@@ -100,6 +100,9 @@ pub struct InterpreterSettings {
     /// Note that this feature is currently not fully implemented yet, so some
     /// annotations might be missing.
     pub render_annotations: bool,
+    /// Draw annotations as for printing: only those with the Print flag (PDF 32000-1
+    /// 12.5.3), instead of all that are not `NoView`. Hidden ones are never drawn.
+    pub annotation_print: bool,
 }
 
 impl Default for InterpreterSettings {
@@ -118,6 +121,7 @@ impl Default for InterpreterSettings {
             cmap_resolver: Arc::new(|_| None),
             warning_sink: Arc::new(|_| {}),
             render_annotations: true,
+            annotation_print: false,
         }
     }
 }
@@ -152,8 +156,11 @@ pub fn interpret_page<'a>(
         for annot in annot_arr.iter::<Dict<'_>>() {
             let flags = annot.get::<u32>(F).unwrap_or(0);
 
-            // Annotation should be hidden.
-            if flags & 2 != 0 {
+            // Hidden; without Print when printing; NoView when viewing.
+            if flags & 2 != 0
+                || (context.settings.annotation_print && flags & 4 == 0)
+                || (!context.settings.annotation_print && flags & 32 != 0)
+            {
                 continue;
             }
 
