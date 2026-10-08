@@ -1,4 +1,3 @@
-use crate::FillRule;
 use crate::color::ColorSpace;
 use crate::context::Context;
 use crate::convert::{convert_line_cap, convert_line_join};
@@ -13,6 +12,7 @@ use crate::pattern::{Pattern, ShadingPattern};
 use crate::shading::Shading;
 use crate::util::{OptionLog, RectExt};
 use crate::x_object::{FormXObject, ImageXObject, XObject};
+use crate::{BlendMode, FillRule};
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
 use hayro_syntax::object::dict::keys::{ANNOTS, AP, AS, F, MCID, N, OC, RECT};
@@ -23,6 +23,7 @@ use rustc_hash::FxHashMap;
 use smallvec::smallvec;
 use std::sync::Arc;
 
+mod annotation;
 pub(crate) mod path;
 pub(crate) mod state;
 pub(crate) mod text;
@@ -216,11 +217,43 @@ pub fn interpret_page<'a>(
                 apx.draw(resources, context, device);
                 context.pop_root_transform();
                 context.restore_state(device);
-            } else if annot.get::<Dict<'_>>(AP).is_some() {
+            } else if annot
+                .get::<Dict<'_>>(AP)
+                .is_some_and(|ap| ap.contains_key(N))
+            {
                 (context.settings.warning_sink)(InterpreterWarning::UnresolvedAnnotationAppearance);
+            } else if let Some(appearance) = annotation::generate(&annot) {
+                draw_generated(&appearance, resources, context, device);
             }
         }
     }
+}
+
+/// Draws an appearance generated for an annotation without one, from a fresh
+/// graphics state in default user space.
+fn draw_generated<'a>(
+    appearance: &annotation::Appearance,
+    resources: &Resources<'a>,
+    context: &mut Context<'a>,
+    device: &mut impl Device<'a>,
+) {
+    context.path_mut().truncate(0);
+    context.save_state();
+    context.get_mut().graphics_state = state::GraphicsState::default();
+    let group = appearance.opacity < 1.0 || appearance.blend != BlendMode::Normal;
+    if group {
+        device.push_transparency_group(appearance.opacity, None, appearance.blend);
+    }
+    interpret(
+        TypedIter::new(appearance.content.as_bytes()),
+        resources,
+        context,
+        device,
+    );
+    if group {
+        device.pop_transparency_group();
+    }
+    context.restore_state(device);
 }
 
 fn appearance_stream<'a>(annot: &Dict<'a>) -> Option<Stream<'a>> {
