@@ -1,12 +1,45 @@
 use super::mask::decode_mask;
 use super::{DecodeContext, decode_context, decode_u8_samples, fix_image_length, unpack_samples};
-use crate::color::{ColorComponents, ToLuma, ToRgb};
+use crate::color::{ColorComponents, ColorSpace, ToLuma, ToRgb};
 use crate::interpret::state::ActiveTransferFunction;
 use crate::x_object::image::ImageXObject;
 use crate::{ImageData, LumaData, RgbData};
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::*;
 use smallvec::SmallVec;
+
+/// Whether 8-bit samples are used as they are (`Some(false)`), inverted
+/// (`Some(true)`), or go through the decode array (`None`): the decode array maps them
+/// onto the colour space's ranges or the reverse.
+pub(crate) fn direct_invert(
+    color_space: &ColorSpace,
+    bits_per_component: u8,
+    decode_arr: &[(f32, f32)],
+) -> Option<bool> {
+    let component_ranges = color_space.component_ranges();
+    let default_decode = color_space.default_decode_arr(bits_per_component as f32);
+    let inverted_default_decode =
+        color_space.inverted_default_decode_arr(bits_per_component as f32);
+    let inverted_component_ranges = component_ranges
+        .iter()
+        .map(|(min, max)| (*max, *min))
+        .collect::<SmallVec<[(f32, f32); 4]>>();
+    let is_indexed = color_space.is_indexed();
+
+    if bits_per_component == 8
+        && (decode_arr == component_ranges.as_slice()
+            || is_indexed && decode_arr == default_decode.as_slice())
+    {
+        Some(false)
+    } else if bits_per_component == 8
+        && (decode_arr == inverted_component_ranges.as_slice()
+            || is_indexed && decode_arr == inverted_default_decode.as_slice())
+    {
+        Some(true)
+    } else {
+        None
+    }
+}
 
 pub(crate) struct DecodedImage {
     pub(crate) image: ImageData,
@@ -57,34 +90,11 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
             return None;
         }
 
-        let component_ranges = self.ctx.color_space.component_ranges();
-        let default_decode = self
-            .ctx
-            .color_space
-            .default_decode_arr(self.ctx.bits_per_component as f32);
-        let inverted_default_decode = self
-            .ctx
-            .color_space
-            .inverted_default_decode_arr(self.ctx.bits_per_component as f32);
-        let inverted_component_ranges = component_ranges
-            .iter()
-            .map(|(min, max)| (*max, *min))
-            .collect::<SmallVec<[(f32, f32); 4]>>();
-        let is_indexed = self.ctx.color_space.is_indexed();
-
-        let direct_invert = if self.ctx.bits_per_component == 8
-            && (self.ctx.decode_arr == component_ranges
-                || is_indexed && self.ctx.decode_arr == default_decode)
-        {
-            Some(false)
-        } else if self.ctx.bits_per_component == 8
-            && (self.ctx.decode_arr == inverted_component_ranges
-                || is_indexed && self.ctx.decode_arr == inverted_default_decode)
-        {
-            Some(true)
-        } else {
-            None
-        };
+        let direct_invert = direct_invert(
+            &self.ctx.color_space,
+            self.ctx.bits_per_component,
+            &self.ctx.decode_arr,
+        );
 
         let mut components = if let Some(invert) = direct_invert {
             // This is actually the most common case, where the PDF is embedded
@@ -289,27 +299,27 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
 
 fn unpremultiply(image: &mut ImageData, alpha: &[u8], matte_rgb: &[u8]) {
     match image {
-        ImageData::Rgb(rgb) => {
-            for (pixel, &a) in rgb.data.chunks_exact_mut(3).zip(alpha.iter()) {
-                if a == 0 {
-                    continue;
-                }
-                let inv_alpha = 255.0 / a as f32;
-                for (c, &m) in pixel.iter_mut().zip(matte_rgb.iter()) {
-                    let m = m as f32;
-                    *c = (m + (*c as f32 - m) * inv_alpha) as u8;
-                }
-            }
+        ImageData::Rgb(rgb) => unpremultiply_samples(&mut rgb.data, 3, alpha, matte_rgb),
+        ImageData::Luma(luma) => unpremultiply_samples(&mut luma.data, 1, alpha, matte_rgb),
+    }
+}
+
+/// Undoes `/Matte` premultiplication of `channels`-channel colour samples (RGB, or
+/// luma against the matte's first component) by their `alpha`.
+pub(crate) fn unpremultiply_samples(
+    data: &mut [u8],
+    channels: usize,
+    alpha: &[u8],
+    matte_rgb: &[u8],
+) {
+    for (pixel, &a) in data.chunks_exact_mut(channels).zip(alpha.iter()) {
+        if a == 0 {
+            continue;
         }
-        ImageData::Luma(luma) => {
-            let m = matte_rgb[0] as f32;
-            for (c, &a) in luma.data.iter_mut().zip(alpha.iter()) {
-                if a == 0 {
-                    continue;
-                }
-                let inv_alpha = 255.0 / a as f32;
-                *c = (m + (*c as f32 - m) * inv_alpha) as u8;
-            }
+        let inv_alpha = 255.0 / a as f32;
+        for (c, &m) in pixel.iter_mut().zip(matte_rgb.iter()) {
+            let m = m as f32;
+            *c = (m + (*c as f32 - m) * inv_alpha) as u8;
         }
     }
 }

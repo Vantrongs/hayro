@@ -1,10 +1,11 @@
 use super::{DecodeContext, decode_context, fix_image_length, unpack_samples};
 use crate::LumaData;
+use crate::color::ColorSpace;
 use crate::function::interpolate;
 use crate::x_object::image::{ImageKind, ImageXObject};
 use std::sync::LazyLock;
 
-static BILEVEL_MASK_LUT: LazyLock<Box<[u64; 256]>> = LazyLock::new(|| {
+pub(crate) static BILEVEL_MASK_LUT: LazyLock<Box<[u64; 256]>> = LazyLock::new(|| {
     let mut lut = Box::new([0; 256]);
     for (byte, expanded) in lut.iter_mut().enumerate() {
         let mut pixels = [0; 8];
@@ -48,30 +49,59 @@ pub(crate) fn decode_mask(
     })
 }
 
+/// How a mask's samples become alpha (`decode_mask_data`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MaskPath {
+    /// One bit per sample, each 0 or 255, inverted or not.
+    Bilevel { invert: bool },
+    /// One byte per sample, inverted or not.
+    Bytes { invert: bool },
+    /// Through the decode array.
+    Decoded,
+}
+
+impl MaskPath {
+    /// The path for samples of `color_space` (one component, if a fast path applies)
+    /// with `bits_per_component` and `decode_arr`; `invert` for a stencil mask.
+    pub(crate) fn new(
+        color_space: &ColorSpace,
+        bits_per_component: u8,
+        decode_arr: &[(f32, f32)],
+        invert: bool,
+    ) -> Self {
+        let default_decode = color_space.default_decode_arr(bits_per_component as f32);
+        let inverted_default = color_space.inverted_default_decode_arr(bits_per_component as f32);
+        let inverted = decode_arr == inverted_default.as_slice();
+        let fast = decode_arr == default_decode.as_slice() || inverted;
+        if bits_per_component == 1 && color_space.num_components() == 1 && fast {
+            Self::Bilevel {
+                invert: invert ^ inverted,
+            }
+        } else if bits_per_component == 8 && fast {
+            Self::Bytes {
+                invert: invert ^ inverted,
+            }
+        } else {
+            Self::Decoded
+        }
+    }
+}
+
 fn decode_mask_data(mut ctx: DecodeContext<'_>, invert: bool) -> Option<(Vec<u8>, u32)> {
-    let default_decode = ctx
-        .color_space
-        .default_decode_arr(ctx.bits_per_component as f32);
-    let inverted_default = ctx
-        .color_space
-        .inverted_default_decode_arr(ctx.bits_per_component as f32);
+    let path = MaskPath::new(
+        &ctx.color_space,
+        ctx.bits_per_component,
+        &ctx.decode_arr,
+        invert,
+    );
 
-    let bilevel_fast_path = ctx.bits_per_component == 1
-        && ctx.color_space.num_components() == 1
-        && (ctx.decode_arr.as_slice() == default_decode.as_slice()
-            || ctx.decode_arr.as_slice() == inverted_default.as_slice());
-    let fast_path = ctx.bits_per_component == 8
-        && (ctx.decode_arr.as_slice() == default_decode.as_slice()
-            || ctx.decode_arr.as_slice() == inverted_default.as_slice());
-
-    let mut data = if bilevel_fast_path {
-        decode_bilevel_mask_data(
-            &ctx,
-            invert ^ (ctx.decode_arr.as_slice() == inverted_default.as_slice()),
-        )
-    } else if fast_path {
+    let mut data = if let MaskPath::Bilevel { invert } = path {
+        decode_bilevel_mask_data(&ctx, invert)
+    } else if let MaskPath::Bytes {
+        invert: should_invert,
+    } = path
+    {
         let mut decoded = ctx.decoded.data;
-        let should_invert = invert ^ (ctx.decode_arr.as_slice() == inverted_default.as_slice());
         if should_invert {
             for byte in decoded.to_mut() {
                 *byte = 255 - *byte;

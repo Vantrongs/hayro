@@ -1,8 +1,8 @@
 mod image;
 mod mask;
 
-pub(crate) use image::{DecodedImage, decode_image};
-pub(crate) use mask::{DecodedMask, decode_mask};
+pub(crate) use image::{DecodedImage, decode_image, direct_invert, unpremultiply_samples};
+pub(crate) use mask::{BILEVEL_MASK_LUT, DecodedMask, MaskPath, decode_mask};
 
 use crate::InterpreterWarning;
 use crate::color::ColorSpace;
@@ -11,7 +11,7 @@ use crate::x_object::image::{ImageKind, ImageXObject};
 use hayro_syntax::bit_reader::BitReader;
 use hayro_syntax::object::Array;
 use hayro_syntax::object::dict::keys::*;
-use hayro_syntax::object::stream::{FilterResult, ImageColorSpace, ImageDecodeParams};
+use hayro_syntax::object::stream::{FilterResult, ImageColorSpace, ImageData, ImageDecodeParams};
 use smallvec::SmallVec;
 
 struct DecodeContext<'a> {
@@ -22,6 +22,62 @@ struct DecodeContext<'a> {
     color_space: ColorSpace,
     bits_per_component: u8,
     decode_arr: SmallVec<[(f32, f32); 4]>,
+}
+
+/// How an image's samples are laid out and what they mean: from its dictionary, and
+/// the image data a filter reported (`decode_context`).
+pub(crate) struct SampleFormat {
+    pub(crate) color_space: ColorSpace,
+    pub(crate) bits_per_component: u8,
+    pub(crate) decode_arr: SmallVec<[(f32, f32); 4]>,
+}
+
+pub(crate) fn sample_format(
+    obj: &ImageXObject<'_>,
+    image_data: Option<&ImageData>,
+) -> SampleFormat {
+    let dict = obj.stream.dict();
+    let dict_bpc = dict
+        .get::<u8>(BPC)
+        .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT));
+
+    let color_space = obj
+        .color_space
+        .clone()
+        .or_else(|| {
+            image_data.map(|i| i.color_space).and_then(|c| {
+                c.and_then(|c| match c {
+                    ImageColorSpace::Gray => Some(ColorSpace::device_gray()),
+                    ImageColorSpace::Rgb => Some(ColorSpace::device_rgb()),
+                    ImageColorSpace::Cmyk => Some(ColorSpace::device_cmyk()),
+                    ImageColorSpace::Unknown(_) => None,
+                })
+            })
+        })
+        .unwrap_or(ColorSpace::device_gray());
+
+    let fallback_bpc = if obj.kind == ImageKind::StencilMask {
+        1
+    } else {
+        8
+    };
+
+    let bits_per_component = image_data
+        .map(|i| i.bits_per_component)
+        .or(dict_bpc)
+        .unwrap_or(fallback_bpc);
+
+    let decode_arr = dict
+        .get::<Array<'_>>(D)
+        .or_else(|| dict.get::<Array<'_>>(DECODE))
+        .map(|a| a.iter::<(f32, f32)>().collect::<SmallVec<_>>())
+        .unwrap_or(color_space.default_decode_arr(bits_per_component as f32));
+
+    SampleFormat {
+        color_space,
+        bits_per_component,
+        decode_arr,
+    }
 }
 
 fn decode_context<'a>(
@@ -63,41 +119,11 @@ fn decode_context<'a>(
         })
         .unwrap_or((obj.width, obj.height));
 
-    let color_space = color_space
-        .or_else(|| {
-            decoded
-                .image_data
-                .as_ref()
-                .map(|i| i.color_space)
-                .and_then(|c| {
-                    c.and_then(|c| match c {
-                        ImageColorSpace::Gray => Some(ColorSpace::device_gray()),
-                        ImageColorSpace::Rgb => Some(ColorSpace::device_rgb()),
-                        ImageColorSpace::Cmyk => Some(ColorSpace::device_cmyk()),
-                        ImageColorSpace::Unknown(_) => None,
-                    })
-                })
-        })
-        .unwrap_or(ColorSpace::device_gray());
-
-    let fallback_bpc = if obj.kind == ImageKind::StencilMask {
-        1
-    } else {
-        8
-    };
-
-    let bits_per_component = decoded
-        .image_data
-        .as_ref()
-        .map(|i| i.bits_per_component)
-        .or(dict_bpc)
-        .unwrap_or(fallback_bpc);
-
-    let decode_arr = dict
-        .get::<Array<'_>>(D)
-        .or_else(|| dict.get::<Array<'_>>(DECODE))
-        .map(|a| a.iter::<(f32, f32)>().collect::<SmallVec<_>>())
-        .unwrap_or(color_space.default_decode_arr(bits_per_component as f32));
+    let SampleFormat {
+        color_space,
+        bits_per_component,
+        decode_arr,
+    } = sample_format(obj, decoded.image_data.as_ref());
 
     Some(DecodeContext {
         decoded,
@@ -135,7 +161,7 @@ fn fix_image_length<T: Copy>(
 /// fill. A last row they fill in part counts, to be padded, unless padding it would
 /// take more than the samples present (and more than `MIN_ROW_PAD`): data cut short
 /// costs memory in proportion to what it holds, never to what the image declares.
-fn rows_present(samples: usize, row_len: usize, height: u32) -> u32 {
+pub(crate) fn rows_present(samples: usize, row_len: usize, height: u32) -> u32 {
     if row_len == 0 {
         return 0;
     }
