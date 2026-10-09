@@ -293,25 +293,43 @@ fn text_lines(annot: &Dict<'_>, line: Line, out: &mut Out) -> Option<()> {
                 out.nums(&[x0, y], "m")?;
                 out.nums(&[x1, y], "l")?;
             }
-            Line::Squiggle => {
-                const DELTA: f32 = 2.0;
-                let (bottom, top) = (y0, y0 + DELTA);
-                out.nums(&[x0, top], "m")?;
-                let mut x = x0 + DELTA;
-                let mut up = false;
-                while x < x1 {
-                    out.nums(&[x, if up { top } else { bottom }], "l")?;
-                    x += DELTA;
-                    up = !up;
-                }
-                // The last partial step keeps the slope.
-                let rest = x1 - (x - DELTA);
-                out.nums(&[x1, if up { bottom + rest } else { top - rest }], "l")?;
-            }
+            Line::Squiggle => squiggle(x0, x1, y0, out)?,
         }
         out.op("S");
     }
     Some(())
+}
+
+/// The zigzag of a `Squiggly` quad from `x0` to `x1` above `y`: 2 pt high, one step per
+/// 2 pt as in `PDFium`, but at most `MAX_STEPS` steps, so a wider quad gets longer
+/// steps. Positions are computed from the step index in f64: in f32, `x += 2` stops
+/// advancing at 2^25.
+fn squiggle(x0: f32, x1: f32, y: f32, out: &mut Out) -> Option<()> {
+    const DELTA: f64 = 2.0;
+    const MAX_STEPS: f64 = 1024.0;
+    let (bottom, top) = (y, y + DELTA as f32);
+    let (x0, x1) = (f64::from(x0), f64::from(x1));
+    let width = x1 - x0;
+    let steps = (width / DELTA).ceil().max(1.0);
+    let (steps, step) = if steps > MAX_STEPS {
+        (MAX_STEPS, width / MAX_STEPS)
+    } else {
+        (steps, DELTA)
+    };
+    // Every step but the last ends on a full peak or trough.
+    let full = steps as u32 - 1;
+    out.nums(&[x0 as f32, top], "m")?;
+    for i in 1..=full {
+        let x = x0 + f64::from(i) * step;
+        out.nums(&[x as f32, if i % 2 == 0 { top } else { bottom }], "l")?;
+    }
+    // The last, possibly partial, step keeps the slope.
+    let rise = ((x1 - (x0 + f64::from(full) * step)) / step * DELTA) as f32;
+    let up = full % 2 == 1;
+    out.nums(
+        &[x1 as f32, if up { bottom + rise } else { top - rise }],
+        "l",
+    )
 }
 
 /// `Ink`: each `/InkList` path stroked as a polyline in /C (default black) at the border
@@ -370,4 +388,51 @@ fn note_icon(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
     }
     out.op("B*");
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate;
+    use hayro_syntax::object::{Dict, FromBytes};
+
+    fn content(annot: &str) -> String {
+        let dict = Dict::from_bytes(annot.as_bytes()).expect("valid dict");
+        generate(&dict).expect("an appearance").content
+    }
+
+    fn squiggly(quad: &str) -> String {
+        content(&format!(
+            "<< /Subtype /Squiggly /Rect [0 0 1 1] /QuadPoints [{quad}] >>"
+        ))
+    }
+
+    #[test]
+    fn squiggly_follows_pdfium_steps() {
+        let c = squiggly("10 20 15 20 10 10 15 10");
+        assert!(
+            c.ends_with("10 12 m\n12 10 l\n14 12 l\n15 11 l\nS\n"),
+            "{c}"
+        );
+    }
+
+    #[test]
+    fn squiggly_ends_at_large_coordinates() {
+        // In f32, 2^25 + 2 == 2^25: a loop adding the step never reached x1.
+        let c = squiggly("33554432 20 33554440 20 33554432 10 33554440 10");
+        assert_eq!(c.matches(" l\n").count(), 4, "{c}");
+        assert!(c.ends_with(" l\nS\n"), "{c}");
+    }
+
+    #[test]
+    fn squiggly_steps_are_bounded_per_quad() {
+        let big = "1000000000000000000000000000000";
+        let c = squiggly(&format!(
+            "0 20 {big} 20 0 10 {big} 10 0 50 40 50 0 40 40 40"
+        ));
+        let quads: Vec<&str> = c.split("S\n").filter(|q| q.contains(" m\n")).collect();
+        assert_eq!(quads.len(), 2, "{c}");
+        assert_eq!(quads[0].matches(" l\n").count(), 1024);
+        assert!(quads[0].ends_with(&format!("{big} 12 l\n")), "{}", quads[0]);
+        assert_eq!(quads[1].matches(" l\n").count(), 20);
+    }
 }
