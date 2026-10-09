@@ -18,6 +18,7 @@ use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp;
+use core::hash::{Hash, Hasher};
 use core::ops::Deref;
 
 mod aes;
@@ -47,7 +48,7 @@ pub enum DecryptionError {
     UnsupportedAlgorithm,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 enum DecryptorTag {
     None,
     Rc4,
@@ -81,6 +82,21 @@ pub(crate) enum DecryptionTarget {
 }
 
 impl Decryptor {
+    pub(crate) fn hash_stream_decryption<H: Hasher>(&self, state: &mut H) {
+        let (key, tag) = match self {
+            Self::None => (&[][..], DecryptorTag::None),
+            Self::Rc4 { key } => (key.as_slice(), DecryptorTag::Rc4),
+            Self::Aes128 { key, dict } | Self::Aes256 { key, dict } => {
+                (key.as_slice(), dict.stream_filter.cfm)
+            }
+        };
+        tag.hash(state);
+        if tag != DecryptorTag::None {
+            // A caller-provided hasher must not receive the secret key itself.
+            sha256::calculate(key).hash(state);
+        }
+    }
+
     pub(crate) fn decrypt(
         &self,
         id: ObjectIdentifier,

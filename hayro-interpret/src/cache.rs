@@ -2,6 +2,7 @@ use crate::util::hash128;
 use hayro_syntax::object::{Array, Dict, MaybeRef, Name, Null, ObjRef, Object, Stream};
 use kurbo::{Affine, Rect};
 use rustc_hash::FxHashMap;
+use siphasher::sip128::{Hasher128, SipHasher13};
 use std::any::Any;
 use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex};
@@ -70,7 +71,9 @@ impl CacheKey for Dict<'_> {
 
 impl CacheKey for Stream<'_> {
     fn cache_key(&self) -> u128 {
-        self.dict().cache_key()
+        let mut state = SipHasher13::new();
+        self.hash_content(&mut state);
+        state.finish128().as_u128()
     }
 }
 
@@ -168,5 +171,114 @@ impl CacheKey for Rect {
 impl CacheKey for u128 {
     fn cache_key(&self) -> u128 {
         hash128(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::color::{ColorSpace, ToRgb};
+    use hayro_syntax::Pdf;
+    use hayro_syntax::object::ObjectIdentifier;
+
+    fn icc_pdf(gammas: &[f32]) -> Pdf {
+        let mut objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec(),
+        ];
+        for (index, &gamma) in gammas.iter().enumerate() {
+            let profile = moxcms::ColorProfile::new_gray_with_gamma(gamma)
+                .encode()
+                .unwrap();
+            let mut stream = format!("<< /N 1 /Length {} >>\nstream\n", profile.len()).into_bytes();
+            stream.extend(profile);
+            stream.extend(b"\nendstream");
+            objects.push(stream);
+            objects.push(format!("[/ICCBased {} 0 R]", 3 + index * 2).into_bytes());
+        }
+        let mut data = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(data.len());
+            data.extend(format!("{} 0 obj\n", index + 1).bytes());
+            data.extend(object);
+            data.extend(b"\nendobj\n");
+        }
+        let xref = data.len();
+        data.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).bytes());
+        for offset in offsets {
+            data.extend(format!("{offset:010} 00000 n \n").bytes());
+        }
+        data.extend(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .bytes(),
+        );
+        Pdf::new(data).unwrap()
+    }
+
+    fn stream(pdf: &Pdf, index: usize) -> Stream<'_> {
+        pdf.xref()
+            .get(ObjectIdentifier::new(3 + index as i32 * 2, 0))
+            .unwrap()
+    }
+
+    fn gray_pixel(pdf: &Pdf, index: usize, cache: &Cache) -> [u8; 3] {
+        let object = pdf
+            .xref()
+            .get(ObjectIdentifier::new(4 + index as i32 * 2, 0))
+            .unwrap();
+        let color = ColorSpace::new(object, cache).unwrap();
+        let mut pixel = [0; 3];
+        color.convert(&[128], &mut pixel).unwrap();
+        pixel
+    }
+
+    #[test]
+    fn equal_stream_dictionaries_do_not_share_icc_colors() {
+        let pdf = icc_pdf(&[1.0, 2.2]);
+        assert_eq!(stream(&pdf, 0).dict().data(), stream(&pdf, 1).dict().data());
+        let expected = [
+            gray_pixel(&pdf, 0, &Cache::new()),
+            gray_pixel(&pdf, 1, &Cache::new()),
+        ];
+        assert_ne!(expected[0], expected[1]);
+        for order in [[0, 1], [1, 0]] {
+            let cache = Cache::new();
+            for index in order {
+                assert_eq!(gray_pixel(&pdf, index, &cache), expected[index]);
+            }
+        }
+    }
+
+    #[test]
+    fn resolving_the_same_stream_reuses_its_cache_entry() {
+        let pdf = icc_pdf(&[1.0]);
+        let cache = Cache::new();
+        let key = stream(&pdf, 0).cache_key();
+        assert_eq!(cache.get_or_insert_with(key, || Some(42_u8)), Some(42));
+        let cloned = stream(&pdf, 0).clone();
+        assert_eq!(
+            cache.get_or_insert_with(cloned.cache_key(), || panic!("stream was not cached")),
+            Some(42_u8)
+        );
+    }
+
+    #[test]
+    fn streams_in_different_documents_do_not_share_icc_colors() {
+        let first = icc_pdf(&[1.0]);
+        let second = icc_pdf(&[2.2]);
+        assert_eq!(stream(&first, 0).obj_id(), stream(&second, 0).obj_id());
+        assert_eq!(
+            stream(&first, 0).dict().data(),
+            stream(&second, 0).dict().data()
+        );
+        let cache = Cache::new();
+        let expected = gray_pixel(&second, 0, &Cache::new());
+        assert_ne!(gray_pixel(&first, 0, &cache), expected);
+        drop(first);
+        assert_eq!(gray_pixel(&second, 0, &cache), expected);
     }
 }

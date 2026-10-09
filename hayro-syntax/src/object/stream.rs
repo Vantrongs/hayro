@@ -21,6 +21,7 @@ use crate::xref::XRef;
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
+use core::hash::{Hash, Hasher};
 use smallvec::SmallVec;
 
 struct FiltersAndParams<'a> {
@@ -129,6 +130,20 @@ impl<'a> Stream<'a> {
                     .unwrap_or_default(),
             ),
             None => Cow::Borrowed(self.data),
+        }
+    }
+
+    /// Hash the dictionary, encoded bytes and decryption context for a content cache.
+    ///
+    /// This reads the encoded bytes without decrypting or decoding the stream.
+    pub fn hash_content<H: Hasher>(&self, state: &mut H) {
+        b"hayro-stream".hash(state);
+        self.dict.data().hash(state);
+        self.data.hash(state);
+        let decryption_id = self.decryption_object_id();
+        decryption_id.hash(state);
+        if decryption_id.is_some() {
+            self.dict.ctx().xref().hash_stream_decryption(state);
         }
     }
 

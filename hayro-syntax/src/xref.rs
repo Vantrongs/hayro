@@ -26,6 +26,7 @@ use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::max;
+use core::hash::Hasher;
 use core::iter;
 use core::ops::Deref;
 
@@ -506,6 +507,12 @@ impl XRef {
         match &self.0 {
             Inner::Dummy => Some(data.to_vec()),
             Inner::Some(r) => r.decryptor.decrypt(id, data, target),
+        }
+    }
+
+    pub(crate) fn hash_stream_decryption<H: Hasher>(&self, state: &mut H) {
+        if let Inner::Some(r) = &self.0 {
+            r.decryptor.hash_stream_decryption(state);
         }
     }
 

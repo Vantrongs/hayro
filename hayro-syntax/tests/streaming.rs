@@ -90,13 +90,21 @@ fn unavailable_predictor_rows_do_not_allocate_the_declared_width() {
 }
 
 fn encrypted_pdf(data: &[u8], filter: &str) -> hayro_syntax::Pdf {
+    encrypted_pdf_with_keys(data, filter, [7; 32], [7; 32])
+}
+
+fn encrypted_pdf_with_keys(
+    data: &[u8],
+    filter: &str,
+    key: [u8; 32],
+    payload_key: [u8; 32],
+) -> hayro_syntax::Pdf {
     use aes::cipher::{
         BlockEncryptMut, KeyIvInit,
         block_padding::{NoPadding, Pkcs7},
     };
     use sha2::{Digest, Sha256};
     type Encryptor = cbc::Encryptor<aes::Aes256>;
-    let key = [7; 32];
     let salt = [3; 8];
     let hash = Sha256::digest(salt);
     let user: Vec<u8> = hash.iter().copied().chain(salt).chain(salt).collect();
@@ -107,7 +115,7 @@ fn encrypted_pdf(data: &[u8], filter: &str) -> hayro_syntax::Pdf {
         .unwrap();
     let mut padded = vec![0; data.len() + 16];
     padded[..data.len()].copy_from_slice(data);
-    let encrypted = Encryptor::new_from_slices(&key, &[9; 16])
+    let encrypted = Encryptor::new_from_slices(&payload_key, &[9; 16])
         .unwrap()
         .encrypt_padded_mut::<Pkcs7>(&mut padded, data.len())
         .unwrap();
@@ -140,6 +148,38 @@ fn encrypted_pdf(data: &[u8], filter: &str) -> hayro_syntax::Pdf {
     }
     pdf.extend(format!("trailer\n<< /Size 5 /Root 1 0 R /Encrypt 4 0 R /ID [<01> <01>] >>\nstartxref\n{xref}\n%%EOF\n").bytes());
     hayro_syntax::Pdf::new(pdf).unwrap()
+}
+
+#[test]
+fn content_cache_hash_accounts_for_the_decryption_context_without_decrypting() {
+    use hayro_syntax::object::ObjectIdentifier;
+    use std::hash::{DefaultHasher, Hasher};
+
+    for length in [65_536, 262_144] {
+        let data = vec![71; length];
+        let first = encrypted_pdf_with_keys(&data, "", [7; 32], [7; 32]);
+        // Identical stored stream bytes, but a different file decryption key.
+        let second = encrypted_pdf_with_keys(&data, "", [8; 32], [7; 32]);
+        fn stream(pdf: &hayro_syntax::Pdf) -> Stream<'_> {
+            pdf.xref()
+                .get::<Stream<'_>>(ObjectIdentifier::new(3, 0))
+                .unwrap()
+        }
+        let first_stream = stream(&first);
+        let second_stream = stream(&second);
+        assert_eq!(first_stream, second_stream);
+        assert_ne!(first_stream.raw_data(), second_stream.raw_data());
+        let hash = |stream: &Stream<'_>| {
+            let mut state = DefaultHasher::new();
+            stream.hash_content(&mut state);
+            state.finish()
+        };
+        assert_ne!(hash(&first_stream), hash(&second_stream));
+        let allocation = largest_allocation(|| {
+            assert_eq!(hash(&first_stream), hash(&stream(&first)));
+        });
+        assert!(allocation < 4096, "hash allocated {allocation} bytes");
+    }
 }
 
 #[test]
