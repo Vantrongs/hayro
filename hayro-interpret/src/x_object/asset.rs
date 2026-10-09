@@ -2,6 +2,9 @@
 //! density, so a renderer keeps a handle instead of decoded pixels and asks for what a
 //! view shows.
 
+mod jpeg;
+use jpeg::{JpegIndex, JpegStreamed};
+
 use super::area::Area;
 use super::decode::{
     BILEVEL_MASK_LUT, MaskPath, SampleFormat, decode_image, decode_mask, direct_invert,
@@ -30,6 +33,7 @@ pub struct ImageAsset(Arc<AssetData>);
 struct AssetData {
     stream: OwnedStream,
     checkpoints: Mutex<Checkpoints>,
+    jpeg: Mutex<JpegIndex>,
     width: u32,
     height: u32,
     color_space: Option<ColorSpace>,
@@ -46,6 +50,7 @@ impl ImageXObject<'_> {
         ImageAsset(Arc::new(AssetData {
             stream: self.stream.to_owned_stream(),
             checkpoints: Mutex::new(Checkpoints::default()),
+            jpeg: Mutex::new(JpegIndex::default()),
             width: self.width,
             height: self.height,
             color_space: self.color_space.clone(),
@@ -89,7 +94,13 @@ impl ImageAsset {
             .checkpoints
             .lock()
             .map_err(|_| RequestError::Failed)?
-            .allocation_size())
+            .allocation_size()
+            + self
+                .0
+                .jpeg
+                .lock()
+                .map_err(|_| RequestError::Failed)?
+                .allocation_size())
     }
 
     fn xobject(&self) -> Option<ImageXObject<'_>> {
@@ -108,7 +119,9 @@ impl ImageAsset {
         })
     }
 
-    /// Opens the image for requests. Formats read incrementally (no filter or Flate,
+    /// Opens the image for requests. Exact-size baseline grayscale JPEGs with one
+    /// complete scan and no masks stream MCU bands and retain a bounded seek index.
+    /// Other formats read incrementally (no filter or Flate,
     /// 8-bit `DeviceGray` or `DeviceRGB` samples used as stored or inverted, and their
     /// masks) only read their dictionaries here. Streaming Flate images without
     /// lockstep masks retain a bounded decoder index with cipher and predictor state;
@@ -123,6 +136,14 @@ impl ImageAsset {
             return Some(ImageSource {
                 layout: streamed.layout(),
                 inner: Inner::Streamed(Box::new(streamed)),
+            });
+        }
+        if let Some(jpeg) =
+            JpegStreamed::new(&obj, &self.0.stream, &self.0.checkpoints, &self.0.jpeg)
+        {
+            return Some(ImageSource {
+                layout: jpeg.samples.layout(),
+                inner: Inner::Jpeg(Box::new(jpeg)),
             });
         }
         let decoded = decode_image(&obj, hint)?;
@@ -276,6 +297,7 @@ pub struct ImageSource<'a> {
 
 enum Inner<'a> {
     Streamed(Box<Streamed<'a>>),
+    Jpeg(Box<JpegStreamed<'a>>),
     Decoded(Box<Decoded>),
 }
 
@@ -287,7 +309,7 @@ impl ImageSource<'_> {
 
     /// Whether requests stream the data rather than read planes decoded at `open`.
     pub fn is_streamed(&self) -> bool {
-        matches!(self.inner, Inner::Streamed(_))
+        matches!(self.inner, Inner::Streamed(_) | Inner::Jpeg(_))
     }
 
     /// Bytes retained by this asset's decoder index, including entries and state
@@ -298,7 +320,9 @@ impl ImageSource<'_> {
                 .checkpoints
                 .lock()
                 .map_err(|_| RequestError::Failed)?
-                .allocation_size()),
+                .allocation_size()
+                + size_of::<Mutex<JpegIndex>>()),
+            Inner::Jpeg(j) => j.checkpoint_bytes(),
             Inner::Decoded(_) => Ok(0),
         }
     }
@@ -327,6 +351,7 @@ impl ImageSource<'_> {
         );
         let (rows_decoded, bytes_inflated) = match &mut self.inner {
             Inner::Streamed(s) => s.run(request.plane, &mut area, request.cancel),
+            Inner::Jpeg(j) => j.run(&mut area, request.cancel),
             Inner::Decoded(d) => d
                 .run(request.plane, &mut area, request.cancel)
                 .map(|rows| (rows, 0)),
@@ -407,7 +432,8 @@ impl Checkpoints {
         let state_size = reader.checkpoint_size_bound()?;
         let entry_size =
             state_size + size_of::<IndexedCheckpoint>() - size_of::<DecodedCheckpoint>();
-        let count = (CHECKPOINT_BUDGET - size_of::<Mutex<Self>>()) / entry_size;
+        let count = (CHECKPOINT_BUDGET - size_of::<Mutex<JpegIndex>>() - size_of::<Mutex<Self>>())
+            / entry_size;
         if count == 0 {
             return None;
         }
@@ -460,7 +486,7 @@ impl Checkpoints {
         }
         // Predictor rows and pending plaintext grow after the initial spacing probe.
         // Admission uses the snapshot's actual dynamic size, including vector capacity.
-        let remaining = CHECKPOINT_BUDGET - self.allocation_size();
+        let remaining = CHECKPOINT_BUDGET - size_of::<Mutex<JpegIndex>>() - self.allocation_size();
         if reader
             .checkpoint_size()
             .is_none_or(|size| size - size_of::<DecodedCheckpoint>() > remaining)
@@ -761,6 +787,14 @@ impl<'a> Streamed<'a> {
         if !obj.stream.can_read_incrementally() {
             return None;
         }
+        Self::samples(obj, owner, checkpoints)
+    }
+
+    fn samples(
+        obj: &ImageXObject<'a>,
+        owner: &'a OwnedStream,
+        checkpoints: &'a Mutex<Checkpoints>,
+    ) -> Option<Self> {
         let SampleFormat {
             color_space,
             bits_per_component,
@@ -1018,24 +1052,7 @@ impl<'a> Streamed<'a> {
                         if outside { 255 } else { 0 }
                     }));
                 }
-                colour.clear();
-                colour.extend_from_slice(samples);
-                if self.invert {
-                    colour.iter_mut().for_each(|v| *v = 255 - *v);
-                }
-                if self.luma {
-                    self.color_space.to_luma(&mut colour);
-                } else if self.color_space.convert_in_place(&mut colour).is_none() {
-                    rgb.clear();
-                    rgb.resize((c1 - c0) * 3, 0);
-                    self.color_space
-                        .convert(&colour, &mut rgb)
-                        .ok_or(Stop::Failed)?;
-                    std::mem::swap(&mut colour, &mut rgb);
-                }
-                if let Some(t) = &self.obj.transfer_function {
-                    t.apply_to(&mut colour);
-                }
+                self.convert_colour(samples, &mut colour, &mut rgb)?;
                 let alpha: Option<&[u8]> = match (&mask, &self.alpha) {
                     (Some(m), _) => {
                         let a = &alpha_row[c0..c1];
@@ -1077,6 +1094,31 @@ impl<'a> Streamed<'a> {
             };
             return Ok((decoded, raw.reader.inflated_bytes() + mask_inflated));
         }
+    }
+
+    fn convert_colour(
+        &self,
+        samples: &[u8],
+        colour: &mut Vec<u8>,
+        rgb: &mut Vec<u8>,
+    ) -> Result<(), Stop> {
+        colour.clear();
+        colour.extend_from_slice(samples);
+        if self.invert {
+            colour.iter_mut().for_each(|v| *v = 255 - *v);
+        }
+        if self.luma {
+            self.color_space.to_luma(colour);
+        } else if self.color_space.convert_in_place(colour).is_none() {
+            rgb.clear();
+            rgb.resize(samples.len() / self.components * 3, 0);
+            self.color_space.convert(colour, rgb).ok_or(Stop::Failed)?;
+            std::mem::swap(colour, rgb);
+        }
+        if let Some(t) = &self.obj.transfer_function {
+            t.apply_to(colour);
+        }
+        Ok(())
     }
 
     fn run_mask(
@@ -1260,7 +1302,7 @@ mod tests {
 
     /// A PDF whose objects 3 onwards are `objects`, each a dictionary and its stream
     /// data.
-    fn pdf(objects: &[(String, Vec<u8>)]) -> Pdf {
+    pub(super) fn pdf(objects: &[(String, Vec<u8>)]) -> Pdf {
         let mut objs = vec![
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
             b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec(),
@@ -1294,7 +1336,7 @@ mod tests {
         Pdf::new(out).unwrap()
     }
 
-    fn image(dict: &str, w: u32, h: u32) -> String {
+    pub(super) fn image(dict: &str, w: u32, h: u32) -> String {
         format!("/Type /XObject /Subtype /Image /Width {w} /Height {h} {dict}")
     }
 
@@ -1383,7 +1425,7 @@ mod tests {
         Arc::new(|_| {})
     }
 
-    fn asset(pdf: &Pdf, cache: &Cache) -> ImageAsset {
+    pub(super) fn asset(pdf: &Pdf, cache: &Cache) -> ImageAsset {
         let stream = pdf
             .xref()
             .get::<Stream<'_>>(ObjectIdentifier::new(3, 0))
@@ -1394,7 +1436,7 @@ mod tests {
     }
 
     /// The image decoded whole, as the fallback path reads it.
-    fn whole(asset: &ImageAsset) -> ImageSource<'_> {
+    pub(super) fn whole(asset: &ImageAsset) -> ImageSource<'_> {
         let obj = asset.xobject().unwrap();
         let decoded = decode_image(&obj, None).unwrap();
         let decoded = Decoded::new(decoded.image, decoded.alpha);
@@ -1404,7 +1446,7 @@ mod tests {
         }
     }
 
-    fn request(
+    pub(super) fn request(
         source: &mut ImageSource<'_>,
         plane: Plane,
         grid: (u32, u32),
@@ -1422,7 +1464,7 @@ mod tests {
 
     /// Streamed requests of every plane, at several grids and windows, equal the same
     /// requests of the image decoded whole.
-    fn assert_streams_as_decoded(objects: &[(String, Vec<u8>)]) {
+    pub(super) fn assert_streams_as_decoded(objects: &[(String, Vec<u8>)]) {
         let pdf = pdf(objects);
         let cache = Cache::new();
         let asset = asset(&pdf, &cache);
