@@ -10,8 +10,9 @@ mod dct;
 mod jbig2;
 #[cfg(feature = "images")]
 mod jpx;
-mod lzw_flate;
+pub(crate) mod lzw_flate;
 mod png;
+pub(crate) mod reader;
 mod run_length;
 
 use crate::object::Dict;

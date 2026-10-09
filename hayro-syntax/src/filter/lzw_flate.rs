@@ -47,7 +47,7 @@ pub(crate) mod flate {
 
     /// Ported from <https://github.com/mozilla/pdf.js/blob/master/src/core/flate_stream.js>
     /// TODO: Rewrite this in idiomatic Rust.
-    mod fallback {
+    pub(crate) mod fallback {
         use alloc::vec;
         use alloc::vec::Vec;
 
@@ -708,12 +708,12 @@ pub(crate) mod lzw {
     }
 }
 
-struct PredictorParams {
-    predictor: u8,
-    colors: u8,
-    bits_per_component: u8,
-    columns: usize,
-    early_change: bool,
+pub(crate) struct PredictorParams {
+    pub(crate) predictor: u8,
+    pub(crate) colors: u8,
+    pub(crate) bits_per_component: u8,
+    pub(crate) columns: usize,
+    pub(crate) early_change: bool,
 }
 
 impl PredictorParams {
@@ -739,7 +739,7 @@ impl Default for PredictorParams {
 }
 
 impl PredictorParams {
-    fn from_params(dict: &Dict<'_>) -> Self {
+    pub(crate) fn from_params(dict: &Dict<'_>) -> Self {
         Self {
             predictor: dict.get(PREDICTOR).unwrap_or(1),
             colors: dict.get(COLORS).unwrap_or(1),
@@ -750,7 +750,7 @@ impl PredictorParams {
     }
 }
 
-fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
+pub(crate) fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
     match params.predictor {
         1 => Some(data),
         i => {
@@ -877,6 +877,75 @@ fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
 
             Some(out)
         }
+    }
+}
+
+/// Reverses a predictor row by row, as `apply_predictor` does for the whole data at
+/// once: for the predictors and row layouts `apply_predictor_8bit_png` handles
+/// (whole bytes per pixel), the only ones it accepts.
+pub(crate) struct Unpredictor {
+    is_png_predictor: bool,
+    tbpp: BytesPerPixel,
+    /// The previous decoded row; empty before the first, as `apply_predictor_8bit_png`
+    /// passes it.
+    prev: Vec<u8>,
+    row_len: usize,
+}
+
+impl Unpredictor {
+    /// `None` for predictor 1 (no prediction) and for the predictors and layouts
+    /// `apply_predictor` handles otherwise (or rejects).
+    pub(crate) fn new(params: &PredictorParams) -> Option<Self> {
+        let is_png_predictor = params.predictor >= 10;
+        if !(is_png_predictor || params.predictor == 2)
+            || !matches!(params.bits_per_component, 1 | 2 | 4 | 8 | 16)
+        {
+            return None;
+        }
+        let row_len = params.row_length_in_bytes();
+        let chunk_len = if is_png_predictor {
+            (params.colors * params.bits_per_component).div_ceil(8) as usize
+        } else if params.bits_per_component == 8 {
+            params.colors as usize
+        } else {
+            return None;
+        };
+        if row_len == 0 {
+            return None;
+        }
+        let tbpp = BytesPerPixel::from_row_len(row_len, chunk_len)?;
+        Some(Self {
+            is_png_predictor,
+            tbpp,
+            prev: Vec::with_capacity(row_len),
+            row_len,
+        })
+    }
+
+    /// The bytes of one encoded row (with its predictor byte for PNG predictors).
+    pub(crate) fn input_len(&self) -> usize {
+        self.row_len + usize::from(self.is_png_predictor)
+    }
+
+    /// Decodes `input` (`input_len` bytes) into `out` (`row_len` bytes).
+    pub(crate) fn row(&mut self, input: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        if self.is_png_predictor {
+            out.extend_from_slice(&input[1..]);
+            if let Some(filter) = RowFilter::from_u8(input[0]) {
+                png::unfilter(filter, self.tbpp, &self.prev, out);
+            }
+        } else {
+            out.extend_from_slice(input);
+            png::unfilter(RowFilter::Sub, self.tbpp, &self.prev, out);
+        }
+        self.prev.clear();
+        self.prev.extend_from_slice(out);
+    }
+
+    /// Back to the first row.
+    pub(crate) fn reset(&mut self) {
+        self.prev.clear();
     }
 }
 

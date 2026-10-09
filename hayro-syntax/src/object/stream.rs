@@ -2,16 +2,21 @@
 
 use crate::crypto::DecryptionTarget;
 use crate::filter::Filter;
+use crate::filter::lzw_flate::PredictorParams;
+pub use crate::filter::reader::{DecodedReader, ReadError};
 use crate::object;
 use crate::object::Dict;
 use crate::object::Name;
+use crate::object::dict::InlineImageDict;
 use crate::object::dict::keys::{DECODE_PARMS, DP, F, FILTER, LENGTH, TYPE};
 use crate::object::{Array, ObjectIdentifier};
 use crate::object::{Object, ObjectLike, ObjectRefLike};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
+use crate::sync::Arc;
 use crate::trivia::is_white_space_character;
 use crate::util::{OptionLog, find_needle};
+use crate::xref::XRef;
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
@@ -193,6 +198,70 @@ impl<'a> Stream<'a> {
             data,
             image_data: None,
         }))
+    }
+
+    /// The decoded data, read incrementally, when the stream's filters allow it: no
+    /// filter, or Flate with no predictor or a byte-aligned one. It yields the bytes
+    /// [`Stream::decoded`] returns, without holding them all. `None` for other
+    /// filters.
+    pub fn decoded_reader(&self) -> Option<DecodedReader<'a>> {
+        let FiltersAndParams { filters, params } = self.filters_and_params();
+        match filters.as_slice() {
+            [] => Some(DecodedReader::raw(self.raw_data())),
+            [Filter::FlateDecode] => {
+                DecodedReader::flate(self.raw_data(), &PredictorParams::from_params(&params[0]))
+            }
+            _ => None,
+        }
+    }
+
+    /// An owned handle to this stream, which [`OwnedStream::get`] turns back into it
+    /// without borrowing the data it was read from: the object's identifier in the
+    /// document for an indirect object, a copy of the dictionary and data for an
+    /// inline image.
+    pub fn to_owned_stream(&self) -> OwnedStream {
+        let ctx = self.dict.ctx();
+        OwnedStream(match self.dict.obj_id() {
+            Some(id) => OwnedInner::Indirect {
+                xref: ctx.xref().clone(),
+                id,
+            },
+            None => OwnedInner::Inline {
+                dict: Arc::from(self.dict.data()),
+                data: Arc::from(self.data),
+            },
+        })
+    }
+}
+
+/// A stream that owns what it needs to read it again (see [`Stream::to_owned_stream`]).
+#[derive(Clone)]
+pub struct OwnedStream(OwnedInner);
+
+#[derive(Clone)]
+enum OwnedInner {
+    Indirect { xref: XRef, id: ObjectIdentifier },
+    Inline { dict: Arc<[u8]>, data: Arc<[u8]> },
+}
+
+impl OwnedStream {
+    /// The stream; `None` if it can no longer be read.
+    pub fn get(&self) -> Option<Stream<'_>> {
+        match &self.0 {
+            OwnedInner::Indirect { xref, id } => xref.get::<Stream<'_>>(*id),
+            OwnedInner::Inline { dict, data } => {
+                let dict = Reader::new(dict).read_without_context::<InlineImageDict<'_>>()?;
+                Some(Stream::new(data, dict.get_dict().clone()))
+            }
+        }
+    }
+
+    /// The object identifier of an indirect stream.
+    pub fn obj_id(&self) -> Option<ObjectIdentifier> {
+        match &self.0 {
+            OwnedInner::Indirect { id, .. } => Some(*id),
+            OwnedInner::Inline { .. } => None,
+        }
     }
 }
 
