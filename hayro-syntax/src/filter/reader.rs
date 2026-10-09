@@ -120,6 +120,41 @@ impl<'a> DecodedReader<'a> {
         Some(Self { source, predictor })
     }
 
+    /// Back to the start of the data, keeping the decoder a restart chose (so reading
+    /// again does not repeat the restarts).
+    pub fn rewind(&mut self) {
+        if let Some(p) = &mut self.predictor {
+            p.filled = 0;
+            p.row.clear();
+            p.taken = 0;
+            p.unpredictor.reset();
+        }
+        match &mut self.source {
+            Source::Raw { pos, .. } | Source::Whole { pos, .. } => *pos = 0,
+            Source::Failed => {}
+            #[cfg(feature = "unsafe")]
+            Source::Zlib(_) => {
+                let Source::Zlib(decoder) = core::mem::replace(&mut self.source, Source::Failed)
+                else {
+                    unreachable!()
+                };
+                let mut input = decoder.into_inner();
+                input.pos = 0;
+                self.source = Source::Zlib(flate2::bufread::ZlibDecoder::new(input));
+            }
+            #[cfg(feature = "unsafe")]
+            Source::Deflate(_) => {
+                let Source::Deflate(decoder) = core::mem::replace(&mut self.source, Source::Failed)
+                else {
+                    unreachable!()
+                };
+                let mut input = decoder.into_inner();
+                input.pos = 0;
+                self.source = Source::Deflate(flate2::bufread::DeflateDecoder::new(input));
+            }
+        }
+    }
+
     /// Fills `buf` with the next decoded bytes and returns how many; 0 only at the end.
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
         if buf.is_empty() {
@@ -414,6 +449,39 @@ mod tests {
             }
             assert!(restarts >= 1);
             assert_eq!(Some(out), expected);
+        }
+    }
+
+    /// Rewound after reading part of the data or after a restart, a reader yields the
+    /// data again from its start, with the decoder the restart chose.
+    #[test]
+    fn rewinding_reads_the_data_again() {
+        let data = noise(5000, 3);
+        let mut reader = DecodedReader::raw(Cow::Borrowed(&data));
+        let mut buf = alloc::vec![0; 1234];
+        assert_eq!(reader.read(&mut buf), Ok(1234));
+        reader.rewind();
+        assert_eq!(read_all(reader, 777).unwrap(), data);
+        #[cfg(feature = "unsafe")]
+        {
+            // Raw deflate (no zlib header): one restart, then never again.
+            let mut deflate = stored_zlib(&data, 1000);
+            deflate.drain(..2);
+            deflate.truncate(deflate.len() - 4);
+            let params = PredictorParams::default();
+            let mut reader = DecodedReader::flate(Cow::Borrowed(&deflate), &params).unwrap();
+            assert_eq!(reader.read(&mut buf), Err(ReadError::Restarted));
+            assert_eq!(reader.read(&mut buf), Ok(1234));
+            reader.rewind();
+            let mut out = Vec::new();
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                    Err(e) => panic!("{e:?} after a rewind"),
+                }
+            }
+            assert_eq!(out, data);
         }
     }
 }

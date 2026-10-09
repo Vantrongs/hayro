@@ -361,6 +361,12 @@ impl<'a> RawRows<'a> {
         })
     }
 
+    /// Back to the first row, keeping the decoder a restart chose.
+    fn rewind(&mut self) {
+        self.reader.rewind();
+        self.total = 0;
+    }
+
     fn next(&mut self) -> Result<RawRow, ReadError> {
         let mut filled = 0;
         while filled < self.row.len() {
@@ -407,11 +413,17 @@ enum MaskRows<'a, 'm> {
 }
 
 impl MaskRows<'_, '_> {
-    /// Back to the first row, after the reader restarted.
-    fn rewind(&mut self) {
+    /// Back to the first row: after its reader restarted, or with `reader`, after
+    /// another reader of the pass did.
+    fn rewind(&mut self, reader: bool) {
         match self {
             MaskRows::Decoded { row, .. } => *row = 0,
-            MaskRows::Streamed { row, ended, .. } => {
+            MaskRows::Streamed {
+                raw, row, ended, ..
+            } => {
+                if reader {
+                    raw.rewind();
+                }
                 *row = 0;
                 *ended = false;
             }
@@ -752,8 +764,7 @@ impl<'a> Streamed<'a> {
         let (w, h) = (self.obj.width as usize, self.obj.height);
         let n = self.components;
         let row_len = w * n;
-        let open = || RawRows::new(&self.obj.stream, row_len).ok_or(Stop::Failed);
-        let mut raw = open()?;
+        let mut raw = RawRows::new(&self.obj.stream, row_len).ok_or(Stop::Failed)?;
         let mut mask = self.lockstep_mask()?;
         let (rows, cols) = (area.rows(), area.columns());
         let (c0, c1) = (cols.start as usize, cols.end as usize);
@@ -780,7 +791,9 @@ impl<'a> Streamed<'a> {
                 let last = match raw.next() {
                     Err(ReadError::Restarted) => {
                         area.reset();
-                        mask = self.lockstep_mask()?;
+                        if let Some(m) = &mut mask {
+                            m.rows.rewind(true);
+                        }
                         continue 'pass;
                     }
                     Err(ReadError::Failed) => return Err(Stop::Failed),
@@ -799,8 +812,8 @@ impl<'a> Streamed<'a> {
                     Some(m) => match m.rows.next(&mut alpha_row) {
                         Err(ReadError::Restarted) => {
                             area.reset();
-                            raw = open()?;
-                            m.rows.rewind();
+                            raw.rewind();
+                            m.rows.rewind(false);
                             continue 'pass;
                         }
                         Err(ReadError::Failed) => return Err(Stop::Failed),
@@ -896,7 +909,7 @@ impl<'a> Streamed<'a> {
                 match rows.next(&mut alpha) {
                     Err(ReadError::Restarted) => {
                         area.reset();
-                        rows.rewind();
+                        rows.rewind(false);
                         continue 'pass;
                     }
                     Err(ReadError::Failed) => return Err(Stop::Failed),
@@ -1399,6 +1412,28 @@ mod tests {
             ),
             deflate_stored(&gray),
         )]);
+    }
+
+    /// Colour and soft mask both raw deflate: each restarts once, and a restart of one
+    /// rewinds the other without making it restart again.
+    #[test]
+    fn colour_and_mask_that_both_restart_finish() {
+        let (w, h) = (9_u32, 5_u32);
+        let flate = "/BitsPerComponent 8 /Filter /FlateDecode";
+        assert_streams_as_decoded(&[
+            (
+                image(
+                    &format!("/ColorSpace /DeviceRGB {flate} /SMask 4 0 R"),
+                    w,
+                    h,
+                ),
+                deflate_stored(&noise((w * h * 3) as usize, 7)),
+            ),
+            (
+                image(&format!("/ColorSpace /DeviceGray {flate}"), w, h),
+                deflate_stored(&noise((w * h) as usize, 8)),
+            ),
+        ]);
     }
 
     #[test]
