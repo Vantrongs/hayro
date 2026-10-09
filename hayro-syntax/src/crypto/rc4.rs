@@ -1,6 +1,5 @@
 //! Ported from <https://github.com/mozilla/pdf.js/blob/master/src/core/crypto.js>.
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 #[derive(Clone)]
@@ -31,20 +30,21 @@ impl Rc4 {
     }
 
     pub(crate) fn decrypt(&mut self, data: &[u8]) -> Vec<u8> {
-        let n = data.len();
-        let mut output = vec![0_u8; n];
+        let mut output = data.to_vec();
+        self.decrypt_in_place(&mut output);
+        output
+    }
 
-        for i in 0..n {
+    pub(crate) fn decrypt_in_place(&mut self, data: &mut [u8]) {
+        for byte in data {
             self.a = self.a.wrapping_add(1);
             let tmp = self.s[self.a as usize];
             self.b = self.b.wrapping_add(tmp);
             let tmp2 = self.s[self.b as usize];
             self.s[self.a as usize] = tmp2;
             self.s[self.b as usize] = tmp;
-            output[i] = data[i] ^ self.s[tmp.wrapping_add(tmp2) as usize];
+            *byte ^= self.s[tmp.wrapping_add(tmp2) as usize];
         }
-
-        output
     }
 
     pub(crate) fn encrypt(&mut self, data: &[u8]) -> Vec<u8> {

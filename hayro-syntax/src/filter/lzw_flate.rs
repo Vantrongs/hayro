@@ -717,12 +717,15 @@ pub(crate) struct PredictorParams {
 }
 
 impl PredictorParams {
-    fn bits_per_pixel(&self) -> u8 {
-        self.bits_per_component * self.colors
+    fn bits_per_pixel(&self) -> usize {
+        usize::from(self.bits_per_component) * usize::from(self.colors)
     }
 
-    fn row_length_in_bytes(&self) -> usize {
-        (self.columns * self.bits_per_pixel() as usize).div_ceil(8)
+    fn row_length_in_bytes(&self) -> Option<usize> {
+        let bits = self.bits_per_pixel();
+        (self.columns / 8)
+            .checked_mul(bits)?
+            .checked_add(((self.columns % 8) * bits).div_ceil(8))
     }
 }
 
@@ -756,16 +759,16 @@ pub(crate) fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option
         i => {
             let is_png_predictor = i >= 10;
 
-            let row_len = params.row_length_in_bytes();
+            let row_len = params.row_length_in_bytes()?;
 
             let total_row_len = if is_png_predictor {
                 // + 1 Because each row must start with the predictor that is used for PNG predictors.
-                row_len + 1
+                row_len.checked_add(1)?
             } else {
                 row_len
             };
 
-            let num_rows = data.len() / total_row_len;
+            let num_rows = data.len().checked_div(total_row_len)?;
 
             if !matches!(params.bits_per_component, 1 | 2 | 4 | 8 | 16) {
                 warn!("invalid bits per component {}", params.bits_per_component);
@@ -774,10 +777,7 @@ pub(crate) fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option
             }
 
             let (bit_size, chunk_len) = if is_png_predictor {
-                (
-                    8,
-                    (params.colors * params.bits_per_component).div_ceil(8) as usize,
-                )
+                (8, params.bits_per_pixel().div_ceil(8))
             } else {
                 (params.bits_per_component, params.colors as usize)
             };
@@ -902,9 +902,9 @@ impl Unpredictor {
         {
             return None;
         }
-        let row_len = params.row_length_in_bytes();
+        let row_len = params.row_length_in_bytes()?;
         let chunk_len = if is_png_predictor {
-            (params.colors * params.bits_per_component).div_ceil(8) as usize
+            params.bits_per_pixel().div_ceil(8)
         } else if params.bits_per_component == 8 {
             params.colors as usize
         } else {
@@ -913,11 +913,12 @@ impl Unpredictor {
         if row_len == 0 {
             return None;
         }
+        row_len.checked_add(usize::from(is_png_predictor))?;
         let tbpp = BytesPerPixel::from_row_len(row_len, chunk_len)?;
         Some(Self {
             is_png_predictor,
             tbpp,
-            prev: Vec::with_capacity(row_len),
+            prev: Vec::new(),
             row_len,
         })
     }

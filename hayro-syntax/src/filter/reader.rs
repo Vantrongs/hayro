@@ -1,5 +1,6 @@
 //! Stream data decoded incrementally, in bounded memory where the filters allow it.
 
+use crate::crypto::reader::DecryptedReader;
 use crate::filter::lzw_flate::{PredictorParams, Unpredictor, flate};
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
@@ -31,55 +32,25 @@ struct Predicted {
     unpredictor: Unpredictor,
     /// The encoded row being filled.
     input: Vec<u8>,
-    filled: usize,
     /// The decoded row, and how much of it was handed out.
     row: Vec<u8>,
     taken: usize,
 }
 
 enum Source<'a> {
-    Raw {
-        data: Cow<'a, [u8]>,
-        pos: usize,
-    },
+    /// Raw bytes, or the complete result of the permissive Flate fallback.
+    Raw(DecryptedReader<'a>),
     #[cfg(feature = "unsafe")]
     Zlib(flate2::bufread::ZlibDecoder<Input<'a>>),
     #[cfg(feature = "unsafe")]
     Deflate(flate2::bufread::DeflateDecoder<Input<'a>>),
-    /// A Flate stream decoded whole by the permissive decoder.
-    Whole {
-        data: Vec<u8>,
-        pos: usize,
-    },
     /// Decoding failed.
     Failed,
 }
 
-/// Encoded bytes as a `BufRead`, owned so the decoder can keep them.
+/// The codec buffers only a small window of decrypted input.
 #[cfg(feature = "unsafe")]
-struct Input<'a> {
-    data: Cow<'a, [u8]>,
-    pos: usize,
-}
-
-#[cfg(feature = "unsafe")]
-impl std::io::Read for Input<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = copy_from(&self.data, &mut self.pos, buf);
-        Ok(n)
-    }
-}
-
-#[cfg(feature = "unsafe")]
-impl std::io::BufRead for Input<'_> {
-    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-        Ok(&self.data[self.pos..])
-    }
-
-    fn consume(&mut self, amt: usize) {
-        self.pos = (self.pos + amt).min(self.data.len());
-    }
-}
+type Input<'a> = std::io::BufReader<DecryptedReader<'a>>;
 
 fn copy_from(data: &[u8], pos: &mut usize, buf: &mut [u8]) -> usize {
     let n = buf.len().min(data.len() - *pos);
@@ -90,33 +61,32 @@ fn copy_from(data: &[u8], pos: &mut usize, buf: &mut [u8]) -> usize {
 
 impl<'a> DecodedReader<'a> {
     /// The data as stored, without filters.
-    pub(crate) fn raw(data: Cow<'a, [u8]>) -> Self {
+    pub(crate) fn raw(data: DecryptedReader<'a>) -> Self {
         Self {
-            source: Source::Raw { data, pos: 0 },
+            source: Source::Raw(data),
             predictor: None,
         }
     }
 
     /// Flate data with its predictor `params`; `None` when the predictor is one only
     /// the whole-data decoder handles.
-    pub(crate) fn flate(data: Cow<'a, [u8]>, params: &PredictorParams) -> Option<Self> {
+    pub(crate) fn flate(data: DecryptedReader<'a>, params: &PredictorParams) -> Option<Self> {
         let predictor = match params.predictor {
             1 => None,
             _ => {
                 let unpredictor = Unpredictor::new(params)?;
                 Some(Predicted {
-                    input: alloc::vec![0; unpredictor.input_len()],
+                    input: Vec::new(),
                     unpredictor,
-                    filled: 0,
                     row: Vec::new(),
                     taken: 0,
                 })
             }
         };
         #[cfg(feature = "unsafe")]
-        let source = Source::Zlib(flate2::bufread::ZlibDecoder::new(Input { data, pos: 0 }));
+        let source = Source::Zlib(flate2::bufread::ZlibDecoder::new(Input::new(data)));
         #[cfg(not(feature = "unsafe"))]
-        let source = whole(&data);
+        let source = whole(&data.into_data());
         Some(Self { source, predictor })
     }
 
@@ -124,13 +94,13 @@ impl<'a> DecodedReader<'a> {
     /// again does not repeat the restarts).
     pub fn rewind(&mut self) {
         if let Some(p) = &mut self.predictor {
-            p.filled = 0;
+            p.input.clear();
             p.row.clear();
             p.taken = 0;
             p.unpredictor.reset();
         }
         match &mut self.source {
-            Source::Raw { pos, .. } | Source::Whole { pos, .. } => *pos = 0,
+            Source::Raw(data) => data.rewind(),
             Source::Failed => {}
             #[cfg(feature = "unsafe")]
             Source::Zlib(_) => {
@@ -138,9 +108,9 @@ impl<'a> DecodedReader<'a> {
                 else {
                     unreachable!()
                 };
-                let mut input = decoder.into_inner();
-                input.pos = 0;
-                self.source = Source::Zlib(flate2::bufread::ZlibDecoder::new(input));
+                let mut input = decoder.into_inner().into_inner();
+                input.rewind();
+                self.source = Source::Zlib(flate2::bufread::ZlibDecoder::new(Input::new(input)));
             }
             #[cfg(feature = "unsafe")]
             Source::Deflate(_) => {
@@ -148,9 +118,10 @@ impl<'a> DecodedReader<'a> {
                 else {
                     unreachable!()
                 };
-                let mut input = decoder.into_inner();
-                input.pos = 0;
-                self.source = Source::Deflate(flate2::bufread::DeflateDecoder::new(input));
+                let mut input = decoder.into_inner().into_inner();
+                input.rewind();
+                self.source =
+                    Source::Deflate(flate2::bufread::DeflateDecoder::new(Input::new(input)));
             }
         }
     }
@@ -168,13 +139,17 @@ impl<'a> DecodedReader<'a> {
                 let n = copy_from(&p.row, &mut p.taken, buf);
                 return Ok(n);
             }
-            while p.filled < p.input.len() {
-                match self.source.read(&mut p.input[p.filled..]) {
+            while p.input.len() < p.unpredictor.input_len() {
+                // Only retain bytes the decoder actually produces. Metadata alone
+                // must not allocate a predictor row (see tests/streaming.rs).
+                let mut chunk = [0; 8192];
+                let remaining = (p.unpredictor.input_len() - p.input.len()).min(chunk.len());
+                match self.source.read(&mut chunk[..remaining]) {
                     // A last row cut short is dropped, as `apply_predictor` drops it.
                     Ok(0) => return Ok(0),
-                    Ok(n) => p.filled += n,
+                    Ok(n) => p.input.extend_from_slice(&chunk[..n]),
                     Err(e) => {
-                        p.filled = 0;
+                        p.input.clear();
                         p.row.clear();
                         p.taken = 0;
                         p.unpredictor.reset();
@@ -183,7 +158,7 @@ impl<'a> DecodedReader<'a> {
                 }
             }
             p.unpredictor.row(&p.input, &mut p.row);
-            p.filled = 0;
+            p.input.clear();
             p.taken = 0;
         }
     }
@@ -191,7 +166,7 @@ impl<'a> DecodedReader<'a> {
 
 fn whole(data: &[u8]) -> Source<'static> {
     match flate::fallback::decode(data) {
-        Some(data) => Source::Whole { data, pos: 0 },
+        Some(data) => Source::Raw(DecryptedReader::raw(Cow::Owned(data))),
         None => Source::Failed,
     }
 }
@@ -199,8 +174,7 @@ fn whole(data: &[u8]) -> Source<'static> {
 impl Source<'_> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
         match self {
-            Source::Raw { data, pos } => Ok(copy_from(data, pos, buf)),
-            Source::Whole { data, pos } => Ok(copy_from(data, pos, buf)),
+            Source::Raw(data) => Ok(data.read(buf)),
             Source::Failed => Err(ReadError::Failed),
             #[cfg(feature = "unsafe")]
             Source::Zlib(decoder) => {
@@ -212,9 +186,11 @@ impl Source<'_> {
                         let Source::Zlib(decoder) = core::mem::replace(self, Source::Failed) else {
                             unreachable!()
                         };
-                        let mut input = decoder.into_inner();
-                        input.pos = 0;
-                        *self = Source::Deflate(flate2::bufread::DeflateDecoder::new(input));
+                        let mut input = decoder.into_inner().into_inner();
+                        input.rewind();
+                        *self = Source::Deflate(flate2::bufread::DeflateDecoder::new(Input::new(
+                            input,
+                        )));
                         Err(ReadError::Restarted)
                     }
                 }
@@ -231,7 +207,7 @@ impl Source<'_> {
                         else {
                             unreachable!()
                         };
-                        *self = whole(&decoder.into_inner().data);
+                        *self = whole(&decoder.into_inner().into_inner().into_data());
                         Err(ReadError::Restarted)
                     }
                 }
@@ -243,6 +219,7 @@ impl Source<'_> {
 #[cfg(test)]
 mod tests {
     use super::{DecodedReader, ReadError};
+    use crate::crypto::reader::DecryptedReader;
     use crate::filter::lzw_flate::{PredictorParams, apply_predictor, flate};
     use alloc::borrow::Cow;
     use alloc::vec::Vec;
@@ -325,7 +302,8 @@ mod tests {
                 .or(whole)
         };
         for chunk in (1..10).chain([1 << 16]) {
-            let reader = DecodedReader::flate(Cow::Borrowed(encoded), p).expect("streamable");
+            let reader = DecodedReader::flate(DecryptedReader::raw(Cow::Borrowed(encoded)), p)
+                .expect("streamable");
             assert_eq!(read_all(reader, chunk), whole, "chunk {chunk}");
         }
     }
@@ -389,8 +367,11 @@ mod tests {
             params(15, 3, 8, 0),
             params(15, 5, 8, 3),
             params(11, 1, 3, 3),
+            params(15, 1, 8, usize::MAX),
+            params(15, 3, 16, usize::MAX),
+            params(2, 1, 8, 0),
         ] {
-            assert!(DecodedReader::flate(Cow::Borrowed(&[]), &p).is_none());
+            assert!(DecodedReader::flate(DecryptedReader::raw(Cow::Borrowed(&[])), &p).is_none());
         }
     }
 
@@ -430,8 +411,11 @@ mod tests {
             let end = encoded.len() - 4;
             encoded.insert(end, 0b111);
             let expected = flate::decode(&encoded, &Dict::default());
-            let reader =
-                DecodedReader::flate(Cow::Borrowed(&encoded), &params(1, 1, 8, 1)).unwrap();
+            let reader = DecodedReader::flate(
+                DecryptedReader::raw(Cow::Borrowed(&encoded)),
+                &params(1, 1, 8, 1),
+            )
+            .unwrap();
             let mut restarts = 0;
             let mut out = Vec::new();
             let mut buf = alloc::vec![0; 1000];
@@ -457,7 +441,7 @@ mod tests {
     #[test]
     fn rewinding_reads_the_data_again() {
         let data = noise(5000, 3);
-        let mut reader = DecodedReader::raw(Cow::Borrowed(&data));
+        let mut reader = DecodedReader::raw(DecryptedReader::raw(Cow::Borrowed(&data)));
         let mut buf = alloc::vec![0; 1234];
         assert_eq!(reader.read(&mut buf), Ok(1234));
         reader.rewind();
@@ -469,7 +453,9 @@ mod tests {
             deflate.drain(..2);
             deflate.truncate(deflate.len() - 4);
             let params = PredictorParams::default();
-            let mut reader = DecodedReader::flate(Cow::Borrowed(&deflate), &params).unwrap();
+            let mut reader =
+                DecodedReader::flate(DecryptedReader::raw(Cow::Borrowed(&deflate)), &params)
+                    .unwrap();
             assert_eq!(reader.read(&mut buf), Err(ReadError::Restarted));
             assert_eq!(reader.read(&mut buf), Ok(1234));
             reader.rewind();

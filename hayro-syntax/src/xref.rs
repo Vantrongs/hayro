@@ -509,6 +509,19 @@ impl XRef {
         }
     }
 
+    pub(crate) fn decrypted_reader<'a>(
+        &self,
+        id: ObjectIdentifier,
+        data: &'a [u8],
+    ) -> Option<crate::crypto::reader::DecryptedReader<'a>> {
+        match &self.0 {
+            Inner::Dummy => Some(crate::crypto::reader::DecryptedReader::raw(
+                alloc::borrow::Cow::Borrowed(data),
+            )),
+            Inner::Some(r) => r.decryptor.reader(id, data, DecryptionTarget::Stream),
+        }
+    }
+
     /// Return the object with the given identifier.
     #[allow(private_bounds)]
     pub fn get<'a, T>(&'a self, id: ObjectIdentifier) -> Option<T>

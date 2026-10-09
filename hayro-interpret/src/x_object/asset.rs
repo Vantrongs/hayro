@@ -537,7 +537,7 @@ impl<'a> MaskSource<'a> {
             &decode_arr,
             mask.kind == ImageKind::StencilMask,
         );
-        if path != MaskPath::Decoded && mask.stream.decoded_reader().is_some() {
+        if path != MaskPath::Decoded && mask.stream.can_read_incrementally() {
             return Some(Self::Streamed { obj: mask, path });
         }
         decode_mask(&mask, None).map(|m| Self::Decoded(m.luma))
@@ -609,7 +609,9 @@ struct Streamed<'a> {
 
 impl<'a> Streamed<'a> {
     fn new(obj: &ImageXObject<'a>) -> Option<Self> {
-        obj.stream.decoded_reader()?;
+        if !obj.stream.can_read_incrementally() {
+            return None;
+        }
         let SampleFormat {
             color_space,
             bits_per_component,

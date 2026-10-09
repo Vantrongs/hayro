@@ -1,8 +1,9 @@
 //! Streams.
 
 use crate::crypto::DecryptionTarget;
+use crate::crypto::reader::DecryptedReader;
 use crate::filter::Filter;
-use crate::filter::lzw_flate::PredictorParams;
+use crate::filter::lzw_flate::{PredictorParams, Unpredictor};
 pub use crate::filter::reader::{DecodedReader, ReadError};
 use crate::object;
 use crate::object::Dict;
@@ -118,27 +119,30 @@ impl<'a> Stream<'a> {
     ///
     /// Stream filters will not be applied.
     pub fn raw_data(&self) -> Cow<'a, [u8]> {
-        let ctx = self.dict.ctx();
+        match self.decryption_object_id() {
+            Some(id) => Cow::Owned(
+                self.dict
+                    .ctx()
+                    .xref()
+                    .decrypt(id, self.data, DecryptionTarget::Stream)
+                    // TODO: Maybe an error would be better?
+                    .unwrap_or_default(),
+            ),
+            None => Cow::Borrowed(self.data),
+        }
+    }
 
+    fn decryption_object_id(&self) -> Option<ObjectIdentifier> {
+        let ctx = self.dict.ctx();
         if ctx.xref().needs_decryption(ctx)
             && self
                 .dict
                 .get::<object::String<'_>>(TYPE)
-                .map(|t| t.as_ref() != b"XRef")
-                .unwrap_or(true)
+                .is_none_or(|t| t.as_ref() != b"XRef")
         {
-            match self.dict.obj_id() {
-                Some(obj_id) => Cow::Owned(
-                    ctx.xref()
-                        .decrypt(obj_id, self.data, DecryptionTarget::Stream)
-                        // TODO: MAybe an error would be better?
-                        .unwrap_or_default(),
-                ),
-                // Should not be reachable, as streams always have IDs.
-                None => Cow::Borrowed(self.data),
-            }
+            self.dict.obj_id()
         } else {
-            Cow::Borrowed(self.data)
+            None
         }
     }
 
@@ -205,11 +209,35 @@ impl<'a> Stream<'a> {
     /// [`Stream::decoded`] returns, without holding them all. `None` for other
     /// filters.
     pub fn decoded_reader(&self) -> Option<DecodedReader<'a>> {
+        let filter = self.reader_filter()?;
+        let data = match self.decryption_object_id() {
+            Some(id) => self.dict.ctx().xref().decrypted_reader(id, self.data)?,
+            None => DecryptedReader::raw(Cow::Borrowed(self.data)),
+        };
+        match filter {
+            None => Some(DecodedReader::raw(data)),
+            Some(params) => DecodedReader::flate(data, &params),
+        }
+    }
+
+    /// Whether the filters and predictor support incremental decoding, without
+    /// reading or decrypting any data or constructing a decoder. Malformed data
+    /// can still fail when [`Stream::decoded_reader`] is opened or read.
+    pub fn can_read_incrementally(&self) -> bool {
+        self.reader_filter().is_some()
+    }
+
+    // The outer None means unsupported; the inner None means no filter.
+    fn reader_filter(&self) -> Option<Option<PredictorParams>> {
         let FiltersAndParams { filters, params } = self.filters_and_params();
         match filters.as_slice() {
-            [] => Some(DecodedReader::raw(self.raw_data())),
+            [] => Some(None),
             [Filter::FlateDecode] => {
-                DecodedReader::flate(self.raw_data(), &PredictorParams::from_params(&params[0]))
+                let params = PredictorParams::from_params(&params[0]);
+                if params.predictor != 1 {
+                    Unpredictor::new(&params)?;
+                }
+                Some(Some(params))
             }
             _ => None,
         }

@@ -23,6 +23,7 @@ use core::ops::Deref;
 mod aes;
 mod md5;
 mod rc4;
+pub(crate) mod reader;
 mod sha256;
 mod sha384;
 mod sha512;
@@ -234,12 +235,12 @@ fn decrypt_rc4(key: &[u8], data: &[u8], id: ObjectIdentifier) -> Option<Vec<u8>>
 }
 
 /// Algorithm 1: Encryption of data using the RC4 or AES algorithms
-fn decrypt_rc_aes(
+fn decrypt_rc_aes<T>(
     key: &[u8],
     id: ObjectIdentifier,
     aes: bool,
-    with_key: impl FnOnce(&[u8]) -> Option<Vec<u8>>,
-) -> Option<Vec<u8>> {
+    with_key: impl FnOnce(&[u8]) -> Option<T>,
+) -> Option<T> {
     let n = key.len();
     // a) Obtain the object number and generation number from the object identifier of
     // the string or stream to be encrypted (see 7.3.10, "Indirect objects"). If the
