@@ -2227,7 +2227,7 @@ checksum = "d56377fd46368984a170bc5aac5567e52ca5da874caa60bea39fcbca78fb658b"
 [[package]]
 name = "zune-jpeg"
 version = "0.5.15"
-source = "git+https://github.com/Vantrongs/zune-image?rev=eb3ffd4e94a1223d25ce946b0d1dfa560a913f44#eb3ffd4e94a1223d25ce946b0d1dfa560a913f44"
+source = "git+https://github.com/Vantrongs/zune-image?rev=fa30dcb428ea0939c8e2af0c85d70c1b83251cf7#fa30dcb428ea0939c8e2af0c85d70c1b83251cf7"
 dependencies = [
  "zune-core",
 ]

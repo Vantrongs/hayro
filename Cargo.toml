@@ -123,4 +123,4 @@ overflow-checks = true
 
 [patch.crates-io]
 zlib-rs = { git = "https://github.com/Vantrongs/zlib-rs", rev = "ed2ce5b577cc849b069c5d97bed19de70113460d" }
-zune-jpeg = { git = "https://github.com/Vantrongs/zune-image", rev = "eb3ffd4e94a1223d25ce946b0d1dfa560a913f44" }
+zune-jpeg = { git = "https://github.com/Vantrongs/zune-image", rev = "fa30dcb428ea0939c8e2af0c85d70c1b83251cf7" }
