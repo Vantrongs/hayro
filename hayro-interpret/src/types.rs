@@ -1,5 +1,6 @@
 use crate::CacheKey;
 use crate::color::Color;
+use crate::interpret::state::ActiveTransferFunction;
 use crate::pattern::Pattern;
 use crate::util::hash128;
 use crate::x_object::ImageXObject;
@@ -104,6 +105,30 @@ impl RasterImage<'_> {
     #[doc(hidden)]
     pub fn height(&self) -> u32 {
         self.0.height()
+    }
+}
+
+impl RasterImage<'_> {
+    /// Identifies the pixels `with_rgba` decodes for a given `target_dimension`: the
+    /// image object and the transfer function in effect. `Stream`'s cache key hashes
+    /// the dictionary's bytes, which two images with the same dictionary share; the
+    /// object number does not. `None` when there is no object to identify (an inline
+    /// image) or the colour space is a name looked up in the resources where the
+    /// image is drawn.
+    pub fn pixels_key(&self) -> Option<u128> {
+        let image = &self.0;
+        let id = image.stream.dict().obj_id()?;
+        if image.cs_by_name {
+            return None;
+        }
+        // Decoding applies the transfer function through these tables
+        // (`decode_image`): a luma image the single one, an RGB one the first three.
+        let tables: SmallVec<[&[u8; 256]; 3]> = match &image.transfer_function {
+            None => SmallVec::new(),
+            Some(ActiveTransferFunction::Single(f)) => smallvec![f.samples()],
+            Some(ActiveTransferFunction::Four(f)) => f[..3].iter().map(|f| f.samples()).collect(),
+        };
+        Some(hash128(&(id, tables)))
     }
 }
 

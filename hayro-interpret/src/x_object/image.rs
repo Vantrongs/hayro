@@ -22,6 +22,9 @@ pub(crate) struct ImageXObject<'a> {
     pub(crate) stream: Stream<'a>,
     pub(crate) transfer_function: Option<ActiveTransferFunction>,
     pub(crate) warning_sink: WarningSinkFn,
+    /// Whether the colour space is a name looked up in the resources (which the spec
+    /// allows only for inline images), so it depends on where the image is drawn.
+    pub(crate) cs_by_name: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -82,6 +85,7 @@ impl<'a> ImageXObject<'a> {
             kind = ImageKind::StencilMask;
         }
 
+        let mut cs_by_name = false;
         let image_cs = if kind.is_mask() {
             // Masks are always single-channel.
             Some(ColorSpace::device_gray())
@@ -97,9 +101,9 @@ impl<'a> ImageXObject<'a> {
                 // Apparently, some PDF producers also do this for normal images,
                 // though the PDF spec forbids it. See https://github.com/LaurenzV/hayro/pull/1311.
                 .or_else(|| {
-                    cs_obj
-                        .and_then(|c| c.into_name())
-                        .and_then(|n| resolve_cs(&n))
+                    let name = cs_obj?.into_name()?;
+                    cs_by_name = true;
+                    resolve_cs(&name)
                 })
         };
 
@@ -125,6 +129,7 @@ impl<'a> ImageXObject<'a> {
             interpolate,
             stream: stream.clone(),
             kind,
+            cs_by_name,
         })
     }
 
