@@ -323,6 +323,10 @@ pub fn interpret<'a>(
                 )
                 .to_path(0.1);
                 context.path_mut().extend(rect);
+                // `re` is `x y m ... h`: the current point is the rectangle's origin.
+                let origin = Point::new(r.0.as_f64(), r.1.as_f64());
+                *(context.last_point_mut()) = origin;
+                *(context.sub_path_start_mut()) = origin;
             }
             TypedInstruction::MoveTo(m) => {
                 let p = Point::new(m.0.as_f64(), m.1.as_f64());
@@ -384,7 +388,7 @@ pub fn interpret<'a>(
                         p.x += 0.0001;
                     }
 
-                    context.path_mut().line_to(p);
+                    context.path_for_segment().line_to(p);
                 }
             }
             TypedInstruction::CubicTo(c) => {
@@ -395,7 +399,7 @@ pub fn interpret<'a>(
 
                     *(context.last_point_mut()) = p3;
 
-                    context.path_mut().curve_to(p1, p2, p3);
+                    context.path_for_segment().curve_to(p1, p2, p3);
                 }
             }
             TypedInstruction::CubicStartTo(c) => {
@@ -406,7 +410,7 @@ pub fn interpret<'a>(
 
                     *(context.last_point_mut()) = p3;
 
-                    context.path_mut().curve_to(p1, p2, p3);
+                    context.path_for_segment().curve_to(p1, p2, p3);
                 }
             }
             TypedInstruction::CubicEndTo(c) => {
@@ -416,7 +420,7 @@ pub fn interpret<'a>(
 
                     *(context.last_point_mut()) = p3;
 
-                    context.path_mut().curve_to(p2, p3, p3);
+                    context.path_for_segment().curve_to(p2, p3, p3);
                 }
             }
             TypedInstruction::ClosePath(_) => {

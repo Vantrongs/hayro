@@ -264,6 +264,16 @@ impl<'a> Context<'a> {
         &mut self.path
     }
 
+    /// The path, ready for a segment from the current point. After `h` (or `re`) PDF
+    /// continues from the start of the closed subpath; a `BezPath` subpath always
+    /// begins with a `MoveTo`, so one is added there.
+    pub(crate) fn path_for_segment(&mut self) -> &mut BezPath {
+        if self.path.elements().last() == Some(&PathEl::ClosePath) {
+            self.path.move_to(self.sub_path_start);
+        }
+        &mut self.path
+    }
+
     pub(crate) fn sub_path_start(&self) -> &Point {
         &self.sub_path_start
     }
