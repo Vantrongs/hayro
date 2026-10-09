@@ -282,6 +282,7 @@ fn text_lines(annot: &Dict<'_>, line: Line, out: &mut Out) -> Option<()> {
     }
     out.op(&stroke);
     out.stroke_state(1.0, &[])?;
+    let mut steps_left = SQUIGGLE_STEPS;
     for [x0, y0, x1, y1] in quads {
         match line {
             Line::Under => {
@@ -293,26 +294,39 @@ fn text_lines(annot: &Dict<'_>, line: Line, out: &mut Out) -> Option<()> {
                 out.nums(&[x0, y], "m")?;
                 out.nums(&[x1, y], "l")?;
             }
-            Line::Squiggle => squiggle(x0, x1, y0, out)?,
+            Line::Squiggle => {
+                let steps = squiggle(x0, x1, y0, steps_left.min(QUAD_STEPS), out)?;
+                steps_left = steps_left.saturating_sub(steps);
+            }
         }
         out.op("S");
     }
     Some(())
 }
 
+/// Zigzag steps one `Squiggly` quad has at most: a quad 2048 pt wide or wider gets
+/// longer steps.
+const QUAD_STEPS: u32 = 1024;
+
+/// Zigzag steps one `Squiggly` appearance has at most, over all its quads (a page of
+/// 50 squiggled lines of 500 pt has 12 500); later quads get a step each. The content
+/// is then at most about a megabyte plus a few lines per quad, so in proportion to
+/// `/QuadPoints`.
+const SQUIGGLE_STEPS: u32 = 1 << 16;
+
 /// The zigzag of a `Squiggly` quad from `x0` to `x1` above `y`: 2 pt high, one step per
-/// 2 pt as in `PDFium`, but at most `MAX_STEPS` steps, so a wider quad gets longer
-/// steps. Positions are computed from the step index in f64: in f32, `x += 2` stops
-/// advancing at 2^25.
-fn squiggle(x0: f32, x1: f32, y: f32, out: &mut Out) -> Option<()> {
+/// 2 pt as in `PDFium`, but at most `max_steps` steps (and at least one), so a wider
+/// quad gets longer steps; returns the steps drawn. Positions are computed from the
+/// step index in f64: in f32, `x += 2` stops advancing at 2^25.
+fn squiggle(x0: f32, x1: f32, y: f32, max_steps: u32, out: &mut Out) -> Option<u32> {
     const DELTA: f64 = 2.0;
-    const MAX_STEPS: f64 = 1024.0;
+    let max_steps = f64::from(max_steps.max(1));
     let (bottom, top) = (y, y + DELTA as f32);
     let (x0, x1) = (f64::from(x0), f64::from(x1));
     let width = x1 - x0;
     let steps = (width / DELTA).ceil().max(1.0);
-    let (steps, step) = if steps > MAX_STEPS {
-        (MAX_STEPS, width / MAX_STEPS)
+    let (steps, step) = if steps > max_steps {
+        (max_steps, width / max_steps)
     } else {
         (steps, DELTA)
     };
@@ -329,7 +343,8 @@ fn squiggle(x0: f32, x1: f32, y: f32, out: &mut Out) -> Option<()> {
     out.nums(
         &[x1 as f32, if up { bottom + rise } else { top - rise }],
         "l",
-    )
+    )?;
+    Some(full + 1)
 }
 
 /// `Ink`: each `/InkList` path stroked as a polyline in /C (default black) at the border
@@ -434,5 +449,29 @@ mod tests {
         assert_eq!(quads[0].matches(" l\n").count(), 1024);
         assert!(quads[0].ends_with(&format!("{big} 12 l\n")), "{}", quads[0]);
         assert_eq!(quads[1].matches(" l\n").count(), 20);
+    }
+
+    /// The review's case at a fiftieth of its size: 20 000 quads 2048 pt wide asked
+    /// for 1024 steps each, 20 million lines; the appearance keeps to its budget.
+    #[test]
+    fn squiggly_steps_are_bounded_per_appearance() {
+        let quads = "0 20 2048 20 0 10 2048 10 ".repeat(20_000);
+        let c = squiggly(&quads);
+        let drawn: Vec<usize> = c
+            .split("S\n")
+            .filter(|q| q.contains(" m\n"))
+            .map(|q| q.matches(" l\n").count())
+            .collect();
+        assert_eq!(drawn.len(), 20_000);
+        // The first 64 quads take the budget, 1024 steps each; each later one is a
+        // single step, still across its whole width.
+        assert!(drawn[..64].iter().all(|&n| n == 1024), "{:?}", &drawn[..65]);
+        assert!(drawn[64..].iter().all(|&n| n == 1), "{:?}", &drawn[64..66]);
+        assert!(
+            c.ends_with("0 12 m\n2048 10 l\nS\n"),
+            "{}",
+            &c[c.len() - 40..]
+        );
+        assert!(c.len() < 2 << 20, "{} bytes", c.len());
     }
 }
