@@ -54,7 +54,6 @@ yoke = { version = "0.8" }
 pdf-writer = { version = "0.15" }
 xmlwriter = { version = "0.1" }
 base64 = { version = "0.22" }
-zune-jpeg = { version = "0.5", default-features = false }
 vello_cpu = { version = "0.3", default-features = false, features = ["std", "png", "u8_pipeline"] }
 pic-scale = { version = "0.7.9", default-features = false }
 fearless_simd = "1.0.0"
@@ -124,3 +123,4 @@ overflow-checks = true
 
 [patch.crates-io]
 zlib-rs = { git = "https://github.com/Vantrongs/zlib-rs", rev = "ed2ce5b577cc849b069c5d97bed19de70113460d" }
+zune-jpeg = { git = "https://github.com/Vantrongs/zune-image", rev = "eb3ffd4e94a1223d25ce946b0d1dfa560a913f44" }

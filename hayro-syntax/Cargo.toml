@@ -33,7 +33,7 @@ flate2 = { workspace = true, optional = true, features = ["zlib-rs"] }
 zlib-rs = { git = "https://github.com/Vantrongs/zlib-rs", rev = "ed2ce5b577cc849b069c5d97bed19de70113460d", default-features = false, features = ["std"], optional = true }
 memchr = { workspace = true, optional = true }
 
-zune-jpeg = { workspace = true, optional = true }
+zune-jpeg = { git = "https://github.com/Vantrongs/zune-image", rev = "eb3ffd4e94a1223d25ce946b0d1dfa560a913f44", default-features = false, optional = true }
 hayro-ccitt = { workspace = true, optional = true }
 hayro-jbig2 = { workspace = true, optional = true }
 hayro-jpeg2000 = { workspace = true, optional = true }
