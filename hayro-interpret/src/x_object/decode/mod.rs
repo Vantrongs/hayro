@@ -13,7 +13,6 @@ use hayro_syntax::object::Array;
 use hayro_syntax::object::dict::keys::*;
 use hayro_syntax::object::stream::{FilterResult, ImageColorSpace, ImageDecodeParams};
 use smallvec::SmallVec;
-use std::iter;
 
 struct DecodeContext<'a> {
     decoded: FilterResult<'a>,
@@ -119,19 +118,11 @@ fn fix_image_length<T: Copy>(
     filler: T,
     num_components: usize,
 ) -> Option<()> {
-    let row_len = width as usize * num_components;
-
-    if (row_len * *height as usize) <= image.len() {
-        // Too much data (or just the right amount), truncate it.
-        image.truncate(row_len * *height as usize);
-    } else {
-        // Too little data, adapt the height and pad.
-        *height = image.len().div_ceil(row_len) as u32;
-
-        if !image.len().is_multiple_of(row_len) {
-            image.extend(iter::repeat_n(filler, row_len - (image.len() % row_len)));
-        }
-    }
+    let row_len = (width as usize).saturating_mul(num_components);
+    // Too much data (or just the right amount) is truncated; too little adapts the
+    // height and pads the last row.
+    *height = rows_present(image.len(), row_len, *height);
+    image.resize(row_len * *height as usize, filler);
 
     if width == 0 || *height == 0 {
         None
@@ -139,6 +130,28 @@ fn fix_image_length<T: Copy>(
         Some(())
     }
 }
+
+/// The rows of `row_len` samples, at most `height`, that `samples` decoded samples
+/// fill. A last row they fill in part counts, to be padded, unless padding it would
+/// take more than the samples present (and more than `MIN_ROW_PAD`): data cut short
+/// costs memory in proportion to what it holds, never to what the image declares.
+fn rows_present(samples: usize, row_len: usize, height: u32) -> u32 {
+    if row_len == 0 {
+        return 0;
+    }
+    let (full, part) = (samples / row_len, samples % row_len);
+    let pad = row_len - part;
+    let rows = if part > 0 && (pad <= samples || pad <= MIN_ROW_PAD) {
+        full + 1
+    } else {
+        full
+    };
+    rows.min(height as usize) as u32
+}
+
+/// A short last row is padded up to this many samples even when the data before it
+/// holds fewer.
+const MIN_ROW_PAD: usize = 1 << 16;
 
 fn decode_u8_samples(
     data: &[u8],
@@ -150,7 +163,6 @@ fn decode_u8_samples(
 ) -> Option<Vec<u8>> {
     let source_max = 2.0_f32.powi(bits_per_component as i32) - 1.0;
     let num_components = color_space.num_components() as usize;
-    let capacity = width as usize * height as usize * num_components;
     let ranges = color_space.component_ranges();
     let indexed_hival = color_space.indexed_hival();
 
@@ -174,7 +186,8 @@ fn decode_u8_samples(
 
     match bits_per_component {
         1..8 | 9..16 => {
-            let mut buf = Vec::with_capacity(capacity);
+            let height = sample_rows(data, width, height, num_components, bits_per_component);
+            let mut buf = Vec::with_capacity(width as usize * num_components * height as usize);
             for_each_sample(
                 data,
                 width,
@@ -217,11 +230,10 @@ fn unpack_samples(
     num_components: usize,
     bits_per_component: u8,
 ) -> Option<Vec<u16>> {
-    let capacity = width as usize * height as usize * num_components;
-
     match bits_per_component {
         1..8 | 9..16 => {
-            let mut buf = Vec::with_capacity(capacity);
+            let height = sample_rows(data, width, height, num_components, bits_per_component);
+            let mut buf = Vec::with_capacity(width as usize * num_components * height as usize);
             for_each_sample(
                 data,
                 width,
@@ -249,6 +261,25 @@ fn unpack_samples(
     }
 }
 
+/// The rows of packed samples, at most `height`, that `data` holds (see
+/// `rows_present`); each row starts on a byte.
+fn sample_rows(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    num_components: usize,
+    bits_per_component: u8,
+) -> u32 {
+    let row_len = (width as usize).saturating_mul(num_components);
+    let row_bytes = row_len
+        .saturating_mul(bits_per_component as usize)
+        .div_ceil(8)
+        .max(1);
+    let samples = (data.len() / row_bytes).saturating_mul(row_len)
+        + (data.len() % row_bytes * 8 / bits_per_component.max(1) as usize).min(row_len);
+    rows_present(samples, row_len, height)
+}
+
 fn for_each_sample(
     data: &[u8],
     width: u32,
@@ -263,8 +294,8 @@ fn for_each_sample(
     for _ in 0..height {
         for _ in 0..width {
             for _ in 0..num_components {
-                // See `stream_ccit_not_enough_data`, some images seemingly don't have
-                // enough data, so we just pad with zeroes in this case.
+                // Some images seemingly don't have enough data for their last row,
+                // so we just pad it with zeroes.
                 visit(reader.read(bits_per_component).unwrap_or(0), index)?;
                 index += 1;
             }

@@ -125,7 +125,12 @@ fn decode_bilevel_mask_data(ctx: &DecodeContext<'_>, should_invert: bool) -> Vec
     let full_bytes = width / 8;
     let tail_bits = width % 8;
     let lut = &**BILEVEL_MASK_LUT;
-    let mut out = Vec::with_capacity(width * height);
+    // Rows the data holds; `fix_image_length` pads a short last one.
+    let mut out = Vec::with_capacity(
+        width
+            .saturating_mul(height)
+            .min(data.len().saturating_mul(8)),
+    );
     // To avoid repeatedly calling `extend`, which turns out to be very
     // expensive.
     let mut buffer = [[0; 8]; 32];
