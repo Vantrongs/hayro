@@ -110,8 +110,8 @@ impl ImageAsset {
 
     /// Opens the image for requests. Formats read incrementally (no filter or Flate,
     /// 8-bit `DeviceGray` or `DeviceRGB` samples used as stored or inverted, and their
-    /// masks) only read their dictionaries here. Unencrypted Flate images without
-    /// predictors or lockstep masks retain a bounded decoder index on the asset;
+    /// masks) only read their dictionaries here. Streaming Flate images without
+    /// lockstep masks retain a bounded decoder index with cipher and predictor state;
     /// later requests resume from a prior checkpoint, even after reopening. Other
     /// incremental paths stream from the start. Requests keep a row and their bins.
     /// Other formats are decoded whole here (with `hint`, the size they are wanted
@@ -404,7 +404,7 @@ impl Checkpoints {
         row_bytes: usize,
         height: u32,
     ) -> Option<u32> {
-        let state_size = reader.checkpoint_size()?;
+        let state_size = reader.checkpoint_size_bound()?;
         let entry_size =
             state_size + size_of::<IndexedCheckpoint>() - size_of::<DecodedCheckpoint>();
         let count = (CHECKPOINT_BUDGET - size_of::<Mutex<Self>>()) / entry_size;
@@ -458,9 +458,21 @@ impl Checkpoints {
         if self.entries.len() == self.entries.capacity() {
             return Ok(());
         }
+        // Predictor rows and pending plaintext grow after the initial spacing probe.
+        // Admission uses the snapshot's actual dynamic size, including vector capacity.
+        let remaining = CHECKPOINT_BUDGET - self.allocation_size();
+        if reader
+            .checkpoint_size()
+            .is_none_or(|size| size - size_of::<DecodedCheckpoint>() > remaining)
+        {
+            return Ok(());
+        }
         let Some(state) = reader.checkpoint(owner).map_err(|_| Stop::Failed)? else {
             return Ok(());
         };
+        if state.allocation_size() - size_of::<DecodedCheckpoint>() > remaining {
+            return Ok(());
+        }
         self.entries.insert(at, IndexedCheckpoint { row, state });
         debug_assert!(self.allocation_size() <= CHECKPOINT_BUDGET);
         Ok(())
@@ -1512,6 +1524,102 @@ mod tests {
     }
 
     #[test]
+    fn reopened_png_prediction_preserves_partial_rows_and_skips_prefix() {
+        let (w, h, columns) = (257_u32, 4096_u32, 263_usize);
+        let mut predicted = noise(
+            (w as usize * h as usize).div_ceil(columns) * (columns + 1),
+            71,
+        );
+        for (i, row) in predicted.chunks_mut(columns + 1).enumerate() {
+            row[0] = (i % 5) as u8;
+        }
+        let pdf = pdf(&[(
+            image(
+                &format!(
+                    "/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /DecodeParms << /Predictor 15 /Columns {columns} >>"
+                ),
+                w,
+                h,
+            ),
+            zlib(&predicted),
+        )]);
+        let asset = asset(&pdf, &Cache::new());
+        let mut decoded = whole(&asset);
+        let mut cold = asset.open(None).unwrap();
+        request(&mut cold, Plane::Image, (w, h), [0, 3000, w, 3016]);
+        drop(cold);
+        let mut warm = asset.open(None).unwrap();
+        let actual = request(&mut warm, Plane::Image, (w, h), [0, 2800, w, 2816]);
+        let expected = request(&mut decoded, Plane::Image, (w, h), [0, 2800, w, 2816]);
+        assert_eq!(actual.data, expected.data);
+        assert!(
+            actual.rows_decoded < 1024,
+            "reopened reader repeated {} rows",
+            actual.rows_decoded
+        );
+        println!(
+            "predicted warm rows={} inflated={} retained={}",
+            actual.rows_decoded,
+            actual.bytes_inflated,
+            asset.checkpoint_bytes().unwrap()
+        );
+        let cancel = || {
+            assert!(asset.checkpoint_bytes().unwrap() <= CHECKPOINT_BUDGET);
+            true
+        };
+        assert_eq!(
+            warm.request(&ImageRequest {
+                plane: Plane::Image,
+                grid: (w, h),
+                window: [0, 2800, w, 2816],
+                cancel: Some(&cancel)
+            })
+            .unwrap_err(),
+            RequestError::Cancelled
+        );
+        let again = request(&mut warm, Plane::Image, (w, h), [0, 2800, w, 2816]);
+        assert_eq!(again.data, expected.data);
+        assert!(asset.checkpoint_bytes().unwrap() <= CHECKPOINT_BUDGET);
+    }
+
+    #[test]
+    fn predictor_snapshot_rows_are_charged_to_the_real_retained_budget() {
+        for columns in [131_071, 1_100_003] {
+            let (w, h) = (1024_u32, 12_000_u32);
+            let predicted = vec![0; (w as usize * h as usize).div_ceil(columns) * (columns + 1)];
+            let pdf = pdf(&[(
+                image(
+                    &format!(
+                        "/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /DecodeParms << /Predictor 15 /Columns {columns} >>"
+                    ),
+                    w,
+                    h,
+                ),
+                zlib(&predicted),
+            )]);
+            let asset = asset(&pdf, &Cache::new());
+            for pass in 0..2 {
+                let mut source = asset.open(None).unwrap();
+                let actual = request(&mut source, Plane::Image, (w, h), [0, h - 2, w, h]);
+                assert_eq!(actual.data, vec![0; (w * 2) as usize]);
+                if pass == 1 && columns < CHECKPOINT_BUDGET / 2 {
+                    assert!(
+                        actual.rows_decoded <= h / 2,
+                        "wide predictor checkpoints must span the source"
+                    );
+                }
+                assert!(asset.checkpoint_bytes().unwrap() <= CHECKPOINT_BUDGET);
+            }
+            let index = asset.0.checkpoints.lock().unwrap();
+            if columns > CHECKPOINT_BUDGET / 2 {
+                assert!(index.entries.is_empty());
+            } else {
+                assert!(index.entries.len() > 1);
+            }
+        }
+    }
+
+    #[test]
     fn checkpoint_budget_and_eviction_preserve_pixels() {
         let (w, h) = (1024_u32, 20_000_u32);
         let data = vec![71; w as usize * h as usize];
@@ -1654,6 +1762,41 @@ mod tests {
         let pdf = pdf(&[(
             image(
                 "/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode",
+                w,
+                h,
+            ),
+            encoded,
+        )]);
+        let asset = asset(&pdf, &Cache::new());
+        let mut source = asset.open(None).unwrap();
+        request(&mut source, Plane::Image, (w, h), [0, 2800, w, 2816]);
+        assert!(!asset.0.checkpoints.lock().unwrap().entries.is_empty());
+        let mut decoded = whole(&asset);
+        let expected = request(&mut decoded, Plane::Image, (w, h), [0, 4000, w, h]);
+        let actual = request(&mut source, Plane::Image, (w, h), [0, 4000, w, h]);
+        assert_eq!(
+            (actual.format, actual.data),
+            (expected.format, expected.data)
+        );
+        assert!(asset.0.checkpoints.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn a_late_predicted_restart_invalidates_the_retained_decoder_generation() {
+        let (w, h) = (257_u32, 4096_u32);
+        let columns = 263;
+        let mut data = noise(
+            (w as usize * h as usize).div_ceil(columns) * (columns + 1),
+            31,
+        );
+        for (i, row) in data.chunks_mut(columns + 1).enumerate() {
+            row[0] = (i % 5) as u8;
+        }
+        let mut encoded = zlib(&data);
+        *encoded.last_mut().unwrap() ^= 1; // Valid prefix, invalid final checksum.
+        let pdf = pdf(&[(
+            image(
+                "/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /DecodeParms << /Predictor 15 /Columns 263 >>",
                 w,
                 h,
             ),

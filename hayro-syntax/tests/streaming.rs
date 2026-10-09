@@ -296,3 +296,68 @@ fn encrypted_corrupt_flate_uses_the_same_permissive_fallback() {
     }
     assert_eq!(restarts, 2);
 }
+
+#[cfg(feature = "unsafe")]
+#[test]
+fn encrypted_prediction_checkpoint_owns_input_without_ciphertext_copy() {
+    use hayro_syntax::object::ObjectIdentifier;
+    use std::io::Write;
+    let mut predicted = vec![0_u8; 264 * 4000];
+    let mut noise = 17_u32;
+    for byte in &mut predicted {
+        noise ^= noise << 13;
+        noise ^= noise >> 17;
+        noise ^= noise << 5;
+        *byte = noise as u8;
+    }
+    for (i, row) in predicted.chunks_mut(264).enumerate() {
+        row[0] = (i % 5) as u8;
+    }
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&predicted).unwrap();
+    let encoded = encoder.finish().unwrap();
+    let (owner, checkpoint, expected) = {
+        let pdf = encrypted_pdf(
+            &encoded,
+            "/Filter /FlateDecode /DecodeParms << /Predictor 15 /Columns 263 >>",
+        );
+        let stream = pdf
+            .xref()
+            .get::<Stream<'_>>(ObjectIdentifier::new(3, 0))
+            .unwrap();
+        let expected = stream.decoded().unwrap().into_owned();
+        let owner = stream.to_owned_stream();
+        let mut reader = stream.decoded_reader().unwrap();
+        let mut prefix = vec![0; 456_789];
+        let mut offset = 0;
+        while offset < prefix.len() {
+            offset += reader.read(&mut prefix[offset..]).unwrap();
+        }
+        assert_eq!(prefix, expected[..prefix.len()]);
+        let mut checkpoint = None;
+        let largest = largest_allocation(|| {
+            checkpoint = reader.checkpoint(&owner).unwrap();
+        });
+        assert!(
+            largest < 128 * 1024,
+            "checkpoint copied {largest} bytes of input"
+        );
+        (owner, checkpoint.unwrap(), expected)
+    };
+    // The PDF and original reader have gone away; only owned handles remain.
+    for chunk in [7, 8193] {
+        let stream = owner.get().unwrap();
+        let mut reader = stream.decoded_reader().unwrap();
+        reader.restore(&checkpoint).unwrap();
+        let mut actual = Vec::new();
+        let mut buf = vec![0; chunk];
+        loop {
+            let n = reader.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            actual.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(actual, expected[456_789..]);
+    }
+}

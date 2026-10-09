@@ -1,6 +1,8 @@
 //! Stream data decoded incrementally, in bounded memory where the filters allow it.
 
 use crate::crypto::reader::DecryptedReader;
+#[cfg(feature = "unsafe")]
+use crate::crypto::reader::DecryptedState;
 use crate::filter::lzw_flate::{PredictorParams, Unpredictor, flate};
 use crate::object::stream::OwnedStream;
 use alloc::borrow::Cow;
@@ -21,7 +23,7 @@ pub enum ReadError {
 /// The decoded data of a stream, read from its start in pieces (see
 /// [`Stream::decoded_reader`](crate::object::Stream::decoded_reader)). It yields the
 /// bytes [`Stream::decoded`](crate::object::Stream::decoded) returns, but holds only
-/// the decoder's state and one predictor row, not the whole result, except where a
+/// the decoder's state and predictor row buffers, not the whole result, except where a
 /// corrupt Flate stream needs the permissive decoder, which decodes it whole.
 pub struct DecodedReader<'a> {
     source: Source<'a>,
@@ -30,6 +32,7 @@ pub struct DecodedReader<'a> {
 }
 
 /// A predictor reversed row by row on top of the source.
+#[derive(Clone)]
 struct Predicted {
     unpredictor: Unpredictor,
     /// The encoded row being filled.
@@ -39,11 +42,11 @@ struct Predicted {
     taken: usize,
 }
 
-/// An independent Flate decoder state, sharing encoded input and storing no pixels.
+/// An independent Flate decoder state, sharing encoded input.
 ///
 /// Keeps an owned handle to its immutable input, without copying its bytes, so
 /// restoring into a different stream is rejected even after the original reader
-/// is dropped. Available only for unencrypted Flate data without prediction.
+/// is dropped. Includes the cipher cursor and partial predictor rows.
 pub struct DecodedCheckpoint {
     #[cfg(feature = "unsafe")]
     _owner: OwnedStream,
@@ -53,6 +56,12 @@ pub struct DecodedCheckpoint {
     input: (usize, usize),
     #[cfg(feature = "unsafe")]
     zlib: bool,
+    #[cfg(feature = "unsafe")]
+    crypto: DecryptedState,
+    #[cfg(feature = "unsafe")]
+    pending: Vec<u8>,
+    #[cfg(feature = "unsafe")]
+    predictor: Option<Predicted>,
 }
 
 impl DecodedCheckpoint {
@@ -61,7 +70,13 @@ impl DecodedCheckpoint {
     pub fn allocation_size(&self) -> usize {
         #[cfg(feature = "unsafe")]
         {
-            size_of::<Self>() + self.decoder.allocation_size()
+            size_of::<Self>()
+                + self.decoder.allocation_size()
+                + self.pending.capacity()
+                + self
+                    .predictor
+                    .as_ref()
+                    .map_or(0, Predicted::allocation_size)
         }
         #[cfg(not(feature = "unsafe"))]
         {
@@ -72,7 +87,9 @@ impl DecodedCheckpoint {
 
 #[cfg(feature = "unsafe")]
 struct Seekable<'a> {
-    data: &'a [u8],
+    data: DecryptedReader<'a>,
+    pending: Vec<u8>,
+    taken: usize,
     decoder: zlib_rs::Inflate,
     zlib: bool,
 }
@@ -81,18 +98,21 @@ enum Source<'a> {
     /// Raw bytes, or the complete result of the permissive Flate fallback.
     Raw(DecryptedReader<'a>),
     #[cfg(feature = "unsafe")]
-    Zlib(flate2::bufread::ZlibDecoder<Input<'a>>),
-    #[cfg(feature = "unsafe")]
-    Deflate(flate2::bufread::DeflateDecoder<Input<'a>>),
-    #[cfg(feature = "unsafe")]
     Seekable(Seekable<'a>),
     /// Decoding failed.
     Failed,
 }
 
-/// The codec buffers only a small window of decrypted input.
 #[cfg(feature = "unsafe")]
-type Input<'a> = std::io::BufReader<DecryptedReader<'a>>;
+impl Predicted {
+    fn allocation_size(&self) -> usize {
+        self.input.capacity() + self.row.capacity() + self.unpredictor.allocation_size()
+    }
+
+    fn checkpoint_size(&self) -> usize {
+        self.input.len() + self.row.len() + self.unpredictor.checkpoint_size()
+    }
+}
 
 fn copy_from(data: &[u8], pos: &mut usize, buf: &mut [u8]) -> usize {
     let n = buf.len().min(data.len() - *pos);
@@ -127,14 +147,13 @@ impl<'a> DecodedReader<'a> {
             }
         };
         #[cfg(feature = "unsafe")]
-        let source = match (params.predictor, data.borrowed_plaintext()) {
-            (1, Some(bytes)) => Source::Seekable(Seekable {
-                data: bytes,
-                decoder: zlib_rs::Inflate::new(true, 15),
-                zlib: true,
-            }),
-            _ => Source::Zlib(flate2::bufread::ZlibDecoder::new(Input::new(data))),
-        };
+        let source = Source::Seekable(Seekable {
+            data,
+            pending: Vec::new(),
+            taken: 0,
+            decoder: zlib_rs::Inflate::new(true, 15),
+            zlib: true,
+        });
         #[cfg(not(feature = "unsafe"))]
         let source = whole(&data.into_data());
         Some(Self {
@@ -155,24 +174,57 @@ impl<'a> DecodedReader<'a> {
     pub fn checkpoint_size(&self) -> Option<usize> {
         #[cfg(feature = "unsafe")]
         if let Source::Seekable(source) = &self.source {
-            return Some(size_of::<DecodedCheckpoint>() + source.decoder.allocation_size());
+            source.data.borrowed_input()?;
+            return Some(
+                size_of::<DecodedCheckpoint>()
+                    + source.decoder.allocation_size()
+                    + source.pending.len()
+                    - source.taken
+                    + self
+                        .predictor
+                        .as_ref()
+                        .map_or(0, Predicted::checkpoint_size),
+            );
+        }
+        None
+    }
+
+    /// Upper bound for a later checkpoint on this stream, without allocating rows.
+    /// Used to space an index before any predictor input has arrived.
+    pub fn checkpoint_size_bound(&self) -> Option<usize> {
+        #[cfg(feature = "unsafe")]
+        if let Source::Seekable(source) = &self.source {
+            source.data.borrowed_input()?;
+            let predictor = match &self.predictor {
+                Some(p) => p.unpredictor.checkpoint_size_bound()?,
+                None => 0,
+            };
+            return (size_of::<DecodedCheckpoint>() + source.decoder.allocation_size() + 8192)
+                .checked_add(predictor);
         }
         None
     }
 
     /// Copy the current decoder state, retaining `owner` to keep its encoded input
-    /// alive. Fails if `owner` does not own this reader's input. Copies no input bytes.
+    /// alive. Fails if `owner` does not own this reader's input. The encoded input is
+    /// shared; only pending plaintext and predictor rows are copied.
     pub fn checkpoint(&self, owner: &OwnedStream) -> Result<Option<DecodedCheckpoint>, ReadError> {
         #[cfg(feature = "unsafe")]
         if let Source::Seekable(source) = &self.source {
-            if !owner.owns_data(source.data) {
+            let Some(input) = source.data.borrowed_input() else {
+                return Ok(None);
+            };
+            if !owner.owns_data(input) {
                 return Err(ReadError::Failed);
             }
             return Ok(Some(DecodedCheckpoint {
                 _owner: owner.clone(),
                 decoder: source.decoder.try_clone().map_err(|_| ReadError::Failed)?,
-                input: (source.data.as_ptr() as usize, source.data.len()),
+                input: (input.as_ptr() as usize, input.len()),
                 zlib: source.zlib,
+                crypto: source.data.checkpoint(),
+                pending: source.pending[source.taken..].to_vec(),
+                predictor: self.predictor.clone(),
             }));
         }
         #[cfg(not(feature = "unsafe"))]
@@ -185,7 +237,8 @@ impl<'a> DecodedReader<'a> {
     pub fn restore(&mut self, checkpoint: &DecodedCheckpoint) -> Result<(), ReadError> {
         #[cfg(feature = "unsafe")]
         if let Source::Seekable(source) = &mut self.source {
-            if checkpoint.input != (source.data.as_ptr() as usize, source.data.len()) {
+            let input = source.data.borrowed_input().ok_or(ReadError::Failed)?;
+            if checkpoint.input != (input.as_ptr() as usize, input.len()) {
                 return Err(ReadError::Failed);
             }
             source.decoder = checkpoint
@@ -193,6 +246,10 @@ impl<'a> DecodedReader<'a> {
                 .try_clone()
                 .map_err(|_| ReadError::Failed)?;
             source.zlib = checkpoint.zlib;
+            source.data.restore(&checkpoint.crypto);
+            source.pending = checkpoint.pending.clone();
+            source.taken = 0;
+            self.predictor = checkpoint.predictor.clone();
             return Ok(());
         }
         #[cfg(not(feature = "unsafe"))]
@@ -213,28 +270,7 @@ impl<'a> DecodedReader<'a> {
             Source::Raw(data) => data.rewind(),
             Source::Failed => {}
             #[cfg(feature = "unsafe")]
-            Source::Seekable(source) => source.decoder.reset(source.zlib),
-            #[cfg(feature = "unsafe")]
-            Source::Zlib(_) => {
-                let Source::Zlib(decoder) = core::mem::replace(&mut self.source, Source::Failed)
-                else {
-                    unreachable!()
-                };
-                let mut input = decoder.into_inner().into_inner();
-                input.rewind();
-                self.source = Source::Zlib(flate2::bufread::ZlibDecoder::new(Input::new(input)));
-            }
-            #[cfg(feature = "unsafe")]
-            Source::Deflate(_) => {
-                let Source::Deflate(decoder) = core::mem::replace(&mut self.source, Source::Failed)
-                else {
-                    unreachable!()
-                };
-                let mut input = decoder.into_inner().into_inner();
-                input.rewind();
-                self.source =
-                    Source::Deflate(flate2::bufread::DeflateDecoder::new(Input::new(input)));
-            }
+            Source::Seekable(source) => source.rewind(),
         }
     }
 
@@ -286,87 +322,65 @@ fn whole(data: &[u8]) -> Source<'static> {
     }
 }
 
+#[cfg(feature = "unsafe")]
+impl Seekable<'_> {
+    fn rewind(&mut self) {
+        self.decoder.reset(self.zlib);
+        self.data.rewind();
+        self.pending.clear();
+        self.taken = 0;
+    }
+}
+
 impl Source<'_> {
     fn read(&mut self, buf: &mut [u8], inflated: &mut u64) -> Result<usize, ReadError> {
         #[cfg(not(feature = "unsafe"))]
         let _ = inflated;
         match self {
             #[cfg(feature = "unsafe")]
-            Source::Seekable(source) => {
-                loop {
-                    let before_out = source.decoder.total_out();
-                    let before_in = source.decoder.total_in();
-                    let input = &source.data[before_in as usize..];
-                    let flush = if input.is_empty() {
-                        zlib_rs::InflateFlush::Finish
-                    } else {
-                        zlib_rs::InflateFlush::NoFlush
-                    };
-                    let result = source.decoder.decompress(input, buf, flush);
-                    let written = (source.decoder.total_out() - before_out) as usize;
-                    *inflated += written as u64;
-                    match result {
-                        Ok(zlib_rs::Status::StreamEnd) => return Ok(written),
-                        Ok(_) if written > 0 => return Ok(written),
-                        Ok(_) if source.decoder.total_in() > before_in => continue,
-                        _ => {
-                            // Same zlib -> raw -> permissive sequence as flate2's reader.
-                            if source.zlib {
-                                source.zlib = false;
-                                source.decoder.reset(false);
-                            } else {
-                                warn!("flate stream is broken, decoding with fallback");
-                                *self = whole(source.data);
-                            }
-                            return Err(ReadError::Restarted);
+            Source::Seekable(source) => loop {
+                if source.taken == source.pending.len() {
+                    source.pending.resize(8192, 0);
+                    let n = source.data.read(&mut source.pending);
+                    source.pending.truncate(n);
+                    source.taken = 0;
+                }
+                let before_out = source.decoder.total_out();
+                let before_in = source.decoder.total_in();
+                let input = &source.pending[source.taken..];
+                let flush = if input.is_empty() {
+                    zlib_rs::InflateFlush::Finish
+                } else {
+                    zlib_rs::InflateFlush::NoFlush
+                };
+                let result = source.decoder.decompress(input, buf, flush);
+                let written = (source.decoder.total_out() - before_out) as usize;
+                let consumed = (source.decoder.total_in() - before_in) as usize;
+                source.taken += consumed;
+                *inflated += written as u64;
+                match result {
+                    Ok(zlib_rs::Status::StreamEnd) => return Ok(written),
+                    Ok(_) if written > 0 => return Ok(written),
+                    Ok(_) if consumed > 0 => continue,
+                    _ => {
+                        // Same zlib -> raw -> permissive sequence as whole decoding.
+                        if source.zlib {
+                            source.zlib = false;
+                            source.rewind();
+                        } else {
+                            warn!("flate stream is broken, decoding with fallback");
+                            let Source::Seekable(source) = core::mem::replace(self, Source::Failed)
+                            else {
+                                unreachable!()
+                            };
+                            *self = whole(&source.data.into_data());
                         }
+                        return Err(ReadError::Restarted);
                     }
                 }
-            }
+            },
             Source::Raw(data) => Ok(data.read(buf)),
             Source::Failed => Err(ReadError::Failed),
-            #[cfg(feature = "unsafe")]
-            Source::Zlib(decoder) => {
-                use std::io::Read;
-                let before = decoder.total_out();
-                let result = decoder.read(buf);
-                *inflated += decoder.total_out() - before;
-                match result {
-                    Ok(n) => Ok(n),
-                    // As `flate::decode`: raw deflate next, from the start.
-                    Err(_) => {
-                        let Source::Zlib(decoder) = core::mem::replace(self, Source::Failed) else {
-                            unreachable!()
-                        };
-                        let mut input = decoder.into_inner().into_inner();
-                        input.rewind();
-                        *self = Source::Deflate(flate2::bufread::DeflateDecoder::new(Input::new(
-                            input,
-                        )));
-                        Err(ReadError::Restarted)
-                    }
-                }
-            }
-            #[cfg(feature = "unsafe")]
-            Source::Deflate(decoder) => {
-                use std::io::Read;
-                let before = decoder.total_out();
-                let result = decoder.read(buf);
-                *inflated += decoder.total_out() - before;
-                match result {
-                    Ok(n) => Ok(n),
-                    // Then the permissive decoder.
-                    Err(_) => {
-                        warn!("flate stream is broken, decoding with fallback");
-                        let Source::Deflate(decoder) = core::mem::replace(self, Source::Failed)
-                        else {
-                            unreachable!()
-                        };
-                        *self = whole(&decoder.into_inner().into_inner().into_data());
-                        Err(ReadError::Restarted)
-                    }
-                }
-            }
         }
     }
 }

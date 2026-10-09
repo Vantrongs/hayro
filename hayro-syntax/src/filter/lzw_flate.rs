@@ -883,6 +883,7 @@ pub(crate) fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option
 /// Reverses a predictor row by row, as `apply_predictor` does for the whole data at
 /// once: for the predictors and row layouts `apply_predictor_8bit_png` handles
 /// (whole bytes per pixel), the only ones it accepts.
+#[derive(Clone)]
 pub(crate) struct Unpredictor {
     is_png_predictor: bool,
     tbpp: BytesPerPixel,
@@ -942,6 +943,22 @@ impl Unpredictor {
         }
         self.prev.clear();
         self.prev.extend_from_slice(out);
+    }
+
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn allocation_size(&self) -> usize {
+        self.prev.capacity()
+    }
+
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn checkpoint_size_bound(&self) -> Option<usize> {
+        // Previous output, current output, and a possibly incomplete input row.
+        self.row_len.checked_mul(2)?.checked_add(self.input_len())
+    }
+
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn checkpoint_size(&self) -> usize {
+        self.prev.len()
     }
 
     /// Back to the first row.

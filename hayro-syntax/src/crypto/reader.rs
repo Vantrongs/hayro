@@ -9,6 +9,12 @@ use alloc::vec::Vec;
 
 pub(crate) struct DecryptedReader<'a> {
     data: Cow<'a, [u8]>,
+    state: DecryptedState,
+}
+
+/// Cipher cursor only: encoded bytes stay in the owning stream.
+#[derive(Clone)]
+pub(crate) struct DecryptedState {
     cipher: Cipher,
     pos: usize,
     block: [u8; 16],
@@ -16,6 +22,7 @@ pub(crate) struct DecryptedReader<'a> {
     end: usize,
 }
 
+#[derive(Clone)]
 enum Cipher {
     None,
     Rc4 {
@@ -66,7 +73,7 @@ impl Decryptor {
             return None;
         }
         let mut reader = DecryptedReader::raw(Cow::Borrowed(data));
-        reader.cipher = cipher;
+        reader.state.cipher = cipher;
         reader.rewind();
         Some(reader)
     }
@@ -76,25 +83,36 @@ impl<'a> DecryptedReader<'a> {
     pub(crate) fn raw(data: Cow<'a, [u8]>) -> Self {
         Self {
             data,
-            cipher: Cipher::None,
-            pos: 0,
-            block: [0; 16],
-            taken: 0,
-            end: 0,
+            state: DecryptedState {
+                cipher: Cipher::None,
+                pos: 0,
+                block: [0; 16],
+                taken: 0,
+                end: 0,
+            },
         }
     }
 
-    /// Borrowed unencrypted bytes can be indexed without copying the input.
     #[cfg(feature = "unsafe")]
-    pub(crate) fn borrowed_plaintext(&self) -> Option<&'a [u8]> {
-        match (&self.cipher, &self.data) {
-            (Cipher::None, Cow::Borrowed(data)) => Some(data),
-            _ => None,
+    pub(crate) fn borrowed_input(&self) -> Option<&'a [u8]> {
+        match &self.data {
+            Cow::Borrowed(data) => Some(data),
+            Cow::Owned(_) => None,
         }
+    }
+
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn checkpoint(&self) -> DecryptedState {
+        self.state.clone()
+    }
+
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn restore(&mut self, state: &DecryptedState) {
+        self.state = state.clone();
     }
 
     pub(crate) fn rewind(&mut self) {
-        self.pos = match &mut self.cipher {
+        self.state.pos = match &mut self.state.cipher {
             Cipher::None => 0,
             Cipher::Rc4 {
                 key,
@@ -106,61 +124,64 @@ impl<'a> DecryptedReader<'a> {
             }
             Cipher::Aes128(_) | Cipher::Aes256(_) => 16,
         };
-        self.taken = 0;
-        self.end = 0;
+        self.state.taken = 0;
+        self.state.end = 0;
     }
 
     pub(crate) fn read(&mut self, output: &mut [u8]) -> usize {
-        match &mut self.cipher {
+        match &mut self.state.cipher {
             Cipher::None | Cipher::Rc4 { .. } => {
-                let n = output.len().min(self.data.len() - self.pos);
-                output[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
-                if let Cipher::Rc4 { current, .. } = &mut self.cipher {
+                let n = output.len().min(self.data.len() - self.state.pos);
+                output[..n].copy_from_slice(&self.data[self.state.pos..self.state.pos + n]);
+                if let Cipher::Rc4 { current, .. } = &mut self.state.cipher {
                     current.decrypt_in_place(&mut output[..n]);
                 }
-                self.pos += n;
+                self.state.pos += n;
                 n
             }
             Cipher::Aes128(_) | Cipher::Aes256(_) => {
                 let mut written = 0;
                 while written < output.len() {
-                    if self.taken == self.end {
-                        if self.data.len() - self.pos < 16 {
+                    if self.state.taken == self.state.end {
+                        if self.data.len() - self.state.pos < 16 {
                             break;
                         }
-                        let ciphertext = self.data[self.pos..self.pos + 16].try_into().unwrap();
-                        self.block = match &self.cipher {
+                        let ciphertext = self.data[self.state.pos..self.state.pos + 16]
+                            .try_into()
+                            .unwrap();
+                        self.state.block = match &self.state.cipher {
                             Cipher::Aes128(cipher) => cipher.decrypt_block(ciphertext),
                             Cipher::Aes256(cipher) => cipher.decrypt_block(ciphertext),
                             _ => unreachable!(),
                         };
                         for (plain, previous) in self
+                            .state
                             .block
                             .iter_mut()
-                            .zip(&self.data[self.pos - 16..self.pos])
+                            .zip(&self.data[self.state.pos - 16..self.state.pos])
                         {
                             *plain ^= previous;
                         }
-                        self.pos += 16;
-                        self.taken = 0;
-                        self.end = 16;
+                        self.state.pos += 16;
+                        self.state.taken = 0;
+                        self.state.end = 16;
                         // Match decrypt_cbc: ignore an incomplete trailing block and
                         // remove padding only if every byte of the last block agrees.
-                        if self.data.len() - self.pos < 16 {
-                            let padding = usize::from(self.block[15]);
+                        if self.data.len() - self.state.pos < 16 {
+                            let padding = usize::from(self.state.block[15]);
                             if (1..=16).contains(&padding)
-                                && self.block[16 - padding..]
+                                && self.state.block[16 - padding..]
                                     .iter()
                                     .all(|&b| usize::from(b) == padding)
                             {
-                                self.end -= padding;
+                                self.state.end -= padding;
                             }
                         }
                     }
-                    let n = (output.len() - written).min(self.end - self.taken);
+                    let n = (output.len() - written).min(self.state.end - self.state.taken);
                     output[written..written + n]
-                        .copy_from_slice(&self.block[self.taken..self.taken + n]);
-                    self.taken += n;
+                        .copy_from_slice(&self.state.block[self.state.taken..self.state.taken + n]);
+                    self.state.taken += n;
                     written += n;
                 }
                 written
@@ -170,7 +191,7 @@ impl<'a> DecryptedReader<'a> {
 
     /// The permissive Flate fallback needs the complete decrypted input.
     pub(crate) fn into_data(mut self) -> Cow<'a, [u8]> {
-        if matches!(self.cipher, Cipher::None) {
+        if matches!(self.state.cipher, Cipher::None) {
             return self.data;
         }
         self.rewind();
@@ -184,13 +205,6 @@ impl<'a> DecryptedReader<'a> {
             data.extend_from_slice(&buf[..n]);
         }
         Cow::Owned(data)
-    }
-}
-
-#[cfg(feature = "unsafe")]
-impl std::io::Read for DecryptedReader<'_> {
-    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
-        Ok(Self::read(self, output))
     }
 }
 
@@ -258,6 +272,175 @@ mod tests {
             for len in (0..66).chain([8193]) {
                 let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
                 check(&decryptor, &bytes);
+            }
+        }
+    }
+
+    #[cfg(feature = "unsafe")]
+    fn encrypt(decryptor: &Decryptor, plain: &[u8]) -> Vec<u8> {
+        let reader = decryptor
+            .reader(
+                ObjectIdentifier::new(1234, 17),
+                &[9; 16],
+                DecryptionTarget::Stream,
+            )
+            .unwrap();
+        let mut encrypted = alloc::vec![9; 16];
+        match reader.state.cipher {
+            Cipher::None => return plain.to_vec(),
+            Cipher::Rc4 { mut current, .. } => return current.encrypt(plain),
+            Cipher::Aes128(cipher) => encrypted.extend(cipher.encrypt_cbc(plain, &[9; 16])),
+            Cipher::Aes256(cipher) => encrypted.extend(cipher.encrypt_cbc(plain, &[9; 16])),
+        }
+        encrypted
+    }
+
+    #[cfg(feature = "unsafe")]
+    #[test]
+    fn cipher_checkpoints_preserve_partial_blocks_and_final_padding() {
+        for tag in [
+            DecryptorTag::Rc4,
+            DecryptorTag::Aes128,
+            DecryptorTag::Aes256,
+        ] {
+            let decryptor = decryptor(tag);
+            let plain: Vec<u8> = (0..73).collect();
+            let encrypted = encrypt(&decryptor, &plain);
+            let open = || {
+                decryptor
+                    .reader(
+                        ObjectIdentifier::new(1234, 17),
+                        &encrypted,
+                        DecryptionTarget::Stream,
+                    )
+                    .unwrap()
+            };
+            for offset in [1, 7, 15, 17, 70, 73] {
+                let mut reader = open();
+                let mut prefix = alloc::vec![0; offset];
+                assert_eq!(reader.read(&mut prefix), offset);
+                let state = reader.checkpoint();
+                if matches!(tag, DecryptorTag::Aes128 | DecryptorTag::Aes256) && offset < 70 {
+                    assert!(state.taken > 0 && state.taken < state.end);
+                }
+                drop(reader);
+                for _ in 0..2 {
+                    let mut reopened = open();
+                    reopened.restore(&state);
+                    let mut actual = Vec::new();
+                    let mut buf = [0; 7];
+                    loop {
+                        let n = reopened.read(&mut buf);
+                        if n == 0 {
+                            break;
+                        }
+                        actual.extend_from_slice(&buf[..n]);
+                    }
+                    assert_eq!(actual, plain[offset..]);
+                    reopened.rewind();
+                    let mut all = [0; 73];
+                    assert_eq!(reopened.read(&mut all), 73);
+                    assert_eq!(all.as_slice(), plain);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "unsafe")]
+    #[test]
+    fn encrypted_flate_checkpoints_resume_predictors_and_cipher_state() {
+        use crate::filter::lzw_flate::{PredictorParams, apply_predictor};
+        use crate::filter::reader::{DecodedReader, ReadError};
+        use crate::object::Stream;
+        use crate::reader::{Reader, ReaderExt};
+        use std::io::Write;
+        for tag in [
+            DecryptorTag::Rc4,
+            DecryptorTag::Aes128,
+            DecryptorTag::Aes256,
+        ] {
+            for predictor in [1, 2, 10, 11, 12, 13, 14, 15] {
+                let params = PredictorParams {
+                    predictor,
+                    columns: 263,
+                    ..PredictorParams::default()
+                };
+                let mut plain: Vec<u8> = (0..264 * 200).map(|i| (i % 251) as u8).collect();
+                if predictor >= 10 {
+                    for (i, row) in plain.chunks_mut(264).enumerate() {
+                        row[0] = (i % 5) as u8;
+                    }
+                }
+                let expected = apply_predictor(plain.clone(), &params).unwrap();
+                let mut encoder =
+                    flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(&plain).unwrap();
+                let zlib = encoder.finish().unwrap();
+                let decryptor = decryptor(tag);
+                for raw in [false, true] {
+                    let encoded = if raw { &zlib[2..zlib.len() - 4] } else { &zlib };
+                    let encrypted = encrypt(&decryptor, encoded);
+                    let dict = Reader::new(b"/Filter /FlateDecode ID")
+                        .read_without_context::<crate::object::dict::InlineImageDict<'_>>()
+                        .unwrap();
+                    let owner = Stream::new(&encrypted, dict.get_dict().clone()).to_owned_stream();
+                    let stream = owner.get().unwrap();
+                    let Cow::Borrowed(input) = stream.raw_data() else {
+                        panic!("borrowed")
+                    };
+                    let open = || {
+                        DecodedReader::flate(
+                            decryptor
+                                .reader(
+                                    ObjectIdentifier::new(1234, 17),
+                                    input,
+                                    DecryptionTarget::Stream,
+                                )
+                                .unwrap(),
+                            &params,
+                        )
+                        .unwrap()
+                    };
+                    let mut reader = open();
+                    let mut prefix = alloc::vec![0; 12_345];
+                    if raw {
+                        assert_eq!(reader.read(&mut prefix), Err(ReadError::Restarted));
+                    }
+                    let mut offset = 0;
+                    while offset < prefix.len() {
+                        offset += reader.read(&mut prefix[offset..]).unwrap();
+                    }
+                    assert_eq!(prefix, expected[..prefix.len()]);
+                    let checkpoint = reader
+                        .checkpoint(&owner)
+                        .unwrap()
+                        .expect("encrypted Flate checkpoint");
+                    assert_eq!(Some(checkpoint.allocation_size()), reader.checkpoint_size());
+                    assert!(
+                        checkpoint.allocation_size() <= reader.checkpoint_size_bound().unwrap()
+                    );
+                    drop(reader);
+                    for chunk in [1, 397, 8193] {
+                        let mut reopened = open();
+                        reopened.restore(&checkpoint).unwrap();
+                        assert_eq!(reopened.inflated_bytes(), 0);
+                        for rewind in [false, true] {
+                            if rewind {
+                                reopened.rewind();
+                            }
+                            let mut actual = Vec::new();
+                            let mut buf = alloc::vec![0; chunk];
+                            loop {
+                                let n = reopened.read(&mut buf).unwrap();
+                                if n == 0 {
+                                    break;
+                                }
+                                actual.extend_from_slice(&buf[..n]);
+                            }
+                            assert_eq!(actual, expected[if rewind { 0 } else { prefix.len() }..]);
+                        }
+                    }
+                }
             }
         }
     }
