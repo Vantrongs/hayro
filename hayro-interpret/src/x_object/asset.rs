@@ -15,10 +15,10 @@ use crate::interpret::state::ActiveTransferFunction;
 use crate::{ImageData, LumaData};
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::*;
-use hayro_syntax::object::stream::{DecodedReader, OwnedStream, ReadError};
+use hayro_syntax::object::stream::{DecodedCheckpoint, DecodedReader, OwnedStream, ReadError};
 use kurbo::Affine;
 use smallvec::SmallVec;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// A raster image's source, owned: its stream (by object identifier, or a copy of an
 /// inline image's bytes), resolved colour space, transfer function, interpolation
@@ -29,6 +29,7 @@ pub struct ImageAsset(Arc<AssetData>);
 
 struct AssetData {
     stream: OwnedStream,
+    checkpoints: Mutex<Checkpoints>,
     width: u32,
     height: u32,
     color_space: Option<ColorSpace>,
@@ -44,6 +45,7 @@ impl ImageXObject<'_> {
     pub(crate) fn asset(&self, key: Option<u128>) -> ImageAsset {
         ImageAsset(Arc::new(AssetData {
             stream: self.stream.to_owned_stream(),
+            checkpoints: Mutex::new(Checkpoints::default()),
             width: self.width,
             height: self.height,
             color_space: self.color_space.clone(),
@@ -79,6 +81,17 @@ impl ImageAsset {
         self.0.key
     }
 
+    /// Bytes retained by this asset's shared decoder index, including Rust values
+    /// and state allocations, excluding allocator bookkeeping and shared input.
+    pub fn checkpoint_bytes(&self) -> Result<usize, RequestError> {
+        Ok(self
+            .0
+            .checkpoints
+            .lock()
+            .map_err(|_| RequestError::Failed)?
+            .allocation_size())
+    }
+
     fn xobject(&self) -> Option<ImageXObject<'_>> {
         let a = &*self.0;
         Some(ImageXObject {
@@ -97,14 +110,16 @@ impl ImageAsset {
 
     /// Opens the image for requests. Formats read incrementally (no filter or Flate,
     /// 8-bit `DeviceGray` or `DeviceRGB` samples used as stored or inverted, and their
-    /// masks) only read their dictionaries here, and each request streams the data
-    /// from its start, holding the decoder's state, a row and the requested bins.
+    /// masks) only read their dictionaries here. Unencrypted Flate images without
+    /// predictors or lockstep masks retain a bounded decoder index on the asset;
+    /// later requests resume from a prior checkpoint, even after reopening. Other
+    /// incremental paths stream from the start. Requests keep a row and their bins.
     /// Other formats are decoded whole here (with `hint`, the size they are wanted
     /// at, for decoders that can reduce), and requests read the decoded planes, which
     /// the source holds until it is dropped. `None` when the image cannot be decoded.
     pub fn open(&self, hint: Option<(u32, u32)>) -> Option<ImageSource<'_>> {
         let obj = self.xobject()?;
-        if let Some(streamed) = Streamed::new(&obj) {
+        if let Some(streamed) = Streamed::new(&obj, &self.0.stream, &self.0.checkpoints) {
             return Some(ImageSource {
                 layout: streamed.layout(),
                 inner: Inner::Streamed(Box::new(streamed)),
@@ -236,6 +251,10 @@ pub struct ImageRegion {
     pub to_image: Affine,
     /// The source rows the request decoded, including those it skipped through.
     pub rows_decoded: u32,
+    /// Bytes produced by incremental Flate decoders during this request (zero for
+    /// other codecs). Includes work discarded on restart; excludes checkpoint-skipped
+    /// bytes and the whole-image permissive fallback's work on corrupt streams.
+    pub bytes_inflated: u64,
 }
 
 /// Why a request returned no bins.
@@ -271,6 +290,19 @@ impl ImageSource<'_> {
         matches!(self.inner, Inner::Streamed(_))
     }
 
+    /// Bytes retained by this asset's decoder index, including entries and state
+    /// allocations, excluding allocator bookkeeping. Shared by reopened sources.
+    pub fn checkpoint_bytes(&self) -> Result<usize, RequestError> {
+        match &self.inner {
+            Inner::Streamed(s) => Ok(s
+                .checkpoints
+                .lock()
+                .map_err(|_| RequestError::Failed)?
+                .allocation_size()),
+            Inner::Decoded(_) => Ok(0),
+        }
+    }
+
     /// The bins `request` asks for.
     pub fn request(&mut self, request: &ImageRequest<'_>) -> Result<ImageRegion, RequestError> {
         let plane = *self
@@ -293,9 +325,11 @@ impl ImageSource<'_> {
             w,
             plane.format.channels(),
         );
-        let rows_decoded = match &mut self.inner {
+        let (rows_decoded, bytes_inflated) = match &mut self.inner {
             Inner::Streamed(s) => s.run(request.plane, &mut area, request.cancel),
-            Inner::Decoded(d) => d.run(request.plane, &mut area, request.cancel),
+            Inner::Decoded(d) => d
+                .run(request.plane, &mut area, request.cancel)
+                .map(|rows| (rows, 0)),
         }?;
         let (data, coverage) = area.finish();
         let (format, data) = match coverage {
@@ -325,6 +359,7 @@ impl ImageSource<'_> {
             grid,
             to_image,
             rows_decoded,
+            bytes_inflated,
         })
     }
 }
@@ -334,6 +369,102 @@ const CANCEL_ROWS: u32 = 64;
 
 fn cancelled(cancel: Option<&dyn Fn() -> bool>, row: u32) -> bool {
     row.is_multiple_of(CANCEL_ROWS) && cancel.is_some_and(|c| c())
+}
+
+/// One asset's index has a fixed residency ceiling. Checkpoint spacing grows with
+/// the declared height so the index covers the source rather than only its tail.
+const CHECKPOINT_BUDGET: usize = 2 * 1024 * 1024;
+const MIN_CHECKPOINT_BYTES: usize = 256 * 1024;
+
+struct IndexedCheckpoint {
+    row: u32,
+    state: DecodedCheckpoint,
+}
+
+#[derive(Default)]
+struct Checkpoints {
+    generation: u64,
+    entries: Vec<IndexedCheckpoint>,
+}
+
+impl Checkpoints {
+    fn allocation_size(&self) -> usize {
+        size_of::<Mutex<Self>>()
+            + self.entries.capacity() * size_of::<IndexedCheckpoint>()
+            + self
+                .entries
+                .iter()
+                .map(|e| e.state.allocation_size() - size_of::<DecodedCheckpoint>())
+                .sum::<usize>()
+    }
+
+    fn interval(
+        &mut self,
+        reader: &DecodedReader<'_>,
+        row_bytes: usize,
+        height: u32,
+    ) -> Option<u32> {
+        let state_size = reader.checkpoint_size()?;
+        let entry_size =
+            state_size + size_of::<IndexedCheckpoint>() - size_of::<DecodedCheckpoint>();
+        let count = (CHECKPOINT_BUDGET - size_of::<Mutex<Self>>()) / entry_size;
+        if count == 0 {
+            return None;
+        }
+        let interval = height
+            .div_ceil(count as u32)
+            .max(MIN_CHECKPOINT_BYTES.div_ceil(row_bytes.max(1)) as u32)
+            .max(1);
+        let slots = (height / interval) as usize;
+        if slots == 0 {
+            return None;
+        }
+        if self.entries.capacity() == 0 {
+            self.entries.reserve_exact(slots);
+        }
+        Some(interval)
+    }
+
+    fn invalidate(&mut self) {
+        self.entries.clear();
+        self.generation += 1;
+    }
+
+    fn restore(&self, raw: &mut RawRows<'_>, before: u32) -> Result<u32, Stop> {
+        let Some(entry) = self.entries.iter().rev().find(|e| e.row <= before) else {
+            return Ok(0);
+        };
+        raw.reader.restore(&entry.state).map_err(|_| Stop::Failed)?;
+        raw.total = entry.row as usize * raw.row.len();
+        Ok(entry.row)
+    }
+
+    fn save(
+        &mut self,
+        row: u32,
+        reader: &DecodedReader<'_>,
+        owner: &OwnedStream,
+        generation: u64,
+    ) -> Result<(), Stop> {
+        // A concurrent reader may already have rejected this decoder generation.
+        if generation != self.generation {
+            return Ok(());
+        }
+        let at = match self.entries.binary_search_by_key(&row, |e| e.row) {
+            Ok(_) => return Ok(()),
+            Err(at) => at,
+        };
+        // A full index may repeat work, but it must never lower image detail.
+        if self.entries.len() == self.entries.capacity() {
+            return Ok(());
+        }
+        let Some(state) = reader.checkpoint(owner).map_err(|_| Stop::Failed)? else {
+            return Ok(());
+        };
+        self.entries.insert(at, IndexedCheckpoint { row, state });
+        debug_assert!(self.allocation_size() <= CHECKPOINT_BUDGET);
+        Ok(())
+    }
 }
 
 /// Rows of an image's or mask's stored samples, read incrementally.
@@ -597,6 +728,8 @@ enum Alpha<'a> {
 
 /// An image read incrementally.
 struct Streamed<'a> {
+    owner: &'a OwnedStream,
+    checkpoints: &'a Mutex<Checkpoints>,
     obj: ImageXObject<'a>,
     color_space: ColorSpace,
     /// Components per stored sample.
@@ -608,7 +741,11 @@ struct Streamed<'a> {
 }
 
 impl<'a> Streamed<'a> {
-    fn new(obj: &ImageXObject<'a>) -> Option<Self> {
+    fn new(
+        obj: &ImageXObject<'a>,
+        owner: &'a OwnedStream,
+        checkpoints: &'a Mutex<Checkpoints>,
+    ) -> Option<Self> {
         if !obj.stream.can_read_incrementally() {
             return None;
         }
@@ -673,6 +810,8 @@ impl<'a> Streamed<'a> {
 
         Some(Self {
             obj: obj.clone(),
+            owner,
+            checkpoints,
             color_space,
             components,
             invert,
@@ -735,7 +874,7 @@ impl<'a> Streamed<'a> {
         plane: Plane,
         area: &mut Area,
         cancel: Option<&dyn Fn() -> bool>,
-    ) -> Result<u32, RequestError> {
+    ) -> Result<(u32, u64), RequestError> {
         let result = match plane {
             Plane::Image => self.run_image(area, cancel),
             Plane::Mask => self.run_mask(area, cancel),
@@ -762,12 +901,17 @@ impl<'a> Streamed<'a> {
         })
     }
 
-    fn run_image(&self, area: &mut Area, cancel: Option<&dyn Fn() -> bool>) -> Result<u32, Stop> {
+    fn run_image(
+        &self,
+        area: &mut Area,
+        cancel: Option<&dyn Fn() -> bool>,
+    ) -> Result<(u32, u64), Stop> {
         let (w, h) = (self.obj.width as usize, self.obj.height);
         let n = self.components;
         let row_len = w * n;
         let mut raw = RawRows::new(&self.obj.stream, row_len).ok_or(Stop::Failed)?;
         let mut mask = self.lockstep_mask()?;
+        let indexed = mask.is_none() && raw.reader.checkpoint_size().is_some();
         let (rows, cols) = (area.rows(), area.columns());
         let (c0, c1) = (cols.start as usize, cols.end as usize);
         let mut alpha_row = vec![0; if mask.is_some() { w } else { 0 }];
@@ -785,14 +929,28 @@ impl<'a> Streamed<'a> {
         let mut work = Vec::with_capacity((c1 - c0) * 4);
         let mut key_alpha = Vec::new();
         let mut decoded = 0;
+        let (interval, mut generation, mut start) = if indexed {
+            let mut index = self.checkpoints.lock().map_err(|_| Stop::Failed)?;
+            let interval = index.interval(&raw.reader, row_len, h);
+            let start = index.restore(&mut raw, rows.start)?;
+            (interval, index.generation, start)
+        } else {
+            (None, 0, 0)
+        };
         'pass: loop {
-            for y in 0..rows.end.min(h) {
-                if cancelled(cancel, y) {
+            let first = std::mem::take(&mut start);
+            for y in first..rows.end.min(h) {
+                if cancelled(cancel, y - first) {
                     return Err(Stop::Cancelled);
                 }
                 let last = match raw.next() {
                     Err(ReadError::Restarted) => {
                         area.reset();
+                        if indexed {
+                            let mut index = self.checkpoints.lock().map_err(|_| Stop::Failed)?;
+                            index.invalidate();
+                            generation = index.generation;
+                        }
                         if let Some(m) = &mut mask {
                             m.rows.rewind(true);
                         }
@@ -810,6 +968,14 @@ impl<'a> Streamed<'a> {
                     }
                 };
                 decoded += 1;
+                if !last && interval.is_some_and(|step| (y + 1).is_multiple_of(step)) {
+                    self.checkpoints.lock().map_err(|_| Stop::Failed)?.save(
+                        y + 1,
+                        &raw.reader,
+                        self.owner,
+                        generation,
+                    )?;
+                }
                 let mask_present = match &mut mask {
                     Some(m) => match m.rows.next(&mut alpha_row) {
                         Err(ReadError::Restarted) => {
@@ -890,11 +1056,22 @@ impl<'a> Streamed<'a> {
                     break;
                 }
             }
-            return Ok(decoded);
+            let mask_inflated = match &mask {
+                Some(Lockstep {
+                    rows: MaskRows::Streamed { raw, .. },
+                    ..
+                }) => raw.reader.inflated_bytes(),
+                _ => 0,
+            };
+            return Ok((decoded, raw.reader.inflated_bytes() + mask_inflated));
         }
     }
 
-    fn run_mask(&self, area: &mut Area, cancel: Option<&dyn Fn() -> bool>) -> Result<u32, Stop> {
+    fn run_mask(
+        &self,
+        area: &mut Area,
+        cancel: Option<&dyn Fn() -> bool>,
+    ) -> Result<(u32, u64), Stop> {
         let Alpha::Mask { mask, .. } = &self.alpha else {
             return Err(Stop::Failed);
         };
@@ -923,7 +1100,11 @@ impl<'a> Streamed<'a> {
                     area.push(&alpha[cols.start as usize..cols.end as usize]);
                 }
             }
-            return Ok(decoded);
+            let inflated = match &rows {
+                MaskRows::Streamed { raw, .. } => raw.reader.inflated_bytes(),
+                _ => 0,
+            };
+            return Ok((decoded, inflated));
         }
     }
 }
@@ -1264,6 +1445,232 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn reopened_flate_image_seeks_to_retained_decoder_state() {
+        let (w, h) = (257_u32, 4096_u32);
+        let data = noise(w as usize * h as usize, 71);
+        let pdf = pdf(&[(
+            image(
+                "/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode",
+                w,
+                h,
+            ),
+            zlib(&data),
+        )]);
+        let asset = asset(&pdf, &Cache::new());
+        let start = std::time::Instant::now();
+        let mut cold = asset.open(None).unwrap();
+        let a = request(&mut cold, Plane::Image, (w, h), [0, 3000, w, 3016]);
+        let cold_time = start.elapsed();
+        assert_eq!(a.data, data[3000 * w as usize..3016 * w as usize]);
+        assert_eq!(a.bytes_inflated, u64::from(3016 * w));
+        drop(cold);
+        let start = std::time::Instant::now();
+        let mut warm = asset.open(None).unwrap();
+        let b = request(&mut warm, Plane::Image, (w, h), [0, 2800, w, 2816]);
+        assert_eq!(b.data, data[2800 * w as usize..2816 * w as usize]);
+        let warm_time = start.elapsed();
+        assert!(
+            b.rows_decoded < 1024,
+            "warm request repeated {} rows",
+            b.rows_decoded
+        );
+        assert_eq!(b.bytes_inflated, u64::from(b.rows_decoded * w));
+        assert!(b.bytes_inflated < (MIN_CHECKPOINT_BYTES + 16 * w as usize) as u64);
+        assert!(warm.checkpoint_bytes().unwrap() <= CHECKPOINT_BUDGET);
+        println!(
+            "reopened cold={cold_time:?} rows={} inflated={} warm={warm_time:?} rows={} inflated={} checkpoint_bytes={}",
+            a.rows_decoded,
+            a.bytes_inflated,
+            b.rows_decoded,
+            b.bytes_inflated,
+            warm.checkpoint_bytes().unwrap()
+        );
+        let mut decoded = whole(&asset);
+        for (grid, window) in [
+            ((w, h), [3, 3077, 200, 3091]),
+            ((31, 511), [1, 222, 27, 233]),
+            ((w, h), [0, 21, w, 41]),
+        ] {
+            let actual = request(&mut warm, Plane::Image, grid, window);
+            let expected = request(&mut decoded, Plane::Image, grid, window);
+            assert_eq!(
+                (actual.format, actual.data),
+                (expected.format, expected.data)
+            );
+        }
+        drop(warm);
+        drop(decoded);
+        let weak = Arc::downgrade(&asset.0);
+        drop(asset);
+        assert!(
+            weak.upgrade().is_none(),
+            "checkpoint ownership must not retain the image asset"
+        );
+    }
+
+    #[test]
+    fn checkpoint_budget_and_eviction_preserve_pixels() {
+        let (w, h) = (1024_u32, 20_000_u32);
+        let data = vec![71; w as usize * h as usize];
+        let pdf = pdf(&[(
+            image(
+                "/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode",
+                w,
+                h,
+            ),
+            zlib(&data),
+        )]);
+        let asset = asset(&pdf, &Cache::new());
+        let mut source = asset.open(None).unwrap();
+        let first = request(&mut source, Plane::Image, (w, h), [0, h - 2, w, h]);
+        assert_eq!(first.data, vec![71; w as usize * 2]);
+        assert!(source.checkpoint_bytes().unwrap() <= CHECKPOINT_BUDGET);
+        assert!(asset.0.checkpoints.lock().unwrap().entries.len() > 2);
+        let warm = request(&mut source, Plane::Image, (w, h), [0, h - 9, w, h - 7]);
+        asset.0.checkpoints.lock().unwrap().entries.clear();
+        let evicted = request(&mut source, Plane::Image, (w, h), [0, h - 9, w, h - 7]);
+        assert_eq!(warm.data, evicted.data);
+        assert!(warm.bytes_inflated < evicted.bytes_inflated);
+        assert!(source.checkpoint_bytes().unwrap() <= CHECKPOINT_BUDGET);
+    }
+
+    #[test]
+    fn concurrent_views_and_cancel_callbacks_do_not_hold_the_index_lock() {
+        let (w, h) = (257_u32, 4096_u32);
+        let data = noise(w as usize * h as usize, 71);
+        let pdf = pdf(&[(
+            image(
+                "/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode",
+                w,
+                h,
+            ),
+            zlib(&data),
+        )]);
+        let asset = asset(&pdf, &Cache::new());
+        let mut source = asset.open(None).unwrap();
+        request(&mut source, Plane::Image, (w, h), [0, 3000, w, 3016]);
+        // Checkpoint rows are not aligned to the cancellation polling cadence.
+        let row = asset.0.checkpoints.lock().unwrap().entries[0].row;
+        let cancel = || {
+            assert!(asset.checkpoint_bytes().unwrap() <= CHECKPOINT_BUDGET);
+            true
+        };
+        assert_eq!(
+            source
+                .request(&ImageRequest {
+                    plane: Plane::Image,
+                    grid: (w, h),
+                    window: [0, row, w, row + 1],
+                    cancel: Some(&cancel)
+                })
+                .unwrap_err(),
+            RequestError::Cancelled
+        );
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                let mut source = asset.open(None).unwrap();
+                request(&mut source, Plane::Image, (w, h), [0, 2800, w, 2816]).data
+            });
+            let b = scope.spawn(|| {
+                let mut source = asset.open(None).unwrap();
+                request(&mut source, Plane::Image, (w, h), [0, 3100, w, 3116]).data
+            });
+            assert_eq!(
+                a.join().unwrap(),
+                data[2800 * w as usize..2816 * w as usize]
+            );
+            assert_eq!(
+                b.join().unwrap(),
+                data[3100 * w as usize..3116 * w as usize]
+            );
+        });
+    }
+
+    #[test]
+    fn a_reader_from_a_rejected_generation_cannot_repopulate_the_index() {
+        let (w, h) = (257_u32, 4096_u32);
+        let data = noise(w as usize * h as usize, 71);
+        let pdf = pdf(&[(
+            image(
+                "/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode",
+                w,
+                h,
+            ),
+            zlib(&data),
+        )]);
+        let asset = asset(&pdf, &Cache::new());
+        let mut raw = RawRows::new(&asset.xobject().unwrap().stream, w as usize).unwrap();
+        let mut index = asset.0.checkpoints.lock().unwrap();
+        let interval = index.interval(&raw.reader, w as usize, h).unwrap();
+        let generation = index.generation;
+        for _ in 0..interval {
+            assert!(matches!(raw.next().unwrap(), RawRow::Full));
+        }
+        assert!(
+            index
+                .save(interval, &raw.reader, &asset.0.stream, generation)
+                .is_ok()
+        );
+        index.invalidate();
+        assert!(
+            index
+                .save(interval, &raw.reader, &asset.0.stream, generation)
+                .is_ok()
+        );
+        assert!(index.entries.is_empty());
+    }
+
+    #[test]
+    fn raw_flate_checkpoints_reopen_in_the_selected_mode() {
+        let (w, h) = (257_u32, 4096_u32);
+        let data = noise(w as usize * h as usize, 71);
+        let pdf = pdf(&[(
+            image(
+                "/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode",
+                w,
+                h,
+            ),
+            deflate_stored(&data),
+        )]);
+        let asset = asset(&pdf, &Cache::new());
+        let mut source = asset.open(None).unwrap();
+        request(&mut source, Plane::Image, (w, h), [0, 3000, w, 3016]);
+        drop(source);
+        let mut source = asset.open(None).unwrap();
+        let warm = request(&mut source, Plane::Image, (w, h), [0, 2800, w, 2816]);
+        assert_eq!(warm.data, data[2800 * w as usize..2816 * w as usize]);
+        assert!(warm.bytes_inflated < (MIN_CHECKPOINT_BYTES + 16 * w as usize) as u64);
+    }
+
+    #[test]
+    fn a_late_restart_invalidates_the_retained_decoder_generation() {
+        let (w, h) = (257_u32, 4096_u32);
+        let data = noise(w as usize * h as usize, 31);
+        let mut encoded = zlib(&data);
+        *encoded.last_mut().unwrap() ^= 1; // Valid prefix, invalid final checksum.
+        let pdf = pdf(&[(
+            image(
+                "/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode",
+                w,
+                h,
+            ),
+            encoded,
+        )]);
+        let asset = asset(&pdf, &Cache::new());
+        let mut source = asset.open(None).unwrap();
+        request(&mut source, Plane::Image, (w, h), [0, 2800, w, 2816]);
+        assert!(!asset.0.checkpoints.lock().unwrap().entries.is_empty());
+        let mut decoded = whole(&asset);
+        let expected = request(&mut decoded, Plane::Image, (w, h), [0, 4000, w, h]);
+        let actual = request(&mut source, Plane::Image, (w, h), [0, 4000, w, h]);
+        assert_eq!(
+            (actual.format, actual.data),
+            (expected.format, expected.data)
+        );
+        assert!(asset.0.checkpoints.lock().unwrap().entries.is_empty());
     }
 
     #[test]

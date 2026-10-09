@@ -821,6 +821,7 @@ dependencies = [
  "rustc-hash",
  "sha2",
  "smallvec",
+ "zlib-rs",
  "zune-jpeg",
 ]
 
@@ -2208,9 +2209,8 @@ dependencies = [
 
 [[package]]
 name = "zlib-rs"
-version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3be3d40e40a133f9c916ee3f9f4fa2d9d63435b5fbe1bfc6d9dae0aa0ada1513"
+version = "0.6.8"
+source = "git+https://github.com/Vantrongs/zlib-rs?rev=ed2ce5b577cc849b069c5d97bed19de70113460d#ed2ce5b577cc849b069c5d97bed19de70113460d"
 
 [[package]]
 name = "zmij"

@@ -121,3 +121,6 @@ strip = "none"
 inherits = "release"
 debug = 1
 overflow-checks = true
+
+[patch.crates-io]
+zlib-rs = { git = "https://github.com/Vantrongs/zlib-rs", rev = "ed2ce5b577cc849b069c5d97bed19de70113460d" }

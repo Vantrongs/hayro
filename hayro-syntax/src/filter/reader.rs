@@ -2,6 +2,7 @@
 
 use crate::crypto::reader::DecryptedReader;
 use crate::filter::lzw_flate::{PredictorParams, Unpredictor, flate};
+use crate::object::stream::OwnedStream;
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
 
@@ -25,6 +26,7 @@ pub enum ReadError {
 pub struct DecodedReader<'a> {
     source: Source<'a>,
     predictor: Option<Predicted>,
+    inflated: u64,
 }
 
 /// A predictor reversed row by row on top of the source.
@@ -37,6 +39,44 @@ struct Predicted {
     taken: usize,
 }
 
+/// An independent Flate decoder state, sharing encoded input and storing no pixels.
+///
+/// Keeps an owned handle to its immutable input, without copying its bytes, so
+/// restoring into a different stream is rejected even after the original reader
+/// is dropped. Available only for unencrypted Flate data without prediction.
+pub struct DecodedCheckpoint {
+    #[cfg(feature = "unsafe")]
+    _owner: OwnedStream,
+    #[cfg(feature = "unsafe")]
+    decoder: zlib_rs::Inflate,
+    #[cfg(feature = "unsafe")]
+    input: (usize, usize),
+    #[cfg(feature = "unsafe")]
+    zlib: bool,
+}
+
+impl DecodedCheckpoint {
+    /// Retained state bytes, including the Rust value and inflater allocation;
+    /// excludes system allocator bookkeeping.
+    pub fn allocation_size(&self) -> usize {
+        #[cfg(feature = "unsafe")]
+        {
+            size_of::<Self>() + self.decoder.allocation_size()
+        }
+        #[cfg(not(feature = "unsafe"))]
+        {
+            size_of::<Self>()
+        }
+    }
+}
+
+#[cfg(feature = "unsafe")]
+struct Seekable<'a> {
+    data: &'a [u8],
+    decoder: zlib_rs::Inflate,
+    zlib: bool,
+}
+
 enum Source<'a> {
     /// Raw bytes, or the complete result of the permissive Flate fallback.
     Raw(DecryptedReader<'a>),
@@ -44,6 +84,8 @@ enum Source<'a> {
     Zlib(flate2::bufread::ZlibDecoder<Input<'a>>),
     #[cfg(feature = "unsafe")]
     Deflate(flate2::bufread::DeflateDecoder<Input<'a>>),
+    #[cfg(feature = "unsafe")]
+    Seekable(Seekable<'a>),
     /// Decoding failed.
     Failed,
 }
@@ -65,6 +107,7 @@ impl<'a> DecodedReader<'a> {
         Self {
             source: Source::Raw(data),
             predictor: None,
+            inflated: 0,
         }
     }
 
@@ -84,10 +127,77 @@ impl<'a> DecodedReader<'a> {
             }
         };
         #[cfg(feature = "unsafe")]
-        let source = Source::Zlib(flate2::bufread::ZlibDecoder::new(Input::new(data)));
+        let source = match (params.predictor, data.borrowed_plaintext()) {
+            (1, Some(bytes)) => Source::Seekable(Seekable {
+                data: bytes,
+                decoder: zlib_rs::Inflate::new(true, 15),
+                zlib: true,
+            }),
+            _ => Source::Zlib(flate2::bufread::ZlibDecoder::new(Input::new(data))),
+        };
         #[cfg(not(feature = "unsafe"))]
         let source = whole(&data.into_data());
-        Some(Self { source, predictor })
+        Some(Self {
+            source,
+            predictor,
+            inflated: 0,
+        })
+    }
+
+    /// Bytes produced by this reader's incremental Flate decoders, including work
+    /// discarded on restart. Excludes bytes skipped by restoring a checkpoint and
+    /// the whole-data permissive fallback's work on corrupt streams.
+    pub fn inflated_bytes(&self) -> u64 {
+        self.inflated
+    }
+
+    /// Retained size of a checkpoint, or `None` for unsupported filter/cipher paths.
+    pub fn checkpoint_size(&self) -> Option<usize> {
+        #[cfg(feature = "unsafe")]
+        if let Source::Seekable(source) = &self.source {
+            return Some(size_of::<DecodedCheckpoint>() + source.decoder.allocation_size());
+        }
+        None
+    }
+
+    /// Copy the current decoder state, retaining `owner` to keep its encoded input
+    /// alive. Fails if `owner` does not own this reader's input. Copies no input bytes.
+    pub fn checkpoint(&self, owner: &OwnedStream) -> Result<Option<DecodedCheckpoint>, ReadError> {
+        #[cfg(feature = "unsafe")]
+        if let Source::Seekable(source) = &self.source {
+            if !owner.owns_data(source.data) {
+                return Err(ReadError::Failed);
+            }
+            return Ok(Some(DecodedCheckpoint {
+                _owner: owner.clone(),
+                decoder: source.decoder.try_clone().map_err(|_| ReadError::Failed)?,
+                input: (source.data.as_ptr() as usize, source.data.len()),
+                zlib: source.zlib,
+            }));
+        }
+        #[cfg(not(feature = "unsafe"))]
+        let _ = owner;
+        Ok(None)
+    }
+
+    /// Resume a checkpoint from the same stream. Callers must discard
+    /// saved checkpoints whenever a read returns [`ReadError::Restarted`].
+    pub fn restore(&mut self, checkpoint: &DecodedCheckpoint) -> Result<(), ReadError> {
+        #[cfg(feature = "unsafe")]
+        if let Source::Seekable(source) = &mut self.source {
+            if checkpoint.input != (source.data.as_ptr() as usize, source.data.len()) {
+                return Err(ReadError::Failed);
+            }
+            source.decoder = checkpoint
+                .decoder
+                .try_clone()
+                .map_err(|_| ReadError::Failed)?;
+            source.zlib = checkpoint.zlib;
+            return Ok(());
+        }
+        #[cfg(not(feature = "unsafe"))]
+        let _ = checkpoint;
+        Err(ReadError::Failed)
     }
 
     /// Back to the start of the data, keeping the decoder a restart chose (so reading
@@ -102,6 +212,8 @@ impl<'a> DecodedReader<'a> {
         match &mut self.source {
             Source::Raw(data) => data.rewind(),
             Source::Failed => {}
+            #[cfg(feature = "unsafe")]
+            Source::Seekable(source) => source.decoder.reset(source.zlib),
             #[cfg(feature = "unsafe")]
             Source::Zlib(_) => {
                 let Source::Zlib(decoder) = core::mem::replace(&mut self.source, Source::Failed)
@@ -132,7 +244,7 @@ impl<'a> DecodedReader<'a> {
             return Ok(0);
         }
         let Some(p) = &mut self.predictor else {
-            return self.source.read(buf);
+            return self.source.read(buf, &mut self.inflated);
         };
         loop {
             if p.taken < p.row.len() {
@@ -144,7 +256,10 @@ impl<'a> DecodedReader<'a> {
                 // must not allocate a predictor row (see tests/streaming.rs).
                 let mut chunk = [0; 8192];
                 let remaining = (p.unpredictor.input_len() - p.input.len()).min(chunk.len());
-                match self.source.read(&mut chunk[..remaining]) {
+                match self
+                    .source
+                    .read(&mut chunk[..remaining], &mut self.inflated)
+                {
                     // A last row cut short is dropped, as `apply_predictor` drops it.
                     Ok(0) => return Ok(0),
                     Ok(n) => p.input.extend_from_slice(&chunk[..n]),
@@ -172,14 +287,51 @@ fn whole(data: &[u8]) -> Source<'static> {
 }
 
 impl Source<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
+    fn read(&mut self, buf: &mut [u8], inflated: &mut u64) -> Result<usize, ReadError> {
+        #[cfg(not(feature = "unsafe"))]
+        let _ = inflated;
         match self {
+            #[cfg(feature = "unsafe")]
+            Source::Seekable(source) => {
+                loop {
+                    let before_out = source.decoder.total_out();
+                    let before_in = source.decoder.total_in();
+                    let input = &source.data[before_in as usize..];
+                    let flush = if input.is_empty() {
+                        zlib_rs::InflateFlush::Finish
+                    } else {
+                        zlib_rs::InflateFlush::NoFlush
+                    };
+                    let result = source.decoder.decompress(input, buf, flush);
+                    let written = (source.decoder.total_out() - before_out) as usize;
+                    *inflated += written as u64;
+                    match result {
+                        Ok(zlib_rs::Status::StreamEnd) => return Ok(written),
+                        Ok(_) if written > 0 => return Ok(written),
+                        Ok(_) if source.decoder.total_in() > before_in => continue,
+                        _ => {
+                            // Same zlib -> raw -> permissive sequence as flate2's reader.
+                            if source.zlib {
+                                source.zlib = false;
+                                source.decoder.reset(false);
+                            } else {
+                                warn!("flate stream is broken, decoding with fallback");
+                                *self = whole(source.data);
+                            }
+                            return Err(ReadError::Restarted);
+                        }
+                    }
+                }
+            }
             Source::Raw(data) => Ok(data.read(buf)),
             Source::Failed => Err(ReadError::Failed),
             #[cfg(feature = "unsafe")]
             Source::Zlib(decoder) => {
                 use std::io::Read;
-                match decoder.read(buf) {
+                let before = decoder.total_out();
+                let result = decoder.read(buf);
+                *inflated += decoder.total_out() - before;
+                match result {
                     Ok(n) => Ok(n),
                     // As `flate::decode`: raw deflate next, from the start.
                     Err(_) => {
@@ -198,7 +350,10 @@ impl Source<'_> {
             #[cfg(feature = "unsafe")]
             Source::Deflate(decoder) => {
                 use std::io::Read;
-                match decoder.read(buf) {
+                let before = decoder.total_out();
+                let result = decoder.read(buf);
+                *inflated += decoder.total_out() - before;
+                match result {
                     Ok(n) => Ok(n),
                     // Then the permissive decoder.
                     Err(_) => {
@@ -221,6 +376,8 @@ mod tests {
     use super::{DecodedReader, ReadError};
     use crate::crypto::reader::DecryptedReader;
     use crate::filter::lzw_flate::{PredictorParams, apply_predictor, flate};
+    #[cfg(feature = "unsafe")]
+    use crate::object::stream::OwnedStream;
     use alloc::borrow::Cow;
     use alloc::vec::Vec;
 
@@ -385,6 +542,59 @@ mod tests {
             let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(6));
             e.write_all(data).unwrap();
             e.finish().unwrap()
+        }
+
+        fn owned_flate(encoded: &[u8]) -> OwnedStream {
+            use crate::reader::{Reader, ReaderExt};
+            let dict = Reader::new(b"/Filter /FlateDecode ID")
+                .read_without_context::<crate::object::dict::InlineImageDict<'_>>()
+                .unwrap();
+            crate::object::Stream::new(encoded, dict.get_dict().clone()).to_owned_stream()
+        }
+
+        #[test]
+        fn checkpoints_keep_input_alive_and_resume_independent_backreferences() {
+            let data: Vec<u8> = (0..300_000_u32).map(|i| ((i / 7) % 251) as u8).collect();
+            for raw in [false, true] {
+                let mut encoded = zlib(&data);
+                if raw {
+                    encoded = encoded[2..encoded.len() - 4].to_vec();
+                }
+                for offset in [1, 17, 65_539, 199_997] {
+                    let checkpoint = {
+                        let owner = owned_flate(&encoded);
+                        let mut reader = owner.get().unwrap().decoded_reader().unwrap();
+                        let mut prefix = alloc::vec![0; offset];
+                        if raw {
+                            assert_eq!(reader.read(&mut prefix), Err(ReadError::Restarted));
+                        }
+                        let mut read = 0;
+                        while read < offset {
+                            read += reader.read(&mut prefix[read..]).unwrap();
+                        }
+                        assert_eq!(&prefix, &data[..offset]);
+                        reader.checkpoint(&owner).unwrap().unwrap()
+                    };
+                    // Both original input handle and decoder are gone. Each restore
+                    // has its own state, including buffered match copies and bits.
+                    for chunk in [7, 4093] {
+                        let mut reader = checkpoint._owner.get().unwrap().decoded_reader().unwrap();
+                        reader.restore(&checkpoint).unwrap();
+                        assert_eq!(reader.inflated_bytes(), 0);
+                        assert_eq!(read_all(reader, chunk).unwrap(), data[offset..]);
+                    }
+                    let other = owned_flate(&encoded);
+                    let mut other_reader = other.get().unwrap().decoded_reader().unwrap();
+                    assert!(matches!(
+                        other_reader.restore(&checkpoint),
+                        Err(ReadError::Failed)
+                    ));
+                    assert!(matches!(
+                        other_reader.checkpoint(&checkpoint._owner),
+                        Err(ReadError::Failed)
+                    ));
+                }
+            }
         }
 
         #[test]

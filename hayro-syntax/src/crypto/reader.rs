@@ -84,6 +84,15 @@ impl<'a> DecryptedReader<'a> {
         }
     }
 
+    /// Borrowed unencrypted bytes can be indexed without copying the input.
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn borrowed_plaintext(&self) -> Option<&'a [u8]> {
+        match (&self.cipher, &self.data) {
+            (Cipher::None, Cow::Borrowed(data)) => Some(data),
+            _ => None,
+        }
+    }
+
     pub(crate) fn rewind(&mut self) {
         self.pos = match &mut self.cipher {
             Cipher::None => 0,

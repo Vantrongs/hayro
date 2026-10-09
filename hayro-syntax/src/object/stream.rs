@@ -4,7 +4,7 @@ use crate::crypto::DecryptionTarget;
 use crate::crypto::reader::DecryptedReader;
 use crate::filter::Filter;
 use crate::filter::lzw_flate::{PredictorParams, Unpredictor};
-pub use crate::filter::reader::{DecodedReader, ReadError};
+pub use crate::filter::reader::{DecodedCheckpoint, DecodedReader, ReadError};
 use crate::object;
 use crate::object::Dict;
 use crate::object::Name;
@@ -297,6 +297,12 @@ impl OwnedStream {
                 Some(Stream::new(data, dict.get_dict().clone()))
             }
         }
+    }
+
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn owns_data(&self, data: &[u8]) -> bool {
+        self.get()
+            .is_some_and(|stream| core::ptr::eq(stream.data, data))
     }
 
     /// The object identifier of an indirect stream.

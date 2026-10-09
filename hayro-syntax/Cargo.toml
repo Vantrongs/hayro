@@ -16,6 +16,7 @@ images = ["dep:zune-jpeg", "dep:hayro-ccitt", "dep:hayro-jbig2", "dep:hayro-jpeg
 unsafe = [
     "std",
     "dep:flate2",
+    "dep:zlib-rs",
     "dep:memchr",
     "hayro-jbig2?/simd",
     "hayro-jpeg2000?/simd",
@@ -29,6 +30,7 @@ log = { workspace = true, optional = true }
 rustc-hash = { workspace = true, optional = true }
 smallvec = { workspace = true }
 flate2 = { workspace = true, optional = true, features = ["zlib-rs"] }
+zlib-rs = { git = "https://github.com/Vantrongs/zlib-rs", rev = "ed2ce5b577cc849b069c5d97bed19de70113460d", default-features = false, features = ["std"], optional = true }
 memchr = { workspace = true, optional = true }
 
 zune-jpeg = { workspace = true, optional = true }
