@@ -188,7 +188,6 @@ impl<'a> JpegStreamed<'a> {
         let width = self.samples.obj.width as usize;
         let columns = area.columns();
         let mut band = vec![0; rows.output_buffer_size()];
-        let mut colour = Vec::new();
         let mut rgb = Vec::new();
         let mut decoded = 0;
         while rows.next_row() < wanted.end as usize {
@@ -217,10 +216,10 @@ impl<'a> JpegStreamed<'a> {
             for at in 0..count {
                 let row = y + at as u32;
                 if row >= wanted.start && row < wanted.end {
-                    let pixels = &band
+                    let pixels = &mut band
                         [at * width + columns.start as usize..at * width + columns.end as usize];
-                    self.samples.convert_colour(pixels, &mut colour, &mut rgb)?;
-                    area.push(&colour);
+                    let colour = self.samples.convert_colour(pixels, &mut rgb)?;
+                    area.push(colour);
                 }
             }
         }
@@ -265,6 +264,19 @@ mod tests {
                     ),
                     bytes.to_vec(),
                 )]);
+            }
+        }
+    }
+
+    #[test]
+    fn jpeg_mutable_bands_preserve_transfer_and_rgb_expansion() {
+        use super::super::tests::{assert_asset_streams_as_decoded, transfer};
+        for four in [false, true] {
+            for decode in ["", "/Decode [1 0]"] {
+                let pdf = jpeg_pdf(include_bytes!("fixtures/257x4097.jpg"), 257, 4097, decode);
+                let mut asset = asset(&pdf, &Cache::new());
+                Arc::get_mut(&mut asset.0).unwrap().transfer_function = Some(transfer(four));
+                assert_asset_streams_as_decoded(&asset);
             }
         }
     }

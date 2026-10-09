@@ -970,7 +970,6 @@ impl<'a> Streamed<'a> {
                     ..
                 }
         );
-        let mut colour = Vec::with_capacity((c1 - c0) * 3);
         let mut rgb = Vec::new();
         let mut work = Vec::with_capacity((c1 - c0) * 4);
         let mut key_alpha = Vec::new();
@@ -1041,7 +1040,7 @@ impl<'a> Streamed<'a> {
                     }
                     continue;
                 }
-                let samples = &raw.row[c0 * n..c1 * n];
+                let samples = &mut raw.row[c0 * n..c1 * n];
                 if let Alpha::ColourKey(key) = &self.alpha {
                     key_alpha.clear();
                     key_alpha.extend(samples.chunks_exact(n).map(|pixel| {
@@ -1052,14 +1051,14 @@ impl<'a> Streamed<'a> {
                         if outside { 255 } else { 0 }
                     }));
                 }
-                self.convert_colour(samples, &mut colour, &mut rgb)?;
+                let colour = self.convert_colour(samples, &mut rgb)?;
                 let alpha: Option<&[u8]> = match (&mask, &self.alpha) {
                     (Some(m), _) => {
                         let a = &alpha_row[c0..c1];
                         if let Some(matte) = &m.matte
                             && mask_present
                         {
-                            unpremultiply_samples(&mut colour, out_channels, a, matte);
+                            unpremultiply_samples(colour, out_channels, a, matte);
                         }
                         m.same_grid.then_some(a)
                     }
@@ -1079,7 +1078,7 @@ impl<'a> Streamed<'a> {
                         }
                         area.push(&work);
                     }
-                    _ => area.push(&colour),
+                    _ => area.push(colour),
                 }
                 if last {
                     break;
@@ -1096,29 +1095,30 @@ impl<'a> Streamed<'a> {
         }
     }
 
-    fn convert_colour(
+    /// The decoded row is request-local scratch; only RGB expansion needs another buffer.
+    fn convert_colour<'s>(
         &self,
-        samples: &[u8],
-        colour: &mut Vec<u8>,
-        rgb: &mut Vec<u8>,
-    ) -> Result<(), Stop> {
-        colour.clear();
-        colour.extend_from_slice(samples);
+        samples: &'s mut [u8],
+        rgb: &'s mut Vec<u8>,
+    ) -> Result<&'s mut [u8], Stop> {
         if self.invert {
-            colour.iter_mut().for_each(|v| *v = 255 - *v);
+            samples.iter_mut().for_each(|v| *v = 255 - *v);
         }
-        if self.luma {
-            self.color_space.to_luma(colour);
-        } else if self.color_space.convert_in_place(colour).is_none() {
+        let colour = if self.luma {
+            self.color_space.to_luma(samples);
+            samples
+        } else if self.color_space.convert_in_place(samples).is_some() {
+            samples
+        } else {
             rgb.clear();
             rgb.resize(samples.len() / self.components * 3, 0);
-            self.color_space.convert(colour, rgb).ok_or(Stop::Failed)?;
-            std::mem::swap(colour, rgb);
-        }
+            self.color_space.convert(samples, rgb).ok_or(Stop::Failed)?;
+            rgb.as_mut_slice()
+        };
         if let Some(t) = &self.obj.transfer_function {
             t.apply_to(colour);
         }
-        Ok(())
+        Ok(colour)
     }
 
     fn run_mask(
@@ -1468,9 +1468,13 @@ mod tests {
         let pdf = pdf(objects);
         let cache = Cache::new();
         let asset = asset(&pdf, &cache);
+        assert_asset_streams_as_decoded(&asset);
+    }
+
+    pub(super) fn assert_asset_streams_as_decoded(asset: &ImageAsset) {
         let mut streamed = asset.open(None).unwrap();
         assert!(streamed.is_streamed());
-        let mut decoded = whole(&asset);
+        let mut decoded = whole(asset);
         assert_eq!(streamed.layout(), decoded.layout());
         let layout = *streamed.layout();
         for plane in [Plane::Image, Plane::Mask] {
@@ -1886,6 +1890,116 @@ mod tests {
                 image(&predicted, w as u32, h as u32),
                 zlib(&png_filter(&data, w * n, n)),
             )]);
+        }
+    }
+
+    pub(super) fn transfer(four: bool) -> ActiveTransferFunction {
+        use crate::function::{Function, TransferFunction};
+        let pdf = pdf(&[(
+            "/FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1".into(),
+            Vec::new(),
+        )]);
+        let function = TransferFunction::new(
+            Function::new(&pdf.xref().get(ObjectIdentifier::new(3, 0)).unwrap()).unwrap(),
+        );
+        if four {
+            ActiveTransferFunction::Four(std::array::from_fn(|_| function.clone()))
+        } else {
+            ActiveTransferFunction::Single(function)
+        }
+    }
+
+    #[test]
+    fn same_channel_conversion_reuses_decoded_storage() {
+        for (space, channels) in [("DeviceGray", 1), ("DeviceRGB", 3)] {
+            for invert in [false, true] {
+                for with_transfer in [false, true] {
+                    let decode = if invert {
+                        format!("/Decode [{}]", "1 0 ".repeat(channels))
+                    } else {
+                        String::new()
+                    };
+                    let pdf = pdf(&[(
+                        image(
+                            &format!("/ColorSpace /{space} /BitsPerComponent 8 {decode}"),
+                            256,
+                            1,
+                        ),
+                        Vec::new(),
+                    )]);
+                    let asset = asset(&pdf, &Cache::new());
+                    let mut obj = asset.xobject().unwrap();
+                    obj.transfer_function = with_transfer.then(|| transfer(false));
+                    let streamed =
+                        Streamed::samples(&obj, &asset.0.stream, &asset.0.checkpoints).unwrap();
+                    let mut samples: Vec<u8> = (0..=255)
+                        .flat_map(|v| std::iter::repeat_n(v, channels))
+                        .collect();
+                    let storage = samples.as_ptr();
+                    let mut rgb = Vec::new();
+                    let colour = streamed
+                        .convert_colour(&mut samples, &mut rgb)
+                        .unwrap_or_else(|_| panic!("same-channel conversion failed"));
+                    assert_eq!(
+                        colour.as_ptr(),
+                        storage,
+                        "same-channel conversion must not stage another row"
+                    );
+                    let expected: Vec<u8> = (0..=255)
+                        .flat_map(|v| {
+                            std::iter::repeat_n(
+                                if invert ^ with_transfer { 255 - v } else { v },
+                                channels,
+                            )
+                        })
+                        .collect();
+                    assert_eq!(colour, expected);
+                    assert_eq!(rgb.capacity(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mutable_rows_preserve_transfer_predictors_colour_keys_and_matte() {
+        for (space, channels) in [("DeviceGray", 1), ("DeviceRGB", 3)] {
+            for four in [false, true] {
+                for mask in [
+                    String::new(),
+                    format!("/Mask [{}]", "0 120 ".repeat(channels)),
+                    "/SMask 4 0 R".into(),
+                ] {
+                    let (w, h) = (13, 9);
+                    let samples = noise(w * h * channels, 37);
+                    let pdf = pdf(&[
+                        (
+                            image(
+                                &format!(
+                                    "/ColorSpace /{space} /BitsPerComponent 8 /Decode [{}] /Filter /FlateDecode /DecodeParms << /Predictor 15 /Colors {channels} /Columns {w} >> {mask}",
+                                    "1 0 ".repeat(channels)
+                                ),
+                                w as u32,
+                                h as u32,
+                            ),
+                            zlib(&png_filter(&samples, w * channels, channels)),
+                        ),
+                        (
+                            image(
+                                &format!(
+                                    "/ColorSpace /DeviceGray /BitsPerComponent 8 /Matte [{}]",
+                                    "0.5 ".repeat(channels)
+                                ),
+                                w as u32,
+                                h as u32,
+                            ),
+                            noise(w * h, 38),
+                        ),
+                    ]);
+                    let mut asset = asset(&pdf, &Cache::new());
+                    Arc::get_mut(&mut asset.0).unwrap().transfer_function = Some(transfer(four));
+                    assert_asset_streams_as_decoded(&asset);
+                }
+            }
         }
     }
 
