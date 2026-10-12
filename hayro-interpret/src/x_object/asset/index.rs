@@ -3,6 +3,7 @@
 //! row from the start.
 
 use super::Stop;
+use super::jpeg::JpegIndex;
 use super::rows::RawRows;
 use hayro_syntax::object::stream::{DecodedCheckpoint, DecodedReader, OwnedStream};
 use std::sync::Mutex;
@@ -16,6 +17,7 @@ pub(super) const MIN_CHECKPOINT_BYTES: usize = 256 * 1024;
 #[derive(Default)]
 pub(super) struct Checkpoints {
     flate: Mutex<FlateIndex>,
+    pub(super) jpeg: Mutex<JpegIndex>,
 }
 
 /// Flate decoder states, by the row they resume at.
@@ -36,14 +38,16 @@ struct Entry {
 impl Checkpoints {
     /// The bytes the saved states take: the index, its slots, and each state's heap.
     pub(super) fn bytes(&self) -> Result<usize, Stop> {
-        let index = self.flate.lock().map_err(|_| Stop::Failed)?;
+        let flate = self.flate.lock().map_err(|_| Stop::Failed)?;
+        let jpeg = self.jpeg.lock().map_err(|_| Stop::Failed)?;
         Ok(size_of::<Self>()
-            + index.entries.capacity() * size_of::<Entry>()
-            + index
+            + flate.entries.capacity() * size_of::<Entry>()
+            + flate
                 .entries
                 .iter()
                 .map(|e| e.state.heap_bytes())
-                .sum::<usize>())
+                .sum::<usize>()
+            + jpeg.heap_bytes())
     }
 
     /// A checkpointer for a pass whose stored rows `raw` reads, `height` rows of
@@ -149,14 +153,13 @@ impl Checkpointer<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{asset, image, pdf, request, whole, zlib};
-    use super::super::{DecodeWork, ImageAsset, ImageRequest, ImageSource, Plane, RequestError};
+    use super::super::tests::{asset, image, pdf, request, rows, whole, zlib};
+    use super::super::{ImageAsset, ImageRequest, Plane, RequestError};
     use super::*;
     use crate::fixtures::{noise, stored_deflate};
     use hayro_syntax::Pdf;
     use hayro_syntax::work::Meter;
     use std::cell::Cell;
-    use std::ops::Range;
     use std::sync::Arc;
 
     const W: u32 = 257;
@@ -180,20 +183,6 @@ mod tests {
             row[0] = (i % 5) as u8;
         }
         data
-    }
-
-    /// The image plane's rows `rows` at full size, and the work reading them took.
-    fn rows(source: &mut ImageSource<'_>, rows: Range<u32>) -> (Vec<u8>, DecodeWork) {
-        let before = source.work();
-        let plane = source.layout().image;
-        let window = [0, rows.start, plane.width, rows.end];
-        let data = request(source, Plane::Image, (plane.width, plane.height), window).data;
-        let after = source.work();
-        let work = DecodeWork {
-            rows_decoded: after.rows_decoded - before.rows_decoded,
-            bytes_inflated: after.bytes_inflated - before.bytes_inflated,
-        };
-        (data, work)
     }
 
     fn saved(asset: &ImageAsset) -> usize {

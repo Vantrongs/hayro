@@ -551,6 +551,15 @@ impl XRef {
         }
     }
 
+    /// The document's bytes.
+    #[cfg(feature = "images")]
+    pub(crate) fn file_data(&self) -> Option<&PdfData> {
+        match &self.0 {
+            Inner::Some(repr) => Some(repr.data.get()),
+            Inner::Dummy => None,
+        }
+    }
+
     /// Return the object with the given identifier.
     #[allow(private_bounds)]
     pub fn get<'a, T>(&'a self, id: ObjectIdentifier) -> Option<T>

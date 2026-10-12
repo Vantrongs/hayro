@@ -80,6 +80,13 @@ impl Default for Meter<'_> {
     }
 }
 
+#[cfg(feature = "images")]
+impl zune_jpeg::progress::Progress for Meter<'_> {
+    fn advance(&self, work: usize) -> bool {
+        self.work(work).is_err()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

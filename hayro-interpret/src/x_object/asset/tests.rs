@@ -10,6 +10,7 @@ use hayro_syntax::object::{ObjectIdentifier, Stream};
 #[cfg(debug_assertions)]
 use hayro_syntax::work::{POLL_BYTES, TOLD};
 use std::cell::Cell;
+use std::ops::Range;
 
 /// A PDF whose objects 3 onwards are `objects`, each a dictionary and its stream
 /// data.
@@ -108,6 +109,20 @@ pub(super) fn request(
             cancel: None,
         })
         .unwrap()
+}
+
+/// The image plane's rows `rows` at full size, and the work reading them took.
+pub(super) fn rows(source: &mut ImageSource<'_>, rows: Range<u32>) -> (Vec<u8>, DecodeWork) {
+    let before = source.work();
+    let plane = source.layout().image;
+    let window = [0, rows.start, plane.width, rows.end];
+    let data = request(source, Plane::Image, (plane.width, plane.height), window).data;
+    let after = source.work();
+    let work = DecodeWork {
+        rows_decoded: after.rows_decoded - before.rows_decoded,
+        bytes_inflated: after.bytes_inflated - before.bytes_inflated,
+    };
+    (data, work)
 }
 
 pub(super) fn is_streamed(source: &ImageSource<'_>) -> bool {

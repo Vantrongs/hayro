@@ -87,6 +87,17 @@ impl Colour {
         self.components
     }
 
+    /// The plane of `obj`'s colour, with alpha or not.
+    pub(super) fn plane(&self, obj: &ImageXObject<'_>, alpha: bool) -> PlaneLayout {
+        PlaneLayout {
+            width: obj.width,
+            height: obj.height,
+            to_image: (1.0, 1.0),
+            interpolate: obj.interpolate,
+            format: PixelFormat::colour(self.channels(), alpha),
+        }
+    }
+
     /// Bytes per texel of the colour returned.
     pub(super) fn channels(&self) -> usize {
         if self.luma { 1 } else { 3 }
@@ -231,13 +242,7 @@ impl<'a> Streamed<'a> {
             _ => None,
         };
         ImageLayout {
-            image: PlaneLayout {
-                width: w,
-                height: h,
-                to_image: (1.0, 1.0),
-                interpolate: self.obj.interpolate,
-                format: PixelFormat::colour(self.colour.channels(), self.alpha.on_image_grid()),
-            },
+            image: self.colour.plane(&self.obj, self.alpha.on_image_grid()),
             mask,
         }
     }

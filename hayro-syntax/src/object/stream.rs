@@ -26,6 +26,11 @@ use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
 use smallvec::SmallVec;
 
+#[cfg(feature = "images")]
+mod jpeg;
+#[cfg(feature = "images")]
+pub use jpeg::{JpegCheckpoint, JpegInput, JpegRows};
+
 struct FiltersAndParams<'a> {
     filters: SmallVec<[Filter; 2]>,
     params: SmallVec<[Dict<'a>; 2]>,

@@ -5,7 +5,7 @@ use crate::work::{Meter, POLL_BYTES};
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use core::num::NonZeroU32;
-use zune_jpeg::zune_core::bytestream::ZCursor;
+use zune_jpeg::progress::ProgressCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::colorspace::ColorSpace::CMYK;
 use zune_jpeg::zune_core::options::DecoderOptions;
@@ -30,7 +30,8 @@ pub(crate) fn decode(
     let options = DecoderOptions::default()
         .set_max_width(u16::MAX as usize)
         .set_max_height(u16::MAX as usize);
-    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(&*data), options);
+    let mut decoder =
+        zune_jpeg::JpegDecoder::new_with_options(ProgressCursor::new(&*data, meter), options);
     decoder.decode_headers().ok()?;
 
     let color_transform = params.get::<u8>(COLOR_TRANSFORM);
@@ -64,7 +65,7 @@ pub(crate) fn decode(
     }
 
     decoder.set_options(DecoderOptions::default().jpeg_set_out_colorspace(out_colorspace));
-    let mut decoded = decoder.decode().ok()?;
+    let mut decoded = decoder.decode_with_progress(meter).ok()?;
 
     if out_colorspace == ColorSpace::YCCK {
         // See <https://github.com/mozilla/pdf.js/blob/69595a29192b7704733404a42a2ebb537601117b/src/core/jpg.js#L1331>

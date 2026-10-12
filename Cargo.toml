@@ -126,3 +126,5 @@ overflow-checks = true
 [patch.crates-io]
 # `Inflate::try_clone` and `Inflate::allocation_size`, which Flate checkpoints need.
 zlib-rs = { git = "https://github.com/Vantrongs/zlib-rs", rev = "7a2aa9db8aaefe950749789b4cb42217744c7b67" }
+# `zune_jpeg::rows`, which grayscale JPEG rows need.
+zune-jpeg = { git = "https://github.com/Vantrongs/zune-image", rev = "67bcb66dcd6f027b9f84d9fdf3d404b5c28cfa71" }

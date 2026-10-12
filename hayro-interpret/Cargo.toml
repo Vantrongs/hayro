@@ -25,6 +25,7 @@ rustc-hash = { workspace = true }
 
 [dev-dependencies]
 image = { workspace = true, features = ["png"] }
+jpeg-encoder = "0.7"
 
 [features]
 default = ["embed-fonts", "embed-cmaps"]

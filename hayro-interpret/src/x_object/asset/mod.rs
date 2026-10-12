@@ -4,6 +4,7 @@
 
 mod decoded;
 mod index;
+mod jpeg;
 mod rows;
 mod streamed;
 
@@ -18,6 +19,7 @@ use decoded::Decoded;
 use hayro_syntax::object::stream::OwnedStream;
 use hayro_syntax::work::{Cancelled, Meter};
 use index::Checkpoints;
+use jpeg::JpegStreamed;
 use kurbo::Affine;
 use rows::{MaskHeight, PIECE_BYTES};
 use std::sync::Arc;
@@ -113,11 +115,14 @@ impl ImageAsset {
     /// time, read such a mask's data through to count its rows); requests read their
     /// data and keep a piece of a row and a few sums per bin. A request of such a Flate
     /// image without a mask read alongside resumes from the nearest decoder state an
-    /// earlier request of the asset saved, instead of from the start. Other images are
-    /// decoded whole here (with `hint`, the size they are wanted at, for decoders that
-    /// can reduce), and requests read the decoded planes, which the source holds until
-    /// it is dropped. `cancel` is polled as [`ImageRequest::cancel`] is; a cancelled
-    /// open leaves the asset as it was, to be opened again.
+    /// earlier request of the asset saved, instead of from the start. So does a request
+    /// of a single-scan baseline grayscale JPEG of its declared size without masks,
+    /// read in bands of eight rows; once its data fails to decode, it is decoded whole
+    /// like other images. Other images are decoded whole here (with `hint`, the size
+    /// they are wanted at, for decoders that can reduce), and requests read the decoded
+    /// planes, which the source holds until it is dropped. `cancel` is polled as
+    /// [`ImageRequest::cancel`] is; a cancelled open leaves the asset as it was, to be
+    /// opened again.
     pub fn open(
         &self,
         hint: Option<(u32, u32)>,
@@ -134,6 +139,14 @@ impl ImageAsset {
                 layout,
                 Inner::Streamed(Box::new(streamed)),
                 opened,
+            ));
+        }
+        if let Some(jpeg) = JpegStreamed::new(&obj, &a.stream, &a.checkpoints.jpeg, &meter)? {
+            let layout = jpeg.layout();
+            return Ok(ImageSource::new(
+                layout,
+                Inner::Jpeg(Box::new(jpeg)),
+                DecodeWork::default(),
             ));
         }
         let decoded = decode_image(&obj, hint, &meter);
@@ -321,6 +334,7 @@ pub struct ImageSource<'a> {
 
 enum Inner<'a> {
     Streamed(Box<Streamed<'a>>),
+    Jpeg(Box<JpegStreamed<'a>>),
     Decoded(Decoded),
 }
 
@@ -370,6 +384,8 @@ impl<'a> ImageSource<'a> {
         )?;
         let work = match &mut self.inner {
             Inner::Streamed(s) => s.run(request.plane, &mut area, &meter),
+            // Its layout has no mask plane.
+            Inner::Jpeg(j) => j.run(&mut area, &meter),
             Inner::Decoded(d) => d.run(request.plane, &mut area).map(|rows| DecodeWork {
                 rows_decoded: u64::from(rows),
                 bytes_inflated: 0,
