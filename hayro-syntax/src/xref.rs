@@ -524,7 +524,6 @@ impl XRef {
         }
     }
 
-    #[inline]
     pub(crate) fn decrypt(
         &self,
         id: ObjectIdentifier,

@@ -2,6 +2,9 @@
 //! refuses any single request over 1 GiB so that code sizing a buffer by declared
 //! dimensions aborts the test instead of exhausting the machine.
 
+// Test crates use different parts of this module.
+#![allow(dead_code)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 

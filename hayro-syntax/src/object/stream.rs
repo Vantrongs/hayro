@@ -114,27 +114,32 @@ impl<'a> Stream<'a> {
     ///
     /// Stream filters will not be applied.
     pub fn raw_data(&self) -> Cow<'a, [u8]> {
-        let ctx = self.dict.ctx();
+        match self.decryption_object_id() {
+            Some(id) => Cow::Owned(
+                self.dict
+                    .ctx()
+                    .xref()
+                    .decrypt(id, self.data, DecryptionTarget::Stream)
+                    // TODO: Maybe an error would be better?
+                    .unwrap_or_default(),
+            ),
+            None => Cow::Borrowed(self.data),
+        }
+    }
 
+    /// The object whose key decrypts the stream, when the document is encrypted and
+    /// the stream is not a cross-reference stream.
+    fn decryption_object_id(&self) -> Option<ObjectIdentifier> {
+        let ctx = self.dict.ctx();
         if ctx.xref().needs_decryption(ctx)
             && self
                 .dict
                 .get::<object::String<'_>>(TYPE)
-                .map(|t| t.as_ref() != b"XRef")
-                .unwrap_or(true)
+                .is_none_or(|t| t.as_ref() != b"XRef")
         {
-            match self.dict.obj_id() {
-                Some(obj_id) => Cow::Owned(
-                    ctx.xref()
-                        .decrypt(obj_id, self.data, DecryptionTarget::Stream)
-                        // TODO: MAybe an error would be better?
-                        .unwrap_or_default(),
-                ),
-                // Should not be reachable, as streams always have IDs.
-                None => Cow::Borrowed(self.data),
-            }
+            self.dict.obj_id()
         } else {
-            Cow::Borrowed(self.data)
+            None
         }
     }
 

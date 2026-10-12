@@ -108,11 +108,10 @@ impl RasterImage<'_> {
     }
 
     /// Identifies the pixels `with_rgba` decodes for a given `target_dimension`: the
-    /// image object and the transfer function in effect. `Stream`'s cache key hashes
-    /// the dictionary's bytes, which two images with the same dictionary share; the
-    /// object number does not. `None` when there is no object to identify (an inline
-    /// image) or the colour space is a name looked up in the resources where the
-    /// image is drawn.
+    /// image object ([`Stream::identity`](hayro_syntax::object::Stream::identity),
+    /// unique among the documents loaded) and the transfer function in effect. `None`
+    /// when there is no object to identify (an inline image) or the colour space is a
+    /// name looked up in the resources where the image is drawn.
     pub fn pixels_key(&self) -> Option<u128> {
         let image = &self.0;
         let id = image.stream.identity()?;

@@ -154,8 +154,8 @@ impl<'a> Device<'a> for Keys {
 }
 
 /// Drawing one image object twice gives one key; another object with the same
-/// dictionary (whose `cache_key` is the same), the same object under a transfer
-/// function, and an inline image give other keys or none.
+/// dictionary, the same object under a transfer function, and an inline image give
+/// other keys or none.
 #[test]
 fn pixels_keys_tell_decoded_images_apart() {
     let gray = "/Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8";
@@ -178,7 +178,8 @@ fn pixels_keys_tell_decoded_images_apart() {
         k[3].expect("a key"),
     );
     assert_eq!(k[1], Some(a));
-    assert_eq!(cache[0], cache[2], "the same dictionary");
+    assert_eq!(cache[0], cache[1]);
+    assert_ne!(cache[0], cache[2]);
     assert_ne!(a, b);
     assert_ne!(a, a_inverted);
     assert_eq!(k[4], None, "inline image");
@@ -201,4 +202,5 @@ fn pixels_keys_tell_documents_apart() {
     let (a, b) = (keys(0x40), keys(0xC0));
     assert!(a[0].0.is_some());
     assert_ne!(a[0].0, b[0].0);
+    assert_ne!(a[0].1, b[0].1);
 }
