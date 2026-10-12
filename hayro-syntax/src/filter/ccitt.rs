@@ -3,18 +3,33 @@ use crate::object::dict::keys::{
     BLACK_IS_1, COLUMNS, ENCODED_BYTE_ALIGN, END_OF_BLOCK, END_OF_LINE, K, ROWS,
 };
 use crate::object::stream::{FilterResult, ImageColorSpace, ImageData, ImageDecodeParams};
+use crate::work::{Meter, POLL_BYTES};
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use core::iter;
 use hayro_ccitt::{DecodeSettings, Decoder, DecoderContext, EncodingMode};
 
+/// Appends `count` copies of `byte` to `output`, a counted piece at a time; stops
+/// appending once `meter`'s hook asks to stop.
+fn push_counted(output: &mut Vec<u8>, byte: u8, count: usize, meter: &Meter<'_>) {
+    let mut left = count;
+    while left > 0 && !meter.cancelled() {
+        let n = left.min(POLL_BYTES);
+        output.extend(iter::repeat_n(byte, n));
+        left -= n;
+        let _ = meter.work(n);
+    }
+}
+
 /// White pixels a stream that ends early is padded with whatever it decoded.
 const MIN_WHITE_PAD: usize = 1 << 16;
 
+/// The data decoded, its work counted on `meter`; `None` once its hook asks to stop.
 pub(crate) fn decode(
     data: &[u8],
     params: &Dict<'_>,
     image_params: &ImageDecodeParams,
+    meter: &Meter<'_>,
 ) -> Option<FilterResult<'static>> {
     let k = params.get::<i32>(K).unwrap_or(0);
 
@@ -49,14 +64,15 @@ pub(crate) fn decode(
     // into an RGBA8 image.
 
     let (decoded, bpc) = if image_params.is_indexed {
-        struct BitPackDecoder {
+        struct BitPackDecoder<'m> {
             output: Vec<u8>,
             decoded_rows: u32,
             buffer: u8,
             bit_count: u8,
+            meter: &'m Meter<'m>,
         }
 
-        impl BitPackDecoder {
+        impl BitPackDecoder<'_> {
             fn flush(&mut self) {
                 if self.bit_count > 0 {
                     let padded = self.buffer << (8 - self.bit_count);
@@ -67,7 +83,7 @@ pub(crate) fn decode(
             }
         }
 
-        impl Decoder for BitPackDecoder {
+        impl Decoder for BitPackDecoder<'_> {
             fn push_pixels(&mut self, white: bool, mut count: u32) {
                 if self.bit_count > 0 {
                     let head = count.min(u32::from(8 - self.bit_count)) as u8;
@@ -88,8 +104,7 @@ pub(crate) fn decode(
                 let full_bytes = count / 8;
                 if full_bytes > 0 {
                     let byte = if white { 0xFF } else { 0x00 };
-                    self.output
-                        .extend(iter::repeat_n(byte, full_bytes as usize));
+                    push_counted(&mut self.output, byte, full_bytes as usize, self.meter);
                     count %= 8;
                 }
 
@@ -107,6 +122,10 @@ pub(crate) fn decode(
                 self.decoded_rows += 1;
                 self.flush();
             }
+
+            fn stop(&mut self) -> bool {
+                self.meter.work(1).is_err()
+            }
         }
 
         let mut decoder = BitPackDecoder {
@@ -114,31 +133,37 @@ pub(crate) fn decode(
             decoded_rows: 0,
             buffer: 0,
             bit_count: 0,
+            meter,
         };
         let mut context = DecoderContext::new(settings);
         let result = hayro_ccitt::decode(data, &mut decoder, &mut context);
 
         // If we decoded at least one row, let's be lenient and return what we got.
         // See also 0001763.pdf.
-        if result.is_err() && decoder.decoded_rows == 0 {
+        if result.is_err() && decoder.decoded_rows == 0 || meter.cancelled() {
             return None;
         }
 
         (decoder.output, 1)
     } else {
-        struct Luma8Decoder {
+        struct Luma8Decoder<'m> {
             output: Vec<u8>,
             decoded_rows: u32,
+            meter: &'m Meter<'m>,
         }
 
-        impl Decoder for Luma8Decoder {
+        impl Decoder for Luma8Decoder<'_> {
             fn push_pixels(&mut self, white: bool, count: u32) {
                 let byte = if white { 0xFF } else { 0x00 };
-                self.output.extend(iter::repeat_n(byte, count as usize));
+                push_counted(&mut self.output, byte, count as usize, self.meter);
             }
 
             fn next_line(&mut self) {
                 self.decoded_rows += 1;
+            }
+
+            fn stop(&mut self) -> bool {
+                self.meter.work(1).is_err()
             }
         }
 
@@ -147,11 +172,12 @@ pub(crate) fn decode(
         let mut decoder = Luma8Decoder {
             output: Vec::new(),
             decoded_rows: 0,
+            meter,
         };
         let mut context = DecoderContext::new(settings);
         let result = hayro_ccitt::decode(data, &mut decoder, &mut context);
 
-        if result.is_err() && decoder.decoded_rows == 0 {
+        if result.is_err() && decoder.decoded_rows == 0 || meter.cancelled() {
             return None;
         }
 
@@ -161,7 +187,10 @@ pub(crate) fn decode(
         // with the rows decoded, as one whose data breaks off does.
         let missing = output_len - decoder.output.len();
         if result.is_ok() && missing <= decoder.output.len().max(MIN_WHITE_PAD) {
-            decoder.output.resize(output_len, 0xFF);
+            push_counted(&mut decoder.output, 0xFF, missing, meter);
+            if meter.cancelled() {
+                return None;
+            }
         }
 
         (decoder.output, 8)
@@ -185,12 +214,19 @@ mod tests {
     use crate::object::FromBytes;
     use crate::object::dict::Dict;
     use crate::object::stream::ImageDecodeParams;
+    use crate::work::Meter;
 
     #[test]
     fn issue1258() {
         let params = Dict::from_bytes(b"<< /K 0 /Columns 8 /Rows 1 >>").unwrap();
 
-        let decoded = decode(&[0x35, 0x14], &params, &ImageDecodeParams::default()).unwrap();
+        let decoded = decode(
+            &[0x35, 0x14],
+            &params,
+            &ImageDecodeParams::default(),
+            &Meter::default(),
+        )
+        .unwrap();
 
         assert_eq!(decoded.data.as_ref(), &[0; 8]);
         assert_eq!(decoded.image_data.unwrap().height, 1);

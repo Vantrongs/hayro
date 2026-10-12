@@ -97,6 +97,7 @@ pub mod metadata;
 pub mod object;
 pub mod page;
 pub mod transform;
+pub mod work;
 pub mod xref;
 
 // We only expose them so hayro-interpret can use them, but they are not intended

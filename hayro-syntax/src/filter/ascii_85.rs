@@ -2,9 +2,12 @@
 
 use crate::reader::Reader;
 use crate::trivia::is_white_space_character;
+use crate::work::Meter;
 use alloc::vec::Vec;
 
-pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
+/// The data decoded, each byte read counted on `meter`; `None` once its hook asks to
+/// stop.
+pub(crate) fn decode(data: &[u8], meter: &Meter<'_>) -> Option<Vec<u8>> {
     const POW_85: [u32; 5] = [52200625, 614125, 7225, 85, 1];
 
     let mut reader = Reader::new(data);
@@ -12,6 +15,7 @@ pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
     let mut read_byte = || -> Option<u8> {
         loop {
             let b = reader.read_byte()?;
+            meter.work(1).ok()?;
 
             // White space characters should be ignored.
             if !is_white_space_character(b) {

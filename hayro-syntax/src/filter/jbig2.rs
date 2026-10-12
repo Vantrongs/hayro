@@ -3,6 +3,7 @@ use crate::object::Dict;
 use crate::object::Stream;
 use crate::object::dict::keys::JBIG2_GLOBALS;
 use crate::object::stream::{FilterResult, ImageColorSpace, ImageData, ImageDecodeParams};
+use crate::work::Meter;
 use alloc::borrow::Cow;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -15,10 +16,14 @@ pub(crate) fn decode(
     data: &[u8],
     params: &Dict<'_>,
     image_params: &ImageDecodeParams,
+    meter: &Meter<'_>,
 ) -> Option<FilterResult<'static>> {
-    let globals = params
-        .get::<Stream<'_>>(JBIG2_GLOBALS)
-        .and_then(|g| g.decoded().ok());
+    let globals = params.get::<Stream<'_>>(JBIG2_GLOBALS).and_then(|g| {
+        g.decoded_image_metered(&ImageDecodeParams::default(), meter)
+            .map(|d| d.data)
+            .ok()
+    });
+    meter.poll().ok()?;
 
     let image = hayro_jbig2::Image::new_embedded(data, globals.as_deref()).ok()?;
 

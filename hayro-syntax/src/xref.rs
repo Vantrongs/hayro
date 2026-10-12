@@ -1,5 +1,6 @@
 //! Reading and querying the xref table of a PDF file.
 
+use crate::crypto::reader::DecryptedReader;
 use crate::crypto::{DecryptionError, DecryptionTarget, Decryptor, get};
 use crate::data::Data;
 use crate::metadata::Metadata;
@@ -22,6 +23,7 @@ use crate::sync::{Arc, FxHashMap, RwLock, RwLockExt};
 use crate::trivia::is_white_space_character;
 use crate::util::findr_needle;
 use crate::{PdfData, object};
+use alloc::borrow::Cow;
 use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -533,6 +535,19 @@ impl XRef {
         match &self.0 {
             Inner::Dummy => Some(data.to_vec()),
             Inner::Some(r) => r.decryptor.decrypt(id, data, target),
+        }
+    }
+
+    /// A reader of stream `data` of object `id`, decrypted; `None` where
+    /// [`Self::decrypt`] would fail.
+    pub(crate) fn decrypted_reader<'a>(
+        &self,
+        id: ObjectIdentifier,
+        data: &'a [u8],
+    ) -> Option<DecryptedReader<'a>> {
+        match &self.0 {
+            Inner::Dummy => Some(DecryptedReader::raw(Cow::Borrowed(data))),
+            Inner::Some(r) => r.decryptor.reader(id, data, DecryptionTarget::Stream),
         }
     }
 

@@ -1,18 +1,24 @@
 //! Streams.
 
 use crate::crypto::DecryptionTarget;
+use crate::crypto::reader::DecryptedReader;
 use crate::filter::Filter;
+use crate::filter::lzw_flate::{PredictorParams, Unpredictor};
+pub use crate::filter::reader::{DecodedReader, ReadError};
 use crate::object;
 use crate::object::Dict;
 use crate::object::Name;
+use crate::object::dict::InlineImageDict;
 use crate::object::dict::keys::{DECODE_PARMS, DP, F, FILTER, LENGTH, TYPE};
 use crate::object::{Array, ObjectIdentifier};
 use crate::object::{Object, ObjectLike, ObjectRefLike};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
+use crate::sync::Arc;
 use crate::trivia::is_white_space_character;
 use crate::util::{OptionLog, find_needle};
-use crate::xref::DocumentId;
+use crate::work::Meter;
+use crate::xref::{DocumentId, XRef};
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
@@ -127,6 +133,20 @@ impl<'a> Stream<'a> {
         }
     }
 
+    /// [`Self::raw_data`], decrypted a counted piece at a time.
+    fn raw_data_metered(&self, meter: &Meter<'_>) -> Result<Cow<'a, [u8]>, DecodeFailure> {
+        let Some(id) = self.decryption_object_id() else {
+            return Ok(Cow::Borrowed(self.data));
+        };
+        match self.dict.ctx().xref().decrypted_reader(id, self.data) {
+            Some(mut data) => data
+                .decrypt_all(meter)
+                .map(Cow::Owned)
+                .map_err(|_| DecodeFailure::Cancelled),
+            None => Ok(Cow::Owned(Vec::new())),
+        }
+    }
+
     /// The object whose key decrypts the stream, when the document is encrypted and
     /// the stream is not a cross-reference stream.
     fn decryption_object_id(&self) -> Option<ObjectIdentifier> {
@@ -184,7 +204,17 @@ impl<'a> Stream<'a> {
         &self,
         image_params: &ImageDecodeParams,
     ) -> Result<FilterResult<'a>, DecodeFailure> {
-        let data = self.raw_data();
+        self.decoded_image_metered(image_params, &Meter::default())
+    }
+
+    /// [`Self::decoded_image`], its work counted on `meter`, a bounded amount at a
+    /// time: [`DecodeFailure::Cancelled`] once the meter's hook asks to stop.
+    pub fn decoded_image_metered(
+        &self,
+        image_params: &ImageDecodeParams,
+        meter: &Meter<'_>,
+    ) -> Result<FilterResult<'a>, DecodeFailure> {
+        let data = self.raw_data_metered(meter)?;
         let filters_and_params = self.filters_and_params();
 
         let mut current: Option<FilterResult<'a>> = None;
@@ -198,6 +228,7 @@ impl<'a> Stream<'a> {
                 current.as_ref().map(|c| c.data.as_ref()).unwrap_or(&data),
                 params,
                 image_params,
+                meter,
             )?;
             current = Some(new);
         }
@@ -206,6 +237,85 @@ impl<'a> Stream<'a> {
             data,
             image_data: None,
         }))
+    }
+
+    /// The decoded data, read incrementally, when the stream's filters allow it: no
+    /// filter, or Flate with no predictor or a byte-aligned one. It yields the bytes
+    /// [`Stream::decoded`] returns, without holding them all. `None` for other
+    /// filters, or where decryption would fail.
+    pub fn decoded_reader(&self) -> Option<DecodedReader<'a>> {
+        let filter = self.reader_filter()?;
+        let data = match self.decryption_object_id() {
+            Some(id) => self.dict.ctx().xref().decrypted_reader(id, self.data)?,
+            None => DecryptedReader::raw(Cow::Borrowed(self.data)),
+        };
+        match filter {
+            None => Some(DecodedReader::raw(data)),
+            Some(params) => DecodedReader::flate(data, &params),
+        }
+    }
+
+    /// Whether the filters and predictor allow [`Stream::decoded_reader`], judged from
+    /// the dictionary alone: no data is read or decrypted.
+    pub fn can_read_incrementally(&self) -> bool {
+        self.reader_filter().is_some()
+    }
+
+    /// The predictor of the one Flate filter, `Some(None)` for no filter, `None` when
+    /// the filters cannot be read incrementally.
+    fn reader_filter(&self) -> Option<Option<PredictorParams>> {
+        let FiltersAndParams { filters, params } = self.filters_and_params();
+        match filters.as_slice() {
+            [] => Some(None),
+            [Filter::FlateDecode] => {
+                let params = PredictorParams::from_params(&params[0]);
+                if params.predictor != 1 {
+                    Unpredictor::new(&params)?;
+                }
+                Some(Some(params))
+            }
+            _ => None,
+        }
+    }
+
+    /// An owned handle to this stream, which [`OwnedStream::get`] turns back into it
+    /// without borrowing the data it was read from: the object's identifier in the
+    /// document for an indirect object, a copy of the dictionary and data for an
+    /// inline image.
+    pub fn to_owned_stream(&self) -> OwnedStream {
+        OwnedStream(match self.dict.obj_id() {
+            Some(id) => OwnedInner::Indirect {
+                xref: self.dict.ctx().xref().clone(),
+                id,
+            },
+            None => OwnedInner::Inline {
+                dict: Arc::from(self.dict.data()),
+                data: Arc::from(self.data),
+            },
+        })
+    }
+}
+
+/// A stream that owns what it needs to read it again (see [`Stream::to_owned_stream`]).
+#[derive(Clone)]
+pub struct OwnedStream(OwnedInner);
+
+#[derive(Clone)]
+enum OwnedInner {
+    Indirect { xref: XRef, id: ObjectIdentifier },
+    Inline { dict: Arc<[u8]>, data: Arc<[u8]> },
+}
+
+impl OwnedStream {
+    /// The stream; `None` if it can no longer be read.
+    pub fn get(&self) -> Option<Stream<'_>> {
+        match &self.0 {
+            OwnedInner::Indirect { xref, id } => xref.get::<Stream<'_>>(*id),
+            OwnedInner::Inline { dict, data } => {
+                let dict = Reader::new(dict).read_without_context::<InlineImageDict<'_>>()?;
+                Some(Stream::new(data, dict.get_dict().clone()))
+            }
+        }
     }
 }
 
@@ -263,6 +373,8 @@ pub enum DecodeFailure {
     Decryption,
     /// An unknown failure occurred.
     Unknown,
+    /// The hook of the [`Meter`] counting the work asked to stop.
+    Cancelled,
 }
 
 /// An image color space.

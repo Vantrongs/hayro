@@ -1,6 +1,6 @@
 use crate::bit_reader::BitReader;
 use crate::state_machine::{BLACK_STATES, INVALID, State, TERMINAL, VALUE_MASK, WHITE_STATES};
-use crate::{Color, DecodeError, Result};
+use crate::{Color, DecodeError, Decoder, Result, stop};
 
 /// End-of-facsimile-block marker (T.6 Section 2.4.1.1).
 /// Two consecutive EOL codes: 000000000001 000000000001.
@@ -23,7 +23,7 @@ impl BitReader<'_> {
     /// Run lengths 0-63 use terminating codes.
     /// Run lengths 64+ use one or more make-up codes followed by a terminating code.
     #[inline(always)]
-    fn decode_run_inner(&mut self, states: &[State]) -> Result<u32> {
+    fn decode_run_inner(&mut self, states: &[State], decoder: &mut impl Decoder) -> Result<u32> {
         let mut total: u32 = 0;
         let mut state: usize = 0;
 
@@ -48,6 +48,7 @@ impl BitReader<'_> {
                     return Ok(total);
                 }
 
+                stop(decoder)?;
                 state = 0;
             } else {
                 state = transition as usize;
@@ -57,28 +58,36 @@ impl BitReader<'_> {
 
     /// Decode a white run length.
     #[inline(always)]
-    fn decode_white_run(&mut self) -> Result<u32> {
-        self.decode_run_inner(&WHITE_STATES)
-            // See 0506179.pdf. We are lenient and check whether perhaps
-            // the opposite color works.
-            .or_else(|_| self.decode_run_inner(&BLACK_STATES))
+    fn decode_white_run(&mut self, decoder: &mut impl Decoder) -> Result<u32> {
+        match self.decode_run_inner(&WHITE_STATES, decoder) {
+            Err(e) if e != DecodeError::Stopped => {
+                // See 0506179.pdf. We are lenient and check whether perhaps
+                // the opposite color works.
+                self.decode_run_inner(&BLACK_STATES, decoder)
+            }
+            run => run,
+        }
     }
 
     /// Decode a black run length.
     #[inline(always)]
-    fn decode_black_run(&mut self) -> Result<u32> {
-        self.decode_run_inner(&BLACK_STATES)
-            // See 0506179.pdf. We are lenient and check whether perhaps
-            // the opposite color works.
-            .or_else(|_| self.decode_run_inner(&WHITE_STATES))
+    fn decode_black_run(&mut self, decoder: &mut impl Decoder) -> Result<u32> {
+        match self.decode_run_inner(&BLACK_STATES, decoder) {
+            Err(e) if e != DecodeError::Stopped => {
+                // See 0506179.pdf. We are lenient and check whether perhaps
+                // the opposite color works.
+                self.decode_run_inner(&WHITE_STATES, decoder)
+            }
+            run => run,
+        }
     }
 
     /// Decode a run length for the specified color.
     #[inline(always)]
-    pub(crate) fn decode_run(&mut self, color: Color) -> Result<u32> {
+    pub(crate) fn decode_run(&mut self, color: Color, decoder: &mut impl Decoder) -> Result<u32> {
         match color {
-            Color::White => self.decode_white_run(),
-            Color::Black => self.decode_black_run(),
+            Color::White => self.decode_white_run(decoder),
+            Color::Black => self.decode_black_run(decoder),
         }
     }
 
@@ -126,7 +135,7 @@ impl BitReader<'_> {
     /// Fill bits (T.4 Section 4.1.3) may precede the EOL as a variable-length
     /// string of zeros.
     #[inline(always)]
-    pub(crate) fn read_eol_if_available(&mut self) -> usize {
+    pub(crate) fn read_eol_if_available(&mut self, decoder: &mut impl Decoder) -> Result<usize> {
         let mut count = 0;
 
         // T.4 Section 4.1.2: EOL = 000000000001
@@ -149,10 +158,11 @@ impl BitReader<'_> {
                 // Found EOL with fill bits, consume all of it.
                 self.read_bits(fill_bits + 1).unwrap();
                 count += 1;
+                stop(decoder)?;
                 continue;
             }
 
-            return count;
+            return Ok(count);
         }
     }
 }

@@ -2,6 +2,7 @@ use crate::bit_reader::{BitChunk, BitChunks, BitReader, BitWriter, bit_mask};
 use crate::filter::png::{self, BytesPerPixel, RowFilter};
 use crate::object::Dict;
 use crate::object::dict::keys::{BITS_PER_COMPONENT, COLORS, COLUMNS, EARLY_CHANGE, PREDICTOR};
+use crate::work::{Meter, POLL_BYTES};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -10,52 +11,83 @@ pub(crate) mod flate {
     use crate::filter::lzw_flate::{PredictorParams, apply_predictor};
     use crate::object::Dict;
 
+    /// The data inflated and its predictor reversed, the work counted on `meter`;
+    /// `None` once its hook asks to stop.
     #[cfg(feature = "unsafe")]
-    pub(crate) fn decode(data: &[u8], params: &Dict<'_>) -> Option<Vec<u8>> {
+    pub(crate) fn decode(data: &[u8], params: &Dict<'_>, meter: &Meter<'_>) -> Option<Vec<u8>> {
         use flate2::read::{DeflateDecoder, ZlibDecoder};
-        use std::io::Read;
+        use std::io::{self, Read};
 
-        fn zlib_stream(data: &[u8]) -> Option<Vec<u8>> {
-            let mut decoder = ZlibDecoder::new(data);
-            let mut result = Vec::new();
-            decoder.read_to_end(&mut result).ok().map(|_| result)
+        /// The encoded bytes, each piece the decoder takes counted before it is read.
+        struct Input<'d, 'm> {
+            data: &'d [u8],
+            meter: &'m Meter<'m>,
         }
 
-        fn deflate_stream(data: &[u8]) -> Option<Vec<u8>> {
-            let mut decoder = DeflateDecoder::new(data);
-            let mut result = Vec::new();
-            decoder.read_to_end(&mut result).ok().map(|_| result)
+        impl Read for Input<'_, '_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.meter
+                    .work(buf.len().min(self.data.len()) + 1)
+                    .map_err(|_| io::Error::from(io::ErrorKind::Other))?;
+                self.data.read(buf)
+            }
         }
 
-        let decoded = zlib_stream(data)
-            .or_else(|| deflate_stream(data))
+        /// Everything `decoder` yields, read a counted piece at a time.
+        fn read_all(mut decoder: impl Read, meter: &Meter<'_>) -> Option<Vec<u8>> {
+            let mut result = Vec::new();
+            loop {
+                // `read_to_end` grows the buffer only as the data needs.
+                let n = (&mut decoder)
+                    .take(POLL_BYTES as u64)
+                    .read_to_end(&mut result)
+                    .ok()?;
+                meter.work(n).ok()?;
+                if n == 0 {
+                    return Some(result);
+                }
+            }
+        }
+
+        let input = || Input { data, meter };
+        let decoded = read_all(ZlibDecoder::new(input()), meter)
             .or_else(|| {
+                (!meter.cancelled()).then(|| read_all(DeflateDecoder::new(input()), meter))?
+            })
+            .or_else(|| {
+                if meter.cancelled() {
+                    return None;
+                }
                 warn!("flate stream is broken, decoding with fallback");
 
-                fallback::decode(data)
+                fallback::decode(data, meter).ok()?
             })?;
         let params = PredictorParams::from_params(params);
-        apply_predictor(decoded, &params)
+        apply_predictor(decoded, &params, meter)
     }
 
+    /// The data inflated and its predictor reversed, the work counted on `meter`;
+    /// `None` once its hook asks to stop.
     #[cfg(not(feature = "unsafe"))]
-    pub(crate) fn decode(data: &[u8], params: &Dict<'_>) -> Option<Vec<u8>> {
-        let decoded = fallback::decode(data)?;
+    pub(crate) fn decode(data: &[u8], params: &Dict<'_>, meter: &Meter<'_>) -> Option<Vec<u8>> {
+        let decoded = fallback::decode(data, meter).ok()??;
         let params = PredictorParams::from_params(params);
-        apply_predictor(decoded, &params)
+        apply_predictor(decoded, &params, meter)
     }
 
     /// Ported from <https://github.com/mozilla/pdf.js/blob/master/src/core/flate_stream.js>
     /// TODO: Rewrite this in idiomatic Rust.
-    mod fallback {
+    pub(crate) mod fallback {
+        use crate::work::{Cancelled, Meter};
         use alloc::vec;
         use alloc::vec::Vec;
 
-        pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
-            flate_decode(data)
+        /// The data decoded, its work counted on `meter`.
+        pub(crate) fn decode(data: &[u8], meter: &Meter<'_>) -> Result<Option<Vec<u8>>, Cancelled> {
+            flate_decode(data, meter)
         }
 
-        fn flate_decode(data: &[u8]) -> Option<Vec<u8>> {
+        fn flate_decode(data: &[u8], meter: &Meter<'_>) -> Result<Option<Vec<u8>>, Cancelled> {
             if data.len() >= 2 {
                 let cmf = data[0];
                 let flg = data[1];
@@ -64,26 +96,41 @@ pub(crate) mod flate {
                     && ((cmf as u16) << 8 | flg as u16).is_multiple_of(31)
                     && (flg & 0x20) == 0
                 {
-                    let mut stream = FlateStream::new(&data[2..]);
+                    let mut stream = FlateStream::new(&data[2..], meter);
                     return stream.decode();
                 }
             }
 
-            let mut stream = FlateStream::new(data);
+            let mut stream = FlateStream::new(data, meter);
             stream.decode()
         }
 
-        struct FlateStream<'a> {
+        #[cfg(test)]
+        std::thread_local! {
+            /// The bytes the last decoder dropped on this thread took and made.
+            pub(crate) static WORK: core::cell::Cell<(usize, usize)> =
+                const { core::cell::Cell::new((0, 0)) };
+        }
+
+        #[cfg(test)]
+        impl Drop for FlateStream<'_, '_> {
+            fn drop(&mut self) {
+                WORK.set((self.pos, self.output.len()));
+            }
+        }
+
+        struct FlateStream<'a, 'm> {
             data: &'a [u8],
             pos: usize,
             code_buf: u32,
             code_size: u8,
             output: Vec<u8>,
             eof: bool,
+            meter: &'m Meter<'m>,
         }
 
-        impl<'a> FlateStream<'a> {
-            fn new(data: &'a [u8]) -> Self {
+        impl<'a, 'm> FlateStream<'a, 'm> {
+            fn new(data: &'a [u8], meter: &'m Meter<'m>) -> Self {
                 FlateStream {
                     data,
                     pos: 0,
@@ -91,15 +138,19 @@ pub(crate) mod flate {
                     code_size: 0,
                     output: Vec::new(),
                     eof: false,
+                    meter,
                 }
             }
 
-            fn decode(&mut self) -> Option<Vec<u8>> {
+            /// Each block counts the bytes it took, and at least one.
+            fn decode(&mut self) -> Result<Option<Vec<u8>>, Cancelled> {
                 while !self.eof && self.pos < self.data.len() {
-                    self.read_block();
+                    let pos = self.pos;
+                    self.read_block()?;
+                    self.meter.work(self.pos - pos + 1)?;
                 }
 
-                Some(core::mem::take(&mut self.output))
+                Ok(Some(core::mem::take(&mut self.output)))
             }
 
             fn get_byte(&mut self) -> Option<u8> {
@@ -169,14 +220,14 @@ pub(crate) mod flate {
                 Some(code_val as u16)
             }
 
-            fn read_block(&mut self) {
+            fn read_block(&mut self) -> Result<(), Cancelled> {
                 // Read block header
                 let hdr = match self.get_bits(3) {
                     Some(h) => h,
                     None => {
                         warn!("bad block header in flate stream");
                         self.eof = true;
-                        return;
+                        return Ok(());
                     }
                 };
 
@@ -188,13 +239,14 @@ pub(crate) mod flate {
 
                 match hdr {
                     0 => self.read_uncompressed_block(),
-                    1 => self.read_compressed_block(true),
-                    2 => self.read_compressed_block(false),
+                    1 => return self.read_compressed_block(true),
+                    2 => return self.read_compressed_block(false),
                     _ => {
                         warn!("unknown block type in flate stream");
                         self.eof = true;
                     }
                 }
+                Ok(())
             }
 
             fn read_uncompressed_block(&mut self) {
@@ -260,7 +312,8 @@ pub(crate) mod flate {
                 }
             }
 
-            fn read_compressed_block(&mut self, fixed: bool) {
+            /// Counts the tables it builds and each code's output.
+            fn read_compressed_block(&mut self, fixed: bool) -> Result<(), Cancelled> {
                 let (lit_code_table, dist_code_table) = if fixed {
                     (get_fixed_lit_table(), get_fixed_dist_table())
                 } else {
@@ -268,24 +321,27 @@ pub(crate) mod flate {
                         Some(tables) => tables,
                         None => {
                             self.eof = true;
-                            return;
+                            return Ok(());
                         }
                     }
                 };
+                self.meter
+                    .work(lit_code_table.codes.len() + dist_code_table.codes.len())?;
 
                 loop {
                     let code1 = match self.get_code(&lit_code_table) {
                         Some(c) => c,
                         None => {
                             self.eof = true;
-                            return;
+                            return Ok(());
                         }
                     };
 
                     if code1 < 256 {
                         self.output.push(code1 as u8);
+                        self.meter.work(1)?;
                     } else if code1 == 256 {
-                        return;
+                        return Ok(());
                     } else {
                         let code1 = code1 - 257;
                         let length_info = LENGTH_DECODE.get(code1 as usize).copied().unwrap_or(0);
@@ -297,7 +353,7 @@ pub(crate) mod flate {
                                 length += extra as usize;
                             } else {
                                 self.eof = true;
-                                return;
+                                return Ok(());
                             }
                         }
 
@@ -305,7 +361,7 @@ pub(crate) mod flate {
                             Some(c) => c,
                             None => {
                                 self.eof = true;
-                                return;
+                                return Ok(());
                             }
                         };
 
@@ -315,7 +371,7 @@ pub(crate) mod flate {
                                 warn!("invalid distance code {} in flate stream", dist_code);
 
                                 self.eof = true;
-                                return;
+                                return Ok(());
                             }
                         };
 
@@ -327,7 +383,7 @@ pub(crate) mod flate {
                                 distance += extra as usize;
                             } else {
                                 self.eof = true;
-                                return;
+                                return Ok(());
                             }
                         }
 
@@ -339,6 +395,7 @@ pub(crate) mod flate {
                                 self.output.push(byte);
                             }
                         }
+                        self.meter.work(length + 1)?;
                     }
                 }
             }
@@ -566,16 +623,18 @@ pub(crate) mod lzw {
     use crate::bit_reader::BitReader;
     use crate::filter::lzw_flate::{PredictorParams, apply_predictor};
     use crate::object::Dict;
+    use crate::work::Meter;
     use alloc::vec;
     use alloc::vec::Vec;
 
-    /// Decode a LZW-encoded stream.
-    pub(crate) fn decode(data: &[u8], params: &Dict<'_>) -> Option<Vec<u8>> {
+    /// Decode a LZW-encoded stream, its work counted on `meter`; `None` once its hook
+    /// asks to stop.
+    pub(crate) fn decode(data: &[u8], params: &Dict<'_>, meter: &Meter<'_>) -> Option<Vec<u8>> {
         let params = PredictorParams::from_params(params);
 
-        let decoded = decode_impl(data, params.early_change)?;
+        let decoded = decode_impl(data, params.early_change, meter)?;
 
-        apply_predictor(decoded, &params)
+        apply_predictor(decoded, &params, meter)
     }
 
     const CLEAR_TABLE: usize = 256;
@@ -583,7 +642,7 @@ pub(crate) mod lzw {
     const MAX_ENTRIES: usize = 4096;
     const INITIAL_SIZE: u16 = 258;
 
-    fn decode_impl(data: &[u8], early_change: bool) -> Option<Vec<u8>> {
+    fn decode_impl(data: &[u8], early_change: bool, meter: &Meter<'_>) -> Option<Vec<u8>> {
         let mut table = Table::new(early_change);
         let mut bit_size = table.code_length();
         let mut reader = BitReader::new(data);
@@ -591,6 +650,7 @@ pub(crate) mod lzw {
         let mut prev = None;
 
         loop {
+            meter.work(1).ok()?;
             let next = match reader.read(bit_size) {
                 Some(code) => code as usize,
                 None => {
@@ -615,6 +675,7 @@ pub(crate) mod lzw {
                     if new < table.size() {
                         let entry = table.get(new)?;
                         let first_byte = entry[0];
+                        meter.work(entry.len()).ok()?;
                         decoded.extend_from_slice(entry);
 
                         if let Some(prev_code) = prev {
@@ -626,6 +687,7 @@ pub(crate) mod lzw {
                         let first_byte = prev_entry[0];
 
                         let new_entry = table.register(prev_code, first_byte)?;
+                        meter.work(new_entry.len()).ok()?;
                         decoded.extend_from_slice(new_entry);
                     } else {
                         warn!("LZW decode error: code {new} not found and prev is None");
@@ -708,21 +770,24 @@ pub(crate) mod lzw {
     }
 }
 
-struct PredictorParams {
-    predictor: u8,
-    colors: u8,
-    bits_per_component: u8,
-    columns: usize,
-    early_change: bool,
+pub(crate) struct PredictorParams {
+    pub(crate) predictor: u8,
+    pub(crate) colors: u8,
+    pub(crate) bits_per_component: u8,
+    pub(crate) columns: usize,
+    pub(crate) early_change: bool,
 }
 
 impl PredictorParams {
-    fn bits_per_pixel(&self) -> u8 {
-        self.bits_per_component * self.colors
+    fn bits_per_pixel(&self) -> usize {
+        usize::from(self.bits_per_component) * usize::from(self.colors)
     }
 
-    fn row_length_in_bytes(&self) -> usize {
-        (self.columns * self.bits_per_pixel() as usize).div_ceil(8)
+    fn row_length_in_bytes(&self) -> Option<usize> {
+        let bits = self.bits_per_pixel();
+        (self.columns / 8)
+            .checked_mul(bits)?
+            .checked_add(((self.columns % 8) * bits).div_ceil(8))
     }
 }
 
@@ -739,7 +804,7 @@ impl Default for PredictorParams {
 }
 
 impl PredictorParams {
-    fn from_params(dict: &Dict<'_>) -> Self {
+    pub(crate) fn from_params(dict: &Dict<'_>) -> Self {
         Self {
             predictor: dict.get(PREDICTOR).unwrap_or(1),
             colors: dict.get(COLORS).unwrap_or(1),
@@ -750,22 +815,28 @@ impl PredictorParams {
     }
 }
 
-fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
+/// The data with its predictor reversed, in pieces whose work counts on `meter`;
+/// `None` once its hook asks to stop.
+pub(crate) fn apply_predictor(
+    data: Vec<u8>,
+    params: &PredictorParams,
+    meter: &Meter<'_>,
+) -> Option<Vec<u8>> {
     match params.predictor {
         1 => Some(data),
         i => {
             let is_png_predictor = i >= 10;
 
-            let row_len = params.row_length_in_bytes();
+            let row_len = params.row_length_in_bytes()?;
 
             let total_row_len = if is_png_predictor {
                 // + 1 Because each row must start with the predictor that is used for PNG predictors.
-                row_len + 1
+                row_len.checked_add(1)?
             } else {
                 row_len
             };
 
-            let num_rows = data.len() / total_row_len;
+            let num_rows = data.len().checked_div(total_row_len)?;
 
             if !matches!(params.bits_per_component, 1 | 2 | 4 | 8 | 16) {
                 warn!("invalid bits per component {}", params.bits_per_component);
@@ -774,10 +845,7 @@ fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
             }
 
             let (bit_size, chunk_len) = if is_png_predictor {
-                (
-                    8,
-                    (params.colors * params.bits_per_component).div_ceil(8) as usize,
-                )
+                (8, params.bits_per_pixel().div_ceil(8))
             } else {
                 (params.bits_per_component, params.colors as usize)
             };
@@ -793,6 +861,7 @@ fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
                     total_row_len,
                     num_rows,
                     tbpp,
+                    meter,
                 );
             }
 
@@ -817,6 +886,7 @@ fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
                             &mut writer,
                             chunk_len,
                             bit_size,
+                            meter,
                         )?,
                         2 => apply::<Up>(
                             prev_row,
@@ -826,6 +896,7 @@ fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
                             &mut writer,
                             chunk_len,
                             bit_size,
+                            meter,
                         )?,
                         3 => apply::<Avg>(
                             prev_row,
@@ -835,6 +906,7 @@ fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
                             &mut writer,
                             chunk_len,
                             bit_size,
+                            meter,
                         )?,
                         4 => apply::<Paeth>(
                             prev_row,
@@ -844,12 +916,14 @@ fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
                             &mut writer,
                             chunk_len,
                             bit_size,
+                            meter,
                         )?,
                         _ => {
                             // Just copy the data.
                             let mut reader = BitReader::new(in_data);
 
                             while let Some(data) = reader.read(bit_size) {
+                                meter.work(1).ok()?;
                                 writer.write(data);
                             }
                         }
@@ -863,7 +937,8 @@ fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
                         &mut writer,
                         chunk_len,
                         bit_size,
-                    );
+                        meter,
+                    )?;
                 } else {
                     warn!("unknown predictor {i}");
 
@@ -880,6 +955,105 @@ fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
     }
 }
 
+/// Reverses a predictor row by row, as `apply_predictor` does for the whole data at
+/// once: for the predictors and row layouts `apply_predictor_8bit_png` handles
+/// (whole bytes per pixel), the only ones it accepts. A row is reversed in parts, as
+/// its bytes arrive.
+#[derive(Clone)]
+pub(crate) struct Unpredictor {
+    is_png_predictor: bool,
+    tbpp: BytesPerPixel,
+    /// The previous row, decoded after its predictor byte for PNG predictors; empty
+    /// before the first, as `apply_predictor_8bit_png` passes it.
+    prev: Vec<u8>,
+    row_len: usize,
+    /// The bytes of the row being read that are reversed.
+    done: usize,
+}
+
+impl Unpredictor {
+    /// `None` for predictor 1 (no prediction) and for the predictors and layouts
+    /// `apply_predictor` handles otherwise (or rejects).
+    pub(crate) fn new(params: &PredictorParams) -> Option<Self> {
+        let is_png_predictor = params.predictor >= 10;
+        if !(is_png_predictor || params.predictor == 2)
+            || !matches!(params.bits_per_component, 1 | 2 | 4 | 8 | 16)
+        {
+            return None;
+        }
+        let row_len = params.row_length_in_bytes()?;
+        let chunk_len = if is_png_predictor {
+            params.bits_per_pixel().div_ceil(8)
+        } else if params.bits_per_component == 8 {
+            params.colors as usize
+        } else {
+            return None;
+        };
+        if row_len == 0 {
+            return None;
+        }
+        row_len.checked_add(usize::from(is_png_predictor))?;
+        let tbpp = BytesPerPixel::from_row_len(row_len, chunk_len)?;
+        Some(Self {
+            is_png_predictor,
+            tbpp,
+            prev: Vec::new(),
+            row_len,
+            done: 0,
+        })
+    }
+
+    /// The bytes of one encoded row (with its predictor byte for PNG predictors).
+    pub(crate) fn input_len(&self) -> usize {
+        self.row_len + usize::from(self.is_png_predictor)
+    }
+
+    /// Reverses the predictor over the bytes of `input`, the encoded row read so far,
+    /// that make whole pixels and were not reversed before, once there are at least
+    /// `min` of them.
+    pub(crate) fn advance(&mut self, input: &mut [u8], min: usize) {
+        let (filter, row) = if self.is_png_predictor {
+            let Some((&mut filter, row)) = input.split_first_mut() else {
+                return;
+            };
+            (RowFilter::from_u8(filter), row)
+        } else {
+            (Some(RowFilter::Sub), input)
+        };
+        let end = row.len() / self.tbpp as usize * self.tbpp as usize;
+        if end <= self.done || end - self.done < min {
+            return;
+        }
+        if let Some(filter) = filter {
+            png::unfilter_part(filter, self.tbpp, self.row(), row, self.done..end);
+        }
+        self.done = end;
+    }
+
+    /// Decodes the rest of `input`, which holds the whole encoded row, and takes it
+    /// as the previous row ([`Self::row`]), leaving `input` empty.
+    pub(crate) fn finish_row(&mut self, input: &mut Vec<u8>) {
+        self.advance(input, 0);
+        core::mem::swap(&mut self.prev, input);
+        input.clear();
+        self.done = 0;
+    }
+
+    /// The last row decoded; empty before the first.
+    pub(crate) fn row(&self) -> &[u8] {
+        self.prev
+            .get(usize::from(self.is_png_predictor)..)
+            .unwrap_or_default()
+    }
+
+    /// Back to the first row.
+    pub(crate) fn reset(&mut self) {
+        self.prev.clear();
+        self.done = 0;
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
 fn apply_predictor_8bit_png(
     mut data: Vec<u8>,
     predictor: u8,
@@ -888,45 +1062,51 @@ fn apply_predictor_8bit_png(
     total_row_len: usize,
     num_rows: usize,
     tbpp: BytesPerPixel,
+    meter: &Meter<'_>,
 ) -> Option<Vec<u8>> {
     if row_len == 0 || total_row_len == 0 {
         return None;
     }
 
     let out_len = num_rows * row_len;
+    let part_len = POLL_BYTES / tbpp as usize * tbpp as usize;
 
     for row_idx in 0..num_rows {
         let src_start = row_idx * total_row_len;
         let dst_start = row_idx * row_len;
 
-        if is_png_predictor {
-            let predictor = data[src_start];
-            data.copy_within(src_start + 1..src_start + 1 + row_len, dst_start);
-
-            let (done, rest) = data.split_at_mut(dst_start);
-            let prev_row = if let Some(prev_start) = done.len().checked_sub(row_len) {
-                &done[prev_start..]
-            } else {
-                &[]
-            };
-            let row = &mut rest[..row_len];
-
-            if let Some(filter) = RowFilter::from_u8(predictor) {
-                png::unfilter(filter, tbpp, prev_row, row);
-            }
+        let filter = if is_png_predictor {
+            RowFilter::from_u8(data[src_start])
         } else if predictor == 2 {
-            let (done, rest) = data.split_at_mut(dst_start);
-            let prev_row = if let Some(prev_start) = done.len().checked_sub(row_len) {
-                &done[prev_start..]
-            } else {
-                &[]
-            };
-            let row = &mut rest[..row_len];
-            png::unfilter(RowFilter::Sub, tbpp, prev_row, row);
+            Some(RowFilter::Sub)
         } else {
             warn!("unknown predictor {predictor}");
 
             return None;
+        };
+
+        for start in (0..row_len).step_by(part_len) {
+            let end = (start + part_len).min(row_len);
+            if is_png_predictor {
+                // The row moves left, so the bytes a part overwrites were moved before.
+                data.copy_within(
+                    src_start + 1 + start..src_start + 1 + end,
+                    dst_start + start,
+                );
+            }
+
+            let (done, rest) = data.split_at_mut(dst_start);
+            let prev_row = if let Some(prev_start) = done.len().checked_sub(row_len) {
+                &done[prev_start..]
+            } else {
+                &[]
+            };
+            let row = &mut rest[..row_len];
+
+            if let Some(filter) = filter {
+                png::unfilter_part(filter, tbpp, prev_row, row, start..end);
+            }
+            meter.work(end - start).ok()?;
         }
     }
 
@@ -935,6 +1115,7 @@ fn apply_predictor_8bit_png(
     Some(data)
 }
 
+#[expect(clippy::too_many_arguments)]
 fn apply<'a, T: Predictor>(
     prev_row: BitChunks<'a>,
     mut prev_col: BitChunk,
@@ -943,8 +1124,10 @@ fn apply<'a, T: Predictor>(
     writer: &mut BitWriter<'a>,
     chunk_len: usize,
     bit_size: u8,
+    meter: &Meter<'_>,
 ) -> Option<()> {
     for (cur_row, prev_row) in cur_row.zip(prev_row) {
+        meter.work(chunk_len).ok()?;
         let old_pos = writer.cur_pos();
 
         for (((cur_row, prev_row), prev_col), top_left) in cur_row
@@ -1028,12 +1211,14 @@ impl Predictor for Paeth {
 #[rustfmt::skip]
 mod tests {
     use crate::filter::lzw_flate::{PredictorParams, apply_predictor, flate, lzw};
+    use crate::filter::png::{self, BytesPerPixel, RowFilter};
     use crate::object::Dict;
+    use crate::work::{Meter, POLL_BYTES};
 
     #[test]
     fn decode_lzw() {
         let input = [0x80, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01];
-        let decoded = lzw::decode(&input, &Dict::default()).unwrap();
+        let decoded = lzw::decode(&input, &Dict::default(), &Meter::default()).unwrap();
 
         assert_eq!(decoded, vec![45, 45, 45, 45, 45, 65, 45, 45, 45, 66]);
     }
@@ -1044,7 +1229,7 @@ mod tests {
             0x78, 0x9c, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x7, 0x0, 0x5, 0x8c, 0x1, 0xf5,
         ];
 
-        let decoded = flate::decode(&input, &Dict::default()).unwrap();
+        let decoded = flate::decode(&input, &Dict::default(), &Meter::default()).unwrap();
         assert_eq!(decoded, b"Hello");
     }
 
@@ -1052,7 +1237,7 @@ mod tests {
     fn decode_flate() {
         let input = [0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x7, 0x0];
 
-        let decoded = flate::decode(&input, &Dict::default()).unwrap();
+        let decoded = flate::decode(&input, &Dict::default(), &Meter::default()).unwrap();
         assert_eq!(decoded, b"Hello");
     }
     
@@ -1077,7 +1262,7 @@ mod tests {
         };
 
         let expected = predictor_expected();
-        let out = apply_predictor(input.to_vec(), &params).unwrap();
+        let out = apply_predictor(input.to_vec(), &params, &Meter::default()).unwrap();
 
         assert_eq!(expected, out);
     }
@@ -1140,5 +1325,35 @@ mod tests {
                 4, 3, 1, 252, 5, 253, 6, 1, 229, 254,
             ],
         );
+    }
+
+    /// Rows wider than a piece, each with another filter, reverse as whole rows do.
+    #[test]
+    fn wide_rows_reverse_as_whole_rows() {
+        let row_len = (2 * POLL_BYTES / 3 + 5) * 3;
+        let mut seed = 7_u32;
+        let mut input = Vec::new();
+        for filter in 0..5 {
+            input.push(filter);
+            input.extend((0..row_len).map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (seed >> 16) as u8
+            }));
+        }
+        let mut expected = Vec::new();
+        for row in input.chunks(row_len + 1) {
+            let mut current = row[1..].to_vec();
+            let previous = &expected[expected.len().saturating_sub(row_len)..];
+            png::unfilter(RowFilter::from_u8(row[0]).unwrap(), BytesPerPixel::Three, previous, &mut current);
+            expected.extend(current);
+        }
+        let params = PredictorParams {
+            predictor: 15,
+            colors: 3,
+            bits_per_component: 8,
+            columns: row_len / 3,
+            early_change: false,
+        };
+        assert_eq!(apply_predictor(input, &params, &Meter::default()).unwrap(), expected);
     }
 }

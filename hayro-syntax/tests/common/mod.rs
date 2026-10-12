@@ -6,7 +6,7 @@
 pub(crate) mod allocations;
 mod fixtures;
 
-pub(crate) use fixtures::{file, one_page_objects, stream};
+pub(crate) use fixtures::{file, noise, one_page_objects, stored_zlib, stream};
 
 use aes::cipher::block_padding::{NoPadding, Pkcs7};
 use aes::cipher::{BlockEncryptMut, KeyIvInit};
@@ -68,28 +68,4 @@ pub(crate) fn encrypted_stream_file(
         aes256_encryption(key),
     ];
     file(&objects, &aes256_trailer(4))
-}
-
-/// A zlib stream of stored blocks, which every Flate decoder reads without a
-/// compressor.
-pub(crate) fn stored_zlib(data: &[u8]) -> Vec<u8> {
-    let mut out = vec![0x78, 1];
-    let mut chunks = data.chunks(usize::from(u16::MAX)).peekable();
-    if chunks.peek().is_none() {
-        out.extend([1, 0, 0, 0xFF, 0xFF]);
-    }
-    while let Some(chunk) = chunks.next() {
-        out.push(u8::from(chunks.peek().is_none()));
-        let len = chunk.len() as u16;
-        out.extend(len.to_le_bytes());
-        out.extend((!len).to_le_bytes());
-        out.extend(chunk);
-    }
-    let (mut a, mut b) = (1_u32, 0_u32);
-    for &byte in data {
-        a = (a + u32::from(byte)) % 65521;
-        b = (b + a) % 65521;
-    }
-    out.extend(((b << 16) | a).to_be_bytes());
-    out
 }

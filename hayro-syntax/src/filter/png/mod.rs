@@ -1,6 +1,7 @@
 //! Taken from the png crate, see <https://github.com/image-rs/image-png/blob/master/src/filter/mod.rs>
 
 use core::convert::TryInto;
+use core::ops::Range;
 
 mod paeth;
 
@@ -55,6 +56,41 @@ impl RowFilter {
             _ => None,
         }
     }
+}
+
+// Note: This function is not from the png crate.
+/// Unfilters pixels `part` of `current` (a range of whole pixels), whose pixels before
+/// it are unfiltered, as `unfilter` does for the whole row: a row is unfiltered in
+/// parts as its bytes arrive.
+pub(crate) fn unfilter_part(
+    filter: RowFilter,
+    tbpp: BytesPerPixel,
+    previous: &[u8],
+    current: &mut [u8],
+    part: Range<usize>,
+) {
+    let bpp = tbpp as usize;
+    let from = part.start.saturating_sub(bpp);
+    let above = previous.get(from..part.end).unwrap_or(&[]);
+    if part.start == 0 || filter == RowFilter::NoFilter {
+        unfilter(filter, tbpp, above, &mut current[part]);
+        return;
+    }
+    // `unfilter` takes the pixels left and above-left of its first as zero. The pixel
+    // before the part is filtered again against those zeros, so that unfiltering it
+    // with the part gives it back and the part sees its true neighbours.
+    let mut left = [0; 8];
+    left[..bpp].copy_from_slice(&current[from..part.start]);
+    for (i, v) in current[from..part.start].iter_mut().enumerate() {
+        let b = above.get(i).copied().unwrap_or(0);
+        *v = v.wrapping_sub(match filter {
+            RowFilter::Up | RowFilter::Paeth => b,
+            RowFilter::Avg => b / 2,
+            RowFilter::NoFilter | RowFilter::Sub => 0,
+        });
+    }
+    unfilter(filter, tbpp, above, &mut current[from..part.end]);
+    debug_assert_eq!(current[from..part.start], left[..bpp]);
 }
 
 pub(crate) fn unfilter(
@@ -313,5 +349,54 @@ pub(crate) fn unfilter(
             }
         },
         Paeth => paeth::unfilter(tbpp, previous, current),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// A row unfiltered in parts, split at every pixel boundary and at several at
+    /// once, comes out as unfiltering it whole does: for every filter and pixel size,
+    /// with a previous row and without.
+    #[test]
+    fn a_row_unfiltered_in_parts_matches_it_whole() {
+        let bytes = |n: usize, seed: u32| -> Vec<u8> {
+            let mut x = seed.wrapping_mul(2_654_435_761) | 1;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    (x >> 24) as u8
+                })
+                .collect()
+        };
+        for bpp in [1, 2, 3, 4, 6, 8] {
+            let tbpp = BytesPerPixel::from_row_len(bpp, bpp).unwrap();
+            let len = 9 * bpp;
+            for filter in 0..5 {
+                let filter = RowFilter::from_u8(filter).unwrap();
+                for previous in [Vec::new(), bytes(len, 7)] {
+                    let encoded = bytes(len, bpp as u32 + 11);
+                    let mut whole = encoded.clone();
+                    unfilter(filter, tbpp, &previous, &mut whole);
+                    let splits = (1..9).map(|k| alloc::vec![k * bpp]).chain([
+                        alloc::vec![bpp, 2 * bpp, 5 * bpp],
+                        (1..9).map(|k| k * bpp).collect(),
+                    ]);
+                    for split in splits {
+                        let mut parts = encoded.clone();
+                        let mut start = 0;
+                        for end in split.into_iter().chain([len]) {
+                            unfilter_part(filter, tbpp, &previous, &mut parts, start..end);
+                            start = end;
+                        }
+                        assert_eq!(parts, whole, "{filter:?} bpp {bpp}");
+                    }
+                }
+            }
+        }
     }
 }

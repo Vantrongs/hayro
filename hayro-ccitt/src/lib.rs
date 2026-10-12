@@ -54,6 +54,8 @@ pub enum DecodeError {
     LineLengthMismatch,
     /// Arithmetic overflow in run length or position calculation.
     Overflow,
+    /// The decoder asked to stop ([`Decoder::stop`]).
+    Stopped,
 }
 
 impl core::fmt::Display for DecodeError {
@@ -63,6 +65,7 @@ impl core::fmt::Display for DecodeError {
             Self::InvalidCode => write!(f, "invalid CCITT code sequence"),
             Self::LineLengthMismatch => write!(f, "scanline length mismatch"),
             Self::Overflow => write!(f, "arithmetic overflow in position calculation"),
+            Self::Stopped => write!(f, "decoding stopped"),
         }
     }
 }
@@ -116,6 +119,12 @@ pub trait Decoder {
     fn push_pixels(&mut self, white: bool, count: u32);
     /// Called when a row has been completed.
     fn next_line(&mut self);
+    /// Whether to stop decoding, asked before each line and after each code read, so
+    /// that it is asked within a bounded amount of work whatever the data; decoding
+    /// then fails with [`DecodeError::Stopped`]. Never by default.
+    fn stop(&mut self) -> bool {
+        false
+    }
 }
 
 /// Pixel color in a bi-level (black and white) image.
@@ -182,13 +191,14 @@ fn decode_group3_1d(
 ) -> Result<()> {
     // It seems like PDF producers are a bit sloppy with the `end_of_line` flag,
     // so we just always try to read one.
-    let _ = reader.read_eol_if_available();
+    reader.read_eol_if_available(decoder)?;
 
     loop {
+        stop(decoder)?;
         decode_1d_line(ctx, reader, decoder)?;
         ctx.next_line(reader, decoder)?;
 
-        if group3_check_eob(ctx, reader) {
+        if group3_check_eob(ctx, reader, decoder)? {
             break;
         }
     }
@@ -204,9 +214,10 @@ fn decode_group3_2d(
 ) -> Result<()> {
     // It seems like PDF producers are a bit sloppy with the `end_of_line` flag,
     // so we just always try to read one.
-    let _ = reader.read_eol_if_available();
+    reader.read_eol_if_available(decoder)?;
 
     loop {
+        stop(decoder)?;
         let tag_bit = reader.read_bit()?;
 
         if tag_bit == 1 {
@@ -217,7 +228,7 @@ fn decode_group3_2d(
 
         ctx.next_line(reader, decoder)?;
 
-        if group3_check_eob(ctx, reader) {
+        if group3_check_eob(ctx, reader, decoder)? {
             break;
         }
     }
@@ -226,22 +237,26 @@ fn decode_group3_2d(
 }
 
 /// Check for end-of-block, including RTC (T.4 Section 4.1.4).
-fn group3_check_eob(ctx: &mut DecoderContext, reader: &mut BitReader<'_>) -> bool {
-    let eol_count = reader.read_eol_if_available();
+fn group3_check_eob(
+    ctx: &mut DecoderContext,
+    reader: &mut BitReader<'_>,
+    decoder: &mut impl Decoder,
+) -> Result<bool> {
+    let eol_count = reader.read_eol_if_available(decoder)?;
 
     // T.4 Section 4.1.4: "The end of a document transmission is indicated by
     // sending six consecutive EOLs."
     // PDFBOX-2778 has 7 EOL, although it should only be 6. Let's be lenient
     // and check with >=.
     if ctx.settings.end_of_block && eol_count >= 6 {
-        return true;
+        return Ok(true);
     }
 
     if ctx.decoded_rows == ctx.settings.rows || reader.at_end() {
-        return true;
+        return Ok(true);
     }
 
-    false
+    Ok(false)
 }
 
 fn decode_group4(
@@ -250,6 +265,7 @@ fn decode_group4(
     decoder: &mut impl Decoder,
 ) -> Result<()> {
     loop {
+        stop(decoder)?;
         if ctx.settings.end_of_block && reader.peak_bits(24) == Ok(EOFB) {
             reader.read_bits(24)?;
             break;
@@ -266,6 +282,16 @@ fn decode_group4(
     Ok(())
 }
 
+/// Fails with [`DecodeError::Stopped`] when `decoder` asks to stop.
+#[inline(always)]
+pub(crate) fn stop(decoder: &mut impl Decoder) -> Result<()> {
+    if decoder.stop() {
+        Err(DecodeError::Stopped)
+    } else {
+        Ok(())
+    }
+}
+
 /// Decode a single 1D-coded line (T.4 Section 4.1.1, T.6 Section 2.2.4).
 #[inline(always)]
 fn decode_1d_line(
@@ -274,7 +300,8 @@ fn decode_1d_line(
     decoder: &mut impl Decoder,
 ) -> Result<()> {
     while !ctx.at_eol() {
-        let run_length = reader.decode_run(ctx.color)?;
+        stop(decoder)?;
+        let run_length = reader.decode_run(ctx.color, decoder)?;
         ctx.push_pixels(decoder, run_length);
         ctx.color = ctx.color.opposite();
     }
@@ -290,6 +317,7 @@ fn decode_2d_line(
     decoder: &mut impl Decoder,
 ) -> Result<()> {
     while !ctx.at_eol() {
+        stop(decoder)?;
         let mode = reader.decode_mode()?;
 
         match mode {
@@ -317,11 +345,11 @@ fn decode_2d_line(
             }
             // Horizontal mode (T.4 Section 4.2.1.3.2c, T.6 Section 2.2.3.3).
             Mode::Horizontal => {
-                let a0a1 = reader.decode_run(ctx.color)?;
+                let a0a1 = reader.decode_run(ctx.color, decoder)?;
                 ctx.push_pixels(decoder, a0a1);
                 ctx.color = ctx.color.opposite();
 
-                let a1a2 = reader.decode_run(ctx.color)?;
+                let a1a2 = reader.decode_run(ctx.color, decoder)?;
                 ctx.push_pixels(decoder, a1a2);
                 ctx.color = ctx.color.opposite();
 

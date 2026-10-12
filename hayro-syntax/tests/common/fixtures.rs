@@ -49,3 +49,47 @@ pub(crate) fn one_page(size: u32, entries: &str, objects: Vec<Vec<u8>>) -> Vec<u
     all.extend(objects);
     file(&all, "")
 }
+
+/// `data` as raw deflate of stored (uncompressed) blocks of at most `block` bytes,
+/// which every Flate decoder reads without a compressor.
+pub(crate) fn stored_deflate(data: &[u8], block: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut blocks = data.chunks(block).peekable();
+    if blocks.peek().is_none() {
+        out.extend([1, 0, 0, 0xFF, 0xFF]);
+    }
+    while let Some(b) = blocks.next() {
+        out.push(u8::from(blocks.peek().is_none()));
+        let len = b.len() as u16;
+        out.extend(len.to_le_bytes());
+        out.extend((!len).to_le_bytes());
+        out.extend_from_slice(b);
+    }
+    out
+}
+
+/// `stored_deflate` in a zlib stream, with its header and checksum.
+pub(crate) fn stored_zlib(data: &[u8], block: usize) -> Vec<u8> {
+    let mut out = vec![0x78, 0x01];
+    out.extend(stored_deflate(data, block));
+    let (mut a, mut b) = (1_u32, 0_u32);
+    for &d in data {
+        a = (a + u32::from(d)) % 65521;
+        b = (b + a) % 65521;
+    }
+    out.extend(((b << 16) | a).to_be_bytes());
+    out
+}
+
+/// `n` deterministic pseudo-random bytes.
+pub(crate) fn noise(n: usize, seed: u32) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x >> 24) as u8
+        })
+        .collect()
+}
