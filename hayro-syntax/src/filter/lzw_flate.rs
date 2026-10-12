@@ -1046,6 +1046,12 @@ impl Unpredictor {
             .unwrap_or_default()
     }
 
+    /// The heap bytes the previous row holds.
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.prev.capacity()
+    }
+
     /// Back to the first row.
     pub(crate) fn reset(&mut self) {
         self.prev.clear();

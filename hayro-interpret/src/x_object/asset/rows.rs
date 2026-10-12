@@ -9,7 +9,7 @@ use crate::x_object::decode::{
 use crate::x_object::image::{ImageKind, ImageXObject};
 use core::ops::Range;
 use hayro_syntax::object::Stream;
-use hayro_syntax::object::stream::{DecodedReader, ReadError};
+use hayro_syntax::object::stream::{DecodedCheckpoint, DecodedReader, ReadError};
 use hayro_syntax::work::{Cancelled, Meter};
 use std::sync::OnceLock;
 
@@ -30,6 +30,7 @@ pub(super) fn piece_texels(columns: usize, bytes: usize) -> usize {
 }
 
 /// Why reading rows stopped before the last.
+#[derive(Debug)]
 pub(super) enum Break {
     /// A reader restarted: the pass starts over from the first row.
     Restart,
@@ -98,6 +99,17 @@ impl<'a> RawRows<'a> {
         self.reader.rewind();
         self.total = 0;
         self.at = 0;
+    }
+
+    /// Continues from `state`, saved at the start of `row`; false if it does not
+    /// resume this reader.
+    pub(super) fn resume(&mut self, row: u32, state: &DecodedCheckpoint) -> bool {
+        if !self.reader.restore(state) {
+            return false;
+        }
+        self.total = row as usize * self.row_bytes;
+        self.at = 0;
+        true
     }
 
     /// Starts reading the next row.

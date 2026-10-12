@@ -3,6 +3,7 @@
 //! view shows.
 
 mod decoded;
+mod index;
 mod rows;
 mod streamed;
 
@@ -16,6 +17,7 @@ use crate::interpret::state::ActiveTransferFunction;
 use decoded::Decoded;
 use hayro_syntax::object::stream::OwnedStream;
 use hayro_syntax::work::{Cancelled, Meter};
+use index::Checkpoints;
 use kurbo::Affine;
 use rows::{MaskHeight, PIECE_BYTES};
 use std::sync::Arc;
@@ -30,6 +32,7 @@ pub struct ImageAsset(Arc<AssetData>);
 
 struct AssetData {
     stream: OwnedStream,
+    checkpoints: Checkpoints,
     mask_height: MaskHeight,
     width: u32,
     height: u32,
@@ -46,6 +49,7 @@ impl ImageXObject<'_> {
     pub(crate) fn asset(&self, key: Option<u128>) -> ImageAsset {
         ImageAsset(Arc::new(AssetData {
             stream: self.stream.to_owned_stream(),
+            checkpoints: Checkpoints::default(),
             mask_height: MaskHeight::new(),
             width: self.width,
             height: self.height,
@@ -81,6 +85,12 @@ impl ImageAsset {
         self.0.key
     }
 
+    /// The bytes the decoder states saved for this asset's requests take: at most
+    /// 2 MiB, whatever the image's size.
+    pub fn checkpoint_bytes(&self) -> Result<usize, RequestError> {
+        Ok(self.0.checkpoints.bytes()?)
+    }
+
     fn xobject(&self) -> Option<ImageXObject<'_>> {
         let a = &*self.0;
         Some(ImageXObject {
@@ -101,12 +111,13 @@ impl ImageAsset {
     /// `DeviceGray` or `DeviceRGB` samples used as stored or inverted, and masks of the
     /// same kinds or decoded whole, only read their dictionaries here (and, the first
     /// time, read such a mask's data through to count its rows); requests read their
-    /// data from the start and keep a piece of a row and a few sums per bin. Other
-    /// images are decoded whole here (with `hint`, the size they are wanted at, for
-    /// decoders that can reduce), and requests read the decoded planes, which the
-    /// source holds until it is dropped. `cancel` is polled as
-    /// [`ImageRequest::cancel`] is; a cancelled open leaves the asset as it was, to be
-    /// opened again.
+    /// data and keep a piece of a row and a few sums per bin. A request of such a Flate
+    /// image without a mask read alongside resumes from the nearest decoder state an
+    /// earlier request of the asset saved, instead of from the start. Other images are
+    /// decoded whole here (with `hint`, the size they are wanted at, for decoders that
+    /// can reduce), and requests read the decoded planes, which the source holds until
+    /// it is dropped. `cancel` is polled as [`ImageRequest::cancel`] is; a cancelled
+    /// open leaves the asset as it was, to be opened again.
     pub fn open(
         &self,
         hint: Option<(u32, u32)>,
@@ -116,7 +127,8 @@ impl ImageAsset {
         meter.poll()?;
         let obj = self.xobject().ok_or(RequestError::Failed)?;
         let a = &*self.0;
-        if let Some(streamed) = Streamed::new(&obj, &a.mask_height, &meter)? {
+        let streamed = Streamed::new(&obj, &a.stream, &a.checkpoints, &a.mask_height, &meter)?;
+        if let Some(streamed) = streamed {
             let (layout, opened) = (streamed.layout(), streamed.opened);
             return Ok(ImageSource::new(
                 layout,
@@ -410,6 +422,7 @@ fn with_coverage(
 }
 
 /// Why a request stopped before its last row.
+#[derive(Debug)]
 enum Stop {
     Cancelled,
     Failed,

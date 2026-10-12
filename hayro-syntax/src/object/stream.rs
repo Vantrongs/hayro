@@ -4,6 +4,8 @@ use crate::crypto::DecryptionTarget;
 use crate::crypto::reader::DecryptedReader;
 use crate::filter::Filter;
 use crate::filter::lzw_flate::{PredictorParams, Unpredictor};
+#[cfg(feature = "unsafe")]
+pub use crate::filter::reader::DecodedCheckpoint;
 pub use crate::filter::reader::{DecodedReader, ReadError};
 use crate::object;
 use crate::object::Dict;
@@ -316,6 +318,13 @@ impl OwnedStream {
                 Some(Stream::new(data, dict.get_dict().clone()))
             }
         }
+    }
+
+    /// Whether `data` are this stream's stored bytes, not merely equal to them.
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn holds(&self, data: &[u8]) -> bool {
+        self.get()
+            .is_some_and(|stream| core::ptr::eq(stream.data, data))
     }
 }
 

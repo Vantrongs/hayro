@@ -593,7 +593,8 @@ fn a_request_is_cancelled_within_two_pieces() {
             vec![(image(gray, w, 2), zlib(&noise(2 * w as usize, 21)))],
             Plane::Image,
             (w, 2),
-            vec![[0, 0, 1, 1], [w - 1, 0, w, 1], [0, 1, 1, 2], [0, 0, w, 1]],
+            // Row 1 first: once row 0 is read whole, a state saved at row 1 skips it.
+            vec![[0, 1, 1, 2], [0, 0, 1, 1], [w - 1, 0, w, 1], [0, 0, w, 1]],
         ),
         (masked("SMask", gray, w), Plane::Mask, (w, 1), streamed_mask),
         (

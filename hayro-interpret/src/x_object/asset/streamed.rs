@@ -1,5 +1,6 @@
 //! Images whose samples are read incrementally for each request.
 
+use super::index::{Checkpointer, Checkpoints};
 use super::rows::{
     Break, MaskHeight, MaskRows, MaskSource, RawRow, RawRows, keeps_partial_row, piece_texels,
 };
@@ -14,6 +15,7 @@ use crate::x_object::image::ImageXObject;
 use core::ops::Range;
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::{MASK, MATTE, SMASK, SMASK_IN_DATA};
+use hayro_syntax::object::stream::OwnedStream;
 use hayro_syntax::work::{Cancelled, Meter};
 use smallvec::SmallVec;
 
@@ -22,6 +24,9 @@ pub(super) struct Streamed<'a> {
     obj: ImageXObject<'a>,
     colour: Colour,
     alpha: Alpha<'a>,
+    /// `obj`'s stream, owned, which the decoder states saved in `checkpoints` keep.
+    stream: &'a OwnedStream,
+    checkpoints: &'a Checkpoints,
     /// The decoding opening the image did.
     pub(super) opened: DecodeWork,
 }
@@ -183,6 +188,8 @@ impl<'a> Streamed<'a> {
     /// into `mask_height` once.
     pub(super) fn new(
         obj: &ImageXObject<'a>,
+        stream: &'a OwnedStream,
+        checkpoints: &'a Checkpoints,
         mask_height: &MaskHeight,
         meter: &Meter<'_>,
     ) -> Result<Option<Self>, Cancelled> {
@@ -198,6 +205,8 @@ impl<'a> Streamed<'a> {
             obj: obj.clone(),
             colour,
             alpha,
+            stream,
+            checkpoints,
             opened,
         }))
     }
@@ -290,6 +299,11 @@ struct ImagePass<'s, 'a> {
     image: &'s Streamed<'a>,
     raw: RawRows<'s>,
     mask: Option<Lockstep<'s>>,
+    /// Saves decoder states along the rows; only without a mask read alongside, whose
+    /// reader would need its own.
+    checkpointer: Option<Checkpointer<'s>>,
+    /// The row `raw` continues at in the first pass, resumed from a saved state.
+    start: u32,
     /// The stored samples of the piece being read.
     samples: Vec<u8>,
     /// Converted colour, when it does not fit the stored samples.
@@ -311,9 +325,10 @@ enum RowEnd {
 
 impl<'s, 'a> ImagePass<'s, 'a> {
     fn new(image: &'s Streamed<'a>, area: &Area<'_>, meter: &'s Meter<'s>) -> Result<Self, Stop> {
+        let h = image.obj.height;
         let n = image.colour.components();
         let row_bytes = image.obj.width as usize * n;
-        let raw = RawRows::new(&image.obj.stream, row_bytes, meter).ok_or(Stop::Failed)?;
+        let mut raw = RawRows::new(&image.obj.stream, row_bytes, meter).ok_or(Stop::Failed)?;
         let columns = area.columns();
         let piece = piece_texels(columns.len(), n);
         let mask = match &image.alpha {
@@ -329,10 +344,23 @@ impl<'s, 'a> ImagePass<'s, 'a> {
             }),
             _ => None,
         };
+        let resumed = match mask {
+            Some(_) => None,
+            None => image.checkpoints.checkpointer(
+                image.stream,
+                &mut raw,
+                row_bytes,
+                h,
+                area.rows().start,
+            )?,
+        };
+        let (checkpointer, start) = resumed.map_or((None, 0), |(c, start)| (Some(c), start));
         Ok(Self {
             image,
             raw,
             mask,
+            checkpointer,
+            start,
             samples: vec![0; piece * n],
             rgb: Vec::new(),
             with_alpha: Vec::with_capacity(piece * 4),
@@ -352,7 +380,8 @@ impl<'s, 'a> ImagePass<'s, 'a> {
     /// Reads the rows from the first to the last `area` reads, pushing those it reads.
     fn run(&mut self, area: &mut Area<'_>) -> Result<(), Break> {
         let wanted = area.rows();
-        for y in 0..wanted.end.min(self.image.obj.height) {
+        let first = std::mem::take(&mut self.start);
+        for y in first..wanted.end.min(self.image.obj.height) {
             let end = if y >= wanted.start {
                 self.read_row(area)?
             } else {
@@ -365,17 +394,26 @@ impl<'s, 'a> ImagePass<'s, 'a> {
             if matches!(end, RowEnd::Last) {
                 break;
             }
+            if let Some(c) = &self.checkpointer {
+                c.after_row(y + 1, &self.raw.reader)?;
+            }
         }
         Ok(())
     }
 
     /// Why reading the colour stopped. After its reader restarted, the mask starts
-    /// over too.
+    /// over too, and the states saved are dropped (they decode the data the way that
+    /// failed).
     fn colour_failed(&mut self, e: Break) -> Break {
-        if matches!(e, Break::Restart)
-            && let Some(m) = &mut self.mask
-        {
-            m.rows.rewind(true);
+        if matches!(e, Break::Restart) {
+            if let Some(m) = &mut self.mask {
+                m.rows.rewind(true);
+            }
+            if let Some(c) = &mut self.checkpointer
+                && let Err(stop) = c.restarted()
+            {
+                return stop.into();
+            }
         }
         e
     }

@@ -162,6 +162,26 @@ impl<'a> DecryptedReader<'a> {
         }
     }
 
+    /// The stored bytes, when they are borrowed from the document rather than owned.
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn borrowed_data(&self) -> Option<&'a [u8]> {
+        match &self.data {
+            Cow::Borrowed(data) => Some(data),
+            Cow::Owned(_) => None,
+        }
+    }
+
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn cursor(&self) -> Cursor {
+        self.cursor.clone()
+    }
+
+    /// Continues from `cursor`, taken from a reader of the same data.
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn restore(&mut self, cursor: &Cursor) {
+        self.cursor = cursor.clone();
+    }
+
     /// The stored bytes read.
     #[cfg(test)]
     pub(crate) fn position(&self) -> usize {
@@ -249,6 +269,20 @@ mod tests {
 
     /// The reader yields what whole decryption returns, read in pieces of several
     /// sizes, after a rewind from several places.
+    fn read_all(reader: &mut DecryptedReader<'_>, chunk: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = alloc::vec![0; chunk];
+        loop {
+            let n = reader.read(&mut buf);
+            if n == 0 {
+                return out;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    /// Read after a prefix and a rewind, or continued from the cursor after the prefix
+    /// in another reader, `data` reads as whole decryption returns it.
     fn check(decryptor: &Decryptor, data: &[u8]) {
         let id = ObjectIdentifier::new(1234, 17);
         let expected = decryptor.decrypt(id, data, DecryptionTarget::Stream);
@@ -257,21 +291,26 @@ mod tests {
                 assert!(expected.is_none());
                 continue;
             };
+            let expected = expected.as_deref().unwrap();
             for prefix in [0, 1, 15, 17, 37, data.len() + 1] {
-                reader.read(&mut alloc::vec![0; prefix]);
                 reader.rewind();
-                let mut actual = Vec::new();
-                let mut buf = alloc::vec![0; chunk];
-                loop {
-                    let n = reader.read(&mut buf);
-                    if n == 0 {
-                        break;
-                    }
-                    actual.extend_from_slice(&buf[..n]);
+                let read = reader.read(&mut alloc::vec![0; prefix]);
+                #[cfg(feature = "unsafe")]
+                {
+                    let mut resumed = decryptor
+                        .reader(id, data, DecryptionTarget::Stream)
+                        .unwrap();
+                    resumed.restore(&reader.cursor());
+                    assert_eq!(
+                        read_all(&mut resumed, chunk),
+                        expected[read..],
+                        "resumed at {read}"
+                    );
                 }
+                reader.rewind();
                 assert_eq!(
-                    actual.as_slice(),
-                    expected.as_deref().unwrap(),
+                    read_all(&mut reader, chunk),
+                    expected,
                     "chunk {chunk}, prefix {prefix}"
                 );
             }

@@ -1,10 +1,18 @@
 //! Stream data decoded incrementally, in memory bounded by the decoder's state.
 
+#[cfg(feature = "unsafe")]
+use crate::crypto::reader::Cursor;
 use crate::crypto::reader::DecryptedReader;
 use crate::filter::lzw_flate::{PredictorParams, Unpredictor, flate};
+#[cfg(feature = "unsafe")]
+use crate::object::stream::OwnedStream;
 use crate::work::{Cancelled, Meter, POLL_BYTES};
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
+
+/// How many decrypted encoded bytes the Flate decoder is given at a time.
+#[cfg(feature = "unsafe")]
+const INPUT_CHUNK: usize = 8192;
 
 /// Why reading decoded data stopped before its end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +66,24 @@ struct Inflating<'a> {
     decoder: zlib_rs::Inflate,
     /// Whether the data is read as zlib; after that fails, as raw deflate.
     zlib: bool,
+}
+
+/// A position in a stream's Flate data to resume reading from (see
+/// [`DecodedReader::checkpoint`]): the decoder's state and history window, the
+/// decryption cursor, and the input and predictor rows in flight. The stored bytes are
+/// not copied; the checkpoint keeps its stream, and with it those bytes, alive.
+#[cfg(feature = "unsafe")]
+pub struct DecodedCheckpoint {
+    /// Keeps the bytes at `data` alive, so no other bytes can take their address.
+    _stream: OwnedStream,
+    /// The address and length of the stored bytes.
+    data: (usize, usize),
+    decoder: zlib_rs::Inflate,
+    zlib: bool,
+    cursor: Cursor,
+    /// Decrypted encoded bytes the decoder has not taken yet.
+    input: Vec<u8>,
+    predictor: Option<Predicted>,
 }
 
 /// A predictor reversed row by row on top of the source.
@@ -114,6 +140,73 @@ impl<'a> DecodedReader<'a> {
         self.inflated
     }
 
+    /// The most heap bytes a checkpoint of this reader holds
+    /// ([`DecodedCheckpoint::heap_bytes`]), at any position; `None` when the reader
+    /// cannot be checkpointed (see [`Self::checkpoint`]).
+    #[cfg(feature = "unsafe")]
+    pub fn checkpoint_heap_bound(&self) -> Option<usize> {
+        let (inflating, _) = self.checkpointable()?;
+        let predictor = match &self.predictor {
+            Some(p) => p.heap_bound()?,
+            None => 0,
+        };
+        (inflating.decoder.allocation_size() + INPUT_CHUNK).checked_add(predictor)
+    }
+
+    /// The reader's position, to resume from with [`Self::restore`] on a reader of the
+    /// same `stream`. `None` unless the reader inflates `stream`'s stored bytes
+    /// incrementally (not as stored, nor after a restart to the permissive decoder),
+    /// or when the decoder state cannot be allocated.
+    #[cfg(feature = "unsafe")]
+    pub fn checkpoint(&self, stream: &OwnedStream) -> Option<DecodedCheckpoint> {
+        let (inflating, data) = self.checkpointable()?;
+        if !stream.holds(data) {
+            return None;
+        }
+        Some(DecodedCheckpoint {
+            _stream: stream.clone(),
+            data: address(data),
+            decoder: inflating.decoder.try_clone().ok()?,
+            zlib: inflating.zlib,
+            cursor: inflating.data.cursor(),
+            input: inflating.input[inflating.consumed..].to_vec(),
+            predictor: self.predictor.clone(),
+        })
+    }
+
+    /// Continues from `checkpoint`, as if the data before it had been read (the
+    /// restarts that preceded it included). False, with the reader unchanged, when the
+    /// checkpoint is of other bytes or its decoder state cannot be allocated.
+    #[cfg(feature = "unsafe")]
+    #[must_use]
+    pub fn restore(&mut self, checkpoint: &DecodedCheckpoint) -> bool {
+        let Source::Inflating(inflating) = &mut self.source else {
+            return false;
+        };
+        if inflating.data.borrowed_data().map(address) != Some(checkpoint.data) {
+            return false;
+        }
+        let Ok(decoder) = checkpoint.decoder.try_clone() else {
+            return false;
+        };
+        inflating.decoder = decoder;
+        inflating.zlib = checkpoint.zlib;
+        inflating.data.restore(&checkpoint.cursor);
+        inflating.input.clone_from(&checkpoint.input);
+        inflating.consumed = 0;
+        self.predictor.clone_from(&checkpoint.predictor);
+        true
+    }
+
+    /// The incremental Flate decoder, and the document's bytes it reads.
+    #[cfg(feature = "unsafe")]
+    fn checkpointable(&self) -> Option<(&Inflating<'a>, &'a [u8])> {
+        match &self.source {
+            Source::Inflating(inflating) => Some((inflating, inflating.data.borrowed_data()?)),
+            _ => None,
+        }
+    }
+
     /// The stored bytes read.
     #[cfg(test)]
     fn stored_read(&self) -> usize {
@@ -159,7 +252,36 @@ impl<'a> DecodedReader<'a> {
     }
 }
 
+#[cfg(feature = "unsafe")]
+impl DecodedCheckpoint {
+    /// The bytes it holds on the heap: the decoder's state and window, and the input
+    /// and rows it copied.
+    pub fn heap_bytes(&self) -> usize {
+        self.decoder.allocation_size()
+            + self.input.capacity()
+            + self.predictor.as_ref().map_or(0, Predicted::heap_bytes)
+    }
+}
+
+/// Identifies stored bytes by where they are.
+#[cfg(feature = "unsafe")]
+fn address(data: &[u8]) -> (usize, usize) {
+    (data.as_ptr() as usize, data.len())
+}
+
 impl Predicted {
+    #[cfg(feature = "unsafe")]
+    fn heap_bytes(&self) -> usize {
+        self.input.capacity() + self.unpredictor.heap_bytes()
+    }
+
+    /// The most a copy of these rows holds: the encoded row being read and the last
+    /// one decoded (a copy's capacities are its lengths).
+    #[cfg(feature = "unsafe")]
+    fn heap_bound(&self) -> Option<usize> {
+        self.unpredictor.input_len().checked_mul(2)
+    }
+
     fn reset(&mut self) {
         self.input.clear();
         self.taken = 0;
@@ -293,7 +415,7 @@ impl Inflating<'_> {
     ) -> Result<Option<usize>, Cancelled> {
         loop {
             if self.consumed == self.input.len() {
-                self.input.resize(8192, 0);
+                self.input.resize(INPUT_CHUNK, 0);
                 let n = self.data.read(&mut self.input);
                 self.input.truncate(n);
                 self.consumed = 0;
