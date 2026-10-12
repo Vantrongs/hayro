@@ -107,6 +107,12 @@ impl RasterImage<'_> {
         self.0.height()
     }
 
+    /// The image as an owned asset: a handle that outlives the content stream and
+    /// decodes regions of the image on request, keyed by [`Self::pixels_key`].
+    pub fn asset(&self) -> crate::ImageAsset {
+        self.0.asset(self.pixels_key())
+    }
+
     /// Identifies the pixels `with_rgba` decodes for a given `target_dimension`: the
     /// image object ([`Stream::identity`](hayro_syntax::object::Stream::identity),
     /// unique among the documents loaded) and the transfer function in effect. `None`

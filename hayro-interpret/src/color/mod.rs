@@ -307,6 +307,14 @@ impl ColorSpace {
         matches!(self.0.as_ref(), ColorSpaceType::Pattern(_))
     }
 
+    /// Return `true` for `DeviceGray` and `DeviceRGB`.
+    pub(crate) fn is_device_gray_or_rgb(&self) -> bool {
+        matches!(
+            self.0.as_ref(),
+            ColorSpaceType::DeviceGray(_) | ColorSpaceType::DeviceRgb(_)
+        )
+    }
+
     /// Return `true` if the current color space is an indexed color space.
     pub(crate) fn is_indexed(&self) -> bool {
         matches!(self.0.as_ref(), ColorSpaceType::Indexed(_))

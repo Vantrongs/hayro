@@ -9,6 +9,7 @@ use crate::interpret::state::ActiveTransferFunction;
 use crate::{BlendMode, CacheKey, Image, ImageDrawProps, RasterImage, StencilImage};
 use hayro_syntax::object::dict::keys::*;
 use hayro_syntax::object::{Name, Object, Stream};
+use hayro_syntax::work::Meter;
 use kurbo::Affine;
 
 #[derive(Clone)]
@@ -208,7 +209,7 @@ impl<'a> ImageXObject<'a> {
             return None;
         }
 
-        decode_mask(self, target_dimension)
+        decode_mask(self, target_dimension, &Meter::default())
     }
 
     pub(crate) fn decoded_image(
@@ -219,7 +220,7 @@ impl<'a> ImageXObject<'a> {
             return None;
         }
 
-        decode_image(self, target_dimension)
+        decode_image(self, target_dimension, &Meter::default())
     }
 
     pub(crate) fn width(&self) -> u32 {

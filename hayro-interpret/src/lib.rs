@@ -41,6 +41,11 @@ mod ocg;
 mod types;
 mod x_object;
 
+#[cfg(test)]
+#[path = "../../hayro-syntax/tests/common/fixtures.rs"]
+#[allow(dead_code)]
+mod fixtures;
+
 pub mod color;
 pub mod encode;
 pub mod font;
@@ -58,4 +63,9 @@ pub use hayro_syntax;
 pub use interpret::*;
 pub use types::*;
 pub use util::{RectExt, TransformExt};
+pub use x_object::area::{area_resample, area_texels};
+pub use x_object::asset::{
+    DecodeWork, ImageAsset, ImageLayout, ImageRegion, ImageRequest, ImageSource, PixelFormat,
+    Plane, PlaneLayout, RequestError,
+};
 pub use x_object::soft_mask::*;

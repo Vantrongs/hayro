@@ -7,7 +7,7 @@ use hayro_interpret::font::GlyphRun;
 use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::{
     BlendMode, CacheKey, ClipPath, Device, DrawMode, DrawProps, Image, ImageData, ImageDrawProps,
-    InterpreterSettings, SoftMask,
+    ImageRequest, InterpreterSettings, Plane, SoftMask,
 };
 use kurbo::BezPath;
 
@@ -203,4 +203,106 @@ fn pixels_keys_tell_documents_apart() {
     assert!(a[0].0.is_some());
     assert_ne!(a[0].0, b[0].0);
     assert_ne!(a[0].1, b[0].1);
+}
+
+/// What a region request of each raster image drawn allocated at most, and its
+/// pixels: of `plane`, the grid and window `bins` gives for the plane's size.
+struct Requested {
+    plane: Plane,
+    bins: Bins,
+    regions: Vec<(usize, Vec<u8>)>,
+}
+
+/// The grid and window to request of a plane of a width and height.
+type Bins = fn(u32, u32) -> ((u32, u32), [u32; 4]);
+
+impl Requested {
+    fn new(plane: Plane, bins: Bins) -> Self {
+        Self {
+            plane,
+            bins,
+            regions: Vec::new(),
+        }
+    }
+}
+
+impl<'a> Device<'a> for Requested {
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
+    fn draw_glyph_run(&mut self, _: &GlyphRun<'_, 'a>, _: DrawProps<'a>, _: &DrawMode) {}
+    fn draw_image(&mut self, image: Image<'a, '_>, _: ImageDrawProps<'a>) {
+        let Image::Raster(r) = image else { return };
+        let asset = r.asset();
+        let (data, used) = allocations::measure(|| {
+            let mut source = asset.open(None, None).expect("streamed");
+            let plane = *source.layout().plane(self.plane).expect("the plane");
+            let (grid, window) = (self.bins)(plane.width, plane.height);
+            let request = ImageRequest {
+                plane: self.plane,
+                grid,
+                window,
+                cancel: None,
+            };
+            source.request(&request).expect("a region").data
+        });
+        self.regions.push((used.peak, data));
+    }
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
+}
+
+/// One output texel over rows two million samples wide, with a soft mask as wide,
+/// holds pieces of the rows, not whole rows or a sum per column.
+#[test]
+fn a_region_of_wide_rows_holds_pieces_of_them() {
+    let (w, h) = (2_000_000_u32, 2_u32);
+    let gray = format!("/Width {w} /Height {h} /ColorSpace /DeviceGray /BitsPerComponent 8");
+    let pdf = page(
+        "q 100 0 0 100 0 0 cm /Im Do Q",
+        "/XObject << /Im 5 0 R >>",
+        vec![
+            image(
+                &format!("{gray} /SMask 6 0 R"),
+                &vec![200; (w * h) as usize],
+            ),
+            image(&gray, &vec![255; (w * h) as usize]),
+        ],
+    );
+    let mut requested = Requested::new(Plane::Image, |_, _| ((1, 1), [0, 0, 1, 1]));
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+    let [(peak, data)] = &requested.regions[..] else {
+        panic!("one image")
+    };
+    assert_eq!(data, &[200, 255]);
+    assert!(*peak < 1 << 20, "peak {peak} bytes");
+}
+
+/// The last texel of a bilevel mask 40 million samples wide whose data ends halfway
+/// through its row holds a piece of the row, not the bytes between the data's end and
+/// the texel.
+#[test]
+fn a_texel_past_a_masks_data_holds_a_piece() {
+    let w = 40_000_000_u32;
+    let pdf = page(
+        "q 100 0 0 100 0 0 cm /Im Do Q",
+        "/XObject << /Im 5 0 R >>",
+        vec![
+            image(
+                "/Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Mask 6 0 R",
+                &[200],
+            ),
+            image(
+                &format!("/Width {w} /Height 1 /ImageMask true"),
+                &vec![0; (w / 16) as usize],
+            ),
+        ],
+    );
+    let mut requested = Requested::new(Plane::Mask, |w, h| ((w, h), [w - 1, 0, w, h]));
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+    let [(peak, data)] = &requested.regions[..] else {
+        panic!("one image")
+    };
+    assert_eq!(data, &[0]);
+    assert!(*peak < 1 << 20, "peak {peak} bytes");
 }

@@ -1,3 +1,5 @@
+pub(crate) mod area;
+pub(crate) mod asset;
 mod decode;
 mod form;
 mod image;

@@ -1,8 +1,8 @@
 mod image;
 mod mask;
 
-pub(crate) use image::{DecodedImage, decode_image};
-pub(crate) use mask::{DecodedMask, decode_mask};
+pub(crate) use image::{DecodedImage, decode_image, direct_invert, unpremultiply_samples};
+pub(crate) use mask::{BILEVEL_MASK_LUT, DecodedMask, MaskPath, decode_mask};
 
 use crate::InterpreterWarning;
 use crate::color::ColorSpace;
@@ -11,8 +11,12 @@ use crate::x_object::image::{ImageKind, ImageXObject};
 use hayro_syntax::bit_reader::BitReader;
 use hayro_syntax::object::Array;
 use hayro_syntax::object::dict::keys::*;
-use hayro_syntax::object::stream::{FilterResult, ImageColorSpace, ImageDecodeParams};
+use hayro_syntax::object::stream::{
+    DecodeFailure, FilterResult, ImageColorSpace, ImageData, ImageDecodeParams,
+};
+use hayro_syntax::work::{Meter, POLL_BYTES};
 use smallvec::SmallVec;
+use std::borrow::Cow;
 
 struct DecodeContext<'a> {
     decoded: FilterResult<'a>,
@@ -24,9 +28,66 @@ struct DecodeContext<'a> {
     decode_arr: SmallVec<[(f32, f32); 4]>,
 }
 
+/// How an image's samples are laid out and what they mean: from its dictionary, and
+/// the image data a filter reported (`decode_context`).
+pub(crate) struct SampleFormat {
+    pub(crate) color_space: ColorSpace,
+    pub(crate) bits_per_component: u8,
+    pub(crate) decode_arr: SmallVec<[(f32, f32); 4]>,
+}
+
+pub(crate) fn sample_format(
+    obj: &ImageXObject<'_>,
+    image_data: Option<&ImageData>,
+) -> SampleFormat {
+    let dict = obj.stream.dict();
+    let dict_bpc = dict
+        .get::<u8>(BPC)
+        .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT));
+
+    let color_space = obj
+        .color_space
+        .clone()
+        .or_else(|| {
+            image_data.map(|i| i.color_space).and_then(|c| {
+                c.and_then(|c| match c {
+                    ImageColorSpace::Gray => Some(ColorSpace::device_gray()),
+                    ImageColorSpace::Rgb => Some(ColorSpace::device_rgb()),
+                    ImageColorSpace::Cmyk => Some(ColorSpace::device_cmyk()),
+                    ImageColorSpace::Unknown(_) => None,
+                })
+            })
+        })
+        .unwrap_or(ColorSpace::device_gray());
+
+    let fallback_bpc = if obj.kind == ImageKind::StencilMask {
+        1
+    } else {
+        8
+    };
+
+    let bits_per_component = image_data
+        .map(|i| i.bits_per_component)
+        .or(dict_bpc)
+        .unwrap_or(fallback_bpc);
+
+    let decode_arr = dict
+        .get::<Array<'_>>(D)
+        .or_else(|| dict.get::<Array<'_>>(DECODE))
+        .map(|a| a.iter::<(f32, f32)>().collect::<SmallVec<_>>())
+        .unwrap_or(color_space.default_decode_arr(bits_per_component as f32));
+
+    SampleFormat {
+        color_space,
+        bits_per_component,
+        decode_arr,
+    }
+}
+
 fn decode_context<'a>(
     obj: &ImageXObject<'a>,
     target_dimension: Option<(u32, u32)>,
+    meter: &Meter<'_>,
 ) -> Option<DecodeContext<'a>> {
     let dict = obj.stream.dict();
     let dict_bpc = dict
@@ -46,8 +107,12 @@ fn decode_context<'a>(
 
     let decoded = obj
         .stream
-        .decoded_image(&decode_params)
-        .map_err(|_| (obj.warning_sink)(InterpreterWarning::ImageDecodeFailure))
+        .decoded_image_metered(&decode_params, meter)
+        .map_err(|e| {
+            if !matches!(e, DecodeFailure::Cancelled) {
+                (obj.warning_sink)(InterpreterWarning::ImageDecodeFailure);
+            }
+        })
         .ok()?;
 
     let (mut scale_x, mut scale_y) = (1.0, 1.0);
@@ -63,41 +128,11 @@ fn decode_context<'a>(
         })
         .unwrap_or((obj.width, obj.height));
 
-    let color_space = color_space
-        .or_else(|| {
-            decoded
-                .image_data
-                .as_ref()
-                .map(|i| i.color_space)
-                .and_then(|c| {
-                    c.and_then(|c| match c {
-                        ImageColorSpace::Gray => Some(ColorSpace::device_gray()),
-                        ImageColorSpace::Rgb => Some(ColorSpace::device_rgb()),
-                        ImageColorSpace::Cmyk => Some(ColorSpace::device_cmyk()),
-                        ImageColorSpace::Unknown(_) => None,
-                    })
-                })
-        })
-        .unwrap_or(ColorSpace::device_gray());
-
-    let fallback_bpc = if obj.kind == ImageKind::StencilMask {
-        1
-    } else {
-        8
-    };
-
-    let bits_per_component = decoded
-        .image_data
-        .as_ref()
-        .map(|i| i.bits_per_component)
-        .or(dict_bpc)
-        .unwrap_or(fallback_bpc);
-
-    let decode_arr = dict
-        .get::<Array<'_>>(D)
-        .or_else(|| dict.get::<Array<'_>>(DECODE))
-        .map(|a| a.iter::<(f32, f32)>().collect::<SmallVec<_>>())
-        .unwrap_or(color_space.default_decode_arr(bits_per_component as f32));
+    let SampleFormat {
+        color_space,
+        bits_per_component,
+        decode_arr,
+    } = sample_format(obj, decoded.image_data.as_ref());
 
     Some(DecodeContext {
         decoded,
@@ -117,12 +152,19 @@ fn fix_image_length<T: Copy>(
     height: &mut u32,
     filler: T,
     num_components: usize,
+    meter: &Meter<'_>,
 ) -> Option<()> {
     let row_len = (width as usize).saturating_mul(num_components);
     // Too much data (or just the right amount) is truncated; too little adapts the
     // height and pads the last row.
     *height = rows_present(image.len(), row_len, *height);
-    image.resize(row_len * *height as usize, filler);
+    let len = row_len * *height as usize;
+    image.truncate(len);
+    while image.len() < len {
+        let n = (len - image.len()).min(POLL_BYTES);
+        image.resize(image.len() + n, filler);
+        meter.work(n).ok()?;
+    }
 
     if width == 0 || *height == 0 {
         None
@@ -131,11 +173,57 @@ fn fix_image_length<T: Copy>(
     }
 }
 
+/// The pixels of `channels` bytes a piece of work takes: whole groups of 64, so that
+/// a conversion that works on groups of pixels splits pieces as it splits the whole.
+fn pixel_piece(channels: usize) -> usize {
+    (POLL_BYTES / channels.max(1)).max(64) / 64 * 64
+}
+
+/// `f` applied to `data`, `channels`-byte pixels a piece at a time, each piece counted
+/// on `meter`; `None` if `f` fails or the meter's hook asks to stop.
+fn in_pieces(
+    data: &mut [u8],
+    channels: usize,
+    meter: &Meter<'_>,
+    mut f: impl FnMut(&mut [u8]) -> Option<()>,
+) -> Option<()> {
+    for piece in data.chunks_mut(pixel_piece(channels) * channels.max(1)) {
+        f(piece)?;
+        meter.work(piece.len()).ok()?;
+    }
+    Some(())
+}
+
+/// The bytes of `data`, owned, copied a counted piece at a time if borrowed.
+fn into_owned(data: Cow<'_, [u8]>, meter: &Meter<'_>) -> Option<Vec<u8>> {
+    match data {
+        Cow::Owned(data) => Some(data),
+        Cow::Borrowed(data) => {
+            let mut owned = Vec::with_capacity(data.len());
+            for piece in data.chunks(POLL_BYTES) {
+                owned.extend_from_slice(piece);
+                meter.work(piece.len()).ok()?;
+            }
+            Some(owned)
+        }
+    }
+}
+
+/// Every byte of `data` inverted, a counted piece at a time.
+fn invert(data: &mut [u8], meter: &Meter<'_>) -> Option<()> {
+    in_pieces(data, 1, meter, |piece| {
+        for value in piece {
+            *value = 255 - *value;
+        }
+        Some(())
+    })
+}
+
 /// The rows of `row_len` samples, at most `height`, that `samples` decoded samples
 /// fill. A last row they fill in part counts, to be padded, unless padding it would
 /// take more than the samples present (and more than `MIN_ROW_PAD`): data cut short
 /// costs memory in proportion to what it holds, never to what the image declares.
-fn rows_present(samples: usize, row_len: usize, height: u32) -> u32 {
+pub(crate) fn rows_present(samples: usize, row_len: usize, height: u32) -> u32 {
     if row_len == 0 {
         return 0;
     }
@@ -160,6 +248,7 @@ fn decode_u8_samples(
     color_space: &ColorSpace,
     bits_per_component: u8,
     decode: &[(f32, f32)],
+    meter: &Meter<'_>,
 ) -> Option<Vec<u8>> {
     let source_max = 2.0_f32.powi(bits_per_component as i32) - 1.0;
     let num_components = color_space.num_components() as usize;
@@ -194,6 +283,7 @@ fn decode_u8_samples(
                 height,
                 num_components,
                 bits_per_component,
+                meter,
                 |value, index| {
                     buf.push(decode_component(value, index)?);
                     Some(())
@@ -202,20 +292,14 @@ fn decode_u8_samples(
 
             Some(buf)
         }
-        8 => Some(
-            data.iter()
-                .enumerate()
-                .map(|(index, value)| decode_component(*value as u32, index))
-                .collect::<Option<Vec<_>>>()?,
-        ),
-        16 => Some(
-            data.chunks_exact(2)
-                .enumerate()
-                .map(|(index, value)| {
-                    decode_component(u16::from_be_bytes([value[0], value[1]]) as u32, index)
-                })
-                .collect::<Option<Vec<_>>>()?,
-        ),
+        8 | 16 => {
+            let mut buf = Vec::with_capacity(data.len() / (bits_per_component as usize / 8));
+            for_each_whole_sample(data, bits_per_component, meter, |value, index| {
+                buf.push(decode_component(value, index)?);
+                Some(())
+            })?;
+            Some(buf)
+        }
         _ => {
             warn!("unsupported bits per component: {bits_per_component}");
             None
@@ -229,6 +313,7 @@ fn unpack_samples(
     height: u32,
     num_components: usize,
     bits_per_component: u8,
+    meter: &Meter<'_>,
 ) -> Option<Vec<u16>> {
     match bits_per_component {
         1..8 | 9..16 => {
@@ -240,6 +325,7 @@ fn unpack_samples(
                 height,
                 num_components,
                 bits_per_component,
+                meter,
                 |value, _| {
                     buf.push(value as u16);
                     Some(())
@@ -248,12 +334,14 @@ fn unpack_samples(
 
             Some(buf)
         }
-        8 => Some(data.iter().map(|value| *value as u16).collect()),
-        16 => Some(
-            data.chunks_exact(2)
-                .map(|value| u16::from_be_bytes([value[0], value[1]]))
-                .collect(),
-        ),
+        8 | 16 => {
+            let mut buf = Vec::with_capacity(data.len() / (bits_per_component as usize / 8));
+            for_each_whole_sample(data, bits_per_component, meter, |value, _| {
+                buf.push(value as u16);
+                Some(())
+            })?;
+            Some(buf)
+        }
         _ => {
             warn!("unsupported bits per component: {bits_per_component}");
             None
@@ -286,10 +374,13 @@ fn for_each_sample(
     height: u32,
     num_components: usize,
     bits_per_component: u8,
+    meter: &Meter<'_>,
     mut visit: impl FnMut(u32, usize) -> Option<()>,
 ) -> Option<()> {
     let mut reader = BitReader::new(data);
     let mut index = 0;
+    // Samples since the meter last counted them.
+    let mut uncounted = 0;
 
     for _ in 0..height {
         for _ in 0..width {
@@ -299,10 +390,42 @@ fn for_each_sample(
                 visit(reader.read(bits_per_component).unwrap_or(0), index)?;
                 index += 1;
             }
+            uncounted += num_components;
+            if uncounted >= POLL_BYTES {
+                meter.work(uncounted).ok()?;
+                uncounted = 0;
+            }
         }
 
         reader.align();
     }
 
+    meter.work(uncounted).ok()
+}
+
+/// Visits the 8- or 16-bit samples of `data` with their index, a counted piece at a
+/// time; a last odd byte of 16-bit samples is left out.
+fn for_each_whole_sample(
+    data: &[u8],
+    bits_per_component: u8,
+    meter: &Meter<'_>,
+    mut visit: impl FnMut(u32, usize) -> Option<()>,
+) -> Option<()> {
+    let mut index = 0;
+    // A piece holds whole 16-bit samples.
+    for piece in data.chunks(POLL_BYTES) {
+        if bits_per_component == 8 {
+            for value in piece {
+                visit(*value as u32, index)?;
+                index += 1;
+            }
+        } else {
+            for value in piece.chunks_exact(2) {
+                visit(u16::from_be_bytes([value[0], value[1]]) as u32, index)?;
+                index += 1;
+            }
+        }
+        meter.work(piece.len()).ok()?;
+    }
     Some(())
 }
