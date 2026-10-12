@@ -6,7 +6,7 @@
 pub(crate) mod allocations;
 mod fixtures;
 
-pub(crate) use fixtures::{file, noise, one_page_objects, stored_zlib, stream};
+pub(crate) use fixtures::{file, noise, one_page, one_page_objects, stored_zlib, stream};
 
 use aes::cipher::block_padding::{NoPadding, Pkcs7};
 use aes::cipher::{BlockEncryptMut, KeyIvInit};
