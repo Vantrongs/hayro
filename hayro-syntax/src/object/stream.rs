@@ -12,6 +12,7 @@ use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::trivia::is_white_space_character;
 use crate::util::{OptionLog, find_needle};
+use crate::xref::DocumentId;
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
@@ -140,6 +141,13 @@ impl<'a> Stream<'a> {
     /// Return the raw, underlying dictionary of the stream.
     pub fn dict(&self) -> &Dict<'a> {
         &self.dict
+    }
+
+    /// Identifies the stream among the streams of every document loaded in this
+    /// process: its document and its object. `None` for a stream that is no object of
+    /// a loaded document (an inline image), or on a target without 64-bit atomics.
+    pub fn identity(&self) -> Option<(DocumentId, ObjectIdentifier)> {
+        Some((self.dict.ctx().xref().document_id()?, self.dict.obj_id()?))
     }
 
     /// Return the object identifier of the stream.

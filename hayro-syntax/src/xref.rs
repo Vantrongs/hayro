@@ -31,6 +31,24 @@ use core::ops::Deref;
 
 pub(crate) const XREF_ENTRY_LEN: usize = 20;
 
+/// Identifies a loaded document among every document loaded in this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DocumentId(u64);
+
+impl DocumentId {
+    /// A new identifier; `None` on a target without 64-bit atomics to count with.
+    fn new() -> Option<Self> {
+        #[cfg(target_has_atomic = "64")]
+        {
+            use core::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            Some(Self(NEXT.fetch_add(1, Ordering::Relaxed)))
+        }
+        #[cfg(not(target_has_atomic = "64"))]
+        None
+    }
+}
+
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum XRefError {
     Unknown,
@@ -287,6 +305,7 @@ impl XRef {
         let trailer_data = TrailerData::dummy();
 
         let mut xref = Self(Inner::Some(Arc::new(SomeRepr {
+            document: DocumentId::new(),
             data: Arc::new(Data::new(data)),
             map: Arc::new(RwLock::new(MapRepr { xref_map, repaired })),
             decryptor: Arc::new(Decryptor::None),
@@ -403,6 +422,15 @@ impl XRef {
         match &self.0 {
             Inner::Dummy => unreachable!(),
             Inner::Some(r) => &r.metadata,
+        }
+    }
+
+    /// The document's identifier, unless this is no document's table or the target
+    /// cannot count documents.
+    pub(crate) fn document_id(&self) -> Option<DocumentId> {
+        match &self.0 {
+            Inner::Dummy => None,
+            Inner::Some(r) => r.document,
         }
     }
 
@@ -665,6 +693,7 @@ impl TrailerData {
 
 #[derive(Debug, Clone)]
 struct SomeRepr {
+    document: Option<DocumentId>,
     data: Arc<Data>,
     map: Arc<RwLock<MapRepr>>,
     metadata: Arc<Metadata>,

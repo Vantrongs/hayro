@@ -1,11 +1,12 @@
 //! Decoding an image costs memory in proportion to the data it holds, not to the size
 //! its dictionary declares: an image 100 000 × 100 000 with a one-byte stream must
-//! not reserve 10 GB before reading it.
+//! not reserve 10 GB before reading it. `RasterImage::pixels_key` tells images apart
+//! that decode differently.
 
 use hayro_interpret::font::GlyphRun;
 use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::{
-    BlendMode, ClipPath, Device, DrawMode, DrawProps, Image, ImageData, ImageDrawProps,
+    BlendMode, CacheKey, ClipPath, Device, DrawMode, DrawProps, Image, ImageData, ImageDrawProps,
     InterpreterSettings, SoftMask,
 };
 use kurbo::BezPath;
@@ -132,4 +133,72 @@ fn a_huge_ccitt_image_with_one_byte_costs_little() {
 fn a_short_image_keeps_the_rows_its_data_holds() {
     let dict = "/Width 16 /Height 4 /ColorSpace /DeviceGray /BitsPerComponent 1";
     assert_eq!(draw(dict, &[0xFF, 0x00, 0xF0], None), [(16, 2)]);
+}
+
+/// The `pixels_key` and `cache_key` of each raster image drawn.
+#[derive(Default)]
+struct Keys(Vec<(Option<u128>, u128)>);
+
+impl<'a> Device<'a> for Keys {
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
+    fn draw_glyph_run(&mut self, _: &GlyphRun<'_, 'a>, _: DrawProps<'a>, _: &DrawMode) {}
+    fn draw_image(&mut self, image: Image<'a, '_>, _: ImageDrawProps<'a>) {
+        if let Image::Raster(r) = image {
+            self.0.push((r.pixels_key(), r.cache_key()));
+        }
+    }
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
+}
+
+/// Drawing one image object twice gives one key; another object with the same
+/// dictionary (whose `cache_key` is the same), the same object under a transfer
+/// function, and an inline image give other keys or none.
+#[test]
+fn pixels_keys_tell_decoded_images_apart() {
+    let gray = "/Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8";
+    let pdf = page(
+        "/A Do /A Do /B Do q /Inv gs /A Do Q BI /W 1 /H 1 /CS /G /BPC 8 ID \x50 EI",
+        "/XObject << /A 5 0 R /B 6 0 R >> /ExtGState << /Inv << /TR 7 0 R >> >>",
+        vec![
+            image(gray, &[0x40]),
+            image(gray, &[0xC0]),
+            b"<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>".to_vec(),
+        ],
+    );
+    let mut keys = Keys::default();
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut keys);
+    let (k, cache): (Vec<_>, Vec<_>) = keys.0.into_iter().unzip();
+    assert_eq!(k.len(), 5, "{k:?}");
+    let (a, b, a_inverted) = (
+        k[0].expect("a key"),
+        k[2].expect("a key"),
+        k[3].expect("a key"),
+    );
+    assert_eq!(k[1], Some(a));
+    assert_eq!(cache[0], cache[2], "the same dictionary");
+    assert_ne!(a, b);
+    assert_ne!(a, a_inverted);
+    assert_eq!(k[4], None, "inline image");
+}
+
+/// The same object of two documents gives two keys.
+#[test]
+fn pixels_keys_tell_documents_apart() {
+    let gray = "/Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8";
+    let keys = |sample: u8| {
+        let pdf = page(
+            "/A Do",
+            "/XObject << /A 5 0 R >>",
+            vec![image(gray, &[sample])],
+        );
+        let mut keys = Keys::default();
+        common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut keys);
+        keys.0
+    };
+    let (a, b) = (keys(0x40), keys(0xC0));
+    assert!(a[0].0.is_some());
+    assert_ne!(a[0].0, b[0].0);
 }
