@@ -4,10 +4,12 @@ use crate::object::dict::keys::{
 };
 use crate::object::stream::{FilterResult, ImageColorSpace, ImageData, ImageDecodeParams};
 use alloc::borrow::Cow;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::iter;
 use hayro_ccitt::{DecodeSettings, Decoder, DecoderContext, EncodingMode};
+
+/// White pixels a stream that ends early is padded with whatever it decoded.
+const MIN_WHITE_PAD: usize = 1 << 16;
 
 pub(crate) fn decode(
     data: &[u8],
@@ -126,19 +128,13 @@ pub(crate) fn decode(
     } else {
         struct Luma8Decoder {
             output: Vec<u8>,
-            idx: usize,
             decoded_rows: u32,
         }
 
         impl Decoder for Luma8Decoder {
             fn push_pixels(&mut self, white: bool, count: u32) {
-                let len = count as usize;
-
-                if !white {
-                    self.output[self.idx..self.idx + len].fill(0x00);
-                }
-
-                self.idx += len;
+                let byte = if white { 0xFF } else { 0x00 };
+                self.output.extend(iter::repeat_n(byte, count as usize));
             }
 
             fn next_line(&mut self) {
@@ -146,9 +142,10 @@ pub(crate) fn decode(
             }
         }
 
+        // The output grows with the rows decoded: a stream cut short costs what it
+        // holds, not what `Rows` declares.
         let mut decoder = Luma8Decoder {
-            output: vec![0xFF; output_len],
-            idx: 0,
+            output: Vec::new(),
             decoded_rows: 0,
         };
         let mut context = DecoderContext::new(settings);
@@ -158,8 +155,13 @@ pub(crate) fn decode(
             return None;
         }
 
-        if result.is_err() {
-            decoder.output.truncate(decoder.idx);
+        decoder.output.truncate(output_len);
+        // Rows a stream that ends early leaves out are white, while padding them takes
+        // no more than the rows decoded (or a small image); otherwise the image ends
+        // with the rows decoded, as one whose data breaks off does.
+        let missing = output_len - decoder.output.len();
+        if result.is_ok() && missing <= decoder.output.len().max(MIN_WHITE_PAD) {
+            decoder.output.resize(output_len, 0xFF);
         }
 
         (decoder.output, 8)
