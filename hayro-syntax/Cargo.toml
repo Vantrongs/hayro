@@ -15,7 +15,6 @@ std = ["hayro-jbig2?/std", "hayro-jpeg2000?/std", "dep:rustc-hash", "zune-jpeg?/
 images = ["dep:zune-jpeg", "dep:hayro-ccitt", "dep:hayro-jbig2", "dep:hayro-jpeg2000"]
 unsafe = [
     "std",
-    "dep:flate2",
     "dep:zlib-rs",
     "dep:memchr",
     "hayro-jbig2?/simd",
@@ -29,7 +28,6 @@ logging = ["dep:log", "hayro-jpeg2000?/logging"]
 log = { workspace = true, optional = true }
 rustc-hash = { workspace = true, optional = true }
 smallvec = { workspace = true }
-flate2 = { workspace = true, optional = true, features = ["zlib-rs"] }
 zlib-rs = { workspace = true, optional = true }
 memchr = { workspace = true, optional = true }
 
@@ -42,6 +40,7 @@ hayro-jpeg2000 = { workspace = true, optional = true }
 workspace = true
 
 [dev-dependencies]
+flate2 = { workspace = true, features = ["zlib-rs"] }
 sha2 = "0.10"
 md5 = "0.8"
 aes = "0.8.4"

@@ -68,6 +68,13 @@ impl<'a> Meter<'a> {
         }
     }
 
+    /// The work that can be done before the hook is polled again; 0 once it asked to
+    /// stop.
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn until_poll(&self) -> usize {
+        self.left.get()
+    }
+
     /// Whether the hook asked to stop, for work that reports stopping as failure.
     pub fn cancelled(&self) -> bool {
         self.cancelled.get()

@@ -15,45 +15,8 @@ pub(crate) mod flate {
     /// `None` once its hook asks to stop.
     #[cfg(feature = "unsafe")]
     pub(crate) fn decode(data: &[u8], params: &Dict<'_>, meter: &Meter<'_>) -> Option<Vec<u8>> {
-        use flate2::read::{DeflateDecoder, ZlibDecoder};
-        use std::io::{self, Read};
-
-        /// The encoded bytes, each piece the decoder takes counted before it is read.
-        struct Input<'d, 'm> {
-            data: &'d [u8],
-            meter: &'m Meter<'m>,
-        }
-
-        impl Read for Input<'_, '_> {
-            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-                self.meter
-                    .work(buf.len().min(self.data.len()) + 1)
-                    .map_err(|_| io::Error::from(io::ErrorKind::Other))?;
-                self.data.read(buf)
-            }
-        }
-
-        /// Everything `decoder` yields, read a counted piece at a time.
-        fn read_all(mut decoder: impl Read, meter: &Meter<'_>) -> Option<Vec<u8>> {
-            let mut result = Vec::new();
-            loop {
-                // `read_to_end` grows the buffer only as the data needs.
-                let n = (&mut decoder)
-                    .take(POLL_BYTES as u64)
-                    .read_to_end(&mut result)
-                    .ok()?;
-                meter.work(n).ok()?;
-                if n == 0 {
-                    return Some(result);
-                }
-            }
-        }
-
-        let input = || Input { data, meter };
-        let decoded = read_all(ZlibDecoder::new(input()), meter)
-            .or_else(|| {
-                (!meter.cancelled()).then(|| read_all(DeflateDecoder::new(input()), meter))?
-            })
+        let decoded = inflate(data, true, meter)
+            .or_else(|| (!meter.cancelled()).then(|| inflate(data, false, meter))?)
             .or_else(|| {
                 if meter.cancelled() {
                     return None;
@@ -64,6 +27,56 @@ pub(crate) mod flate {
             })?;
         let params = PredictorParams::from_params(params);
         apply_predictor(decoded, &params, meter)
+    }
+
+    /// `data` inflated whole, read as zlib if `zlib`, else as raw deflate, the work
+    /// counted on `meter`; `None` when the data is corrupt for that format or the hook
+    /// asks to stop. Data that ends before its stream does yields what it holds, and
+    /// bytes after the stream's end are ignored.
+    #[cfg(feature = "unsafe")]
+    fn inflate(data: &[u8], zlib: bool, meter: &Meter<'_>) -> Option<Vec<u8>> {
+        let mut decoder = zlib_rs::Inflate::new(zlib, 15);
+        let mut out = Vec::new();
+        // The input bytes the decoder took, and those it was offered and counted.
+        let (mut taken, mut offered) = (0, 0);
+        loop {
+            if out.len() == out.capacity() {
+                // Doubling, from the encoded size and at least the room zlib's fast
+                // loop needs.
+                out.reserve(out.capacity().max(data.len()).max(1024));
+            }
+            // Input is offered half of POLL_BYTES at a time and counted before it is
+            // taken, and output is made no further than the next poll, so at most
+            // POLL_BYTES and one piece of input are worked on between two polls.
+            // Calls that make less are slower: each copies what it made into zlib's
+            // history window, and matches reaching back past its output read from
+            // there.
+            let end = data.len().min(taken + POLL_BYTES / 2);
+            meter.work(end.saturating_sub(offered)).ok()?;
+            offered = offered.max(end);
+            let input = &data[taken..end];
+            let len = out.len();
+            let room = (out.capacity() - len).min(meter.until_poll());
+            out.resize(len + room, 0);
+            let flush = if input.is_empty() {
+                zlib_rs::InflateFlush::Finish
+            } else {
+                zlib_rs::InflateFlush::NoFlush
+            };
+            let (out_before, in_before) = (decoder.total_out(), decoder.total_in());
+            let status = decoder.decompress(input, &mut out[len..], flush);
+            let written = (decoder.total_out() - out_before) as usize;
+            let took = (decoder.total_in() - in_before) as usize;
+            out.truncate(len + written);
+            taken += took;
+            meter.work(written).ok()?;
+            match status {
+                Ok(zlib_rs::Status::StreamEnd) => return Some(out),
+                Ok(_) if written > 0 || took > 0 => {}
+                Ok(_) if input.is_empty() => return Some(out),
+                _ => return None,
+            }
+        }
     }
 
     /// The data inflated and its predictor reversed, the work counted on `meter`;
@@ -1246,7 +1259,32 @@ mod tests {
         let decoded = flate::decode(&input, &Dict::default(), &Meter::default()).unwrap();
         assert_eq!(decoded, b"Hello");
     }
-    
+
+    /// As flate2's reader decodes them: a stream cut short yields the bytes it holds,
+    /// and bytes after a stream's end are ignored.
+    #[cfg(feature = "unsafe")]
+    #[test]
+    fn decode_flate_cut_short_or_followed_by_more() {
+        use std::io::{Read, Write};
+        let data: Vec<u8> = (0..300_000_u64).map(|i| (i * i / 7) as u8).collect();
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&data).unwrap();
+        let encoded = encoder.finish().unwrap();
+        let cut = &encoded[..encoded.len() / 2];
+        let mut expected = Vec::new();
+        flate2::read::ZlibDecoder::new(cut)
+            .read_to_end(&mut expected)
+            .unwrap();
+        assert!(expected.len() > POLL_BYTES && data.starts_with(&expected));
+        let decoded = flate::decode(cut, &Dict::default(), &Meter::default());
+        assert_eq!(decoded, Some(expected));
+        let mut followed = encoded.clone();
+        followed.extend(b"more");
+        let decoded = flate::decode(&followed, &Dict::default(), &Meter::default());
+        assert_eq!(decoded, Some(data));
+    }
+
     fn predictor_expected() -> Vec<u8> {
         vec![
             // Row 1
