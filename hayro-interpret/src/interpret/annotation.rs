@@ -1,27 +1,71 @@
-//! Appearances for annotations without an `/AP` stream, for the subtypes `PDFium`
-//! generates one for, with its geometry and defaults (`core/fpdfdoc/cpdf_generateap.cpp`,
-//! BSD-3-Clause). `FreeText` and `Popup` are left out: their appearance is laid-out text.
+//! How annotations look: the appearance stream an annotation names and where it lands
+//! on the page, and, for an annotation without `/AP`, the appearance `PDFium` generates
+//! for its subtype, with its geometry and defaults (`core/fpdfdoc/cpdf_generateap.cpp`,
+//! BSD-3-Clause). `FreeText` and `Popup` get none: their appearance is laid-out text.
 //!
-//! The appearance is a content stream in default user space; /CA and the highlight's
-//! Multiply blend apply to it as one transparency group.
+//! The renderer draws annotations with these, and a writer that bakes annotations
+//! into page content can use the same to draw what the renderer shows.
+//!
+//! A generated appearance is a content stream in default user space; /CA and the
+//! highlight's Multiply blend apply to it as one transparency group.
 
 use crate::BlendMode;
 use crate::util::RectExt;
 use hayro_syntax::object::dict::keys::{
-    BORDER, BS, C, CA, D, IC, INKLIST, QUADPOINTS, RECT, S, SUBTYPE, W,
+    AP, AS, BORDER, BS, C, CA, D, IC, INKLIST, N, QUADPOINTS, RECT, S, SUBTYPE, W,
 };
-use hayro_syntax::object::{Array, Dict, Name, Object, Rect};
+use hayro_syntax::object::{Array, Dict, Name, Object, Rect, Stream};
+use kurbo::{Affine, Shape};
 use std::fmt::Write;
 
-pub(crate) struct Appearance {
-    pub(crate) content: String,
-    pub(crate) opacity: f32,
-    pub(crate) blend: BlendMode,
+/// The normal appearance stream of `annot`: `/AP /N`, or, when that is a dictionary
+/// of states, the state `/AS` names (`/Off` without `/AS`).
+pub fn normal_appearance<'a>(annot: &Dict<'a>) -> Option<Stream<'a>> {
+    // Read as `Object` first: a dictionary read as a stream may pick up the data of
+    // a stream after it in the file.
+    match annot.get::<Dict<'_>>(AP)?.get::<Object<'_>>(N)? {
+        Object::Stream(stream) => Some(stream),
+        Object::Dict(states) => annot
+            .get::<Name<'_>>(AS)
+            .and_then(|state| states.get::<Stream<'_>>(state))
+            .or_else(|| states.get::<Stream<'_>>(b"Off")),
+        _ => None,
+    }
+}
+
+/// The matrix A of PDF 32000-1 12.5.5 for an appearance with `bbox` and `matrix` on
+/// an annotation with `rect`: it maps the appearance box, transformed by `matrix`,
+/// onto `rect`. The appearance is drawn with `matrix` and then A.
+pub fn rect_transform(rect: kurbo::Rect, bbox: [f32; 4], matrix: Affine) -> Affine {
+    let [x0, y0, x1, y1] = bbox.map(f64::from);
+    let transformed = (matrix * kurbo::Rect::new(x0, y0, x1, y1).to_path(0.1)).bounding_box();
+    let (sx, sy) = (
+        rect.width() / transformed.width(),
+        rect.height() / transformed.height(),
+    );
+    Affine::new([
+        sx,
+        0.0,
+        0.0,
+        sy,
+        rect.x0 - transformed.x0,
+        rect.y0 - transformed.y0,
+    ])
+}
+
+/// An appearance generated for an annotation without `/AP`.
+pub struct Appearance {
+    /// The content stream, in default user space.
+    pub content: String,
+    /// The annotation's `/CA`, clamped to 0–1.
+    pub opacity: f32,
+    /// Multiply for highlights, Normal otherwise.
+    pub blend: BlendMode,
 }
 
 /// The appearance `PDFium` would generate for `annot`, if its subtype gets one and it
 /// paints anything, on a page that shows `visible` (in default user space) of it.
-pub(crate) fn generate(annot: &Dict<'_>, visible: kurbo::Rect) -> Option<Appearance> {
+pub fn generate(annot: &Dict<'_>, visible: kurbo::Rect) -> Option<Appearance> {
     let subtype = annot.get::<Name<'_>>(SUBTYPE)?;
     let mut out = Out(String::new());
     let blend = match subtype.as_ref() {
