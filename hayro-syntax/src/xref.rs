@@ -394,7 +394,6 @@ impl XRef {
                 let td = TrailerData {
                     root_ref: root_ref.into(),
                     version,
-                    size: trailer_dict.get::<i64>(SIZE),
                 };
 
                 (td, has_ocgs, metadata)
@@ -405,7 +404,6 @@ impl XRef {
                 let td = TrailerData {
                     root_ref,
                     version: None,
-                    size: None,
                 };
 
                 (td, false, Metadata::default())
@@ -434,27 +432,6 @@ impl XRef {
         match &self.0 {
             Inner::Dummy => 0,
             Inner::Some(r) => r.map.get().xref_map.len(),
-        }
-    }
-
-    // How many object numbers the table spans, as MuPDF's `pdf_xref_len` counts them:
-    // past the highest object and, unless the table was rebuilt, the trailer's /Size.
-    pub(crate) fn xref_len(&self) -> i64 {
-        match &self.0 {
-            Inner::Dummy => 0,
-            Inner::Some(r) => {
-                let locked = r.map.get();
-                let highest = locked
-                    .xref_map
-                    .keys()
-                    .map(|id| i64::from(id.obj_number) + 1)
-                    .max()
-                    .unwrap_or(0);
-                match r.trailer_data.size {
-                    Some(size) if !locked.repaired => highest.max(size),
-                    _ => highest,
-                }
-            }
         }
     }
 
@@ -746,8 +723,6 @@ struct MapRepr {
 pub(crate) struct TrailerData {
     pub(crate) root_ref: ObjectIdentifier,
     pub(crate) version: Option<PdfVersion>,
-    /// The trailer's /Size.
-    pub(crate) size: Option<i64>,
 }
 
 impl TrailerData {
@@ -755,7 +730,6 @@ impl TrailerData {
         Self {
             root_ref: ObjectIdentifier::new(0, 0),
             version: None,
-            size: None,
         }
     }
 }
