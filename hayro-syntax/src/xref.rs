@@ -600,7 +600,7 @@ impl XRef {
 
     /// Whether the table lists object `id`; a reference to an object it does not list
     /// is `null`.
-    pub(crate) fn has_entry(&self, id: ObjectIdentifier) -> bool {
+    pub fn has_entry(&self, id: ObjectIdentifier) -> bool {
         match &self.0 {
             Inner::Dummy => false,
             Inner::Some(r) => r.map.get().xref_map.contains_key(&id),

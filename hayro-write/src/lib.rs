@@ -16,13 +16,13 @@ mod primitive;
 use crate::primitive::{WriteDirect, WriteIndirect};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
-use hayro_syntax::object::ObjRef;
-use hayro_syntax::object::Object;
 use hayro_syntax::object::dict::keys::{
-    COLORSPACE, EXT_G_STATE, FONT, GROUP, LENGTH, PATTERN, PROPERTIES, SHADING, SUBTYPE, TYPE,
+    COLORSPACE, EXT_G_STATE, FONT, GROUP, PATTERN, PROPERTIES, RESOURCES, SHADING, SUBTYPE, TYPE,
     XOBJECT,
 };
-use hayro_syntax::page::{Page, Resources, Rotation};
+use hayro_syntax::object::stream::DecodeFailure;
+use hayro_syntax::object::{Dict, ObjRef, Object};
+use hayro_syntax::page::{ContentError, Page, Resources, Rotation};
 use pdf_writer::{Chunk, Content, Filter, Finish, Name, Rect, Ref};
 use rustc_hash::FxHashMap;
 use std::collections::HashSet;
@@ -35,6 +35,13 @@ pub use pdf_writer;
 pub use pdf_writer::Settings as ChunkSettings;
 
 /// Apply the extraction queries to the given PDF and return the results.
+///
+/// The copy never leaves out what the source draws: a page whose content cannot be
+/// read whole is an error for its query, and a stream it copies that cannot be
+/// decrypted whole, or an object the file lists but that cannot be parsed, fails
+/// the extraction. Streams whose dictionaries refer to no other object are written
+/// once for all that copy to the same dictionary and data, as fonts embedded in
+/// each of several pages are.
 pub fn extract<'a>(
     pdf: &Pdf,
     new_ref: Box<dyn FnMut() -> Ref + 'a>,
@@ -51,20 +58,33 @@ pub fn extract<'a>(
                 .ok_or(ExtractionError::InvalidPageIndex(query.page_index))
         };
 
-        let root_ref = ctx.new_ref();
-
         let res = match query.query_type {
-            ExtractionQueryType::XObject => write_xobject(page()?, root_ref, &mut ctx),
-            ExtractionQueryType::Page => write_page(page()?, root_ref, query.page_index, &mut ctx),
-            ExtractionQueryType::Form(obj) => write_form(obj, root_ref, &mut ctx),
+            ExtractionQueryType::XObject => {
+                let root_ref = ctx.new_ref();
+                write_xobject(page()?, query.page_index, None, root_ref, &mut ctx).map(|_| root_ref)
+            }
+            ExtractionQueryType::UserSpaceXObject(bbox) => {
+                let root_ref = ctx.new_ref();
+                write_xobject(page()?, query.page_index, Some(bbox), root_ref, &mut ctx)
+                    .map(|_| root_ref)
+            }
+            ExtractionQueryType::Page => {
+                let root_ref = ctx.new_ref();
+                write_page(page()?, root_ref, query.page_index, &mut ctx).map(|_| root_ref)
+            }
+            ExtractionQueryType::Form(obj) => write_form(obj, page()?, query.page_index, &mut ctx),
         };
 
-        ctx.root_refs.push(res.map(|_| root_ref));
+        ctx.root_refs.push(res);
     }
 
     // Now we have shallowly extracted all pages, now go through all dependencies until there aren't
     // any anymore.
     write_dependencies(pdf, &mut ctx);
+
+    if let Some(error) = ctx.error {
+        return Err(error);
+    }
 
     let mut global_chunk = Chunk::with_settings(chunk_settings);
 
@@ -83,11 +103,16 @@ pub fn extract<'a>(
 /// object you want to extract the page.
 #[derive(Copy, Clone, Debug)]
 pub enum ExtractionQueryType {
-    /// Extract the page as an `XObject`.
+    /// Extract the page as an `XObject`, placed and clipped as hayro reads the page's
+    /// boxes.
     XObject,
+    /// Extract the page as an `XObject` in the page's default user space, clipped to
+    /// the box `[x0, y0, x1, y1]` the caller gives.
+    UserSpaceXObject([f32; 4]),
     /// Extract the page as a new page.
     Page,
-    /// Extract a stream, such as an annotation's appearance, as a form `XObject`.
+    /// Extract a stream, such as an annotation's appearance, as a form `XObject`
+    /// drawn on the query's page.
     Form(ObjRef),
 }
 
@@ -108,12 +133,15 @@ impl ExtractionQuery {
     }
 
     /// Create a query that copies the stream `obj`, with everything it refers to, as a
-    /// form `XObject`. The copy is typed `/XObject /Form` whatever the stream says:
-    /// annotation appearance streams may leave the type out.
-    pub fn new_form(obj: ObjRef) -> Self {
+    /// form `XObject` drawn on page `page_index`. The copy is typed `/XObject /Form`
+    /// whatever the stream says: annotation appearance streams may leave the type out.
+    /// A stream without a /Resources dictionary uses the page's, as renderers draw an
+    /// appearance with the resources of its page; its copy gets those. Queries for
+    /// the same stream share a copy where it has its own resources.
+    pub fn new_form(obj: ObjRef, page_index: usize) -> Self {
         Self {
             query_type: ExtractionQueryType::Form(obj),
-            page_index: 0,
+            page_index,
         }
     }
 
@@ -121,6 +149,16 @@ impl ExtractionQuery {
     pub fn new_xobject(page_index: usize) -> Self {
         Self {
             query_type: ExtractionQueryType::XObject,
+            page_index,
+        }
+    }
+
+    /// Create a query that copies the page as an `XObject` in its default user space,
+    /// with no /Matrix, clipped to `bbox`, `[x0, y0, x1, y1]`: for a caller that
+    /// places the page by its own reading of the page's boxes.
+    pub fn new_user_space_xobject(page_index: usize, bbox: [f32; 4]) -> Self {
+        Self {
+            query_type: ExtractionQueryType::UserSpaceXObject(bbox),
             page_index,
         }
     }
@@ -133,6 +171,12 @@ pub enum ExtractionError {
     InvalidPageIndex(usize),
     /// A form query named an object that is not a stream.
     NotAStream(ObjRef),
+    /// The content of the page with this index cannot be read whole.
+    Content(usize, ContentError),
+    /// A stream the copy needs cannot be decrypted whole.
+    StreamData(ObjRef, DecodeFailure),
+    /// An object the copy needs is listed in the file but cannot be parsed.
+    Unreadable(ObjRef),
 }
 
 /// The result of an extraction.
@@ -146,11 +190,24 @@ pub struct ExtractionResult {
     pub page_tree_parent_ref: Ref,
 }
 
+/// A stream's copied dictionary, and its data's length and hash.
+type StreamKey = (Vec<u8>, usize, u64);
+
 struct ExtractionContext<'a> {
     chunks: Vec<Chunk>,
     visited_objects: HashSet<ObjRef>,
     to_visit_refs: Vec<ObjRef>,
-    valid_ref_cache: FxHashMap<ObjRef, bool>,
+    /// What each reference to a source object is written as: the copy's reference,
+    /// or `None` for `null`, where the object does not exist.
+    ref_targets: FxHashMap<ObjRef, Option<Ref>>,
+    /// The copies of streams whose dictionaries refer to no other object: the source
+    /// stream and its copy.
+    shared_streams: FxHashMap<StreamKey, Vec<(ObjRef, Ref)>>,
+    /// The copies of streams form queries asked for, by the stream and, for one
+    /// that takes its page's resources, the page.
+    forms: FxHashMap<(ObjRef, Option<usize>), Ref>,
+    /// The first part of the source that could not be read whole.
+    error: Option<ExtractionError>,
     root_refs: Vec<Result<Ref, ExtractionError>>,
     pdf: &'a Pdf,
     new_ref: Box<dyn FnMut() -> Ref + 'a>,
@@ -171,7 +228,10 @@ impl<'a> ExtractionContext<'a> {
             chunks: vec![],
             visited_objects: HashSet::new(),
             to_visit_refs: Vec::new(),
-            valid_ref_cache: FxHashMap::default(),
+            ref_targets: FxHashMap::default(),
+            shared_streams: FxHashMap::default(),
+            forms: FxHashMap::default(),
+            error: None,
             pdf,
             new_ref,
             ref_map: FxHashMap::default(),
@@ -196,6 +256,11 @@ impl<'a> ExtractionContext<'a> {
     pub(crate) fn new_ref(&mut self) -> Ref {
         (self.new_ref)()
     }
+
+    /// Records that part of the source could not be read whole.
+    pub(crate) fn fail(&mut self, error: ExtractionError) {
+        self.error.get_or_insert(error);
+    }
 }
 
 fn write_dependencies(pdf: &Pdf, ctx: &mut ExtractionContext<'_>) {
@@ -213,7 +278,9 @@ fn write_dependencies(pdf: &Pdf, ctx: &mut ExtractionContext<'_>) {
 
             ctx.visited_objects.insert(ref_);
         } else {
+            // It was read when it was first referred to.
             warn!("failed to extract object with ref: {ref_:?}");
+            ctx.fail(ExtractionError::Unreadable(ref_));
         }
     }
 }
@@ -334,13 +401,13 @@ fn write_page(
     let stream_ref = if let Some(cached) = ctx.cached_content_streams.get(&page_idx) {
         *cached
     } else {
+        let content = page
+            .try_page_stream()
+            .map_err(|e| ExtractionError::Content(page_idx, e))?;
         let stream_ref = ctx.new_ref();
 
         chunk
-            .stream(
-                stream_ref,
-                &deflate_encode(page.page_stream().unwrap_or(b"")),
-            )
+            .stream(stream_ref, &deflate_encode(&content))
             .filter(Filter::FlateDecode);
         ctx.cached_content_streams.insert(page_idx, stream_ref);
 
@@ -376,35 +443,46 @@ fn write_page(
     Ok(())
 }
 
+/// The page as a form: placed by hayro's reading of its boxes, or, with `bbox`, in
+/// its user space clipped to `bbox`.
 fn write_xobject(
     page: &Page<'_>,
+    page_idx: usize,
+    bbox: Option<[f32; 4]>,
     xobj_ref: Ref,
     ctx: &mut ExtractionContext<'_>,
 ) -> Result<(), ExtractionError> {
+    let content = page
+        .try_page_stream()
+        .map_err(|e| ExtractionError::Content(page_idx, e))?;
     let mut chunk = Chunk::with_settings(ctx.chunk_settings);
-    let encoded_stream = deflate_encode(page.page_stream().unwrap_or(b""));
+    let encoded_stream = deflate_encode(&content);
     let mut x_object = chunk.form_xobject(xobj_ref, &encoded_stream);
     x_object.deref_mut().filter(Filter::FlateDecode);
 
-    let bbox = page.crop_box();
-    let initial_transform = page.initial_transform(false);
+    if let Some([x0, y0, x1, y1]) = bbox {
+        x_object.bbox(Rect::new(x0, y0, x1, y1));
+    } else {
+        let bbox = page.crop_box();
+        let initial_transform = page.initial_transform(false);
 
-    x_object.bbox(Rect::new(
-        bbox.x0 as f32,
-        bbox.y0 as f32,
-        bbox.x1 as f32,
-        bbox.y1 as f32,
-    ));
+        x_object.bbox(Rect::new(
+            bbox.x0 as f32,
+            bbox.y0 as f32,
+            bbox.x1 as f32,
+            bbox.y1 as f32,
+        ));
 
-    let i = initial_transform.as_coeffs();
-    x_object.matrix([
-        i[0] as f32,
-        i[1] as f32,
-        i[2] as f32,
-        i[3] as f32,
-        i[4] as f32,
-        i[5] as f32,
-    ]);
+        let i = initial_transform.as_coeffs();
+        x_object.matrix([
+            i[0] as f32,
+            i[1] as f32,
+            i[2] as f32,
+            i[3] as f32,
+            i[4] as f32,
+            i[5] as f32,
+        ]);
+    }
 
     serialize_resources(page.resources(), ctx, &mut x_object);
 
@@ -422,27 +500,42 @@ fn write_xobject(
 
 fn write_form(
     obj: ObjRef,
-    form_ref: Ref,
+    page: &Page<'_>,
+    page_idx: usize,
     ctx: &mut ExtractionContext<'_>,
-) -> Result<(), ExtractionError> {
+) -> Result<Ref, ExtractionError> {
     // Read as `Object` first: a dictionary read as a stream may pick up the data of a
     // stream after it in the file.
     let Some(Object::Stream(stream)) = ctx.pdf.xref().get::<Object<'_>>(obj.into()) else {
         return Err(ExtractionError::NotAStream(obj));
     };
-    let data = stream.raw_data();
+    // What a renderer draws the stream with: its own resources if they are a
+    // dictionary, the page's otherwise.
+    let own_resources = stream.dict().get::<Dict<'_>>(RESOURCES).is_some();
+    let key = (obj, (!own_resources).then_some(page_idx));
+    if let Some(form_ref) = ctx.forms.get(&key) {
+        return Ok(*form_ref);
+    }
+    let data = stream
+        .try_raw_data()
+        .map_err(|failure| ExtractionError::StreamData(obj, failure))?;
+    let form_ref = ctx.new_ref();
+    ctx.forms.insert(key, form_ref);
     let mut chunk = Chunk::with_settings(ctx.chunk_settings);
     let mut form = chunk.form_xobject(form_ref, &data);
-    primitive::write_dict(
-        stream.dict(),
-        form.deref_mut(),
-        ctx,
-        &[LENGTH, TYPE, SUBTYPE],
-    );
+    let skip: &[&[u8]] = if own_resources {
+        &[TYPE, SUBTYPE]
+    } else {
+        &[TYPE, SUBTYPE, RESOURCES]
+    };
+    primitive::write_stream_dict(stream.dict(), form.deref_mut(), ctx, skip);
+    if !own_resources {
+        serialize_resources(page.resources(), ctx, &mut form);
+    }
     form.finish();
     ctx.chunks.push(chunk);
 
-    Ok(())
+    Ok(form_ref)
 }
 
 fn serialize_resources(
@@ -475,10 +568,14 @@ fn serialize_resources(
     write!(properties, PROPERTIES);
 }
 
-pub(crate) fn deflate_encode(data: &[u8]) -> Vec<u8> {
+/// `data` compressed for a `FlateDecode` stream.
+///
+/// Level 4 rather than zlib's default 6: on large drawings it takes about a quarter
+/// of the time for about 2% more bytes.
+pub fn deflate_encode(data: &[u8]) -> Vec<u8> {
     use std::io::Write;
 
-    const COMPRESSION_LEVEL: u8 = 6;
+    const COMPRESSION_LEVEL: u8 = 4;
     let mut e = ZlibEncoder::new(Vec::new(), Compression::new(COMPRESSION_LEVEL as u32));
     e.write_all(data).unwrap();
     e.finish().unwrap()

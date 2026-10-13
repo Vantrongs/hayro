@@ -72,7 +72,7 @@ fn draw_roots(
 #[test]
 fn form_copies_an_appearance_stream_as_a_typed_form() {
     let source = annotated();
-    let (file, roots) = draw_roots(&source, &[ExtractionQuery::new_form(ObjRef::new(5, 0))]);
+    let (file, roots) = draw_roots(&source, &[ExtractionQuery::new_form(ObjRef::new(5, 0), 0)]);
     assert!(roots[0].is_ok());
 
     let copy = Pdf::new(file).expect("the copy parses");
@@ -114,7 +114,7 @@ fn form_keeps_a_type_the_stream_already_has() {
         )],
     );
     let source = Pdf::new(file).unwrap();
-    let (file, _) = draw_roots(&source, &[ExtractionQuery::new_form(ObjRef::new(4, 0))]);
+    let (file, _) = draw_roots(&source, &[ExtractionQuery::new_form(ObjRef::new(4, 0), 0)]);
     // pdf-writer would have written the keys twice had the copy not left them out.
     let text = String::from_utf8_lossy(&file);
     assert_eq!(text.matches("/Subtype /Form").count(), 1);
@@ -127,9 +127,9 @@ fn form_of_something_other_than_a_stream_is_an_error() {
     let (_, roots) = draw_roots(
         &source,
         &[
-            ExtractionQuery::new_form(ObjRef::new(4, 0)),
-            ExtractionQuery::new_form(ObjRef::new(99, 0)),
-            ExtractionQuery::new_form(ObjRef::new(5, 0)),
+            ExtractionQuery::new_form(ObjRef::new(4, 0), 0),
+            ExtractionQuery::new_form(ObjRef::new(99, 0), 0),
+            ExtractionQuery::new_form(ObjRef::new(5, 0), 0),
         ],
     );
     assert!(matches!(
