@@ -192,7 +192,15 @@ impl Skippable for Object<'_> {
                 _ => String::skip(r, is_content_stream),
             },
             b'(' => String::skip(r, is_content_stream),
-            b'.' | b'+' | b'-' | b'0'..=b'9' => Number::skip(r, is_content_stream),
+            b'.' | b'+' | b'-' | b'0'..=b'9' => {
+                if r.skip::<Number>(is_content_stream).is_none() {
+                    if is_content_stream {
+                        return None;
+                    }
+                    skip_bad_number(r)?;
+                }
+                Some(())
+            }
             b'[' => Array::skip_with_depth(r, is_content_stream, depth),
             // See test case operator-in-TJ-array-0: Be lenient and skip content operators in
             // array
@@ -224,7 +232,14 @@ impl<'a> Readable<'a> for Object<'a> {
                 _ => Self::String(String::read(r, ctx)?),
             },
             b'(' => Self::String(String::read(r, ctx)?),
-            b'.' | b'+' | b'-' | b'0'..=b'9' => Self::Number(Number::read(r, ctx)?),
+            b'.' | b'+' | b'-' | b'0'..=b'9' => match Number::read(r, ctx) {
+                Some(number) => Self::Number(number),
+                None if !ctx.in_content_stream() => {
+                    skip_bad_number(r)?;
+                    Self::Null(Null)
+                }
+                None => return None,
+            },
             b'[' => Self::Array(Array::read(r, ctx)?),
             // See the comment in `skip`.
             _ => {
@@ -235,6 +250,15 @@ impl<'a> Readable<'a> for Object<'a> {
 
         Some(object)
     }
+}
+
+// Skip a token that starts like a number but is not one, such as `1e3`, up to the
+// next white space or delimiter. MuPDF reads such a token as a keyword, which is
+// `null` as a value in an array or dictionary (`lex_number` in MuPDF's `pdf-lex.c`,
+// `pdf_parse_array` and `pdf_parse_dict` in `pdf-parse.c`), so one bad number does not
+// lose the object around it. Content streams keep their own handling.
+fn skip_bad_number(r: &mut Reader<'_>) -> Option<()> {
+    skip_name_like(r, false)
 }
 
 /// A trait for objects that can be parsed from a simple byte stream.
