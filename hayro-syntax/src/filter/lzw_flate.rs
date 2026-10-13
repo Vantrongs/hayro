@@ -41,9 +41,7 @@ pub(crate) mod flate {
         let (mut taken, mut offered) = (0, 0);
         loop {
             if out.len() == out.capacity() {
-                // Doubling, from the encoded size and at least the room zlib's fast
-                // loop needs.
-                out.reserve(out.capacity().max(data.len()).max(1024));
+                out.reserve(more_room(out.len(), taken, data.len()));
             }
             // Input is offered half of POLL_BYTES at a time and counted before it is
             // taken, and output is made no further than the next poll, so at most
@@ -77,6 +75,26 @@ pub(crate) mod flate {
                 _ => return None,
             }
         }
+    }
+
+    /// How much to grow a full output buffer holding the `made` bytes inflated from the
+    /// first `taken` of `len` encoded bytes. The first room is at most a poll's worth,
+    /// since encoded bytes may hold empty blocks or a tail after the stream's end, which
+    /// make nothing. Later rooms fit what the rest would make at the rate so far, with an
+    /// eighth to spare, each at least doubling and at most growing eightfold what was
+    /// made, so a large stream is reallocated a few times rather than at every doubling.
+    /// At least the room zlib's fast loop needs.
+    #[cfg(feature = "unsafe")]
+    fn more_room(made: usize, taken: usize, len: usize) -> usize {
+        let room = match made {
+            0 => len.min(POLL_BYTES),
+            _ => {
+                let rest = (len - taken) as u128 * made as u128 / taken.max(1) as u128;
+                let rest = usize::try_from(rest + rest / 8).unwrap_or(usize::MAX);
+                rest.clamp(made, made.saturating_mul(7))
+            }
+        };
+        room.max(1024)
     }
 
     /// The data inflated and its predictor reversed, the work counted on `meter`;

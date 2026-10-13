@@ -6,9 +6,11 @@ use hayro_syntax::Pdf;
 use hayro_syntax::object::stream::{DecodeFailure, ImageDecodeParams};
 use hayro_syntax::object::{ObjectIdentifier, Stream};
 use hayro_syntax::work::{Meter, POLL_BYTES, TOLD};
+use std::borrow::Cow;
 use std::cell::Cell;
 
 mod common;
+use common::allocations::measure;
 use common::stored_zlib;
 
 fn stream_file(dict: &str, data: &[u8]) -> Pdf {
@@ -162,6 +164,55 @@ fn whole_decoding_is_cancelled_within_bounded_work() {
     let data = common::noise(4 << 20, 3);
     let pdf = Pdf::new(common::encrypted_stream_file("", &data, [7; 32], [7; 32])).unwrap();
     assert_cancelled("decryption", &object_3(&pdf));
+}
+
+/// Whole Flate decoding allocates with the output it makes, not with the stored bytes:
+/// a run of empty blocks, or bytes after the stream's end, enlarge neither the buffer
+/// it starts with nor the one it returns, nor what a decode stopped early allocated.
+/// Output that outgrows the first buffer is held in at most eight times its size.
+#[test]
+fn whole_flate_decoding_allocates_with_its_output() {
+    let with_tail = |mut data: Vec<u8>| {
+        data.extend(vec![b' '; 4 << 20]);
+        data
+    };
+    let zeros = vec![0; 258 * 1000 + 1];
+    for (name, data, decoded) in [
+        ("empty blocks", zlib_empty_blocks(800_000), &[][..]),
+        ("tail", with_tail(stored_zlib(b"short", 5)), b"short"),
+        (
+            "zeros and a tail",
+            with_tail(zlib_zeros(zeros.len())),
+            &zeros,
+        ),
+    ] {
+        let pdf = stream_file(
+            &format!("/Filter /FlateDecode /Length {}", data.len()),
+            &data,
+        );
+        let stream = object_3(&pdf);
+        let (result, used) = measure(|| stream.decoded().unwrap());
+        let Cow::Owned(result) = result else {
+            panic!("{name}: not decoded")
+        };
+        assert_eq!(result, decoded, "{name}");
+        let held = POLL_BYTES.max(8 * decoded.len());
+        assert!(result.capacity() <= held, "{name}: {}", result.capacity());
+        assert!(used.peak < held + POLL_BYTES, "{name}: {used:?}");
+    }
+
+    let data = zlib_empty_blocks(800_000);
+    let pdf = stream_file(
+        &format!("/Filter /FlateDecode /Length {}", data.len()),
+        &data,
+    );
+    let stream = object_3(&pdf);
+    let stop = || true;
+    let (result, used) = measure(|| {
+        stream.decoded_image_metered(&ImageDecodeParams::default(), &Meter::new(Some(&stop)))
+    });
+    assert!(matches!(result, Err(DecodeFailure::Cancelled)));
+    assert!(used.peak < 2 * POLL_BYTES, "{used:?}");
 }
 
 fn assert_cancelled(name: &str, stream: &Stream<'_>) {
