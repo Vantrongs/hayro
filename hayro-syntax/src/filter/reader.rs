@@ -246,12 +246,18 @@ impl<'a> DecodedReader<'a> {
     }
 
     /// Fills `buf` with the next decoded bytes and returns how many: at most
-    /// [`POLL_BYTES`], 0 only at the end. The work counts on `meter`.
+    /// [`POLL_BYTES`], 0 only at the end. The work counts on `meter`; once its hook
+    /// asked to stop, every read fails.
     pub fn read(&mut self, buf: &mut [u8], meter: &Meter<'_>) -> Result<usize, ReadError> {
         let len = buf.len().min(POLL_BYTES);
         let buf = &mut buf[..len];
         if buf.is_empty() {
             return Ok(0);
+        }
+        // Bytes inflated ahead were counted when they were made, so handing them out
+        // counts nothing that would find the stop.
+        if meter.cancelled() {
+            return Err(ReadError::Cancelled);
         }
         let Some(p) = &mut self.predictor else {
             return self.source.read(buf, &mut self.inflated, meter);

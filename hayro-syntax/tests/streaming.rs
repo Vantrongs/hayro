@@ -4,7 +4,8 @@
 use hayro_syntax::Pdf;
 use hayro_syntax::object::stream::{DecodedReader, ReadError};
 use hayro_syntax::object::{ObjectIdentifier, Stream};
-use hayro_syntax::work::Meter;
+use hayro_syntax::work::{Cancelled, Meter, POLL_BYTES};
+use std::cell::Cell;
 
 mod common;
 use common::allocations::measure;
@@ -64,7 +65,6 @@ fn read_twice(stream: &Stream<'_>, chunk: usize) -> (Vec<u8>, usize) {
     first
 }
 
-#[cfg(feature = "unsafe")]
 fn zlib(data: &[u8]) -> Vec<u8> {
     use std::io::Write;
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
@@ -202,6 +202,55 @@ fn resume_at(encrypted: bool, params: &str, encoded: &[u8], offset: usize) {
             rest == (expected[offset..].to_vec(), 0),
             "{params} at {offset}"
         );
+    }
+}
+
+/// Once its meter stops, a reader of Flate data reads nothing more, not even the bytes
+/// it inflated ahead or a checkpoint carried, whatever the size of the reads; and when
+/// the hook asks to stop between polls, at most what was inflated ahead is read.
+#[test]
+fn a_stopped_meter_stops_every_later_read() {
+    let data: Vec<u8> = (0..1_000_000_u32).map(|i| ((i / 7) % 251) as u8).collect();
+    let pdf = stream_file("/Filter /FlateDecode", &zlib(&data));
+    let stream = object_3(&pdf);
+    let stop = Cell::new(false);
+    let hook = || stop.get();
+    let mut buf = [0; 257];
+
+    let meter = Meter::new(Some(&hook));
+    let mut reader = stream.decoded_reader().unwrap();
+    assert_eq!(reader.read(&mut buf[..1], &meter), Ok(1));
+    stop.set(true);
+    let mut read = 0;
+    let result = loop {
+        match reader.read(&mut buf[..1 + read % 2 * 256], &meter) {
+            Ok(n) if n > 0 => read += n,
+            other => break other,
+        }
+    };
+    assert_eq!(result, Err(ReadError::Cancelled));
+    assert!(read < 2 * POLL_BYTES, "{read} bytes read after the stop");
+
+    let meter = Meter::new(Some(&hook));
+    assert_eq!(meter.poll(), Err(Cancelled));
+    let mut reader = stream.decoded_reader().unwrap();
+    assert_eq!(reader.read(&mut buf[..1], &Meter::default()), Ok(1));
+    #[cfg(feature = "unsafe")]
+    let readers = {
+        let checkpoint = reader.checkpoint(&stream.to_owned_stream()).unwrap();
+        let mut resumed = stream.decoded_reader().unwrap();
+        assert!(resumed.restore(&checkpoint));
+        [reader, resumed]
+    };
+    #[cfg(not(feature = "unsafe"))]
+    let readers = [reader];
+    for mut reader in readers {
+        for len in [1, 257, 1, 257] {
+            assert_eq!(
+                reader.read(&mut buf[..len], &meter),
+                Err(ReadError::Cancelled)
+            );
+        }
     }
 }
 
