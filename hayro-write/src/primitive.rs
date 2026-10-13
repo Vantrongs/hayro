@@ -108,18 +108,18 @@ impl<T: WriteDirect> WriteDirect for MaybeRef<T> {
     }
 }
 
-fn write_dict(
+/// The entries of a stream dictionary that its writer sets itself.
+pub(crate) const STREAM_KEYS: &[&[u8]] = &[LENGTH];
+
+/// Copies `hayro_dict` into `pdf_dict`, leaving out the ignored keys and `skip`.
+pub(crate) fn write_dict(
     hayro_dict: &dict::Dict<'_>,
     pdf_dict: &mut Dict<'_>,
     ctx: &mut ExtractionContext<'_>,
-    is_stream: bool,
+    skip: &[&[u8]],
 ) {
     for (name, val) in hayro_dict.entries() {
-        if is_stream && name.deref() == LENGTH {
-            continue;
-        }
-
-        if !IGNORE_KEYS.contains(name.deref()) {
+        if !IGNORE_KEYS.contains(name.deref()) && !skip.contains(&name.deref()) {
             val.write_direct(pdf_dict.insert(pdf_writer::Name(name.deref())), ctx);
         }
     }
@@ -129,7 +129,7 @@ impl WriteDirect for object::Dict<'_> {
     fn write_direct(&self, obj: Obj<'_>, ctx: &mut ExtractionContext<'_>) {
         let mut dict = obj.dict();
 
-        write_dict(self, &mut dict, ctx, false);
+        write_dict(self, &mut dict, ctx, &[]);
     }
 }
 
@@ -175,7 +175,7 @@ impl WriteIndirect for Stream<'_> {
         // TODO: Handle `Crypt` filter
         let data = self.raw_data();
         let mut obj = chunk.stream(id, &data);
-        write_dict(self.dict(), obj.deref_mut(), ctx, true);
+        write_dict(self.dict(), obj.deref_mut(), ctx, STREAM_KEYS);
     }
 }
 

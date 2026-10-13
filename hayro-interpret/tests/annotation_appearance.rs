@@ -1,12 +1,14 @@
 //! Annotations without `/AP` get the appearance `PDFium` generates for their subtype.
 
+use hayro_interpret::annotation::{generate, normal_appearance, rect_transform};
 use hayro_interpret::font::GlyphRun;
 use hayro_interpret::hayro_syntax::Pdf;
+use hayro_interpret::hayro_syntax::object::{Array, Dict};
 use hayro_interpret::{
     BlendMode, ClipPath, Device, DrawMode, DrawProps, Image, ImageDrawProps, InterpreterSettings,
     Paint, SoftMask,
 };
-use kurbo::{BezPath, Shape};
+use kurbo::{Affine, BezPath, Shape};
 
 mod common;
 
@@ -294,4 +296,78 @@ fn flags_and_existing_appearances_decide_what_is_generated() {
         ),
         vec![]
     );
+}
+
+/// The first page's annotations, in a file with `objects` numbered from 4.
+fn annotations(page_entries: &str, objects: Vec<Vec<u8>>) -> Pdf {
+    Pdf::new(common::one_page(200, page_entries, objects)).expect("valid pdf")
+}
+
+#[test]
+fn normal_appearance_follows_the_state_and_never_reads_a_dictionary_as_a_stream() {
+    let pdf = annotations(
+        "/Annots [4 0 R 5 0 R 6 0 R]",
+        vec![
+            // A check box whose states sit in an indirect dictionary (7).
+            b"<< /Subtype /Widget /Rect [0 0 10 10] /AS /Yes /AP << /N 7 0 R >> >>".to_vec(),
+            b"<< /Subtype /Widget /Rect [0 0 10 10] /AP << /N 7 0 R >> >>".to_vec(),
+            // /N is a dictionary that is not a state dictionary; a stream follows it.
+            b"<< /Subtype /Square /Rect [0 0 10 10] /AP << /N 10 0 R >> >>".to_vec(),
+            b"<< /Yes 8 0 R /Off 9 0 R >>".to_vec(),
+            common::stream("/BBox [0 0 10 10]", b"0 0 10 10 re f"),
+            common::stream("/BBox [0 0 10 10]", b"0 0 m 10 10 l S"),
+            b"<< /Unrelated true >>".to_vec(),
+            common::stream("/BBox [0 0 10 10]", b"(not an appearance)"),
+        ],
+    );
+    let annots: Vec<Dict<'_>> = pdf.pages()[0]
+        .raw()
+        .get::<Array<'_>>(b"Annots")
+        .unwrap()
+        .iter::<Dict<'_>>()
+        .collect();
+    let data = |i: usize| normal_appearance(&annots[i]).map(|s| s.decoded().unwrap().into_owned());
+    assert_eq!(data(0).as_deref(), Some(&b"0 0 10 10 re f"[..]));
+    assert_eq!(
+        data(1).as_deref(),
+        Some(&b"0 0 m 10 10 l S"[..]),
+        "/Off without /AS"
+    );
+    assert_eq!(data(2), None);
+}
+
+#[test]
+fn rect_transform_maps_the_transformed_box_onto_the_rect() {
+    // A 20 × 10 box turned a quarter by its matrix spans x -10 to 0 and y 0 to 20;
+    // the rect is 30 × 40, so the box is scaled as well as moved.
+    let rect = kurbo::Rect::new(100.0, 200.0, 130.0, 240.0);
+    let turned = Affine::new([0.0, 1.0, -1.0, 0.0, 0.0, 0.0]);
+    let a = rect_transform(rect, [0.0, 0.0, 20.0, 10.0], turned);
+    let corners = (a * turned * kurbo::Rect::new(0.0, 0.0, 20.0, 10.0).to_path(0.1)).bounding_box();
+    assert_eq!(corners, rect);
+}
+
+#[test]
+fn generate_is_what_the_renderer_draws_without_ap() {
+    let pdf = annotations(
+        "/Annots [4 0 R 5 0 R]",
+        vec![
+            b"<< /Subtype /Highlight /CA 0.5 /Rect [10 10 90 40] /QuadPoints [10 40 90 40 10 30 90 30] >>".to_vec(),
+            b"<< /Subtype /Link /Rect [10 10 90 40] >>".to_vec(),
+        ],
+    );
+    let annots: Vec<Dict<'_>> = pdf.pages()[0]
+        .raw()
+        .get::<Array<'_>>(b"Annots")
+        .unwrap()
+        .iter::<Dict<'_>>()
+        .collect();
+    let visible = kurbo::Rect::new(0.0, 0.0, 200.0, 200.0);
+    let highlight = generate(&annots[0], visible).expect("a highlight is generated");
+    assert_eq!(
+        (highlight.opacity, highlight.blend),
+        (0.5, BlendMode::Multiply)
+    );
+    assert_eq!(highlight.content, "1 1 0 rg\n10 30 80 10 re\nf\n");
+    assert!(generate(&annots[1], visible).is_none());
 }

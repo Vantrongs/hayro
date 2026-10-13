@@ -15,15 +15,15 @@ use crate::x_object::{FormXObject, ImageXObject, XObject};
 use crate::{BlendMode, FillRule};
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
-use hayro_syntax::object::dict::keys::{ANNOTS, AP, AS, F, MCID, N, OC, RECT};
-use hayro_syntax::object::{Array, Dict, Name, Object, Rect, Stream, dict_or_stream};
+use hayro_syntax::object::dict::keys::{ANNOTS, AP, F, MCID, N, OC, RECT};
+use hayro_syntax::object::{Array, Dict, Name, Object, Rect, dict_or_stream};
 use hayro_syntax::page::{Page, Resources};
 use kurbo::{Affine, Point, Shape};
 use rustc_hash::FxHashMap;
 use smallvec::smallvec;
 use std::sync::Arc;
 
-mod annotation;
+pub mod annotation;
 pub(crate) mod path;
 pub(crate) mod state;
 pub(crate) mod text;
@@ -165,51 +165,14 @@ pub fn interpret_page<'a>(
                 continue;
             }
 
-            if let Some(apx) = appearance_stream(&annot).and_then(|o| FormXObject::new(&o)) {
+            if let Some(apx) =
+                annotation::normal_appearance(&annot).and_then(|o| FormXObject::new(&o))
+            {
                 let Some(rect) = annot.get::<Rect>(RECT) else {
                     continue;
                 };
+                let affine = annotation::rect_transform(rect.to_kurbo(), apx.bbox, apx.matrix);
 
-                let annot_rect = rect.to_kurbo();
-                // 12.5.5. Appearance streams
-                // "The algorithm outlined in this subclause shall be used
-                // to map from the coordinate system of the appearance XObject."
-
-                // 1) The appearance’s bounding box (specified by its BBox entry)
-                // shall be transformed, using Matrix, to produce a
-                // quadrilateral with arbitrary orientation. The transformed
-                // appearance box is the smallest upright rectangle that
-                // encompasses this quadrilateral.
-                let transformed_rect = (apx.matrix
-                    * kurbo::Rect::new(
-                        apx.bbox[0] as f64,
-                        apx.bbox[1] as f64,
-                        apx.bbox[2] as f64,
-                        apx.bbox[3] as f64,
-                    )
-                    .to_path(0.1))
-                .bounding_box();
-
-                // 2) A matrix A shall be computed that scales and translates
-                // the transformed appearance box to align with the edges
-                // of the annotation’s rectangle (specified by the Rect entry).
-                // A maps the lower-left corner (the corner with the smallest
-                // x and y coordinates) and the upper-right corner (the
-                // corner with the greatest x and y coordinates) of the
-                // transformed appearance box to the corresponding corners
-                // of the annotation’s rectangle.
-                let affine = Affine::new([
-                    annot_rect.width() / transformed_rect.width(),
-                    0.0,
-                    0.0,
-                    annot_rect.height() / transformed_rect.height(),
-                    annot_rect.x0 - transformed_rect.x0,
-                    annot_rect.y0 - transformed_rect.y0,
-                ]);
-
-                // 3) Matrix shall be concatenated with A to form a matrix
-                // AA that maps from the appearance’s coordinate system to
-                // the annotation’s rectangle in default user space.
                 context.save_state();
                 context.pre_concat_affine(affine);
                 context.push_root_transform();
@@ -256,17 +219,6 @@ fn draw_generated<'a>(
         device.pop_transparency_group();
     }
     context.restore_state(device);
-}
-
-fn appearance_stream<'a>(annot: &Dict<'a>) -> Option<Stream<'a>> {
-    match annot.get::<Dict<'_>>(AP)?.get::<Object<'_>>(N)? {
-        Object::Stream(stream) => Some(stream),
-        Object::Dict(states) => annot
-            .get::<Name<'_>>(AS)
-            .and_then(|state| states.get::<Stream<'_>>(state))
-            .or_else(|| states.get::<Stream<'_>>(b"Off")),
-        _ => None,
-    }
 }
 
 /// Interpret the instructions from `ops` and render them into the device.
