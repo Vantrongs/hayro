@@ -11,7 +11,7 @@ use crate::object;
 use crate::object::Dict;
 use crate::object::Name;
 use crate::object::dict::InlineImageDict;
-use crate::object::dict::keys::{DECODE_PARMS, DP, F, FILTER, LENGTH, TYPE};
+use crate::object::dict::keys::{DECODE_PARMS, DP, F, FILTER, IDENTITY, LENGTH, NAME, TYPE};
 use crate::object::{Array, ObjectIdentifier};
 use crate::object::{Object, ObjectLike, ObjectRefLike};
 use crate::reader::Reader;
@@ -24,6 +24,7 @@ use crate::xref::{DocumentId, XRef};
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
+use core::ops::Deref;
 use smallvec::SmallVec;
 
 #[cfg(feature = "images")]
@@ -123,39 +124,65 @@ impl<'a> Stream<'a> {
         }
     }
 
-    /// Return the raw, decrypted data of the stream.
+    /// Return the raw, decrypted data of the stream, empty where decryption fails.
     ///
     /// Stream filters will not be applied.
     pub fn raw_data(&self) -> Cow<'a, [u8]> {
+        self.try_raw_data().unwrap_or_default()
+    }
+
+    /// The raw, decrypted data of the stream, or [`DecodeFailure::Decryption`] where
+    /// it cannot be decrypted whole.
+    ///
+    /// Stream filters will not be applied; a /Crypt filter is not one of them, and is
+    /// left for the caller to drop.
+    pub fn try_raw_data(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
         match self.decryption_object_id() {
-            Some(id) => Cow::Owned(
-                self.dict
-                    .ctx()
-                    .xref()
-                    .decrypt(id, self.data, DecryptionTarget::Stream)
-                    // TODO: Maybe an error would be better?
-                    .unwrap_or_default(),
-            ),
-            None => Cow::Borrowed(self.data),
+            // No data has no IV to decrypt with, and holds nothing.
+            Some(_) if self.data.is_empty() => Ok(Cow::Borrowed(self.data)),
+            Some(_) if !self.dict.ctx().xref().decrypts_whole(self.data) => {
+                Err(DecodeFailure::Decryption)
+            }
+            Some(id) => self
+                .dict
+                .ctx()
+                .xref()
+                .decrypt(id, self.data, DecryptionTarget::Stream)
+                .map(Cow::Owned)
+                .ok_or(DecodeFailure::Decryption),
+            None => Ok(Cow::Borrowed(self.data)),
         }
     }
 
-    /// [`Self::raw_data`], decrypted a counted piece at a time.
-    fn raw_data_metered(&self, meter: &Meter<'_>) -> Result<Cow<'a, [u8]>, DecodeFailure> {
-        let Some(id) = self.decryption_object_id() else {
+    /// [`Self::raw_data`], decrypted a counted piece at a time; if `strict`, data that
+    /// does not decrypt whole is a failure.
+    fn raw_data_metered(
+        &self,
+        meter: &Meter<'_>,
+        strict: bool,
+    ) -> Result<Cow<'a, [u8]>, DecodeFailure> {
+        let Some(id) = self
+            .decryption_object_id()
+            .filter(|_| !self.data.is_empty())
+        else {
             return Ok(Cow::Borrowed(self.data));
         };
+        if strict && !self.dict.ctx().xref().decrypts_whole(self.data) {
+            return Err(DecodeFailure::Decryption);
+        }
         match self.dict.ctx().xref().decrypted_reader(id, self.data) {
             Some(mut data) => data
                 .decrypt_all(meter)
                 .map(Cow::Owned)
                 .map_err(|_| DecodeFailure::Cancelled),
-            None => Ok(Cow::Owned(Vec::new())),
+            None => Err(DecodeFailure::Decryption),
         }
     }
 
-    /// The object whose key decrypts the stream, when the document is encrypted and
-    /// the stream is not a cross-reference stream.
+    // The object whose key decrypts the stream, when the document is encrypted and
+    // the stream is neither a cross-reference stream nor one with its own /Crypt
+    // filter, which replaces the document's (`pdf_open_raw_filter` in MuPDF's
+    // `pdf-stream.c`).
     fn decryption_object_id(&self) -> Option<ObjectIdentifier> {
         let ctx = self.dict.ctx();
         if ctx.xref().needs_decryption(ctx)
@@ -163,11 +190,24 @@ impl<'a> Stream<'a> {
                 .dict
                 .get::<object::String<'_>>(TYPE)
                 .is_none_or(|t| t.as_ref() != b"XRef")
+            && !self.filters().contains(&Filter::Crypt)
         {
             self.dict.obj_id()
         } else {
             None
         }
+    }
+
+    // Whether a /Crypt filter with these parameters passes the data through: its
+    // /Name is /Identity or missing, or the document is not encrypted, where MuPDF
+    // ignores it (`build_filter` in `pdf-stream.c`). Other crypt filters, which name
+    // one of the document's, are not supported.
+    fn crypt_passes_through(&self, params: &Dict<'_>) -> bool {
+        let ctx = self.dict.ctx();
+        !ctx.xref().is_encrypted()
+            || params
+                .get::<Name<'_>>(NAME)
+                .is_none_or(|name| name.deref() == IDENTITY)
     }
 
     /// Return the raw, underlying dictionary of the stream.
@@ -214,6 +254,14 @@ impl<'a> Stream<'a> {
         self.decoded_image_metered(image_params, &Meter::default())
     }
 
+    /// [`Self::decoded`], but [`DecodeFailure::StreamDecode`] where the data is
+    /// corrupt rather than what a lenient reading recovers of it: for a writer, which
+    /// must not take part of the data for all of it. Data cut short is not corrupt.
+    pub fn decoded_strict(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
+        self.decode(&ImageDecodeParams::default(), &Meter::default(), true)
+            .map(|r| r.data)
+    }
+
     /// [`Self::decoded_image`], its work counted on `meter`, a bounded amount at a
     /// time: [`DecodeFailure::Cancelled`] once the meter's hook asks to stop.
     pub fn decoded_image_metered(
@@ -221,7 +269,16 @@ impl<'a> Stream<'a> {
         image_params: &ImageDecodeParams,
         meter: &Meter<'_>,
     ) -> Result<FilterResult<'a>, DecodeFailure> {
-        let data = self.raw_data_metered(meter)?;
+        self.decode(image_params, meter, false)
+    }
+
+    fn decode(
+        &self,
+        image_params: &ImageDecodeParams,
+        meter: &Meter<'_>,
+        strict: bool,
+    ) -> Result<FilterResult<'a>, DecodeFailure> {
+        let data = self.raw_data_metered(meter, strict)?;
         let filters_and_params = self.filters_and_params();
 
         let mut current: Option<FilterResult<'a>> = None;
@@ -231,11 +288,19 @@ impl<'a> Stream<'a> {
             .iter()
             .zip(filters_and_params.params.iter())
         {
+            if *filter == Filter::Crypt {
+                if self.crypt_passes_through(params) {
+                    continue;
+                }
+                warn!("unsupported crypt filter");
+                return Err(DecodeFailure::Decryption);
+            }
             let new = filter.apply(
                 current.as_ref().map(|c| c.data.as_ref()).unwrap_or(&data),
                 params,
                 image_params,
                 meter,
+                strict,
             )?;
             current = Some(new);
         }

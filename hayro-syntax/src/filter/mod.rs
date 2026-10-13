@@ -84,13 +84,15 @@ impl Filter {
     }
 
     /// The filter applied to `data`, its work counted on `meter`;
-    /// [`DecodeFailure::Cancelled`] once the meter's hook asks to stop.
+    /// [`DecodeFailure::Cancelled`] once the meter's hook asks to stop. If `strict`,
+    /// data a lenient decoder would recover part of is a failure.
     pub(crate) fn apply(
         &self,
         data: &[u8],
         params: &Dict<'_>,
         #[cfg_attr(not(feature = "images"), allow(unused))] image_params: &ImageDecodeParams,
         meter: &Meter<'_>,
+        strict: bool,
     ) -> Result<FilterResult<'static>, DecodeFailure> {
         let res =
             match self {
@@ -106,7 +108,7 @@ impl Filter {
                 Self::LzwDecode => lzw_flate::lzw::decode(data, params, meter)
                     .map(FilterResult::from_data)
                     .ok_or(DecodeFailure::StreamDecode),
-                Self::FlateDecode => lzw_flate::flate::decode(data, params, meter)
+                Self::FlateDecode => lzw_flate::flate::decode(data, params, meter, strict)
                     .map(FilterResult::from_data)
                     .ok_or(DecodeFailure::StreamDecode),
                 #[cfg(feature = "images")]

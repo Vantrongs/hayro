@@ -414,7 +414,7 @@ fn fallback(
             &decrypted
         }
     };
-    Ok(match flate::fallback::decode(bytes, meter)? {
+    Ok(match flate::fallback::decode(bytes, meter, false)? {
         Some(decoded) => Source::Raw(DecryptedReader::raw(Cow::Owned(decoded))),
         None => Source::Failed,
     })
@@ -546,7 +546,7 @@ mod tests {
     /// The reader's bytes equal the whole-data decoder's for `encoded` under `p`, read
     /// in pieces of every size from 1 to 9 bytes and in one large piece.
     fn same_as_whole(encoded: &[u8], p: &PredictorParams) {
-        let whole = flate::fallback::decode(encoded, &Meter::default())
+        let whole = flate::fallback::decode(encoded, &Meter::default(), false)
             .unwrap()
             .and_then(|d| apply_predictor(d, p, &Meter::default()));
         #[cfg(feature = "unsafe")]
@@ -711,7 +711,7 @@ mod tests {
             encoded[2] = 0;
             let end = encoded.len() - 4;
             encoded.insert(end, 0b111);
-            let expected = flate::decode(&encoded, &Dict::default(), &Meter::default());
+            let expected = flate::decode(&encoded, &Dict::default(), &Meter::default(), false);
             let mut reader = DecodedReader::flate(
                 DecryptedReader::raw(Cow::Borrowed(&encoded)),
                 &params(1, 1, 8, 1),
@@ -750,7 +750,7 @@ mod tests {
         /// and by the permissive decoder) each stay under three polls' work. Rewound,
         /// the reader then yields what whole decoding does, as does a fresh reader.
         fn cancelled_within_bounded_work(encoded: &[u8], p: &PredictorParams) {
-            let whole = flate::decode(encoded, &Dict::default(), &Meter::default())
+            let whole = flate::decode(encoded, &Dict::default(), &Meter::default(), false)
                 .and_then(|d| apply_predictor(d, p, &Meter::default()));
             let hook = second_poll();
             let meter = Meter::new(Some(&hook));

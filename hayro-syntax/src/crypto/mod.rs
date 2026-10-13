@@ -81,6 +81,24 @@ pub(crate) enum DecryptionTarget {
 }
 
 impl Decryptor {
+    /// Whether `data` decrypts whole: AES needs its IV and whole blocks, and the
+    /// decryption leaves a trailing partial block out. No data is whole.
+    pub(crate) fn decrypts_whole(&self, data: &[u8], target: DecryptionTarget) -> bool {
+        let tag = match self {
+            Self::None | Self::Rc4 { .. } => return true,
+            Self::Aes128 { dict, .. } | Self::Aes256 { dict, .. } => match target {
+                DecryptionTarget::String => dict.string_filter.cfm,
+                DecryptionTarget::Stream => dict.stream_filter.cfm,
+            },
+        };
+        match tag {
+            DecryptorTag::Aes128 | DecryptorTag::Aes256 => {
+                data.is_empty() || (data.len() >= 16 && data.len().is_multiple_of(16))
+            }
+            DecryptorTag::None | DecryptorTag::Rc4 => true,
+        }
+    }
+
     pub(crate) fn decrypt(
         &self,
         id: ObjectIdentifier,
@@ -676,4 +694,121 @@ fn decryption_key_rev56(
     // the file encryption key as the key. Verify that bytes 9-11 of the result are the characters "a", "d",
     // "b". Bytes 0-3 of the decrypted Perms entry, treated as a little-endian integer, are the user
     // permissions. They shall match the value in the P key.
+}
+
+/// Encrypted test files.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::aes::AES128Cipher;
+    use super::rc4::Rc4;
+    use super::{PASSWORD_PADDING, md5};
+    use alloc::format;
+    use alloc::vec::Vec;
+
+    /// An object of a test file.
+    pub(crate) enum Part<'a> {
+        /// An object without strings, written as it is.
+        Plain(&'a str),
+        /// A stream with `dict`'s entries and `data`, encrypted unless `encrypt` is false.
+        Stream {
+            dict: &'a str,
+            data: &'a [u8],
+            encrypt: bool,
+        },
+    }
+
+    const ID: [u8; 16] = *b"hayro-test-file!";
+    const PERMISSIONS: i32 = -4;
+
+    fn rc4_rounds(key: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut out = Rc4::new(key).encrypt(data);
+        for i in 1..=19_u8 {
+            let key: Vec<u8> = key.iter().map(|b| b ^ i).collect();
+            out = Rc4::new(&key).encrypt(&out);
+        }
+        out
+    }
+
+    /// A file encrypted with AES-128 (/V 4 /R 4) and the empty user and owner
+    /// password, whose objects are numbered from 1, the first being the catalog.
+    pub(crate) fn aes128(objects: &[Part<'_>]) -> Vec<u8> {
+        // Algorithm 3: /O from the empty owner password.
+        let mut hash = md5::calculate(&PASSWORD_PADDING);
+        for _ in 0..50 {
+            hash = md5::calculate(&hash);
+        }
+        let owner = rc4_rounds(&hash, &PASSWORD_PADDING);
+        // Algorithm 2: the file key.
+        let mut input = PASSWORD_PADDING.to_vec();
+        input.extend(&owner);
+        input.extend(PERMISSIONS.to_le_bytes());
+        input.extend(ID);
+        let mut key = md5::calculate(&input);
+        for _ in 0..50 {
+            key = md5::calculate(&key);
+        }
+        // Algorithm 5: /U.
+        let mut input = PASSWORD_PADDING.to_vec();
+        input.extend(ID);
+        let mut user = rc4_rounds(&key, &md5::calculate(&input));
+        user.extend([0; 16]);
+
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>();
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, part) in objects.iter().enumerate() {
+            let number = i + 1;
+            offsets.push(out.len());
+            out.extend(format!("{number} 0 obj\n").bytes());
+            match part {
+                Part::Plain(object) => out.extend(object.bytes()),
+                Part::Stream {
+                    dict,
+                    data,
+                    encrypt,
+                } => {
+                    let data = if *encrypt {
+                        let mut input = key.to_vec();
+                        input.extend(&(number as u32).to_le_bytes()[..3]);
+                        input.extend([0, 0]);
+                        input.extend(b"sAlT");
+                        let object_key = md5::calculate(&input);
+                        let iv = [7; 16];
+                        let mut encrypted = iv.to_vec();
+                        encrypted.extend(
+                            AES128Cipher::new(&object_key)
+                                .unwrap()
+                                .encrypt_cbc(data, &iv),
+                        );
+                        encrypted
+                    } else {
+                        data.to_vec()
+                    };
+                    out.extend(format!("<< {dict} /Length {} >>\nstream\n", data.len()).bytes());
+                    out.extend(data);
+                    out.extend(b"\nendstream");
+                }
+            }
+            out.extend(b"\nendobj\n");
+        }
+        let xref = out.len();
+        out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).bytes());
+        for offset in offsets {
+            out.extend(format!("{offset:010} 00000 n \n").bytes());
+        }
+        let id = hex(&ID).concat();
+        out.extend(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R /ID [<{id}> <{id}>] /Encrypt << /Filter \
+                 /Standard /V 4 /R 4 /Length 128 /CF << /StdCF << /CFM /AESV2 /AuthEvent \
+                 /DocOpen /Length 16 >> >> /StmF /StdCF /StrF /StdCF /P {PERMISSIONS} /O <{}> \
+                 /U <{}> >> >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1,
+                hex(&owner).concat(),
+                hex(&user).concat(),
+            )
+            .bytes(),
+        );
+        out
+    }
 }

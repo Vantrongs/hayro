@@ -8,7 +8,8 @@ use crate::object::Rect;
 use crate::object::Stream;
 use crate::object::array::ArrayIter;
 use crate::object::dict::keys::*;
-use crate::object::{MaybeRef, Object, ObjectIdentifier};
+use crate::object::stream::DecodeFailure;
+use crate::object::{MaybeRef, Null, Object, ObjectIdentifier};
 use crate::reader::ReaderContext;
 use crate::sync::{FxHashSet, OnceLock};
 use crate::transform::Transform;
@@ -125,9 +126,9 @@ impl<'a> Node<'a> {
         )
     }
 
-    /// Whether the entry lists kids rather than being a page: /Type /Pages, or, as
-    /// MuPDF reads a node without /Type (`pdf_lookup_page_loc_imp`), /Kids and no
-    /// /MediaBox. Any other entry is a page, including one that is no dictionary.
+    // Whether the entry lists kids rather than being a page: /Type /Pages, or, as
+    // MuPDF reads a node without /Type (`pdf_lookup_page_loc_imp`), /Kids and no
+    // /MediaBox. Any other entry is a page, including one that is no dictionary.
     fn is_tree(&self) -> bool {
         if self.has(TYPE) {
             self.dict.get::<Name<'_>>(TYPE).as_deref() == Some(PAGES)
@@ -193,6 +194,16 @@ fn brute_force<'a>(ctx: &ReaderContext<'a>, xref: &'a XRef) -> Vec<Page<'a>> {
         }
     }
     pages
+}
+
+/// A part of a page's /Contents that cannot be read; the object is `None` for a part
+/// written directly into the page or its /Contents array.
+#[derive(Debug, Copy, Clone)]
+pub enum ContentError {
+    /// The part is no stream, or its object cannot be parsed.
+    Unreadable(Option<ObjectIdentifier>),
+    /// The part's stream cannot be decrypted or decoded.
+    Decode(Option<ObjectIdentifier>, DecodeFailure),
 }
 
 /// The rotation of the page.
@@ -308,6 +319,54 @@ impl<'a> Page<'a> {
             })
             .as_ref()
             .map(|d| d.as_slice())
+    }
+
+    /// The decoded content of the page, as [`Self::page_stream`] joins it, or the
+    /// first part that cannot be read: unlike `page_stream`, which leaves such a part
+    /// out, so that a page that lost content is not taken for a whole one. A missing
+    /// or `null` /Contents, or a part that is `null`, is no content.
+    pub fn try_page_stream(&self) -> Result<Vec<u8>, ContentError> {
+        let Some(contents) = self.inner.get_raw::<Object<'a>>(CONTENTS) else {
+            return Ok(vec![]);
+        };
+        let resolved = |object: MaybeRef<Object<'a>>| -> Result<_, ContentError> {
+            match object {
+                MaybeRef::NotRef(object) => Ok((None, object)),
+                MaybeRef::Ref(r) => {
+                    let id = ObjectIdentifier::from(r);
+                    match self.ctx.xref().get_with::<Object<'a>>(id, &self.ctx) {
+                        Some(object) => Ok((Some(id), object)),
+                        None if self.ctx.xref().has_entry(id) => {
+                            Err(ContentError::Unreadable(Some(id)))
+                        }
+                        None => Ok((Some(id), Object::Null(Null))),
+                    }
+                }
+            }
+        };
+        let decode = |(id, object): (Option<ObjectIdentifier>, Object<'a>)| match object {
+            Object::Null(_) => Ok(None),
+            Object::Stream(stream) => stream
+                .decoded_strict()
+                .map(|data| Some(data.into_owned()))
+                .map_err(|failure| ContentError::Decode(id, failure)),
+            _ => Err(ContentError::Unreadable(id)),
+        };
+
+        match resolved(contents)? {
+            (_, Object::Array(array)) => {
+                let mut collected = vec![];
+                for item in array.raw_iter() {
+                    if let Some(data) = decode(resolved(item)?)? {
+                        collected.extend(data);
+                        // Streams must have at least one whitespace in-between.
+                        collected.push(b' ');
+                    }
+                }
+                Ok(collected)
+            }
+            single => Ok(decode(single)?.unwrap_or_default()),
+        }
     }
 
     /// Get the resources of the page.
@@ -767,6 +826,164 @@ mod tests {
                 Some(vec![(3, Some(300.0)), (5, Some(400.0))]),
                 "{catalog}"
             );
+        }
+    }
+
+    mod content {
+        use crate::crypto::fixture::{Part, aes128};
+        use crate::object::ObjectIdentifier;
+        use crate::object::stream::DecodeFailure;
+        use crate::page::ContentError;
+        use crate::pdf::Pdf;
+        use alloc::vec::Vec;
+
+        const RED: &[u8] = b"1 0 0 rg 0 0 10 10 re f";
+        const BLUE: &[u8] = b"0 0 1 rg 10 0 10 10 re f";
+        /// zlib of "0 1 0 rg 20 0 10 10 re f".
+        const GREEN_FLATE: &[u8] = &[
+            0x78, 0x9c, 0x33, 0x50, 0x30, 0x54, 0x30, 0x50, 0x28, 0x4a, 0x57, 0x30, 0x32, 0x00,
+            0xd2, 0x86, 0x60, 0x54, 0x94, 0xaa, 0x90, 0x06, 0x00, 0x3b, 0x65, 0x05, 0x1c,
+        ];
+
+        const CATALOG: Part<'_> = Part::Plain("<< /Type /Catalog /Pages 2 0 R >>");
+        const TREE: Part<'_> = Part::Plain("<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+
+        fn page(contents: &str) -> String {
+            format!("<< /Type /Page /MediaBox [0 0 100 100] /Contents {contents} >>")
+        }
+
+        /// The page's content read strictly and leniently.
+        fn read(file: Vec<u8>) -> (Result<Vec<u8>, ContentError>, Vec<u8>) {
+            let pdf = Pdf::new(file).unwrap();
+            let page = &pdf.pages()[0];
+            let lenient = page.page_stream().unwrap_or_default().to_vec();
+            (page.try_page_stream(), lenient)
+        }
+
+        fn joined(parts: &[&[u8]]) -> Vec<u8> {
+            parts
+                .iter()
+                .flat_map(|p| p.iter().chain(b" "))
+                .copied()
+                .collect()
+        }
+
+        #[test]
+        fn an_identity_crypt_filter_leaves_its_stream_unencrypted() {
+            for dict in [
+                "/Filter /Crypt /DecodeParms << /Name /Identity >>",
+                "/Filter /Crypt",
+                "/Filter [/Crypt] /DecodeParms [<< /Name /Identity >>]",
+            ] {
+                let page = page("[4 0 R 5 0 R]");
+                let file = aes128(&[
+                    CATALOG,
+                    TREE,
+                    Part::Plain(&page),
+                    Part::Stream {
+                        dict,
+                        data: RED,
+                        encrypt: false,
+                    },
+                    Part::Stream {
+                        dict: "",
+                        data: BLUE,
+                        encrypt: true,
+                    },
+                ]);
+                let (strict, lenient) = read(file);
+                assert_eq!(strict.unwrap(), joined(&[RED, BLUE]), "{dict}");
+                assert_eq!(lenient, joined(&[RED, BLUE]), "{dict}");
+            }
+        }
+
+        #[test]
+        fn an_identity_crypt_filter_goes_before_the_others() {
+            let page = page("4 0 R");
+            let file = aes128(&[
+                CATALOG,
+                TREE,
+                Part::Plain(&page),
+                Part::Stream {
+                    dict: "/Filter [/Crypt /FlateDecode] /DecodeParms [<< /Name /Identity >> null]",
+                    data: GREEN_FLATE,
+                    encrypt: false,
+                },
+            ]);
+            assert_eq!(read(file).0.unwrap(), b"0 1 0 rg 20 0 10 10 re f");
+        }
+
+        #[test]
+        fn a_part_that_cannot_be_read_is_an_error() {
+            let id = |n| Some(ObjectIdentifier::new(n, 0));
+            let page = page("[4 0 R 5 0 R]");
+            let file = |part: Part<'_>| {
+                aes128(&[
+                    CATALOG,
+                    TREE,
+                    Part::Plain(&page),
+                    Part::Stream {
+                        dict: "",
+                        data: RED,
+                        encrypt: true,
+                    },
+                    part,
+                ])
+            };
+            // Data that is no Flate stream.
+            let (strict, lenient) = read(file(Part::Stream {
+                dict: "/Filter /FlateDecode",
+                data: b"not flate at all, not flate at all",
+                encrypt: true,
+            }));
+            assert!(
+                matches!(strict, Err(ContentError::Decode(i, DecodeFailure::StreamDecode)) if i == id(5))
+            );
+            // A lenient reading recovers nothing of it.
+            assert_eq!(lenient, joined(&[RED, b""]));
+            // A crypt filter naming one of the document's, which is not supported.
+            let (strict, _) = read(file(Part::Stream {
+                dict: "/Filter /Crypt /DecodeParms << /Name /StdCF >>",
+                data: BLUE,
+                encrypt: true,
+            }));
+            assert!(
+                matches!(strict, Err(ContentError::Decode(i, DecodeFailure::Decryption)) if i == id(5))
+            );
+            // Data that does not decrypt: AES needs whole blocks.
+            let (strict, _) = read(file(Part::Stream {
+                dict: "",
+                data: BLUE,
+                encrypt: false,
+            }));
+            assert!(
+                matches!(strict, Err(ContentError::Decode(i, DecodeFailure::Decryption)) if i == id(5))
+            );
+            // An object that is no stream.
+            let (strict, _) = read(file(Part::Plain("<< /Length 3 >>")));
+            assert!(matches!(strict, Err(ContentError::Unreadable(i)) if i == id(5)));
+        }
+
+        #[test]
+        fn no_contents_is_an_empty_page() {
+            // A missing /Contents, a null one, a null part and a part the file lacks.
+            for contents in ["null", "[null 9 0 R]", "9 0 R"] {
+                let page = page(contents);
+                let file = aes128(&[CATALOG, TREE, Part::Plain(&page)]);
+                assert_eq!(read(file).0.unwrap(), b"", "{contents}");
+            }
+            let bare = "<< /Type /Page /MediaBox [0 0 100 100] >>";
+            let file = aes128(&[CATALOG, TREE, Part::Plain(bare)]);
+            assert_eq!(read(file).0.unwrap(), b"");
+            // An empty stream, which has no IV to decrypt with.
+            let page = page("4 0 R");
+            let empty = Part::Stream {
+                dict: "",
+                data: b"",
+                encrypt: false,
+            };
+            let file = aes128(&[CATALOG, TREE, Part::Plain(&page), empty]);
+            assert_eq!(read(file).0.unwrap(), b"");
         }
     }
 

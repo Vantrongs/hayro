@@ -535,6 +535,14 @@ impl XRef {
     }
 
     #[inline]
+    /// Whether the document is encrypted.
+    pub(crate) fn is_encrypted(&self) -> bool {
+        match &self.0 {
+            Inner::Dummy => false,
+            Inner::Some(r) => !matches!(r.decryptor.as_ref(), Decryptor::None),
+        }
+    }
+
     pub(crate) fn needs_decryption(&self, ctx: &ReaderContext<'_>) -> bool {
         match &self.0 {
             Inner::Dummy => false,
@@ -560,6 +568,14 @@ impl XRef {
         }
     }
 
+    /// Whether stream `data` decrypts whole (see [`Decryptor::decrypts_whole`]).
+    pub(crate) fn decrypts_whole(&self, data: &[u8]) -> bool {
+        match &self.0 {
+            Inner::Dummy => true,
+            Inner::Some(r) => r.decryptor.decrypts_whole(data, DecryptionTarget::Stream),
+        }
+    }
+
     /// A reader of stream `data` of object `id`, decrypted; `None` where
     /// [`Self::decrypt`] would fail.
     pub(crate) fn decrypted_reader<'a>(
@@ -579,6 +595,15 @@ impl XRef {
         match &self.0 {
             Inner::Some(repr) => Some(repr.data.get()),
             Inner::Dummy => None,
+        }
+    }
+
+    /// Whether the table lists object `id`; a reference to an object it does not list
+    /// is `null`.
+    pub(crate) fn has_entry(&self, id: ObjectIdentifier) -> bool {
+        match &self.0 {
+            Inner::Dummy => false,
+            Inner::Some(r) => r.map.get().xref_map.contains_key(&id),
         }
     }
 

@@ -12,9 +12,15 @@ pub(crate) mod flate {
     use crate::object::Dict;
 
     /// The data inflated and its predictor reversed, the work counted on `meter`;
-    /// `None` once its hook asks to stop.
+    /// `None` once its hook asks to stop, or, if `strict`, where the data is corrupt
+    /// rather than cut short (see [`fallback::decode`]).
     #[cfg(feature = "unsafe")]
-    pub(crate) fn decode(data: &[u8], params: &Dict<'_>, meter: &Meter<'_>) -> Option<Vec<u8>> {
+    pub(crate) fn decode(
+        data: &[u8],
+        params: &Dict<'_>,
+        meter: &Meter<'_>,
+        strict: bool,
+    ) -> Option<Vec<u8>> {
         let decoded = inflate(data, true, meter)
             .or_else(|| (!meter.cancelled()).then(|| inflate(data, false, meter))?)
             .or_else(|| {
@@ -23,7 +29,7 @@ pub(crate) mod flate {
                 }
                 warn!("flate stream is broken, decoding with fallback");
 
-                fallback::decode(data, meter).ok()?
+                fallback::decode(data, meter, strict).ok()?
             })?;
         let params = PredictorParams::from_params(params);
         apply_predictor(decoded, &params, meter)
@@ -98,10 +104,16 @@ pub(crate) mod flate {
     }
 
     /// The data inflated and its predictor reversed, the work counted on `meter`;
-    /// `None` once its hook asks to stop.
+    /// `None` once its hook asks to stop, or, if `strict`, where the data is corrupt
+    /// rather than cut short (see [`fallback::decode`]).
     #[cfg(not(feature = "unsafe"))]
-    pub(crate) fn decode(data: &[u8], params: &Dict<'_>, meter: &Meter<'_>) -> Option<Vec<u8>> {
-        let decoded = fallback::decode(data, meter).ok()??;
+    pub(crate) fn decode(
+        data: &[u8],
+        params: &Dict<'_>,
+        meter: &Meter<'_>,
+        strict: bool,
+    ) -> Option<Vec<u8>> {
+        let decoded = fallback::decode(data, meter, strict).ok()??;
         let params = PredictorParams::from_params(params);
         apply_predictor(decoded, &params, meter)
     }
@@ -113,12 +125,25 @@ pub(crate) mod flate {
         use alloc::vec;
         use alloc::vec::Vec;
 
-        /// The data decoded, its work counted on `meter`.
-        pub(crate) fn decode(data: &[u8], meter: &Meter<'_>) -> Result<Option<Vec<u8>>, Cancelled> {
-            flate_decode(data, meter)
+        /// The data decoded, its work counted on `meter`. Decoding stops at the first
+        /// thing that is no valid deflate data and keeps what came before; if `strict`,
+        /// such data is `None` instead. Data that ends early, or with a wrong or missing
+        /// checksum, is not corrupt: what it holds is all decoded.
+        pub(crate) fn decode(
+            data: &[u8],
+            meter: &Meter<'_>,
+            strict: bool,
+        ) -> Result<Option<Vec<u8>>, Cancelled> {
+            let (decoded, corrupt) = flate_decode(data, meter)?;
+            if corrupt && strict {
+                warn!("flate stream is corrupt");
+                return Ok(None);
+            }
+            Ok(Some(decoded))
         }
 
-        fn flate_decode(data: &[u8], meter: &Meter<'_>) -> Result<Option<Vec<u8>>, Cancelled> {
+        /// The data decoded, and whether decoding met data that is no valid deflate.
+        fn flate_decode(data: &[u8], meter: &Meter<'_>) -> Result<(Vec<u8>, bool), Cancelled> {
             if data.len() >= 2 {
                 let cmf = data[0];
                 let flg = data[1];
@@ -157,6 +182,9 @@ pub(crate) mod flate {
             code_size: u8,
             output: Vec<u8>,
             eof: bool,
+            /// Whether decoding stopped at, or passed over, data that is no valid
+            /// deflate, rather than at the end of the stream or of the data.
+            corrupt: bool,
             meter: &'m Meter<'m>,
         }
 
@@ -169,19 +197,26 @@ pub(crate) mod flate {
                     code_size: 0,
                     output: Vec::new(),
                     eof: false,
+                    corrupt: false,
                     meter,
                 }
             }
 
             /// Each block counts the bytes it took, and at least one.
-            fn decode(&mut self) -> Result<Option<Vec<u8>>, Cancelled> {
+            fn decode(&mut self) -> Result<(Vec<u8>, bool), Cancelled> {
                 while !self.eof && self.pos < self.data.len() {
                     let pos = self.pos;
                     self.read_block()?;
                     self.meter.work(self.pos - pos + 1)?;
                 }
 
-                Ok(Some(core::mem::take(&mut self.output)))
+                Ok((core::mem::take(&mut self.output), self.corrupt))
+            }
+
+            /// Stops decoding at data that is no valid deflate.
+            fn corrupt(&mut self) {
+                self.corrupt = true;
+                self.eof = true;
             }
 
             fn get_byte(&mut self) -> Option<u8> {
@@ -241,7 +276,12 @@ pub(crate) mod flate {
                 let code_len = (code >> 16) as u8;
                 let code_val = code & 0xffff;
 
-                if code_len < 1 || self.code_size < code_len {
+                if code_len < 1 {
+                    // No code of the table starts with these bits.
+                    self.corrupt = true;
+                    return None;
+                }
+                if self.code_size < code_len {
                     return None;
                 }
 
@@ -274,7 +314,7 @@ pub(crate) mod flate {
                     2 => return self.read_compressed_block(false),
                     _ => {
                         warn!("unknown block type in flate stream");
-                        self.eof = true;
+                        self.corrupt();
                     }
                 }
                 Ok(())
@@ -328,6 +368,7 @@ pub(crate) mod flate {
                 if check != !block_len && (block_len != 0 || check != 0) {
                     // Ignoring error for bad "empty" block
                     warn!("bad uncompressed block length in flate stream");
+                    self.corrupt = true;
                 }
 
                 if block_len == 0 {
@@ -375,7 +416,11 @@ pub(crate) mod flate {
                         return Ok(());
                     } else {
                         let code1 = code1 - 257;
-                        let length_info = LENGTH_DECODE.get(code1 as usize).copied().unwrap_or(0);
+                        let Some(&length_info) = LENGTH_DECODE.get(code1 as usize) else {
+                            warn!("invalid length code {} in flate stream", code1 + 257);
+                            self.corrupt();
+                            return Ok(());
+                        };
                         let extra_bits = (length_info >> 16) as u8;
                         let mut length = (length_info & 0xffff) as usize;
 
@@ -401,7 +446,7 @@ pub(crate) mod flate {
                             None => {
                                 warn!("invalid distance code {} in flate stream", dist_code);
 
-                                self.eof = true;
+                                self.corrupt();
                                 return Ok(());
                             }
                         };
@@ -420,6 +465,10 @@ pub(crate) mod flate {
 
                         // Copy from previous output
                         let start = self.output.len().wrapping_sub(distance);
+                        if start >= self.output.len() {
+                            // A distance back past the start of the output.
+                            self.corrupt = true;
+                        }
                         for _ in 0..length {
                             if start < self.output.len() {
                                 let byte = self.output[self.output.len() - distance];
@@ -488,7 +537,10 @@ pub(crate) mod flate {
                                 }
                             }
                         }
-                        _ => return None,
+                        _ => {
+                            self.corrupt = true;
+                            return None;
+                        }
                     }
                 }
 
@@ -1266,7 +1318,7 @@ mod tests {
             0x78, 0x9c, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x7, 0x0, 0x5, 0x8c, 0x1, 0xf5,
         ];
 
-        let decoded = flate::decode(&input, &Dict::default(), &Meter::default()).unwrap();
+        let decoded = flate::decode(&input, &Dict::default(), &Meter::default(), false).unwrap();
         assert_eq!(decoded, b"Hello");
     }
 
@@ -1274,7 +1326,7 @@ mod tests {
     fn decode_flate() {
         let input = [0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x7, 0x0];
 
-        let decoded = flate::decode(&input, &Dict::default(), &Meter::default()).unwrap();
+        let decoded = flate::decode(&input, &Dict::default(), &Meter::default(), false).unwrap();
         assert_eq!(decoded, b"Hello");
     }
 
@@ -1295,11 +1347,11 @@ mod tests {
             .read_to_end(&mut expected)
             .unwrap();
         assert!(expected.len() > POLL_BYTES && data.starts_with(&expected));
-        let decoded = flate::decode(cut, &Dict::default(), &Meter::default());
+        let decoded = flate::decode(cut, &Dict::default(), &Meter::default(), false);
         assert_eq!(decoded, Some(expected));
         let mut followed = encoded.clone();
         followed.extend(b"more");
-        let decoded = flate::decode(&followed, &Dict::default(), &Meter::default());
+        let decoded = flate::decode(&followed, &Dict::default(), &Meter::default(), false);
         assert_eq!(decoded, Some(data));
     }
 
