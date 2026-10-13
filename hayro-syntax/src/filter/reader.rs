@@ -226,7 +226,7 @@ impl<'a> DecodedReader<'a> {
     }
 
     /// The stored bytes read.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "unsafe"))]
     fn stored_read(&self) -> usize {
         match &self.source {
             Source::Raw(data) | Source::Fallback(data) => data.position(),

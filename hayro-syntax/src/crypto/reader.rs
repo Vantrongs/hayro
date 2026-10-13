@@ -183,7 +183,7 @@ impl<'a> DecryptedReader<'a> {
     }
 
     /// The stored bytes read.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "unsafe"))]
     pub(crate) fn position(&self) -> usize {
         self.cursor.pos
     }
@@ -294,6 +294,7 @@ mod tests {
             let expected = expected.as_deref().unwrap();
             for prefix in [0, 1, 15, 17, 37, data.len() + 1] {
                 reader.rewind();
+                #[cfg_attr(not(feature = "unsafe"), allow(unused))]
                 let read = reader.read(&mut alloc::vec![0; prefix]);
                 #[cfg(feature = "unsafe")]
                 {
