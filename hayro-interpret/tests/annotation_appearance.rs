@@ -337,6 +337,17 @@ fn normal_appearance_follows_the_state_and_never_reads_a_dictionary_as_a_stream(
 }
 
 #[test]
+fn rect_transform_maps_the_transformed_box_onto_the_rect() {
+    // A 20 × 10 box turned a quarter by its matrix spans x -10 to 0 and y 0 to 20;
+    // the rect is 30 × 40, so the box is scaled as well as moved.
+    let rect = kurbo::Rect::new(100.0, 200.0, 130.0, 240.0);
+    let turned = Affine::new([0.0, 1.0, -1.0, 0.0, 0.0, 0.0]);
+    let a = rect_transform(rect, [0.0, 0.0, 20.0, 10.0], turned);
+    let corners = (a * turned * kurbo::Rect::new(0.0, 0.0, 20.0, 10.0).to_path(0.1)).bounding_box();
+    assert_eq!(corners, rect);
+}
+
+#[test]
 fn generate_is_what_the_renderer_draws_without_ap() {
     let pdf = annotations(
         "/Annots [4 0 R 5 0 R]",

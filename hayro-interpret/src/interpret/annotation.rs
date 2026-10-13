@@ -48,8 +48,8 @@ pub fn rect_transform(rect: kurbo::Rect, bbox: [f32; 4], matrix: Affine) -> Affi
         0.0,
         0.0,
         sy,
-        rect.x0 - transformed.x0,
-        rect.y0 - transformed.y0,
+        rect.x0 - transformed.x0 * sx,
+        rect.y0 - transformed.y0 * sy,
     ])
 }
 
