@@ -56,6 +56,11 @@ impl Number {
         }
     }
 
+    /// Whether the number was written as an integer, without a decimal point.
+    pub fn is_integer(&self) -> bool {
+        matches!(self.0, InternalNumber::Integer(_))
+    }
+
     /// Create a new `Number` from an f32 number.
     pub const fn from_f32(num: f32) -> Self {
         Self(InternalNumber::Real(num as f64))

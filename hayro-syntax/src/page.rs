@@ -8,9 +8,9 @@ use crate::object::Rect;
 use crate::object::Stream;
 use crate::object::array::ArrayIter;
 use crate::object::dict::keys::*;
-use crate::object::{MaybeRef, Object};
+use crate::object::{MaybeRef, Object, ObjectIdentifier};
 use crate::reader::ReaderContext;
-use crate::sync::{FxHashSet, OnceLock};
+use crate::sync::{FxHashMap, OnceLock};
 use crate::transform::Transform;
 use crate::util::FloatExt;
 use crate::xref::XRef;
@@ -27,7 +27,7 @@ struct PagesContext<'a> {
     resources: Dict<'a>,
 }
 
-impl PagesContext<'_> {
+impl<'a> PagesContext<'a> {
     fn new() -> Self {
         Self {
             media_box: None,
@@ -35,6 +35,17 @@ impl PagesContext<'_> {
             rotate: None,
             resources: Dict::empty(),
         }
+    }
+
+    /// The attributes a page below `node` inherits.
+    fn with(mut self, node: &Dict<'a>) -> Self {
+        self.media_box = node.get::<Rect>(MEDIA_BOX).or(self.media_box);
+        self.crop_box = node.get::<Rect>(CROP_BOX).or(self.crop_box);
+        self.rotate = node.get::<i32>(ROTATE).or(self.rotate);
+        if let Some(resources) = node.get::<Dict<'a>>(RESOURCES) {
+            self.resources = resources;
+        }
+        self
     }
 }
 
@@ -45,37 +56,32 @@ pub struct Pages<'a> {
 }
 
 impl<'a> Pages<'a> {
-    /// Create a new `Pages` object.
-    pub(crate) fn new(
-        pages_dict: &Dict<'a>,
-        ctx: &ReaderContext<'a>,
-        xref: &'a XRef,
-    ) -> Option<Self> {
-        let mut pages = vec![];
-        let pages_ctx = PagesContext::new();
-        resolve_pages(pages_dict, &mut pages, pages_ctx, ctx)?;
-
-        Some(Self { pages, xref })
-    }
-
-    /// Create a new `Pages` object by bruteforce-searching.
-    ///
-    /// Of course this could result in the order of pages being messed up, but
-    /// this is still better than nothing.
-    pub(crate) fn new_brute_force(ctx: &ReaderContext<'a>, xref: &'a XRef) -> Option<Self> {
-        let mut pages = vec![];
-
-        for object in xref.objects() {
-            if let Some(dict) = object.into_dict()
-                && let Some(page) = Page::new(&dict, &PagesContext::new(), ctx, true)
-            {
-                pages.push(page);
-            }
-        }
-
-        if pages.is_empty() {
+    // The pages in the order MuPDF numbers them, or `None` where MuPDF fails to count
+    // them or to find one of them.
+    //
+    // MuPDF takes the page count from the root's /Count (`pdf_count_pages` in
+    // MuPDF's `pdf-page.c`). It walks the tree depth first; a tree with fewer pages
+    // than that sets the count (`pdf_load_page_tree_internal`). Where the walk meets
+    // a node that is neither /Pages nor /Page, a cycle, or more pages than the count,
+    // MuPDF finds each page by descending with the nodes' /Count instead
+    // (`pdf_lookup_page_loc_imp`).
+    pub(crate) fn new(ctx: &ReaderContext<'a>, xref: &'a XRef) -> Option<Self> {
+        let tree = xref
+            .get_with::<Dict<'a>>(xref.root_id(), ctx)
+            .and_then(|root| root.get_raw::<Object<'a>>(PAGES))
+            .map(|tree| Node::new(tree, ctx));
+        let count = tree
+            .as_ref()
+            .map_or(0, |tree| to_int(tree.dict.get::<Object<'a>>(COUNT)));
+        if count < 0 || i64::from(count) >= xref.xref_len() {
             return None;
         }
+        let pages = match tree {
+            Some(tree) if count > 0 => {
+                walk(&tree, count as usize, ctx).or_else(|| Lookup::new(tree, ctx).pages(count))?
+            }
+            _ => vec![],
+        };
 
         Some(Self { pages, xref })
     }
@@ -94,82 +100,208 @@ impl<'a> Deref for Pages<'a> {
     }
 }
 
-struct PageTreeFrame<'a> {
-    kids: ArrayIter<'a>,
-    ctx: PagesContext<'a>,
+/// A page tree entry: a dictionary, or an empty one for any other object.
+#[derive(Clone)]
+struct Node<'a> {
+    id: Option<ObjectIdentifier>,
+    dict: Dict<'a>,
 }
 
-impl<'a> PageTreeFrame<'a> {
-    fn new(dict: &Dict<'a>, mut ctx: PagesContext<'a>) -> Option<Self> {
-        ctx.media_box = dict.get::<Rect>(MEDIA_BOX).or(ctx.media_box);
-        ctx.crop_box = dict.get::<Rect>(CROP_BOX).or(ctx.crop_box);
-        ctx.rotate = dict.get::<i32>(ROTATE).or(ctx.rotate);
-        if let Some(resources) = dict.get::<Dict<'a>>(RESOURCES) {
-            ctx.resources = resources;
-        }
+impl<'a> Node<'a> {
+    fn new(object: MaybeRef<Object<'a>>, ctx: &ReaderContext<'a>) -> Self {
+        let (id, object) = match object {
+            MaybeRef::Ref(id) => (Some(id.into()), ctx.xref().get_with(id.into(), ctx)),
+            MaybeRef::NotRef(object) => (None, Some(object)),
+        };
+        let dict = match object {
+            Some(Object::Dict(dict)) => dict,
+            Some(Object::Stream(stream)) => stream.dict().clone(),
+            _ => Dict::empty(),
+        };
+        Self { id, dict }
+    }
 
-        Some(Self {
-            kids: dict.get::<Array<'a>>(KIDS)?.raw_iter(),
-            ctx,
-        })
+    // The object number MuPDF tells objects apart by, 0 for a direct object.
+    fn number(&self) -> i32 {
+        self.id.map_or(0, |id| id.obj_number)
+    }
+
+    // Whether MuPDF sees the entry: a direct `null` is stored as no entry.
+    fn has(&self, key: &[u8]) -> bool {
+        !matches!(
+            self.dict.get_raw::<Object<'a>>(key),
+            None | Some(MaybeRef::NotRef(Object::Null(_)))
+        )
+    }
+
+    fn type_is(&self, name: &[u8]) -> bool {
+        self.dict.get::<Name<'_>>(TYPE).as_deref() == Some(name)
+    }
+
+    fn kids(&self) -> ArrayIter<'a> {
+        self.dict
+            .get::<Array<'a>>(KIDS)
+            .unwrap_or_default()
+            .raw_iter()
+    }
+
+    fn page(self, ctx: &PagesContext<'a>, reader_ctx: &ReaderContext<'a>) -> Page<'a> {
+        Page::new(self.id, &self.dict, ctx, reader_ctx)
     }
 }
 
-fn resolve_pages<'a>(
-    pages_dict: &Dict<'a>,
-    entries: &mut Vec<Page<'a>>,
-    ctx: PagesContext<'a>,
-    reader_ctx: &ReaderContext<'a>,
-) -> Option<()> {
-    let mut visited = FxHashSet::default();
+/// `pdf_to_int`: an integer cut to C `int`, a real rounded half up, anything else 0.
+fn to_int(object: Option<Object<'_>>) -> i32 {
+    match object {
+        Some(Object::Number(n)) if n.is_integer() => n.as_i64() as i32,
+        Some(Object::Number(n)) => {
+            // `(int)floorf(f + 0.5)`; C converts an out-of-range float to `int` as x86
+            // does: INT_MIN.
+            let half_up = (f64::from(n.as_f32()) + 0.5) as f32;
+            if (-2_147_483_648.0..2_147_483_648.0).contains(&half_up) {
+                let cut = half_up as i32;
+                if cut as f32 > half_up { cut - 1 } else { cut }
+            } else {
+                i32::MIN
+            }
+        }
+        _ => 0,
+    }
+}
 
-    if let Some(id) = pages_dict.obj_id() {
-        visited.insert(id);
+/// `pdf_cycle` gives up on a node with this many /Pages nodes above it.
+const MAX_CYCLE_DEPTH: usize = 257;
+
+// `pdf_load_page_tree_imp`: the pages depth first, at most `count`; `None` where
+// MuPDF's walk throws.
+fn walk<'a>(tree: &Node<'a>, count: usize, ctx: &ReaderContext<'a>) -> Option<Vec<Page<'a>>> {
+    struct Frame<'a> {
+        number: i32,
+        kids: ArrayIter<'a>,
+        ctx: PagesContext<'a>,
     }
 
-    let mut stack = vec![PageTreeFrame::new(pages_dict, ctx)?];
-
-    while let Some(frame) = stack.last_mut() {
-        let Some(kid) = frame.kids.next() else {
-            stack.pop();
-
-            continue;
-        };
-
-        let dict = match kid {
-            MaybeRef::Ref(id) => {
-                if !visited.insert(id.into()) {
-                    continue;
+    let mut pages = vec![];
+    let mut stack: Vec<Frame<'a>> = vec![];
+    let mut next = Some((tree.clone(), PagesContext::new()));
+    loop {
+        if let Some((node, pages_ctx)) = next.take() {
+            if node.type_is(PAGES) {
+                let number = node.number();
+                if number > 0
+                    && (stack.len() >= MAX_CYCLE_DEPTH || stack.iter().any(|f| f.number == number))
+                {
+                    return None;
                 }
-
-                reader_ctx
-                    .xref()
-                    .get_with::<Dict<'a>>(id.into(), reader_ctx)
+                stack.push(Frame {
+                    number,
+                    kids: node.kids(),
+                    ctx: pages_ctx.with(&node.dict),
+                });
+            } else if node.type_is(PAGE) && pages.len() < count {
+                pages.push(node.page(&pages_ctx, ctx));
+            } else {
+                return None;
             }
-            MaybeRef::NotRef(object) => object.into_dict(),
+        }
+        let Some(frame) = stack.last_mut() else {
+            return Some(pages);
         };
-
-        let Some(dict) = dict else {
-            continue;
-        };
-
-        match dict.get::<Name<'_>>(TYPE).as_deref() {
-            Some(PAGES) => {
-                if let Some(child) = PageTreeFrame::new(&dict, frame.ctx.clone()) {
-                    stack.push(child);
-                }
-            }
-            // Let's be lenient and assume it's a `Page` in case it's `None` or something else
-            // (see corpus test case 0083781).
-            _ => {
-                if let Some(page) = Page::new(&dict, &frame.ctx, reader_ctx, false) {
-                    entries.push(page);
-                }
+        match frame.kids.next() {
+            Some(kid) => next = Some((Node::new(kid, ctx), frame.ctx.clone())),
+            None => {
+                stack.pop();
             }
         }
     }
+}
 
-    Some(())
+/// A kid as `pdf_lookup_page_loc_imp` sees it.
+#[derive(Clone)]
+enum Kid<'a> {
+    /// A node and its /Count.
+    Tree(Node<'a>, i32),
+    Leaf(Node<'a>),
+}
+
+// MuPDF's search for each page by /Count, with each node's kids read once.
+struct Lookup<'a> {
+    tree: Node<'a>,
+    ctx: ReaderContext<'a>,
+    kids: FxHashMap<(i32, usize), Vec<Kid<'a>>>,
+}
+
+impl<'a> Lookup<'a> {
+    fn new(tree: Node<'a>, ctx: &ReaderContext<'a>) -> Self {
+        Self {
+            tree,
+            ctx: ctx.clone(),
+            kids: FxHashMap::default(),
+        }
+    }
+
+    fn pages(mut self, count: i32) -> Option<Vec<Page<'a>>> {
+        (0..count).map(|needle| self.page(needle)).collect()
+    }
+
+    // `pdf_lookup_page_loc_imp`: page `needle`, or `None` where MuPDF throws.
+    fn page(&mut self, needle: i32) -> Option<Page<'a>> {
+        let mut node = self.tree.clone();
+        let mut skip = needle;
+        let mut marks = vec![];
+        let mut pages_ctx = PagesContext::new();
+        loop {
+            let number = node.number();
+            // A direct node has no number of its own; its bytes tell it apart.
+            let key = (
+                number,
+                node.dict.data().as_ptr() as usize * usize::from(number == 0),
+            );
+            let ctx = &self.ctx;
+            let kids = self.kids.entry(key).or_insert_with(|| {
+                node.kids()
+                    .map(|kid| {
+                        let kid = Node::new(kid, ctx);
+                        let tree = if kid.has(TYPE) {
+                            kid.type_is(PAGES)
+                        } else {
+                            kid.has(KIDS) && !kid.has(MEDIA_BOX)
+                        };
+                        if tree {
+                            let count = to_int(kid.dict.get::<Object<'a>>(COUNT));
+                            Kid::Tree(kid, count)
+                        } else {
+                            Kid::Leaf(kid)
+                        }
+                    })
+                    .collect()
+            });
+            if kids.is_empty() || (number > 0 && marks.contains(&number)) {
+                return None;
+            }
+            marks.push(number);
+            pages_ctx = pages_ctx.with(&node.dict);
+            let mut below = None;
+            for kid in kids.iter() {
+                match kid {
+                    Kid::Tree(kid, count) => {
+                        if skip < *count {
+                            below = Some(kid.clone());
+                            break;
+                        }
+                        skip = skip.wrapping_sub(*count);
+                    }
+                    Kid::Leaf(kid) => {
+                        if skip == 0 {
+                            return Some(kid.clone().page(&pages_ctx, &self.ctx));
+                        }
+                        skip -= 1;
+                    }
+                }
+            }
+            node = below?;
+        }
+    }
 }
 
 /// The rotation of the page.
@@ -187,6 +319,7 @@ pub enum Rotation {
 
 /// A PDF page.
 pub struct Page<'a> {
+    id: Option<ObjectIdentifier>,
     inner: Dict<'a>,
     media_box: Rect,
     crop_box: Rect,
@@ -198,17 +331,11 @@ pub struct Page<'a> {
 
 impl<'a> Page<'a> {
     fn new(
+        id: Option<ObjectIdentifier>,
         dict: &Dict<'a>,
         ctx: &PagesContext<'a>,
         reader_ctx: &ReaderContext<'a>,
-        brute_force: bool,
-    ) -> Option<Self> {
-        // In general, pages without content are allowed, but in case we are brute-forcing
-        // we ignore them.
-        if brute_force && !dict.contains_key(CONTENTS) {
-            return None;
-        }
-
+    ) -> Self {
         let media_box = dict.get::<Rect>(MEDIA_BOX).or(ctx.media_box).unwrap_or(A4);
 
         let crop_box = dict
@@ -234,7 +361,8 @@ impl<'a> Page<'a> {
                 .unwrap_or_else(|| ctx.resources.clone()),
         );
 
-        Some(Self {
+        Self {
+            id,
             inner: dict.clone(),
             media_box,
             crop_box,
@@ -242,7 +370,13 @@ impl<'a> Page<'a> {
             page_streams: OnceLock::new(),
             resources,
             ctx: reader_ctx.clone(),
-        })
+        }
+    }
+
+    /// The page object's identifier; `None` for a page written directly into a /Kids
+    /// array. A /Kids entry that is not a dictionary is a page with no entries.
+    pub fn obj_id(&self) -> Option<ObjectIdentifier> {
+        self.id
     }
 
     fn operations_impl(&self) -> Option<UntypedIter<'_>> {
@@ -527,10 +661,7 @@ pub(crate) mod cached {
             let xref_reference: &'static XRef = unsafe { core::mem::transmute(xref.deref()) };
 
             let ctx = ReaderContext::new(xref_reference, false);
-            let pages = xref_reference
-                .get_with(xref.trailer_data().pages_ref, &ctx)
-                .and_then(|p| Pages::new(&p, &ctx, xref_reference))
-                .or_else(|| Pages::new_brute_force(&ctx, xref_reference))?;
+            let pages = Pages::new(&ctx, xref_reference)?;
 
             Some(Self { pages, _xref: xref })
         }
@@ -538,5 +669,197 @@ pub(crate) mod cached {
         pub(crate) fn get(&self) -> &Pages<'_> {
             &self.pages
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::object::{Dict, ObjectIdentifier, Rect};
+    use crate::pdf::Pdf;
+
+    const CATALOG: &str = "<< /Type /Catalog /Pages 2 0 R >>";
+
+    /// A PDF of `objects`, numbered from 1; the first is the catalog.
+    fn pdf(objects: &[&str]) -> Vec<u8> {
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut offsets = vec![];
+        for (i, object) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend(format!("{} 0 obj\n{object}\nendobj\n", i + 1).bytes());
+        }
+        let xref = out.len();
+        out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).bytes());
+        for offset in offsets {
+            out.extend(format!("{offset:010} 00000 n \n").bytes());
+        }
+        out.extend(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .bytes(),
+        );
+        out
+    }
+
+    // Each page's object number (0 for a direct one) and MediaBox width, or `None`
+    // where the document does not open.
+    fn pages(objects: &[&str]) -> Option<Vec<(i32, Option<f64>)>> {
+        let pdf = Pdf::new(pdf(objects)).ok()?;
+        Some(
+            pdf.pages()
+                .iter()
+                .map(|page| {
+                    let number = page.obj_id().map_or(0, |id| id.obj_number);
+                    (number, page.raw().get::<Rect>(b"MediaBox").map(|r| r.x1))
+                })
+                .collect(),
+        )
+    }
+
+    fn pages_node(count: &str, kids: &str) -> String {
+        format!("<< /Type /Pages /Count {count} /Kids [{kids}] >>")
+    }
+
+    const PAGE: &str = "<< /Type /Page /MediaBox [0 0 1600 1000] >>";
+    const SMALL: &str = "<< /Type /Page /MediaBox [0 0 200 100] >>";
+
+    #[test]
+    fn a_node_without_type_is_a_node() {
+        let node = "<< /Kids [4 0 R] /Count 1 >>";
+        let tree = pages_node("1", "3 0 R");
+        assert_eq!(
+            pages(&[CATALOG, &tree, node, PAGE]),
+            Some(vec![(4, Some(1600.0))])
+        );
+    }
+
+    #[test]
+    fn a_node_without_type_but_with_a_media_box_is_a_page() {
+        let node = "<< /Kids [4 0 R] /Count 1 /MediaBox [0 0 300 300] >>";
+        let tree = pages_node("1", "3 0 R");
+        assert_eq!(
+            pages(&[CATALOG, &tree, node, PAGE]),
+            Some(vec![(3, Some(300.0))])
+        );
+    }
+
+    #[test]
+    fn a_page_with_a_bad_number_is_kept() {
+        let tree = pages_node("3", "3 0 R 4 0 R 5 0 R");
+        let bad = "<< /Type /Page /MediaBox [0 0 1e3 2e3] /Rotate 9x >>";
+        let pdf = pdf(&[CATALOG, &tree, PAGE, bad, PAGE]);
+        let pdf = Pdf::new(pdf).unwrap();
+        let ids: Vec<_> = pdf.pages().iter().map(|p| p.obj_id()).collect();
+        assert_eq!(ids, [3, 4, 5].map(|n| Some(ObjectIdentifier::new(n, 0))));
+        let bad: &Dict<'_> = pdf.pages()[1].raw();
+        assert!(bad.get::<crate::object::Array<'_>>(b"MediaBox").is_some());
+    }
+
+    #[test]
+    fn count_lower_than_the_tree_keeps_the_first_pages() {
+        let tree = pages_node("1", "3 0 R 4 0 R");
+        assert_eq!(
+            pages(&[CATALOG, &tree, PAGE, SMALL]),
+            Some(vec![(3, Some(1600.0))])
+        );
+    }
+
+    #[test]
+    fn count_higher_than_the_tree_is_the_tree() {
+        let tree = pages_node("3", "3 0 R 4 0 R");
+        assert_eq!(
+            pages(&[CATALOG, &tree, PAGE, SMALL, "null"]),
+            Some(vec![(3, Some(1600.0)), (4, Some(200.0))])
+        );
+    }
+
+    #[test]
+    fn a_count_mupdf_rejects_refuses_the_document() {
+        for count in ["-1", "4"] {
+            let tree = pages_node(count, "3 0 R");
+            assert_eq!(pages(&[CATALOG, &tree, PAGE]), None, "{count}");
+        }
+    }
+
+    #[test]
+    fn kids_that_are_not_pages_are_empty_pages() {
+        let tree = pages_node("4", "3 0 R 9 0 R 5 4 0 R");
+        let other = "<< /Type /Foo /MediaBox [0 0 300 100] >>";
+        assert_eq!(
+            pages(&[CATALOG, &tree, PAGE, other]),
+            Some(vec![
+                (3, Some(1600.0)),
+                (9, None),
+                (0, None),
+                (4, Some(300.0))
+            ])
+        );
+    }
+
+    #[test]
+    fn a_page_listed_twice_is_two_pages() {
+        let tree = pages_node("2", "3 0 R 3 0 R");
+        assert_eq!(
+            pages(&[CATALOG, &tree, PAGE]),
+            Some(vec![(3, Some(1600.0)), (3, Some(1600.0))])
+        );
+    }
+
+    #[test]
+    fn a_page_mupdf_cannot_find_refuses_the_document() {
+        // A cycle sends MuPDF to search by /Count, which finds no second page.
+        let tree = pages_node("2", "3 0 R 4 0 R");
+        let cycle = "<< /Type /Pages /Kids [2 0 R] /Count 1 >>";
+        assert_eq!(pages(&[CATALOG, &tree, PAGE, cycle]), None);
+        // An intermediate /Count lower than its kids hides the last page.
+        let tree = pages_node("3", "3 0 R 5 0 R");
+        let low = "<< /Type /Pages /Kids [4 0 R 6 0 R] /Count 1 >>";
+        let untyped = "<< /Kids [7 0 R] /Count 1 >>";
+        assert_eq!(
+            pages(&[CATALOG, &tree, low, PAGE, untyped, SMALL, SMALL]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_search_by_count_skips_by_each_node_count() {
+        // The untyped node sends MuPDF to search by /Count; the first node's /Count 1
+        // hides its second kid, so page 2 is the untyped node's kid.
+        let tree = pages_node("2", "3 0 R 5 0 R");
+        let low = "<< /Type /Pages /Kids [4 0 R 6 0 R] /Count 1 >>";
+        let untyped = "<< /Kids [7 0 R] /Count 1 >>";
+        let other = "<< /Type /Page /MediaBox [0 0 300 100] >>";
+        assert_eq!(
+            pages(&[CATALOG, &tree, low, PAGE, untyped, SMALL, other]),
+            Some(vec![(4, Some(1600.0)), (7, Some(300.0))])
+        );
+    }
+
+    #[test]
+    fn a_tree_without_pages_has_none() {
+        let tree = pages_node("1", "");
+        assert_eq!(pages(&[CATALOG, &tree]), Some(vec![]));
+        assert_eq!(pages(&["<< /Type /Catalog >>", PAGE]), Some(vec![]));
+        let tree = pages_node("0", "3 0 R");
+        assert_eq!(pages(&[CATALOG, &tree, PAGE]), Some(vec![]));
+    }
+
+    #[test]
+    fn a_table_entry_in_a_missing_object_stream_rebuilds_the_table() {
+        // Object 2, the page tree, is listed in object stream 10, which the table lacks.
+        let data = std::fs::read("../hayro-tests/pdfs/custom/lopdf_issue_449_2.pdf").unwrap();
+        let pdf = Pdf::new(data).unwrap();
+        let ids: Vec<_> = pdf.pages().iter().map(|p| p.obj_id()).collect();
+        assert_eq!(ids, [Some(ObjectIdentifier::new(3, 0))]);
+    }
+
+    #[test]
+    fn a_page_tree_written_into_the_catalog_is_read() {
+        let catalog = "<< /Type /Catalog /Pages << /Type /Pages /Kids [3 0 R] /Count 1 >> >>";
+        assert_eq!(
+            pages(&[catalog, "null", PAGE]),
+            Some(vec![(3, Some(1600.0))])
+        );
     }
 }

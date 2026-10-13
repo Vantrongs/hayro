@@ -63,6 +63,7 @@ pub(crate) fn root_xref(data: PdfData, password: &[u8]) -> Result<XRef, XRefErro
     let xref_pos = find_last_xref_pos(data.as_ref()).ok_or(XRefError::Unknown)?;
     let trailer =
         populate_xref_impl(data.as_ref(), xref_pos, &mut xref_map).ok_or(XRefError::Unknown)?;
+    check_entries(&mut xref_map, data.as_ref().len())?;
 
     XRef::new(
         data.clone(),
@@ -71,6 +72,31 @@ pub(crate) fn root_xref(data: PdfData, password: &[u8]) -> Result<XRef, XRefErro
         false,
         password,
     )
+}
+
+// Check the entries as MuPDF does before it trusts a table (`check_xref_entry_offsets`
+// in MuPDF's `pdf-xref.c`): an entry at offset 0 is free, and an offset past the end
+// of the file or an object stream the table does not list as an object is a broken
+// table, which MuPDF rebuilds.
+fn check_entries(xref_map: &mut XrefMap, file_len: usize) -> Result<(), XRefError> {
+    xref_map.retain(|_, entry| *entry != EntryType::Normal(0));
+    let objects: BTreeSet<i32> = xref_map
+        .iter()
+        .filter(|(_, entry)| matches!(entry, EntryType::Normal(_)))
+        .map(|(id, _)| id.obj_number)
+        .collect();
+    let valid = xref_map.values().all(|entry| match *entry {
+        EntryType::Normal(offset) => offset < file_len,
+        EntryType::ObjStream(stream, _) => {
+            i32::try_from(stream).is_ok_and(|stream| objects.contains(&stream))
+        }
+    });
+    if valid {
+        Ok(())
+    } else {
+        warn!("xref table has an entry no object can be at, rebuilding it");
+        Err(XRefError::Unknown)
+    }
 }
 
 /// Try to manually parse the PDF to build an xref table and trailer dictionary.
@@ -360,28 +386,26 @@ impl XRef {
                     .get::<Dict<'_>>(INFO)
                     .map(|d| parse_metadata(&d))
                     .unwrap_or_default();
-                let pages_ref = root.get_ref(PAGES).ok_or(XRefError::Unknown)?;
                 let has_ocgs = root.get::<Dict<'_>>(OCPROPERTIES).is_some();
                 let version = root
                     .get::<Name<'_>>(VERSION)
                     .and_then(|v| PdfVersion::from_bytes(v.deref()));
 
                 let td = TrailerData {
-                    pages_ref: pages_ref.into(),
                     root_ref: root_ref.into(),
                     version,
+                    size: trailer_dict.get::<i64>(SIZE),
                 };
 
                 (td, has_ocgs, metadata)
             }
             XRefInput::RootRef(root_ref) => {
-                let root = xref.get::<Dict<'_>>(root_ref).ok_or(XRefError::Unknown)?;
-                let pages_ref = root.get_ref(PAGES).ok_or(XRefError::Unknown)?;
+                xref.get::<Dict<'_>>(root_ref).ok_or(XRefError::Unknown)?;
 
                 let td = TrailerData {
-                    pages_ref: pages_ref.into(),
                     root_ref,
                     version: None,
+                    size: None,
                 };
 
                 (td, false, Metadata::default())
@@ -410,6 +434,27 @@ impl XRef {
         match &self.0 {
             Inner::Dummy => 0,
             Inner::Some(r) => r.map.get().xref_map.len(),
+        }
+    }
+
+    // How many object numbers the table spans, as MuPDF's `pdf_xref_len` counts them:
+    // past the highest object and, unless the table was rebuilt, the trailer's /Size.
+    pub(crate) fn xref_len(&self) -> i64 {
+        match &self.0 {
+            Inner::Dummy => 0,
+            Inner::Some(r) => {
+                let locked = r.map.get();
+                let highest = locked
+                    .xref_map
+                    .keys()
+                    .map(|id| i64::from(id.obj_number) + 1)
+                    .max()
+                    .unwrap_or(0);
+                match r.trailer_data.size {
+                    Some(size) if !locked.repaired => highest.max(size),
+                    _ => highest,
+                }
+            }
         }
     }
 
@@ -699,17 +744,18 @@ struct MapRepr {
 
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct TrailerData {
-    pub(crate) pages_ref: ObjectIdentifier,
     pub(crate) root_ref: ObjectIdentifier,
     pub(crate) version: Option<PdfVersion>,
+    /// The trailer's /Size.
+    pub(crate) size: Option<i64>,
 }
 
 impl TrailerData {
     pub(crate) fn dummy() -> Self {
         Self {
-            pages_ref: ObjectIdentifier::new(0, 0),
             root_ref: ObjectIdentifier::new(0, 0),
             version: None,
+            size: None,
         }
     }
 }
