@@ -19,7 +19,8 @@ use flate2::write::ZlibEncoder;
 use hayro_syntax::object::ObjRef;
 use hayro_syntax::object::Object;
 use hayro_syntax::object::dict::keys::{
-    COLORSPACE, EXT_G_STATE, FONT, GROUP, PATTERN, PROPERTIES, SHADING, XOBJECT,
+    COLORSPACE, EXT_G_STATE, FONT, GROUP, LENGTH, PATTERN, PROPERTIES, SHADING, SUBTYPE, TYPE,
+    XOBJECT,
 };
 use hayro_syntax::page::{Page, Resources, Rotation};
 use pdf_writer::{Chunk, Content, Filter, Finish, Name, Rect, Ref};
@@ -44,15 +45,18 @@ pub fn extract<'a>(
     let mut ctx = ExtractionContext::new(new_ref, pdf, chunk_settings);
 
     for query in queries {
-        let page = pages
-            .get(query.page_index)
-            .ok_or(ExtractionError::InvalidPageIndex(query.page_index))?;
+        let page = || {
+            pages
+                .get(query.page_index)
+                .ok_or(ExtractionError::InvalidPageIndex(query.page_index))
+        };
 
         let root_ref = ctx.new_ref();
 
         let res = match query.query_type {
-            ExtractionQueryType::XObject => write_xobject(page, root_ref, &mut ctx),
-            ExtractionQueryType::Page => write_page(page, root_ref, query.page_index, &mut ctx),
+            ExtractionQueryType::XObject => write_xobject(page()?, root_ref, &mut ctx),
+            ExtractionQueryType::Page => write_page(page()?, root_ref, query.page_index, &mut ctx),
+            ExtractionQueryType::Form(obj) => write_form(obj, root_ref, &mut ctx),
         };
 
         ctx.root_refs.push(res.map(|_| root_ref));
@@ -83,6 +87,8 @@ pub enum ExtractionQueryType {
     XObject,
     /// Extract the page as a new page.
     Page,
+    /// Extract a stream, such as an annotation's appearance, as a form `XObject`.
+    Form(ObjRef),
 }
 
 /// An extraction query.
@@ -101,6 +107,16 @@ impl ExtractionQuery {
         }
     }
 
+    /// Create a query that copies the stream `obj`, with everything it refers to, as a
+    /// form `XObject`. The copy is typed `/XObject /Form` whatever the stream says:
+    /// annotation appearance streams may leave the type out.
+    pub fn new_form(obj: ObjRef) -> Self {
+        Self {
+            query_type: ExtractionQueryType::Form(obj),
+            page_index: 0,
+        }
+    }
+
     /// Create a new `XObject` extraction query with the given page index.
     pub fn new_xobject(page_index: usize) -> Self {
         Self {
@@ -115,6 +131,8 @@ impl ExtractionQuery {
 pub enum ExtractionError {
     /// An invalid page index was given.
     InvalidPageIndex(usize),
+    /// A form query named an object that is not a stream.
+    NotAStream(ObjRef),
 }
 
 /// The result of an extraction.
@@ -397,6 +415,31 @@ fn write_xobject(
     }
 
     x_object.finish();
+    ctx.chunks.push(chunk);
+
+    Ok(())
+}
+
+fn write_form(
+    obj: ObjRef,
+    form_ref: Ref,
+    ctx: &mut ExtractionContext<'_>,
+) -> Result<(), ExtractionError> {
+    // Read as `Object` first: a dictionary read as a stream may pick up the data of a
+    // stream after it in the file.
+    let Some(Object::Stream(stream)) = ctx.pdf.xref().get::<Object<'_>>(obj.into()) else {
+        return Err(ExtractionError::NotAStream(obj));
+    };
+    let data = stream.raw_data();
+    let mut chunk = Chunk::with_settings(ctx.chunk_settings);
+    let mut form = chunk.form_xobject(form_ref, &data);
+    primitive::write_dict(
+        stream.dict(),
+        form.deref_mut(),
+        ctx,
+        &[LENGTH, TYPE, SUBTYPE],
+    );
+    form.finish();
     ctx.chunks.push(chunk);
 
     Ok(())
