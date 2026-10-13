@@ -14,6 +14,12 @@ use alloc::vec::Vec;
 #[cfg(feature = "unsafe")]
 const INPUT_CHUNK: usize = 8192;
 
+/// How many bytes the Flate decoder makes at a time for reads that ask for fewer. Calls
+/// that make less are slower: each copies what it made into zlib's history window, and
+/// matches reaching back past its output read from there.
+#[cfg(feature = "unsafe")]
+const OUTPUT_CHUNK: usize = POLL_BYTES;
+
 /// Why reading decoded data stopped before its end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadError {
@@ -37,8 +43,9 @@ impl From<Cancelled> for ReadError {
 /// The decoded data of a stream, read from its start in pieces (see
 /// [`Stream::decoded_reader`](crate::object::Stream::decoded_reader)). It yields the
 /// bytes [`Stream::decoded`](crate::object::Stream::decoded) returns, but holds only
-/// the decoder's state and a predictor row, not the whole result, except where a
-/// corrupt Flate stream needs the permissive decoder, which decodes it whole. Every
+/// the decoder's state, up to [`POLL_BYTES`] inflated ahead of the reads and a
+/// predictor row, not the whole result, except where a corrupt Flate stream needs the
+/// permissive decoder, which decodes it whole. Every
 /// read counts its work on a [`Meter`], and stops when the meter's hook asks to.
 pub struct DecodedReader<'a> {
     source: Source<'a>,
@@ -63,6 +70,9 @@ struct Inflating<'a> {
     /// Decrypted encoded bytes, of which the decoder has taken `consumed`.
     input: Vec<u8>,
     consumed: usize,
+    /// Inflated bytes, of which `handed` were read.
+    output: Vec<u8>,
+    handed: usize,
     decoder: zlib_rs::Inflate,
     /// Whether the data is read as zlib; after that fails, as raw deflate.
     zlib: bool,
@@ -70,7 +80,7 @@ struct Inflating<'a> {
 
 /// A position in a stream's Flate data to resume reading from (see
 /// [`DecodedReader::checkpoint`]): the decoder's state and history window, the
-/// decryption cursor, and the input and predictor rows in flight. The stored bytes are
+/// decryption cursor, and the input, output and predictor rows in flight. The stored bytes are
 /// not copied; the checkpoint keeps its stream, and with it those bytes, alive.
 #[cfg(feature = "unsafe")]
 pub struct DecodedCheckpoint {
@@ -83,6 +93,8 @@ pub struct DecodedCheckpoint {
     cursor: Cursor,
     /// Decrypted encoded bytes the decoder has not taken yet.
     input: Vec<u8>,
+    /// Inflated bytes not read yet.
+    output: Vec<u8>,
     predictor: Option<Predicted>,
 }
 
@@ -122,6 +134,8 @@ impl<'a> DecodedReader<'a> {
             data,
             input: Vec::new(),
             consumed: 0,
+            output: Vec::new(),
+            handed: 0,
             decoder: zlib_rs::Inflate::new(true, 15),
             zlib: true,
         });
@@ -135,7 +149,8 @@ impl<'a> DecodedReader<'a> {
     }
 
     /// The bytes this reader's incremental Flate decoder produced, including those a
-    /// restart voided; not those the permissive decoder produced.
+    /// restart voided and those not read yet; not those the permissive decoder
+    /// produced.
     pub fn inflated_bytes(&self) -> u64 {
         self.inflated
     }
@@ -150,7 +165,7 @@ impl<'a> DecodedReader<'a> {
             Some(p) => p.heap_bound()?,
             None => 0,
         };
-        (inflating.decoder.allocation_size() + INPUT_CHUNK).checked_add(predictor)
+        (inflating.decoder.allocation_size() + INPUT_CHUNK + OUTPUT_CHUNK).checked_add(predictor)
     }
 
     /// The reader's position, to resume from with [`Self::restore`] on a reader of the
@@ -170,6 +185,7 @@ impl<'a> DecodedReader<'a> {
             zlib: inflating.zlib,
             cursor: inflating.data.cursor(),
             input: inflating.input[inflating.consumed..].to_vec(),
+            output: inflating.output[inflating.handed..].to_vec(),
             predictor: self.predictor.clone(),
         })
     }
@@ -194,6 +210,8 @@ impl<'a> DecodedReader<'a> {
         inflating.data.restore(&checkpoint.cursor);
         inflating.input.clone_from(&checkpoint.input);
         inflating.consumed = 0;
+        inflating.output.clone_from(&checkpoint.output);
+        inflating.handed = 0;
         self.predictor.clone_from(&checkpoint.predictor);
         true
     }
@@ -254,11 +272,12 @@ impl<'a> DecodedReader<'a> {
 
 #[cfg(feature = "unsafe")]
 impl DecodedCheckpoint {
-    /// The bytes it holds on the heap: the decoder's state and window, and the input
-    /// and rows it copied.
+    /// The bytes it holds on the heap: the decoder's state and window, and the input,
+    /// output and rows it copied.
     pub fn heap_bytes(&self) -> usize {
         self.decoder.allocation_size()
             + self.input.capacity()
+            + self.output.capacity()
             + self.predictor.as_ref().map_or(0, Predicted::heap_bytes)
     }
 }
@@ -402,12 +421,46 @@ impl Inflating<'_> {
         self.data.rewind();
         self.input.clear();
         self.consumed = 0;
+        self.output.clear();
+        self.handed = 0;
+    }
+
+    /// Reads inflated bytes into `buf`: those made before and not read yet, else new
+    /// ones, made straight into `buf` when it takes a whole chunk; `None` when the data
+    /// is corrupt for this decoder.
+    fn read(
+        &mut self,
+        buf: &mut [u8],
+        inflated: &mut u64,
+        meter: &Meter<'_>,
+    ) -> Result<Option<usize>, Cancelled> {
+        if self.handed == self.output.len() {
+            if buf.len() >= OUTPUT_CHUNK {
+                return self.inflate(buf, inflated, meter);
+            }
+            let mut output = core::mem::take(&mut self.output);
+            output.resize(OUTPUT_CHUNK, 0);
+            let made = self.inflate(&mut output, inflated, meter);
+            output.truncate(match made {
+                Ok(Some(n)) => n,
+                _ => 0,
+            });
+            self.output = output;
+            self.handed = 0;
+            if made?.is_none() {
+                return Ok(None);
+            }
+        }
+        let n = buf.len().min(self.output.len() - self.handed);
+        buf[..n].copy_from_slice(&self.output[self.handed..][..n]);
+        self.handed += n;
+        Ok(Some(n))
     }
 
     /// Inflates into `buf`; `None` when the data is corrupt for this decoder. Each
     /// step counts the bytes it took and made, so a run of input that inflates to
     /// nothing is counted too.
-    fn read(
+    fn inflate(
         &mut self,
         buf: &mut [u8],
         inflated: &mut u64,

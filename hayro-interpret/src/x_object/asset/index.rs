@@ -158,7 +158,7 @@ mod tests {
     use super::*;
     use crate::fixtures::{noise, stored_deflate};
     use hayro_syntax::Pdf;
-    use hayro_syntax::work::Meter;
+    use hayro_syntax::work::{Meter, POLL_BYTES};
     use std::cell::Cell;
     use std::sync::Arc;
 
@@ -210,8 +210,15 @@ mod tests {
                 "{resumed:?}"
             );
             if params.is_empty() {
-                assert_eq!(cold.bytes_inflated, u64::from(3016 * W));
-                assert_eq!(resumed.bytes_inflated, resumed.rows_decoded * u64::from(W));
+                // A reader inflates up to `POLL_BYTES` ahead, which a saved state carries.
+                let near = |inflated: u64, rows: u64| {
+                    inflated.abs_diff(rows * u64::from(W)) <= POLL_BYTES as u64
+                };
+                assert!(near(cold.bytes_inflated, 3016), "{cold:?}");
+                assert!(
+                    near(resumed.bytes_inflated, resumed.rows_decoded),
+                    "{resumed:?}"
+                );
             }
             let mut decoded = whole(&asset);
             for (grid, window) in [
