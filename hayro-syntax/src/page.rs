@@ -19,36 +19,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Deref;
 
-/// Attributes that can be inherited.
-#[derive(Debug, Clone)]
-struct PagesContext<'a> {
-    media_box: Option<Rect>,
-    crop_box: Option<Rect>,
-    rotate: Option<i32>,
-    resources: Dict<'a>,
-}
+mod inherit;
 
-impl<'a> PagesContext<'a> {
-    fn new() -> Self {
-        Self {
-            media_box: None,
-            crop_box: None,
-            rotate: None,
-            resources: Dict::empty(),
-        }
-    }
-
-    /// The attributes a page below `node` inherits.
-    fn with(mut self, node: &Dict<'a>) -> Self {
-        self.media_box = node.get::<Rect>(MEDIA_BOX).or(self.media_box);
-        self.crop_box = node.get::<Rect>(CROP_BOX).or(self.crop_box);
-        self.rotate = node.get::<i32>(ROTATE).or(self.rotate);
-        if let Some(resources) = node.get::<Dict<'a>>(RESOURCES) {
-            self.resources = resources;
-        }
-        self
-    }
-}
+pub use inherit::{Inheritance, InheritanceError};
 
 /// A structure holding the pages of a PDF document.
 pub struct Pages<'a> {
@@ -72,8 +45,9 @@ impl<'a> Pages<'a> {
             .filter(|tree| tree.is_dict);
         let mut pages = tree.map(|tree| walk(tree, ctx)).unwrap_or_default();
         if pages.is_empty() {
-            pages = brute_force(ctx, xref);
+            pages = brute_force(xref);
         }
+        let pages = with_inherited(pages, ctx);
 
         Some(Self { pages, xref })
     }
@@ -137,15 +111,20 @@ impl<'a> Node<'a> {
         }
     }
 
+    // A page's own entry, which is a dictionary.
+    fn page(id: Option<ObjectIdentifier>, dict: &Dict<'a>) -> Self {
+        Self {
+            id,
+            dict: dict.clone(),
+            is_dict: true,
+        }
+    }
+
     fn kids(&self) -> ArrayIter<'a> {
         self.dict
             .get::<Array<'a>>(KIDS)
             .unwrap_or_default()
             .raw_iter()
-    }
-
-    fn page(self, ctx: &PagesContext<'a>, reader_ctx: &ReaderContext<'a>) -> Page<'a> {
-        Page::new(self.id, &self.dict, ctx, reader_ctx)
     }
 }
 
@@ -153,24 +132,24 @@ impl<'a> Node<'a> {
 // walk reaches it: a node listed again, as a shared subtree or in a cycle, adds
 // nothing, which keeps the walk linear in the file. A page listed again is a page
 // again, as in MuPDF.
-fn walk<'a>(tree: Node<'a>, ctx: &ReaderContext<'a>) -> Vec<Page<'a>> {
+fn walk<'a>(tree: Node<'a>, ctx: &ReaderContext<'a>) -> Vec<Node<'a>> {
     let mut pages = vec![];
     let mut read = FxHashSet::default();
-    let mut stack: Vec<(ArrayIter<'a>, PagesContext<'a>)> = vec![];
-    let mut next = Some((tree, PagesContext::new()));
+    let mut stack: Vec<ArrayIter<'a>> = vec![];
+    let mut next = Some(tree);
     loop {
-        if let Some((node, pages_ctx)) = next.take() {
+        if let Some(node) = next.take() {
             if !node.is_tree() {
-                pages.push(node.page(&pages_ctx, ctx));
+                pages.push(node);
             } else if node.id.is_none_or(|id| read.insert(id)) {
-                stack.push((node.kids(), pages_ctx.with(&node.dict)));
+                stack.push(node.kids());
             }
         }
-        let Some((kids, pages_ctx)) = stack.last_mut() else {
+        let Some(kids) = stack.last_mut() else {
             return pages;
         };
         match kids.next() {
-            Some(kid) => next = Some((Node::new(kid, ctx), pages_ctx.clone())),
+            Some(kid) => next = Some(Node::new(kid, ctx)),
             None => {
                 stack.pop();
             }
@@ -178,10 +157,10 @@ fn walk<'a>(tree: Node<'a>, ctx: &ReaderContext<'a>) -> Vec<Page<'a>> {
     }
 }
 
-// Every dictionary of the file that has /Contents and, if typed, is a /Page: a page
-// with nothing inherited. Better than nothing where the page tree is lost, though
-// the order is the objects', which may not be the document's.
-fn brute_force<'a>(ctx: &ReaderContext<'a>, xref: &'a XRef) -> Vec<Page<'a>> {
+// Every dictionary of the file that has /Contents and, if typed, is a /Page. Better
+// than nothing where the page tree is lost, though the order is the objects', which
+// may not be the document's.
+fn brute_force<'a>(xref: &'a XRef) -> Vec<Node<'a>> {
     let mut pages = vec![];
     for object in xref.objects() {
         if let Some(dict) = object.into_dict()
@@ -190,10 +169,40 @@ fn brute_force<'a>(ctx: &ReaderContext<'a>, xref: &'a XRef) -> Vec<Page<'a>> {
                 .get::<Name<'_>>(TYPE)
                 .is_none_or(|kind| kind.deref() == PAGE)
         {
-            pages.push(Page::new(dict.obj_id(), &dict, &PagesContext::new(), ctx));
+            pages.push(Node::page(dict.obj_id(), &dict));
         }
     }
     pages
+}
+
+/// The entries a page inherits, in the order of [`INHERITED`].
+type Inherited<'a> = [Option<Object<'a>>; 4];
+
+/// The entries a page inherits (the PDF specification's table 31).
+const INHERITED: [&[u8]; 4] = [MEDIA_BOX, CROP_BOX, ROTATE, RESOURCES];
+
+// Each of `entries` as a page with the entries it inherits through /Parent, as
+// MuPDF finds them once it has loaded every page, which reads these entries: by
+// then a /Parent loop any of the lookups meets has been repaired (see
+// `Inheritance`). An entry that cannot be found, because a /Parent chain loops even
+// so, is not inherited.
+fn with_inherited<'a>(entries: Vec<Node<'a>>, ctx: &ReaderContext<'a>) -> Vec<Page<'a>> {
+    let mut tree = Inheritance::with(ctx.clone());
+    let look_up = |tree: &mut Inheritance<'a>| -> Vec<Inherited<'a>> {
+        entries
+            .iter()
+            .map(|page| INHERITED.map(|key| tree.lookup(page, key).ok().flatten()))
+            .collect()
+    };
+    let mut inherited = look_up(&mut tree);
+    if tree.is_repaired() {
+        inherited = look_up(&mut tree);
+    }
+    entries
+        .iter()
+        .zip(inherited)
+        .map(|(page, inherited)| Page::new(page.id, &page.dict, inherited, ctx))
+        .collect()
 }
 
 /// A part of a page's /Contents that cannot be read; the object is `None` for a part
@@ -235,19 +244,16 @@ impl<'a> Page<'a> {
     fn new(
         id: Option<ObjectIdentifier>,
         dict: &Dict<'a>,
-        ctx: &PagesContext<'a>,
+        inherited: Inherited<'a>,
         reader_ctx: &ReaderContext<'a>,
     ) -> Self {
-        let media_box = dict.get::<Rect>(MEDIA_BOX).or(ctx.media_box).unwrap_or(A4);
+        let [media_box, crop_box, rotate, resources] = inherited;
+        let rect = |entry: Option<Object<'a>>| entry.and_then(|e| Rect::try_from(e).ok());
+        let media_box = rect(media_box).unwrap_or(A4);
+        let crop_box = rect(crop_box).unwrap_or(media_box);
 
-        let crop_box = dict
-            .get::<Rect>(CROP_BOX)
-            .or(ctx.crop_box)
-            .unwrap_or(media_box);
-
-        let rotation = match dict
-            .get::<i32>(ROTATE)
-            .or(ctx.rotate)
+        let rotation = match rotate
+            .and_then(Object::into_i32)
             .unwrap_or(0)
             .rem_euclid(360)
         {
@@ -259,8 +265,9 @@ impl<'a> Page<'a> {
         };
 
         let resources = Resources::new(
-            dict.get::<Dict<'a>>(RESOURCES)
-                .unwrap_or_else(|| ctx.resources.clone()),
+            resources
+                .and_then(Object::into_dict)
+                .unwrap_or_else(Dict::empty),
         );
 
         Self {
@@ -624,8 +631,12 @@ pub(crate) mod cached {
 
 #[cfg(test)]
 mod tests {
+    use super::A4;
     use crate::object::{Dict, ObjectIdentifier, Rect};
     use crate::pdf::Pdf;
+    use alloc::borrow::ToOwned;
+    use alloc::string::String;
+    use alloc::vec::Vec;
 
     const CATALOG: &str = "<< /Type /Catalog /Pages 2 0 R >>";
 
@@ -803,6 +814,96 @@ mod tests {
         let start = std::time::Instant::now();
         let page = (depth + 2, Some(1600.0));
         assert_eq!(pages(&objects), Some(vec![page, page]));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    // The /XObject names of each page's resources, its MediaBox width and its
+    // rotation in quarter turns.
+    fn inherited(objects: &[&str]) -> Vec<(Vec<String>, f64, u8)> {
+        let pdf = Pdf::new(pdf(objects)).unwrap();
+        pdf.pages()
+            .iter()
+            .map(|page| {
+                let names = page
+                    .resources()
+                    .x_objects
+                    .keys()
+                    .map(|name| name.as_str().to_owned())
+                    .collect();
+                let quarters = match page.rotation() {
+                    super::Rotation::None => 0,
+                    super::Rotation::Horizontal => 1,
+                    super::Rotation::Flipped => 2,
+                    super::Rotation::FlippedHorizontal => 3,
+                };
+                (names, page.media_box().x1, quarters)
+            })
+            .collect()
+    }
+
+    fn named(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    // A page inherits through its /Parent, as MuPDF reads it, not from the node
+    // that lists it; past a direct `null`, and not past an entry that is no box.
+    #[test]
+    fn a_page_inherits_from_its_parent() {
+        let tree = "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 100 100] \
+                    /Resources << /XObject << /Root 9 0 R >> >> >>";
+        let other = "<< /Type /Pages /Kids [] /Count 0 /MediaBox [0 0 300 300] /Rotate 90 \
+                     /Resources << /XObject << /X1 9 0 R >> >> >>";
+        let listed = "<< /Type /Page /Parent 5 0 R /MediaBox null >>";
+        let bad_box = "<< /Type /Page /Parent 2 0 R /MediaBox (none) /Resources 9 0 R >>";
+        assert_eq!(
+            inherited(&[CATALOG, tree, listed, bad_box, other]),
+            [(named(&["X1"]), 300.0, 1), (named(&[]), A4.x1, 0)]
+        );
+    }
+
+    // A /Parent loop makes MuPDF set every node's /Parent to the node that lists
+    // it, the last listing in its walk winning: here node 6, listed by nodes 3 and
+    // 5, over node 4, which lists the page between them.
+    #[test]
+    fn a_parent_loop_is_repaired_from_the_last_listing() {
+        let form = |name: &str| format!("/Resources << /XObject << /{name} 9 0 R >> >>");
+        let objects = [
+            CATALOG.to_owned(),
+            "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /MediaBox [0 0 300 300] >>".to_owned(),
+            "<< /Type /Pages /Kids [6 0 R] >>".to_owned(),
+            format!("<< /Type /Pages /Kids [7 0 R] {} >>", form("Z")),
+            "<< /Type /Pages /Kids [6 0 R] >>".to_owned(),
+            format!("<< /Type /Pages /Kids [7 0 R] {} >>", form("X")),
+            "<< /Type /Page /Parent 7 0 R >>".to_owned(),
+        ];
+        let objects: Vec<&str> = objects.iter().map(String::as_str).collect();
+        let page = (named(&["X"]), 300.0, 0);
+        assert_eq!(inherited(&objects), [page.clone(), page]);
+    }
+
+    #[test]
+    fn a_parent_loop_in_shared_subtrees_is_repaired_in_linear_time() {
+        // As `shared_subtrees_are_read_in_linear_time`, with a page whose /Parent
+        // is itself, which makes the lookups repair the tree: walking every listing
+        // would take 2^40 steps.
+        let depth = 40;
+        let mut objects = vec![CATALOG.to_owned()];
+        for level in 0..depth {
+            let next = level + 3;
+            let entries = if level == 0 {
+                "/MediaBox [0 0 300 300]"
+            } else {
+                ""
+            };
+            objects.push(format!(
+                "<< /Type /Pages /Kids [{next} 0 R {next} 0 R] {entries} >>"
+            ));
+        }
+        objects.push(format!("<< /Type /Page /Parent {} 0 R >>", depth + 2));
+        let objects: Vec<&str> = objects.iter().map(String::as_str).collect();
+        let start = std::time::Instant::now();
+        let page = (named(&[]), 300.0, 0);
+        assert_eq!(inherited(&objects), [page.clone(), page]);
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
     }
 
