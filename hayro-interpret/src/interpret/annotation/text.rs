@@ -512,11 +512,20 @@ pub(super) fn layout<'f>(
     spans: &[Span],
     width: Option<f32>,
 ) -> Result<Vec<Line<'f>>, Unsupported> {
-    // Each character with its span; a line break is a paragraph's end.
-    let mut chars: Vec<(char, usize)> = Vec::new();
-    for (i, span) in spans.iter().enumerate() {
-        let text = span.text.replace("\r\n", "\n").replace('\r', "\n");
-        chars.extend(text.chars().map(|c| (c, i)));
+    // Each character with its span; a line break is a paragraph's end. A carriage
+    // return is a line break, one with the line feed after it, in whichever span.
+    let all: Vec<(char, usize)> = spans
+        .iter()
+        .enumerate()
+        .flat_map(|(i, span)| span.text.chars().map(move |c| (c, i)))
+        .collect();
+    let mut chars: Vec<(char, usize)> = Vec::with_capacity(all.len());
+    for (k, &(c, span)) in all.iter().enumerate() {
+        match c {
+            '\r' if all.get(k + 1).is_some_and(|(next, _)| *next == '\n') => {}
+            '\r' => chars.push(('\n', span)),
+            _ => chars.push((c, span)),
+        }
     }
     let mut out = Vec::new();
     let mut start = 0;
@@ -574,9 +583,9 @@ pub(super) fn layout<'f>(
 
 /// The lines `n` glyphs are broken into to fit `width`: each line as many words
 /// as fit, with the spaces before each but the first; a word wider than a line
-/// alone as many of its glyphs as fit, at least one. `space(k)` tells whether glyph
-/// `k` is a space and `advance(k)` its width; each is asked a bounded number of
-/// times per glyph.
+/// alone on its line, overflowing it, as viewers set it. `space(k)` tells whether
+/// glyph `k` is a space and `advance(k)` its width; each is asked at most twice
+/// per glyph.
 fn breaks(
     n: usize,
     space: impl Fn(usize) -> bool,
@@ -587,41 +596,19 @@ fn breaks(
     // The current line, from `start` to `i`, and its width.
     let (mut start, mut line_width) = (0, 0.0_f32);
     let mut i = 0;
-    // The end and width of the word from `i`, with the spaces before it, once
-    // measured: what is left of a word wider than a line is not measured again.
-    let mut word: Option<(usize, f32)> = None;
     while i < n {
-        let (j, word_width) = *word.get_or_insert_with(|| {
-            let mut j = i;
-            while j < n && space(j) {
-                j += 1;
-            }
-            while j < n && !space(j) {
-                j += 1;
-            }
-            (j, (i..j).map(&advance).sum())
-        });
-        let empty = start == i;
-        if line_width + word_width <= width || empty && word_width <= width {
+        // The next word with the spaces before it.
+        let mut j = i;
+        while j < n && space(j) {
+            j += 1;
+        }
+        while j < n && !space(j) {
+            j += 1;
+        }
+        let word_width: f32 = (i..j).map(&advance).sum();
+        if start == i || line_width + word_width <= width {
             line_width += word_width;
             i = j;
-            word = None;
-        } else if empty {
-            // A word wider than the line: as much of it as fits, at least one
-            // glyph.
-            let mut rest = word_width;
-            while i < j {
-                let w = advance(i);
-                if i > start && line_width + w > width {
-                    break;
-                }
-                line_width += w;
-                rest -= w;
-                i += 1;
-            }
-            lines.push(start..i);
-            (start, line_width) = (i, 0.0);
-            word = (i < j).then_some((j, rest));
         } else {
             lines.push(start..i);
             line_width = 0.0;
@@ -630,7 +617,6 @@ fn breaks(
                 i += 1;
             }
             start = i;
-            word = None;
         }
     }
     lines.push(start..i);
@@ -652,26 +638,27 @@ mod tests {
     }
 
     #[test]
-    fn words_wrap_and_a_long_word_breaks_between_characters() {
+    fn words_wrap_and_a_long_word_overflows_its_line() {
         assert_eq!(wrap("ab cd ef", 5.0), ["ab cd", "ef"]);
-        assert_eq!(wrap("abcdefgh ij", 3.0), ["abc", "def", "gh", "ij"]);
-        assert_eq!(wrap("ab  abcdefg", 3.0), ["ab", "abc", "def", "g"]);
+        assert_eq!(wrap("abcdefgh ij", 3.0), ["abcdefgh", "ij"]);
+        assert_eq!(wrap("ab  abcdefg ij", 3.0), ["ab", "abcdefg", "ij"]);
+        assert_eq!(wrap("  ab", 3.0), ["  ab"]);
         assert_eq!(wrap("", 3.0), [""]);
-        // At least one glyph on each line, however narrow.
-        assert_eq!(wrap("abc", 0.0), ["a", "b", "c", ""]);
+        assert_eq!(wrap("abc", 0.0), ["abc"]);
     }
 
     /// Each glyph is looked at a bounded number of times, however long the word
-    /// wider than the line.
+    /// wider than the line or the words after it.
     #[test]
     fn wrapping_a_long_word_is_linear() {
         for n in [1_000, 10_000, 100_000] {
             let (spaces, advances) = (Cell::new(0), Cell::new(0));
+            // A word as long as the text, then words of one glyph.
             let lines = breaks(
                 n,
-                |_| {
+                |k| {
                     spaces.set(spaces.get() + 1);
-                    false
+                    k > n / 2 && k % 2 == 1
                 },
                 |_| {
                     advances.set(advances.get() + 1);
@@ -679,8 +666,8 @@ mod tests {
                 },
                 7.0,
             );
-            assert_eq!(lines.len(), n.div_ceil(7));
-            assert!(spaces.get() <= 2 * n && advances.get() <= 3 * n, "{n}");
+            assert!(spaces.get() <= 2 * n && advances.get() <= 2 * n, "{n}");
+            assert_eq!(lines[0], 0..n / 2 + 1, "{n}");
         }
     }
 }

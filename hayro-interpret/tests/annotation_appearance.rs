@@ -1276,3 +1276,41 @@ fn rich_text_aligns_by_text_align_not_q() {
         "{justified:?}"
     );
 }
+
+/// The lines of a `FreeText` in `/Rect [20 20 180 180]`: the bottom of each fill.
+fn free_text_rows(entries: &str) -> Vec<i32> {
+    fills(&draw(
+        &[&format!(
+            "/Subtype /FreeText /Rect [20 20 180 180] /BS << /W 0 >> {entries}"
+        )],
+        VIEW,
+    ))
+    .iter()
+    .map(|(b, _)| b[1])
+    .collect()
+}
+
+/// A word wider than the box stays whole on a line of its own, overflowing it, as
+/// viewers set it; the words after it go on the next line.
+#[test]
+fn a_word_wider_than_the_box_overflows_its_line() {
+    let rows = free_text_rows(&format!(
+        "/DA (/Helv 12 Tf 0 g) /Contents (ab {} cd)",
+        "H".repeat(40)
+    ));
+    // One fill per line: "ab", the long word, "cd".
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert!(rows[0] > rows[1] && rows[1] > rows[2], "{rows:?}");
+}
+
+/// A carriage return before a paragraph's end is one line break, whichever span
+/// each is in, as Acrobat writes `&#13;` at the end of its paragraphs.
+#[test]
+fn a_carriage_return_ending_a_paragraph_breaks_once() {
+    let rows = free_text_rows(
+        "/RC (<body style=\"font-family:Helvetica;font-size:10pt\"><p><span \
+         style=\"color:#ff0000\">H&#13;</span></p><p>H</p></body>)",
+    );
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0] - rows[1], 12, "{rows:?}");
+}
