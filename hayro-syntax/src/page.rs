@@ -20,9 +20,11 @@ use alloc::vec::Vec;
 use core::ops::Deref;
 
 mod inherit;
+mod node;
 
 use inherit::Listings;
 pub use inherit::{Inheritable, Inheritance, InheritanceError};
+use node::{Node, Nodes};
 
 /// A structure holding the pages of a PDF document.
 pub struct Pages<'a> {
@@ -39,16 +41,13 @@ impl<'a> Pages<'a> {
     // (`pdf_lookup_page_loc_imp`), so a damaged /Count hides pages or refuses the
     // file. The walk ignores /Count: it hides no page the /Kids hold.
     pub(crate) fn new(ctx: &ReaderContext<'a>, xref: &'a XRef) -> Option<Self> {
-        let tree = xref
-            .get_with::<Dict<'a>>(xref.root_id(), ctx)
-            .and_then(|root| root.get_raw::<Object<'a>>(PAGES))
-            .map(|tree| Node::new(tree, ctx))
-            .filter(|tree| tree.is_dict);
-        let (mut pages, listings) = tree.map(|tree| walk(tree, ctx)).unwrap_or_default();
+        let mut nodes = Nodes::new(ctx.clone());
+        let tree = nodes.tree().filter(Node::is_dict);
+        let (mut pages, listings) = tree.map(|tree| walk(tree, &mut nodes)).unwrap_or_default();
         if pages.is_empty() {
             pages = brute_force(xref);
         }
-        let pages = with_inherited(pages, Arc::new(listings), ctx);
+        let pages = with_inherited(pages, Arc::new(listings), nodes, ctx);
 
         Some(Self { pages, xref })
     }
@@ -88,63 +87,6 @@ fn kids_stored(entries: usize) {
     KIDS_STORED.set(KIDS_STORED.get() + entries);
 }
 
-/// A page tree entry: a dictionary, or an empty one for any other object.
-#[derive(Clone)]
-struct Node<'a> {
-    id: Option<ObjectIdentifier>,
-    dict: Dict<'a>,
-    is_dict: bool,
-}
-
-impl<'a> Node<'a> {
-    fn new(object: MaybeRef<Object<'a>>, ctx: &ReaderContext<'a>) -> Self {
-        let (id, object) = match object {
-            MaybeRef::Ref(id) => (Some(id.into()), ctx.xref().get_with(id.into(), ctx)),
-            MaybeRef::NotRef(object) => (None, Some(object)),
-        };
-        let dict = match object {
-            Some(Object::Dict(dict)) => Some(dict),
-            Some(Object::Stream(stream)) => Some(stream.dict().clone()),
-            _ => None,
-        };
-        Self {
-            id,
-            is_dict: dict.is_some(),
-            dict: dict.unwrap_or_else(Dict::empty),
-        }
-    }
-
-    // Whether MuPDF sees the entry: a direct `null` is stored as no entry.
-    fn has(&self, key: &[u8]) -> bool {
-        #[cfg(test)]
-        LOOKUPS.set(LOOKUPS.get() + 1);
-        !matches!(
-            self.dict.get_raw::<Object<'a>>(key),
-            None | Some(MaybeRef::NotRef(Object::Null(_)))
-        )
-    }
-
-    // Whether the entry lists kids rather than being a page: /Type /Pages, or, as
-    // MuPDF reads a node without /Type (`pdf_lookup_page_loc_imp`), /Kids and no
-    // /MediaBox. Any other entry is a page, including one that is no dictionary.
-    fn is_tree(&self) -> bool {
-        if self.has(TYPE) {
-            self.dict.get::<Name<'_>>(TYPE).as_deref() == Some(PAGES)
-        } else {
-            self.has(KIDS) && !self.has(MEDIA_BOX)
-        }
-    }
-
-    // A page's own entry, which is a dictionary.
-    fn page(id: Option<ObjectIdentifier>, dict: &Dict<'a>) -> Self {
-        Self {
-            id,
-            dict: dict.clone(),
-            is_dict: true,
-        }
-    }
-}
-
 /// A state for each /Kids array a walk of the page tree reads: the nodes whose
 /// /Kids is the same object share one, so that the walk reads the array once
 /// however many nodes list it. The walks read /Kids only through this.
@@ -168,7 +110,7 @@ impl<T> KidsStates<T> {
     fn of<'a>(&mut self, node: &Node<'a>, new: impl FnOnce(ArrayIter<'a>) -> T) -> usize {
         // The object of the /Kids array, which other nodes may list too; `None` for
         // an array written into the node, which only it lists.
-        let id = match node.dict.get_raw::<Object<'a>>(KIDS) {
+        let id = match node.dict().get_raw::<Object<'a>>(KIDS) {
             Some(MaybeRef::Ref(kids)) => Some(ObjectIdentifier::from(kids)),
             _ => None,
         };
@@ -176,7 +118,7 @@ impl<T> KidsStates<T> {
             return *at;
         }
         let at = self.states.len();
-        let kids = node.dict.get::<Array<'a>>(KIDS).unwrap_or_default();
+        let kids = node.dict().get::<Array<'a>>(KIDS).unwrap_or_default();
         self.states.push(new(kids.raw_iter()));
         if let Some(id) = id {
             self.shared.insert(id, at);
@@ -198,7 +140,7 @@ type Listed<'a> = (Node<'a>, Option<usize>);
 // node listing the array lists the pages read from it and goes on reading where the
 // others stopped. Each array is thus read once, and its pages listed again for each
 // node that lists it, which is the walk's output.
-fn walk<'a>(tree: Node<'a>, ctx: &ReaderContext<'a>) -> (Vec<Listed<'a>>, Listings<'a>) {
+fn walk<'a>(tree: Node<'a>, nodes: &mut Nodes<'a>) -> (Vec<Listed<'a>>, Listings<'a>) {
     /// A /Kids array: the entries not read yet, and the pages among those read.
     struct Kids<'a> {
         unread: ArrayIter<'a>,
@@ -236,7 +178,7 @@ fn walk<'a>(tree: Node<'a>, ctx: &ReaderContext<'a>) -> (Vec<Listed<'a>>, Listin
         } else if let Some(kid) = array.unread.next() {
             #[cfg(test)]
             kids_read();
-            let kid = Node::new(kid, ctx);
+            let kid = nodes.get(kid);
             if kid.is_tree() {
                 next = Some((kid, Some(*at)));
             } else {
@@ -279,9 +221,10 @@ type Inherited<'a> = [Option<Object<'a>>; 4];
 fn with_inherited<'a>(
     entries: Vec<Listed<'a>>,
     listings: Arc<Listings<'a>>,
+    nodes: Nodes<'a>,
     ctx: &ReaderContext<'a>,
 ) -> Vec<Page<'a>> {
-    let mut tree = Inheritance::with(ctx.clone());
+    let mut tree = Inheritance::with(nodes);
     let look_up = |tree: &mut Inheritance<'a>| -> Vec<Inherited<'a>> {
         entries
             .iter()
@@ -375,8 +318,8 @@ impl<'a> Page<'a> {
         );
 
         Self {
-            id: node.id,
-            inner: node.dict,
+            id: node.id(),
+            inner: node.into_dict(),
             media_box,
             crop_box,
             rotation,
@@ -737,7 +680,7 @@ pub(crate) mod cached {
 
 #[cfg(test)]
 mod tests {
-    use super::A4;
+    use super::{A4, Inheritable, Inheritance};
     use crate::object::{Dict, ObjectIdentifier, Rect};
     use crate::pdf::Pdf;
     use alloc::borrow::ToOwned;
@@ -1244,6 +1187,108 @@ mod tests {
             assert!(
                 large.0 < small.0 * 21 / 10 && large.1 < small.1 * 21 / 10,
                 "parent loop: {parent_loop}: (read, stored) {small:?} for 500, {large:?} for 1000"
+            );
+        }
+    }
+
+    /// The objects other than the catalog that `run` resolves more than once.
+    fn resolved_again(run: impl FnOnce()) -> Vec<(ObjectIdentifier, usize)> {
+        crate::xref::RESOLVED.set(Some(crate::sync::FxHashMap::default()));
+        run();
+        let resolved = crate::xref::RESOLVED.take().unwrap();
+        let mut again: Vec<_> = resolved
+            .into_iter()
+            .filter(|&(id, count)| count > 1 && id != ObjectIdentifier::new(1, 0))
+            .collect();
+        again.sort();
+        again
+    }
+
+    /// Each page's object number, once it is checked that no object is resolved
+    /// twice while `file` loads, nor while an [`Inheritance`] of its own looks up
+    /// every entry of every page, as a reader of the pages does. Parsing then takes
+    /// time linear in the file, however often an object is listed.
+    fn resolved_once(file: Vec<u8>) -> Vec<i32> {
+        let mut pdf = None;
+        assert_eq!(resolved_again(|| pdf = Some(Pdf::new(file).unwrap())), []);
+        let pdf = pdf.unwrap();
+        let lookups = || {
+            let mut tree = Inheritance::new(&pdf);
+            for page in pdf.pages().iter() {
+                for key in Inheritable::ALL {
+                    let _ = tree.get(page, key);
+                }
+            }
+        };
+        assert_eq!(resolved_again(lookups), []);
+        pdf.pages()
+            .iter()
+            .map(|page| page.obj_id().map_or(0, |id| id.obj_number))
+            .collect()
+    }
+
+    // The root lists node 3 `n` times, and node 3 lists an empty node `n` times and
+    // page 5, whose /Parent, with `parent_loop`, is itself, which makes the lookups
+    // repair the tree: the file grows with `n`, and is one page.
+    fn repeated_nodes(n: usize, parent_loop: bool) -> Vec<u8> {
+        let parent = if parent_loop { "/Parent 5 0 R" } else { "" };
+        let objects = [
+            CATALOG.to_owned(),
+            pages_node("1", &["3 0 R"; 1000][..n].join(" ")),
+            pages_node("1", &format!("{} 5 0 R", ["4 0 R"; 1000][..n].join(" "))),
+            pages_node("0", ""),
+            format!("<< /Type /Page /MediaBox [0 0 200 100] {parent} >>"),
+        ];
+        pdf(&objects.each_ref().map(String::as_str))
+    }
+
+    #[test]
+    fn a_node_listed_many_times_is_resolved_once() {
+        for parent_loop in [false, true] {
+            for n in [500, 1000] {
+                assert_eq!(
+                    resolved_once(repeated_nodes(n, parent_loop)),
+                    [5],
+                    "parent loop: {parent_loop}, n: {n}"
+                );
+            }
+        }
+    }
+
+    // A page as large as the file, listed `n` times, is `n` pages, read once.
+    #[test]
+    fn a_page_listed_many_times_is_resolved_once() {
+        for n in [500, 1000] {
+            let page = format!(
+                "<< /Type /Page /MediaBox [0 0 200 100] /Pad [{}] >>",
+                "0 ".repeat(n)
+            );
+            let tree = pages_node(&n.to_string(), &"3 0 R ".repeat(n));
+            assert_eq!(resolved_once(pdf(&[CATALOG, &tree, &page])), vec![3; n]);
+        }
+    }
+
+    // Pages without /Parent inherit the root's /Resources, an object as large as the
+    // file, through the node listing them: each page finds it, and it is read once.
+    #[test]
+    fn an_entry_pages_inherit_through_the_listing_is_resolved_once() {
+        for n in [500, 1000] {
+            let pages: Vec<String> = (0..n).map(|page| format!("{} 0 R", page + 4)).collect();
+            let tree = format!(
+                "<< /Type /Pages /Kids [{}] /Resources 3 0 R >>",
+                pages.join(" ")
+            );
+            let names: Vec<String> = (0..n).map(|name| format!("/X{name} 9 0 R")).collect();
+            let resources = format!("<< /XObject << {} >> >>", names.join(" "));
+            let mut objects = vec![CATALOG, &tree, &resources];
+            objects.extend([SMALL; 1000][..n].iter());
+            let numbers: Vec<i32> = (4..n as i32 + 4).collect();
+            assert_eq!(resolved_once(pdf(&objects)), numbers);
+            let pdf = Pdf::new(pdf(&objects)).unwrap();
+            assert!(
+                pdf.pages()
+                    .iter()
+                    .all(|page| page.resources().x_objects.keys().count() == n)
             );
         }
     }

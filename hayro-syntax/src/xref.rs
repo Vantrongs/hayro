@@ -315,6 +315,14 @@ fn fallback_xref_map_inner<'a>(
 
 const DUMMY_XREF: XRef = XRef(Inner::Dummy);
 
+#[cfg(test)]
+std::thread_local! {
+    /// While `Some`, how often each object has been resolved on this thread, which
+    /// the tests bound to show that the page tree resolves each object once.
+    pub(crate) static RESOLVED: core::cell::RefCell<Option<FxHashMap<ObjectIdentifier, usize>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
 /// An xref table.
 #[derive(Debug, Clone)]
 pub struct XRef(Inner);
@@ -519,6 +527,14 @@ impl XRef {
         }
     }
 
+    /// Whether the table has been rebuilt by scanning the file.
+    pub(crate) fn is_repaired(&self) -> bool {
+        match &self.0 {
+            Inner::Dummy => false,
+            Inner::Some(r) => r.map.get().repaired,
+        }
+    }
+
     pub(crate) fn repair(&self) {
         let Inner::Some(r) = &self.0 else {
             unreachable!();
@@ -628,6 +644,13 @@ impl XRef {
     where
         T: ObjectLike<'a>,
     {
+        #[cfg(test)]
+        RESOLVED.with_borrow_mut(|resolved| {
+            if let Some(resolved) = resolved {
+                *resolved.entry(id).or_default() += 1;
+            }
+        });
+
         let Inner::Some(repr) = &self.0 else {
             return None;
         };

@@ -1,8 +1,8 @@
 //! The entries a page inherits from the page tree, found as `MuPDF` finds them.
 
-use super::{KidsStates, Node, Page};
-use crate::object::dict::keys::{CROP_BOX, MEDIA_BOX, PAGES, PARENT, RESOURCES, ROTATE};
-use crate::object::{Dict, MaybeRef, Null, Object, ObjectIdentifier};
+use super::{KidsStates, Node, Nodes, Page};
+use crate::object::dict::keys::{CROP_BOX, MEDIA_BOX, PARENT, RESOURCES, ROTATE};
+use crate::object::{MaybeRef, Null, Object, ObjectIdentifier};
 use crate::pdf::Pdf;
 use crate::reader::ReaderContext;
 use crate::sync::{FxHashMap, FxHashSet};
@@ -70,7 +70,7 @@ impl Inheritable {
 /// entries are repaired, so the lookups for all pages take time linear in the
 /// nodes the chains pass and the pages.
 pub struct Inheritance<'a> {
-    ctx: ReaderContext<'a>,
+    nodes: Nodes<'a>,
     repaired: Option<FxHashMap<Key, Node<'a>>>,
     chains: FxHashMap<Key, [Option<Chain<'a>>; 4]>,
 }
@@ -99,9 +99,9 @@ pub(super) enum Key {
 
 impl<'a> Node<'a> {
     pub(super) fn key(&self) -> Key {
-        match self.id {
+        match self.id() {
             Some(id) => Key::Object(id),
-            None => Key::Direct(self.dict.data().as_ptr() as usize),
+            None => Key::Direct(self.dict().data().as_ptr() as usize),
         }
     }
 }
@@ -109,12 +109,13 @@ impl<'a> Node<'a> {
 impl<'a> Inheritance<'a> {
     /// No /Parent repaired yet.
     pub fn new(pdf: &'a Pdf) -> Self {
-        Self::with(ReaderContext::new(pdf.xref(), false))
+        Self::with(Nodes::new(ReaderContext::new(pdf.xref(), false)))
     }
 
-    pub(super) fn with(ctx: ReaderContext<'a>) -> Self {
+    /// Resolving page tree objects through `nodes`.
+    pub(super) fn with(nodes: Nodes<'a>) -> Self {
         Self {
-            ctx,
+            nodes,
             repaired: None,
             chains: FxHashMap::default(),
         }
@@ -142,7 +143,7 @@ impl<'a> Inheritance<'a> {
     ) -> Result<Option<Object<'a>>, InheritanceError> {
         let chain = match self.chain(page, key) {
             Chain::Loop if self.repaired.is_none() => {
-                self.repaired = Some(tree_parents(&self.ctx));
+                self.repaired = Some(tree_parents(&mut self.nodes));
                 self.chains.clear();
                 self.chain(page, key)
             }
@@ -150,8 +151,19 @@ impl<'a> Inheritance<'a> {
         };
         match chain {
             Chain::Found(value) => Ok(Some(value)),
-            Chain::End(end) => Ok(listings.inherited(end, page.key(), lister, key)),
+            Chain::End(end) => Ok(listings
+                .holder(end, page.key(), lister, key)
+                .map(|holder| self.held(holder, key))),
             Chain::Loop | Chain::Followed => Err(InheritanceError::ParentLoop),
+        }
+    }
+
+    /// The value of `key` for `holder`, which has the entry, kept with the chains, so
+    /// that it is found once however many pages inherit it.
+    fn held(&mut self, holder: &Node<'a>, key: Inheritable) -> Object<'a> {
+        match self.chain(holder, key) {
+            Chain::Found(value) => value,
+            _ => unreachable!("a chain from a node with the entry ends there"),
         }
     }
 
@@ -195,14 +207,14 @@ impl<'a> Inheritance<'a> {
 
     /// The node's /Parent as the lookups see it: repaired, or one that is a
     /// dictionary.
-    fn parent(&self, node: &Node<'a>) -> Option<Node<'a>> {
+    fn parent(&mut self, node: &Node<'a>) -> Option<Node<'a>> {
         match self.repaired.as_ref().and_then(|map| map.get(&node.key())) {
             Some(parent) => Some(parent.clone()),
             None => node
-                .dict
+                .dict()
                 .get_raw::<Object<'a>>(PARENT)
-                .map(|parent| Node::new(parent, &self.ctx))
-                .filter(|parent| parent.is_dict),
+                .map(|parent| self.nodes.get(parent))
+                .filter(Node::is_dict),
         }
     }
 }
@@ -250,16 +262,16 @@ impl<'a> Listings<'a> {
         self.nodes[at].end = self.nodes.len();
     }
 
-    /// The value of `key` for `page`, listed under the node at `lister`, through the
-    /// nodes listing it above `end`, where its /Parent chain ends: all of them if
-    /// `end` is the page itself, none if `end` does not list the page.
-    fn inherited(
+    /// The node `page`, listed under the node at `lister`, inherits `key` from
+    /// through the nodes listing it above `end`, where its /Parent chain ends: all
+    /// of them if `end` is the page itself, none if `end` does not list the page.
+    fn holder(
         &self,
         end: Key,
         page: Key,
         lister: Option<usize>,
         key: Inheritable,
-    ) -> Option<Object<'a>> {
+    ) -> Option<&Node<'a>> {
         let lister = lister?;
         let from = if end == page {
             lister
@@ -271,14 +283,14 @@ impl<'a> Listings<'a> {
             at
         };
         let holder = self.nodes[from].holders[key.index()]?;
-        value(&self.nodes[holder].node, key)
+        Some(&self.nodes[holder].node)
     }
 }
 
 // The value `node` has for `key`, `null` for a reference to nothing.
 fn value<'a>(node: &Node<'a>, key: Inheritable) -> Option<Object<'a>> {
     node.has(key.name()).then(|| {
-        node.dict
+        node.dict()
             .get::<Object<'a>>(key.name())
             .unwrap_or(Object::Null(Null))
     })
@@ -299,19 +311,15 @@ fn value<'a>(node: &Node<'a>, key: Inheritable) -> Option<Object<'a>> {
 // The nodes listing one /Kids array object share the kids left in it: those that
 // one of them took were met then, so every other would pass over them. Each array
 // is thus read and stored once, however many nodes list it.
-fn tree_parents<'a>(ctx: &ReaderContext<'a>) -> FxHashMap<Key, Node<'a>> {
+fn tree_parents<'a>(nodes: &mut Nodes<'a>) -> FxHashMap<Key, Node<'a>> {
     let mut parents = FxHashMap::default();
-    let xref = ctx.xref();
-    let Some(root) = xref
-        .get_with::<Dict<'a>>(xref.root_id(), ctx)
-        .and_then(|catalog| catalog.get_raw::<Object<'a>>(PAGES))
-    else {
+    let Some(root) = nodes.tree() else {
         return parents;
     };
     // The kids of each /Kids array not taken yet, first first, taken from the end;
     // `None` for a direct `null`, which `MuPDF` skips.
     let mut kids = KidsStates::<Vec<Option<Node<'a>>>>::default();
-    let read = |kids: &mut KidsStates<_>, node: &Node<'a>| {
+    let mut read = |kids: &mut KidsStates<_>, node: &Node<'a>| {
         kids.of(node, |kids| {
             let kids: Vec<_> = kids
                 .map(|kid| {
@@ -319,7 +327,7 @@ fn tree_parents<'a>(ctx: &ReaderContext<'a>) -> FxHashMap<Key, Node<'a>> {
                     super::kids_read();
                     match kid {
                         MaybeRef::NotRef(Object::Null(_)) => None,
-                        kid => Some(Node::new(kid, ctx)),
+                        kid => Some(nodes.get(kid)),
                     }
                 })
                 .collect();
@@ -328,7 +336,6 @@ fn tree_parents<'a>(ctx: &ReaderContext<'a>) -> FxHashMap<Key, Node<'a>> {
             kids
         })
     };
-    let root = Node::new(root, ctx);
     let mut met = FxHashSet::default();
     met.insert(root.key());
     let mut stack = vec![(read(&mut kids, &root), root)];
@@ -338,7 +345,7 @@ fn tree_parents<'a>(ctx: &ReaderContext<'a>) -> FxHashMap<Key, Node<'a>> {
             continue;
         };
         // A node met before is in the map already, or on the stack, above itself.
-        let Some(kid) = kid.filter(|kid| kid.is_dict && met.insert(kid.key())) else {
+        let Some(kid) = kid.filter(|kid| kid.is_dict() && met.insert(kid.key())) else {
             continue;
         };
         parents.insert(kid.key(), node.clone());
