@@ -17,20 +17,12 @@ impl<'a, T> Readable<'a> for IndirectObject<T>
 where
     T: ObjectLike<'a>,
 {
+    // The object is read in `ctx`, which names the object the table lists here
+    // (`XRef::get_with`): the header may name another, and is no identity.
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
-        let mut ctx = ctx.clone();
-        let id = r.read_without_context::<ObjectIdentifier>()?;
-
-        if ctx.parent_chain_contains(&id) {
-            warn!("cycle detected in indirect object: {id:?}");
-
-            return None;
-        }
-
-        ctx.set_obj_number(id);
-        ctx.parent_chain_push(id);
+        r.skip::<ObjectIdentifier>(false)?;
         r.skip_white_spaces_and_comments();
-        let inner = r.read_with_context::<T>(&ctx)?;
+        let inner = r.read_with_context::<T>(ctx)?;
         r.skip_white_spaces_and_comments();
         // We are lenient and don't require it.
         r.forward_tag(b"endobj");

@@ -297,3 +297,60 @@ fn resources_pages_share_are_copied_once() {
         "{small} bytes for 256 pages, {large} for 512"
     );
 }
+
+/// A file of `n` pages that share one `/Font` category of `n` fonts, each page with
+/// its own `/XObject` category, and the copy of each page as a form.
+fn copied_with_own_xobjects(n: usize) -> (Pdf, ExtractionResult) {
+    let fonts: Vec<String> = (0..n).map(|i| format!("/F{i} 4 0 R")).collect();
+    let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", 5 + 2 * i)).collect();
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!("<< /Type /Pages /Count {n} /Kids [{}] >>", kids.join(" ")).into_bytes(),
+        format!("<< {} >>", fonts.join(" ")).into_bytes(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ];
+    for i in 0..n {
+        objects.push(
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                 /Resources << /Font 3 0 R /XObject << /X{i} {} 0 R >> >> >>",
+                6 + 2 * i
+            )
+            .into_bytes(),
+        );
+        objects.push(fixtures::stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 50 50]",
+            b"0 0 50 50 re f",
+        ));
+    }
+    let source = Pdf::new(fixtures::file(&objects, "")).unwrap();
+    let queries: Vec<_> = (0..n)
+        .map(|page| ExtractionQuery::new_user_space_xobject(page, [0.0, 0.0, 200.0, 200.0]))
+        .collect();
+    let result = run(&source, &queries).unwrap();
+    (reread(&result), result)
+}
+
+// A resource category pages share is copied once, whatever the pages' other
+// categories: copying `n` pages that share `n` fonts, each with its own form, writes a
+// file linear in `n`, and each page has all the fonts and its own form.
+#[test]
+fn a_category_pages_share_is_copied_once() {
+    let [small, large] = [256, 512].map(|n| {
+        let (copy, result) = copied_with_own_xobjects(n);
+        for (i, root) in result.root_refs.iter().enumerate() {
+            let form = get(&copy, root.unwrap());
+            let resources = form.dict().get::<Dict<'_>>(b"Resources").unwrap();
+            assert_eq!(resources.get::<Dict<'_>>(b"Font").unwrap().len(), n);
+            let x_objects = resources.get::<Dict<'_>>(b"XObject").unwrap();
+            assert_eq!(x_objects.len(), 1);
+            let own = x_objects.get::<Stream<'_>>(format!("X{i}").as_bytes());
+            assert_eq!(own.unwrap().decoded().unwrap().as_ref(), b"0 0 50 50 re f");
+        }
+        result.chunk.len()
+    });
+    assert!(
+        large < small * 21 / 10,
+        "{small} bytes for 256 pages, {large} for 512"
+    );
+}

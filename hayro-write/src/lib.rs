@@ -206,9 +206,9 @@ struct ExtractionContext<'a> {
     /// The copies of streams form queries asked for, by the stream and, for one
     /// that takes its page's resources, the page.
     forms: FxHashMap<(ObjRef, Option<usize>), Ref>,
-    /// The copy of each set of resources pages and forms are drawn with, by the
-    /// bytes of its categories, which pages that share their resources share.
-    resources: FxHashMap<[(usize, usize); 7], Ref>,
+    /// The copy of each resource category dictionary pages and forms are drawn
+    /// with, by its bytes in the source, which pages that share it share.
+    resource_categories: FxHashMap<(usize, usize), Ref>,
     /// The first part of the source that could not be read whole.
     error: Option<ExtractionError>,
     root_refs: Vec<Result<Ref, ExtractionError>>,
@@ -234,7 +234,7 @@ impl<'a> ExtractionContext<'a> {
             ref_targets: FxHashMap::default(),
             shared_streams: FxHashMap::default(),
             forms: FxHashMap::default(),
-            resources: FxHashMap::default(),
+            resource_categories: FxHashMap::default(),
             error: None,
             pdf,
             new_ref,
@@ -542,8 +542,9 @@ fn write_form(
     Ok(form_ref)
 }
 
-/// Writes `/Resources` into `writer` as a reference to the copy of `resources`,
-/// written once however many pages and forms are drawn with them.
+/// Writes `/Resources` into `writer`, each category a reference to the copy of its
+/// dictionary, written once however many pages and forms are drawn with it, whatever
+/// their other categories.
 fn serialize_resources(
     resources: &Resources<'_>,
     ctx: &mut ExtractionContext<'_>,
@@ -558,33 +559,35 @@ fn serialize_resources(
         (&resources.fonts, FONT),
         (&resources.properties, PROPERTIES),
     ];
-    let key = categories.map(|(category, _)| {
-        let data = category.data();
-        (data.as_ptr() as usize, data.len())
+    let copies = categories.map(|(category, name)| {
+        (!category.is_empty()).then(|| (name, category_copy(category, ctx)))
     });
-    let copy = match ctx.resources.get(&key) {
-        Some(copy) => *copy,
-        None => {
-            let copy = ctx.new_ref();
-            ctx.resources.insert(key, copy);
-            let mut chunk = Chunk::with_settings(ctx.chunk_settings);
-            // Resource dictionary is always required (unless it can be inherited), so
-            // let's just be safe and always write it.
-            let mut output = chunk.indirect(copy).dict();
-            for (category, name) in categories {
-                if !category.is_empty() {
-                    let mut dict = output.insert(Name(name)).dict();
-                    for (name, obj) in category.entries() {
-                        obj.write_direct(dict.insert(Name(name.deref())), ctx);
-                    }
-                }
-            }
-            output.finish();
-            ctx.chunks.push(chunk);
-            copy
-        }
-    };
-    writer.pair(Name(RESOURCES), copy);
+    // Resource dictionary is always required (unless it can be inherited), so
+    // let's just be safe and always write it.
+    let mut output = writer.insert(Name(RESOURCES)).dict();
+    for (name, copy) in copies.into_iter().flatten() {
+        output.pair(Name(name), copy);
+    }
+}
+
+/// The copy of resource category `category`, written the first time it is asked for.
+fn category_copy(category: &Dict<'_>, ctx: &mut ExtractionContext<'_>) -> Ref {
+    // By the bytes of the dictionary, which are those of one dictionary of the file.
+    let data = category.data();
+    let key = (data.as_ptr() as usize, data.len());
+    if let Some(copy) = ctx.resource_categories.get(&key) {
+        return *copy;
+    }
+    let copy = ctx.new_ref();
+    ctx.resource_categories.insert(key, copy);
+    let mut chunk = Chunk::with_settings(ctx.chunk_settings);
+    let mut output = chunk.indirect(copy).dict();
+    for (name, obj) in category.entries() {
+        obj.write_direct(output.insert(Name(name.deref())), ctx);
+    }
+    output.finish();
+    ctx.chunks.push(chunk);
+    copy
 }
 
 /// `data` compressed for a `FlateDecode` stream.

@@ -1543,10 +1543,10 @@ mod tests {
         assert_eq!(inherited_in(file), [(vec![], A4.x1, 1), (vec![], A4.x1, 0)]);
     }
 
-    // Where an entry leads to an object whose header names another object, which the
-    // table finds at its own offset, the table tells the two apart: the object is
-    // the entry's, and the table is kept, which a rebuilt table, taking the later of
-    // the two as the catalog, would lose.
+    // Where an entry leads to an object whose header names another object, the table
+    // is rebuilt and keeps the entry, which the scan does not find under its number:
+    // the object is the entry's, /Rotate 90 here, and the scan does not take it for
+    // the later definition of the catalog it is headed as.
     #[test]
     fn an_object_numbered_as_another_the_table_lists_is_the_entry_s() {
         let file = damaged(
@@ -1560,6 +1560,133 @@ mod tests {
             &[],
         );
         assert_eq!(inherited_in(file), [(vec![], 300.0, 1)]);
+    }
+
+    // Where two entries lead to one object, which the table lists under its header's
+    // number too, both are that object: the entry headed otherwise does not take it
+    // from the number the header names.
+    #[test]
+    fn an_object_two_entries_lead_to_is_both_entries() {
+        let file = damaged(
+            &[
+                (1, CATALOG),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /MediaBox 4 0 R /CropBox 5 0 R >>"),
+                (4, "[0 0 300 300]"),
+            ],
+            &[(5, 3)],
+            &[],
+        );
+        let pdf = Pdf::new(file).unwrap();
+        let page = &pdf.pages()[0];
+        assert_eq!((page.media_box().x1, page.crop_box().x1), (300.0, 300.0));
+    }
+
+    const DRAWING: &[u8] = b"0 0 1 rg 10 10 80 80 re f";
+
+    fn drawing() -> String {
+        let data = core::str::from_utf8(DRAWING).unwrap();
+        format!("<< /Length {} >>\nstream\n{data}\nendstream", DRAWING.len())
+    }
+
+    /// Each page of `file`: its object number, its media box and its content.
+    fn drawn(file: Vec<u8>) -> Vec<(i32, [f64; 4], Vec<u8>)> {
+        let pdf = Pdf::new(file).unwrap();
+        pdf.pages()
+            .iter()
+            .map(|page| {
+                let number = page.obj_id().map_or(0, |id| id.obj_number);
+                let m = page.media_box();
+                (
+                    number,
+                    [m.x0, m.y0, m.x1, m.y1],
+                    page.try_page_stream().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    // An object is the one its entry names, not the one its header names: node 2 and
+    // its /Type, object 3, are both headed `1 0 obj`, and reading /Type from node 2
+    // is no cycle, so node 2 is a node and page 4 is the page.
+    #[test]
+    fn an_entry_read_from_a_node_headed_as_another_object_is_no_cycle() {
+        let file = damaged(
+            &[
+                (1, CATALOG),
+                (
+                    1,
+                    "<< /Type 3 0 R /Kids [4 0 R] /Count 1 /MediaBox [0 0 300 300] >>",
+                ),
+                (1, "/Pages"),
+                (
+                    4,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 5 0 R >>",
+                ),
+                (5, &drawing()),
+            ],
+            &[(2, 1), (3, 2)],
+            &[],
+        );
+        assert_eq!(
+            drawn(file),
+            [(4, [0.0, 0.0, 100.0, 100.0], DRAWING.to_vec())]
+        );
+    }
+
+    // So too for /Kids: node 2's /Kids, object 3, lists page 5 before page 4, and both
+    // are headed `1 0 obj`.
+    #[test]
+    fn kids_read_from_a_node_headed_as_another_object_keep_their_order() {
+        let page = |size: &str| {
+            format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {size}] /Contents 6 0 R >>")
+        };
+        let file = damaged(
+            &[
+                (1, CATALOG),
+                (1, "<< /Type /Pages /Kids 3 0 R /Count 2 >>"),
+                (1, "[5 0 R 4 0 R]"),
+                (4, &page("100 200")),
+                (5, &page("300 400")),
+                (6, &drawing()),
+            ],
+            &[(2, 1), (3, 2)],
+            &[],
+        );
+        assert_eq!(
+            drawn(file),
+            [
+                (5, [0.0, 0.0, 300.0, 400.0], DRAWING.to_vec()),
+                (4, [0.0, 0.0, 100.0, 200.0], DRAWING.to_vec()),
+            ]
+        );
+    }
+
+    // Where an entry leads to another object's second definition and the file holds
+    // the entry's own object, the rebuilt table has that object: page 3's box is
+    // object 6, 600 by 700, not the second object 7 that entry 6 leads to.
+    #[test]
+    fn an_object_the_scan_finds_is_read_rather_than_the_one_its_entry_leads_to() {
+        let file = damaged(
+            &[
+                (1, CATALOG),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (
+                    3,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox 6 0 R /Contents 8 0 R >>",
+                ),
+                (7, "[0 0 200 300]"),
+                (7, "[0 0 400 500]"),
+                (6, "[0 0 600 700]"),
+                (8, &drawing()),
+            ],
+            &[(6, 4)],
+            &[],
+        );
+        assert_eq!(
+            drawn(file),
+            [(3, [0.0, 0.0, 600.0, 700.0], DRAWING.to_vec())]
+        );
     }
 
     // Where a damaged file holds two generations of an object, the loader keeps
