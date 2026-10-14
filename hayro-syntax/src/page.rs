@@ -11,7 +11,7 @@ use crate::object::dict::keys::*;
 use crate::object::stream::DecodeFailure;
 use crate::object::{MaybeRef, Null, Object, ObjectIdentifier};
 use crate::reader::ReaderContext;
-use crate::sync::{Arc, FxHashSet, OnceLock};
+use crate::sync::{Arc, OnceLock};
 use crate::transform::Transform;
 use crate::util::FloatExt;
 use crate::xref::XRef;
@@ -21,7 +21,8 @@ use core::ops::Deref;
 
 mod inherit;
 
-pub use inherit::{Inheritance, InheritanceError};
+use inherit::Listings;
+pub use inherit::{Inheritable, Inheritance, InheritanceError};
 
 /// A structure holding the pages of a PDF document.
 pub struct Pages<'a> {
@@ -43,11 +44,11 @@ impl<'a> Pages<'a> {
             .and_then(|root| root.get_raw::<Object<'a>>(PAGES))
             .map(|tree| Node::new(tree, ctx))
             .filter(|tree| tree.is_dict);
-        let mut pages = tree.map(|tree| walk(tree, ctx)).unwrap_or_default();
+        let (mut pages, listings) = tree.map(|tree| walk(tree, ctx)).unwrap_or_default();
         if pages.is_empty() {
             pages = brute_force(xref);
         }
-        let pages = with_inherited(pages, ctx);
+        let pages = with_inherited(pages, Arc::new(listings), ctx);
 
         Some(Self { pages, xref })
     }
@@ -64,6 +65,13 @@ impl<'a> Deref for Pages<'a> {
     fn deref(&self) -> &Self::Target {
         &self.pages
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// The entries looked up in page tree nodes on this thread, which the tests
+    /// bound to show that reading the tree takes linear time.
+    static LOOKUPS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 /// A page tree entry: a dictionary, or an empty one for any other object.
@@ -94,6 +102,8 @@ impl<'a> Node<'a> {
 
     // Whether MuPDF sees the entry: a direct `null` is stored as no entry.
     fn has(&self, key: &[u8]) -> bool {
+        #[cfg(test)]
+        LOOKUPS.set(LOOKUPS.get() + 1);
         !matches!(
             self.dict.get_raw::<Object<'a>>(key),
             None | Some(MaybeRef::NotRef(Object::Null(_)))
@@ -128,48 +138,34 @@ impl<'a> Node<'a> {
     }
 }
 
-/// The nodes that list a page tree entry, nearest first, as the walk of the /Kids
-/// meets them.
-struct Listing<'a> {
-    node: Node<'a>,
-    up: Option<Arc<Self>>,
-}
+/// A page tree entry and the index in the [`Listings`] of the node listing it.
+type Listed<'a> = (Node<'a>, Option<usize>);
 
-impl<'a> Listing<'a> {
-    fn nodes(&self) -> impl Iterator<Item = &Node<'a>> {
-        core::iter::successors(Some(self), |listing| listing.up.as_deref())
-            .map(|listing| &listing.node)
-    }
-}
-
-/// A page tree entry and the nodes that list it.
-type Listed<'a> = (Node<'a>, Option<Arc<Listing<'a>>>);
-
-// The pages below `tree`, depth first. A node's kids are read the first time the
-// walk reaches it: a node listed again, as a shared subtree or in a cycle, adds
-// nothing, which keeps the walk linear in the file. A page listed again is a page
-// again, as in MuPDF.
-fn walk<'a>(tree: Node<'a>, ctx: &ReaderContext<'a>) -> Vec<Listed<'a>> {
+// The pages below `tree`, depth first, and the nodes listing them. A node's kids are
+// read the first time the walk reaches it: a node listed again, as a shared subtree,
+// in a cycle or in a /Kids array that two nodes share, adds nothing, which keeps the
+// walk linear in the file. A page listed again is a page again, as in MuPDF.
+fn walk<'a>(tree: Node<'a>, ctx: &ReaderContext<'a>) -> (Vec<Listed<'a>>, Listings<'a>) {
     let mut pages = vec![];
-    let mut read = FxHashSet::default();
-    let mut stack: Vec<(Arc<Listing<'a>>, ArrayIter<'a>)> = vec![];
+    let mut listings = Listings::default();
+    let mut stack: Vec<(usize, ArrayIter<'a>)> = vec![];
     let mut next = Some(tree);
     loop {
         if let Some(node) = next.take() {
-            let up = stack.last().map(|(listing, _)| listing.clone());
+            let lister = stack.last().map(|(at, _)| *at);
             if !node.is_tree() {
-                pages.push((node, up));
-            } else if node.id.is_none_or(|id| read.insert(id)) {
-                let kids = node.kids();
-                stack.push((Arc::new(Listing { node, up }), kids));
+                pages.push((node, lister));
+            } else if let Some(at) = listings.read(&node, lister) {
+                stack.push((at, node.kids()));
             }
         }
-        let Some((_, kids)) = stack.last_mut() else {
-            return pages;
+        let Some((at, kids)) = stack.last_mut() else {
+            return (pages, listings);
         };
         match kids.next() {
             Some(kid) => next = Some(Node::new(kid, ctx)),
             None => {
+                listings.close(*at);
                 stack.pop();
             }
         }
@@ -194,23 +190,25 @@ fn brute_force<'a>(xref: &'a XRef) -> Vec<Listed<'a>> {
     pages
 }
 
-/// The entries a page inherits, in the order of [`INHERITED`].
+/// The entries a page inherits, in the order of [`Inheritable::ALL`].
 type Inherited<'a> = [Option<Object<'a>>; 4];
-
-/// The entries a page inherits (the PDF specification's table 31).
-const INHERITED: [&[u8]; 4] = [MEDIA_BOX, CROP_BOX, ROTATE, RESOURCES];
 
 // Each of `entries` as a page with the entries it inherits, found as MuPDF finds
 // them once it has loaded every page, which reads these entries: by then a /Parent
 // loop any of the lookups meets has been repaired (see `Inheritance`). An entry
 // that cannot be found, because a /Parent chain loops even so, is not inherited.
-fn with_inherited<'a>(entries: Vec<Listed<'a>>, ctx: &ReaderContext<'a>) -> Vec<Page<'a>> {
+fn with_inherited<'a>(
+    entries: Vec<Listed<'a>>,
+    listings: Arc<Listings<'a>>,
+    ctx: &ReaderContext<'a>,
+) -> Vec<Page<'a>> {
     let mut tree = Inheritance::with(ctx.clone());
     let look_up = |tree: &mut Inheritance<'a>| -> Vec<Inherited<'a>> {
         entries
             .iter()
-            .map(|(page, listing)| {
-                INHERITED.map(|key| tree.lookup(page, listing.as_deref(), key).ok().flatten())
+            .map(|(page, lister)| {
+                Inheritable::ALL
+                    .map(|key| tree.lookup(page, &listings, *lister, key).ok().flatten())
             })
             .collect()
     };
@@ -221,7 +219,9 @@ fn with_inherited<'a>(entries: Vec<Listed<'a>>, ctx: &ReaderContext<'a>) -> Vec<
     entries
         .into_iter()
         .zip(inherited)
-        .map(|((page, listing), inherited)| Page::new(page, listing, inherited, ctx))
+        .map(|((page, lister), inherited)| {
+            Page::new(page, listings.clone(), lister, inherited, ctx)
+        })
         .collect()
 }
 
@@ -257,14 +257,18 @@ pub struct Page<'a> {
     rotation: Rotation,
     page_streams: OnceLock<Option<Vec<u8>>>,
     resources: Resources<'a>,
-    listing: Option<Arc<Listing<'a>>>,
+    /// The nodes the page tree lists pages under, and the index of the one listing
+    /// this page.
+    listings: Arc<Listings<'a>>,
+    lister: Option<usize>,
     ctx: ReaderContext<'a>,
 }
 
 impl<'a> Page<'a> {
     fn new(
         node: Node<'a>,
-        listing: Option<Arc<Listing<'a>>>,
+        listings: Arc<Listings<'a>>,
+        lister: Option<usize>,
         inherited: Inherited<'a>,
         reader_ctx: &ReaderContext<'a>,
     ) -> Self {
@@ -299,7 +303,8 @@ impl<'a> Page<'a> {
             rotation,
             page_streams: OnceLock::new(),
             resources,
-            listing,
+            listings,
+            lister,
             ctx: reader_ctx.clone(),
         }
     }
@@ -1000,6 +1005,116 @@ mod tests {
         let objects: Vec<&str> = objects.iter().map(String::as_str).collect();
         let page = (named(&[]), 300.0, 0);
         assert_eq!(inherited(&objects), [page.clone(), page.clone(), page]);
+    }
+
+    // The root lists a chain of `depth` nodes, each listing the next, and the last
+    // lists `pages` pages. Only the root has entries a page inherits; each node and
+    // page has a /Parent to the node listing it where `parents` holds.
+    fn nested(depth: usize, pages: usize, parents: bool) -> Vec<u8> {
+        let first_page = depth + 3;
+        let parent = |of: usize| {
+            if parents {
+                format!("/Parent {of} 0 R")
+            } else {
+                String::new()
+            }
+        };
+        let mut objects = vec![
+            CATALOG.to_owned(),
+            "<< /Type /Pages /Kids [3 0 R] /MediaBox [0 0 200 100] /Rotate 90 \
+             /Resources << /XObject << /F 9 0 R >> >> >>"
+                .to_owned(),
+        ];
+        for level in 0..depth {
+            let number = level + 3;
+            let kids: Vec<String> = if level + 1 < depth {
+                vec![format!("{} 0 R", number + 1)]
+            } else {
+                (0..pages)
+                    .map(|p| format!("{} 0 R", first_page + p))
+                    .collect()
+            };
+            objects.push(format!(
+                "<< /Type /Pages /Kids [{}] {} >>",
+                kids.join(" "),
+                parent(number - 1)
+            ));
+        }
+        for _ in 0..pages {
+            objects.push(format!("<< /Type /Page {} >>", parent(depth + 2)));
+        }
+        let objects: Vec<&str> = objects.iter().map(String::as_str).collect();
+        pdf(&objects)
+    }
+
+    // A page under 100,000 nested nodes opens and is dropped on a thread with the
+    // 1 MB stack of a render thread: nothing takes stack in proportion to the depth.
+    #[test]
+    fn a_page_under_deeply_nested_nodes_opens_and_drops_on_a_small_stack() {
+        for parents in [false, true] {
+            let file = nested(100_000, 1, parents);
+            let read = std::thread::Builder::new()
+                .stack_size(1 << 20)
+                .spawn(move || {
+                    let pdf = Pdf::new(file).unwrap();
+                    let page = &pdf.pages()[0];
+                    let names: Vec<String> = page
+                        .resources()
+                        .x_objects
+                        .keys()
+                        .map(|name| name.as_str().to_owned())
+                        .collect();
+                    (names, page.media_box().x1)
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            assert_eq!(read, (named(&["F"]), 200.0), "parents: {parents}");
+        }
+    }
+
+    // The entries `pages` pages under `depth` nested nodes inherit are found with a
+    // number of dictionary lookups linear in the nodes and pages, whether the pages
+    // reach the root through /Parent or only through the nodes listing them.
+    #[test]
+    fn inherited_entries_are_found_in_linear_time() {
+        for parents in [false, true] {
+            let lookups = |n: usize| {
+                let file = nested(n, n, parents);
+                super::LOOKUPS.set(0);
+                let pdf = Pdf::new(file).unwrap();
+                assert!(pdf.pages().iter().all(|page| page.media_box().x1 == 200.0));
+                super::LOOKUPS.get()
+            };
+            let [small, large] = [1000, 2000].map(lookups);
+            assert!(
+                large < small * 21 / 10,
+                "parents: {parents}: {small} lookups for 1000, {large} for 2000"
+            );
+        }
+    }
+
+    // Each /Kids array is a shared object whose two direct nodes list the next array:
+    // walking every listing would take 2^40 steps. A direct node met again adds
+    // nothing, as an indirect one: the last array's page is a page under each of the
+    // two nodes listing it.
+    #[test]
+    fn shared_kids_arrays_of_direct_nodes_are_read_in_linear_time() {
+        let depth: i32 = 40;
+        let mut objects = vec![
+            CATALOG.to_owned(),
+            "<< /Type /Pages /Kids 3 0 R >>".to_owned(),
+        ];
+        for level in 0..depth {
+            let next = level + 4;
+            let node = format!("<< /Type /Pages /Kids {next} 0 R >>");
+            objects.push(format!("[{node} {node}]"));
+        }
+        objects.push(format!("[{} 0 R]", depth + 4));
+        objects.push(PAGE.to_owned());
+        let objects: Vec<&str> = objects.iter().map(String::as_str).collect();
+        let page = (depth + 4, Some(1600.0));
+        assert_eq!(pages(&objects), Some(vec![page, page]));
     }
 
     #[test]
