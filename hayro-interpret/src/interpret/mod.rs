@@ -164,8 +164,12 @@ pub fn interpret_page<'a>(
     if context.settings.render_annotations
         && let Some(annot_arr) = page.raw().get::<Array<'_>>(ANNOTS)
     {
-        let appearances =
-            annotation::Appearances::new(page.xref(), context.settings.font_resolver.clone());
+        // The fields of the document's forms are read once for all its pages.
+        let appearances = annotation::Appearances::with_fields(
+            page.xref(),
+            context.settings.font_resolver.clone(),
+            context.interpreter_cache.annotation_fields.clone(),
+        );
         let visible = page.intersected_crop_box().to_kurbo();
         for annot in annot_arr.iter::<Dict<'_>>() {
             let flags = annotation::flags(&annot);

@@ -42,6 +42,7 @@ use hayro_syntax::xref::XRef;
 use kurbo::{Affine, Shape};
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
+use std::rc::Rc;
 
 /// What an annotation draws.
 pub enum Look<'a> {
@@ -146,22 +147,37 @@ fn flags_of(annot: &Entries<'_>) -> u32 {
 /// What the annotations of one document look like: [`Appearances::look`], with
 /// generated text in the standard fonts a font resolver gives (Helvetica for
 /// characters a family's font lacks) and widget defaults from the document's
-/// interactive form. Make one per page or document: fonts are loaded once, and each
-/// field above widgets is read once.
+/// interactive form. Make one per document: fonts are loaded once, and each field
+/// above widgets is read once, however many pages its widgets are on.
 pub struct Appearances<'a> {
     xref: &'a XRef,
     fonts: Fonts,
     /// The interactive form dictionary (`/AcroForm`).
     form: Option<Entries<'a>>,
-    /// The fields read so far, by reference: what the widgets below each inherit, or
-    /// `None` when its `/Parent` chain loops.
-    fields: RefCell<FxHashMap<ObjRef, Option<Field<'a>>>>,
+    fields: Fields<'a>,
 }
+
+/// The fields of a document read so far, by reference: what the widgets below each
+/// inherit, or `None` when its `/Parent` chain loops. Shared by every
+/// [`Appearances`] of the document a renderer makes, one per page, through its
+/// document's cache.
+#[derive(Clone, Default)]
+pub(crate) struct Fields<'a>(Rc<RefCell<FxHashMap<ObjRef, Option<Field<'a>>>>>);
 
 impl<'a> Appearances<'a> {
     /// The appearances of annotations in the document of `xref`, with text in the
     /// fonts `font_resolver` gives for the standard fonts.
     pub fn new(xref: &'a XRef, font_resolver: crate::FontResolverFn) -> Self {
+        Self::with_fields(xref, font_resolver, Fields::default())
+    }
+
+    /// As [`Appearances::new`], reading fields into `fields`, the fields of the
+    /// document of `xref` read before.
+    pub(crate) fn with_fields(
+        xref: &'a XRef,
+        font_resolver: crate::FontResolverFn,
+        fields: Fields<'a>,
+    ) -> Self {
         let form = xref
             .get::<Dict<'a>>(xref.root_id())
             .and_then(|root| root.get::<Dict<'a>>(b"AcroForm"))
@@ -170,7 +186,7 @@ impl<'a> Appearances<'a> {
             xref,
             fonts: Fonts::new(font_resolver),
             form,
-            fields: RefCell::default(),
+            fields,
         }
     }
 
@@ -338,7 +354,7 @@ impl<'a> Appearances<'a> {
     /// chain; `None` when the chain loops, which viewers read as a broken field and
     /// draw nothing for. Each field above widgets is read once.
     fn field(&self, annot: &Entries<'a>) -> Option<Field<'a>> {
-        let mut known = self.fields.borrow_mut();
+        let mut known = self.fields.0.borrow_mut();
         let mut on_walk = rustc_hash::FxHashSet::default();
         on_walk.extend(annot.id());
         // From the widget up to the first field read before, or to the top.

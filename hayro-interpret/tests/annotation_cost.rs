@@ -225,6 +225,64 @@ fn widgets_below_one_chain_of_fields_read_each_field_once() {
     assert!(bytes < 32 << 20, "{bytes} bytes");
 }
 
+/// Pages whose widgets are below one deep chain of fields, interpreted with one cache
+/// for the document as a renderer interprets them, read each field once: the work
+/// grows with the fields and pages, not with their product.
+#[test]
+fn pages_below_one_chain_of_fields_read_each_field_once() {
+    use hayro_interpret::{Context, DummyDevice, InterpreterCache, interpret_page};
+    const N: usize = 1000;
+    // The catalog, the page tree, N pages, a widget on each, and N fields above them.
+    let (page, widget, field) = (3, 3 + N, 3 + 2 * N);
+    let kids: Vec<String> = (0..N).map(|i| format!("{} 0 R", page + i)).collect();
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!("<< /Type /Pages /Kids [{}] /Count {N} >>", kids.join(" ")).into_bytes(),
+    ];
+    for i in 0..N {
+        objects.push(
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [{} 0 R] >>",
+                widget + i
+            )
+            .into_bytes(),
+        );
+    }
+    for _ in 0..N {
+        objects.push(
+            format!(
+                "<< /Type /Annot /Subtype /Widget /Parent {field} 0 R \
+                 /MK << /BG [1 0 0] >> /Rect [10 10 110 30] >>"
+            )
+            .into_bytes(),
+        );
+    }
+    for k in 0..N {
+        objects.push(if k == N - 1 {
+            b"<< /FT /Tx >>".to_vec()
+        } else {
+            format!("<< /Parent {} 0 R >>", field + k + 1).into_bytes()
+        });
+    }
+    let pdf = Pdf::new(common::file(&objects, "")).expect("valid pdf");
+    let pages = pdf.pages();
+    let cache = InterpreterCache::new();
+    let before = allocated();
+    for page in pages.iter() {
+        let mut ctx = Context::new(
+            kurbo::Affine::IDENTITY,
+            PAGE,
+            &cache,
+            page.xref(),
+            InterpreterSettings::default(),
+        );
+        interpret_page(page, &mut ctx, &mut DummyDevice);
+    }
+    let bytes = allocated() - before;
+    // About 15 KiB a page; reading the whole chain for each page takes 1.7 GB.
+    assert!(bytes < 64 << 20, "{bytes} bytes");
+}
+
 /// A Squiggly quad whose top line stands still while its bottom edge runs a million
 /// points: its hundred million steps all fan out of one point on the page, more than
 /// the page can tell apart. Such a quad marks no text and is unsupported, not drawn

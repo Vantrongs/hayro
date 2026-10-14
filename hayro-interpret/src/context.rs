@@ -28,6 +28,8 @@ pub(crate) const MAX_NESTED_INTERPRETATION_DEPTH: u32 = 50;
 pub struct InterpreterCache<'a> {
     pub(crate) font_cache: Rc<RefCell<FxHashMap<u128, Option<Font<'a>>>>>,
     pub(crate) object_cache: Cache,
+    /// The form fields read for the annotations of the document's pages.
+    pub(crate) annotation_fields: crate::interpret::annotation::Fields<'a>,
 }
 
 impl<'a> Default for InterpreterCache<'a> {
@@ -42,6 +44,7 @@ impl<'a> InterpreterCache<'a> {
         Self {
             font_cache: Rc::new(RefCell::new(FxHashMap::default())),
             object_cache: Cache::new(),
+            annotation_fields: Default::default(),
         }
     }
 }
