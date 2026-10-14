@@ -2,24 +2,35 @@
 //! on the page, or, for an annotation without a usable one, an appearance generated
 //! from its entries (PDF 32000-1 12.5).
 //!
-//! The renderer draws annotations with [`look`], and a writer that flattens
+//! The renderer draws annotations with [`Appearances::look`], and a writer that flattens
 //! annotations into page content can use the same to draw what the renderer shows.
 //!
-//! The generated appearances follow the PDF specification and `PDFium`
-//! (`core/fpdfdoc/cpdf_generateap.cpp`, BSD-3-Clause); each generator names its
-//! source. Their licenses are in the repository's `NOTICE.md`.
+//! What a generated appearance shows follows the PDF specification. The markup
+//! shapes (`markup.rs`) are adapted from `PDFium` (`core/fpdfdoc/cpdf_generateap.cpp`,
+//! BSD-3-Clause; its license is in the repository's `NOTICE.md`). The layout of the
+//! other generators, which the spec leaves to the viewer, is written here and sized
+//! to match the rendered output of common viewers; each module says what it draws.
+//! Text is drawn as glyph outlines from the standard fonts the font resolver gives.
 //!
 //! A generated appearance is a content stream in default user space that needs no
 //! resources. /CA and the highlight's Multiply
 //! blend apply to it as one transparency group.
 
+mod freetext;
+mod icons;
+mod lines;
 mod markup;
+mod text;
+mod widget;
+
+use text::Fonts;
 
 use crate::BlendMode;
 use hayro_syntax::object::dict::keys::{
     AP, AS, BBOX, BORDER, BS, C, CA, D, F, MATRIX, N, RECT, S, SUBTYPE, W,
 };
 use hayro_syntax::object::{Array, Dict, Name, Object, Rect, Stream};
+use hayro_syntax::xref::XRef;
 use kurbo::{Affine, Shape};
 use std::fmt::Write;
 
@@ -66,44 +77,69 @@ pub fn flattened(annot: &Dict<'_>) -> bool {
     !link && annot.get::<u32>(F).unwrap_or(0) & 3 == 0
 }
 
-/// What `annot` draws on a page that shows `visible` (in default user space) of it.
-///
-/// The normal appearance is `/AP /N`, or, when that is a dictionary of states, the
-/// state `/AS` names. A stream there draws when it has a `/BBox` of some area, and
-/// nothing otherwise. An `/AP` that is not a dictionary draws nothing. Without an
-/// appearance there (no `/AP`, no `/N`, no stream for the state), one is generated
-/// from the annotation's entries.
-pub fn look<'a>(annot: &Dict<'a>, visible: kurbo::Rect) -> Look<'a> {
-    match annot.get::<Object<'_>>(AP) {
-        None | Some(Object::Null(_)) => {}
-        Some(Object::Dict(ap)) => {
-            // Read as `Object` first: a dictionary read as a stream may pick up the
-            // data of a stream after it in the file.
-            let stream = match ap.get::<Object<'_>>(N) {
-                Some(Object::Stream(stream)) => Some(stream),
-                Some(Object::Dict(states)) => annot
-                    .get::<Name<'_>>(AS)
-                    .and_then(|state| states.get::<Stream<'_>>(state)),
-                _ => None,
-            };
-            if let Some(stream) = stream {
-                return if has_area(&stream) {
-                    Look::Stream(stream)
-                } else {
-                    Look::Nothing
-                };
-            }
+/// What the annotations of one document look like: [`Appearances::look`], with
+/// generated text in the standard fonts a font resolver gives (Helvetica for
+/// characters a family's font lacks) and widget defaults from the document's
+/// interactive form. Make one per page or document: fonts are loaded once.
+pub struct Appearances<'a> {
+    fonts: Fonts,
+    /// The interactive form dictionary (`/AcroForm`).
+    form: Option<Dict<'a>>,
+}
+
+impl<'a> Appearances<'a> {
+    /// The appearances of annotations in the document of `xref`, with text in the
+    /// fonts `font_resolver` gives for the standard fonts.
+    pub fn new(xref: &'a XRef, font_resolver: crate::FontResolverFn) -> Self {
+        let form = xref
+            .get::<Dict<'a>>(xref.root_id())
+            .and_then(|root| root.get::<Dict<'a>>(b"AcroForm"));
+        Self {
+            fonts: Fonts::new(font_resolver),
+            form,
         }
-        Some(_) => return Look::Nothing,
     }
-    if annot.contains_key(AP) && annot.get::<Object<'_>>(AP).is_none() {
-        // A reference to no object.
-        return Look::Nothing;
-    }
-    match generate(annot, visible) {
-        Ok(Some(appearance)) => Look::Generated(appearance),
-        Ok(None) => Look::Nothing,
-        Err(why) => Look::Unsupported(why),
+
+    /// What `annot` draws on a page that shows `visible` (in default user space) of it,
+    /// with text in `fonts`.
+    ///
+    /// The normal appearance is `/AP /N`, or, when that is a dictionary of states, the
+    /// state `/AS` names. A stream there draws when it has a `/BBox` of some area, and
+    /// nothing otherwise. An `/AP` that is not a dictionary draws nothing. Without an
+    /// appearance there (no `/AP`, no `/N`, no stream for the state), one is generated
+    /// from the annotation's entries.
+    pub fn look(&self, annot: &Dict<'a>, visible: kurbo::Rect) -> Look<'a> {
+        match annot.get::<Object<'_>>(AP) {
+            None | Some(Object::Null(_)) => {}
+            Some(Object::Dict(ap)) => {
+                // Read as `Object` first: a dictionary read as a stream may pick up the
+                // data of a stream after it in the file.
+                let stream = match ap.get::<Object<'_>>(N) {
+                    Some(Object::Stream(stream)) => Some(stream),
+                    Some(Object::Dict(states)) => annot
+                        .get::<Name<'_>>(AS)
+                        .and_then(|state| states.get::<Stream<'_>>(state)),
+                    _ => None,
+                };
+                if let Some(stream) = stream {
+                    return if has_area(&stream) {
+                        Look::Stream(stream)
+                    } else {
+                        Look::Nothing
+                    };
+                }
+            }
+            Some(_) => return Look::Nothing,
+        }
+        if annot.contains_key(AP) && annot.get::<Object<'_>>(AP).is_none() {
+            // A reference to no object.
+            return Look::Nothing;
+        }
+        match self.generate(annot, visible) {
+            Ok(Some(appearance)) => Look::Generated(appearance),
+            Ok(None) => Look::Nothing,
+            Err(why) => Look::Unsupported(why),
+        }
     }
 }
 
@@ -147,120 +183,79 @@ pub fn rect_transform(rect: kurbo::Rect, bbox: [f32; 4], matrix: Affine) -> Affi
 /// What a generator makes: an appearance, nothing to draw, or why it cannot.
 type Generated = Result<Option<Appearance>, Unsupported>;
 
-/// The appearance generated for `annot` from its entries.
-fn generate(annot: &Dict<'_>, visible: kurbo::Rect) -> Generated {
-    let Some(subtype) = annot.get::<Name<'_>>(SUBTYPE) else {
-        return Ok(None);
-    };
-    let mut out = Out(String::new());
-    let drew = match subtype.as_ref() {
-        b"Square" => markup::shape(annot, false, &mut out),
-        b"Circle" => markup::shape(annot, true, &mut out),
-        b"Highlight" => markup::highlight(annot, &mut out),
-        b"Underline" => markup::text_lines(annot, markup::Line::Under, visible, &mut out),
-        b"StrikeOut" => markup::text_lines(annot, markup::Line::Through, visible, &mut out),
-        b"Squiggly" => markup::text_lines(annot, markup::Line::Squiggle, visible, &mut out),
-        b"Ink" => markup::ink(annot, &mut out),
-        b"Text" => markup::note_icon(annot, &mut out),
-        b"FreeText" | b"Line" | b"Polygon" | b"PolyLine" | b"Caret" | b"FileAttachment"
-        | b"Sound" | b"Redact" => return Err(Unsupported::Kind),
-        b"Stamp"
-            if annot
-                .get::<Name<'_>>(b"Name")
-                .is_some_and(|n| STAMPS.contains(&n.as_ref())) =>
-        {
-            return Err(Unsupported::Kind);
-        }
-        b"Widget" => return widget(annot),
-        // Popup, Link, the media and 3D subtypes, PrinterMark, TrapNet, Watermark,
-        // Projection, stamps of other names and unknown subtypes: nothing.
-        _ => return Ok(None),
-    };
-    if drew.is_none() {
-        return Ok(None);
-    }
-    let blend = if subtype.as_ref() == b"Highlight" {
-        BlendMode::Multiply
-    } else {
-        BlendMode::Normal
-    };
-    Ok(Some(Appearance {
-        content: out.0,
-        opacity: opacity(annot),
-        blend,
-    }))
-}
-
-/// The stamp names of PDF 32000-1 Table 181, which a stamp without an appearance
-/// stream is drawn for.
-const STAMPS: [&[u8]; 14] = [
-    b"Approved",
-    b"Experimental",
-    b"NotApproved",
-    b"AsIs",
-    b"Expired",
-    b"NotForPublicRelease",
-    b"Confidential",
-    b"Final",
-    b"Sold",
-    b"Departmental",
-    b"ForComment",
-    b"TopSecret",
-    b"Draft",
-    b"ForPublicRelease",
-];
-
-/// A form field's widget: one shows its border and background (`/MK /BC`, `/BG`), and
-/// the value of its field: the text of a text field or a combo box, the options of
-/// a list box, the caption of a push button (`/MK /CA`), the mark of a check box or
-/// radio button in an on state (`/AS`), the look of an unsigned signature field. A
-/// field without a type, a signed signature and a widget with none of these draw
-/// nothing.
-fn widget(annot: &Dict<'_>) -> Generated {
-    let field_type = field(annot, b"FT").and_then(|d| d.get::<Name<'_>>(b"FT"));
-    let flags = field(annot, b"Ff")
-        .and_then(|d| d.get::<u32>(b"Ff"))
-        .unwrap_or(0);
-    let mk = annot.get::<Dict<'_>>(b"MK");
-    let mk_color = |key: &[u8]| {
-        mk.as_ref()
-            .and_then(|mk| mk.get::<Array<'_>>(key))
-            .is_some_and(|a| color(&a, false).is_some())
-    };
-    let border = mk_color(b"BC") && border_width(annot) > 0.0;
-    let text = |key: &[u8]| {
-        field(annot, key)
-            .and_then(|d| d.get::<hayro_syntax::object::String<'_>>(key))
-            .is_some_and(|s| !s.as_bytes().is_empty())
-    };
-    let shows = match field_type.as_ref().map(|n| n.as_ref()) {
-        Some(b"Sig") => {
-            return if field(annot, b"V").is_none() {
-                Err(Unsupported::Kind)
-            } else {
-                Ok(None)
-            };
-        }
-        Some(b"Tx") => text(b"V"),
-        // Bit 18: a combo box.
-        Some(b"Ch") if flags & (1 << 17) != 0 => text(b"V"),
-        Some(b"Ch") => field(annot, b"Opt")
-            .and_then(|d| d.get::<Array<'_>>(b"Opt"))
-            .is_some_and(|o| o.iter::<Object<'_>>().next().is_some()),
-        // Bit 17: a push button.
-        Some(b"Btn") if flags & (1 << 16) != 0 => mk
+impl Appearances<'_> {
+    /// The appearance generated for `annot` from its entries.
+    fn generate(&self, annot: &Dict<'_>, visible: kurbo::Rect) -> Generated {
+        let Some(subtype) = annot.get::<Name<'_>>(SUBTYPE) else {
+            return Ok(None);
+        };
+        let mut out = Out(String::new());
+        let fonts = &self.fonts;
+        let dr = self
+            .form
             .as_ref()
-            .and_then(|mk| mk.get::<hayro_syntax::object::String<'_>>(b"CA"))
-            .is_some_and(|s| !s.as_bytes().is_empty()),
-        Some(b"Btn") => annot
-            .get::<Name<'_>>(AS)
-            .is_some_and(|state| state.as_ref() != b"Off"),
-        _ => return Ok(None),
-    };
-    if shows || border || mk_color(b"BG") {
-        Err(Unsupported::Kind)
-    } else {
-        Ok(None)
+            .and_then(|f| f.get::<Dict<'_>>(b"DR"))
+            .and_then(|dr| dr.get::<Dict<'_>>(b"Font"));
+        let ok = |drew: Option<()>| Ok(drew);
+        let drew = match subtype.as_ref() {
+            b"Square" => ok(markup::shape(annot, false, &mut out)),
+            b"Circle" => ok(markup::shape(annot, true, &mut out)),
+            b"Highlight" => ok(markup::highlight(annot, &mut out)),
+            b"Underline" => ok(markup::text_lines(
+                annot,
+                markup::Line::Under,
+                visible,
+                &mut out,
+            )),
+            b"StrikeOut" => ok(markup::text_lines(
+                annot,
+                markup::Line::Through,
+                visible,
+                &mut out,
+            )),
+            b"Squiggly" => ok(markup::text_lines(
+                annot,
+                markup::Line::Squiggle,
+                visible,
+                &mut out,
+            )),
+            b"Ink" => ok(markup::ink(annot, &mut out)),
+            b"Text" => icons::icon(annot, icons::Icon::Note, fonts, &mut out),
+            b"FileAttachment" => icons::icon(annot, icons::Icon::FileAttachment, fonts, &mut out),
+            b"Sound" => icons::icon(annot, icons::Icon::Sound, fonts, &mut out),
+            b"Caret" => ok(icons::caret(annot, &mut out)),
+            b"Redact" => ok(icons::redact(annot, &mut out)),
+            b"Stamp" => icons::stamp(annot, fonts, &mut out),
+            b"FreeText" => freetext::free_text(annot, dr.as_ref(), fonts, &mut out),
+            b"Line" => lines::line(annot, fonts, &mut out),
+            b"Polygon" => ok(lines::poly(annot, true, &mut out)),
+            b"PolyLine" => ok(lines::poly(annot, false, &mut out)),
+            b"Widget" => widget::widget(annot, self.form.as_ref(), fonts, &mut out),
+            // Popup, Link, the media and 3D subtypes, PrinterMark, TrapNet, Watermark,
+            // Projection, stamps of other names and unknown subtypes: nothing.
+            _ => Ok(None),
+        }?;
+        // An appearance that paints nothing, such as a widget with no value, border
+        // or background, is no appearance.
+        let paints = out.0.lines().any(|l| {
+            matches!(
+                l.rsplit(' ').next(),
+                Some("f" | "f*" | "S" | "s" | "b" | "b*" | "B" | "B*")
+            )
+        });
+        if drew.is_none() || !paints {
+            return Ok(None);
+        }
+        let blend = if subtype.as_ref() == b"Highlight" {
+            BlendMode::Multiply
+        } else {
+            BlendMode::Normal
+        };
+        Ok(Some(Appearance {
+            content: out.0,
+            opacity: opacity(annot),
+            blend,
+        }))
     }
 }
 
@@ -304,6 +299,41 @@ impl Out {
         Some(())
     }
 
+    /// `path` as path construction operators, to a thousandth of a point.
+    fn path(&mut self, path: &kurbo::BezPath) -> Option<()> {
+        use kurbo::PathEl;
+        let mut last = kurbo::Point::ZERO;
+        for el in path.elements() {
+            let pts: &[kurbo::Point] = match el {
+                PathEl::MoveTo(p) | PathEl::LineTo(p) => &[*p],
+                PathEl::QuadTo(c, p) => {
+                    // The cubic of the same curve.
+                    let c1 = last + (*c - last) * (2.0 / 3.0);
+                    let c2 = *p + (*c - *p) * (2.0 / 3.0);
+                    &[c1, c2, *p]
+                }
+                PathEl::CurveTo(a, b, p) => &[*a, *b, *p],
+                PathEl::ClosePath => {
+                    self.op("h");
+                    continue;
+                }
+            };
+            for p in pts {
+                if !(p.x.is_finite() && p.y.is_finite()) {
+                    return None;
+                }
+                write!(self.0, "{} {} ", round(p.x), round(p.y)).ok()?;
+            }
+            self.op(match el {
+                PathEl::MoveTo(_) => "m",
+                PathEl::LineTo(_) => "l",
+                _ => "c",
+            });
+            last = *pts.last()?;
+        }
+        Some(())
+    }
+
     fn op(&mut self, op: &str) {
         self.0.push_str(op);
         self.0.push('\n');
@@ -320,6 +350,11 @@ impl Out {
         self.op("] 0 d");
         Some(())
     }
+}
+
+/// `v` to a thousandth, without the trailing zeros.
+fn round(v: f64) -> f64 {
+    (v * 1000.0).round() / 1000.0 + 0.0
 }
 
 /// The colour operator for a colour array (gray, RGB or CMYK); `None` when the array

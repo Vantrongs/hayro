@@ -1,6 +1,6 @@
-//! Annotations without `/AP` get the appearance `PDFium` generates for their subtype.
+//! Annotations without a usable `/AP` get an appearance generated from their entries.
 
-use hayro_interpret::annotation::{Look, Unsupported, look, rect_transform};
+use hayro_interpret::annotation::{Appearances, Look, Unsupported, rect_transform};
 use hayro_interpret::font::GlyphRun;
 use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::hayro_syntax::object::{Array, Dict};
@@ -251,28 +251,275 @@ fn square_and_circle_fill_ic_and_stroke_c_inside_rect() {
     );
 }
 
+/// The fills drawn, as bounding box and colour, skipping strokes and groups.
+fn fills(ev: &[Ev]) -> Vec<([i32; 4], [u8; 4])> {
+    ev.iter()
+        .filter_map(|e| match e {
+            Ev::Fill { bbox, rgba } => Some((*bbox, *rgba)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether box `b` lies inside `outer`.
+fn inside(b: [i32; 4], outer: [i32; 4]) -> bool {
+    b[0] >= outer[0] && b[1] >= outer[1] && b[2] <= outer[2] && b[3] <= outer[3]
+}
+
+const WHITE: [u8; 4] = [255, 255, 255, 255];
+const BLUE: [u8; 4] = [0, 0, 255, 255];
+
 #[test]
-fn note_is_a_20pt_icon_at_the_bottom_left() {
+fn note_is_a_20pt_icon_at_the_top_left() {
     let ev = draw(&["/Subtype /Text /Rect [100 100 140 160]"], VIEW);
-    let icon = [100, 100, 120, 120];
-    assert_eq!(ev.len(), 2, "{ev:?}");
-    let Ev::Fill { bbox, rgba } = &ev[0] else {
+    let frame = [101, 141, 119, 159];
+    assert_eq!(
+        ev,
+        vec![
+            Ev::Fill {
+                bbox: frame,
+                rgba: WHITE
+            },
+            Ev::Stroke {
+                bbox: frame,
+                rgba: BLACK,
+                width: 1.25,
+                dashed: false
+            },
+            // Four lines of text in the symbol's 10 pt square.
+            Ev::Fill {
+                bbox: [105, 146, 115, 155],
+                rgba: BLACK
+            },
+        ]
+    );
+    // /C fills the box; other icons draw a symbol in the same square.
+    for icon in [
+        "/Subtype /Text /Name /Help /C [1 1 0]",
+        "/Subtype /FileAttachment",
+        "/Subtype /FileAttachment /Name /Paperclip",
+        "/Subtype /Sound /Name /Mic",
+        "/Subtype /Sound /Name /Unknown",
+    ] {
+        let ev = fills(&draw(&[&format!("{icon} /Rect [100 100 140 160]")], VIEW));
+        assert_eq!(ev.len(), 2, "{icon}: {ev:?}");
+        let fill = if icon.contains("/C") { YELLOW } else { WHITE };
+        assert_eq!(ev[0], (frame, fill), "{icon}");
+        assert!(
+            inside(ev[1].0, [104, 144, 116, 156]) && ev[1].1 == BLACK,
+            "{icon}: {ev:?}"
+        );
+    }
+}
+
+#[test]
+fn caret_is_centred_and_redact_outlines_its_area() {
+    assert_eq!(
+        draw(&["/Subtype /Caret /Rect [40 40 60 60] /RD [5 5 5 5]"], VIEW),
+        vec![Ev::Fill {
+            bbox: [40, 43, 60, 57],
+            rgba: BLACK
+        }]
+    );
+    assert_eq!(
+        draw(&["/Subtype /Caret /Rect [0 0 100 100] /C [1 0 0]"], VIEW),
+        vec![Ev::Fill {
+            bbox: [40, 43, 60, 57],
+            rgba: RED
+        }]
+    );
+    let outline = |bbox| Ev::Stroke {
+        bbox,
+        rgba: RED,
+        width: 1.0,
+        dashed: false,
+    };
+    // Each quadrilateral, whatever the colours; without /QuadPoints, /Rect less 1 pt.
+    assert_eq!(
+        draw(
+            &["/Subtype /Redact /C [0 0 1] /IC [0] /Rect [40 40 160 80] \
+               /QuadPoints [40 80 160 80 40 60 160 60 40 60 100 60 40 40 100 40]"],
+            VIEW
+        ),
+        vec![outline([40, 40, 160, 80])]
+    );
+    assert_eq!(
+        draw(&["/Subtype /Redact /Rect [40 40 160 80]"], VIEW),
+        vec![outline([41, 41, 159, 79])]
+    );
+}
+
+#[test]
+fn a_standard_stamp_is_its_name_in_a_tilted_box() {
+    let ev = draw(
+        &["/Subtype /Stamp /Name /NotForPublicRelease /C [1 0 0] /Rect [5 75 195 125]"],
+        VIEW,
+    );
+    let Ev::Stroke {
+        bbox, rgba, width, ..
+    } = ev[0]
+    else {
         panic!("{ev:?}")
     };
-    assert_eq!(
-        (*rgba, bbox[0] - icon[0] <= 1, bbox[3] - icon[3] <= 1),
-        (YELLOW, true, true)
-    );
+    // The 186 × 44 box turned 0.6°: 2 pt taller than it is, inside /Rect.
+    assert_eq!((rgba, width), (RED, 2.0));
     assert!(
-        matches!(
-            ev[1],
-            Ev::Stroke {
-                rgba: BLACK,
-                width: 1.0,
-                ..
-            }
-        ),
+        inside(bbox, [5, 75, 195, 125]) && bbox[3] - bbox[1] == 46,
+        "{bbox:?}"
+    );
+    // Two lines of text, in /C.
+    let text = fills(&ev);
+    assert_eq!(text.len(), 2, "{ev:?}");
+    assert!(
+        text.iter().all(|&(b, c)| c == RED && inside(b, bbox)),
         "{ev:?}"
+    );
+    // Scaled to a smaller /Rect, centred.
+    let small = draw(&["/Subtype /Stamp /Name /Draft /Rect [10 60 70 80]"], VIEW);
+    let Ev::Stroke { bbox, width, .. } = small[0] else {
+        panic!("{small:?}")
+    };
+    assert!(
+        inside(bbox, [10, 60, 70, 80]) && (width - 2.0 * 60.0 / 190.0).abs() < 1e-3,
+        "{small:?}"
+    );
+}
+
+#[test]
+fn free_text_fills_its_box_and_writes_in_the_default_appearance() {
+    let ev = draw(
+        &[
+            "/Subtype /FreeText /Rect [10 10 110 60] /C [1 1 0] /DA (/Helv 12 Tf 1 0 0 rg) /Contents (Hi)",
+        ],
+        VIEW,
+    );
+    assert_eq!(
+        ev[..2],
+        [
+            Ev::Fill {
+                bbox: [10, 10, 110, 60],
+                rgba: YELLOW
+            },
+            Ev::Stroke {
+                bbox: [11, 11, 110, 60],
+                rgba: RED,
+                width: 1.0,
+                dashed: false
+            },
+        ]
+    );
+    // "Hi" from 2 pt inside the border, its baseline 0.8 em below that.
+    let text = fills(&ev[2..]);
+    assert_eq!(text.len(), 1, "{ev:?}");
+    assert!(
+        inside(text[0].0, [12, 48, 30, 58]) && text[0].0[1] == 48,
+        "{text:?}"
+    );
+    assert_eq!(text[0].1, RED);
+}
+
+#[test]
+fn lines_and_polygons_draw_their_points_and_endings() {
+    let ev = draw(
+        &[
+            "/Subtype /Line /L [20 20 120 20] /C [0 0 1] /IC [1 0 0] /LE [/None /ClosedArrow] /Rect [0 0 200 200]",
+        ],
+        VIEW,
+    );
+    assert_eq!(
+        ev[0],
+        Ev::Stroke {
+            bbox: [20, 20, 120, 20],
+            rgba: BLUE,
+            width: 1.0,
+            dashed: false
+        }
+    );
+    // The arrow, filled with /IC.
+    let arrow = fills(&ev);
+    assert_eq!(arrow.len(), 1, "{ev:?}");
+    assert!(
+        inside(arrow[0].0, [110, 15, 120, 25]) && arrow[0].1 == RED,
+        "{ev:?}"
+    );
+    assert_eq!(
+        draw(
+            &[
+                "/Subtype /Polygon /Vertices [10 10 50 10 30 40] /C [1 0 0] /IC [1 1 0] /Rect [0 0 100 100]"
+            ],
+            VIEW
+        ),
+        vec![
+            Ev::Fill {
+                bbox: [10, 10, 50, 40],
+                rgba: YELLOW
+            },
+            Ev::Stroke {
+                bbox: [10, 10, 50, 40],
+                rgba: RED,
+                width: 1.0,
+                dashed: false
+            },
+        ]
+    );
+}
+
+#[test]
+fn widgets_show_their_value_or_state() {
+    let field = draw(
+        &[
+            "/Subtype /Widget /FT /Tx /V (Hello) /DA (/Helv 10 Tf 0 0 1 rg) /MK << /BG [1 1 0] /BC [1 0 0] >> /Rect [10 10 110 30]",
+        ],
+        VIEW,
+    );
+    assert_eq!(
+        field[..2],
+        [
+            Ev::Fill {
+                bbox: [10, 10, 110, 30],
+                rgba: YELLOW
+            },
+            Ev::Stroke {
+                bbox: [11, 11, 110, 30],
+                rgba: RED,
+                width: 1.0,
+                dashed: false
+            },
+        ]
+    );
+    let text = fills(&field[2..]);
+    assert!(
+        text.len() == 1 && text[0].1 == BLUE && inside(text[0].0, [12, 12, 60, 28]),
+        "{field:?}"
+    );
+    // A check box in its on state shows a check mark; off, nothing.
+    let check = fills(&draw(
+        &["/Subtype /Widget /FT /Btn /AS /Yes /Rect [10 10 30 30]"],
+        VIEW,
+    ));
+    assert!(
+        check.len() == 1 && check[0].1 == BLACK && inside(check[0].0, [10, 10, 30, 30]),
+        "{check:?}"
+    );
+    // A radio button: its background as a disc and a dot.
+    let radio = fills(&draw(
+        &["/Subtype /Widget /FT /Btn /Ff 32768 /AS /a /MK << /BG [1 1 0] >> /Rect [10 10 30 30]"],
+        VIEW,
+    ));
+    assert_eq!(radio[0], ([10, 10, 30, 30], YELLOW), "{radio:?}");
+    assert!(
+        radio[1].1 == BLACK && inside(radio[1].0, [15, 15, 25, 25]),
+        "{radio:?}"
+    );
+    // An unsigned signature field: an orange tag at the top left with white text.
+    let sig = fills(&draw(
+        &["/Subtype /Widget /FT /Sig /Rect [10 10 110 70]"],
+        VIEW,
+    ));
+    assert_eq!(sig.len(), 2, "{sig:?}");
+    assert!(
+        sig[0].0 == [10, 60, 55, 70] && sig[1].1 == WHITE && inside(sig[1].0, sig[0].0),
+        "{sig:?}"
     );
 }
 
@@ -311,7 +558,8 @@ fn an_annotation_without_a_generator_warns_and_draws_nothing() {
     let file = common::one_page(
         200,
         "/Resources << >> /Annots [4 0 R]",
-        vec![b"<< /Subtype /Widget /FT /Tx /V (x) /Rect [0 0 100 100] >>".to_vec()],
+        // A character none of the fonts has.
+        vec![b"<< /Subtype /FreeText /Contents <FEFF6F22> /Rect [0 0 100 100] >>".to_vec()],
     );
     let pdf = Pdf::new(file).expect("valid pdf");
     let warned = Arc::new(AtomicUsize::new(0));
@@ -349,12 +597,13 @@ fn annots<'a>(pdf: &'a Pdf) -> Vec<Dict<'a>> {
 
 const PAGE: kurbo::Rect = kurbo::Rect::new(0.0, 0.0, 200.0, 200.0);
 
-/// What `look` says, in short: the stream's data, `generated`, `nothing`, or
-/// `unsupported`.
-fn looks(annots: &[Dict<'_>]) -> Vec<String> {
-    annots
+/// What [`Appearances::look`] says for each annotation of the first page, in short:
+/// the stream's data, `generated`, `nothing`, or `unsupported`.
+fn looks(pdf: &Pdf) -> Vec<String> {
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    annots(pdf)
         .iter()
-        .map(|a| match look(a, PAGE) {
+        .map(|a| match appearances.look(a, PAGE) {
             Look::Stream(s) => String::from_utf8(s.decoded().unwrap().into_owned()).unwrap(),
             Look::Generated(_) => "generated".into(),
             Look::Nothing => "nothing".into(),
@@ -400,7 +649,7 @@ fn the_normal_appearance_follows_the_state_and_is_generated_without_one() {
     let refs: Vec<String> = (4..4 + entries.len()).map(|n| format!("{n} 0 R")).collect();
     let pdf = annotations(&format!("/Annots [{}]", refs.join(" ")), objects);
     assert_eq!(
-        looks(&annots(&pdf)),
+        looks(&pdf),
         [
             "yes",
             "generated",
@@ -422,7 +671,7 @@ fn the_normal_appearance_follows_the_state_and_is_generated_without_one() {
             zero,
         ],
     );
-    assert_eq!(looks(&annots(&pdf)), ["nothing"]);
+    assert_eq!(looks(&pdf), ["nothing"]);
 }
 
 #[test]
@@ -439,8 +688,8 @@ fn subtypes_that_draw_without_an_appearance() {
         format!("/Subtype /Widget /FT /Sig {r}"),
         format!("/Subtype /Widget /FT /Sig /V << >> {r}"),
         format!("/Subtype /Widget {r}"),
-        // The field type is inherited from the parent field (22).
-        format!("/Subtype /Widget /Parent 22 0 R /AS /Yes {r}"),
+        // The field type is inherited from the parent field (23).
+        format!("/Subtype /Widget /Parent 23 0 R /AS /Yes {r}"),
         format!("/Subtype /Square /C [0] /BS << /W 0 >> {r}"),
         format!("/Subtype /Ink /InkList [[1 1 5 5]] {r}"),
         // Widgets with nothing to show: no value, no border, no background, an off
@@ -451,6 +700,8 @@ fn subtypes_that_draw_without_an_appearance() {
         format!("/Subtype /Widget /FT /Btn /Ff 65536 {r}"),
         // And with something.
         format!("/Subtype /Widget /FT /Tx /MK << /BG [1] >> {r}"),
+        // Text in a character no font has.
+        format!("/Subtype /FreeText /Contents <FEFF6F22> {r}"),
     ];
     let mut objects: Vec<Vec<u8>> = entries
         .iter()
@@ -460,19 +711,19 @@ fn subtypes_that_draw_without_an_appearance() {
     let refs: Vec<String> = (4..4 + entries.len()).map(|n| format!("{n} 0 R")).collect();
     let pdf = annotations(&format!("/Annots [{}]", refs.join(" ")), objects);
     assert_eq!(
-        looks(&annots(&pdf)),
+        looks(&pdf),
         [
-            "unsupported",
+            "generated",
             "nothing",
             "nothing",
             "nothing",
             "nothing",
             "nothing",
             "nothing",
-            "unsupported",
+            "generated",
             "nothing",
             "nothing",
-            "unsupported",
+            "generated",
             // Width 0 is the thinnest line; ink without /C has no colour.
             "generated",
             "nothing",
@@ -480,7 +731,8 @@ fn subtypes_that_draw_without_an_appearance() {
             "nothing",
             "nothing",
             "nothing",
-            "unsupported",
+            "generated",
+            "Character('漢')",
         ]
     );
 }
@@ -502,7 +754,8 @@ fn a_generated_appearance_has_its_opacity_and_blend() {
         "/Annots [4 0 R]",
         vec![b"<< /Subtype /Highlight /CA 0.5 /Rect [10 10 90 40] /QuadPoints [10 40 90 40 10 30 90 30] >>".to_vec()],
     );
-    let Look::Generated(highlight) = look(&annots(&pdf)[0], PAGE) else {
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    let Look::Generated(highlight) = appearances.look(&annots(&pdf)[0], PAGE) else {
         panic!("a highlight is generated");
     };
     assert_eq!(

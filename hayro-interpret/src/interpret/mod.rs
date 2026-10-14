@@ -167,6 +167,8 @@ pub fn interpret_page<'a>(
     if context.settings.render_annotations
         && let Some(annot_arr) = page.raw().get::<Array<'_>>(ANNOTS)
     {
+        let appearances =
+            annotation::Appearances::new(page.xref(), context.settings.font_resolver.clone());
         let visible = page.intersected_crop_box().to_kurbo();
         for annot in annot_arr.iter::<Dict<'_>>() {
             let flags = annot.get::<u32>(F).unwrap_or(0);
@@ -179,7 +181,7 @@ pub fn interpret_page<'a>(
                 continue;
             }
 
-            match annotation::look(&annot, visible) {
+            match appearances.look(&annot, visible) {
                 annotation::Look::Stream(stream) => {
                     let (Some(apx), Some(rect)) =
                         (FormXObject::new(&stream), annot.get::<Rect>(RECT))

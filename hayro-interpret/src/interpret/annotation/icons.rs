@@ -1,0 +1,360 @@
+//! Annotations drawn as a symbol: `Text` (a note), `FileAttachment` and `Sound` as
+//! an icon of their `/Name` (PDF 32000-1 12.5.6.4, 12.5.6.15, 12.5.6.16), `Caret`
+//! (12.5.6.11), `Stamp` as its standard text (12.5.6.12, Table 181) and `Redact`
+//! (12.5.6.23) as the outline of the area it marks.
+//!
+//! The spec leaves their look to the viewer. These follow what common viewers draw
+//! when such an annotation has no appearance stream: a 20 pt icon at the top left
+//! of `/Rect`, a black symbol in a box of /C (white without it); a 20 × 14 pt caret
+//! centred on `/Rect`; the stamp's name in Times Bold in a box tilted 0.6°, set for
+//! a 190 × 50 stamp and scaled to fit `/Rect`; a red outline of each quadrilateral.
+//! The symbols are drawn here, each in a 10 pt square.
+
+use super::text::{self, Family, Fonts};
+use super::{Out, Unsupported, c_color, color, rect};
+use hayro_syntax::object::dict::keys::{C, QUADPOINTS};
+use hayro_syntax::object::{Array, Dict, Name};
+use kurbo::{Affine, BezPath, Circle, Point, Shape};
+
+type Drawn = Result<Option<()>, Unsupported>;
+
+fn fail(o: Option<()>) -> Result<(), Unsupported> {
+    o.ok_or(Unsupported::Kind)
+}
+
+/// Which symbol an icon shows.
+#[derive(Clone, Copy)]
+pub(super) enum Icon {
+    Note,
+    FileAttachment,
+    Sound,
+}
+
+/// The icon of a `Text`, `FileAttachment` or `Sound` annotation.
+pub(super) fn icon(annot: &Dict<'_>, kind: Icon, fonts: &Fonts, out: &mut Out) -> Drawn {
+    let Some(r) = rect(annot) else {
+        return Ok(None);
+    };
+    let name = annot.get::<Name<'_>>(b"Name");
+    let name = name.as_ref().map_or(&b""[..], |n| n.as_ref());
+    let fill = annot
+        .get::<Array<'_>>(C)
+        .and_then(|a| color(&a, false))
+        .unwrap_or_else(|| "1 g".to_owned());
+    let (x0, y1) = (r.x0 as f32, r.y1 as f32);
+    out.op(&fill);
+    out.op("0 G");
+    fail(out.stroke_state(1.25, &[]))?;
+    fail(out.nums(&[x0 + 0.625, y1 - 19.375, 18.75, 18.75], "re"))?;
+    out.op("b");
+    // The symbol's 10 pt square.
+    let at = Affine::translate((f64::from(x0) + 5.0, f64::from(y1) - 15.0));
+    out.op("0 g");
+    let symbol = match (kind, name) {
+        (Icon::Note, b"Comment") => Symbol::Comment,
+        (Icon::Note, b"Key") => Symbol::Key,
+        (Icon::Note, b"Note" | b"") => Symbol::Note,
+        (Icon::Note, b"Help") => Symbol::Glyph('?'),
+        (Icon::Note, b"Paragraph") => Symbol::Glyph('¶'),
+        (Icon::Note, b"NewParagraph") => Symbol::Triangle(0.0, 10.0),
+        (Icon::Note, b"Insert") => Symbol::Triangle(2.5, 7.5),
+        (Icon::FileAttachment, b"PushPin" | b"") => Symbol::PushPin,
+        (Icon::FileAttachment, b"Graph") => Symbol::Graph,
+        (Icon::FileAttachment, b"Paperclip") => Symbol::Paperclip,
+        (Icon::FileAttachment, b"Tag") => Symbol::Tag,
+        (Icon::Sound, b"Speaker" | b"") => Symbol::Speaker,
+        (Icon::Sound, b"Mic") => Symbol::Mic,
+        _ => Symbol::Star,
+    };
+    symbol.draw(at, fonts, out)?;
+    Ok(Some(()))
+}
+
+enum Symbol {
+    Note,
+    Comment,
+    Key,
+    Glyph(char),
+    /// A triangle pointing up, between these heights.
+    Triangle(f64, f64),
+    Star,
+    PushPin,
+    Graph,
+    Paperclip,
+    Tag,
+    Speaker,
+    Mic,
+}
+
+impl Symbol {
+    /// Fills the symbol in the 10 pt square `at` maps from (0, 0)–(10, 10).
+    fn draw(&self, at: Affine, fonts: &Fonts, out: &mut Out) -> Result<(), Unsupported> {
+        let mut p = BezPath::new();
+        let poly = |p: &mut BezPath, pts: &[(f64, f64)]| {
+            p.move_to(pts[0]);
+            for &q in &pts[1..] {
+                p.line_to(q);
+            }
+            p.close_path();
+        };
+        let rect = |p: &mut BezPath, x0: f64, y0: f64, x1: f64, y1: f64| {
+            poly(p, &[(x0, y0), (x1, y0), (x1, y1), (x0, y1)]);
+        };
+        // A stroke of `width` along the points, as an outline to fill.
+        let stroke = |p: &mut BezPath, pts: &[(f64, f64)], width: f64| {
+            let mut line = BezPath::new();
+            line.move_to(pts[0]);
+            for &q in &pts[1..] {
+                line.line_to(q);
+            }
+            let style = kurbo::Stroke::new(width)
+                .with_caps(kurbo::Cap::Round)
+                .with_join(kurbo::Join::Round);
+            p.extend(kurbo::stroke(
+                line,
+                &style,
+                &kurbo::StrokeOpts::default(),
+                0.01,
+            ));
+        };
+        let ring = |p: &mut BezPath, c: (f64, f64), r: f64, width: f64| {
+            let style = kurbo::Stroke::new(width);
+            p.extend(kurbo::stroke(
+                Circle::new(c, r).to_path(0.01),
+                &style,
+                &kurbo::StrokeOpts::default(),
+                0.01,
+            ));
+        };
+        match self {
+            Self::Note => {
+                for y in [8.75, 6.25, 3.75, 1.25] {
+                    rect(&mut p, 0.0, y, 10.0, y + 1.25);
+                }
+            }
+            Self::Comment => poly(
+                &mut p,
+                &[
+                    (0.0, 3.0),
+                    (6.5, 3.0),
+                    (9.0, 0.5),
+                    (9.0, 3.0),
+                    (10.0, 3.0),
+                    (10.0, 10.0),
+                    (0.0, 10.0),
+                ],
+            ),
+            Self::Key => {
+                p.extend(Circle::new((6.8, 6.8), 3.2).to_path(0.01));
+                stroke(&mut p, &[(5.5, 5.5), (0.8, 0.8)], 2.2);
+                stroke(&mut p, &[(2.2, 2.2), (3.6, 0.8)], 2.0);
+            }
+            Self::Glyph(c) => {
+                let glyphs = fonts.shape(Family::Sans, &c.to_string())?;
+                // About 10 pt from baseline to top.
+                let size = 13.0;
+                let x = (10.0 - text::width(&glyphs, size)) / 2.0;
+                fail(text::draw(&glyphs, size, (x, 0.3), at, out))?;
+                return Ok(());
+            }
+            Self::Triangle(y0, y1) => {
+                let half = (y1 - y0) / 2.0 + 1.0;
+                poly(&mut p, &[(5.0 - half, *y0), (5.0 + half, *y0), (5.0, *y1)]);
+            }
+            Self::Star => {
+                let pts: Vec<(f64, f64)> = (0..10)
+                    .map(|i| {
+                        let r = if i % 2 == 0 { 5.0 } else { 2.0 };
+                        let a =
+                            std::f64::consts::FRAC_PI_2 + f64::from(i) * std::f64::consts::PI / 5.0;
+                        (5.0 + r * a.cos(), 4.5 + r * a.sin())
+                    })
+                    .collect();
+                poly(&mut p, &pts);
+            }
+            Self::PushPin => {
+                rect(&mut p, 2.0, 8.75, 8.0, 10.0);
+                rect(&mut p, 3.25, 5.0, 6.75, 8.75);
+                rect(&mut p, 0.0, 3.75, 10.0, 5.0);
+                poly(&mut p, &[(4.4, 3.75), (5.6, 3.75), (5.0, 0.0)]);
+            }
+            Self::Graph => {
+                stroke(
+                    &mut p,
+                    &[(1.0, 2.5), (3.75, 5.5), (5.75, 4.0), (9.25, 7.75)],
+                    1.3,
+                );
+                rect(&mut p, 0.0, 0.0, 10.0, 1.25);
+            }
+            Self::Paperclip => stroke(
+                &mut p,
+                &[
+                    (7.5, 6.5),
+                    (3.5, 2.5),
+                    (2.5, 3.5),
+                    (6.5, 7.5),
+                    (8.0, 8.5),
+                    (9.0, 7.0),
+                    (4.5, 1.5),
+                    (1.5, 1.0),
+                    (1.0, 4.5),
+                    (5.0, 9.0),
+                ],
+                1.1,
+            ),
+            Self::Tag => {
+                poly(
+                    &mut p,
+                    &[(0.5, 9.5), (5.0, 9.5), (9.5, 4.8), (5.2, 0.5), (0.5, 5.2)],
+                );
+                p.extend(
+                    Circle::new((2.8, 7.2), 1.0)
+                        .to_path(0.01)
+                        .reverse_subpaths(),
+                );
+            }
+            Self::Speaker => {
+                poly(
+                    &mut p,
+                    &[
+                        (0.0, 2.5),
+                        (2.5, 2.5),
+                        (4.2, 0.0),
+                        (5.0, 0.0),
+                        (5.0, 10.0),
+                        (4.2, 10.0),
+                        (2.5, 7.5),
+                        (0.0, 7.5),
+                    ],
+                );
+                ring(&mut p, (6.2, 5.0), 2.4, 1.2);
+            }
+            Self::Mic => {
+                p.extend(kurbo::RoundedRect::new(3.25, 3.5, 6.75, 10.0, 1.75).to_path(0.01));
+                stroke(
+                    &mut p,
+                    &[
+                        (1.75, 6.0),
+                        (1.75, 5.0),
+                        (3.0, 2.75),
+                        (5.0, 2.25),
+                        (7.0, 2.75),
+                        (8.25, 5.0),
+                        (8.25, 6.0),
+                    ],
+                    1.1,
+                );
+                rect(&mut p, 4.4, 0.0, 5.6, 2.5);
+                rect(&mut p, 2.5, 0.0, 7.5, 1.0);
+            }
+        }
+        p.apply_affine(at);
+        fail(out.path(&p))?;
+        out.op("f");
+        Ok(())
+    }
+}
+
+/// `Caret`: a 20 × 14 pt caret with concave sides, centred on `/Rect`, filled with /C
+/// (black without it).
+pub(super) fn caret(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
+    let r = rect(annot)?;
+    let fill = c_color(annot, false, "0 g")?;
+    let c = r.center();
+    let (x, y) = (c.x as f32, c.y as f32);
+    out.op(&fill);
+    out.nums(&[x - 10.0, y - 7.0], "m")?;
+    out.nums(&[x, y - 7.0, x, y, x, y + 7.0], "c")?;
+    out.nums(&[x, y, x, y - 7.0, x + 10.0, y - 7.0], "c")?;
+    out.op("f");
+    Some(())
+}
+
+/// `Redact`: each quadrilateral's box outlined in red, or `/Rect` less a point
+/// without `/QuadPoints`.
+pub(super) fn redact(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
+    let boxes = super::markup::quads(annot);
+    let boxes = if boxes.is_empty() && annot.get::<Array<'_>>(QUADPOINTS).is_none() {
+        let r = rect(annot)?.inset(-1.0);
+        vec![[r.x0 as f32, r.y0 as f32, r.x1 as f32, r.y1 as f32]]
+    } else {
+        boxes
+    };
+    if boxes.is_empty() {
+        return None;
+    }
+    out.op("1 0 0 RG");
+    out.stroke_state(1.0, &[])?;
+    for [x0, y0, x1, y1] in boxes {
+        out.nums(&[x0, y0, x1 - x0, y1 - y0], "re")?;
+    }
+    out.op("S");
+    Some(())
+}
+
+/// The text of each standard stamp name, its lines and size.
+fn stamp_text(name: &[u8]) -> Option<(&'static [&'static str], f32)> {
+    Some(match name {
+        b"Approved" => (&["APPROVED"], 30.0),
+        b"Experimental" => (&["EXPERIMENTAL"], 20.0),
+        b"NotApproved" => (&["NOT APPROVED"], 20.0),
+        b"AsIs" => (&["AS IS"], 30.0),
+        b"Expired" => (&["EXPIRED"], 30.0),
+        b"NotForPublicRelease" => (&["NOT FOR", "PUBLIC RELEASE"], 18.0),
+        b"Confidential" => (&["CONFIDENTIAL"], 20.0),
+        b"Final" => (&["FINAL"], 30.0),
+        b"Sold" => (&["SOLD"], 30.0),
+        b"Departmental" => (&["DEPARTMENTAL"], 20.0),
+        b"ForComment" => (&["FOR COMMENT"], 20.0),
+        b"TopSecret" => (&["TOP SECRET"], 26.0),
+        b"Draft" => (&["DRAFT"], 30.0),
+        b"ForPublicRelease" => (&["FOR PUBLIC", "RELEASE"], 18.0),
+        _ => return None,
+    })
+}
+
+/// `Stamp` of a standard name: its text in /C (black without it) in a box of the
+/// same colour; another name draws nothing.
+pub(super) fn stamp(annot: &Dict<'_>, fonts: &Fonts, out: &mut Out) -> Drawn {
+    let name = annot.get::<Name<'_>>(b"Name");
+    let (Some((lines, size)), Some(r)) = (
+        name.as_ref().and_then(|n| stamp_text(n.as_ref())),
+        rect(annot),
+    ) else {
+        return Ok(None);
+    };
+    let Some(fill) = c_color(annot, false, "0 g") else {
+        return Ok(None);
+    };
+    let stroke = c_color(annot, true, "0 G").unwrap_or_default();
+    let scale = (r.width() / 190.0).min(r.height() / 50.0);
+    if scale <= 0.0 {
+        return Ok(None);
+    }
+    let at = Affine::translate(r.center().to_vec2())
+        * Affine::rotate(0.6_f64.to_radians())
+        * Affine::scale(scale);
+    out.op(&stroke);
+    fail(out.stroke_state((2.0 * scale) as f32, &[]))?;
+    let corners = [(-93.0, -22.0), (93.0, -22.0), (93.0, 22.0), (-93.0, 22.0)]
+        .map(|(x, y)| at * Point::new(x, y));
+    fail(out.nums(&[corners[0].x as f32, corners[0].y as f32], "m"))?;
+    for c in &corners[1..] {
+        fail(out.nums(&[c.x as f32, c.y as f32], "l"))?;
+    }
+    out.op("s");
+    out.op(&fill);
+    // Baselines from the box's middle.
+    let baselines: &[f32] = match (lines.len(), size as u32) {
+        (2, _) => &[2.0, -15.5],
+        (_, 30) => &[-11.0],
+        (_, 26) => &[-10.0],
+        _ => &[-7.0],
+    };
+    for (line, y) in lines.iter().zip(baselines) {
+        let glyphs = fonts.shape(Family::SerifBold, line)?;
+        let x = -text::width(&glyphs, size) / 2.0;
+        fail(text::draw(&glyphs, size, (x, *y), at, out))?;
+    }
+    Ok(Some(()))
+}

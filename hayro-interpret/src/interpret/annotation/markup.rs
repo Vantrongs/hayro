@@ -52,7 +52,7 @@ pub(super) fn shape(annot: &Dict<'_>, circle: bool, out: &mut Out) -> Option<()>
 }
 
 /// The upright bounding box of each quadrilateral in `/QuadPoints`.
-fn quads(annot: &Dict<'_>) -> Vec<[f32; 4]> {
+pub(super) fn quads(annot: &Dict<'_>) -> Vec<[f32; 4]> {
     let Some(arr) = annot.get::<Array<'_>>(QUADPOINTS) else {
         return Vec::new();
     };
@@ -198,40 +198,10 @@ pub(super) fn ink(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
     drew.then_some(())
 }
 
-/// `Text` (a note): `PDFium`'s 20 pt note icon at the bottom left of /Rect, a yellow
-/// speech box with three black lines.
-pub(super) fn note_icon(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
-    const SIZE: f32 = 20.0;
-    const HALF: f32 = 0.5;
-    const TIP: f32 = 4.0;
-    let r = rect(annot)?;
-    let (left, bottom) = (r.x0 as f32 + HALF, r.y0 as f32 + HALF);
-    let (right, top) = (r.x0 as f32 + SIZE - HALF, r.y0 as f32 + SIZE - HALF);
-    let box_bottom = bottom + TIP;
-    let (tip_left, tip_right) = (left + TIP, left + 2.0 * TIP);
-    out.op("1 1 0 rg 0 G");
-    out.stroke_state(1.0, &[])?;
-    out.nums(&[left, box_bottom], "m")?;
-    out.nums(&[left, top], "l")?;
-    out.nums(&[right, top], "l")?;
-    out.nums(&[right, box_bottom], "l")?;
-    out.nums(&[tip_right, box_bottom], "l")?;
-    out.nums(&[(tip_left + tip_right) / 2.0, box_bottom - TIP], "l")?;
-    out.nums(&[tip_left, box_bottom], "l")?;
-    out.nums(&[left, box_bottom], "l")?;
-    let step = (top - box_bottom) / 4.0;
-    for i in 1..=3 {
-        let y = top - step * i as f32;
-        out.nums(&[left + 2.0, y], "m")?;
-        out.nums(&[right - 2.0, y], "l")?;
-    }
-    out.op("B*");
-    Some(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::{Look, look};
+    use super::super::Out;
+    use super::{Line, text_lines};
     use hayro_syntax::object::{Dict, FromBytes};
     use kurbo::Rect;
 
@@ -240,10 +210,9 @@ mod tests {
 
     fn content(annot: &str, visible: Rect) -> String {
         let dict = Dict::from_bytes(annot.as_bytes()).expect("valid dict");
-        match look(&dict, visible) {
-            Look::Generated(appearance) => appearance.content,
-            _ => panic!("an appearance"),
-        }
+        let mut out = Out(String::new());
+        text_lines(&dict, Line::Squiggle, visible, &mut out).expect("an appearance");
+        out.0
     }
 
     fn squiggly(quads: &str, visible: Rect) -> String {

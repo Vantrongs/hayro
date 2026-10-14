@@ -192,8 +192,8 @@ END OF TERMS AND CONDITIONS
 
 The following parts of code have been adapted/translated from [PDFium](https://pdfium.googlesource.com/pdfium/),
 available under the BSD 3-Clause license below:
-- The appearances generated for annotations without an appearance stream, in
-  `hayro-interpret/src/interpret/annotation/` (each function names its source).
+- The appearances generated for markup annotations without an appearance stream,
+  in `hayro-interpret/src/interpret/annotation/markup.rs`.
 
 ```
 Copyright 2014 The PDFium Authors

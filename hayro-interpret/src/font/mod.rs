@@ -28,7 +28,7 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
-mod blob;
+pub(crate) mod blob;
 mod cid;
 mod generated;
 mod glyph_simulator;
