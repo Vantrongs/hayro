@@ -23,6 +23,7 @@ use hayro_syntax::object::dict::keys::{
 use hayro_syntax::object::stream::DecodeFailure;
 use hayro_syntax::object::{Dict, ObjRef, Object};
 use hayro_syntax::page::{ContentError, Page, Resources, Rotation};
+use hayro_syntax::xref::ContentKey;
 use pdf_writer::{Chunk, Content, Filter, Finish, Name, Rect, Ref};
 use rustc_hash::FxHashMap;
 use std::collections::HashSet;
@@ -207,8 +208,8 @@ struct ExtractionContext<'a> {
     /// that takes its page's resources, the page.
     forms: FxHashMap<(ObjRef, Option<usize>), Ref>,
     /// The copy of each resource category dictionary pages and forms are drawn
-    /// with, by its bytes in the source, which pages that share it share.
-    resource_categories: FxHashMap<(usize, usize), Ref>,
+    /// with, by what it is read from, which pages that share it share.
+    resource_categories: FxHashMap<ContentKey<'a>, Ref>,
     /// The first part of the source that could not be read whole.
     error: Option<ExtractionError>,
     root_refs: Vec<Result<Ref, ExtractionError>>,
@@ -393,11 +394,11 @@ pub fn extract_pages_as_xobject_to_pdf(hayro_pdf: &Pdf, page_indices: &[usize]) 
     pdf.finish()
 }
 
-fn write_page(
-    page: &Page<'_>,
+fn write_page<'a>(
+    page: &Page<'a>,
     page_ref: Ref,
     page_idx: usize,
-    ctx: &mut ExtractionContext<'_>,
+    ctx: &mut ExtractionContext<'a>,
 ) -> Result<(), ExtractionError> {
     let mut chunk = Chunk::with_settings(ctx.chunk_settings);
     // Note: We can cache content stream references, but _not_ the page references themselves.
@@ -449,12 +450,12 @@ fn write_page(
 
 /// The page as a form: placed by hayro's reading of its boxes, or, with `bbox`, in
 /// its user space clipped to `bbox`.
-fn write_xobject(
-    page: &Page<'_>,
+fn write_xobject<'a>(
+    page: &Page<'a>,
     page_idx: usize,
     bbox: Option<[f32; 4]>,
     xobj_ref: Ref,
-    ctx: &mut ExtractionContext<'_>,
+    ctx: &mut ExtractionContext<'a>,
 ) -> Result<(), ExtractionError> {
     let content = page
         .try_page_stream()
@@ -502,11 +503,11 @@ fn write_xobject(
     Ok(())
 }
 
-fn write_form(
+fn write_form<'a>(
     obj: ObjRef,
-    page: &Page<'_>,
+    page: &Page<'a>,
     page_idx: usize,
-    ctx: &mut ExtractionContext<'_>,
+    ctx: &mut ExtractionContext<'a>,
 ) -> Result<Ref, ExtractionError> {
     // Read as `Object` first: a dictionary read as a stream may pick up the data of a
     // stream after it in the file.
@@ -545,9 +546,9 @@ fn write_form(
 /// Writes `/Resources` into `writer`, each category a reference to the copy of its
 /// dictionary, written once however many pages and forms are drawn with it, whatever
 /// their other categories.
-fn serialize_resources(
-    resources: &Resources<'_>,
-    ctx: &mut ExtractionContext<'_>,
+fn serialize_resources<'a>(
+    resources: &Resources<'a>,
+    ctx: &mut ExtractionContext<'a>,
     writer: &mut pdf_writer::Dict<'_>,
 ) {
     let categories = [
@@ -571,10 +572,8 @@ fn serialize_resources(
 }
 
 /// The copy of resource category `category`, written the first time it is asked for.
-fn category_copy(category: &Dict<'_>, ctx: &mut ExtractionContext<'_>) -> Ref {
-    // By the bytes of the dictionary, which are those of one dictionary of the file.
-    let data = category.data();
-    let key = (data.as_ptr() as usize, data.len());
+fn category_copy<'a>(category: &Dict<'a>, ctx: &mut ExtractionContext<'a>) -> Ref {
+    let key = category.content_key();
     if let Some(copy) = ctx.resource_categories.get(&key) {
         return *copy;
     }

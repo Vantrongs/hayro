@@ -2,7 +2,9 @@
 //! page's content or an error, one copy of repeated streams, and no encryption.
 
 use hayro_write::hayro_syntax::Pdf;
-use hayro_write::hayro_syntax::object::{Dict, Name, ObjRef, Rect, Stream};
+use hayro_write::hayro_syntax::object::{
+    Array, Dict, Name, ObjRef, Object, Rect, Stream, dict_or_stream,
+};
 use hayro_write::hayro_syntax::page::ContentError;
 use hayro_write::pdf_writer::{self, Ref};
 use hayro_write::{ChunkSettings, ExtractionError, ExtractionQuery, ExtractionResult, extract};
@@ -10,6 +12,8 @@ use hayro_write::{ChunkSettings, ExtractionError, ExtractionQuery, ExtractionRes
 #[path = "../../hayro-syntax/tests/common/fixtures.rs"]
 #[allow(dead_code)]
 mod fixtures;
+#[path = "../../hayro-syntax/tests/common/rc4.rs"]
+mod rc4;
 
 fn run(pdf: &Pdf, queries: &[ExtractionQuery]) -> Result<ExtractionResult, ExtractionError> {
     let mut next = Ref::new(1);
@@ -353,4 +357,112 @@ fn a_category_pages_share_is_copied_once() {
         large < small * 21 / 10,
         "{small} bytes for 256 pages, {large} for 512"
     );
+}
+
+/// The dictionary of the copy's object `root`, a page's or a form's.
+fn copied_dict(copy: &Pdf, root: Ref) -> Dict<'_> {
+    let object = copy
+        .xref()
+        .get::<Object<'_>>(ObjRef::new(root.get(), 0).into())
+        .expect("a copy");
+    dict_or_stream(&object).expect("a page or a form").0.clone()
+}
+
+/// The queries copying page `page` whole, as a page and as forms.
+fn page_queries(page: usize, size: [f32; 2]) -> [ExtractionQuery; 3] {
+    [
+        ExtractionQuery::new_page(page),
+        ExtractionQuery::new_xobject(page),
+        ExtractionQuery::new_user_space_xobject(page, [0.0, 0.0, size[0], size[1]]),
+    ]
+}
+
+// Pages drawn with entries of an encrypted file's table that lead to one object keep
+// each its own colors, copied alone or together: their resources, or one category of
+// them, are copied as each entry decrypts them, not shared by their bytes.
+#[test]
+fn pages_drawn_with_entries_leading_to_one_object_keep_their_colors() {
+    for (whole, alias, target) in [(true, 9, 6), (false, 8, 7)] {
+        let source = Pdf::new(rc4::aliased(whole)).unwrap();
+        let own = [
+            rc4::PALETTE.to_vec(),
+            rc4::crypt(alias, &rc4::crypt(target, rc4::PALETTE)),
+        ];
+        assert_ne!(own[0], own[1]);
+        for pages in [&[0][..], &[1], &[0, 1], &[1, 0]] {
+            for kind in 0..3 {
+                let queries: Vec<_> = pages
+                    .iter()
+                    .map(|&page| page_queries(page, [100.0, 100.0])[kind])
+                    .collect();
+                let result = run(&source, &queries).unwrap();
+                let copy = reread(&result);
+                for (&page, root) in pages.iter().zip(&result.root_refs) {
+                    let space = copied_dict(&copy, root.unwrap())
+                        .get::<Dict<'_>>(b"Resources")
+                        .and_then(|r| r.get::<Dict<'_>>(b"ColorSpace"))
+                        .and_then(|c| c.get::<Array<'_>>(b"CS"))
+                        .expect("the copy is drawn with /CS");
+                    let palette = match space.iter::<Object<'_>>().nth(3) {
+                        Some(Object::String(palette)) => palette.to_vec(),
+                        other => panic!("no palette: {other:?}"),
+                    };
+                    assert_eq!(
+                        palette, own[page],
+                        "whole: {whole}, pages {pages:?}, query {kind}, page {page}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// A page whose dictionary holds a name with escapes that are not hex, which reading
+// it skips, is read and copied whole, its box and its drawing: the file's table, which
+// is sound, is checked by reading each object as reading it does.
+#[test]
+fn a_page_holding_a_name_that_is_no_key_is_copied_whole() {
+    const DRAWING: &[u8] = b"0 0 1 rg 0 0 50 50 re f";
+    let source = Pdf::new(fixtures::file(
+        &[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] /Contents 4 0 R /Broken#zz >>"
+                .to_vec(),
+            fixtures::stream("", DRAWING),
+        ],
+        "",
+    ))
+    .unwrap();
+    let media_box = source.pages()[0].media_box();
+    assert_eq!(
+        [media_box.x0, media_box.y0, media_box.x1, media_box.y1],
+        [0.0, 0.0, 600.0, 700.0]
+    );
+    for (kind, query) in page_queries(0, [600.0, 700.0]).into_iter().enumerate() {
+        let result = run(&source, &[query]).unwrap();
+        let copy = reread(&result);
+        let root = result.root_refs[0].unwrap();
+        let (bounds, drawing) = if kind == 0 {
+            let page = copied_dict(&copy, root);
+            let contents = page.get::<Stream<'_>>(b"Contents").expect("contents");
+            (
+                page.get::<Rect>(b"MediaBox"),
+                contents.decoded().unwrap().to_vec(),
+            )
+        } else {
+            let form = get(&copy, root);
+            (
+                form.dict().get::<Rect>(b"BBox"),
+                form.decoded().unwrap().to_vec(),
+            )
+        };
+        let bounds = bounds.expect("a box");
+        assert_eq!(
+            [bounds.x0, bounds.y0, bounds.x1, bounds.y1],
+            [0.0, 0.0, 600.0, 700.0],
+            "query {kind}"
+        );
+        assert_eq!(drawing, DRAWING, "query {kind}");
+    }
 }

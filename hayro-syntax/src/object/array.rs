@@ -5,6 +5,7 @@ use crate::object::r#ref::MaybeRef;
 use crate::object::{FromBytes, Object, ObjectLike};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
+use crate::xref::ContentKey;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
 use core::marker::PhantomData;
@@ -51,6 +52,12 @@ impl<'a> Array<'a> {
     /// Return the raw data of the array.
     pub fn data(&self) -> &'a [u8] {
         self.data
+    }
+
+    /// What the array's items are read from, for a cache of what is read or copied
+    /// from them.
+    pub fn content_key(&self) -> ContentKey<'a> {
+        ContentKey::new(self.data, &self.ctx)
     }
 
     /// The array of the same bytes, read in `ctx`.

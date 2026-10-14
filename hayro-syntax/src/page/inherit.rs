@@ -6,6 +6,7 @@ use crate::object::{MaybeRef, Null, Object, ObjectIdentifier};
 use crate::pdf::Pdf;
 use crate::reader::ReaderContext;
 use crate::sync::{FxHashMap, FxHashSet};
+use crate::xref::ContentKey;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -71,8 +72,8 @@ impl Inheritable {
 /// nodes the chains pass and the pages.
 pub struct Inheritance<'a> {
     objects: Objects<'a>,
-    repaired: Option<FxHashMap<Key, Node<'a>>>,
-    chains: FxHashMap<Key, [Option<Chain<'a>>; 4]>,
+    repaired: Option<FxHashMap<Key<'a>, Node<'a>>>,
+    chains: FxHashMap<Key<'a>, [Option<Chain<'a>>; 4]>,
 }
 
 /// Where a node's /Parent chain leads for one entry.
@@ -81,7 +82,7 @@ enum Chain<'a> {
     /// To a node with the entry: its value, `null` for a reference to nothing.
     Found(Object<'a>),
     /// To this node, which has no /Parent, or one that is no dictionary.
-    End(Key),
+    End(Key<'a>),
     /// Round in a loop.
     Loop,
     /// Being followed: a chain that meets the node again loops.
@@ -90,18 +91,18 @@ enum Chain<'a> {
 
 /// What tells nodes apart: the object number and generation, which the loader
 /// keeps apart where a damaged file holds two generations of a number, or for a
-/// direct dictionary its bytes.
+/// direct dictionary what it is read from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(super) enum Key {
+pub(super) enum Key<'a> {
     Object(ObjectIdentifier),
-    Direct(usize),
+    Direct(ContentKey<'a>),
 }
 
 impl<'a> Node<'a> {
-    pub(super) fn key(&self) -> Key {
+    pub(super) fn key(&self) -> Key<'a> {
         match self.id() {
             Some(id) => Key::Object(id),
-            None => Key::Direct(self.dict().data().as_ptr() as usize),
+            None => Key::Direct(self.dict().content_key()),
         }
     }
 }
@@ -218,7 +219,7 @@ impl<'a> Inheritance<'a> {
 #[derive(Default)]
 pub(super) struct Listings<'a> {
     nodes: Vec<Listing<'a>>,
-    at: FxHashMap<Key, usize>,
+    at: FxHashMap<Key<'a>, usize>,
 }
 
 struct Listing<'a> {
@@ -263,8 +264,8 @@ impl<'a> Listings<'a> {
     /// of them if `end` is the page itself, none if `end` does not list the page.
     fn held(
         &self,
-        end: Key,
-        page: Key,
+        end: Key<'a>,
+        page: Key<'a>,
         lister: Option<usize>,
         key: Inheritable,
     ) -> Option<&Object<'a>> {
@@ -306,7 +307,7 @@ fn value<'a>(node: &Node<'a>, key: Inheritable, objects: &mut Objects<'a>) -> Op
 // The nodes listing one /Kids array object share the kids left in it: those that
 // one of them took were met then, so every other would pass over them. Each array
 // is thus read and stored once, however many nodes list it.
-fn tree_parents<'a>(objects: &mut Objects<'a>) -> FxHashMap<Key, Node<'a>> {
+fn tree_parents<'a>(objects: &mut Objects<'a>) -> FxHashMap<Key<'a>, Node<'a>> {
     let mut parents = FxHashMap::default();
     let Some(root) = objects.tree() else {
         return parents;

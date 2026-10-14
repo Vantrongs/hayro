@@ -7,6 +7,11 @@
 //! [`Scan`] answers each question as reading the object on the whole rest of the
 //! file would, reading every part of the file a bounded number of times:
 //!
+//! - An object reads as the reader reads it: a token that is no array or dictionary
+//!   is read by the reader itself, and an array or dictionary, at any depth, reads
+//!   its items and keys as the one reading of them that reading and skipping share
+//!   (`parse_dict_with` in `object::dict`): a name whose `#` escapes are not hex is
+//!   no key, and is skipped as an object.
 //! - A literal string ends where the depth of its unescaped parentheses first falls
 //!   below the depth after its `(`. One pass over the file finds that depth after
 //!   each byte, kept as its least value in each block of the file in a tree of
@@ -39,8 +44,8 @@
 
 use crate::object::dict::keys::{ROOT, TYPE};
 use crate::object::name::skip_name_like;
-use crate::object::{MAX_OBJECT_NESTING_DEPTH, Name, Null, Number, ObjRef};
-use crate::reader::{Reader, ReaderExt, Skippable};
+use crate::object::{MAX_OBJECT_NESTING_DEPTH, Name, Null, Number, ObjRef, Object};
+use crate::reader::{Reader, ReaderContext, ReaderExt, Skippable};
 use crate::sync::FxHashMap;
 use crate::trivia::{is_eol_character, is_white_space_character};
 use alloc::collections::VecDeque;
@@ -175,18 +180,26 @@ impl Strings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     /// It ends at `end`. Kept for its `[` or `<<`, `nest` is how deep it and the
-    /// arrays and dictionaries in it nest; kept for a byte it was read on from, how
-    /// deep those after the byte nest.
-    Ends { end: usize, nest: u8 },
+    /// arrays and dictionaries in it nest, and `keys` the keys of it that the
+    /// scan's callers ask about; kept for a byte it was read on from, how deep those
+    /// after the byte nest, and those keys after the byte.
+    Ends { end: usize, nest: u8, keys: Keys },
     /// It cannot be read: a token in it is none, or it never ends.
     Fails,
 }
 
-impl Outcome {
-    fn end(self) -> Option<usize> {
-        match self {
-            Self::Ends { end, .. } => Some(end),
-            Self::Fails => None,
+/// Whether a dictionary, or a part of one, has /Root and /Type keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Keys {
+    root: bool,
+    kind: bool,
+}
+
+impl Keys {
+    fn or(self, other: Self) -> Self {
+        Self {
+            root: self.root || other.root,
+            kind: self.kind || other.kind,
         }
     }
 }
@@ -199,16 +212,6 @@ enum State {
     Value,
 }
 
-/// How the dictionary a reading starts at reads its keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum Keys {
-    /// As skipping it does: a `/` and the regular characters after it are a key.
-    Skipped,
-    /// As reading it does: a key whose `#` escapes are not hex is skipped as an
-    /// object, as other tokens that are no key are.
-    Read,
-}
-
 /// What the scan finds of an object it is asked about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Found {
@@ -219,25 +222,14 @@ pub(crate) struct Found {
     pub(crate) kind: bool,
 }
 
-/// What a reading finds of the keys of the dictionary it starts at.
-#[derive(Debug, Clone, Copy, Default)]
-struct TopKeys {
-    root: bool,
-    kind: bool,
-    /// Whether a key's `#` escapes are not hex, which the two ways of reading keys
-    /// read differently.
-    escaped: bool,
-}
-
-/// The last object the scan was asked about: the scan that rebuilds a table asks
-/// about a header's object, then, where it is a dictionary, about it again with
-/// its keys read, which finds the same where no key is escaped.
-#[derive(Debug, Clone, Copy)]
-struct Last {
-    at: usize,
-    keys: Keys,
-    found: Option<Found>,
-    escaped: bool,
+impl Found {
+    fn new(end: usize, keys: Keys) -> Self {
+        Self {
+            end,
+            root: keys.root,
+            kind: keys.kind,
+        }
+    }
 }
 
 /// An array or dictionary a reading has opened.
@@ -256,6 +248,10 @@ struct Frame {
     /// The bytes in it where another reading may meet this one, each with the state
     /// there and how deep the arrays and dictionaries read since nest.
     points: Vec<(usize, State, u8)>,
+    /// The keys read in it, and for each, how many of `points` were before the last
+    /// one read: those points have it after them.
+    keys: Keys,
+    before: [usize; 2],
 }
 
 impl Frame {
@@ -275,6 +271,26 @@ impl Frame {
                 break;
             }
             point.2 = nest;
+        }
+    }
+
+    /// Notes `keys`, read after every point so far.
+    fn read_keys(&mut self, keys: Keys) {
+        self.keys = self.keys.or(keys);
+        let points = self.points.len();
+        if keys.root {
+            self.before[0] = points;
+        }
+        if keys.kind {
+            self.before[1] = points;
+        }
+    }
+
+    /// The keys read after the `i`-th point.
+    fn keys_after(&self, i: usize) -> Keys {
+        Keys {
+            root: i < self.before[0],
+            kind: i < self.before[1],
         }
     }
 }
@@ -311,22 +327,19 @@ pub(crate) struct Scan<'a> {
     comment_ends: Vec<usize>,
     /// The `[` and `<<` of arrays and dictionaries that cannot be read.
     fails: Bits,
-    /// The outcomes kept for readings that start at a `[` or `<<` after a header,
-    /// read as skipping them does. A reading starts at the `[` or `<<` it is asked
-    /// about after all readings that started before it, and only reads on from
-    /// where it starts, so another can only meet one it starts at inside another
-    /// object, after its header.
+    /// The outcomes kept for readings that start at a `[` or `<<` that the scan was
+    /// asked about, or that is after a header. A reading starts at the `[` or `<<` it
+    /// is asked about after all readings that started before it, and only reads on
+    /// from where it starts, so another can only meet one it starts at inside
+    /// another object, after its header, or one asked about before.
     kept: FxHashMap<usize, Outcome>,
     /// The outcomes of the arrays and dictionaries read on from a byte in `meets`,
-    /// or from where one such closes, in a state and reading keys in a way: only a
-    /// reading's outermost dictionary reads them as the reader does, and the rest
-    /// of it may then end where skipping it fails.
-    met: FxHashMap<(usize, State, Keys), Outcome>,
-    last: Option<Last>,
-    /// How the reading being read reads the keys of the dictionary it starts at, and
-    /// what it found of them.
-    keys: Keys,
-    top: TopKeys,
+    /// or from where one such closes, in a state.
+    met: FxHashMap<(usize, State), Outcome>,
+    /// The last object the scan was asked about, and what it found: the scan that
+    /// rebuilds a table asks about a header's object, then, where it is a dictionary,
+    /// about it again for its keys.
+    last: Option<(usize, Option<Found>)>,
 }
 
 impl<'a> Scan<'a> {
@@ -397,52 +410,51 @@ impl<'a> Scan<'a> {
             kept: FxHashMap::default(),
             met: FxHashMap::default(),
             last: None,
-            keys: Keys::Skipped,
-            top: TopKeys::default(),
         }
     }
 
-    /// What the scan finds of the object at `at`, read as skipping it does; a
-    /// dictionary at `at` reads its keys as `keys` says.
-    pub(crate) fn object(&mut self, at: usize, keys: Keys) -> Option<Found> {
-        if let Some(last) = self.last
-            && last.at == at
-            && (last.keys == keys || !last.escaped)
+    /// What the scan finds of the object at `at`, after white space and comments,
+    /// read as reading an object there does (`read_object` in the parent module):
+    /// `None` where that fails.
+    pub(crate) fn object(&mut self, at: usize) -> Option<Found> {
+        let at = self.space(at, &mut false);
+        if let Some((last, found)) = self.last
+            && last == at
         {
-            return last.found;
+            return found;
         }
-        let at_end = |end| Found {
-            end,
-            root: false,
-            kind: false,
+        let found = match self.data.get(at) {
+            Some(b'(') => self
+                .strings
+                .end(self.data, at)
+                .map(|end| Found::new(end, Keys::default())),
+            Some(b'[') => self.container(at, at + 1, false),
+            Some(b'<') if self.data[at..].starts_with(b"<<") => self.container(at, at + 2, true),
+            _ => {
+                // A name, string, number, keyword, `null` or boolean: read by the
+                // reader, which reads a name with escapes that are not hex as none.
+                let mut r = Reader::new(self.data);
+                r.jump(at);
+                let read = r.read_with_context::<Object<'_>>(&ReaderContext::dummy());
+                step(r.offset() - at + 1);
+                read.map(|_| Found::new(r.offset(), Keys::default()))
+            }
         };
-        let (found, escaped) = match self.token(at, false) {
-            Token::Ends(end) | Token::String(end) => (Some(at_end(end)), false),
-            Token::Fails => (None, false),
-            Token::Opens(after, dict) => match (keys, self.known(at)) {
-                // Kept without its keys, which are found again if asked for.
-                (Keys::Skipped, Some(outcome)) => (outcome.end().map(at_end), true),
-                _ => {
-                    (self.keys, self.top) = (keys, TopKeys::default());
-                    let top = self.frame(at, dict, 0, false);
-                    let end = self.read(after, top);
-                    let TopKeys {
-                        root,
-                        kind,
-                        escaped,
-                    } = self.top;
-                    let found = end.map(|end| Found { end, root, kind });
-                    (found, escaped)
-                }
-            },
-        };
-        self.last = Some(Last {
-            at,
-            keys,
-            found,
-            escaped,
-        });
+        self.last = Some((at, found));
         found
+    }
+
+    /// What the scan finds of the array or dictionary whose `[` or `<<` is at `at` and
+    /// ends at `after`.
+    fn container(&mut self, at: usize, after: usize, dict: bool) -> Option<Found> {
+        match self.known(at) {
+            Some(Outcome::Ends { end, keys, .. }) => Some(Found::new(end, keys)),
+            Some(Outcome::Fails) => None,
+            None => {
+                let top = self.frame(at, dict, 0, false);
+                self.read(after, top)
+            }
+        }
     }
 
     /// The token at `at`, read as an item of an array or a dictionary's value where
@@ -482,7 +494,7 @@ impl<'a> Scan<'a> {
         skipped.map(|()| r.offset())
     }
 
-    /// The outcome known for the `[` or `<<` at `at`, read as skipping it does.
+    /// The outcome known for the `[` or `<<` at `at`.
     fn known(&self, at: usize) -> Option<Outcome> {
         step(1);
         if self.fails.get(at) {
@@ -500,6 +512,8 @@ impl<'a> Scan<'a> {
             nest: 1,
             kept,
             points: vec![],
+            keys: Keys::default(),
+            before: [0; 2],
         }
     }
 
@@ -517,12 +531,12 @@ impl<'a> Scan<'a> {
 
     /// Reads on from `at` in the array or dictionary `top`, a reading's outermost,
     /// to where it ends.
-    fn read(&mut self, mut at: usize, top: Frame) -> Option<usize> {
+    fn read(&mut self, mut at: usize, top: Frame) -> Option<Found> {
         let mut stack = VecDeque::from([top]);
         // The outcome of the object the reading started at, once known.
         let mut outcome = None;
         while let Some(frame) = stack.back() {
-            let (state, top) = (frame.state(), frame.height == 0);
+            let state = frame.state();
             let mut met = false;
             at = self.space(at, &mut met);
             if met && self.meet(&mut stack, &mut at, &mut outcome) {
@@ -546,22 +560,19 @@ impl<'a> Scan<'a> {
                     r.jump(at);
                     let name = r.skip::<Name<'_>>(false).unwrap_or_default();
                     step(name.len());
-                    let mut key = true;
-                    if top {
-                        match Name::new(&name[1..]) {
-                            Some(name) => {
-                                self.top.root |= name.as_ref() == ROOT;
-                                self.top.kind |= name.as_ref() == TYPE;
-                            }
-                            // Read as the reader reads keys, a name whose escapes
-                            // are not hex is no key, and is skipped as an object.
-                            None => {
-                                self.top.escaped = true;
-                                key = self.keys == Keys::Skipped;
-                            }
+                    let frame = stack.back_mut().unwrap();
+                    // As reading a dictionary reads it, a name whose escapes are not
+                    // hex is no key, and is skipped as an object.
+                    match Name::new(&name[1..]) {
+                        Some(key) => {
+                            frame.read_keys(Keys {
+                                root: key.as_ref() == ROOT,
+                                kind: key.as_ref() == TYPE,
+                            });
+                            frame.value = true;
                         }
+                        None => frame.value = false,
                     }
-                    stack.back_mut().unwrap().value = key;
                     at = r.offset();
                     continue;
                 }
@@ -582,7 +593,7 @@ impl<'a> Scan<'a> {
                     let height = stack.back().unwrap().height + 1;
                     match self.known(at) {
                         Some(Outcome::Fails) => self.fail(&mut stack, &mut outcome),
-                        Some(Outcome::Ends { end, nest }) => {
+                        Some(Outcome::Ends { end, nest, .. }) => {
                             self.deepest(&mut stack, height + nest as usize - 1, &mut outcome);
                             if let Some(frame) = stack.back_mut() {
                                 frame.holds(nest);
@@ -636,21 +647,21 @@ impl<'a> Scan<'a> {
         &mut self,
         stack: &mut VecDeque<Frame>,
         at: &mut usize,
-        outcome: &mut Option<Option<usize>>,
+        outcome: &mut Option<Option<Found>>,
     ) -> bool {
         let Some(frame) = stack.back_mut() else {
             return false;
         };
         let (state, height) = (frame.state(), frame.height);
-        let keys = self.keys_of(height);
         step(1);
-        match self.met.get(&(*at, state, keys)).copied() {
+        match self.met.get(&(*at, state)).copied() {
             Some(Outcome::Fails) => {
                 self.fail(stack, outcome);
                 true
             }
-            Some(Outcome::Ends { end, nest }) => {
+            Some(Outcome::Ends { end, nest, keys }) => {
                 frame.holds(nest);
+                frame.read_keys(keys);
                 self.deepest(stack, height + nest as usize, outcome);
                 if !stack.is_empty() {
                     self.close(stack, at, end, true, outcome);
@@ -672,40 +683,33 @@ impl<'a> Scan<'a> {
         at: &mut usize,
         end: usize,
         met: bool,
-        outcome: &mut Option<Option<usize>>,
+        outcome: &mut Option<Option<Found>>,
     ) {
         let frame = stack.pop_back().unwrap();
         *at = end;
+        let nest = frame.nest;
         if frame.kept {
-            let nest = frame.nest;
-            self.kept.insert(frame.opener, Outcome::Ends { end, nest });
+            let keys = frame.keys;
+            self.kept
+                .insert(frame.opener, Outcome::Ends { end, nest, keys });
         }
-        let keys = self.keys_of(frame.height);
-        for &(point, state, nest) in &frame.points {
+        for (i, &(point, state, nest)) in frame.points.iter().enumerate() {
+            let keys = frame.keys_after(i);
             self.met
-                .insert((point, state, keys), Outcome::Ends { end, nest });
+                .insert((point, state), Outcome::Ends { end, nest, keys });
         }
         if frame.height == 0 {
-            *outcome = Some(Some(end));
+            *outcome = Some(Some(Found::new(end, frame.keys)));
         }
         // Where a reading met another in the frame, the two close it alike and go on
         // from its end, where they meet again if their frames around it are alike.
         // Where the frame around it was dropped, nothing is left to read.
         if let Some(around) = stack.back_mut() {
-            around.holds(frame.nest);
+            around.holds(nest);
             around.value = false;
             if met || !frame.points.is_empty() {
                 self.meet(stack, at, outcome);
             }
-        }
-    }
-
-    /// How a frame `height` deep in the reading reads its keys.
-    fn keys_of(&self, height: usize) -> Keys {
-        if height == 0 {
-            self.keys
-        } else {
-            Keys::Skipped
         }
     }
 
@@ -715,7 +719,7 @@ impl<'a> Scan<'a> {
         &mut self,
         stack: &mut VecDeque<Frame>,
         deepest: usize,
-        outcome: &mut Option<Option<usize>>,
+        outcome: &mut Option<Option<Found>>,
     ) {
         while let Some(frame) = stack.front() {
             if deepest - frame.height < MAX_DEPTH {
@@ -727,24 +731,19 @@ impl<'a> Scan<'a> {
     }
 
     /// Fails every open frame: the innermost cannot be read, nor can those holding it.
-    fn fail(&mut self, stack: &mut VecDeque<Frame>, outcome: &mut Option<Option<usize>>) {
+    fn fail(&mut self, stack: &mut VecDeque<Frame>, outcome: &mut Option<Option<Found>>) {
         while let Some(frame) = stack.pop_back() {
             self.failed(&frame, outcome);
         }
     }
 
-    fn failed(&mut self, frame: &Frame, outcome: &mut Option<Option<usize>>) {
+    fn failed(&mut self, frame: &Frame, outcome: &mut Option<Option<Found>>) {
         if frame.kept {
             self.kept.insert(frame.opener, Outcome::Fails);
         }
-        // Only an outermost frame reads its keys as the reader does, which fails
-        // as skipping it does where no key is escaped.
-        if frame.height > 0 || self.keys == Keys::Skipped || !self.top.escaped {
-            self.fails.set(frame.opener);
-        }
-        let keys = self.keys_of(frame.height);
+        self.fails.set(frame.opener);
         for &(point, state, _) in &frame.points {
-            self.met.insert((point, state, keys), Outcome::Fails);
+            self.met.insert((point, state), Outcome::Fails);
         }
         if frame.height == 0 {
             *outcome = Some(None);
@@ -754,9 +753,9 @@ impl<'a> Scan<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{Syntax, read_object};
     use super::*;
-    use crate::object::{Dict, Object};
-    use crate::reader::{ReaderContext, ReaderExt};
+    use crate::object::Dict;
     use alloc::string::String;
 
     /// A generator of pseudo-random numbers, the same in every run.
@@ -772,7 +771,9 @@ mod tests {
     }
 
     /// A file of `len` pieces of tokens, strings, escapes, comments and headers that
-    /// open, close and nest in every way.
+    /// open, close and nest in every way, and the tokens reading reads leniently:
+    /// names whose escapes are not hex, which are no keys, bad numbers, keywords,
+    /// brackets that do not match.
     fn file(random: &mut Random, len: usize) -> Vec<u8> {
         const PIECES: &[&str] = &[
             "(",
@@ -797,33 +798,45 @@ mod tests {
             "/Root",
             "/Type",
             "/R#6Fot",
+            "/T#79pe",
             "/B#zz",
+            "/B#4",
             "/K#41",
+            "#",
             "1",
             "0",
             "R",
             "5 0 obj ",
             "6 0 obj",
             "obj",
+            "endobj",
+            "stream",
             "null",
             "true",
             "fals",
             "1.5",
+            "1.2.3",
+            "--5",
+            "+-",
+            "-.x",
+            "5-.5",
+            "1e3",
             "-",
             "+",
+            ".",
             "<ab>",
             "<a b",
-            "endobj",
+            "<a#>",
             "{",
             "}",
             "x",
             "1 0 R",
             "12 0 R ",
             "0 R",
-            "#",
-            ".",
             "<< /B#zz /A >>",
             "<< /B#zz >>",
+            "<< /B#zz /Root 1 0 R >>",
+            "<< /A ( /Root \\( ) /Root 1 0 R >>",
         ];
         let mut out = String::new();
         for _ in 0..len {
@@ -838,66 +851,105 @@ mod tests {
         out.into_bytes()
     }
 
-    /// Where the object at `at` ends as skipping it on the whole rest of the file
-    /// finds it.
-    fn skipped(data: &[u8], at: usize) -> Option<usize> {
+    /// What reading the object at `at` of `data` finds, as an entry's object is read
+    /// (`Syntax::read_from`): where it ends, and for a dictionary whether it has a
+    /// /Root and a /Type key.
+    fn entry_read(data: &[u8], at: usize) -> Option<Found> {
         let mut r = Reader::new(data);
         r.jump(at);
-        r.skip::<Object<'_>>(false).map(|_| r.offset())
-    }
-
-    /// What reading the dictionary at `at` on the whole rest of the file finds.
-    fn read(data: &[u8], at: usize) -> Option<Found> {
-        let mut r = Reader::new(data);
-        r.jump(at);
-        let dict = r.read_with_context::<Dict<'_>>(&ReaderContext::dummy())?;
+        let syntax = Syntax::read_from(&mut r, false, &ReaderContext::dummy())?;
+        let dict = match &syntax {
+            Syntax::Object {
+                object: Object::Dict(dict),
+                ..
+            }
+            | Syntax::Stream { dict, .. } => Some(dict),
+            Syntax::Object { .. } => None,
+        };
         Some(Found {
             end: r.offset(),
-            root: dict.contains_key(ROOT),
-            kind: dict.contains_key(TYPE),
+            root: dict.is_some_and(|dict| dict.contains_key(ROOT)),
+            kind: dict.is_some_and(|dict| dict.contains_key(TYPE)),
         })
     }
 
-    // A scan finds where each object ends as reading it on the whole rest of the file
-    // does, whatever it was asked before.
+    /// Where the object at `at` of `data` ends as checking a table reads it, which
+    /// skips a dictionary.
+    fn checked(data: &[u8], at: usize) -> Option<usize> {
+        let mut r = Reader::new(data);
+        r.jump(at);
+        read_object(&mut r, false, &ReaderContext::dummy(), |r| {
+            r.skip::<Dict<'_>>(false)
+        })
+        .map(|_| r.offset())
+    }
+
+    // What the rebuild of a table finds of an object, through a scan, and what its
+    // check finds, which skips a dictionary, are what reading the object as an entry's
+    // object finds: wherever it starts, whatever the scan was asked before, and on the
+    // whole rest of the file or only up to the next offset an entry names.
     #[test]
-    fn scan_ends_objects_as_reading_them_does() {
-        let mut random = Random(0x9e37_79b9_7f4a_7c15);
-        for case in 0..3000 {
-            let len = 1 + random.below(120);
-            let data = file(&mut random, len);
-            let mut scan = Scan::new(&data);
-            let mut positions: Vec<usize> = (0..data.len()).collect();
-            for i in (1..positions.len()).rev() {
-                positions.swap(i, random.below(i + 1));
-            }
-            for at in positions {
-                // Both ways of reading keys in turn, as the scan that rebuilds a
-                // table asks about a header's dictionary, in either order.
-                let mut modes = vec![Keys::Skipped];
-                if data[at..].starts_with(b"<<") {
-                    modes.push(Keys::Read);
-                }
-                if random.below(2) == 0 {
-                    modes.reverse();
-                }
-                for keys in modes {
-                    let found = scan.object(at, keys);
-                    let expected = match keys {
-                        Keys::Skipped => skipped(&data, at),
-                        Keys::Read => read(&data, at).map(|read| read.end),
-                    };
-                    assert_eq!(
-                        found.map(|found| found.end),
-                        expected,
-                        "case {case}, {keys:?} at {at} of {:?}",
-                        String::from_utf8_lossy(&data)
-                    );
-                    if keys == Keys::Read {
-                        let keys = |found: Option<Found>| found.map(|f| (f.root, f.kind));
-                        assert_eq!(keys(found), keys(read(&data, at)), "case {case} at {at}");
+    fn rebuilding_and_checking_a_table_read_objects_as_reading_them_does() {
+        const CASES: usize = 3000;
+        let workers = std::thread::available_parallelism().map_or(1, usize::from);
+        std::thread::scope(|scope| {
+            for worker in 0..workers {
+                scope.spawn(move || {
+                    for case in (worker..CASES).step_by(workers) {
+                        compare(case);
                     }
-                }
+                });
+            }
+        });
+    }
+
+    /// Compares, for `case`'s file, what the scan and the check find with reading.
+    fn compare(case: usize) {
+        let mut random = Random(0x9e37_79b9_7f4a_7c15 ^ (case as u64 + 1) << 20);
+        let len = 1 + random.below(120);
+        let data = file(&mut random, len);
+        let shown = || String::from_utf8_lossy(&data).into_owned();
+        let mut scan = Scan::new(&data);
+        let mut positions: Vec<usize> = (0..data.len()).collect();
+        for i in (1..positions.len()).rev() {
+            positions.swap(i, random.below(i + 1));
+        }
+        for at in positions {
+            let read = entry_read(&data, at);
+            // The scan, asked twice, as the scan that rebuilds a table asks about a
+            // header's object and then about a dictionary there.
+            for _ in 0..2 {
+                let found = scan.object(at);
+                assert_eq!(
+                    found,
+                    read,
+                    "case {case}, scan at {at}: {:?} of {:?}",
+                    String::from_utf8_lossy(&data[at..]),
+                    shown()
+                );
+            }
+            // The check on the whole rest of the file, and up to an offset where
+            // the next object may start.
+            let whole = checked(&data, at);
+            assert_eq!(
+                whole,
+                read.map(|read| read.end),
+                "case {case}, check at {at} of {:?}",
+                shown()
+            );
+            let next = at + random.below(data.len() - at + 1);
+            let checked = checked(&data[..next], at);
+            assert_eq!(
+                checked,
+                entry_read(&data[..next], at).map(|read| read.end),
+                "case {case}, check at {at} to {next} of {:?}",
+                shown()
+            );
+            // What reads to its end before that offset is read there.
+            if let Some(read) = read
+                && read.end <= next
+            {
+                assert_eq!(checked, Some(read.end), "case {case}");
             }
         }
     }

@@ -233,6 +233,18 @@ impl<'a> ReaderContext<'a> {
         }
     }
 
+    /// The entry whose key decrypts the strings and streams read in this context;
+    /// `None` where they are not decrypted. What is read depends on it, so a cache
+    /// of what is read keys by it ([`crate::xref::ContentKey`]).
+    #[inline]
+    pub(crate) fn decryption(&self) -> Option<ObjectIdentifier> {
+        if self.xref().needs_decryption(self) {
+            self.obj_number()
+        } else {
+            None
+        }
+    }
+
     #[inline]
     pub(crate) fn set_obj_number(&mut self, id: ObjectIdentifier) {
         match &mut self.0 {

@@ -62,9 +62,13 @@ impl<T: CacheKey, U: CacheKey> CacheKey for (T, U) {
     }
 }
 
+// A dictionary or an array is what its bytes hold read in its document and, where
+// that is encrypted, under its entry's key: the same bytes of another object hold
+// other strings. Kept for as long as the cache, which outlives the bytes, it is
+// named by their value.
 impl CacheKey for Dict<'_> {
     fn cache_key(&self) -> u128 {
-        hash128(self.data())
+        hash128(&(b"dict", self.content_key().value()))
     }
 }
 
@@ -110,7 +114,7 @@ impl CacheKey for Name<'_> {
 
 impl CacheKey for Array<'_> {
     fn cache_key(&self) -> u128 {
-        hash128(self.data())
+        hash128(&(b"array", self.content_key().value()))
     }
 }
 

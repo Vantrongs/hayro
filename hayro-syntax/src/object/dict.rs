@@ -8,6 +8,7 @@ use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::sync::Arc;
 use crate::sync::FxHashMap;
+use crate::xref::ContentKey;
 use alloc::format;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
@@ -135,6 +136,12 @@ impl<'a> Dict<'a> {
         }
     }
 
+    /// What the dictionary's entries are read from, for a cache of what is read or
+    /// copied from them.
+    pub fn content_key(&self) -> ContentKey<'a> {
+        ContentKey::new(self.data(), self.ctx())
+    }
+
     /// The dictionary of the same bytes, read in `ctx`: its entries are found as
     /// they were for this one, without parsing it again.
     pub(crate) fn in_context(&self, ctx: &ReaderContext<'a>) -> Self {
@@ -197,34 +204,22 @@ impl Skippable for Dict<'_> {
         Self::skip_with_depth(r, is_content_stream, 0)
     }
 
+    // Read as `Dict::read` reads a dictionary, which keeps where its entries are: the
+    // dictionary a reading skips is the one reading it finds.
     fn skip_with_depth(r: &mut Reader<'_>, is_content_stream: bool, depth: usize) -> Option<()> {
         if depth >= super::MAX_OBJECT_NESTING_DEPTH {
             return None;
         }
 
-        r.forward_tag(b"<<")?;
-
-        loop {
-            r.skip_white_spaces_and_comments();
-
-            if let Some(()) = r.forward_tag(b">>") {
-                break Some(());
-            } else {
-                let Some(_) = r.skip::<Name<'_>>(is_content_stream) else {
-                    // In case there is garbage in-between, be lenient and just try to skip it.
-                    r.skip_with_depth::<Object<'_>>(is_content_stream, depth + 1)?;
-                    continue;
-                };
-
-                r.skip_white_spaces_and_comments();
-
-                if is_content_stream {
-                    r.skip_with_depth::<Object<'_>>(is_content_stream, depth + 1)?;
-                } else {
-                    r.skip_with_depth::<MaybeRef<Object<'_>>>(is_content_stream, depth + 1)?;
-                }
-            }
-        }
+        parse_dict_with(
+            r,
+            is_content_stream,
+            depth + 1,
+            Some(b"<<"),
+            b">>",
+            |_, _| (),
+        )
+        .map(|_| ())
     }
 }
 
@@ -251,13 +246,13 @@ fn read_inner<'a>(
 
     let data = parse_dict_with(
         r,
-        ctx,
+        ctx.in_content_stream(),
+        usize::from(start_tag.is_some()),
         start_tag,
         end_tag,
         #[inline]
-        |name, offset, _| {
+        |name, offset| {
             offsets.insert(name, offset);
-            Some(())
         },
     )?;
 
@@ -282,17 +277,21 @@ std::thread_local! {
         const { core::cell::Cell::new((0, 0)) };
 }
 
+/// Reads a dictionary, calling `on_entry` with each key and where its value starts:
+/// the one way a dictionary is read, whether it is kept or skipped. A key is a name
+/// whose `#` escapes are hex; another token in its place, such as a name with other
+/// escapes, is skipped as an object. Values are skipped, as objects `depth` deep.
 fn parse_dict_with<'a, F>(
     r: &mut Reader<'a>,
-    ctx: &ReaderContext<'a>,
+    in_content_stream: bool,
+    depth: usize,
     start_tag: Option<&[u8]>,
     end_tag: &[u8],
     mut on_entry: F,
 ) -> Option<&'a [u8]>
 where
-    F: FnMut(Name<'a>, usize, &Reader<'a>) -> Option<()>,
+    F: FnMut(Name<'a>, usize),
 {
-    let depth = usize::from(start_tag.is_some());
     let dict_data = r.tail()?;
     let start_offset = r.offset();
 
@@ -316,7 +315,7 @@ where
                     // In case there is garbage in-between, be lenient and just try to skip it.
                     // But only do this if we are parsing a proper dictionary as opposed to an
                     // inline dictionary.
-                    r.skip_with_depth::<Object<'_>>(ctx.in_content_stream(), depth)?;
+                    r.skip_with_depth::<Object<'_>>(in_content_stream, depth)?;
                     continue;
                 } else {
                     return None;
@@ -332,12 +331,12 @@ where
             // whether the object is `null` before inserting it, but that caused problems
             // in some test cases where encryption + object streams are involved (as we would
             // attempt to read an object stream before having resolved the encryption dictionary).
-            on_entry(name, offset, r)?;
+            on_entry(name, offset);
 
-            if ctx.in_content_stream() {
-                r.skip_with_depth::<Object<'_>>(ctx.in_content_stream(), depth)?;
+            if in_content_stream {
+                r.skip_with_depth::<Object<'_>>(in_content_stream, depth)?;
             } else {
-                r.skip_with_depth::<MaybeRef<Object<'_>>>(ctx.in_content_stream(), depth)?;
+                r.skip_with_depth::<MaybeRef<Object<'_>>>(in_content_stream, depth)?;
             }
         }
     }

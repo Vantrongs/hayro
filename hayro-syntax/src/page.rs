@@ -14,7 +14,7 @@ use crate::reader::ReaderContext;
 use crate::sync::{Arc, FxHashMap, OnceLock};
 use crate::transform::Transform;
 use crate::util::FloatExt;
-use crate::xref::XRef;
+use crate::xref::{ContentKey, XRef};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Deref;
@@ -244,17 +244,16 @@ fn with_inherited<'a>(
         inherited = look_up(&mut tree);
     }
     let mut objects = tree.into_objects();
-    // By the bytes of the dictionary, which are those of one dictionary of the file.
-    let mut read = FxHashMap::<(usize, usize), Resources<'a>>::default();
+    // By what the dictionary is read from, which pages share where they share it.
+    let mut read = FxHashMap::<ContentKey<'a>, Resources<'a>>::default();
     entries
         .into_iter()
         .zip(inherited)
         .map(
             |((page, lister), [media_box, crop_box, rotate, resources])| {
                 let resources = resources.and_then(Object::into_dict).unwrap_or_default();
-                let data = resources.data();
                 let resources = read
-                    .entry((data.as_ptr() as usize, data.len()))
+                    .entry(resources.content_key())
                     .or_insert_with(|| {
                         Resources::read(|key| objects.get(&resources, key).and_then(dict_of))
                     })
@@ -1515,6 +1514,39 @@ mod tests {
         assert!(
             large.0 < small.0 * 21 / 10 && large.1 < small.1 * 21 / 10 + 100,
             "(entries, bytes searched) {small:?} for 500 pages, {large:?} for 1000"
+        );
+    }
+
+    // A damaged object stream whose header lists `n` numbers at one offset holds one
+    // object, which the entry of each number is, each in its own context: the `n`
+    // pages they are parse it once, so loading them parses bytes linear in the file.
+    #[test]
+    fn entries_at_one_offset_of_an_object_stream_parse_it_once() {
+        let parsed = |n: usize| {
+            let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", i + 3)).collect();
+            let header: String = (0..n).map(|i| format!("{} 0 ", i + 3)).collect();
+            let keys: String = (0..n).map(|i| format!("/K{i} 0 ")).collect();
+            let page = format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] {keys}>>");
+            let stream = format!(
+                "<< /Type /ObjStm /N {n} /First {} /Length {} >>\nstream\n{header}{page}\nendstream",
+                header.len(),
+                header.len() + page.len()
+            );
+            let tree = format!("<< /Type /Pages /Count {n} /Kids [{}] >>", kids.join(" "));
+            let file = recovered(&[(1, 0, CATALOG), (2, 0, &tree), (n as i32 + 3, 0, &stream)]);
+            let pdf = Pdf::new(file.clone()).unwrap();
+            let pages = pdf.pages();
+            assert_eq!(pages.len(), n);
+            for (i, page) in pages.iter().enumerate() {
+                assert_eq!(page.media_box().x1, 200.0);
+                assert_eq!(page.obj_id(), Some(ObjectIdentifier::new(i as i32 + 3, 0)));
+            }
+            parsed(file, 0)
+        };
+        let [small, large] = [250, 500].map(parsed);
+        assert!(
+            large.0 < small.0 * 22 / 10 && large.1 < small.1 * 22 / 10,
+            "(entries, bytes) parsed {small:?} for 250 entries, {large:?} for 500"
         );
     }
 

@@ -5,6 +5,7 @@
 
 pub(crate) mod allocations;
 mod fixtures;
+pub(crate) mod rc4;
 
 pub(crate) use fixtures::{file, noise, one_page, one_page_objects, stored_zlib, stream};
 

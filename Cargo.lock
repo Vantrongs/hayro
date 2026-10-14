@@ -852,6 +852,7 @@ dependencies = [
  "flate2",
  "hayro-syntax",
  "log",
+ "md5",
  "pdf-writer",
  "rustc-hash",
 ]

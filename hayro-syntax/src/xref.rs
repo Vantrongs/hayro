@@ -32,12 +32,12 @@ use core::ops::Deref;
 
 mod scan;
 
-use scan::{Keys, Scan};
+use scan::Scan;
 
 pub(crate) const XREF_ENTRY_LEN: usize = 20;
 
 /// Identifies a loaded document among every document loaded in this process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DocumentId(u64);
 
 impl DocumentId {
@@ -51,6 +51,94 @@ impl DocumentId {
         }
         #[cfg(not(target_has_atomic = "64"))]
         None
+    }
+}
+
+/// Identifies what is read from bytes of a document, for a cache of what is parsed or
+/// copied from them: the bytes, by where they are, in the file or in the decoded data
+/// of an object stream; the document; and, where it is encrypted, the entry whose key
+/// decrypts their strings. The same bytes read under another entry hold other
+/// strings, so no cache keyed by this merges them, while in a document that is not
+/// encrypted the bytes are all there is to them.
+///
+/// The parts are what decrypting reads too: the entry is the one strings and streams
+/// decrypt with ([`ReaderContext::decryption`]), and the crypt filter is the
+/// document's string filter, or for a stream the one its dictionary, in these bytes,
+/// names. A key is only made from bytes read in a context
+/// ([`Dict::content_key`](crate::object::Dict::content_key),
+/// [`Array::content_key`](crate::object::Array::content_key)), so none can leave the
+/// entry out.
+///
+/// Two keys are equal where they name the same bytes in the same place: the key
+/// borrows them, so no other bytes can take their place while it is held. For a cache
+/// that outlives the bytes, [`Self::value`] names them by value.
+#[derive(Debug, Clone, Copy)]
+pub struct ContentKey<'a> {
+    bytes: &'a [u8],
+    document: Option<DocumentId>,
+    decryption: Option<ObjectIdentifier>,
+}
+
+impl<'a> ContentKey<'a> {
+    /// The key of `bytes`, read in `ctx`.
+    pub(crate) fn new(bytes: &'a [u8], ctx: &ReaderContext<'a>) -> Self {
+        Self {
+            bytes,
+            document: ctx.xref().document_id(),
+            decryption: ctx.decryption(),
+        }
+    }
+
+    /// The key of the bytes an object is parsed from, whichever entry reads them, for
+    /// [`Parsed`]: what it keeps is read out only through [`Syntax::in_context`],
+    /// which reads what decrypts in the context of the entry asking.
+    fn syntax(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            document: None,
+            decryption: None,
+        }
+    }
+
+    /// What the key names, the bytes by value: for a cache that may outlive them,
+    /// where other bytes may take their place.
+    pub fn value(&self) -> impl core::hash::Hash + Eq + 'a {
+        (self.bytes, self.document, self.decryption)
+    }
+
+    /// What equality, order, and hashing compare: the bytes by where they are.
+    fn parts(&self) -> ((usize, usize), Option<DocumentId>, Option<ObjectIdentifier>) {
+        (
+            (self.bytes.as_ptr() as usize, self.bytes.len()),
+            self.document,
+            self.decryption,
+        )
+    }
+}
+
+impl PartialEq for ContentKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
+    }
+}
+
+impl Eq for ContentKey<'_> {}
+
+impl PartialOrd for ContentKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ContentKey<'_> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.parts().cmp(&other.parts())
+    }
+}
+
+impl core::hash::Hash for ContentKey<'_> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.parts().hash(state);
     }
 }
 
@@ -126,7 +214,8 @@ fn opened(_bytes: usize) {
 // the rebuilt table, if one does not lead to its own.
 //
 // An entry leads to its object where an object whose header names it is at its offset
-// and ends before the next offset any entry names: objects of a table do not overlap.
+// and reading it as the entry's object is read (`Syntax::read_from`) reads it before the
+// next offset any entry names: objects of a table do not overlap.
 // So each object is read once however many entries name it, and no further than the
 // next, which reads each byte of the file once. MuPDF, too, rebuilds a table with an
 // entry past the end of the file or in an object stream the table does not list as an
@@ -186,14 +275,43 @@ fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Old> {
 }
 
 /// The identifier in the header of the object `data` starts with, if the object ends
-/// in `data`.
+/// in `data`: if reading it as an entry's object is read ([`read_object`]) reads it
+/// there. A dictionary is skipped, which reads it as reading it does.
 fn object_in(data: &[u8]) -> Option<ObjectIdentifier> {
+    let header = Reader::new(data).read_without_context::<ObjectIdentifier>()?;
     let mut r = Reader::new(data);
-    let header = r.clone().read_without_context::<ObjectIdentifier>();
-    let object = r.skip::<IndirectObject<Object<'_>>>(false);
+    let object = read_object(&mut r, true, &ReaderContext::dummy(), |r| {
+        r.skip::<Dict<'_>>(false)
+    });
     #[cfg(test)]
-    opened(object.map_or(data.len(), <[u8]>::len));
-    object.and(header)
+    opened(if object.is_some() {
+        r.offset()
+    } else {
+        data.len()
+    });
+    object.map(|_| header)
+}
+
+/// The object `r` is at, after its header where `header`, and where it starts, as an
+/// entry's object is read: a dictionary, read by `dict`, or another object. This is
+/// how [`XRef::get_parsed`] reads an object (`Syntax::read_from`), keeping the
+/// dictionary, and how the table's check finds that an entry leads to one, skipping
+/// it: a dictionary is skipped and read by one reading.
+fn read_object<'a, D>(
+    r: &mut Reader<'a>,
+    header: bool,
+    ctx: &ReaderContext<'a>,
+    dict: impl FnOnce(&mut Reader<'a>) -> Option<D>,
+) -> Option<(usize, Result<D, Object<'a>>)> {
+    if header {
+        r.skip::<ObjectIdentifier>(false)?;
+    }
+    r.skip_white_spaces_and_comments();
+    let at = r.offset();
+    if r.peek_bytes(2) == Some(b"<<") {
+        return Some((at, Ok(dict(r)?)));
+    }
+    Some((at, Err(r.read_with_context::<Object<'a>>(ctx)?)))
 }
 
 // Try to manually parse the PDF to build an xref table and trailer dictionary.
@@ -254,7 +372,7 @@ fn read_unread(
             let header = r.read_without_context::<ObjectIdentifier>()?;
             r.skip_white_spaces_and_comments();
             opened(r.offset() - offset);
-            scan.object(r.offset(), Keys::Skipped).map(|_| header)
+            scan.object(r.offset()).map(|_| header)
         });
         if let Some(header) = header {
             listed.extend(
@@ -300,7 +418,7 @@ fn fallback_xref_map_inner<'a>(
                 let mut body = r.clone();
                 body.skip_white_spaces_and_comments();
                 opened(body.offset() - r.offset());
-                if scan.object(body.offset(), Keys::Skipped).is_some() {
+                if scan.object(body.offset()).is_some() {
                     xref_map.insert(obj_id, EntryType::Normal(cur_pos));
                     found.push((obj_id, cur_pos));
                     last_obj_num = Some(obj_id);
@@ -315,7 +433,7 @@ fn fallback_xref_map_inner<'a>(
             // dictionary: the scan finds where it ends and whether it has the keys
             // that make one worth reading.
             if r.peek_bytes(2).is_some_and(|b| b == b"<<")
-                && let Some(found) = scan.object(cur_pos, Keys::Read)
+                && let Some(found) = scan.object(cur_pos)
             {
                 r.jump(found.end);
                 if found.root || found.kind {
@@ -882,17 +1000,20 @@ impl XRef {
         parsed: &mut Parsed<'a>,
     ) -> Option<Object<'a>> {
         let (repr, entry, ctx) = self.entry(id, ctx)?;
-        let data = repr.data.get().as_ref();
-        match entry {
-            EntryType::Normal(offset) => parsed
-                .0
-                .entry(offset)
-                .or_insert_with(|| Syntax::read(data, offset, &ctx))
-                .as_ref()?
-                .in_context(data, &ctx),
-            // An entry into an object stream is the only one leading to its object.
-            EntryType::ObjStream(stream, index) => self.compressed(id, stream, index, &ctx),
-        }
+        // The bytes the object is in, where it starts, and whether a header does.
+        let (data, at, header) = match entry {
+            EntryType::Normal(offset) => (repr.data.get().as_ref(), offset, true),
+            EntryType::ObjStream(stream, index) => {
+                let stream = self.object_stream(id, stream, &ctx)?;
+                (stream.data.as_slice(), stream.offset(id, index)?, false)
+            }
+        };
+        parsed
+            .0
+            .entry(ContentKey::syntax(data.get(at..)?))
+            .or_insert_with(|| Syntax::read(data, at, header, &ctx))
+            .as_ref()?
+            .in_context(data, &ctx)
     }
 
     /// The entry of object `id`, and the context to read it in, reached from `ctx`:
@@ -943,6 +1064,16 @@ impl XRef {
     where
         T: ObjectLike<'a>,
     {
+        self.object_stream(id, stream, ctx)?.get(id, index, ctx)
+    }
+
+    /// The object stream `stream` that the entry of object `id` names.
+    fn object_stream<'a>(
+        &'a self,
+        id: ObjectIdentifier,
+        stream: u32,
+        ctx: &ReaderContext<'a>,
+    ) -> Option<&'a ObjectStream> {
         let Inner::Some(repr) = &self.0 else {
             return None;
         };
@@ -954,14 +1085,14 @@ impl XRef {
             return None;
         }
 
-        repr.data.get_with(stream, ctx)?.get(id, index, ctx)
+        repr.data.get_with(stream, ctx)
     }
 }
 
-/// What reading the object at each offset of the file found, by offset, for
-/// [`XRef::get_parsed`].
+/// What reading the object at each place of the file or of an object stream's data
+/// found, for [`XRef::get_parsed`].
 #[derive(Default)]
-pub(crate) struct Parsed<'a>(FxHashMap<usize, Option<Syntax<'a>>>);
+pub(crate) struct Parsed<'a>(FxHashMap<ContentKey<'a>, Option<Syntax<'a>>>);
 
 /// What reading an indirect object finds whatever entry it is read for: the context
 /// an entry reads it in does not change how it parses.
@@ -975,27 +1106,36 @@ enum Syntax<'a> {
 }
 
 impl<'a> Syntax<'a> {
-    fn read(data: &'a [u8], offset: usize, ctx: &ReaderContext<'a>) -> Option<Self> {
+    /// The object at `offset` of `data`, after its header where `header`, as an object
+    /// of an object stream has none.
+    fn read(data: &'a [u8], offset: usize, header: bool, ctx: &ReaderContext<'a>) -> Option<Self> {
         let mut r = Reader::new(data);
         r.jump(offset);
-        r.skip::<ObjectIdentifier>(false)?;
-        r.skip_white_spaces_and_comments();
-        let at = r.offset();
-        // As `Object::read` reads an indirect object.
-        if r.peek_bytes(2) == Some(b"<<") {
-            let dict = r.read_with_context::<Dict<'a>>(ctx)?;
-            let end = r.offset();
-            r.skip_white_spaces_and_comments();
-            if r.forward_tag(b"stream").is_some() {
-                return Some(Self::Stream { dict, end });
+        Self::read_from(&mut r, header, ctx)
+    }
+
+    /// The object `r` is at, after its header where `header` ([`read_object`]); `r`
+    /// is left where it ends, a stream at its dictionary.
+    fn read_from(r: &mut Reader<'a>, header: bool, ctx: &ReaderContext<'a>) -> Option<Self> {
+        let (at, object) = read_object(r, header, ctx, |r| r.read_with_context::<Dict<'a>>(ctx))?;
+        match object {
+            // As `Object::read` reads an indirect object.
+            Ok(dict) => {
+                let end = r.offset();
+                r.skip_white_spaces_and_comments();
+                let stream = r.forward_tag(b"stream").is_some();
+                r.jump(end);
+                Some(if stream {
+                    Self::Stream { dict, end }
+                } else {
+                    Self::Object {
+                        object: Object::Dict(dict),
+                        at,
+                    }
+                })
             }
-            return Some(Self::Object {
-                object: Object::Dict(dict),
-                at,
-            });
+            Err(object) => Some(Self::Object { object, at }),
         }
-        let object = r.read_with_context::<Object<'a>>(ctx)?;
-        Some(Self::Object { object, at })
     }
 
     /// The object read in `ctx`.
@@ -1492,17 +1632,28 @@ impl ObjectStream {
         })
     }
 
-    /// Object `id`, which an entry puts at `index`: the stream's header names the
-    /// number of each object it holds, and an index that names another object is
-    /// damaged, so the object of `id`'s number is read wherever it is in the stream,
-    /// or none where the stream holds none.
+    /// Object `id`, which an entry puts at `index`.
     fn get<'a, T>(&'a self, id: ObjectIdentifier, index: u32, ctx: &ReaderContext<'a>) -> Option<T>
     where
         T: ObjectLike<'a>,
     {
+        let mut r = Reader::new(&self.data);
+        r.jump(self.offset(id, index)?);
+        r.skip_white_spaces_and_comments();
+
+        let mut ctx = ctx.clone();
+        ctx.set_in_object_stream(true);
+        r.read_with_context::<T>(&ctx)
+    }
+
+    /// Where in the data object `id` starts, which an entry puts at `index`: the
+    /// stream's header names the number of each object it holds, and an index that
+    /// names another object is damaged, so the object of `id`'s number is read
+    /// wherever it is in the stream, or none where the stream holds none.
+    fn offset(&self, id: ObjectIdentifier, index: u32) -> Option<usize> {
         let number = u32::try_from(id.obj_number).ok()?;
-        let offset = match self.offsets.get(index as usize) {
-            Some(&(listed, offset)) if listed == number => offset,
+        match self.offsets.get(index as usize) {
+            Some(&(listed, offset)) if listed == number => Some(offset),
             _ => {
                 let by_number = self.by_number.get_or_init(|| {
                     let numbers = self.offsets.iter().enumerate();
@@ -1510,16 +1661,9 @@ impl ObjectStream {
                         .map(|(index, (number, _))| (*number, index))
                         .collect()
                 });
-                self.offsets[*by_number.get(&number)?].1
+                Some(self.offsets[*by_number.get(&number)?].1)
             }
-        };
-        let mut r = Reader::new(&self.data);
-        r.jump(offset);
-        r.skip_white_spaces_and_comments();
-
-        let mut ctx = ctx.clone();
-        ctx.set_in_object_stream(true);
-        r.read_with_context::<T>(&ctx)
+        }
     }
 }
 
@@ -1922,6 +2066,56 @@ mod tests {
                 let id = ObjectIdentifier::new(number, 0);
                 let string = pdf.xref().get::<object::String<'_>>(id);
                 assert!(string.is_some(), "object {number}, space {space}");
+            }
+        }
+    }
+
+    /// A file of `objects`, numbered from 1, the first being the catalog, with a table
+    /// listing them, or, where `broken`, a `startxref` that leads to none, which
+    /// rebuilds it.
+    fn file_of(objects: &[&str], broken: bool) -> Vec<u8> {
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut offsets = vec![];
+        for (i, object) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend(format!("{} 0 obj\n{object}\nendobj\n", i + 1).bytes());
+        }
+        let xref = out.len();
+        out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).bytes());
+        for offset in offsets {
+            out.extend(format!("{offset:010} 00000 n \n").bytes());
+        }
+        let start = if broken { 9 } else { xref };
+        out.extend(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{start}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .bytes(),
+        );
+        out
+    }
+
+    // A page holding a name whose escapes are not hex, which reading a dictionary
+    // skips, is read whether its table is sound or rebuilt, and so is one holding such
+    // a name in a dictionary in it: checking the table and rebuilding it read each
+    // object as reading it does, and a dictionary is read alike wherever it is.
+    #[test]
+    fn a_page_holding_a_name_that_is_no_key_is_read() {
+        let content = stream("", BLUE);
+        for page in [
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] /Contents 4 0 R /Broken#zz >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] /Contents 4 0 R \
+             /Resources << /Broken#zz >> >>",
+            "<< /Type /Page /Parent 2 0 R /Broken#zz /MediaBox [0 0 600 700] /Contents 4 0 R >>",
+        ] {
+            for broken in [false, true] {
+                let file = file_of(&[CATALOG, TREE, page, &content], broken);
+                assert_eq!(
+                    one_page(file),
+                    (600.0, 700.0, BLUE.as_bytes().to_vec()),
+                    "{page}, rebuilt: {broken}"
+                );
             }
         }
     }

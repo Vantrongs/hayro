@@ -203,11 +203,7 @@ impl<'a> Stream<'a> {
         }
         let FiltersAndParams { filters, params } = self.filters_and_params();
         if !filters.contains(&Filter::Crypt) {
-            let id = self
-                .dict
-                .obj_id()
-                .filter(|_| ctx.xref().needs_decryption(ctx));
-            return Ok(id.map(|id| (id, None)));
+            return Ok(ctx.decryption().map(|id| (id, None)));
         }
         let mut named = None;
         for (i, (filter, params)) in filters.iter().zip(&params).enumerate() {
@@ -216,7 +212,7 @@ impl<'a> Stream<'a> {
             }
             match params.get::<Name<'a>>(NAME) {
                 Some(name) if name.deref() != IDENTITY => {
-                    let id = self.dict.obj_id().filter(|_| i == 0);
+                    let id = ctx.decryption().filter(|_| i == 0);
                     named = Some((id.ok_or(DecodeFailure::Decryption)?, Some(name)));
                 }
                 _ => {}
