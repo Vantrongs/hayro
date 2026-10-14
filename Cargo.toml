@@ -44,6 +44,7 @@ kurbo = { version = "0.13.0" }
 log = { version = "0.4" }
 resvg = { version = "0.47.0" }
 flate2 = { version = "1" }
+html5ever = { version = "0.39.0" }
 zlib-rs = { version = "0.6.8", default-features = false, features = ["std"] }
 phf = { version = "0.13.1", default-features = false }
 moxcms = { version = "0.8.1" }

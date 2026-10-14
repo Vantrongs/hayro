@@ -7,7 +7,7 @@
 //! allocated in all ([`allocated`]).
 
 use hayro_interpret::InterpreterSettings;
-use hayro_interpret::annotation::{Appearances, Look};
+use hayro_interpret::annotation::{Appearances, Look, Unsupported};
 use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::hayro_syntax::object::{Array, Dict};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -251,6 +251,95 @@ fn a_squiggly_fanning_out_of_a_point_is_unsupported() {
         .unwrap();
     assert!(matches!(
         appearances.look(&annot, PAGE),
-        Look::Unsupported(hayro_interpret::annotation::Unsupported::Coordinates)
+        Look::Unsupported(Unsupported::Coordinates)
     ));
+}
+
+/// What `annot` looks like on a 200 pt page: its generated content, or why it has
+/// none. Fails the test unless it is done within `secs` seconds.
+fn look_within(secs: u64, annot: String) -> Result<String, Unsupported> {
+    let (sent, done) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let pdf = Pdf::new(common::one_page(
+            200,
+            "/Annots [4 0 R]",
+            vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
+        ))
+        .expect("valid pdf");
+        let appearances =
+            Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+        let annots: Vec<Dict<'_>> = pdf.pages()[0]
+            .raw()
+            .get::<Array<'_>>(b"Annots")
+            .unwrap()
+            .iter::<Dict<'_>>()
+            .collect();
+        let look = match appearances.look(&annots[0], PAGE) {
+            Look::Generated(a) => Ok(a.content),
+            Look::Unsupported(why) => Err(why),
+            _ => panic!("neither generated nor unsupported"),
+        };
+        let _ = sent.send(look);
+    });
+    done.recv_timeout(std::time::Duration::from_secs(secs))
+        .expect("done in time")
+}
+
+/// A `FreeText` with rich text `rc`, a UTF-8 text string.
+fn rich(rc: &str) -> String {
+    format!("/Subtype /FreeText /Rect [20 20 180 180] /BS << /W 0 >> /RC (\u{FEFF}{rc})")
+}
+
+/// Reading rich text costs what its length does, however many ampersands start no
+/// character reference: here the text is read, and then its first character found
+/// in no font.
+#[test]
+fn rich_text_with_many_ampersands_is_read_at_a_bounded_cost() {
+    let rc = format!("<p>\u{6F22}{}</p>", "&".repeat(1_600_000));
+    assert_eq!(
+        look_within(10, rich(&rc)),
+        Err(Unsupported::Character('\u{6F22}'))
+    );
+}
+
+/// Elements nested beyond what written rich text does make it unsupported before
+/// the parser's work, which grows with the depth for each element, outgrows the
+/// text.
+#[test]
+fn deeply_nested_rich_text_is_unsupported_at_a_bounded_cost() {
+    let rc = format!("{}{}", "<span>".repeat(100_000), "</p>".repeat(100_000));
+    assert_eq!(look_within(20, rich(&rc)), Err(Unsupported::RichText));
+}
+
+/// Formatting elements left open are copied into each paragraph after them, as
+/// viewers read HTML; copies beyond what the text could hold make it unsupported
+/// before they fill the memory.
+#[test]
+fn formatting_left_open_across_paragraphs_is_unsupported_at_a_bounded_cost() {
+    let open: String = (0..200).map(|i| format!("<b title={i}>")).collect();
+    let rc = format!("<p>{open}{}", "</p><p>x".repeat(50_000));
+    assert_eq!(look_within(20, rich(&rc)), Err(Unsupported::RichText));
+}
+
+/// Text beside or below a `FreeText`'s box is clipped away, so it is not drawn:
+/// the content stays the size of what the box shows, however long the text.
+#[test]
+fn text_draws_only_what_its_box_shows() {
+    let box_ = "/Rect [20 20 60 180] /BS << /W 0 >> /DA (/Helv 12 Tf 0 g)";
+    let options = "(A) ".repeat(100_000);
+    for (contents, kind) in [
+        ("A".repeat(200_000), "/Subtype /FreeText /Contents"),
+        ("A ".repeat(100_000), "/Subtype /FreeText /Contents"),
+        ("A".repeat(200_000), "/Subtype /Widget /FT /Tx /V"),
+        ("A".repeat(200_000), "/Subtype /Widget /FT /Tx /Ff 4096 /V"),
+        (String::new(), "/Subtype /Widget /FT /Ch /V"),
+    ] {
+        let annot = if contents.is_empty() {
+            format!("{kind} () /Opt [{options}] {box_}")
+        } else {
+            format!("{kind} ({contents}) {box_}")
+        };
+        let content = generated(&annot);
+        assert!(content.len() < 100_000, "{kind}: {} bytes", content.len());
+    }
 }

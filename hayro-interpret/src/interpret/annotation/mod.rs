@@ -24,6 +24,7 @@ mod freetext;
 mod icons;
 mod lines;
 mod markup;
+mod rich;
 mod text;
 mod widget;
 
@@ -102,6 +103,10 @@ pub enum Unsupported {
     /// A coordinate it draws at is too large to write: beyond the range of the
     /// 32-bit numbers content streams are read in.
     Coordinates,
+    /// Its rich text (`/RC`) or default style (`/DS`) uses an element, attribute or
+    /// style declaration the generator cannot draw as viewers do, or nests or
+    /// repeats elements beyond what written rich text does.
+    RichText,
 }
 
 /// An appearance generated for an annotation without a usable appearance stream.
@@ -258,11 +263,6 @@ impl<'a> Appearances<'a> {
         };
         let mut out = Out::default();
         let fonts = &self.fonts;
-        let dr = self
-            .form
-            .as_ref()
-            .and_then(|f| f.dict(b"DR"))
-            .and_then(|dr| dr.dict(b"Font"));
         let ok = |drew: Option<()>| Ok(drew);
         let drew = match subtype.as_ref() {
             b"Square" => ok(markup::shape(annot, false, &mut out)),
@@ -278,7 +278,7 @@ impl<'a> Appearances<'a> {
             b"Caret" => ok(icons::caret(annot, &mut out)),
             b"Redact" => ok(icons::redact(annot, &mut out)),
             b"Stamp" => icons::stamp(annot, fonts, &mut out),
-            b"FreeText" => freetext::free_text(annot, dr.as_ref(), fonts, &mut out),
+            b"FreeText" => freetext::free_text(annot, fonts, &mut out),
             b"Line" => lines::line(annot, fonts, &mut out),
             b"Polygon" => ok(lines::poly(annot, true, &mut out)),
             b"PolyLine" => ok(lines::poly(annot, false, &mut out)),
@@ -516,6 +516,33 @@ impl Out {
             last = *pts.last()?;
         }
         Some(())
+    }
+
+    /// `path` as [`Out::path`] writes it, unless it lies wholly outside `clip`, where
+    /// nothing of it would show; whether it was written. Its numbers pass [`written`]
+    /// either way, so that clipping a path away never hides one that cannot be
+    /// written.
+    fn path_within(&mut self, path: &kurbo::BezPath, clip: kurbo::Rect) -> Option<bool> {
+        use kurbo::PathEl;
+        for el in path.elements() {
+            let pts: &[kurbo::Point] = match el {
+                PathEl::MoveTo(p) | PathEl::LineTo(p) => &[*p],
+                PathEl::QuadTo(c, p) => &[*c, *p],
+                PathEl::CurveTo(a, b, p) => &[*a, *b, *p],
+                PathEl::ClosePath => &[],
+            };
+            if pts.iter().any(|p| written(p.x).is_none() || written(p.y).is_none()) {
+                self.failed = true;
+                return None;
+            }
+        }
+        let (b, c) = (path.control_box(), clip.abs());
+        if b.x1 >= c.x0 && b.x0 <= c.x1 && b.y1 >= c.y0 && b.y0 <= c.y1 {
+            self.path(path)?;
+            Some(true)
+        } else {
+            Some(false)
+        }
     }
 
     fn op(&mut self, op: &str) {

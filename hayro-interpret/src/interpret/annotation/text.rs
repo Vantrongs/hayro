@@ -5,7 +5,7 @@ use super::{Out, Unsupported};
 use crate::FontResolverFn;
 use crate::font::blob::{CffFontBlob, OpenTypeFontBlob};
 use crate::font::{FontQuery, StandardFont, glyph_name_to_unicode};
-use kurbo::{Affine, BezPath};
+use kurbo::{Affine, BezPath, Rect};
 use rustc_hash::FxHashMap;
 use skrifa::GlyphId;
 use std::cell::OnceCell;
@@ -16,71 +16,112 @@ use std::fmt::Write;
 pub(super) enum Family {
     /// Helvetica.
     Sans,
-    /// Times Roman.
+    /// Times.
     Serif,
     /// Courier.
     Mono,
-    /// Times Bold, the stamps' face.
-    SerifBold,
-    /// `ZapfDingbats`, the check box mark.
+    /// The face of rich text that names no family a viewer maps to a standard
+    /// font ([`FontQuery::TextDefault`]).
+    Text,
+    /// `ZapfDingbats`: the check box mark, and text in its built-in encoding.
     Dingbats,
 }
 
 impl Family {
-    const ALL: [Self; 5] = [
-        Self::Sans,
-        Self::Serif,
-        Self::Mono,
-        Self::SerifBold,
-        Self::Dingbats,
-    ];
-
-    fn standard(self) -> StandardFont {
-        match self {
-            Self::Sans => StandardFont::Helvetica,
-            Self::Serif => StandardFont::TimesRoman,
-            Self::Mono => StandardFont::Courier,
-            Self::SerifBold => StandardFont::TimesBold,
-            Self::Dingbats => StandardFont::ZapfDingBats,
-        }
-    }
-
-    /// The family a default appearance font name stands for: the base fonts of the
-    /// names Acrobat puts in `/DR` (`Helv`, `TiRo`, `Cour`, …) or a base font name,
-    /// by its family; Helvetica for any other.
+    /// The family a default appearance font name stands for, as viewers draw it:
+    /// three of the names Acrobat puts in `/DR` by their own family, whatever font
+    /// `/DR` gives them, and Helvetica for any other.
     pub(super) fn of_font_name(name: &[u8]) -> Self {
-        let name = String::from_utf8_lossy(name).to_ascii_lowercase();
-        if name.starts_with("tiro")
-            || name.starts_with("times")
-            || name.starts_with("tibo")
-            || name.starts_with("tiit")
-            || name.starts_with("tibi")
-        {
-            Self::Serif
-        } else if name.starts_with("cour")
-            || name.starts_with("cobo")
-            || name.starts_with("coit")
-            || name.starts_with("cobi")
-        {
-            Self::Mono
-        } else {
-            Self::Sans
+        match name {
+            b"TiRo" => Self::Serif,
+            b"Cour" => Self::Mono,
+            b"ZaDb" => Self::Dingbats,
+            _ => Self::Sans,
         }
     }
 }
 
-/// The fonts generated text is drawn with: for each family, the standard font the
-/// font resolver gives; a character that font lacks is drawn in the Helvetica one.
+/// A family in a weight and slant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Typeface {
+    pub(super) family: Family,
+    pub(super) bold: bool,
+    pub(super) italic: bool,
+}
+
+impl From<Family> for Typeface {
+    fn from(family: Family) -> Self {
+        Self {
+            family,
+            bold: false,
+            italic: false,
+        }
+    }
+}
+
+impl Typeface {
+    /// Times Bold, the stamps' face.
+    pub(super) const SERIF_BOLD: Self = Self {
+        family: Family::Serif,
+        bold: true,
+        italic: false,
+    };
+
+    /// The number of typefaces, [`Self::index`]'s bound.
+    const COUNT: usize = 20;
+
+    fn index(self) -> usize {
+        let family = match self.family {
+            Family::Sans => 0,
+            Family::Serif => 1,
+            Family::Mono => 2,
+            Family::Text => 3,
+            Family::Dingbats => 4,
+        };
+        family * 4 + usize::from(self.bold) * 2 + usize::from(self.italic)
+    }
+
+    fn query(self) -> FontQuery {
+        use StandardFont as S;
+        let (bold, italic) = (self.bold, self.italic);
+        let pick = |faces: [S; 4]| faces[usize::from(bold) * 2 + usize::from(italic)];
+        FontQuery::Standard(match self.family {
+            Family::Sans => pick([
+                S::Helvetica,
+                S::HelveticaOblique,
+                S::HelveticaBold,
+                S::HelveticaBoldOblique,
+            ]),
+            Family::Serif => pick([
+                S::TimesRoman,
+                S::TimesItalic,
+                S::TimesBold,
+                S::TimesBoldItalic,
+            ]),
+            Family::Mono => pick([
+                S::Courier,
+                S::CourierOblique,
+                S::CourierBold,
+                S::CourierBoldOblique,
+            ]),
+            Family::Text => return FontQuery::TextDefault { bold, italic },
+            Family::Dingbats => S::ZapfDingBats,
+        })
+    }
+}
+
+/// The fonts generated text is drawn with: for each typeface, the font the font
+/// resolver gives; a character that font lacks is drawn in the Helvetica one.
 /// A character neither has makes the appearance unsupported.
 ///
 /// Fonts are loaded on first use; make one per page, or per document, and reuse it.
 pub(super) struct Fonts {
     resolver: FontResolverFn,
-    faces: [OnceCell<Option<Face>>; 5],
+    faces: [OnceCell<Option<Face>>; Typeface::COUNT],
 }
 
 impl Fonts {
-    /// The fonts `resolver` gives for the standard font queries.
+    /// The fonts `resolver` gives for the typefaces.
     pub(super) fn new(resolver: FontResolverFn) -> Self {
         Self {
             resolver,
@@ -88,12 +129,12 @@ impl Fonts {
         }
     }
 
-    fn face(&self, family: Family) -> Option<&Face> {
-        let i = Family::ALL.iter().position(|f| *f == family)?;
-        self.faces[i]
+    fn face(&self, typeface: Typeface) -> Option<&Face> {
+        self.faces[typeface.index()]
             .get_or_init(|| {
-                let (data, index) = (self.resolver)(&FontQuery::Standard(family.standard()))?;
-                Face::new(data, index, family.standard())
+                let query = typeface.query();
+                let (data, index) = (self.resolver)(&query)?;
+                Face::new(data, index, query.standard_substitute())
             })
             .as_ref()
     }
@@ -101,32 +142,63 @@ impl Fonts {
     /// The glyph named `name` in `family`'s font, when that is a bare CFF font as the
     /// embedded standard fonts are.
     pub(super) fn named(&self, family: Family, name: &str) -> Option<Glyph<'_>> {
-        let face = self.face(family)?;
+        let face = self.face(family.into())?;
         let Face::Cff { blob, standard, .. } = face else {
             return None;
         };
         let id = blob.glyph_index_by_name(name)?;
         let advance = standard.get_width(name)? / 1000.0;
-        Some(Glyph { face, id, advance })
+        Some(Glyph {
+            face,
+            id,
+            advance,
+            space: false,
+        })
     }
 
-    /// The glyphs of `text` in `family`, each with its advance in em.
-    pub(super) fn shape(&self, family: Family, text: &str) -> Result<Vec<Glyph<'_>>, Unsupported> {
-        text.chars().map(|c| self.glyph(family, c)).collect()
+    /// The glyphs of `text` in `typeface`, each with its advance in em.
+    pub(super) fn shape(
+        &self,
+        typeface: impl Into<Typeface>,
+        text: &str,
+    ) -> Result<Vec<Glyph<'_>>, Unsupported> {
+        let typeface = typeface.into();
+        text.chars().map(|c| self.glyph(typeface, c)).collect()
     }
 
-    /// The glyph of `c` in `family`, with its advance in em.
-    fn glyph(&self, family: Family, c: char) -> Result<Glyph<'_>, Unsupported> {
+    /// The glyph of `c` in `typeface`, with its advance in em.
+    fn glyph(&self, typeface: Typeface, c: char) -> Result<Glyph<'_>, Unsupported> {
+        if typeface.family == Family::Dingbats {
+            // Viewers write the text's bytes in the font's own encoding; where
+            // PDFDocEncoding and Latin-1 agree, a character is its byte.
+            let code = u8::try_from(c)
+                .ok()
+                .filter(|b| matches!(b, 0x20..=0x7E | 0xA1..=0xFF));
+            return code
+                .and_then(|b| StandardFont::ZapfDingBats.code_to_name(b))
+                .and_then(|name| self.named(Family::Dingbats, name))
+                .map(|g| Glyph {
+                    space: c == ' ',
+                    ..g
+                })
+                .ok_or(Unsupported::Character(c));
+        }
         // Tabs and other controls take a space.
         let c = if c.is_control() { ' ' } else { c };
-        [family, Family::Sans]
+        let sans = Typeface::from(Family::Sans);
+        [typeface, sans]
             .into_iter()
             .find_map(|f| {
                 let face = self.face(f)?;
                 let (id, advance) = face.glyph(c)?;
-                Some(Glyph { face, id, advance })
+                Some(Glyph {
+                    face,
+                    id,
+                    advance,
+                    space: c == ' ',
+                })
             })
-            .ok_or(if self.face(Family::Sans).is_some() {
+            .ok_or(if self.face(sans).is_some() {
                 Unsupported::Character(c)
             } else {
                 // No fonts at all: nothing is drawable.
@@ -142,6 +214,14 @@ pub(super) struct Glyph<'a> {
     id: GlyphId,
     /// The advance, in em.
     pub(super) advance: f32,
+    /// Whether it is a space, where justified lines stretch.
+    space: bool,
+}
+
+impl Glyph<'_> {
+    pub(super) fn is_space(&self) -> bool {
+        self.space
+    }
 }
 
 /// The width of `glyphs` at `size`.
@@ -153,8 +233,43 @@ pub(super) fn width(glyphs: &[Glyph<'_>], size: f32) -> f32 {
 pub(super) fn draw(
     glyphs: &[Glyph<'_>],
     size: f32,
-    (x, y): (f32, f32),
+    origin: (f32, f32),
     transform: Affine,
+    out: &mut Out,
+) -> Option<()> {
+    fill(glyphs, size, origin, 0.0, transform, None, out)
+}
+
+/// Fills `glyphs` as [`draw`] does, each space `spacing` wider than its advance,
+/// under a clip to `clip`: a glyph wholly outside it is not written, so text
+/// running far beyond its box costs no more output than the box shows.
+pub(super) fn draw_clipped(
+    glyphs: &[Glyph<'_>],
+    size: f32,
+    origin: (f32, f32),
+    spacing: f32,
+    transform: Affine,
+    clip: Rect,
+    out: &mut Out,
+) -> Option<()> {
+    fill(
+        glyphs,
+        size,
+        origin,
+        spacing,
+        transform,
+        Some(clip),
+        out,
+    )
+}
+
+fn fill(
+    glyphs: &[Glyph<'_>],
+    size: f32,
+    (x, y): (f32, f32),
+    spacing: f32,
+    transform: Affine,
+    clip: Option<Rect>,
     out: &mut Out,
 ) -> Option<()> {
     let mut x = f64::from(x);
@@ -164,10 +279,15 @@ pub(super) fn draw(
         let mut path = g.face.outline(g.id);
         if !path.elements().is_empty() {
             path.apply_affine(transform * Affine::new([scale, 0.0, 0.0, scale, x, f64::from(y)]));
-            out.path(&path)?;
-            any = true;
+            any |= match clip {
+                Some(clip) => out.path_within(&path, clip)?,
+                None => out.path(&path).is_some(),
+            };
         }
         x += f64::from(g.advance) * f64::from(size);
+        if g.space {
+            x += f64::from(spacing);
+        }
     }
     if any {
         out.op("f");
@@ -233,23 +353,32 @@ impl Face {
     }
 }
 
-/// How text is set: family, size in points, and the fill colour operator.
+/// How text is set: typeface, size in points, the fill colour operator, and how
+/// the lines of its paragraph are aligned.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Style {
-    pub(super) family: Family,
+    pub(super) face: Typeface,
     pub(super) size: f32,
     pub(super) color: String,
+    pub(super) align: Align,
+}
+
+/// How a line sits between the sides of its box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Align {
+    Left,
+    Center,
+    Right,
+    /// Stretched to both sides at its spaces, but for the last line of a paragraph,
+    /// which is left aligned.
+    Justify,
 }
 
 /// The style of a default appearance string (PDF 32000-1 12.7.3.3): the font
-/// operand of `Tf` and its size, and the last colour operator. The font name is
-/// looked up in `fonts` (an `/DR /Font` dictionary) for its `/BaseFont`. A size of 0
+/// operand of `Tf` and its size, and the last colour operator. A size of 0
 /// (fit to the field) is `None`; without `Tf` the size is 12 pt, as common viewers
 /// set it.
-pub(super) fn default_appearance(
-    da: &[u8],
-    fonts: Option<&super::entries::Entries<'_>>,
-) -> (Family, Option<f32>, Option<String>) {
+pub(super) fn default_appearance(da: &[u8]) -> (Family, Option<f32>, Option<String>) {
     let tokens: Vec<&[u8]> = da
         .split(|b| b.is_ascii_whitespace())
         .filter(|t| !t.is_empty())
@@ -272,11 +401,8 @@ pub(super) fn default_appearance(
         };
         match *op {
             b"Tf" if i >= 2 => {
-                let name = tokens[i - 2].strip_prefix(b"/").unwrap_or(tokens[i - 2]);
-                let base = fonts
-                    .and_then(|f| f.dict(name))
-                    .and_then(|f| f.name(b"BaseFont"));
-                family = Family::of_font_name(base.as_ref().map_or(name, |b| b.as_ref()));
+                family =
+                    Family::of_font_name(tokens[i - 2].strip_prefix(b"/").unwrap_or(tokens[i - 2]));
                 size = operands(1).map(|s| s[0]).filter(|s| *s > 0.0);
             }
             b"g" | b"rg" | b"k" => {
@@ -348,9 +474,10 @@ pub(super) fn lines<'f>(
     let span = Span {
         text: text.to_owned(),
         style: Style {
-            family,
+            face: family.into(),
             size,
             color: String::new(),
+            align: Align::Left,
         },
     };
     Ok(layout(fonts, &[span], width)?
@@ -360,6 +487,7 @@ pub(super) fn lines<'f>(
 }
 
 /// Text in one style.
+#[derive(Debug)]
 pub(super) struct Span {
     pub(super) text: String,
     pub(super) style: Style,
@@ -384,27 +512,45 @@ pub(super) struct Line<'f> {
     pub(super) glyphs: Vec<Set<'f>>,
     /// The largest size on the line, or, on an empty one, its paragraph's.
     pub(super) size: f32,
+    /// The alignment of its paragraph, but left for the last line of a justified
+    /// one.
+    pub(super) align: Align,
 }
 
 impl Line<'_> {
     pub(super) fn width(&self) -> f32 {
         self.glyphs.iter().map(Set::width).sum()
     }
+
+    /// The number of spaces a justified line stretches at.
+    pub(super) fn spaces(&self) -> usize {
+        self.glyphs.iter().filter(|g| g.glyph.is_space()).count()
+    }
 }
 
 /// The lines of `spans`, each glyph in its span's family and size: paragraphs split
 /// at line breaks, and, with a `width`, wrapped between words, a word wider than
-/// the line between its characters.
+/// the line between its characters. A line is aligned as the span of its first
+/// glyph, or of its paragraph's break when it has none.
 pub(super) fn layout<'f>(
     fonts: &'f Fonts,
     spans: &[Span],
     width: Option<f32>,
 ) -> Result<Vec<Line<'f>>, Unsupported> {
-    // Each character with its span; a line break is a paragraph's end.
-    let mut chars: Vec<(char, usize)> = Vec::new();
-    for (i, span) in spans.iter().enumerate() {
-        let text = span.text.replace("\r\n", "\n").replace('\r', "\n");
-        chars.extend(text.chars().map(|c| (c, i)));
+    // Each character with its span; a line break is a paragraph's end. A carriage
+    // return is a line break, one with the line feed after it, in whichever span.
+    let all: Vec<(char, usize)> = spans
+        .iter()
+        .enumerate()
+        .flat_map(|(i, span)| span.text.chars().map(move |c| (c, i)))
+        .collect();
+    let mut chars: Vec<(char, usize)> = Vec::with_capacity(all.len());
+    for (k, &(c, span)) in all.iter().enumerate() {
+        match c {
+            '\r' if all.get(k + 1).is_some_and(|(next, _)| *next == '\n') => {}
+            '\r' => chars.push(('\n', span)),
+            _ => chars.push((c, span)),
+        }
     }
     let mut out = Vec::new();
     let mut start = 0;
@@ -417,342 +563,136 @@ pub(super) fn layout<'f>(
             .or(chars.last())
             .map_or(0, |(_, span)| *span);
         let para_size = spans.get(span).map_or(0.0, |s| s.style.size);
+        let para_align = spans.get(span).map_or(Align::Left, |s| s.style.align);
         start += paragraph.len() + 1;
         let glyphs = paragraph
             .iter()
             .map(|&(c, span)| {
                 let style = &spans[span].style;
                 Ok(Set {
-                    glyph: fonts.glyph(style.family, c)?,
+                    glyph: fonts.glyph(style.face, c)?,
                     size: style.size,
                     span,
                 })
             })
             .collect::<Result<Vec<_>, Unsupported>>()?;
-        let mut push = |glyphs: Vec<Set<'f>>| {
-            let size = glyphs.iter().map(|g| g.size).fold(0.0, f32::max);
+        let ranges = match width {
+            Some(width) => breaks(
+                glyphs.len(),
+                |k| paragraph[k].0 == ' ',
+                |k| glyphs[k].width(),
+                width,
+            ),
+            None => std::iter::once(0..glyphs.len()).collect(),
+        };
+        let count = ranges.len();
+        for (n, range) in ranges.into_iter().enumerate() {
+            let line = glyphs[range].to_vec();
+            let size = line.iter().map(|g| g.size).fold(0.0, f32::max);
+            let align = match line
+                .first()
+                .map_or(para_align, |g| spans[g.span].style.align)
+            {
+                Align::Justify if n + 1 == count => Align::Left,
+                align => align,
+            };
             out.push(Line {
-                size: if glyphs.is_empty() { para_size } else { size },
-                glyphs,
+                size: if line.is_empty() { para_size } else { size },
+                glyphs: line,
+                align,
             });
-        };
-        let Some(width) = width else {
-            push(glyphs);
-            continue;
-        };
-        let space = |k: usize| paragraph[k].0 == ' ';
-        let mut line: Vec<Set<'f>> = Vec::new();
-        let mut line_width = 0.0;
-        let mut i = 0;
-        while i < glyphs.len() {
-            // The next word with the spaces before it.
-            let mut j = i;
-            while j < glyphs.len() && space(j) {
-                j += 1;
-            }
-            while j < glyphs.len() && !space(j) {
-                j += 1;
-            }
-            let word_width: f32 = glyphs[i..j].iter().map(Set::width).sum();
-            if line_width + word_width <= width || line.is_empty() && word_width <= width {
-                line.extend_from_slice(&glyphs[i..j]);
-                line_width += word_width;
-                i = j;
-            } else if line.is_empty() {
-                // A word wider than the line: as much of it as fits, at least one
-                // character.
-                let mut k = i;
-                while k < j && (k == i || line_width + glyphs[k].width() <= width) {
-                    line_width += glyphs[k].width();
-                    line.push(glyphs[k].clone());
-                    k += 1;
-                }
-                push(std::mem::take(&mut line));
-                line_width = 0.0;
-                i = k;
-            } else {
-                push(std::mem::take(&mut line));
-                line_width = 0.0;
-                // The next line starts with the word, not the spaces before it.
-                while i < j && space(i) {
-                    i += 1;
-                }
-            }
         }
-        push(line);
     }
     Ok(out)
 }
 
-/// The style rich text (PDF 32000-1 12.7.3.4) sets: `font-size`, `font-family`
-/// (also in the `font` shorthand) and `color` declarations of `css`, over `style`.
-pub(super) fn css_style(css: &str, mut style: Style) -> Style {
-    for declaration in css.split(';') {
-        let Some((property, value)) = declaration.split_once(':') else {
-            continue;
-        };
-        let value = value.trim();
-        match property.trim().to_ascii_lowercase().as_str() {
-            "font-size" => {
-                if let Some(size) = css_size(value) {
-                    style.size = size;
-                }
+/// The lines `n` glyphs are broken into to fit `width`: each line as many words
+/// as fit, with the spaces before each but the first; a word wider than a line
+/// alone on its line, overflowing it, as viewers set it. `space(k)` tells whether
+/// glyph `k` is a space and `advance(k)` its width; each is asked at most twice
+/// per glyph.
+fn breaks(
+    n: usize,
+    space: impl Fn(usize) -> bool,
+    advance: impl Fn(usize) -> f32,
+    width: f32,
+) -> Vec<std::ops::Range<usize>> {
+    let mut lines = Vec::new();
+    // The current line, from `start` to `i`, and its width.
+    let (mut start, mut line_width) = (0, 0.0_f32);
+    let mut i = 0;
+    while i < n {
+        // The next word with the spaces before it.
+        let mut j = i;
+        while j < n && space(j) {
+            j += 1;
+        }
+        while j < n && !space(j) {
+            j += 1;
+        }
+        let word_width: f32 = (i..j).map(&advance).sum();
+        if start == i || line_width + word_width <= width {
+            line_width += word_width;
+            i = j;
+        } else {
+            lines.push(start..i);
+            line_width = 0.0;
+            // The next line starts with the word, not the spaces before it.
+            while i < j && space(i) {
+                i += 1;
             }
-            "font-family" => style.family = css_family(value),
-            "font" => {
-                // [style] [weight] size[/line-height] family…
-                let mut words = value.split_whitespace();
-                for word in words.by_ref() {
-                    if let Some(size) = css_size(word.split('/').next().unwrap_or(word)) {
-                        style.size = size;
-                        break;
-                    }
-                }
-                let family: Vec<&str> = words.collect();
-                if !family.is_empty() {
-                    style.family = css_family(&family.join(" "));
-                }
-            }
-            "color" => {
-                if let Some(color) = css_color(value) {
-                    style.color = color;
-                }
-            }
-            _ => {}
+            start = i;
         }
     }
-    style
-}
-
-fn css_size(value: &str) -> Option<f32> {
-    let number = value.trim_end_matches("pt").trim_end_matches("px");
-    number
-        .parse::<f32>()
-        .ok()
-        .filter(|s| s.is_finite() && *s > 0.0)
-}
-
-fn css_family(value: &str) -> Family {
-    let first = value
-        .split(',')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .trim_matches(['\'', '"']);
-    let lower = first.to_ascii_lowercase();
-    if lower.contains("courier") || lower == "monospace" {
-        Family::Mono
-    } else if lower.contains("helvetica") || lower.contains("arial") || lower == "sans-serif" {
-        Family::Sans
-    } else {
-        Family::Serif
-    }
-}
-
-/// A CSS colour as an RGB fill operator: `#rrggbb`, `#rgb` or `rgb(r, g, b)`.
-fn css_color(value: &str) -> Option<String> {
-    let rgb: [f32; 3] = if let Some(hex) = value.strip_prefix('#') {
-        let digits: Vec<u32> = hex.chars().map(|c| c.to_digit(16)).collect::<Option<_>>()?;
-        match digits.len() {
-            6 => [0, 2, 4].map(|i| (digits[i] * 16 + digits[i + 1]) as f32 / 255.0),
-            3 => [0, 1, 2].map(|i| (digits[i] * 17) as f32 / 255.0),
-            _ => return None,
-        }
-    } else {
-        let inner = value.strip_prefix("rgb(")?.strip_suffix(')')?;
-        let parts: Vec<f32> = inner
-            .split(',')
-            .map(|p| p.trim().parse::<f32>().ok())
-            .collect::<Option<_>>()?;
-        let [r, g, b] = parts.as_slice() else {
-            return None;
-        };
-        [*r, *g, *b].map(|v| (v / 255.0).clamp(0.0, 1.0))
-    };
-    let [r, g, b] = rgb.map(|v| (v * 10000.0).round() / 10000.0);
-    Some(format!("{r} {g} {b} rg"))
-}
-
-/// The text of rich text (PDF 32000-1 12.7.3.4, XHTML) in the styles its elements
-/// set: each element's style attribute over the style of the element it is in, the
-/// outermost over `base`. Paragraphs and breaks are line breaks, other whitespace is
-/// kept, entities are decoded.
-pub(super) fn rich_text(xhtml: &str, base: &Style) -> Vec<Span> {
-    let mut spans: Vec<Span> = Vec::new();
-    let add = |spans: &mut Vec<Span>, text: &str, style: &Style| {
-        if text.is_empty() {
-            return;
-        }
-        match spans.last_mut() {
-            Some(last) if last.style == *style => last.text.push_str(text),
-            _ => spans.push(Span {
-                text: text.to_owned(),
-                style: style.clone(),
-            }),
-        }
-    };
-    // The style of each open element, outermost first.
-    let mut open = vec![base.clone()];
-    let mut rest = xhtml;
-    while let Some(lt) = rest.find('<') {
-        add(
-            &mut spans,
-            &decode_entities(&rest[..lt]),
-            open.last().unwrap_or(base),
-        );
-        let Some(gt) = rest[lt..].find('>') else {
-            rest = "";
-            break;
-        };
-        let tag = &rest[lt + 1..lt + gt];
-        rest = &rest[lt + gt + 1..];
-        if tag.starts_with('?') || tag.starts_with('!') {
-            continue;
-        }
-        let closing = tag.starts_with('/');
-        let name: String = tag
-            .trim_start_matches('/')
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric())
-            .collect::<String>()
-            .to_ascii_lowercase();
-        let current = open.last().unwrap_or(base).clone();
-        let at_line_start = spans.last().is_none_or(|s| s.text.ends_with('\n'));
-        match name.as_str() {
-            // A paragraph starts and ends a line; whitespace is kept as written.
-            "p" | "div" if !at_line_start => add(&mut spans, "\n", &current),
-            "br" => add(&mut spans, "\n", &current),
-            _ => {}
-        }
-        if closing {
-            if open.len() > 1 {
-                open.pop();
-            }
-        } else if !tag.ends_with('/') && name != "br" {
-            let style = match tag.find("style=") {
-                // The value between its quotes.
-                Some(at) => {
-                    let mut value = tag[at + 6..].chars();
-                    match value
-                        .next()
-                        .and_then(|quote| value.as_str().split(quote).next())
-                    {
-                        Some(css) => css_style(css, current),
-                        None => current,
-                    }
-                }
-                None => current,
-            };
-            open.push(style);
-        }
-    }
-    add(
-        &mut spans,
-        &decode_entities(rest),
-        open.last().unwrap_or(base),
-    );
-    spans
-}
-
-fn decode_entities(s: &str) -> String {
-    let mut out = String::new();
-    let mut rest = s;
-    while let Some(amp) = rest.find('&') {
-        out.push_str(&rest[..amp]);
-        let after = &rest[amp + 1..];
-        let Some(semi) = after.find(';').filter(|&i| i <= 10) else {
-            out.push('&');
-            rest = after;
-            continue;
-        };
-        let entity = &after[..semi];
-        let c = match entity {
-            "amp" => Some('&'),
-            "lt" => Some('<'),
-            "gt" => Some('>'),
-            "quot" => Some('"'),
-            "apos" => Some('\''),
-            "nbsp" => Some('\u{A0}'),
-            _ => entity.strip_prefix('#').and_then(|n| {
-                let code = match n.strip_prefix(['x', 'X']) {
-                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
-                    None => n.parse().ok(),
-                };
-                code.and_then(char::from_u32)
-            }),
-        };
-        match c {
-            Some(c) => {
-                out.push(c);
-                rest = &after[semi + 1..];
-            }
-            None => {
-                out.push('&');
-                rest = after;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
+    lines.push(start..i);
+    lines
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Family, Style, rich_text};
+    use super::breaks;
+    use std::cell::Cell;
 
-    fn base() -> Style {
-        Style {
-            family: Family::Serif,
-            size: 12.0,
-            color: "0 g".to_owned(),
+    /// Lines as the characters of `text` with 1-wide glyphs.
+    fn wrap(text: &str, width: f32) -> Vec<String> {
+        let chars: Vec<char> = text.chars().collect();
+        breaks(chars.len(), |k| chars[k] == ' ', |_| 1.0, width)
+            .into_iter()
+            .map(|r| chars[r].iter().collect())
+            .collect()
+    }
+
+    #[test]
+    fn words_wrap_and_a_long_word_overflows_its_line() {
+        assert_eq!(wrap("ab cd ef", 5.0), ["ab cd", "ef"]);
+        assert_eq!(wrap("abcdefgh ij", 3.0), ["abcdefgh", "ij"]);
+        assert_eq!(wrap("ab  abcdefg ij", 3.0), ["ab", "abcdefg", "ij"]);
+        assert_eq!(wrap("  ab", 3.0), ["  ab"]);
+        assert_eq!(wrap("", 3.0), [""]);
+        assert_eq!(wrap("abc", 0.0), ["abc"]);
+    }
+
+    /// Each glyph is looked at a bounded number of times, however long the word
+    /// wider than the line or the words after it.
+    #[test]
+    fn wrapping_a_long_word_is_linear() {
+        for n in [1_000, 10_000, 100_000] {
+            let (spaces, advances) = (Cell::new(0), Cell::new(0));
+            // A word as long as the text, then words of one glyph.
+            let lines = breaks(
+                n,
+                |k| {
+                    spaces.set(spaces.get() + 1);
+                    k > n / 2 && k % 2 == 1
+                },
+                |_| {
+                    advances.set(advances.get() + 1);
+                    1.0
+                },
+                7.0,
+            );
+            assert!(spaces.get() <= 2 * n && advances.get() <= 2 * n, "{n}");
+            assert_eq!(lines[0], 0..n / 2 + 1, "{n}");
         }
-    }
-
-    /// A paragraph starts and ends a line; spaces and line breaks in the text stay.
-    #[test]
-    fn rich_text_keeps_whitespace_and_breaks_at_paragraphs() {
-        let spans = rich_text(
-            "<?xml version=\"1.0\"?><body style=\"color:#f00\"><p>A</p>  <p>  B  </p>\
-             <span>C</span> D<br/>E &amp;\n F</body>",
-            &base(),
-        );
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
-        assert_eq!(text, "A\n  \n  B  \nC D\nE &\n F");
-        assert!(spans.iter().all(|s| s.style.color == "1 0 0 rg"));
-        // An attribute without a value.
-        let spans = rich_text("<p style=>x</p>", &base());
-        assert_eq!((spans.len(), spans[0].text.as_str()), (1, "x\n"));
-        assert_eq!(spans[0].style, base());
-    }
-
-    /// An element's style applies to what it holds, over the style of the element it
-    /// is in; the next element starts from that again.
-    #[test]
-    fn rich_text_styles_nest() {
-        let spans = rich_text(
-            "<body style=\"font-size:10pt\"><p style=\"font-family:Helvetica\">A \
-             <span style=\"color:#ff0000\">B</span> C</p><p>D</p></body>",
-            &base(),
-        );
-        let got: Vec<(&str, Family, f32, &str)> = spans
-            .iter()
-            .map(|s| {
-                (
-                    s.text.as_str(),
-                    s.style.family,
-                    s.style.size,
-                    s.style.color.as_str(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            got,
-            [
-                ("A ", Family::Sans, 10.0, "0 g"),
-                ("B", Family::Sans, 10.0, "1 0 0 rg"),
-                (" C\n", Family::Sans, 10.0, "0 g"),
-                ("D\n", Family::Serif, 10.0, "0 g"),
-            ]
-        );
     }
 }

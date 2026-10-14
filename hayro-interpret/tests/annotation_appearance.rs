@@ -1516,3 +1516,181 @@ fn a_highlight_quad_without_a_bottom_edge_bulges_to_the_origin() {
         "{content}"
     );
 }
+
+/// A comment in rich text draws nothing, whatever `>` it holds: the text after it
+/// stays on the first line, inside the box.
+#[test]
+fn a_comment_in_rich_text_draws_nothing() {
+    let rc = format!(
+        "<body style=\"font-family:Helvetica\"><p>A<!-- >{} --><span \
+         style=\"color:#ff0000\">IMPORTANT</span></p></body>",
+        "M".repeat(200)
+    );
+    let text = fills(&draw(
+        &[&format!(
+            "/Subtype /FreeText /Rect [10 80 190 140] /BS << /W 0 >> \
+             /DA (/Helv 12 Tf 0 g) /RC ({rc})"
+        )],
+        VIEW,
+    ));
+    assert_eq!(
+        text.iter().filter(|(_, c)| *c == RED).count(),
+        1,
+        "{text:?}"
+    );
+    for (bbox, _) in &text {
+        assert!(inside(*bbox, [10, 125, 190, 140]), "{text:?}");
+    }
+}
+
+/// Rich text asks the font resolver for the face of each part: the default face
+/// where it names no family the standard fonts have, in its weight and slant, and
+/// the standard fonts' bold and italic.
+#[test]
+fn rich_text_asks_for_the_face_of_each_part() {
+    let rc = "<body><p>a<b>b</b><i>c</i></p><p style=\"font-family:Times New Roman;\
+              font-weight:700\">d<i>e</i></p><p style=\"font:italic 9pt Helvetica\">f</p>\
+              <p style=\"font-family:Courier;font-weight:bold;font-style:oblique\">g</p></body>";
+    let asked = faces_asked(&format!(
+        "/Subtype /FreeText /Rect [20 20 180 180] /BS << /W 0 >> /RC ({rc})"
+    ));
+    for face in [
+        "default false false",
+        "default true false",
+        "default false true",
+        "Times-Bold",
+        "Times-BoldItalic",
+        "Helvetica-Oblique",
+        "Courier-BoldOblique",
+    ] {
+        assert!(asked.iter().any(|a| a == face), "{face}: {asked:?}");
+    }
+    assert!(!asked.iter().any(|a| a == "Times-Roman"), "{asked:?}");
+}
+
+/// The fonts the appearance of `annot` asks the font resolver for.
+fn faces_asked(annot: &str) -> Vec<String> {
+    use hayro_interpret::font::FontQuery;
+    use std::sync::{Arc, Mutex};
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let record = asked.clone();
+    let settings = InterpreterSettings {
+        font_resolver: Arc::new(move |query: &FontQuery| {
+            record.lock().unwrap().push(match query {
+                FontQuery::Standard(s) => s.postscript_name().to_owned(),
+                FontQuery::TextDefault { bold, italic } => format!("default {bold} {italic}"),
+                FontQuery::Fallback(_) => "fallback".to_owned(),
+            });
+            Some(query.standard_substitute().get_font_data())
+        }),
+        ..Default::default()
+    };
+    let file = common::one_page(
+        200,
+        "/Resources << >> /Annots [4 0 R]",
+        vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
+    );
+    let pdf = Pdf::new(file).expect("valid pdf");
+    common::interpret_first_page(&pdf, settings, &mut Rec::default());
+    asked.lock().unwrap().clone()
+}
+
+/// A default appearance's font is Times for `TiRo`, Courier for `Cour`,
+/// `ZapfDingbats` for `ZaDb`, and Helvetica for any other name, whatever the form's
+/// resources say it is: the faces viewers draw it in.
+#[test]
+fn a_default_appearance_font_is_one_of_four_names() {
+    for (name, face) in [
+        ("Helv", "Helvetica"),
+        ("TiRo", "Times-Roman"),
+        ("Cour", "Courier"),
+        ("ZaDb", "ZapfDingbats"),
+        ("TiBo", "Helvetica"),
+        ("CoBo", "Helvetica"),
+        ("Times-Roman", "Helvetica"),
+        ("tiro", "Helvetica"),
+    ] {
+        for annot in [
+            "/Subtype /FreeText /Rect [20 20 180 180] /Contents (4)",
+            "/Subtype /Widget /FT /Tx /Rect [20 20 180 60] /V (4)",
+        ] {
+            let asked = faces_asked(&format!("{annot} /DA (/{name} 12 Tf 0 g)"));
+            // Helvetica may be asked as well, for glyphs the face lacks.
+            assert!(
+                asked.iter().any(|a| a == face)
+                    && asked.iter().all(|a| a == face || a == "Helvetica"),
+                "{name} in {annot}: {asked:?}"
+            );
+        }
+    }
+}
+
+/// Rich text is aligned by its `text-align`, whatever `/Q`; a justified line
+/// reaches both sides of the box, the last line of its paragraph does not.
+#[test]
+fn rich_text_aligns_by_text_align_not_q() {
+    let spans = |q: u8, body: &str| {
+        let rc = format!("<body style=\"font-family:Helvetica\">{body}</body>");
+        fills(&draw(
+            &[&format!(
+                "/Subtype /FreeText /Rect [20 20 180 180] /BS << /W 0 >> /Q {q} /RC ({rc})"
+            )],
+            VIEW,
+        ))
+        .iter()
+        .map(|(b, _)| [b[0], b[2]])
+        .collect::<Vec<_>>()
+    };
+    let left = spans(1, "<p>H</p>");
+    assert_eq!(left[0][0], 21, "{left:?}");
+    let right = spans(0, "<p style=\"text-align:right\">H</p>");
+    assert_eq!(right[0][1], 179, "{right:?}");
+    let justified = spans(
+        0,
+        "<p style=\"text-align:justify\">HH HH HH HH HH HH HH HH HH HH HH HH HH</p>",
+    );
+    // The first line from side to side, the last from the left.
+    assert_eq!(
+        (justified[0][0], justified[0][1]),
+        (21, 179),
+        "{justified:?}"
+    );
+}
+
+/// The lines of a `FreeText` in `/Rect [20 20 180 180]`: the bottom of each fill.
+fn free_text_rows(entries: &str) -> Vec<i32> {
+    fills(&draw(
+        &[&format!(
+            "/Subtype /FreeText /Rect [20 20 180 180] /BS << /W 0 >> {entries}"
+        )],
+        VIEW,
+    ))
+    .iter()
+    .map(|(b, _)| b[1])
+    .collect()
+}
+
+/// A word wider than the box stays whole on a line of its own, overflowing it, as
+/// viewers set it; the words after it go on the next line.
+#[test]
+fn a_word_wider_than_the_box_overflows_its_line() {
+    let rows = free_text_rows(&format!(
+        "/DA (/Helv 12 Tf 0 g) /Contents (ab {} cd)",
+        "H".repeat(40)
+    ));
+    // One fill per line: "ab", the long word, "cd".
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert!(rows[0] > rows[1] && rows[1] > rows[2], "{rows:?}");
+}
+
+/// A carriage return before a paragraph's end is one line break, whichever span
+/// each is in, as Acrobat writes `&#13;` at the end of its paragraphs.
+#[test]
+fn a_carriage_return_ending_a_paragraph_breaks_once() {
+    let rows = free_text_rows(
+        "/RC (<body style=\"font-family:Helvetica;font-size:10pt\"><p><span \
+         style=\"color:#ff0000\">H&#13;</span></p><p>H</p></body>)",
+    );
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0] - rows[1], 12, "{rows:?}");
+}
