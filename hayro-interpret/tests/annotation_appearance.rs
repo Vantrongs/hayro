@@ -439,10 +439,18 @@ fn subtypes_that_draw_without_an_appearance() {
         format!("/Subtype /Widget /FT /Sig {r}"),
         format!("/Subtype /Widget /FT /Sig /V << >> {r}"),
         format!("/Subtype /Widget {r}"),
-        // The field type is inherited from the parent field (17).
-        format!("/Subtype /Widget /Parent 17 0 R {r}"),
+        // The field type is inherited from the parent field (22).
+        format!("/Subtype /Widget /Parent 22 0 R /AS /Yes {r}"),
         format!("/Subtype /Square /C [0] /BS << /W 0 >> {r}"),
         format!("/Subtype /Ink /InkList [[1 1 5 5]] {r}"),
+        // Widgets with nothing to show: no value, no border, no background, an off
+        // state, a border of width 0.
+        format!("/Subtype /Widget /FT /Ch /Ff 131072 /Opt [(a)] {r}"),
+        format!("/Subtype /Widget /FT /Btn /AS /Off /V /Yes {r}"),
+        format!("/Subtype /Widget /FT /Tx /V () /MK << /BC [0] >> /BS << /W 0 >> {r}"),
+        format!("/Subtype /Widget /FT /Btn /Ff 65536 {r}"),
+        // And with something.
+        format!("/Subtype /Widget /FT /Tx /MK << /BG [1] >> {r}"),
     ];
     let mut objects: Vec<Vec<u8>> = entries
         .iter()
@@ -468,6 +476,11 @@ fn subtypes_that_draw_without_an_appearance() {
             // Width 0 is the thinnest line; ink without /C has no colour.
             "generated",
             "nothing",
+            "nothing",
+            "nothing",
+            "nothing",
+            "nothing",
+            "unsupported",
         ]
     );
 }

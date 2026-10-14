@@ -210,14 +210,57 @@ const STAMPS: [&[u8]; 14] = [
     b"ForPublicRelease",
 ];
 
-/// A form field's widget: text, choice and button fields and unsigned signatures
-/// draw; a field without a type and a signed signature draw nothing.
+/// A form field's widget: one shows its border and background (`/MK /BC`, `/BG`), and
+/// the value of its field: the text of a text field or a combo box, the options of
+/// a list box, the caption of a push button (`/MK /CA`), the mark of a check box or
+/// radio button in an on state (`/AS`), the look of an unsigned signature field. A
+/// field without a type, a signed signature and a widget with none of these draw
+/// nothing.
 fn widget(annot: &Dict<'_>) -> Generated {
     let field_type = field(annot, b"FT").and_then(|d| d.get::<Name<'_>>(b"FT"));
-    match field_type.as_ref().map(|n| n.as_ref()) {
-        Some(b"Tx" | b"Ch" | b"Btn") => Err(Unsupported::Kind),
-        Some(b"Sig") if field(annot, b"V").is_none() => Err(Unsupported::Kind),
-        _ => Ok(None),
+    let flags = field(annot, b"Ff")
+        .and_then(|d| d.get::<u32>(b"Ff"))
+        .unwrap_or(0);
+    let mk = annot.get::<Dict<'_>>(b"MK");
+    let mk_color = |key: &[u8]| {
+        mk.as_ref()
+            .and_then(|mk| mk.get::<Array<'_>>(key))
+            .is_some_and(|a| color(&a, false).is_some())
+    };
+    let border = mk_color(b"BC") && border_width(annot) > 0.0;
+    let text = |key: &[u8]| {
+        field(annot, key)
+            .and_then(|d| d.get::<hayro_syntax::object::String<'_>>(key))
+            .is_some_and(|s| !s.as_bytes().is_empty())
+    };
+    let shows = match field_type.as_ref().map(|n| n.as_ref()) {
+        Some(b"Sig") => {
+            return if field(annot, b"V").is_none() {
+                Err(Unsupported::Kind)
+            } else {
+                Ok(None)
+            };
+        }
+        Some(b"Tx") => text(b"V"),
+        // Bit 18: a combo box.
+        Some(b"Ch") if flags & (1 << 17) != 0 => text(b"V"),
+        Some(b"Ch") => field(annot, b"Opt")
+            .and_then(|d| d.get::<Array<'_>>(b"Opt"))
+            .is_some_and(|o| o.iter::<Object<'_>>().next().is_some()),
+        // Bit 17: a push button.
+        Some(b"Btn") if flags & (1 << 16) != 0 => mk
+            .as_ref()
+            .and_then(|mk| mk.get::<hayro_syntax::object::String<'_>>(b"CA"))
+            .is_some_and(|s| !s.as_bytes().is_empty()),
+        Some(b"Btn") => annot
+            .get::<Name<'_>>(AS)
+            .is_some_and(|state| state.as_ref() != b"Off"),
+        _ => return Ok(None),
+    };
+    if shows || border || mk_color(b"BG") {
+        Err(Unsupported::Kind)
+    } else {
+        Ok(None)
     }
 }
 
