@@ -102,10 +102,17 @@ impl Data {
         }
 
         // Decoding may resolve other objects, so do it without holding the cache lock.
-        let stream = ctx
-            .xref()
-            .get_with::<Stream<'_>>(id, ctx)
-            .and_then(|stream| ObjectStream::new(&stream));
+        // A stream that is read differently from another resolution chain, such as
+        // one rejected while it is being read already, is not kept, nor returned:
+        // what is read from it borrows from what is kept.
+        let (stream, shared) = ctx.shared(|ctx| {
+            ctx.xref()
+                .get_with::<Stream<'_>>(id, ctx)
+                .and_then(|stream| ObjectStream::new(&stream))
+        });
+        if !shared {
+            return None;
+        }
 
         let mut locked = self.map.get();
         if let Some(&idx) = locked.get(&id) {

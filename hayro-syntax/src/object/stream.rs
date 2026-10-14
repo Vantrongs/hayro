@@ -444,7 +444,13 @@ impl Skippable for Stream<'_> {
 impl<'a> Readable<'a> for Stream<'a> {
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         let dict = r.read_with_context::<Dict<'_>>(ctx)?;
+        Self::after_dict(r, dict)
+    }
+}
 
+impl<'a> Stream<'a> {
+    /// The stream of `dict`, read from `r` after the dictionary.
+    pub(crate) fn after_dict(r: &mut Reader<'a>, dict: Dict<'a>) -> Option<Self> {
         if dict.contains_key(F) {
             warn!("encountered stream referencing external file, which is unsupported");
 

@@ -11,7 +11,6 @@ use crate::object::dict::keys::{
     AUTHOR, CREATION_DATE, CREATOR, ENCRYPT, FIRST, ID, INDEX, INFO, KEYWORDS, MOD_DATE, N,
     OCPROPERTIES, PAGES, PREV, PRODUCER, ROOT, SIZE, SUBJECT, TITLE, TYPE, VERSION, W, XREF_STM,
 };
-use crate::object::dict::probe_dict;
 use crate::object::indirect::IndirectObject;
 use crate::object::{Array, MaybeRef};
 use crate::object::{DateTime, Dict};
@@ -19,7 +18,7 @@ use crate::object::{Object, ObjectLike};
 use crate::pdf::PdfVersion;
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt};
-use crate::sync::{Arc, FxHashMap};
+use crate::sync::{Arc, FxHashMap, OnceLock};
 use crate::trivia::{is_eol_character, is_white_space_character};
 use crate::util::findr_needle;
 use crate::{PdfData, object};
@@ -30,6 +29,10 @@ use alloc::vec::Vec;
 use core::cmp::max;
 use core::iter;
 use core::ops::Deref;
+
+mod scan;
+
+use scan::{Keys, Scan};
 
 pub(crate) const XREF_ENTRY_LEN: usize = 20;
 
@@ -93,16 +96,17 @@ struct Listed {
 
 #[cfg(test)]
 std::thread_local! {
-    /// The bytes that opening files has read on this thread to check their tables
-    /// and to scan the files whose tables are rebuilt: what the read objects span,
-    /// and the whole span a read was allowed where it failed. The tests bound it to
-    /// show that opening a file reads each part of it a bounded number of times.
+    /// The work opening files has done on this thread to check their tables and to
+    /// scan the files whose tables are rebuilt: the bytes read, and the blocks, tree
+    /// nodes and outcomes a scan looks at (`scan::Scan`). The tests bound it to show
+    /// that opening a file reads each part of it a bounded number of times.
     pub(crate) static OPEN_BYTES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-fn opened(bytes: usize) {
-    OPEN_BYTES.set(OPEN_BYTES.get() + bytes);
+#[inline]
+fn opened(_bytes: usize) {
+    #[cfg(test)]
+    OPEN_BYTES.set(OPEN_BYTES.get() + _bytes);
 }
 
 // Check that each entry leads to its object before any object is read: a table with
@@ -205,11 +209,20 @@ fn fallback_xref_map<'a>(
     password: &[u8],
     listed: &[Listed],
 ) -> (XrefMap, Option<XRefInput<'a>>) {
-    fallback_xref_map_inner(data, ReaderContext::dummy(), true, password, listed)
+    let mut scan = Scan::new(data.as_ref());
+    fallback_xref_map_inner(
+        data,
+        &mut scan,
+        ReaderContext::dummy(),
+        true,
+        password,
+        listed,
+    )
 }
 
 fn fallback_xref_map_inner<'a>(
     data: &'a PdfData,
+    scan: &mut Scan<'_>,
     mut dummy_ctx: ReaderContext<'a>,
     recurse: bool,
     password: &[u8],
@@ -224,8 +237,6 @@ fn fallback_xref_map_inner<'a>(
     let mut r = Reader::new(data.as_ref());
 
     let mut last_obj_num = None;
-    // The end of the part of the file an object was read past a header in.
-    let mut read_past = 0;
 
     loop {
         let cur_pos = r.offset();
@@ -235,21 +246,13 @@ fn fallback_xref_map_inner<'a>(
         // First try to check if we have an object identifier.
         if r.peek_byte().is_some_and(|b: u8| b.is_ascii_digit()) {
             if let Some(obj_id) = scan_header(&mut r) {
-                // Check that the object following it is actually valid before inserting
-                // it. It is read up to the next header, and past it only once for each
-                // part of the file: a damaged object may run into the next, but the
-                // headers in an object read past them, or after one that never ends,
-                // are each read up to the next, not again to the end of the outer one.
-                // The headers met in turn are each searched for from the last, so the
-                // searches, like the reads, take time linear in the file.
-                let data = data.as_ref();
-                let end = next_header(data, r.offset());
-                let mut valid = object_until(data, r.offset(), end);
-                if valid.is_none() && end < data.len() && cur_pos >= read_past {
-                    valid = object_until(data, r.offset(), data.len());
-                    read_past = valid.unwrap_or(data.len());
-                }
-                if valid.is_some() {
+                // Check that an object follows the header, read to its end however
+                // far that is, as reading it does: the scan reads each part of the
+                // file a bounded number of times however many objects it holds.
+                let mut body = r.clone();
+                body.skip_white_spaces_and_comments();
+                opened(body.offset() - r.offset());
+                if scan.object(body.offset(), Keys::Skipped).is_some() {
                     xref_map.insert(obj_id, EntryType::Normal(cur_pos));
                     found.push((obj_id, cur_pos));
                     last_obj_num = Some(obj_id);
@@ -261,17 +264,17 @@ fn fallback_xref_map_inner<'a>(
             }
         } else {
             // Then, try to check whether we have a dictionary, in particular a trailer
-            // dictionary.
-            let mut probe_reader = r.clone();
+            // dictionary: the scan finds where it ends and whether it has the keys
+            // that make one worth reading.
             if r.peek_bytes(2).is_some_and(|b| b == b"<<")
-                && let Some(probe) =
-                    { probe_dict(&mut probe_reader, &dummy_ctx, Some(b"<<"), b">>") }
+                && let Some(found) = scan.object(cur_pos, Keys::Read)
             {
-                r = probe_reader;
-                if probe.has_root || probe.has_type {
-                    let mut dict_reader = Reader::new(probe.data);
+                r.jump(found.end);
+                if found.root || found.kind {
+                    opened(found.end - cur_pos);
+                    let mut dict_reader = Reader::new(&data.as_ref()[cur_pos..found.end]);
                     if let Some(dict) = dict_reader.read_with_context::<Dict<'_>>(&dummy_ctx) {
-                        if probe.has_root && dict.contains_key(ROOT) {
+                        if found.root && dict.contains_key(ROOT) {
                             trailer_dicts.push(dict.clone());
                         }
 
@@ -333,63 +336,63 @@ fn fallback_xref_map_inner<'a>(
 
     keep_listed(&mut xref_map, &found, listed);
 
-    // Try to choose the right trailer dict by doing basic validation.
-    let mut trailer_dict = None;
-
-    for dict in trailer_dicts {
-        if let Some(root_id) = dict.get_raw::<Dict<'_>>(ROOT) {
-            let check = |dict: &Dict<'_>| -> bool { dict.contains_key(PAGES) };
-
-            match root_id {
-                MaybeRef::Ref(r) => match xref_map.get(&r.into()) {
-                    Some(EntryType::Normal(offset)) => {
-                        let mut reader = Reader::new(&data.as_ref()[*offset..]);
-                        let mut ctx = dummy_ctx.clone();
-                        ctx.set_obj_number(r.into());
-
-                        if let Some(obj) =
-                            reader.read_with_context::<IndirectObject<Dict<'_>>>(&ctx)
-                            && {
-                                let obj = obj.get();
-                                check(&obj)
-                            }
-                        {
-                            trailer_dict = Some(dict);
-                        }
-                    }
-                    Some(EntryType::ObjStream(obj_num, idx)) => {
-                        let stream_id = ObjectIdentifier::new(*obj_num as i32, 0);
-                        if let Some(EntryType::Normal(offset)) = xref_map.get(&stream_id) {
-                            let mut reader = Reader::new(&data.as_ref()[*offset..]);
-                            let mut ctx = dummy_ctx.clone();
-                            ctx.set_obj_number(stream_id);
-
-                            if let Some(stream) =
-                                reader.read_with_context::<IndirectObject<Stream<'_>>>(&ctx)
-                                && {
-                                    let stream = stream.get();
-                                    if let Some(object_stream) = ObjectStream::new(&stream)
-                                        && let Some(obj) =
-                                            object_stream.get::<Dict<'_>>(*idx, &dummy_ctx)
-                                    {
-                                        check(&obj)
-                                    } else {
-                                        false
-                                    }
-                                }
-                            {
-                                trailer_dict = Some(dict);
-                            }
-                        }
-                    }
-                    _ => {}
-                },
-                MaybeRef::NotRef(d) => {
-                    if check(&d) {
-                        trailer_dict = Some(dict);
-                    }
-                }
+    // Try to choose the right trailer dict by doing basic validation: the last whose
+    // /Root is a dictionary with /Pages. Each catalog the trailers name is read once,
+    // however many name it or entries lead to it.
+    let has_pages = |dict: &Dict<'_>| -> bool { dict.contains_key(PAGES) };
+    let catalog_has_pages = |id: ObjectIdentifier| -> bool {
+        match xref_map.get(&id) {
+            Some(EntryType::Normal(offset)) => {
+                let mut reader = Reader::new(data.as_ref());
+                reader.jump(*offset);
+                let mut ctx = dummy_ctx.clone();
+                ctx.set_obj_number(id);
+                let catalog = reader.read_with_context::<IndirectObject<Dict<'_>>>(&ctx);
+                opened(reader.offset() - offset);
+                catalog.is_some_and(|catalog| has_pages(&catalog.get()))
             }
+            Some(EntryType::ObjStream(obj_num, idx)) => {
+                let stream_id = ObjectIdentifier::new(*obj_num as i32, 0);
+                let Some(EntryType::Normal(offset)) = xref_map.get(&stream_id) else {
+                    return false;
+                };
+                let mut reader = Reader::new(data.as_ref());
+                reader.jump(*offset);
+                let mut ctx = dummy_ctx.clone();
+                ctx.set_obj_number(stream_id);
+                let stream = reader.read_with_context::<IndirectObject<Stream<'_>>>(&ctx);
+                opened(reader.offset() - offset);
+                stream
+                    .and_then(|stream| ObjectStream::new(&stream.get()))
+                    .is_some_and(|objects| {
+                        objects
+                            .get::<Dict<'_>>(id, *idx, &dummy_ctx)
+                            .is_some_and(|catalog| has_pages(&catalog))
+                    })
+            }
+            None => false,
+        }
+    };
+    let mut catalogs = FxHashMap::default();
+    let mut trailer_dict = None;
+    for dict in trailer_dicts {
+        let valid = match dict.get_raw::<Dict<'_>>(ROOT) {
+            Some(MaybeRef::Ref(r)) => {
+                let id = ObjectIdentifier::from(r);
+                // An object at an offset is the same dictionary under any entry.
+                let read = match xref_map.get(&id) {
+                    Some(EntryType::Normal(offset)) => (Some(*offset), None),
+                    _ => (None, Some(id)),
+                };
+                *catalogs
+                    .entry(read)
+                    .or_insert_with(|| catalog_has_pages(id))
+            }
+            Some(MaybeRef::NotRef(d)) => has_pages(&d),
+            None => false,
+        };
+        if valid {
+            trailer_dict = Some(dict);
         }
     }
 
@@ -409,7 +412,8 @@ fn fallback_xref_map_inner<'a>(
             password,
         ) {
             let ctx = ReaderContext::new(&xref, false);
-            let (patched_map, _) = fallback_xref_map_inner(data, ctx, false, password, listed);
+            let (patched_map, _) =
+                fallback_xref_map_inner(data, scan, ctx, false, password, listed);
             xref_map = patched_map;
         }
     }
@@ -448,39 +452,6 @@ fn scan_header(r: &mut Reader<'_>) -> Option<ObjectIdentifier> {
         *r = header;
     }
     id
-}
-
-/// Where the object at `from` in `data[..to]` ends, if it ends there.
-fn object_until(data: &[u8], from: usize, to: usize) -> Option<usize> {
-    let mut object = Reader::new(&data[..to]);
-    object.jump(from);
-    object.skip_white_spaces_and_comments();
-    let end = object.skip::<Object<'_>>(false).map(|_| object.offset());
-    #[cfg(test)]
-    opened(end.unwrap_or(to) - from);
-    end
-}
-
-/// Where the first header at or after `from` starts, or the end of `data`: a header
-/// begins a number that follows no digit, outside a comment.
-fn next_header(data: &[u8], from: usize) -> usize {
-    let mut at = from;
-    while at < data.len() {
-        if data[at] == b'%' {
-            at += data[at..]
-                .iter()
-                .position(|b| is_eol_character(*b))
-                .unwrap_or(data.len() - at);
-        } else if data[at].is_ascii_digit()
-            && !data[at - 1].is_ascii_digit()
-            && scan_header(&mut Reader::new(&data[at..])).is_some()
-        {
-            return at;
-        } else {
-            at += 1;
-        }
-    }
-    data.len()
 }
 
 /// Adds to the rebuilt table `xref_map` the entries of the old table, `listed`, whose
@@ -717,13 +688,16 @@ impl XRef {
 
                 // Try to yield in the order the objects appeared in the
                 // PDF.
-                elements.sort_by(|e1, e2| e1.1.cmp(&e2.1));
+                elements.sort_by_key(|element| element.1);
 
                 let mut iter = elements.into_iter();
+                let ctx = ReaderContext::new(self, false);
+                // Entries that lead to one object parse it once.
+                let mut parsed = Parsed::default();
 
                 iter::from_fn(move || {
                     for next in iter.by_ref() {
-                        if let Some(obj) = self.get_with(next.0, &ReaderContext::new(self, false)) {
+                        if let Some(obj) = self.get_parsed(next.0, &ctx, &mut parsed) {
                             return Some(obj);
                         } else {
                             // Skip invalid objects.
@@ -831,6 +805,57 @@ impl XRef {
     where
         T: ObjectLike<'a>,
     {
+        let (repr, entry, ctx) = self.entry(id, ctx)?;
+        match entry {
+            // An object is at the offset, as `check` or the scan that rebuilt the
+            // table found it; one that is not of the type the caller expects is no
+            // such object.
+            EntryType::Normal(offset) => {
+                let mut r = Reader::new(repr.data.get().as_ref());
+                r.jump(offset);
+
+                r.read_with_context::<IndirectObject<T>>(&ctx)
+                    .map(IndirectObject::get)
+            }
+            EntryType::ObjStream(stream, index) => self.compressed(id, stream, index, &ctx),
+        }
+    }
+
+    /// Object `id`, as [`Self::get_with`] reads it, from what `parsed` holds of an
+    /// object read before at the same offset of the file under another entry.
+    ///
+    /// Entries of a damaged table that lead to one object are each that object, read
+    /// in its own context, but the object's bytes are parsed once: `parsed` keeps
+    /// only what reading them finds under any entry, its syntax.
+    pub(crate) fn get_parsed<'a>(
+        &'a self,
+        id: ObjectIdentifier,
+        ctx: &ReaderContext<'a>,
+        parsed: &mut Parsed<'a>,
+    ) -> Option<Object<'a>> {
+        let (repr, entry, ctx) = self.entry(id, ctx)?;
+        let data = repr.data.get().as_ref();
+        match entry {
+            EntryType::Normal(offset) => parsed
+                .0
+                .entry(offset)
+                .or_insert_with(|| Syntax::read(data, offset, &ctx))
+                .as_ref()?
+                .in_context(data, &ctx),
+            // An entry into an object stream is the only one leading to its object.
+            EntryType::ObjStream(stream, index) => self.compressed(id, stream, index, &ctx),
+        }
+    }
+
+    /// The entry of object `id`, and the context to read it in, reached from `ctx`:
+    /// what is read from it is decrypted, cached and checked for cycles as `id`, the
+    /// entry it is reached through, whatever its header says. This is the only place
+    /// that names the object a context reads.
+    fn entry<'a>(
+        &'a self,
+        id: ObjectIdentifier,
+        ctx: &ReaderContext<'a>,
+    ) -> Option<(&'a SomeRepr, EntryType, ReaderContext<'a>)> {
         #[cfg(test)]
         RESOLVED.with_borrow_mut(|resolved| {
             if let Some(resolved) = resolved {
@@ -845,44 +870,110 @@ impl XRef {
         // References to undefined objects are treated as null.
         let entry = *repr.map.get(&id)?;
 
-        if ctx.parent_chain_contains(&id) {
+        if ctx.rejects(&id) {
             warn!("cycle detected in indirect object: {id:?}");
 
             return None;
         }
 
-        // The object is `id`, the entry it was reached through: what is read from it
-        // is decrypted, cached and checked for cycles as `id`, whatever its header
-        // says. This is the only place that names the object a context reads.
         let mut ctx = ctx.clone();
         ctx.set_obj_number(id);
         ctx.parent_chain_push(id);
         ctx.set_in_content_stream(false);
+        ctx.set_in_object_stream(matches!(entry, EntryType::ObjStream(..)));
+        Some((repr, entry, ctx))
+    }
 
-        match entry {
-            // An object is at the offset, as `check` or the scan that rebuilt the
-            // table found it; one that is not of the type the caller expects is no
-            // such object.
-            EntryType::Normal(offset) => {
-                ctx.set_in_object_stream(false);
-                let mut r = Reader::new(repr.data.get().as_ref());
-                r.jump(offset);
+    /// Object `id`, which its entry puts at `index` of object stream `stream`.
+    fn compressed<'a, T>(
+        &'a self,
+        id: ObjectIdentifier,
+        stream: u32,
+        index: u32,
+        ctx: &ReaderContext<'a>,
+    ) -> Option<T>
+    where
+        T: ObjectLike<'a>,
+    {
+        let Inner::Some(repr) = &self.0 else {
+            return None;
+        };
+        // Generation number is implicitly 0.
+        let stream = ObjectIdentifier::new(stream as i32, 0);
+        if stream == id {
+            warn!("cycle detected in object stream");
 
-                r.read_with_context::<IndirectObject<T>>(&ctx)
-                    .map(IndirectObject::get)
+            return None;
+        }
+
+        repr.data.get_with(stream, ctx)?.get(id, index, ctx)
+    }
+}
+
+/// What reading the object at each offset of the file found, by offset, for
+/// [`XRef::get_parsed`].
+#[derive(Default)]
+pub(crate) struct Parsed<'a>(FxHashMap<usize, Option<Syntax<'a>>>);
+
+/// What reading an indirect object finds whatever entry it is read for: the context
+/// an entry reads it in does not change how it parses.
+enum Syntax<'a> {
+    /// An object, read in the context of the first entry it was read for, which
+    /// starts at `at`.
+    Object { object: Object<'a>, at: usize },
+    /// A stream's dictionary, and where the dictionary ends: the stream's data is
+    /// found by its /Length, which may be an object, read in each entry's context.
+    Stream { dict: Dict<'a>, end: usize },
+}
+
+impl<'a> Syntax<'a> {
+    fn read(data: &'a [u8], offset: usize, ctx: &ReaderContext<'a>) -> Option<Self> {
+        let mut r = Reader::new(data);
+        r.jump(offset);
+        r.skip::<ObjectIdentifier>(false)?;
+        r.skip_white_spaces_and_comments();
+        let at = r.offset();
+        // As `Object::read` reads an indirect object.
+        if r.peek_bytes(2) == Some(b"<<") {
+            let dict = r.read_with_context::<Dict<'a>>(ctx)?;
+            let end = r.offset();
+            r.skip_white_spaces_and_comments();
+            if r.forward_tag(b"stream").is_some() {
+                return Some(Self::Stream { dict, end });
             }
-            EntryType::ObjStream(obj_stram_gen_num, index) => {
-                // Generation number is implicitly 0.
-                let obj_stream_id = ObjectIdentifier::new(obj_stram_gen_num as i32, 0);
+            return Some(Self::Object {
+                object: Object::Dict(dict),
+                at,
+            });
+        }
+        let object = r.read_with_context::<Object<'a>>(ctx)?;
+        Some(Self::Object { object, at })
+    }
 
-                if obj_stream_id == id {
-                    warn!("cycle detected in object stream");
-
-                    return None;
+    /// The object read in `ctx`.
+    fn in_context(&self, data: &'a [u8], ctx: &ReaderContext<'a>) -> Option<Object<'a>> {
+        match self {
+            Self::Stream { dict, end } => {
+                let mut r = Reader::new(data);
+                r.jump(*end);
+                Stream::after_dict(&mut r, dict.in_context(ctx)).map(Object::Stream)
+            }
+            Self::Object { object, at } => Some(match object {
+                Object::Dict(dict) => Object::Dict(dict.in_context(ctx)),
+                Object::Array(array) => Object::Array(array.in_context(ctx)),
+                // A string is decrypted as the object it is read for.
+                Object::String(_) if ctx.xref().needs_decryption(ctx) => {
+                    let mut r = Reader::new(data);
+                    r.jump(*at);
+                    r.read_with_context::<Object<'a>>(ctx)?
                 }
-
-                repr.data.get_with(obj_stream_id, &ctx)?.get(index, &ctx)
-            }
+                Object::Null(_)
+                | Object::Boolean(_)
+                | Object::Number(_)
+                | Object::String(_)
+                | Object::Name(_) => object.clone(),
+                Object::Stream(_) => unreachable!("a stream is read as `Self::Stream`"),
+            }),
         }
     }
 }
@@ -1320,6 +1411,9 @@ pub(crate) struct ObjectStream {
     data: Vec<u8>,
     /// Each object's number and offset in `data`.
     offsets: Vec<(u32, usize)>,
+    /// The index of the last object of each number, built the first time an entry's
+    /// index names another object.
+    by_number: OnceLock<FxHashMap<u32, usize>>,
 }
 
 impl ObjectStream {
@@ -1343,14 +1437,34 @@ impl ObjectStream {
         #[cfg(test)]
         OBJECT_STREAM_ENTRIES.set(OBJECT_STREAM_ENTRIES.get() + offsets.len());
 
-        Some(Self { data, offsets })
+        Some(Self {
+            data,
+            offsets,
+            by_number: OnceLock::new(),
+        })
     }
 
-    fn get<'a, T>(&'a self, index: u32, ctx: &ReaderContext<'a>) -> Option<T>
+    /// Object `id`, which an entry puts at `index`: the stream's header names the
+    /// number of each object it holds, and an index that names another object is
+    /// damaged, so the object of `id`'s number is read wherever it is in the stream,
+    /// or none where the stream holds none.
+    fn get<'a, T>(&'a self, id: ObjectIdentifier, index: u32, ctx: &ReaderContext<'a>) -> Option<T>
     where
         T: ObjectLike<'a>,
     {
-        let offset = self.offsets.get(index as usize)?.1;
+        let number = u32::try_from(id.obj_number).ok()?;
+        let offset = match self.offsets.get(index as usize) {
+            Some(&(listed, offset)) if listed == number => offset,
+            _ => {
+                let by_number = self.by_number.get_or_init(|| {
+                    let numbers = self.offsets.iter().enumerate();
+                    numbers
+                        .map(|(index, (number, _))| (*number, index))
+                        .collect()
+                });
+                self.offsets[*by_number.get(&number)?].1
+            }
+        };
         let mut r = Reader::new(&self.data);
         r.jump(offset);
         r.skip_white_spaces_and_comments();
@@ -1476,12 +1590,16 @@ mod tests {
 
     /// Object 4 holding `n` times `unit`, in a file whose table is rebuilt.
     fn repeated(unit: &str, n: usize) -> Vec<u8> {
-        let body = format!("4 0 obj\n{}\nendobj\n", unit.repeat(n));
-        file_with(body.as_bytes(), &[0], true)
+        around(&unit.repeat(n))
     }
 
-    /// The bytes opening `file` reads, after checking it opens to the 100 × 100 page.
-    fn bytes_read(file: &[u8]) -> usize {
+    /// Object 4 holding `body`, in a file whose table is rebuilt.
+    fn around(body: &str) -> Vec<u8> {
+        file_with(format!("4 0 obj\n{body}\nendobj\n").as_bytes(), &[0], true)
+    }
+
+    /// The work opening `file` takes, after checking it opens to the 100 × 100 page.
+    fn work(file: &[u8]) -> usize {
         OPEN_BYTES.set(0);
         let pdf = crate::Pdf::new(file.to_vec()).unwrap();
         let read = OPEN_BYTES.get();
@@ -1494,11 +1612,12 @@ mod tests {
     // Opening a file reads each part of it a bounded number of times: to check the
     // table, however many entries lead to one object or into objects that hold
     // others, and to scan a file whose table is rebuilt, however many headers,
-    // strings and comments the objects hold.
+    // strings, comments and dictionaries its objects hold, however they nest, and
+    // whether or not they end. Each family's work doubles with the file.
     #[test]
     fn opening_a_file_reads_it_in_linear_time() {
         type Family = (&'static str, fn(usize) -> Vec<u8>);
-        let families: [Family; 9] = [
+        let families: [Family; 19] = [
             ("aliases", |n| aliases(n, false)),
             ("nested", |n| nested(n, false, false)),
             ("nested after space", |n| nested(n, true, false)),
@@ -1508,23 +1627,241 @@ mod tests {
             ("unterminated strings", |n| repeated("( 5 0 obj ", n)),
             ("comments", |n| repeated("1 %x ", n)),
             ("headers split by comments", |n| repeated("9 %x\n0 obj ", n)),
+            // Each probe of a dictionary reads to the end of the file (#53).
+            ("dictionaries over unterminated strings", |n| {
+                repeated("<< /A ( ", n)
+            }),
+            ("nested dictionaries around an unterminated string", |n| {
+                around(&format!("{}(", "<< /A ".repeat(n)))
+            }),
+            ("nested dictionaries", |n| {
+                around(&format!("{}{}", "<< /A ".repeat(n), ">> ".repeat(n)))
+            }),
+            ("headers in nested arrays", |n| repeated("5 0 obj [ ", n)),
+            // Objects after one whose string never ends, each holding a header in a
+            // string: each is found.
+            ("objects after an unterminated string", |n| {
+                let objects = "5 0 obj << /T (9 0 obj) >> endobj ".repeat(n);
+                around(&format!("( endobj {objects}"))
+            }),
+            // Strings opened at escaped parentheses end with the string around them,
+            // where readings from each header meet, before a long tail.
+            ("headers in strings that end together", |n| {
+                let tail = "/x ".repeat(n);
+                around(&format!("[ ( {}) {tail}]", "5 0 obj [ \\( ".repeat(n)))
+            }),
+            // So too where they end in a comment line, before its end.
+            ("headers in strings that end in a comment", |n| {
+                let tail = "/x ".repeat(n);
+                around(&format!("[ x% {}) \n{tail}]", "5 0 obj [ \\( ".repeat(n)))
+            }),
+            // Readings started in a comment line, open where it ends.
+            ("headers in a comment line", |n| {
+                let tail = "/x ".repeat(n);
+                around(&format!(
+                    "[ x% {}\n{tail}{}",
+                    "5 0 obj [ ".repeat(50),
+                    "] ".repeat(51)
+                ))
+            }),
+            // Strings nested in each other end one after another in a line, each
+            // before a different `%` of it: each reading leaves its string there and
+            // reads a comment to the end of the line.
+            ("comments entered at each string end of a line", |n| {
+                around(&format!(
+                    "{}{}\n",
+                    "5 0 obj [ ( ".repeat(n),
+                    "% ) ".repeat(n)
+                ))
+            }),
+            // A trailer names a large catalog many times.
+            ("trailers naming a large catalog", |n| {
+                let catalog = format!(
+                    "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Pad [{}] >>\nendobj\n",
+                    " 0".repeat(n)
+                );
+                let trailers = "trailer << /Root 1 0 R >> ".repeat(n);
+                file_with(format!("{catalog}{trailers}").as_bytes(), &[], true)
+            }),
         ];
         for (family, file) in families {
             let [small, large] = [1000, 2000].map(|n| {
                 let file = file(n);
-                let read = bytes_read(&file);
+                let work = work(&file);
                 assert!(
-                    read <= 6 * file.len(),
-                    "{family}: {read} bytes read to open {} bytes",
+                    work <= 12 * file.len(),
+                    "{family}: {work} steps to open {} bytes",
                     file.len()
                 );
-                read
+                work
             });
+            // A string or comment costs a lookup logarithmic in the file, and where a
+            // string ends among blocks varies with the size.
             assert!(
-                large <= small * 22 / 10,
-                "{family}: {small} bytes read for 1000, {large} for 2000"
+                large <= small * 25 / 10,
+                "{family}: {small} steps for 1000, {large} for 2000"
             );
         }
+    }
+
+    /// A stream object of `data`, with `dict` written into its dictionary.
+    fn stream(dict: &str, data: &str) -> String {
+        format!(
+            "<< {dict} /Length {} >>\nstream\n{data}\nendstream",
+            data.len()
+        )
+    }
+
+    /// An object stream of `objects`, with `dict` written into its dictionary.
+    fn object_stream(dict: &str, objects: &[(u32, &str)]) -> String {
+        let mut header = String::new();
+        let mut body = String::new();
+        for (number, object) in objects {
+            header += &format!("{number} {} ", body.len());
+            body += object;
+            body.push('\n');
+        }
+        let first = header.len();
+        let length = header.len() + body.len();
+        format!(
+            "<< /Type /ObjStm /N {} /First {first} {dict} >>\nstream\n{header}{body}\nendstream",
+            objects.len()
+        )
+        .replace("/Length LEN", &format!("/Length {length}"))
+    }
+
+    /// A file of `objects` whose table is an xref stream listing them and the
+    /// `compressed` objects, each by number, object stream and index, with catalog 1.
+    fn file_with_stream_table(
+        objects: &[(u32, String)],
+        compressed: &[(u32, u32, u32)],
+    ) -> Vec<u8> {
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut entries = FxHashMap::default();
+        for (number, object) in objects {
+            entries.insert(*number, (1_u8, out.len() as u32, 0_u16));
+            out.extend(format!("{number} 0 obj\n{object}\nendobj\n").bytes());
+        }
+        for (number, stream, index) in compressed {
+            entries.insert(*number, (2, *stream, *index as u16));
+        }
+        let table = 1 + entries
+            .keys()
+            .chain(objects.iter().map(|(n, _)| n))
+            .max()
+            .unwrap();
+        let offset = out.len() as u32;
+        entries.insert(table, (1, offset, 0));
+        let mut data = vec![];
+        for number in 0..=table {
+            let (kind, field, index) = entries.get(&number).copied().unwrap_or((0, 0, 0));
+            data.push(kind);
+            data.extend(field.to_be_bytes());
+            data.extend(index.to_be_bytes());
+        }
+        out.extend(
+            format!(
+                "{table} 0 obj\n<< /Type /XRef /Size {} /W [1 4 2] /Root 1 0 R /Length {} >>\nstream\n",
+                table + 1,
+                data.len()
+            )
+            .bytes(),
+        );
+        out.extend(data);
+        out.extend(format!("\nendstream\nendobj\nstartxref\n{offset}\n%%EOF\n").bytes());
+        out
+    }
+
+    /// The size and content of the one page `file` opens to.
+    fn one_page(file: Vec<u8>) -> (f64, f64, Vec<u8>) {
+        let pdf = crate::Pdf::new(file).unwrap();
+        let pages = pdf.pages();
+        assert_eq!(pages.len(), 1);
+        let media_box = pages[0].media_box();
+        let content = pages[0].page_stream().unwrap_or_default().to_vec();
+        (
+            media_box.x1 - media_box.x0,
+            media_box.y1 - media_box.y0,
+            content,
+        )
+    }
+
+    const CATALOG: &str = "<< /Type /Catalog /Pages 2 0 R >>";
+    const TREE: &str = "<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
+    const BLUE: &str = "0 0 1 rg 10 10 100 100 re f";
+    const RED: &str = "1 0 0 rg 10 10 50 50 re f";
+
+    // An entry into an object stream is the object of its number, whatever index the
+    // entry names: the stream's header lists the number of each object it holds.
+    #[test]
+    fn an_object_stream_entry_reads_the_object_of_its_number() {
+        let page = |size: &str, content: u32| {
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {size}] /Contents {content} 0 R >>"
+            )
+        };
+        let (blue, red) = (page("600 700", 6), page("100 200", 7));
+        let objects = |order: &[(u32, &str)]| {
+            vec![
+                (1, CATALOG.to_string()),
+                (2, TREE.to_string()),
+                (5, object_stream("/Length LEN", order)),
+                (6, stream("", BLUE)),
+                (7, stream("", RED)),
+            ]
+        };
+        for (order, index) in [
+            ([(3, blue.as_str()), (4, red.as_str())], 1),
+            ([(3, blue.as_str()), (4, red.as_str())], 7),
+            ([(4, red.as_str()), (3, blue.as_str())], 0),
+        ] {
+            let file =
+                file_with_stream_table(&objects(&order), &[(3, 5, index), (4, 5, 0), (9, 5, 0)]);
+            let pdf = crate::Pdf::new(file.clone()).unwrap();
+            assert!(
+                pdf.xref()
+                    .get::<Object<'_>>(ObjectIdentifier::new(9, 0))
+                    .is_none()
+            );
+            assert_eq!(one_page(file), (600.0, 700.0, BLUE.as_bytes().to_vec()));
+        }
+    }
+
+    // An object stream whose /Length is an object it holds is read: reading the
+    // length meets the stream being read, which fails that read only, and the stream
+    // is read as one whose length is unknown.
+    #[test]
+    fn an_object_stream_holding_its_length_is_read() {
+        let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] /Contents 7 0 R >>";
+        let holding = object_stream("/Length 6 0 R", &[(3, page), (6, "0")]);
+        let length = holding.find("stream\n").unwrap() + 7;
+        let length = holding.len() - length - "\nendstream".len();
+        let holding = holding.replacen("0\n\nendstream", &format!("{length}\n\nendstream"), 1);
+        let objects = vec![
+            (1, CATALOG.to_string()),
+            (2, TREE.to_string()),
+            (5, holding),
+            (7, stream("", BLUE)),
+        ];
+        let file = file_with_stream_table(&objects, &[(3, 5, 0), (6, 5, 1)]);
+        assert_eq!(one_page(file), (600.0, 700.0, BLUE.as_bytes().to_vec()));
+    }
+
+    // A page after an object whose string never ends is found, though its own string
+    // holds a header: rebuilding the table reads each object to its end.
+    #[test]
+    fn a_page_after_an_unterminated_string_is_found() {
+        let body = format!(
+            "1 0 obj\n{CATALOG}\nendobj\n2 0 obj\n{TREE}\nendobj\n4 0 obj\n(\nendobj\n\
+             3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] /Title (8 0 obj) \
+             /Contents 5 0 R >>\nendobj\n5 0 obj\n{}\nendobj\n",
+            stream("", BLUE)
+        );
+        let file = format!("%PDF-1.7\n{body}trailer\n<< /Root 1 0 R >>\nstartxref\n9\n%%EOF\n");
+        assert_eq!(
+            one_page(file.into_bytes()),
+            (600.0, 700.0, BLUE.as_bytes().to_vec())
+        );
     }
 
     #[test]

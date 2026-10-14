@@ -1335,6 +1335,85 @@ mod tests {
         parsed
     }
 
+    /// A file whose pages are `n` entries of its table that lead to one page of an
+    /// array of `n` numbers: the table is rebuilt, and keeps the entries. Without a
+    /// `tree`, the catalog's /Pages is free, and every page object is a page.
+    fn aliased_page(n: usize, tree: bool) -> Vec<u8> {
+        let kids: Vec<String> = (5..n + 5).map(|k| format!("{k} 0 R")).collect();
+        let catalog = if tree {
+            CATALOG
+        } else {
+            "<< /Type /Catalog /Pages 4 0 R >>"
+        };
+        let objects = [
+            catalog.to_string(),
+            format!("<< /Type /Pages /Kids [{}] /Count {n} >>", kids.join(" ")),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 2 0 R /Pad [{}] >>",
+                " 0".repeat(n)
+            ),
+        ];
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut offsets = vec![];
+        for (k, object) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend(format!("{} 0 obj\n{object}\nendobj\n", k + 1).bytes());
+        }
+        let page = offsets[2];
+        let xref = out.len();
+        out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", n + 5).bytes());
+        for offset in offsets
+            .iter()
+            .copied()
+            .chain([0])
+            .chain(core::iter::repeat_n(page, n))
+        {
+            let kind = if offset == 0 { "00000 f" } else { "00000 n" };
+            out.extend(format!("{offset:010} {kind} \n").bytes());
+        }
+        out.extend(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                n + 5
+            )
+            .bytes(),
+        );
+        out
+    }
+
+    // So too where the page tree lists no page, and every page object is a page.
+    #[test]
+    fn entries_leading_to_one_object_without_a_page_tree_parse_it_once() {
+        let [small, large] = [250, 500].map(|n| {
+            let file = aliased_page(n, false);
+            let pdf = Pdf::new(file.clone()).unwrap();
+            // The entries, and the table's entry of the page's own number.
+            assert_eq!(pdf.pages().len(), n + 1);
+            parsed(file, 0).1
+        });
+        assert!(
+            large <= small * 22 / 10,
+            "{small} bytes parsed for 250, {large} for 500"
+        );
+    }
+
+    // Entries of a damaged table that lead to one object are each a page, but the
+    // object is parsed once: loading the pages parses bytes linear in the file.
+    #[test]
+    fn entries_leading_to_one_object_parse_it_once() {
+        let [small, large] = [250, 500].map(|n| {
+            let file = aliased_page(n, true);
+            let pdf = Pdf::new(file.clone()).unwrap();
+            assert_eq!(pdf.pages().len(), n);
+            assert!(pdf.pages().iter().all(|page| page.media_box().x1 == 100.0));
+            parsed(file, 0).1
+        });
+        assert!(
+            large <= small * 22 / 10,
+            "{small} bytes parsed for 250, {large} for 500"
+        );
+    }
+
     // Pages that share their resources, through a node or as one object, directly or
     // through an object of their own, share each category, parsed once: a file with
     // `n` pages and `n` fonts that every page has is parsed in time linear in it.

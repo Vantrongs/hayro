@@ -5,6 +5,7 @@ use crate::object::dict::keys::{KIDS, MEDIA_BOX, PAGES, TYPE};
 use crate::object::{Dict, MaybeRef, Name, Object, ObjectIdentifier};
 use crate::reader::ReaderContext;
 use crate::sync::FxHashMap;
+use crate::xref::Parsed;
 
 /// A page tree entry: a dictionary, or an empty one for any other object.
 #[derive(Clone)]
@@ -85,6 +86,9 @@ pub(super) fn dict_of(object: Object<'_>) -> Option<Dict<'_>> {
 pub(super) struct Objects<'a> {
     ctx: ReaderContext<'a>,
     objects: FxHashMap<ObjectIdentifier, Option<Object<'a>>>,
+    /// What reading the objects found at each offset of the file, so that objects
+    /// of a damaged table whose entries lead to one object are each parsed once.
+    parsed: Parsed<'a>,
 }
 
 impl<'a> Objects<'a> {
@@ -92,6 +96,7 @@ impl<'a> Objects<'a> {
         Self {
             ctx,
             objects: FxHashMap::default(),
+            parsed: Parsed::default(),
         }
     }
 
@@ -119,10 +124,10 @@ impl<'a> Objects<'a> {
             MaybeRef::NotRef(object) => Some(object),
             MaybeRef::Ref(id) => {
                 let id = ObjectIdentifier::from(id);
-                let ctx = &self.ctx;
+                let (ctx, parsed) = (&self.ctx, &mut self.parsed);
                 self.objects
                     .entry(id)
-                    .or_insert_with(|| ctx.xref().get_with(id, ctx))
+                    .or_insert_with(|| ctx.xref().get_parsed(id, ctx, parsed))
                     .clone()
             }
         }

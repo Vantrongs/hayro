@@ -52,6 +52,14 @@ impl<'a> Array<'a> {
     pub fn data(&self) -> &'a [u8] {
         self.data
     }
+
+    /// The array of the same bytes, read in `ctx`.
+    pub(crate) fn in_context(&self, ctx: &ReaderContext<'a>) -> Self {
+        Self {
+            data: self.data,
+            ctx: ctx.clone(),
+        }
+    }
 }
 
 impl Debug for Array<'_> {

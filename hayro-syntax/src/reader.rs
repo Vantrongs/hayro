@@ -134,6 +134,37 @@ struct ReaderContextData<'a> {
     in_object_stream: bool,
     obj_number: Option<ObjectIdentifier>,
     parent_chain: SmallVec<[ObjectIdentifier; 8]>,
+    /// While a value shared by every resolution chain is computed: the least index in
+    /// the chain of an object a cycle check rejected (see [`ReaderContext::shared`]).
+    rejected: Option<Arc<Rejected>>,
+}
+
+/// The least index in a resolution chain of an object a cycle check rejected.
+#[derive(Debug)]
+struct Rejected(
+    #[cfg(feature = "std")] core::sync::atomic::AtomicUsize,
+    #[cfg(not(feature = "std"))] core::cell::Cell<usize>,
+);
+
+impl Rejected {
+    fn new() -> Self {
+        Self(usize::MAX.into())
+    }
+
+    fn note(&self, index: usize) {
+        #[cfg(feature = "std")]
+        self.0
+            .fetch_min(index, core::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "std"))]
+        self.0.set(self.0.get().min(index));
+    }
+
+    fn least(&self) -> usize {
+        #[cfg(feature = "std")]
+        return self.0.load(core::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "std"))]
+        return self.0.get();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -154,6 +185,7 @@ impl<'a> ReaderContext<'a> {
             obj_number: None,
             in_object_stream: false,
             parent_chain: smallvec![],
+            rejected: None,
         })))
     }
 
@@ -225,12 +257,56 @@ impl<'a> ReaderContext<'a> {
         }
     }
 
+    /// Whether `id` is being resolved already in this context's chain, which a cycle
+    /// check rejects: a value computed for [`Self::shared`] notes where.
     #[inline]
-    pub(crate) fn parent_chain_contains(&self, id: &ObjectIdentifier) -> bool {
+    pub(crate) fn rejects(&self, id: &ObjectIdentifier) -> bool {
         match &self.0 {
-            ReaderContextInner::Shared(inner) => inner.parent_chain.contains(id),
+            ReaderContextInner::Shared(inner) => {
+                let Some(index) = inner.parent_chain.iter().position(|other| other == id) else {
+                    return false;
+                };
+                if let Some(rejected) = &inner.rejected {
+                    rejected.note(index);
+                }
+                true
+            }
             ReaderContextInner::Dummy { .. } => false,
         }
+    }
+
+    /// The value `compute` finds for an object `id` it resolves first, from this
+    /// context, and whether every resolution chain finds it, so that it may be kept
+    /// for all.
+    ///
+    /// A cycle check rejects an object already being resolved in the chain, so what
+    /// is computed from `id` depends on the chain where a check rejected an object
+    /// the chain held before `id` would be resolved, `id` itself included where the
+    /// chain holds it already; a check rejecting `id` or an object resolved from it
+    /// after that rejects it from any chain.
+    pub(crate) fn shared<T>(&self, compute: impl FnOnce(&Self) -> T) -> (T, bool) {
+        let ReaderContextInner::Shared(inner) = &self.0 else {
+            return (compute(self), true);
+        };
+        // The index `id` is resolved at.
+        let own = inner.parent_chain.len();
+        let rejected = Arc::new(Rejected::new());
+        let mut ctx = self.clone();
+        Arc::make_mut(match &mut ctx.0 {
+            ReaderContextInner::Shared(inner) => inner,
+            ReaderContextInner::Dummy { .. } => unreachable!(),
+        })
+        .rejected = Some(rejected.clone());
+        let value = compute(&ctx);
+        let least = rejected.least();
+        // What depends on this chain depends on it for the value being computed
+        // around this one, if any.
+        if least != usize::MAX
+            && let Some(around) = &inner.rejected
+        {
+            around.note(least);
+        }
+        (value, least >= own)
     }
 
     #[inline]

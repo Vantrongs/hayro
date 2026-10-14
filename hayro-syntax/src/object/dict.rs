@@ -131,7 +131,26 @@ impl<'a> Dict<'a> {
     fn offsets(&self) -> Option<&FxHashMap<Name<'a>, usize>> {
         match &self.0 {
             Inner::Empty => None,
-            Inner::Some(repr) => Some(&repr.offsets),
+            Inner::Some(repr) => Some(repr.offsets()),
+        }
+    }
+
+    /// The dictionary of the same bytes, read in `ctx`: its entries are found as
+    /// they were for this one, without parsing it again.
+    pub(crate) fn in_context(&self, ctx: &ReaderContext<'a>) -> Self {
+        match &self.0 {
+            Inner::Empty => Self::empty(),
+            Inner::Some(repr) => {
+                let parsed = match &repr.offsets {
+                    Offsets::Own(_) => repr.clone(),
+                    Offsets::Of(parsed) => parsed.clone(),
+                };
+                Self(Inner::Some(Arc::new(Repr {
+                    data: repr.data,
+                    offsets: Offsets::Of(parsed),
+                    ctx: ctx.clone(),
+                })))
+            }
         }
     }
 }
@@ -250,7 +269,7 @@ fn read_inner<'a>(
 
     Some(Dict(Inner::Some(Arc::new(Repr {
         data,
-        offsets,
+        offsets: Offsets::Own(offsets),
         ctx: ctx.clone(),
     }))))
 }
@@ -261,48 +280,6 @@ std::thread_local! {
     /// tests bound to show that a dictionary many objects share is parsed once.
     pub(crate) static PARSED: core::cell::Cell<(usize, usize)> =
         const { core::cell::Cell::new((0, 0)) };
-}
-
-pub(crate) struct DictProbe<'a> {
-    pub(crate) data: &'a [u8],
-    pub(crate) has_root: bool,
-    pub(crate) has_type: bool,
-}
-
-// We use that method during fallback xref parsing, so that we can search for
-// the dictionaries we need without allocating the whole hash map.
-// If the above TODOs are ever resolved, we can probably remove this method.
-pub(crate) fn probe_dict<'a>(
-    r: &mut Reader<'a>,
-    ctx: &ReaderContext<'a>,
-    start_tag: Option<&[u8]>,
-    end_tag: &[u8],
-) -> Option<DictProbe<'a>> {
-    let mut has_root = false;
-    let mut has_type = false;
-
-    let data = parse_dict_with(
-        r,
-        ctx,
-        start_tag,
-        end_tag,
-        #[inline]
-        |name, _, _value_reader| {
-            if name.as_ref() == keys::ROOT {
-                has_root = true;
-            } else if name.as_ref() == keys::TYPE {
-                has_type = true;
-            }
-
-            Some(())
-        },
-    )?;
-
-    Some(DictProbe {
-        data,
-        has_root,
-        has_type,
-    })
 }
 
 fn parse_dict_with<'a, F>(
@@ -370,8 +347,24 @@ object!(Dict<'a>, Dict);
 
 struct Repr<'a> {
     data: &'a [u8],
-    offsets: FxHashMap<Name<'a>, usize>,
+    offsets: Offsets<'a>,
     ctx: ReaderContext<'a>,
+}
+
+impl<'a> Repr<'a> {
+    fn offsets(&self) -> &FxHashMap<Name<'a>, usize> {
+        match &self.offsets {
+            Offsets::Own(offsets) => offsets,
+            Offsets::Of(parsed) => parsed.offsets(),
+        }
+    }
+}
+
+/// Where each entry's value starts.
+enum Offsets<'a> {
+    Own(FxHashMap<Name<'a>, usize>),
+    /// Those of a dictionary parsed from the same bytes, which owns them.
+    Of(Arc<Repr<'a>>),
 }
 
 pub(crate) struct InlineImageDict<'a>(Dict<'a>);
