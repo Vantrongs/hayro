@@ -134,23 +134,24 @@ impl<'a> Stream<'a> {
     /// The raw, decrypted data of the stream, or [`DecodeFailure::Decryption`] where
     /// it cannot be decrypted whole.
     ///
-    /// Stream filters will not be applied; a /Crypt filter is not one of them, and is
-    /// left for the caller to drop.
+    /// Stream filters will not be applied. /Crypt filters are: the data are
+    /// decrypted with the crypt filter the first one names, and the others pass the
+    /// data through, so the caller drops them all.
     pub fn try_raw_data(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
-        match self.decryption_object_id() {
+        let Some((id, name)) = self.decryption()? else {
+            return Ok(Cow::Borrowed(self.data));
+        };
+        let target = Self::target(&name);
+        let xref = self.dict.ctx().xref();
+        if self.data.is_empty() {
             // No data has no IV to decrypt with, and holds nothing.
-            Some(_) if self.data.is_empty() => Ok(Cow::Borrowed(self.data)),
-            Some(_) if !self.dict.ctx().xref().decrypts_whole(self.data) => {
-                Err(DecodeFailure::Decryption)
-            }
-            Some(id) => self
-                .dict
-                .ctx()
-                .xref()
-                .decrypt(id, self.data, DecryptionTarget::Stream)
+            Ok(Cow::Borrowed(self.data))
+        } else if !xref.decrypts_whole(self.data, target) {
+            Err(DecodeFailure::Decryption)
+        } else {
+            xref.decrypt(id, self.data, target)
                 .map(Cow::Owned)
-                .ok_or(DecodeFailure::Decryption),
-            None => Ok(Cow::Borrowed(self.data)),
+                .ok_or(DecodeFailure::Decryption)
         }
     }
 
@@ -161,16 +162,18 @@ impl<'a> Stream<'a> {
         meter: &Meter<'_>,
         strict: bool,
     ) -> Result<Cow<'a, [u8]>, DecodeFailure> {
-        let Some(id) = self
-            .decryption_object_id()
-            .filter(|_| !self.data.is_empty())
-        else {
+        let Some((id, name)) = self.decryption()? else {
             return Ok(Cow::Borrowed(self.data));
         };
-        if strict && !self.dict.ctx().xref().decrypts_whole(self.data) {
+        let target = Self::target(&name);
+        let xref = self.dict.ctx().xref();
+        if self.data.is_empty() {
+            return Ok(Cow::Borrowed(self.data));
+        }
+        if strict && !xref.decrypts_whole(self.data, target) {
             return Err(DecodeFailure::Decryption);
         }
-        match self.dict.ctx().xref().decrypted_reader(id, self.data) {
+        match xref.decrypted_reader(id, self.data, target) {
             Some(mut data) => data
                 .decrypt_all(meter)
                 .map(Cow::Owned)
@@ -179,35 +182,52 @@ impl<'a> Stream<'a> {
         }
     }
 
-    // The object whose key decrypts the stream, when the document is encrypted and
-    // the stream is neither a cross-reference stream nor one with its own /Crypt
-    // filter, which replaces the document's (`pdf_open_raw_filter` in MuPDF's
-    // `pdf-stream.c`).
-    fn decryption_object_id(&self) -> Option<ObjectIdentifier> {
+    // How the data is decrypted: `None` where they are stored as is, else with the
+    // key of the object, by the document's stream filter (no name) or the crypt
+    // filter named. In an encrypted document a stream that is no cross-reference
+    // stream is decrypted by the document's stream filter, unless it has /Crypt
+    // filters, which replace it (`pdf_open_raw_filter` in MuPDF's `pdf-stream.c`).
+    // A /Crypt filter without /Name or named /Identity passes the data through;
+    // another names one of the document's crypt filters, which decrypts the data
+    // (`build_filter` there). It must be the first filter, as the PDF specification
+    // requires: decrypting data another filter decoded is not supported.
+    fn decryption(&self) -> Result<Option<(ObjectIdentifier, Option<Name<'a>>)>, DecodeFailure> {
         let ctx = self.dict.ctx();
-        if ctx.xref().needs_decryption(ctx)
-            && self
+        if !ctx.xref().is_encrypted()
+            || self
                 .dict
                 .get::<object::String<'_>>(TYPE)
-                .is_none_or(|t| t.as_ref() != b"XRef")
-            && !self.filters().contains(&Filter::Crypt)
+                .is_some_and(|t| t.as_ref() == b"XRef")
         {
-            self.dict.obj_id()
-        } else {
-            None
+            return Ok(None);
         }
+        let FiltersAndParams { filters, params } = self.filters_and_params();
+        if !filters.contains(&Filter::Crypt) {
+            let id = self
+                .dict
+                .obj_id()
+                .filter(|_| ctx.xref().needs_decryption(ctx));
+            return Ok(id.map(|id| (id, None)));
+        }
+        let mut named = None;
+        for (i, (filter, params)) in filters.iter().zip(&params).enumerate() {
+            if *filter != Filter::Crypt {
+                continue;
+            }
+            match params.get::<Name<'a>>(NAME) {
+                Some(name) if name.deref() != IDENTITY => {
+                    let id = self.dict.obj_id().filter(|_| i == 0);
+                    named = Some((id.ok_or(DecodeFailure::Decryption)?, Some(name)));
+                }
+                _ => {}
+            }
+        }
+        Ok(named)
     }
 
-    // Whether a /Crypt filter with these parameters passes the data through: its
-    // /Name is /Identity or missing, or the document is not encrypted, where MuPDF
-    // ignores it (`build_filter` in `pdf-stream.c`). Other crypt filters, which name
-    // one of the document's, are not supported.
-    fn crypt_passes_through(&self, params: &Dict<'_>) -> bool {
-        let ctx = self.dict.ctx();
-        !ctx.xref().is_encrypted()
-            || params
-                .get::<Name<'_>>(NAME)
-                .is_none_or(|name| name.deref() == IDENTITY)
+    fn target<'n>(name: &'n Option<Name<'_>>) -> DecryptionTarget<'n> {
+        name.as_deref()
+            .map_or(DecryptionTarget::Stream, DecryptionTarget::Named)
     }
 
     /// Return the raw, underlying dictionary of the stream.
@@ -289,11 +309,8 @@ impl<'a> Stream<'a> {
             .zip(filters_and_params.params.iter())
         {
             if *filter == Filter::Crypt {
-                if self.crypt_passes_through(params) {
-                    continue;
-                }
-                warn!("unsupported crypt filter");
-                return Err(DecodeFailure::Decryption);
+                // Decrypted with the raw data.
+                continue;
             }
             let new = filter.apply(
                 current.as_ref().map(|c| c.data.as_ref()).unwrap_or(&data),
@@ -317,8 +334,13 @@ impl<'a> Stream<'a> {
     /// filters, or where decryption would fail.
     pub fn decoded_reader(&self) -> Option<DecodedReader<'a>> {
         let filter = self.reader_filter()?;
-        let data = match self.decryption_object_id() {
-            Some(id) => self.dict.ctx().xref().decrypted_reader(id, self.data)?,
+        let data = match self.decryption().ok()? {
+            Some((id, name)) => {
+                self.dict
+                    .ctx()
+                    .xref()
+                    .decrypted_reader(id, self.data, Self::target(&name))?
+            }
             None => DecryptedReader::raw(Cow::Borrowed(self.data)),
         };
         match filter {

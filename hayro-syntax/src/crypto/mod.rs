@@ -10,11 +10,11 @@ use crate::crypto::aes::{AES128Cipher, AES256Cipher};
 use crate::crypto::rc4::Rc4;
 use crate::object;
 use crate::object::dict::keys::{
-    CF, CFM, ENCRYPT_META_DATA, FILTER, LENGTH, O, OE, P, R, STM_F, STR_F, U, UE, V,
+    CF, CFM, ENCRYPT_META_DATA, FILTER, IDENTITY, LENGTH, O, OE, P, R, STD_CF, STM_F, STR_F, U, UE,
+    V,
 };
 use crate::object::{Dict, Name, ObjectIdentifier};
 use crate::sync::HashMap;
-use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp;
@@ -75,27 +75,51 @@ pub(crate) enum Decryptor {
 }
 
 #[derive(Debug, Copy, Clone)]
-pub(crate) enum DecryptionTarget {
+pub(crate) enum DecryptionTarget<'n> {
     String,
     Stream,
+    /// A stream under a /Crypt filter that names one of the document's crypt
+    /// filters, by that name.
+    Named(&'n [u8]),
 }
 
 impl Decryptor {
+    // The key and method that decrypt `target`; `None` for a crypt filter the
+    // document does not define. As in MuPDF's `pdf_parse_crypt_filter`
+    // (`pdf-crypt.c`), /Identity is no encryption, and a document without /CF
+    // encrypts with RC4 under /StdCF; unlike there, a filter whose /CFM is unknown
+    // does not pass the data through.
+    fn method(&self, target: DecryptionTarget<'_>) -> Option<(&[u8], DecryptorTag)> {
+        if let DecryptionTarget::Named(name) = target
+            && name == IDENTITY
+        {
+            return Some((&[], DecryptorTag::None));
+        }
+        match self {
+            Self::None => Some((&[], DecryptorTag::None)),
+            Self::Rc4 { key } => match target {
+                DecryptionTarget::Named(name) if name != STD_CF => None,
+                _ => Some((key, DecryptorTag::Rc4)),
+            },
+            Self::Aes128 { key, dict } | Self::Aes256 { key, dict } => {
+                let filter = match target {
+                    DecryptionTarget::String => dict.string_filter,
+                    DecryptionTarget::Stream => dict.stream_filter,
+                    DecryptionTarget::Named(name) => dict.named(name)?,
+                };
+                Some((key, filter.cfm))
+            }
+        }
+    }
+
     /// Whether `data` decrypts whole: AES needs its IV and whole blocks, and the
     /// decryption leaves a trailing partial block out. No data is whole.
-    pub(crate) fn decrypts_whole(&self, data: &[u8], target: DecryptionTarget) -> bool {
-        let tag = match self {
-            Self::None | Self::Rc4 { .. } => return true,
-            Self::Aes128 { dict, .. } | Self::Aes256 { dict, .. } => match target {
-                DecryptionTarget::String => dict.string_filter.cfm,
-                DecryptionTarget::Stream => dict.stream_filter.cfm,
-            },
-        };
-        match tag {
-            DecryptorTag::Aes128 | DecryptorTag::Aes256 => {
+    pub(crate) fn decrypts_whole(&self, data: &[u8], target: DecryptionTarget<'_>) -> bool {
+        match self.method(target) {
+            Some((_, DecryptorTag::Aes128 | DecryptorTag::Aes256)) => {
                 data.is_empty() || (data.len() >= 16 && data.len().is_multiple_of(16))
             }
-            DecryptorTag::None | DecryptorTag::Rc4 => true,
+            _ => true,
         }
     }
 
@@ -103,24 +127,14 @@ impl Decryptor {
         &self,
         id: ObjectIdentifier,
         data: &[u8],
-        target: DecryptionTarget,
+        target: DecryptionTarget<'_>,
     ) -> Option<Vec<u8>> {
-        match self {
-            Self::None => Some(data.to_vec()),
-            Self::Rc4 { key } => decrypt_rc4(key, data, id),
-            Self::Aes128 { key, dict } | Self::Aes256 { key, dict } => {
-                let crypt_dict = match target {
-                    DecryptionTarget::String => dict.string_filter,
-                    DecryptionTarget::Stream => dict.stream_filter,
-                };
-
-                match crypt_dict.cfm {
-                    DecryptorTag::None => Some(data.to_vec()),
-                    DecryptorTag::Rc4 => decrypt_rc4(key, data, id),
-                    DecryptorTag::Aes128 => decrypt_aes128(key, data, id),
-                    DecryptorTag::Aes256 => decrypt_aes256(key, data),
-                }
-            }
+        let (key, method) = self.method(target)?;
+        match method {
+            DecryptorTag::None => Some(data.to_vec()),
+            DecryptorTag::Rc4 => decrypt_rc4(key, data, id),
+            DecryptorTag::Aes128 => decrypt_aes128(key, data, id),
+            DecryptorTag::Aes256 => decrypt_aes256(key, data),
         }
     }
 }
@@ -293,37 +307,53 @@ fn decrypt_rc_aes<T>(
     with_key(final_key)
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct DecryptorData {
     stream_filter: CryptDictionary,
     string_filter: CryptDictionary,
+    /// The crypt filters of /CF by name, `None` without /CF.
+    filters: Option<HashMap<Vec<u8>, CryptDictionary>>,
 }
 
 impl DecryptorData {
     fn from_dict(dict: &Dict<'_>, default_length: u16) -> Option<Self> {
-        let mut mappings = HashMap::new();
-
-        if let Some(dict) = dict.get::<Dict<'_>>(CF) {
+        let filters = dict.get::<Dict<'_>>(CF).map(|dict| {
+            let mut mappings = HashMap::new();
             for key in dict.keys() {
                 if let Some(dict) = dict.get::<Dict<'_>>(key.as_ref())
                     && let Some(crypt_dict) = CryptDictionary::from_dict(&dict, default_length)
                 {
-                    mappings.insert(key.as_str().to_string(), crypt_dict);
+                    mappings.insert(key.deref().to_vec(), crypt_dict);
                 }
             }
-        }
-
-        let stm_f = *mappings
-            .get(dict.get::<Name<'_>>(STM_F)?.as_str())
-            .unwrap_or(&CryptDictionary::identity(default_length));
-        let str_f = *mappings
-            .get(dict.get::<Name<'_>>(STR_F)?.as_str())
-            .unwrap_or(&CryptDictionary::identity(default_length));
+            mappings
+        });
+        let named = |key: &[u8]| -> Option<CryptDictionary> {
+            let name = dict.get::<Name<'_>>(key)?;
+            Some(
+                filters
+                    .as_ref()
+                    .and_then(|filters| filters.get(name.deref()).copied())
+                    .unwrap_or(CryptDictionary::identity(default_length)),
+            )
+        };
 
         Some(Self {
-            stream_filter: stm_f,
-            string_filter: str_f,
+            stream_filter: named(STM_F)?,
+            string_filter: named(STR_F)?,
+            filters,
         })
+    }
+
+    /// The crypt filter `name`, other than /Identity.
+    fn named(&self, name: &[u8]) -> Option<CryptDictionary> {
+        match &self.filters {
+            Some(filters) => filters.get(name).copied(),
+            None => (name == STD_CF).then_some(CryptDictionary {
+                cfm: DecryptorTag::Rc4,
+                _length: 0,
+            }),
+        }
     }
 }
 

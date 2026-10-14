@@ -560,7 +560,7 @@ impl XRef {
         &self,
         id: ObjectIdentifier,
         data: &[u8],
-        target: DecryptionTarget,
+        target: DecryptionTarget<'_>,
     ) -> Option<Vec<u8>> {
         match &self.0 {
             Inner::Dummy => Some(data.to_vec()),
@@ -569,10 +569,10 @@ impl XRef {
     }
 
     /// Whether stream `data` decrypts whole (see [`Decryptor::decrypts_whole`]).
-    pub(crate) fn decrypts_whole(&self, data: &[u8]) -> bool {
+    pub(crate) fn decrypts_whole(&self, data: &[u8], target: DecryptionTarget<'_>) -> bool {
         match &self.0 {
             Inner::Dummy => true,
-            Inner::Some(r) => r.decryptor.decrypts_whole(data, DecryptionTarget::Stream),
+            Inner::Some(r) => r.decryptor.decrypts_whole(data, target),
         }
     }
 
@@ -582,10 +582,11 @@ impl XRef {
         &self,
         id: ObjectIdentifier,
         data: &'a [u8],
+        target: DecryptionTarget<'_>,
     ) -> Option<DecryptedReader<'a>> {
         match &self.0 {
             Inner::Dummy => Some(DecryptedReader::raw(Cow::Borrowed(data))),
-            Inner::Some(r) => r.decryptor.reader(id, data, DecryptionTarget::Stream),
+            Inner::Some(r) => r.decryptor.reader(id, data, target),
         }
     }
 

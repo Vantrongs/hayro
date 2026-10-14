@@ -59,19 +59,9 @@ impl Decryptor {
         &self,
         id: ObjectIdentifier,
         data: &'a [u8],
-        target: DecryptionTarget,
+        target: DecryptionTarget<'_>,
     ) -> Option<DecryptedReader<'a>> {
-        let (key, tag) = match self {
-            Self::None => (&[][..], DecryptorTag::None),
-            Self::Rc4 { key } => (key.as_slice(), DecryptorTag::Rc4),
-            Self::Aes128 { key, dict } | Self::Aes256 { key, dict } => {
-                let filter = match target {
-                    DecryptionTarget::String => dict.string_filter,
-                    DecryptionTarget::Stream => dict.stream_filter,
-                };
-                (key.as_slice(), filter.cfm)
-            }
-        };
+        let (key, tag) = self.method(target)?;
         let cipher = match tag {
             DecryptorTag::None => Cipher::None,
             DecryptorTag::Rc4 => decrypt_rc_aes(key, id, false, |key| {
@@ -263,6 +253,7 @@ mod tests {
             dict: DecryptorData {
                 stream_filter: filter,
                 string_filter: filter,
+                filters: None,
             },
         }
     }

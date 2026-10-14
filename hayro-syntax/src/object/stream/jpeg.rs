@@ -47,7 +47,7 @@ impl OwnedStream {
 
     fn jpeg_input(&self) -> Option<JpegInput> {
         let stream = self.get()?;
-        if stream.decryption_object_id().is_some()
+        if !matches!(stream.decryption(), Ok(None))
             || !matches!(stream.filters().as_slice(), [Filter::DctDecode])
         {
             return None;

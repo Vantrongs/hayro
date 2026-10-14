@@ -913,6 +913,43 @@ mod tests {
             assert_eq!(read(file).0.unwrap(), b"0 1 0 rg 20 0 10 10 re f");
         }
 
+        // A crypt filter naming one of the document's decrypts with it, as the
+        // document's stream filter does (MuPDF's `pdf_open_crypt_with_filter`).
+        #[test]
+        fn a_named_crypt_filter_decrypts_its_stream() {
+            let page = page("[4 0 R 5 0 R]");
+            let file = aes128(&[
+                CATALOG,
+                TREE,
+                Part::Plain(&page),
+                Part::Stream {
+                    dict: "/Filter /Crypt /DecodeParms << /Name /StdCF >>",
+                    data: RED,
+                    encrypt: true,
+                },
+                Part::Stream {
+                    dict: "/Filter [/Crypt /FlateDecode] /DecodeParms [<< /Name /StdCF >> null]",
+                    data: GREEN_FLATE,
+                    encrypt: true,
+                },
+            ]);
+            let (strict, lenient) = read(file.clone());
+            let both = joined(&[RED, b"0 1 0 rg 20 0 10 10 re f"]);
+            assert_eq!(strict.unwrap(), both);
+            assert_eq!(lenient, both);
+            // The raw data a writer copies without the /Crypt filter are decrypted.
+            let pdf = Pdf::new(file).unwrap();
+            let raw = |n| {
+                let stream = pdf
+                    .xref()
+                    .get::<crate::object::Stream<'_>>(ObjectIdentifier::new(n, 0))
+                    .unwrap();
+                stream.try_raw_data().unwrap().to_vec()
+            };
+            assert_eq!(raw(4), RED);
+            assert_eq!(raw(5), GREEN_FLATE);
+        }
+
         #[test]
         fn a_part_that_cannot_be_read_is_an_error() {
             let id = |n| Some(ObjectIdentifier::new(n, 0));
@@ -941,15 +978,23 @@ mod tests {
             );
             // A lenient reading recovers nothing of it.
             assert_eq!(lenient, joined(&[RED, b""]));
-            // A crypt filter naming one of the document's, which is not supported.
-            let (strict, _) = read(file(Part::Stream {
-                dict: "/Filter /Crypt /DecodeParms << /Name /StdCF >>",
-                data: BLUE,
-                encrypt: true,
-            }));
-            assert!(
-                matches!(strict, Err(ContentError::Decode(i, DecodeFailure::Decryption)) if i == id(5))
-            );
+            // A crypt filter the document does not define, and one after another
+            // filter, which is not supported.
+            for dict in [
+                "/Filter /Crypt /DecodeParms << /Name /Other >>",
+                "/Filter [/FlateDecode /Crypt] /DecodeParms [null << /Name /StdCF >>]",
+            ] {
+                let (strict, lenient) = read(file(Part::Stream {
+                    dict,
+                    data: BLUE,
+                    encrypt: true,
+                }));
+                assert!(
+                    matches!(strict, Err(ContentError::Decode(i, DecodeFailure::Decryption)) if i == id(5)),
+                    "{dict}"
+                );
+                assert_eq!(lenient, joined(&[RED]), "{dict}");
+            }
             // Data that does not decrypt: AES needs whole blocks.
             let (strict, _) = read(file(Part::Stream {
                 dict: "",
