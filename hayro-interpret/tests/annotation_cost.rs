@@ -379,6 +379,17 @@ fn formatting_left_open_across_paragraphs_is_unsupported_at_a_bounded_cost() {
     assert_eq!(look_within(20, rich(&rc)), Err(Unsupported::RichText));
 }
 
+/// One tag with many attributes is read in time that grows with their number, not
+/// its square: 128 000 of them, 1.2 MB of text, took 8 s in a release build when
+/// each attribute was compared with every earlier one of its tag, and take 0.3 s
+/// in a debug build now.
+#[test]
+fn rich_text_with_a_tag_of_many_attributes_is_read_at_a_bounded_cost() {
+    let attributes: String = (0..128_000).map(|i| format!(" a{i}=x")).collect();
+    let rc = format!("<p{attributes}>A</p>");
+    assert!(look_within(3, rich(&rc)).is_ok());
+}
+
 /// Text beside or below a `FreeText`'s box is clipped away, so it is not drawn:
 /// the content stays the size of what the box shows, however long the text.
 #[test]
