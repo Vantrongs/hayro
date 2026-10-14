@@ -15,9 +15,10 @@ use super::text::{Align, Family, Span, Style};
 use html5ever::interface::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use html5ever::tendril::{StrTendril, TendrilSink};
 use html5ever::{Attribute, ExpandedName, ParseOpts, QualName, ns, parse_document};
-use rustc_hash::FxHashSet;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::rc::{Rc, Weak};
 
 /// How deep elements may nest. The parser looks through the elements open around
@@ -497,6 +498,21 @@ fn color_rgb(value: &str) -> Option<[f32; 3]> {
     Some([16, 8, 0].map(|shift| ((hex >> shift) & 0xff) as f32 / 255.0))
 }
 
+/// An attribute name in a set, hashed by its text with the set's randomly keyed
+/// hasher. The hash of its atoms does not do: `string_cache` 0.9 hashes an atom of
+/// up to seven bytes to a 32-bit fold of them and a longer one with a fixed key,
+/// so names can be chosen to share a hash.
+#[derive(PartialEq, Eq)]
+struct AttrName(QualName);
+
+impl Hash for AttrName {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.prefix.as_deref().hash(state);
+        (*self.0.ns).hash(state);
+        (*self.0.local).hash(state);
+    }
+}
+
 /// A node of the parsed document.
 struct Node {
     kind: Kind,
@@ -512,7 +528,7 @@ enum Kind {
         name: QualName,
         attrs: RefCell<Vec<Attribute>>,
         /// The names of `attrs`, once attributes of a repeated tag are merged in.
-        names: RefCell<Option<FxHashSet<QualName>>>,
+        names: RefCell<Option<HashSet<AttrName>>>,
     },
     Text(RefCell<String>),
     /// A comment or processing instruction.
@@ -715,11 +731,11 @@ impl TreeSink for Dom {
         let mut names = names.borrow_mut();
         let names = names.get_or_insert_with(|| {
             self.looked_at(existing.len());
-            existing.iter().map(|a| a.name.clone()).collect()
+            existing.iter().map(|a| AttrName(a.name.clone())).collect()
         });
         self.looked_at(attrs.len());
         for attr in attrs {
-            if names.insert(attr.name.clone()) {
+            if names.insert(AttrName(attr.name.clone())) {
                 existing.push(attr);
             }
         }

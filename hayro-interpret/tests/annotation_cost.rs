@@ -390,6 +390,35 @@ fn rich_text_with_a_tag_of_many_attributes_is_read_at_a_bounded_cost() {
     assert!(look_within(3, rich(&rc)).is_ok());
 }
 
+/// Attributes `abc` + `z` + `abc`, for all 46 656 strings `abc` of three lowercase
+/// letters or digits, whose names all have one atom hash: `string_cache` 0.9 hashes
+/// a name of up to seven bytes to the XOR of the halves of its 64-bit atom.
+fn attributes_whose_names_hash_alike() -> String {
+    const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut attributes = String::new();
+    for a in CHARS {
+        for b in CHARS {
+            for c in CHARS {
+                let abc = String::from_utf8(vec![*a, *b, *c]).unwrap();
+                attributes.push_str(&format!(" {abc}z{abc}=x"));
+            }
+        }
+    }
+    attributes
+}
+
+/// A repeated tag merges in attributes whose names hash alike in time that grows
+/// with their number: a set of names keyed by their atoms' hash took 16 s for
+/// these in a debug build, and keyed by their text, 0.1 s.
+#[test]
+fn repeated_tags_with_names_whose_atoms_hash_alike_are_merged_at_a_bounded_cost() {
+    let rc = format!(
+        "<body{}><body a=b><p>A</p>",
+        attributes_whose_names_hash_alike()
+    );
+    assert!(look_within(3, rich(&rc)).is_ok());
+}
+
 /// Text beside or below a `FreeText`'s box is clipped away, so it is not drawn:
 /// the content stays the size of what the box shows, however long the text.
 #[test]
