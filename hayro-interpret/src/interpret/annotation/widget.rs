@@ -35,11 +35,7 @@ pub(super) fn widget(
         return Ok(None);
     };
     let field_type = field.get(Inherited::Type);
-    let flags = field
-        .get(Inherited::Flags)
-        .int()
-        .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(0);
+    let flags = field.get(Inherited::Flags).flags();
     let mk = annot.dict(b"MK");
     let mk_color = |key: &[u8]| mk.as_ref().and_then(|mk| color_of(mk, key));
     let w = border_width(annot);

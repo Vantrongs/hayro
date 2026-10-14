@@ -136,12 +136,8 @@ pub fn flags(annot: &Dict<'_>) -> u32 {
     flags_of(&Entries::new(annot.clone()))
 }
 
-/// `/F` as viewers read a damaged one: a real number truncated, an integer to its
-/// low 32 bits, and no flags for anything else.
 fn flags_of(annot: &Entries<'_>) -> u32 {
-    // Truncating to 32 bits is the reading meant.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    annot.int(F).map_or(0, |f| f as u32)
+    annot.get(F).flags()
 }
 
 /// What the annotations of one document look like: [`Appearances::look`], with

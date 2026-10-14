@@ -624,12 +624,18 @@ fn flags_and_existing_appearances_decide_what_is_generated() {
         ("/F 1", 0),
         ("/F 2", 0),
         ("/F 5", 0),
-        // A damaged /F as viewers read it: a real truncated, an integer to its low
-        // 32 bits, anything else no flags.
+        // A damaged /F as viewers read it (see `a_damaged_field_flags_entry_reads_as_viewers_read_it`).
         ("/F -1", 0),
         ("/F 2.9", 0),
+        ("/F 0.5", 0),
+        ("/F 0.4", 1),
+        ("/F 3.5", 1),
+        ("/F -0.6", 0),
         ("/F 4294967298", 0),
         ("/F 4294967296", 1),
+        ("/F 4294967298.0", 0),
+        ("/F 2147483650.0", 1),
+        ("/F -3000000000.0", 1),
         ("/F (x)", 1),
     ] {
         assert_eq!(drawn(flags, Flatten), n, "{flags}");
@@ -1797,6 +1803,46 @@ fn a_damaged_annots_entry_hides_none_after_it() {
         "[(x) [1] 4 0 R]",
     ] {
         assert_eq!(red_square_after(annots), square, "{annots}");
+    }
+}
+
+/// Field flags (`/Ff`) are read as `/F` is, as viewers read damaged ones: an integer
+/// to its low 32 bits; a real rounded half up, to its low 32 bits when that is 2^32
+/// or more away from 0, and to bit 31 alone between 2^31 and 2^32. A push button
+/// stays one.
+#[test]
+fn a_damaged_field_flags_entry_reads_as_viewers_read_it() {
+    let button = |ff: &str| {
+        generated(&format!(
+            "/Subtype /Widget /FT /Btn /Ff {ff} /Rect [20 20 180 60] \
+             /MK << /BG [0.5] /BC [0] /CA (IMPORTANT) >>"
+        ))
+    };
+    let push = button("65536");
+    let check = button("0");
+    assert_ne!(push, check);
+    for ff in [
+        "-1",
+        "4295032832",
+        "-4294901760",
+        "65536.9",
+        "65535.5",
+        "2147418112.0",
+        "-2147418112.0",
+        "4295032832.0",
+        "10000000000.0",
+        "-4294967298.0",
+    ] {
+        assert_eq!(button(ff), push, "/Ff {ff}");
+    }
+    for ff in [
+        "2147483648.0",
+        "4294901760.0",
+        "-4294901759.5",
+        "-2147483904.0",
+        "(x)",
+    ] {
+        assert_eq!(button(ff), check, "/Ff {ff}");
     }
 }
 

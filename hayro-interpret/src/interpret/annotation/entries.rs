@@ -62,6 +62,27 @@ impl<'a> Value<'a> {
         }
     }
 
+    /// A flags entry (`/F`, `/Ff`) as viewers read a damaged one: an integer to its
+    /// low 32 bits; a real rounded half up, to its low 32 bits when that is 2^32 or
+    /// more away from 0, and to bit 31 alone between 2^31 and 2^32; anything else
+    /// no flags.
+    pub(crate) fn flags(&self) -> u32 {
+        // Truncating to 32 bits is the reading meant.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        match self {
+            Self::Number(n) if n.is_integer() => n.as_i64() as u32,
+            Self::Number(n) => {
+                let v = (n.as_f64() + 0.5).floor();
+                if (2_f64.powi(31)..2_f64.powi(32)).contains(&v.abs()) {
+                    1 << 31
+                } else {
+                    v as i64 as u32
+                }
+            }
+            _ => 0,
+        }
+    }
+
     pub(crate) fn name(&self) -> Option<&[u8]> {
         match self {
             Self::Name(n) => Some(n.as_ref()),
