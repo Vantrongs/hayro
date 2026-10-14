@@ -5,9 +5,10 @@ use crate::color::{Color, ColorSpace};
 use crate::context::{Context, InterpreterCache};
 use crate::device::Device;
 use crate::font::GlyphRun;
+use crate::interpret::annotation::entries::Entries;
 use crate::interpret::state::{ActiveTransferFunction, State};
 use crate::shading::Shading;
-use crate::util::{Float32Ext, RectExt, hash128};
+use crate::util::{Float32Ext, hash128};
 use crate::x_object::soft_mask::SoftMask;
 use crate::{BlendMode, CacheKey, ClipPath, DrawMode, DrawProps, Image, ImageDrawProps};
 use crate::{FillRule, InterpreterSettings, Paint, interpret};
@@ -95,10 +96,7 @@ impl ShadingPattern {
 
             Shading::new(dict, stream, cache)
         })?;
-        let matrix = dict
-            .get::<[f64; 6]>(MATRIX)
-            .map(Affine::new)
-            .unwrap_or_default();
+        let matrix = Affine::new(Entries::new(dict.clone()).matrix(MATRIX));
 
         if dict.contains_key(EXT_G_STATE) {
             warn!("shading patterns with ext_g_state are not supported yet");
@@ -154,19 +152,18 @@ impl<'a> TilingPattern<'a> {
         let cache_key = stream.cache_key();
         let dict = stream.dict();
 
-        let bbox = dict.get::<hayro_syntax::object::Rect>(BBOX)?.to_kurbo();
-        let x_step = dict.get::<f32>(X_STEP)?;
-        let y_step = dict.get::<f32>(Y_STEP)?;
+        // Read as viewers read damaged ones, as forms are.
+        let entries = Entries::new(dict.clone());
+        let bbox = entries.rect(BBOX)?;
+        let x_step = entries.number(X_STEP).unwrap_or(0.0) as f32;
+        let y_step = entries.number(Y_STEP).unwrap_or(0.0) as f32;
 
         if x_step.is_nearly_zero() || y_step.is_nearly_zero() || bbox.is_zero_area() {
             return None;
         }
 
         let is_color = dict.get::<u8>(PAINT_TYPE)? == 1;
-        let matrix = dict
-            .get::<[f64; 6]>(MATRIX)
-            .map(Affine::new)
-            .unwrap_or_default();
+        let matrix = Affine::new(entries.matrix(MATRIX));
 
         let state = ctx.get().clone();
         let ctx_bbox = ctx.bbox();

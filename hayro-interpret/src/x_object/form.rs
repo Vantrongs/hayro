@@ -18,11 +18,7 @@ use std::borrow::Cow;
 pub(crate) fn box_and_matrix(dict: &Dict<'_>) -> Option<([f64; 4], [f64; 6])> {
     let dict = Entries::new(dict.clone());
     let b = dict.numbers(BBOX, 4)?;
-    let matrix = match dict.numbers(MATRIX, 6) {
-        Some(m) => [m[0], m[1], m[2], m[3], m[4], m[5]],
-        None => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-    };
-    Some(([b[0], b[1], b[2], b[3]], matrix))
+    Some(([b[0], b[1], b[2], b[3]], dict.matrix(MATRIX)))
 }
 
 pub(crate) struct FormXObject<'a> {

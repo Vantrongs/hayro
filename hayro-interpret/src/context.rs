@@ -44,7 +44,7 @@ impl<'a> InterpreterCache<'a> {
         Self {
             font_cache: Rc::new(RefCell::new(FxHashMap::default())),
             object_cache: Cache::new(),
-            annotation_fields: Default::default(),
+            annotation_fields: crate::interpret::annotation::Fields::default(),
         }
     }
 }

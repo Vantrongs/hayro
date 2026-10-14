@@ -1,5 +1,5 @@
-//! The entries of annotation dictionaries and of the forms they and pages draw, read
-//! as viewers read damaged ones.
+//! The entries of annotation dictionaries, and the boxes and matrices of the forms,
+//! patterns and shadings they and pages draw, read as viewers read damaged ones.
 //!
 //! Generators read an annotation only through [`Entries`], which offers no typed read
 //! that drops an array's entry: every entry keeps its place, and one that is not a
@@ -189,6 +189,22 @@ impl<'a> Entries<'a> {
             n.resize(len, 0.0);
         }
         Some(n)
+    }
+
+    /// Matrix `key` (`/Matrix`), six numbers read as [`Entries::numbers`] reads them;
+    /// the identity when it is not an array.
+    pub(crate) fn matrix(&self, key: &[u8]) -> [f64; 6] {
+        match self.numbers(key, 6) {
+            Some(m) => [m[0], m[1], m[2], m[3], m[4], m[5]],
+            None => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        }
+    }
+
+    /// Rectangle `key` (`/BBox`), four numbers read as [`Entries::numbers`] reads
+    /// them, normalized; `None` when it is not an array.
+    pub(crate) fn rect(&self, key: &[u8]) -> Option<kurbo::Rect> {
+        let n = self.numbers(key, 4)?;
+        Some(kurbo::Rect::new(n[0], n[1], n[2], n[3]).abs())
     }
 
     /// The object this dictionary is, when it is one of its own.
