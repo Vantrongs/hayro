@@ -476,7 +476,8 @@ pub fn interpret<'a>(
                 context.get_mut().graphics_state.stroke_props.dash_offset = p.1.as_f32();
                 // kurbo apparently cannot properly deal with offsets that are exactly 0.
                 context.get_mut().graphics_state.stroke_props.dash_array =
-                    p.0.iter::<f32>()
+                    p.0.items::<f32>()
+                        .map_while(|n| n)
                         .map(|n| if n == 0.0 { 0.01 } else { n })
                         .collect();
             }

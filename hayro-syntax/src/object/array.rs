@@ -31,7 +31,9 @@ impl<'a> Array<'a> {
         ArrayIter::new(self.data, &self.ctx)
     }
 
-    /// Returns an iterator over the resolved objects of the array.
+    /// Returns an iterator over the entries of the array that are objects of type
+    /// `T`, references resolved. An entry of another type, or a reference to no
+    /// object, is skipped: it does not end the iteration.
     #[allow(
         private_bounds,
         reason = "users shouldn't be able to implement `ObjectLike` for custom objects."
@@ -40,7 +42,40 @@ impl<'a> Array<'a> {
     where
         T: ObjectLike<'a>,
     {
-        ResolvedArrayIter::new(self.data, &self.ctx)
+        ResolvedArrayIter {
+            items: self.items(),
+        }
+    }
+
+    /// Returns an iterator with one item for each entry of the array, in its place:
+    /// the entry as an object of type `T`, references resolved, or `None` when it is
+    /// of another type or a reference to no object.
+    #[allow(
+        private_bounds,
+        reason = "users shouldn't be able to implement `ObjectLike` for custom objects."
+    )]
+    pub fn items<T>(&self) -> ArrayItems<'a, T>
+    where
+        T: ObjectLike<'a>,
+    {
+        const {
+            assert!(
+                T::ONE_ENTRY,
+                "a tuple spans several entries; read it with `flex_iter`"
+            );
+        }
+        ArrayItems {
+            reader: Reader::new(self.data),
+            ctx: self.ctx.clone(),
+            phantom_data: PhantomData,
+        }
+    }
+
+    /// The entries before the first one that is not a `T`, as `flex_iter` reads
+    /// them; tuples read several entries at once.
+    fn prefix<T: ObjectLike<'a>>(&self) -> impl Iterator<Item = T> + use<'a, T> {
+        let mut entries = self.flex_iter();
+        core::iter::from_fn(move || entries.next::<T>())
     }
 
     /// Return a flex iterator over the items in the array.
@@ -158,19 +193,10 @@ impl<'a> Iterator for ArrayIter<'a> {
     }
 }
 
-/// An iterator over the array that resolves objects of a specific type.
+/// An iterator over the entries of an array that are objects of a specific type
+/// (see [`Array::iter`]).
 pub struct ResolvedArrayIter<'a, T> {
-    flex_iter: FlexArrayIter<'a>,
-    phantom_data: PhantomData<T>,
-}
-
-impl<'a, T> ResolvedArrayIter<'a, T> {
-    fn new(data: &'a [u8], ctx: &ReaderContext<'a>) -> Self {
-        Self {
-            flex_iter: FlexArrayIter::new(data, ctx),
-            phantom_data: PhantomData,
-        }
-    }
+    items: ArrayItems<'a, T>,
 }
 
 impl<'a, T> Iterator for ResolvedArrayIter<'a, T>
@@ -180,7 +206,48 @@ where
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.flex_iter.next::<T>()
+        self.items.by_ref().flatten().next()
+    }
+}
+
+/// An iterator over the entries of an array, each as an object of a specific type
+/// or `None` (see [`Array::items`]).
+pub struct ArrayItems<'a, T> {
+    reader: Reader<'a>,
+    ctx: ReaderContext<'a>,
+    phantom_data: PhantomData<T>,
+}
+
+impl<'a, T> Iterator for ArrayItems<'a, T>
+where
+    T: ObjectLike<'a>,
+{
+    type Item = Option<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.reader.skip_white_spaces_and_comments();
+        if self.reader.at_end() {
+            return None;
+        }
+        Some(
+            match self.reader.read_with_context::<MaybeRef<T>>(&self.ctx) {
+                Some(MaybeRef::Ref(r)) => self.ctx.xref().get_with::<T>(r.into(), &self.ctx),
+                Some(MaybeRef::NotRef(item)) => Some(item),
+                None => {
+                    // Another object: step over it. The array was read whole, so
+                    // each entry is one.
+                    let skipped = if self.ctx.in_content_stream() {
+                        self.reader.skip::<Object<'_>>(true)
+                    } else {
+                        self.reader.skip::<MaybeRef<Object<'_>>>(false)
+                    };
+                    if skipped.is_none() {
+                        self.reader.jump_to_end();
+                    }
+                    None
+                }
+            },
+        )
     }
 }
 
@@ -222,7 +289,7 @@ impl<'a, T: ObjectLike<'a> + Copy + Default, const C: usize> TryFrom<Array<'a>> 
     type Error = ();
 
     fn try_from(value: Array<'a>) -> Result<Self, Self::Error> {
-        let mut iter = value.iter::<T>();
+        let mut iter = value.prefix::<T>();
 
         let mut val = [T::default(); C];
 
@@ -267,7 +334,7 @@ impl<'a, T: ObjectLike<'a>> TryFrom<Array<'a>> for Vec<T> {
     type Error = ();
 
     fn try_from(value: Array<'a>) -> Result<Self, Self::Error> {
-        Ok(value.iter::<T>().collect())
+        Ok(value.prefix::<T>().collect())
     }
 }
 
@@ -297,7 +364,7 @@ impl<'a, U: ObjectLike<'a>, T: ObjectLike<'a> + smallvec::Array<Item = U>> TryFr
     type Error = ();
 
     fn try_from(value: Array<'a>) -> Result<Self, Self::Error> {
-        Ok(value.iter::<U>().collect())
+        Ok(value.prefix::<U>().collect())
     }
 }
 
@@ -441,6 +508,34 @@ mod tests {
         let res = array_impl(b"[(Hi) /Test]trialing data").unwrap();
         assert!(matches!(res[0], Object::String(_)));
         assert!(matches!(res[1], Object::Name(_)));
+    }
+
+    fn numbers(data: &[u8]) -> Array<'_> {
+        Reader::new(data)
+            .read_with_context::<Array<'_>>(&ReaderContext::new(XRef::dummy(), false))
+            .unwrap()
+    }
+
+    #[test]
+    fn iter_skips_an_entry_of_another_type_or_a_reference_to_no_object() {
+        let array = numbers(b"[1 null 2 (x) 5 0 R 3 /N]");
+        assert_eq!(array.iter::<f32>().collect::<Vec<_>>(), [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn items_keep_each_entry_in_its_place() {
+        let array = numbers(b"[1 null 5 0 R [2] 2]");
+        assert_eq!(
+            array.items::<f32>().collect::<Vec<_>>(),
+            [Some(1.0), None, None, None, Some(2.0)]
+        );
+    }
+
+    #[test]
+    fn a_vec_is_read_up_to_the_first_entry_of_another_type() {
+        let array = numbers(b"[1 2 null 3]");
+        assert_eq!(Vec::<f32>::try_from(array.clone()), Ok(vec![1.0, 2.0]));
+        assert_eq!(<[f32; 3]>::try_from(array), Err(()));
     }
 
     #[test]

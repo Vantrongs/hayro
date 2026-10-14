@@ -345,12 +345,12 @@ pub(crate) fn handle_gs_single<'a>(
                 .or_else(|| dict.get::<Object<'_>>(TR))?
             {
                 Object::Array(array) => {
-                    let mut iter = array.iter::<Object<'_>>();
+                    let mut iter = array.items::<Object<'_>>();
                     let functions = [
-                        TransferFunction::new(Function::new(&iter.next()?)?),
-                        TransferFunction::new(Function::new(&iter.next()?)?),
-                        TransferFunction::new(Function::new(&iter.next()?)?),
-                        TransferFunction::new(Function::new(&iter.next()?)?),
+                        TransferFunction::new(Function::new(&iter.next()??)?),
+                        TransferFunction::new(Function::new(&iter.next()??)?),
+                        TransferFunction::new(Function::new(&iter.next()??)?),
+                        TransferFunction::new(Function::new(&iter.next()??)?),
                     ];
 
                     Some(ActiveTransferFunction::Four(functions))
@@ -397,9 +397,9 @@ pub(crate) fn handle_gs_single<'a>(
         }
         "Font" => {
             let arr = dict.get::<Array<'_>>(FONT)?;
-            let mut iter = arr.iter::<Object<'_>>();
-            let font_dict = iter.next()?.into_dict()?;
-            let size = iter.next()?.into_number()?.as_f32();
+            let mut iter = arr.items::<Object<'_>>();
+            let font_dict = iter.next()??.into_dict()?;
+            let size = iter.next()??.into_number()?.as_f32();
 
             let font = context.resolve_font(&font_dict);
             context.get_mut().text_state.font_size = size;
@@ -407,13 +407,14 @@ pub(crate) fn handle_gs_single<'a>(
         }
         "D" => {
             let arr = dict.get::<Array<'_>>(key)?;
-            let mut iter = arr.iter::<Object<'_>>();
-            let dash_array = iter.next()?.into_array()?;
-            let dash_phase = iter.next()?.into_number()?.as_f32();
+            let mut iter = arr.items::<Object<'_>>();
+            let dash_array = iter.next()??.into_array()?;
+            let dash_phase = iter.next()??.into_number()?.as_f32();
 
             context.get_mut().graphics_state.stroke_props.dash_offset = dash_phase;
             context.get_mut().graphics_state.stroke_props.dash_array = dash_array
-                .iter::<f32>()
+                .items::<f32>()
+                .map_while(|n| n)
                 // kurbo apparently cannot properly deal with offsets that are exactly 0.
                 .map(|n| if n == 0.0 { 0.01 } else { n })
                 .collect();

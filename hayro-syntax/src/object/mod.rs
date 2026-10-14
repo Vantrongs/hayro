@@ -34,7 +34,10 @@ pub mod dict;
 pub mod stream;
 
 /// A trait for PDF objects.
-pub(crate) trait ObjectLike<'a>: TryFrom<Object<'a>> + Readable<'a> + Debug + Clone {}
+pub(crate) trait ObjectLike<'a>: TryFrom<Object<'a>> + Readable<'a> + Debug + Clone {
+    /// Whether it is one entry of an array; a tuple is several.
+    const ONE_ENTRY: bool = true;
+}
 
 /// A trait for PDF objects that can be borrowed directly from an [`Object`].
 pub(crate) trait ObjectRefLike<'a>: Sized {

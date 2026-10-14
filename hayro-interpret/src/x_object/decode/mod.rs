@@ -74,7 +74,10 @@ pub(crate) fn sample_format(
     let decode_arr = dict
         .get::<Array<'_>>(D)
         .or_else(|| dict.get::<Array<'_>>(DECODE))
-        .map(|a| a.iter::<(f32, f32)>().collect::<SmallVec<_>>())
+        .map(|a| {
+            let mut pairs = a.flex_iter();
+            core::iter::from_fn(|| pairs.next::<(f32, f32)>()).collect::<SmallVec<_>>()
+        })
         .unwrap_or(color_space.default_decode_arr(bits_per_component as f32));
 
     SampleFormat {

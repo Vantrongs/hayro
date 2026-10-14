@@ -97,17 +97,21 @@ impl<'a> Stream<'a> {
             .get::<Array<'_>>(F)
             .or_else(|| self.dict.get::<Array<'_>>(FILTER))
         {
-            let filters = filters.iter::<Name<'_>>().map(Filter::from_name);
+            // The filters up to the first entry that is not a name.
+            let filters = Vec::<Name<'_>>::try_from(filters).unwrap_or_default();
+            // Each in the place of its filter; one that is null or refers to no
+            // object is the default.
             let mut params = self
                 .dict
                 .get::<Array<'_>>(DP)
                 .or_else(|| self.dict.get::<Array<'_>>(DECODE_PARMS))
-                .map(|a| a.iter::<Object<'_>>());
+                .map(|a| a.items::<Object<'_>>());
 
-            for filter in filters {
+            for filter in filters.into_iter().map(Filter::from_name) {
                 let params = params
                     .as_mut()
                     .and_then(|p| p.next())
+                    .flatten()
                     .and_then(|p| p.into_dict())
                     .unwrap_or_default();
 

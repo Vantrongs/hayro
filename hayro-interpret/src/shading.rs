@@ -197,7 +197,8 @@ impl Shading {
                 let function = read_function(dict, &color_space);
                 let decode = dict
                     .get::<Array<'_>>(DECODE)?
-                    .iter::<f32>()
+                    .items::<f32>()
+                    .map_while(|n| n)
                     .collect::<Vec<_>>();
 
                 let triangles = read_free_form_triangles(
@@ -222,7 +223,8 @@ impl Shading {
                 let function = read_function(dict, &color_space);
                 let decode = dict
                     .get::<Array<'_>>(DECODE)?
-                    .iter::<f32>()
+                    .items::<f32>()
+                    .map_while(|n| n)
                     .collect::<Vec<_>>();
                 let vertices_per_row = dict.get::<u32>(VERTICES_PER_ROW)?;
 
@@ -249,7 +251,8 @@ impl Shading {
                 let function = read_function(dict, &color_space);
                 let decode = dict
                     .get::<Array<'_>>(DECODE)?
-                    .iter::<f32>()
+                    .items::<f32>()
+                    .map_while(|n| n)
                     .collect::<Vec<_>>();
 
                 let patches = read_coons_patch_mesh(
@@ -272,7 +275,8 @@ impl Shading {
                 let function = read_function(dict, &color_space);
                 let decode = dict
                     .get::<Array<'_>>(DECODE)?
-                    .iter::<f32>()
+                    .items::<f32>()
+                    .map_while(|n| n)
                     .collect::<Vec<_>>();
 
                 let patches = read_tensor_product_patch_mesh(
@@ -293,7 +297,7 @@ impl Shading {
         let bbox = Entries::new(dict.clone()).rect(BBOX);
         let background = dict
             .get::<Array<'_>>(BACKGROUND)
-            .map(|a| a.iter::<f32>().collect::<SmallVec<_>>());
+            .map(|a| a.items::<f32>().map_while(|n| n).collect::<SmallVec<_>>());
 
         Some(Self {
             cache_key,
@@ -1027,7 +1031,8 @@ fn read_tensor_product_patch_mesh(
 fn read_function(dict: &Dict<'_>, color_space: &ColorSpace) -> Option<ShadingFunction> {
     if let Some(arr) = dict.get::<Array<'_>>(FUNCTION) {
         let arr: Option<SmallVec<_>> = arr
-            .iter::<Object<'_>>()
+            .items::<Object<'_>>()
+            .map_while(|o| o)
             .map(|o| Function::new(&o))
             .collect();
         let arr = arr?;

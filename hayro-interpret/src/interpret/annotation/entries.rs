@@ -95,12 +95,7 @@ pub(crate) struct Items<'a>(Array<'a>);
 impl<'a> Items<'a> {
     /// The entries in order; one that refers to no object is [`Value::Null`].
     pub(crate) fn iter(&self) -> impl Iterator<Item = Value<'a>> + '_ {
-        // `flex_iter` resolves references, but ends at one to no object; reading
-        // it in step with the raw entries keeps every place.
-        let mut resolved = self.0.flex_iter();
-        self.0
-            .raw_iter()
-            .map(move |_| Value::of(resolved.next::<Object<'a>>()))
+        self.0.items::<Object<'a>>().map(Value::of)
     }
 
     /// Entry `i`; [`Value::Null`] beyond the end.

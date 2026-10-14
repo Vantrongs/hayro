@@ -1765,3 +1765,37 @@ fn a_rich_text_colour_of_no_css_number_is_unsupported() {
         assert_eq!(looks(&pdf), ["RichText"], "{color}");
     }
 }
+
+/// What a page with `/Annots annots` draws when annotations are flattened, object 4
+/// being a red square.
+fn red_square_after(annots: &str) -> Vec<Ev> {
+    let file = common::one_page(
+        200,
+        &format!("/Resources << >> /Annots {annots}"),
+        vec![b"<< /Type /Annot /Subtype /Square /Rect [20 20 100 100] /IC [1 0 0] >>".to_vec()],
+    );
+    let pdf = Pdf::new(file).expect("valid pdf");
+    let settings = InterpreterSettings {
+        annotations: AnnotationSelection::Flatten,
+        ..Default::default()
+    };
+    let mut rec = Rec::default();
+    common::interpret_first_page(&pdf, settings, &mut rec);
+    rec.0
+}
+
+/// An entry of `/Annots` that is no annotation, null, or refers to no object, is
+/// passed over: the annotations after it are drawn.
+#[test]
+fn a_damaged_annots_entry_hides_none_after_it() {
+    let square = red_square_after("[4 0 R]");
+    assert!(!square.is_empty());
+    for annots in [
+        "[null 4 0 R]",
+        "[999 0 R 4 0 R]",
+        "[5 4 0 R]",
+        "[(x) [1] 4 0 R]",
+    ] {
+        assert_eq!(red_square_after(annots), square, "{annots}");
+    }
+}

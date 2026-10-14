@@ -19,13 +19,16 @@ impl Type3 {
     pub(crate) fn new(dict: &Dict<'_>) -> Option<Self> {
         let clamper = Clamper::new(dict)?;
 
-        let functions = dict
-            .get::<Array<'_>>(FUNCTIONS)
-            .and_then(|d| d.iter::<Object<'_>>().map(|o| Function::new(&o)).collect())?;
+        let functions = dict.get::<Array<'_>>(FUNCTIONS).and_then(|d| {
+            d.items::<Object<'_>>()
+                .map_while(|o| o)
+                .map(|o| Function::new(&o))
+                .collect()
+        })?;
         let domain = *clamper.domain.first()?;
         let mut bounds = vec![domain.0 - 0.0001];
         if let Some(a) = dict.get::<Array<'_>>(BOUNDS) {
-            bounds.extend(a.iter::<f32>());
+            bounds.extend(a.items::<f32>().map_while(|n| n));
         }
         // Add a small delta so that the interval is considered to be closed on the right.
         bounds.push(domain.1 + 0.0001);

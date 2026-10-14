@@ -290,18 +290,18 @@ pub(crate) fn write_stream_dict(
         return;
     };
     let params = hayro_dict.get::<array::Array<'_>>(DECODE_PARMS);
-    let kept: Vec<usize> = filters
-        .iter::<Object<'_>>()
-        .enumerate()
-        .filter(|(_, f)| !matches!(f, Object::Name(n) if is_crypt(n)))
-        .map(|(i, _)| i)
+    // Whether each entry, in its place, is kept.
+    let kept: Vec<bool> = filters
+        .items::<Object<'_>>()
+        .map(|f| !matches!(f, Some(Object::Name(n)) if is_crypt(&n)))
         .collect();
-    if kept.is_empty() {
+    if !kept.contains(&true) {
         return;
     }
+    let kept = |i: usize| kept.get(i) == Some(&true);
     let mut out = pdf_dict.insert(pdf_writer::Name(FILTER)).array();
     for (i, filter) in filters.raw_iter().enumerate() {
-        if kept.contains(&i) {
+        if kept(i) {
             filter.write_direct(out.push(), ctx);
         }
     }
@@ -309,7 +309,7 @@ pub(crate) fn write_stream_dict(
     if let Some(params) = params {
         let mut out = pdf_dict.insert(pdf_writer::Name(DECODE_PARMS)).array();
         for (i, param) in params.raw_iter().enumerate() {
-            if kept.contains(&i) {
+            if kept(i) {
                 param.write_direct(out.push(), ctx);
             }
         }

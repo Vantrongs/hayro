@@ -55,8 +55,8 @@ impl Type0Font {
 
         let descendant_font = dict
             .get::<Array<'_>>(DESCENDANT_FONTS)?
-            .iter::<Dict<'_>>()
-            .next()?;
+            .items::<Dict<'_>>()
+            .next()??;
         let font_descriptor = descendant_font
             .get::<Dict<'_>>(FONT_DESC)
             .unwrap_or_default();
@@ -515,7 +515,7 @@ fn read_widths(arr: &Array<'_>) -> Option<FxHashMap<u32, f32>> {
 
     loop {
         if let Some((mut first, range)) = iter.next::<(u32, Array<'_>)>() {
-            for width in range.iter::<f32>() {
+            for width in range.items::<f32>().map_while(|w| w) {
                 map.insert(first, width);
                 first = first.checked_add(1)?;
             }
@@ -537,7 +537,7 @@ fn read_widths2(arr: &Array<'_>) -> Option<FxHashMap<u32, [f32; 3]>> {
 
     loop {
         if let Some((mut first, range)) = iter.next::<(u32, Array<'_>)>() {
-            let mut iter = range.iter::<f32>();
+            let mut iter = range.items::<f32>().map_while(|w| w);
 
             while let Some(w) = iter.next() {
                 let v1 = iter.next()?;
