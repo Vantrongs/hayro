@@ -24,24 +24,23 @@ mod freetext;
 mod icons;
 mod lines;
 mod markup;
+mod out;
 mod rich;
 mod text;
 mod widget;
 
 use entries::{Entries, Items, Value};
+use out::{Color, Out, written_all};
 use text::Fonts;
 
 use crate::BlendMode;
 use crate::x_object::box_and_matrix;
-use hayro_syntax::object::dict::keys::{
-    AP, AS, BORDER, BS, C, CA, D, F, N, RECT, S, SUBTYPE, W,
-};
+use hayro_syntax::object::dict::keys::{AP, AS, BORDER, BS, C, CA, D, F, N, RECT, S, SUBTYPE, W};
 use hayro_syntax::object::{Dict, Name, ObjRef, Object, Stream};
 use hayro_syntax::xref::XRef;
 use kurbo::{Affine, Shape};
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
-use std::fmt::Write;
 
 /// What an annotation draws.
 pub enum Look<'a> {
@@ -123,10 +122,21 @@ pub struct Appearance {
 /// printing what the reader sees: every annotation but links and those flagged
 /// Invisible or Hidden (PDF 32000-1 12.5.3), whatever their Print and `NoView` flags.
 pub fn flattened(annot: &Dict<'_>) -> bool {
-    let link = annot
-        .get::<Name<'_>>(SUBTYPE)
-        .is_some_and(|s| s.as_ref() == b"Link");
-    !link && annot.get::<u32>(F).unwrap_or(0) & 3 == 0
+    let annot = Entries::new(annot.clone());
+    !annot.is(SUBTYPE, b"Link") && flags_of(&annot) & 3 == 0
+}
+
+/// The annotation flags of `annot` (`/F`, PDF 32000-1 12.5.3).
+pub fn flags(annot: &Dict<'_>) -> u32 {
+    flags_of(&Entries::new(annot.clone()))
+}
+
+/// `/F` as viewers read a damaged one: a real number truncated, an integer to its
+/// low 32 bits, and no flags for anything else.
+fn flags_of(annot: &Entries<'_>) -> u32 {
+    // Truncating to 32 bits is the reading meant.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    annot.int(F).map_or(0, |f| f as u32)
 }
 
 /// What the annotations of one document look like: [`Appearances::look`], with
@@ -295,13 +305,11 @@ impl<'a> Appearances<'a> {
         };
         // A number that could not be written fails the appearance, whatever the
         // generator made of it: `None` from a generator means nothing to draw.
-        if out.failed {
-            return Err(Unsupported::Coordinates);
-        }
+        let content = out.finish()?;
         let drew = drew?;
         // An appearance that paints nothing, such as a widget with no value, border
         // or background, is no appearance.
-        let paints = out.content.lines().any(|l| {
+        let paints = content.lines().any(|l| {
             matches!(
                 l.rsplit(' ').next(),
                 Some("f" | "f*" | "S" | "s" | "b" | "b*" | "B" | "B*")
@@ -316,7 +324,7 @@ impl<'a> Appearances<'a> {
             BlendMode::Normal
         };
         Ok(Some(Appearance {
-            content: out.content,
+            content,
             opacity: opacity(annot),
             blend,
         }))
@@ -442,139 +450,6 @@ fn opacity(annot: &Entries<'_>) -> f32 {
 /// work to draw them is bounded by the size of what is visible.
 const FINEST: f64 = 0.01;
 
-/// `v` as it is written in content: a 32-bit number, the range content streams are
-/// read in. `None` beyond that range, or for no number. Every number of a generated
-/// appearance and of a [`Placement`] is converted here.
-fn written(v: f64) -> Option<f32> {
-    let n = v as f32;
-    n.is_finite().then_some(n)
-}
-
-/// [`written`] of each of `v`; [`Unsupported::Coordinates`] when one cannot be.
-fn written_all<const L: usize>(v: [f64; L]) -> Result<[f32; L], Unsupported> {
-    let mut n = [0.0; L];
-    for (n, v) in n.iter_mut().zip(v) {
-        *n = written(v).ok_or(Unsupported::Coordinates)?;
-    }
-    Ok(n)
-}
-
-/// Content stream text. Numbers reach it only through [`written`]; one that cannot
-/// be written fails the whole appearance (`failed`), whatever the generator does
-/// next.
-#[derive(Default)]
-struct Out {
-    content: String,
-    failed: bool,
-}
-
-impl Out {
-    fn num(&mut self, v: f64) -> Option<()> {
-        let Some(n) = written(v) else {
-            self.failed = true;
-            return None;
-        };
-        write!(self.content, "{n} ").ok()
-    }
-
-    fn nums(&mut self, nums: &[f64], op: &str) -> Option<()> {
-        for n in nums {
-            self.num(*n)?;
-        }
-        self.op(op);
-        Some(())
-    }
-
-    /// `path` as path construction operators, to a thousandth of a point.
-    fn path(&mut self, path: &kurbo::BezPath) -> Option<()> {
-        use kurbo::PathEl;
-        let mut last = kurbo::Point::ZERO;
-        for el in path.elements() {
-            let pts: &[kurbo::Point] = match el {
-                PathEl::MoveTo(p) | PathEl::LineTo(p) => &[*p],
-                PathEl::QuadTo(c, p) => {
-                    // The cubic of the same curve.
-                    let c1 = last + (*c - last) * (2.0 / 3.0);
-                    let c2 = *p + (*c - *p) * (2.0 / 3.0);
-                    &[c1, c2, *p]
-                }
-                PathEl::CurveTo(a, b, p) => &[*a, *b, *p],
-                PathEl::ClosePath => {
-                    self.op("h");
-                    continue;
-                }
-            };
-            for p in pts {
-                self.num(round(p.x))?;
-                self.num(round(p.y))?;
-            }
-            self.op(match el {
-                PathEl::MoveTo(_) => "m",
-                PathEl::LineTo(_) => "l",
-                _ => "c",
-            });
-            last = *pts.last()?;
-        }
-        Some(())
-    }
-
-    /// `path` as [`Out::path`] writes it, unless it lies wholly outside `clip`, where
-    /// nothing of it would show; whether it was written. Its numbers pass [`written`]
-    /// either way, so that clipping a path away never hides one that cannot be
-    /// written.
-    fn path_within(&mut self, path: &kurbo::BezPath, clip: kurbo::Rect) -> Option<bool> {
-        use kurbo::PathEl;
-        for el in path.elements() {
-            let pts: &[kurbo::Point] = match el {
-                PathEl::MoveTo(p) | PathEl::LineTo(p) => &[*p],
-                PathEl::QuadTo(c, p) => &[*c, *p],
-                PathEl::CurveTo(a, b, p) => &[*a, *b, *p],
-                PathEl::ClosePath => &[],
-            };
-            if pts.iter().any(|p| written(p.x).is_none() || written(p.y).is_none()) {
-                self.failed = true;
-                return None;
-            }
-        }
-        let (b, c) = (path.control_box(), clip.abs());
-        if b.x1 >= c.x0 && b.x0 <= c.x1 && b.y1 >= c.y0 && b.y0 <= c.y1 {
-            self.path(path)?;
-            Some(true)
-        } else {
-            Some(false)
-        }
-    }
-
-    fn op(&mut self, op: &str) {
-        self.content.push_str(op);
-        self.content.push('\n');
-    }
-
-    /// The stroke state every generated appearance starts from.
-    fn stroke_state(&mut self, width: f64, dash: &[f64]) -> Option<()> {
-        self.op("0 J 0 j 10 M");
-        self.nums(&[width], "w")?;
-        self.content.push('[');
-        for d in dash {
-            self.num(*d)?;
-        }
-        self.op("] 0 d");
-        Some(())
-    }
-
-    /// Clips what follows to `r`.
-    fn clip(&mut self, r: kurbo::Rect) -> Option<()> {
-        self.nums(&[r.x0, r.y0, r.width(), r.height()], "re")?;
-        self.op("W n");
-        Some(())
-    }
-}
-
-/// `v` to a thousandth, without the trailing zeros.
-fn round(v: f64) -> f64 {
-    (v * 1000.0).round() / 1000.0 + 0.0
-}
-
 /// A circle as viewers draw one: four cubic quarter arcs from its top, clockwise, so
 /// that it costs the same at any size.
 fn circle(c: kurbo::Point, r: f64) -> kurbo::BezPath {
@@ -591,41 +466,22 @@ fn circle(c: kurbo::Point, r: f64) -> kurbo::BezPath {
     p
 }
 
-/// The colour operator for colour array `items`, each component that is not a number
-/// read as 0 and every one clamped to 0–1 (PDF 32000-1 8.6.4): gray for one, RGB for
-/// three, CMYK of the first four for four or more, as viewers read them; `None`
-/// for none (transparent) or two.
-fn color(items: &Items<'_>, stroke: bool) -> Option<String> {
-    let mut c = items.numbers();
-    let op = match (c.len(), stroke) {
-        (1, false) => "g",
-        (1, true) => "G",
-        (3, false) => "rg",
-        (3, true) => "RG",
-        (4.., false) => "k",
-        (4.., true) => "K",
-        _ => return None,
-    };
-    c.truncate(4);
-    let mut s = String::new();
-    for n in &c {
-        // Clamped, so it is always written.
-        write!(s, "{} ", n.clamp(0.0, 1.0) as f32).ok()?;
-    }
-    s.push_str(op);
-    Some(s)
+/// The colour of colour array `items` ([`Color::of`]), each component that is not a
+/// number read as 0.
+fn color(items: &Items<'_>) -> Option<Color> {
+    Color::of(&items.numbers())
 }
 
 /// The colour of array `key` of `dict`, `None` when it is not an array or transparent.
-fn color_of(dict: &Entries<'_>, key: &[u8], stroke: bool) -> Option<String> {
-    color(&dict.items(key)?, stroke)
+fn color_of(dict: &Entries<'_>, key: &[u8]) -> Option<Color> {
+    color(&dict.items(key)?)
 }
 
-/// /C as a colour operator: `default` when absent, `None` when it is transparent.
-fn c_color(annot: &Entries<'_>, stroke: bool, default: &str) -> Option<String> {
+/// /C as a colour: `default` when absent, `None` when it is transparent.
+fn c_color(annot: &Entries<'_>, default: Color) -> Option<Color> {
     match annot.items(C) {
-        Some(items) => color(&items, stroke),
-        None => Some(default.to_string()),
+        Some(items) => color(&items),
+        None => Some(default),
     }
 }
 

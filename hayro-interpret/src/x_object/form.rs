@@ -1,7 +1,7 @@
 use super::xobject_oc;
 use crate::context::Context;
-use crate::interpret::annotation::entries::Entries;
 use crate::device::Device;
+use crate::interpret::annotation::entries::Entries;
 use crate::{ClipPath, FillRule, interpret};
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::object::Dict;

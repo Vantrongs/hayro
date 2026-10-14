@@ -13,8 +13,9 @@
 //! chain loops is a broken field and draws nothing, as in common viewers.
 
 use super::entries::{Entries, Value};
+use super::out::{Color, Out};
 use super::text::{self, Family, Fonts, Glyph};
-use super::{FINEST, Field, Inherited, Out, Unsupported, border_width, circle, color_of, rect};
+use super::{FINEST, Field, Inherited, Unsupported, border_width, circle, color_of, rect};
 use hayro_syntax::object::dict::keys::AS;
 use kurbo::{Affine, Shape};
 
@@ -40,10 +41,10 @@ pub(super) fn widget(
         .and_then(|n| u32::try_from(n).ok())
         .unwrap_or(0);
     let mk = annot.dict(b"MK");
-    let mk_color = |key: &[u8], stroke: bool| mk.as_ref().and_then(|mk| color_of(mk, key, stroke));
+    let mk_color = |key: &[u8]| mk.as_ref().and_then(|mk| color_of(mk, key));
     let w = border_width(annot);
-    let border = mk_color(b"BC", true).filter(|_| w > 0.0);
-    let background = mk_color(b"BG", false);
+    let border = mk_color(b"BC").filter(|_| w > 0.0);
+    let background = mk_color(b"BG");
     let fail = |o: Option<()>| o.ok_or(Unsupported::Kind);
 
     let kind = match field_type.name() {
@@ -90,16 +91,9 @@ pub(super) fn widget(
         // the same turned, the check mark is drawn in the frame.
         let sq = (turn * kurbo::Rect::new(0.0, 0.0, s, s).to_path(0.1)).bounding_box();
         if kind == Kind::Radio {
-            fail(radio(
-                sq,
-                w,
-                background.as_deref(),
-                border.as_deref(),
-                on,
-                out,
-            ))?;
+            fail(radio(sq, w, background, border, on, out))?;
         } else {
-            fail(frame(sq, w, background.as_deref(), border.as_deref(), out))?;
+            fail(frame(sq, w, background, border, out))?;
             if on {
                 // The mark is drawn black whatever the default appearance says.
                 let check = fonts
@@ -120,17 +114,13 @@ pub(super) fn widget(
         _ => form.and_then(|f| f.string(b"DA")).unwrap_or_default(),
     };
     let (family, size, text_color) = text::default_appearance(&da);
-    let text_color = text_color.unwrap_or_else(|| "0 g".to_owned());
+    let text_color = text_color.unwrap_or(Color::BLACK);
     let (fw, fh) = (fw as f32, fh as f32);
 
     if kind == Kind::Push {
-        fail(frame(r, w, background.as_deref(), border.as_deref(), out))?;
-        if let Some(bg) = mk
-            .as_ref()
-            .and_then(|mk| mk.items(b"BG"))
-            .map(|a| a.numbers())
-        {
-            fail(bevel(r, w, &bg, out))?;
+        fail(frame(r, w, background, border, out))?;
+        if let Some(bg) = background {
+            fail(bevel(r, w, bg, out))?;
         }
         let caption = mk
             .as_ref()
@@ -153,7 +143,7 @@ pub(super) fn widget(
             by_height.min(by_width).max(1.0)
         });
         let x = (fw - text::width(&glyphs, size)) / 2.0;
-        out.op(&text_color);
+        fail(out.fill_color(&text_color))?;
         fail(text::draw(
             &glyphs,
             size,
@@ -164,7 +154,7 @@ pub(super) fn widget(
         return Ok(Some(()));
     }
 
-    fail(frame(r, w, background.as_deref(), border.as_deref(), out))?;
+    fail(frame(r, w, background, border, out))?;
     let value = match field.get(Inherited::Value) {
         Value::String(s) => text::text_string(s.as_bytes()),
         Value::Name(n) => String::from_utf8_lossy(n.as_ref()).into_owned(),
@@ -186,7 +176,7 @@ pub(super) fn widget(
     };
     out.op("q");
     fail(out.clip(r))?;
-    out.op(&text_color);
+    fail(out.fill_color(&text_color))?;
     let multiline = kind == Kind::Text && flags & (1 << 12) != 0;
     // A length beyond a 32-bit integer is no comb, as in common viewers.
     let max_len = field
@@ -267,7 +257,7 @@ pub(super) fn widget(
                 ))?;
             }
             if let Some(border) = &border {
-                out.op(border);
+                fail(out.stroke_color(border))?;
                 fail(out.stroke_state(w, &[]))?;
                 fail(comb_dividers(
                     max_len,
@@ -365,17 +355,17 @@ enum Kind {
 fn frame(
     r: kurbo::Rect,
     w: f64,
-    background: Option<&str>,
-    border: Option<&str>,
+    background: Option<Color>,
+    border: Option<Color>,
     out: &mut Out,
 ) -> Option<()> {
     if let Some(bg) = background {
-        out.op(bg);
+        out.fill_color(&bg)?;
         out.nums(&[r.x0, r.y0, r.width(), r.height()], "re")?;
         out.op("f");
     }
     if let Some(bc) = border {
-        out.op(bc);
+        out.stroke_color(&bc)?;
         out.stroke_state(w, &[])?;
         let b = r.inset(-w / 2.0);
         out.nums(&[b.x0, b.y0, b.width(), b.height()], "re")?;
@@ -389,8 +379,8 @@ fn frame(
 fn radio(
     sq: kurbo::Rect,
     w: f64,
-    background: Option<&str>,
-    border: Option<&str>,
+    background: Option<Color>,
+    border: Option<Color>,
     on: bool,
     out: &mut Out,
 ) -> Option<()> {
@@ -398,12 +388,12 @@ fn radio(
     let half = sq.width() / 2.0;
     let disc = |r: f64, out: &mut Out| out.path(&circle(c, r));
     if let Some(bg) = background {
-        out.op(bg);
+        out.fill_color(&bg)?;
         disc(half, out)?;
         out.op("f");
     }
     if let Some(bc) = border {
-        out.op(bc);
+        out.stroke_color(&bc)?;
         out.stroke_state(w, &[])?;
         disc(half - w / 2.0, out)?;
         out.op("S");
@@ -418,20 +408,10 @@ fn radio(
 
 /// The bevel of a push button with background `bg`: a lighter band along the top
 /// and left, a darker one along the bottom and right, 2 pt wide inside the border.
-fn bevel(r: kurbo::Rect, w: f64, bg: &[f64], out: &mut Out) -> Option<()> {
-    let op = match bg.len() {
-        1 => "g",
-        3 => "rg",
-        _ => return Some(()),
-    };
-    // Clamped, so they are always written.
-    let tone = |f: &dyn Fn(f32) -> f32| {
-        let mut s = String::new();
-        for c in bg {
-            s.push_str(&format!("{} ", f(c.clamp(0.0, 1.0) as f32)));
-        }
-        s + op
-    };
+fn bevel(r: kurbo::Rect, w: f64, bg: Color, out: &mut Out) -> Option<()> {
+    if matches!(bg, Color::Cmyk(_)) {
+        return Some(());
+    }
     let o = r.inset(-w);
     let i = r.inset(-(w + 2.0));
     if o.width() <= 0.0 || o.height() <= 0.0 || i.width() <= 0.0 || i.height() <= 0.0 {
@@ -445,7 +425,7 @@ fn bevel(r: kurbo::Rect, w: f64, bg: &[f64], out: &mut Out) -> Option<()> {
         out.op("h f");
         Some(())
     };
-    out.op(&tone(&|c| c + (1.0 - c) / 2.0));
+    out.fill_color(&bg.map(|c| c + (1.0 - c) / 2.0))?;
     poly(
         &[
             (o.x0, o.y0),
@@ -457,7 +437,7 @@ fn bevel(r: kurbo::Rect, w: f64, bg: &[f64], out: &mut Out) -> Option<()> {
         ],
         out,
     )?;
-    out.op(&tone(&|c| c / 2.0));
+    out.fill_color(&bg.map(|c| c / 2.0))?;
     poly(
         &[
             (o.x0, o.y0),

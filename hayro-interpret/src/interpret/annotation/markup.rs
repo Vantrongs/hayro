@@ -7,7 +7,8 @@
 //! quadrilaterals, a line width wider on each side.
 
 use super::entries::{Entries, Value};
-use super::{FINEST, Out, Unsupported, border_width, c_color, color_of, dash, rect};
+use super::out::{Color, Out};
+use super::{FINEST, Unsupported, border_width, c_color, color_of, dash, rect};
 use hayro_syntax::object::dict::keys::{C, IC, INKLIST, QUADPOINTS};
 use kurbo::{Point, Rect, Vec2};
 
@@ -15,15 +16,15 @@ use kurbo::{Point, Rect, Vec2};
 /// `/Rect`. Unlike `PDFium`, an absent `/C` means no border: the spec gives it no default.
 /// A border of width 0 is the thinnest line, not none.
 pub(super) fn shape(annot: &Entries<'_>, circle: bool, out: &mut Out) -> Option<()> {
-    let fill = color_of(annot, IC, false);
+    let fill = color_of(annot, IC);
     let width = border_width(annot);
-    let stroke = color_of(annot, C, true);
+    let stroke = color_of(annot, C);
     if fill.is_none() && stroke.is_none() {
         return None;
     }
     let mut r = rect(annot)?;
     if let Some(stroke) = &stroke {
-        out.op(stroke);
+        out.stroke_color(stroke)?;
         out.stroke_state(width, &dash(annot))?;
         r = r.inset(-width / 2.0);
         if r.width() < 0.0 || r.height() < 0.0 {
@@ -31,7 +32,7 @@ pub(super) fn shape(annot: &Entries<'_>, circle: bool, out: &mut Out) -> Option<
         }
     }
     if let Some(fill) = &fill {
-        out.op(fill);
+        out.fill_color(fill)?;
     }
     let [x0, y0, x1, y1] = [r.x0, r.y0, r.x1, r.y1];
     if circle {
@@ -126,7 +127,7 @@ fn marked(annot: &Entries<'_>) -> Option<(Vec<Quad>, Rect)> {
 /// edge. A quad whose bottom edge has no length has no direction: viewers put the
 /// curves' control points at the origin, and so does this.
 pub(super) fn highlight(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
-    let fill = c_color(annot, false, "1 1 0 rg")?;
+    let fill = c_color(annot, Color::Rgb([1.0, 1.0, 0.0]))?;
     let (quads, around) = marked(annot)?;
     let shapes: Vec<(Quad, Option<[Point; 4]>)> = quads
         .into_iter()
@@ -156,7 +157,7 @@ pub(super) fn highlight(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
         .fold(around, |r, p| r.union_pt(p));
     out.op("q");
     out.clip(clip)?;
-    out.op(&fill);
+    out.fill_color(&fill)?;
     for (q, controls) in shapes {
         let [tl, tr, bl, br] = q.0;
         let [c1, c2, c3, c4] = controls.unwrap_or([Point::ZERO; 4]);
@@ -179,11 +180,11 @@ pub(super) enum Line {
 /// of the quad's height wide, across it from side to side, a seventh or three
 /// sevenths of the way up each side.
 pub(super) fn text_lines(annot: &Entries<'_>, line: Line, out: &mut Out) -> Option<()> {
-    let stroke = c_color(annot, true, "0 G")?;
+    let stroke = c_color(annot, Color::BLACK)?;
     let (quads, clip) = marked(annot)?;
     out.op("q");
     out.clip(clip)?;
-    out.op(&stroke);
+    out.stroke_color(&stroke)?;
     for q in &quads {
         out.stroke_state(line_width(q), &[])?;
         let (a, b) = q.across(match line {
@@ -206,7 +207,7 @@ pub(super) fn squiggly(
     visible: Rect,
     out: &mut Out,
 ) -> Result<Option<()>, Unsupported> {
-    let Some(stroke) = c_color(annot, true, "0 G") else {
+    let Some(stroke) = c_color(annot, Color::BLACK) else {
         return Ok(None);
     };
     let Some((quads, clip)) = marked(annot) else {
@@ -216,7 +217,7 @@ pub(super) fn squiggly(
     let wrote = |o: Option<()>| o.ok_or(Unsupported::Coordinates);
     out.op("q");
     wrote(out.clip(clip))?;
-    out.op(&stroke);
+    wrote(out.stroke_color(&stroke))?;
     if visible.overlaps(clip) {
         let shown = visible.intersect(clip);
         for q in &quads {
@@ -327,14 +328,15 @@ fn clip_line(from: Point, along: Vec2, end: f64, r: Rect) -> Option<(f64, f64)> 
     (lo <= hi).then_some((lo, hi))
 }
 
-/// `Ink`: each `/InkList` path stroked as a polyline in /C at the border width, with
-/// the border dash, round ends and joins; a path of one point is a dot. Unlike `PDFium`, an absent `/C` draws nothing: the spec gives it no
+/// `Ink`: the `/InkList` paths as polylines of one path, stroked once in /C at the
+/// border width, with the border dash, round ends and joins; a path of one point is
+/// a dot. Unlike `PDFium`, an absent `/C` draws nothing: the spec gives it no
 /// default.
 pub(super) fn ink(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     let width = border_width(annot);
-    let stroke = color_of(annot, C, true)?;
+    let stroke = color_of(annot, C)?;
     let list = annot.items(INKLIST)?;
-    out.op(&stroke);
+    out.stroke_color(&stroke)?;
     out.stroke_state(width, &dash(annot))?;
     // Round ends and corners, as a pen draws.
     out.op("1 J 1 j");
@@ -350,16 +352,17 @@ pub(super) fn ink(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
         for pt in rest.as_chunks::<2>().0 {
             out.nums(pt, "l")?;
         }
-        out.op("S");
         drew = true;
     }
-    drew.then_some(())
+    // One stroke of all paths, as viewers draw it: where paths cross, a translucent
+    // ink is laid once.
+    drew.then(|| out.op("S"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::Out;
     use super::super::entries::Entries;
+    use super::super::out::Out;
     use super::squiggly;
     use hayro_syntax::object::{Dict, FromBytes};
     use kurbo::Rect;
@@ -374,7 +377,7 @@ mod tests {
         squiggly(&Entries::new(dict), visible, &mut out)
             .expect("drawable")
             .expect("an appearance");
-        out.content
+        out.finish().expect("written")
     }
 
     /// The corners of the zigzags drawn in `c`.

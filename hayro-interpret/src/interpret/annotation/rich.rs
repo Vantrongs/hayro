@@ -10,6 +10,7 @@
 //! that nothing is drawn differently from them unnoticed.
 
 use super::Unsupported;
+use super::out::Color;
 use super::text::{Align, Family, Span, Style};
 use html5ever::interface::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use html5ever::tendril::{StrTendril, TendrilSink};
@@ -297,6 +298,19 @@ fn number(value: &str) -> Option<(f32, &str)> {
     Some((unsigned.parse().ok()?, digits))
 }
 
+/// A CSS number without a unit, signed: not the words for infinity and not-a-number
+/// a float parser also reads.
+fn signed(value: &str) -> Option<f32> {
+    let (sign, value) = match value.strip_prefix('-') {
+        Some(rest) => (-1.0, rest),
+        None => (1.0, value),
+    };
+    match number(value)? {
+        (n, "") => Some(sign * n),
+        _ => None,
+    }
+}
+
 fn zero(value: &str) -> bool {
     number(value).is_some_and(|(n, unit)| {
         n == 0.0 && ["", "pt", "px", "em", "%", "in", "mm", "cm"].contains(&unit)
@@ -304,7 +318,8 @@ fn zero(value: &str) -> bool {
 }
 
 /// A `font-size`: points (`px` counted as points, as common viewers do), or `em`
-/// and `%` of `parent`.
+/// and `%` of `parent`. A size too large to write is kept: text drawn in it fails
+/// the appearance as every number too large to write does.
 fn font_size(value: &str, parent: f32) -> Result<f32, Unsupported> {
     let (n, unit) = number(value).ok_or(Unsupported::RichText)?;
     let size = match unit.to_ascii_lowercase().as_str() {
@@ -313,7 +328,7 @@ fn font_size(value: &str, parent: f32) -> Result<f32, Unsupported> {
         "%" => n * parent / 100.0,
         _ => return Err(Unsupported::RichText),
     };
-    if size.is_finite() && size > 0.0 {
+    if size > 0.0 {
         Ok(size)
     } else {
         Err(Unsupported::RichText)
@@ -419,12 +434,13 @@ fn font(value: &str, style: &mut Style, parent: f32) -> Result<(), Unsupported> 
     Ok(())
 }
 
-/// A CSS colour as an RGB fill operator: `#rrggbb`, `#rgb`, `rgb(r, g, b)` in
-/// numbers or percentages, or one of the 16 basic colour names.
-fn color(value: &str) -> Result<String, Unsupported> {
+/// A CSS colour as an RGB colour: `#rrggbb`, `#rgb`, `rgb(r, g, b)` in numbers or
+/// percentages, or one of the 16 basic colour names.
+fn color(value: &str) -> Result<Color, Unsupported> {
     let rgb = color_rgb(value).ok_or(Unsupported::RichText)?;
-    let [r, g, b] = rgb.map(|v| (v * 10000.0).round() / 10000.0);
-    Ok(format!("{r} {g} {b} rg"))
+    Ok(Color::Rgb(
+        rgb.map(|v| f64::from((v * 10000.0).round() / 10000.0)),
+    ))
 }
 
 fn color_rgb(value: &str) -> Option<[f32; 3]> {
@@ -443,8 +459,8 @@ fn color_rgb(value: &str) -> Option<[f32; 3]> {
             .map(|p| {
                 let p = p.trim();
                 match p.strip_suffix('%') {
-                    Some(percent) => Some(percent.parse::<f32>().ok()? / 100.0),
-                    None => Some(p.parse::<f32>().ok()? / 255.0),
+                    Some(percent) => Some(signed(percent)? / 100.0),
+                    None => Some(signed(p)? / 255.0),
                 }
             })
             .collect::<Option<_>>()?;
@@ -706,6 +722,7 @@ impl TreeSink for Dom {
 #[cfg(test)]
 mod tests {
     use super::super::Unsupported;
+    use super::super::out::Color;
     use super::super::text::{Align, Family, Style, Typeface};
     use super::{css_style, rich_text};
 
@@ -713,10 +730,12 @@ mod tests {
         Style {
             face: Family::Text.into(),
             size: 12.0,
-            color: "0 g".to_owned(),
+            color: Color::BLACK,
             align: Align::Left,
         }
     }
+
+    const RED: Color = Color::Rgb([1.0, 0.0, 0.0]);
 
     fn text(xhtml: &str) -> String {
         let spans = rich_text(xhtml, &base()).expect("supported");
@@ -724,7 +743,7 @@ mod tests {
     }
 
     /// Each span's text with its face, size, colour and alignment.
-    fn styled(xhtml: &str) -> Vec<(String, Typeface, f32, String, Align)> {
+    fn styled(xhtml: &str) -> Vec<(String, Typeface, f32, Color, Align)> {
         rich_text(xhtml, &base())
             .expect("supported")
             .into_iter()
@@ -769,8 +788,8 @@ mod tests {
     /// they hold; CDATA sections and internal subsets are not read, as in HTML.
     #[test]
     fn markup_is_read_as_html() {
-        let red = |t: &str| (t.to_owned(), SANS, 12.0, "1 0 0 rg".to_owned(), Align::Left);
-        let black = |t: &str| (t.to_owned(), SANS, 12.0, "0 g".to_owned(), Align::Left);
+        let red = |t: &str| (t.to_owned(), SANS, 12.0, RED, Align::Left);
+        let black = |t: &str| (t.to_owned(), SANS, 12.0, Color::BLACK, Align::Left);
         assert_eq!(
             styled(
                 "<body style=\"font-family:Helvetica\"><p>A<!-- > MMMM --><span \
@@ -838,7 +857,7 @@ mod tests {
     /// Styles nest; each element's style applies to what it holds.
     #[test]
     fn styles_nest() {
-        let got: Vec<(String, Typeface, f32, String)> = styled(
+        let got: Vec<(String, Typeface, f32, Color)> = styled(
             "<body style=\"font-size:10pt\"><p style=\"font-family:Helvetica\">A \
              <span style=\"color:#ff0000\">B</span> C</p><p>D</p></body>",
         )
@@ -849,10 +868,10 @@ mod tests {
         assert_eq!(
             got,
             [
-                ("A ".to_owned(), SANS, 10.0, "0 g".to_owned()),
-                ("B".to_owned(), SANS, 10.0, "1 0 0 rg".to_owned()),
-                (" C\n".to_owned(), SANS, 10.0, "0 g".to_owned()),
-                ("D\n".to_owned(), text_face, 10.0, "0 g".to_owned()),
+                ("A ".to_owned(), SANS, 10.0, Color::BLACK),
+                ("B".to_owned(), SANS, 10.0, RED),
+                (" C\n".to_owned(), SANS, 10.0, Color::BLACK),
+                ("D\n".to_owned(), text_face, 10.0, Color::BLACK),
             ]
         );
     }
@@ -956,8 +975,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            (style.face, style.size, style.color.as_str(), style.align),
-            (SANS, 12.0, "1 0 0 rg", Align::Left)
+            (style.face, style.size, style.color, style.align),
+            (SANS, 12.0, RED, Align::Left)
         );
         let style = css_style("font: bold Helvetica 18pt; text-align:center", base()).unwrap();
         assert_eq!(

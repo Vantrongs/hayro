@@ -5,8 +5,9 @@
 //! endings look as common viewers draw them.
 
 use super::entries::{Entries, Value};
+use super::out::{Color, Out};
 use super::text::{self, Family, Fonts};
-use super::{Out, Unsupported, border_width, circle, color_of, dash};
+use super::{Unsupported, border_width, circle, color_of, dash};
 use hayro_syntax::object::dict::keys::{C, IC};
 use kurbo::{Affine, Point, Vec2};
 
@@ -55,10 +56,10 @@ impl Ending {
 
 /// How a shape is painted: its stroke colour and width, dash, and interior fill.
 pub(super) struct Paint {
-    pub(super) stroke: String,
+    pub(super) stroke: Color,
     pub(super) width: f64,
     pub(super) dash: Vec<f64>,
-    pub(super) fill: Option<String>,
+    pub(super) fill: Option<Color>,
 }
 
 impl Paint {
@@ -66,17 +67,17 @@ impl Paint {
     /// a stroke colour.
     fn of(annot: &Entries<'_>) -> Option<Self> {
         Some(Self {
-            stroke: color_of(annot, C, true)?,
+            stroke: color_of(annot, C)?,
             width: border_width(annot),
             dash: dash(annot),
-            fill: color_of(annot, IC, false),
+            fill: color_of(annot, IC),
         })
     }
 
     fn start(&self, out: &mut Out) -> Option<()> {
-        out.op(&self.stroke);
+        out.stroke_color(&self.stroke)?;
         if let Some(fill) = &self.fill {
-            out.op(fill);
+            out.fill_color(fill)?;
         }
         out.stroke_state(self.width, &self.dash)
     }
@@ -179,17 +180,17 @@ pub(super) fn poly(annot: &Entries<'_>, closed: bool, out: &mut Out) -> Option<(
     if vertices.len() < 2 {
         return None;
     }
-    let stroke = color_of(annot, C, true);
-    let fill = color_of(annot, IC, false);
+    let stroke = color_of(annot, C);
+    let fill = color_of(annot, IC);
     if closed {
         if stroke.is_none() && fill.is_none() {
             return None;
         }
         if let Some(stroke) = &stroke {
-            out.op(stroke);
+            out.stroke_color(stroke)?;
         }
         if let Some(fill) = &fill {
-            out.op(fill);
+            out.fill_color(fill)?;
         }
         out.stroke_state(border_width(annot), &dash(annot))?;
         polyline(&vertices, out)?;

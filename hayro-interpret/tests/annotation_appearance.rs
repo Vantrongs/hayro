@@ -176,8 +176,10 @@ fn a_huge_squiggly_is_drawn_across_the_page() {
     assert!((200..=210).contains(&bbox[2]), "{bbox:?}");
 }
 
+/// The paths of an Ink are one path stroked once, as viewers stroke it: where they
+/// cross, a translucent ink is laid once.
 #[test]
-fn ink_strokes_each_path_at_border_width_with_dash() {
+fn ink_strokes_its_paths_as_one_at_border_width_with_dash() {
     let ev = draw(
         &[
             "/Subtype /Ink /C [1 0 0] /BS << /W 3 /S /D /D [2 1] >> /Rect [0 0 100 100] /InkList [[10 10 20 30 40 20] [50 50 60 60]]",
@@ -186,20 +188,12 @@ fn ink_strokes_each_path_at_border_width_with_dash() {
     );
     assert_eq!(
         ev,
-        vec![
-            Ev::Stroke {
-                bbox: [10, 10, 40, 30],
-                rgba: RED,
-                width: 3.0,
-                dashed: true
-            },
-            Ev::Stroke {
-                bbox: [50, 50, 60, 60],
-                rgba: RED,
-                width: 3.0,
-                dashed: true
-            },
-        ]
+        vec![Ev::Stroke {
+            bbox: [10, 10, 60, 60],
+            rgba: RED,
+            width: 3.0,
+            dashed: true
+        }]
     );
 }
 
@@ -593,9 +587,17 @@ fn flags_and_existing_appearances_decide_what_is_generated() {
         ("/F 1", 0),
         ("/F 2", 0),
         ("/F 5", 0),
+        // A damaged /F as viewers read it: a real truncated, an integer to its low
+        // 32 bits, anything else no flags.
+        ("/F -1", 0),
+        ("/F 2.9", 0),
+        ("/F 4294967298", 0),
+        ("/F 4294967296", 1),
+        ("/F (x)", 1),
     ] {
         assert_eq!(drawn(flags, Flatten), n, "{flags}");
     }
+    assert_eq!(drawn("/F 2.5", View), 0);
     // A normal appearance that names no object is generated anew.
     assert_eq!(drawn("/AP << /N 99 0 R >>", View), 1);
     // A link is not flattened, even with an appearance.
@@ -738,7 +740,7 @@ fn subtypes_that_draw_without_an_appearance() {
         format!("/Subtype /Popup {r}"),
         format!("/Subtype /Movie {r}"),
         format!("/Subtype /Foo {r}"),
-        format!("{r}"),
+        r.to_string(),
         format!("/Subtype /Widget /FT /Sig {r}"),
         format!("/Subtype /Widget /FT /Sig /V << >> {r}"),
         format!("/Subtype /Widget {r}"),
@@ -1261,14 +1263,20 @@ fn a_damaged_box_or_matrix_places_the_appearance_as_viewers_do() {
         );
         let mut rec = Rec::default();
         common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut rec);
-        fills(&rec.0).into_iter().map(|(b, _)| b).collect::<Vec<_>>()
+        fills(&rec.0)
+            .into_iter()
+            .map(|(b, _)| b)
+            .collect::<Vec<_>>()
     };
     let upright = vec![[30, 70, 50, 88]];
     let flipped = vec![[30, 52, 50, 70]];
     assert_eq!(in_content("[0 0 10 10]", ""), upright);
     assert_eq!(in_content("[0 /x 10 10]", ""), upright);
     assert_eq!(in_content("[0 99 0 R 10 10 7]", ""), upright);
-    assert_eq!(in_content("[0 0 10 10]", "/Matrix [1 0 0 -1 0 (bad)]"), flipped);
+    assert_eq!(
+        in_content("[0 0 10 10]", "/Matrix [1 0 0 -1 0 (bad)]"),
+        flipped
+    );
     assert_eq!(in_content("[0 0 10 10]", "/Matrix [1 0 0 -1]"), flipped);
 
     // A writer gets the same box and matrix to draw the stream with.
@@ -1311,6 +1319,13 @@ fn every_number_too_large_to_write_is_unsupported() {
         format!("/Subtype /Polygon /C [0] /Rect [0 0 200 200] /Vertices [10 10 50 10 50 {H}]"),
         format!("/Subtype /Widget /FT /Btn /Ff 32768 /MK << /BG [0] >> /Rect [0 0 {H} {H}]"),
         format!("/Subtype /FreeText /Rect [0 0 200 200] /Contents (A) /DA (/Helv {H} Tf)"),
+        // Text clipped away is checked as text drawn is.
+        format!("/Subtype /Widget /FT /Tx /V (A) /DA (/Helv {H} Tf) /Rect [10 10 100 30]"),
+        format!("/Subtype /Widget /FT /Tx /Ff 4096 /V (A) /DA (/Helv {H} Tf) /Rect [10 10 100 30]"),
+        format!(
+            "/Subtype /FreeText /Rect [0 0 200 200] /RC (<p style=\"font-size:{H}pt\">A</p>)"
+        ),
+        format!("/Subtype /FreeText /Rect [0 0 200 200] /DS (font-size:{H}pt) /Contents (A)"),
     ]);
     for annot in &cases {
         let pdf = annotations(
@@ -1693,4 +1708,23 @@ fn a_carriage_return_ending_a_paragraph_breaks_once() {
     );
     assert_eq!(rows.len(), 2, "{rows:?}");
     assert_eq!(rows[0] - rows[1], 12, "{rows:?}");
+}
+
+/// A rich text colour is read as CSS reads numbers: words a float parser also takes
+/// for numbers, such as `nan` and `inf`, make it unsupported rather than a colour.
+#[test]
+fn a_rich_text_colour_of_no_css_number_is_unsupported() {
+    for color in ["rgb(nan, 0, 0)", "rgb(inf, 0, 0)", "rgb(0, 0, infinity)"] {
+        let pdf = annotations(
+            "/Annots [4 0 R]",
+            vec![
+                format!(
+                    "<< /Type /Annot /Subtype /FreeText /Rect [0 0 200 200] \
+                     /RC (<p style=\"color:{color}\">A</p>) >>"
+                )
+                .into_bytes(),
+            ],
+        );
+        assert_eq!(looks(&pdf), ["RichText"], "{color}");
+    }
 }

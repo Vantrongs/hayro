@@ -1,7 +1,8 @@
 //! Text in generated appearances: glyphs of the standard fonts the font resolver
 //! gives, drawn as outlines so that the appearance needs no font resources.
 
-use super::{Out, Unsupported};
+use super::Unsupported;
+use super::out::{Color, Out};
 use crate::FontResolverFn;
 use crate::font::blob::{CffFontBlob, OpenTypeFontBlob};
 use crate::font::{FontQuery, StandardFont, glyph_name_to_unicode};
@@ -9,7 +10,6 @@ use kurbo::{Affine, BezPath, Rect};
 use rustc_hash::FxHashMap;
 use skrifa::GlyphId;
 use std::cell::OnceCell;
-use std::fmt::Write;
 
 /// The font families generated text is set in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,15 +252,7 @@ pub(super) fn draw_clipped(
     clip: Rect,
     out: &mut Out,
 ) -> Option<()> {
-    fill(
-        glyphs,
-        size,
-        origin,
-        spacing,
-        transform,
-        Some(clip),
-        out,
-    )
+    fill(glyphs, size, origin, spacing, transform, Some(clip), out)
 }
 
 fn fill(
@@ -359,7 +351,7 @@ impl Face {
 pub(super) struct Style {
     pub(super) face: Typeface,
     pub(super) size: f32,
-    pub(super) color: String,
+    pub(super) color: Color,
     pub(super) align: Align,
 }
 
@@ -378,7 +370,7 @@ pub(super) enum Align {
 /// operand of `Tf` and its size, and the last colour operator. A size of 0
 /// (fit to the field) is `None`; without `Tf` the size is 12 pt, as common viewers
 /// set it.
-pub(super) fn default_appearance(da: &[u8]) -> (Family, Option<f32>, Option<String>) {
+pub(super) fn default_appearance(da: &[u8]) -> (Family, Option<f32>, Option<Color>) {
     let tokens: Vec<&[u8]> = da
         .split(|b| b.is_ascii_whitespace())
         .filter(|t| !t.is_empty())
@@ -389,21 +381,21 @@ pub(super) fn default_appearance(da: &[u8]) -> (Family, Option<f32>, Option<Stri
     for (i, op) in tokens.iter().enumerate() {
         // Numbers as PDF writes them (7.3.3), however large: one too large to draw
         // fails the appearance where it is drawn.
-        let operands = |n: usize| -> Option<Vec<f32>> {
+        let operands = |n: usize| -> Option<Vec<f64>> {
             let from = i.checked_sub(n)?;
             tokens[from..i]
                 .iter()
                 .map(|t| {
                     let number = t.iter().all(|b| b.is_ascii_digit() || b"+-.".contains(b));
-                    number.then(|| std::str::from_utf8(t).ok()?.parse::<f32>().ok())?
+                    number.then(|| std::str::from_utf8(t).ok()?.parse::<f64>().ok())?
                 })
-                .collect::<Option<Vec<f32>>>()
+                .collect::<Option<Vec<f64>>>()
         };
         match *op {
             b"Tf" if i >= 2 => {
                 family =
                     Family::of_font_name(tokens[i - 2].strip_prefix(b"/").unwrap_or(tokens[i - 2]));
-                size = operands(1).map(|s| s[0]).filter(|s| *s > 0.0);
+                size = operands(1).map(|s| s[0] as f32).filter(|s| *s > 0.0);
             }
             b"g" | b"rg" | b"k" => {
                 let n = match *op {
@@ -412,12 +404,7 @@ pub(super) fn default_appearance(da: &[u8]) -> (Family, Option<f32>, Option<Stri
                     _ => 4,
                 };
                 if let Some(c) = operands(n) {
-                    let mut s = String::new();
-                    for v in c {
-                        let _ = write!(s, "{} ", v.clamp(0.0, 1.0));
-                    }
-                    s.push_str(std::str::from_utf8(op).unwrap_or("g"));
-                    color = Some(s);
+                    color = Color::of(&c);
                 }
             }
             _ => {}
@@ -476,7 +463,7 @@ pub(super) fn lines<'f>(
         style: Style {
             face: family.into(),
             size,
-            color: String::new(),
+            color: Color::BLACK,
             align: Align::Left,
         },
     };

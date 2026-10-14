@@ -12,8 +12,9 @@
 
 use super::entries::Entries;
 use super::markup::{Quad, quads};
+use super::out::{Color, Out};
 use super::text::{self, Family, Fonts, Typeface};
-use super::{Out, Unsupported, c_color, color_of, rect};
+use super::{Unsupported, c_color, color_of, rect};
 use hayro_syntax::object::dict::keys::C;
 use kurbo::{Affine, BezPath, Circle, Point, Shape};
 
@@ -38,9 +39,9 @@ pub(super) fn icon(annot: &Entries<'_>, kind: Icon, fonts: &Fonts, out: &mut Out
     };
     let name = annot.name(b"Name");
     let name = name.as_ref().map_or(&b""[..], |n| n.as_ref());
-    let fill = color_of(annot, C, false).unwrap_or_else(|| "1 g".to_owned());
+    let fill = color_of(annot, C).unwrap_or(Color::Gray(1.0));
     let (x0, y1) = (r.x0, r.y1);
-    out.op(&fill);
+    fail(out.fill_color(&fill))?;
     out.op("0 G");
     fail(out.stroke_state(1.25, &[]))?;
     fail(out.nums(&[x0 + 0.625, y1 - 19.375, 18.75, 18.75], "re"))?;
@@ -257,10 +258,10 @@ impl Symbol {
 /// (black without it).
 pub(super) fn caret(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     let r = rect(annot)?;
-    let fill = c_color(annot, false, "0 g")?;
+    let fill = c_color(annot, Color::BLACK)?;
     let c = r.center();
     let (x, y) = (c.x, c.y);
-    out.op(&fill);
+    out.fill_color(&fill)?;
     out.nums(&[x - 10.0, y - 7.0], "m")?;
     out.nums(&[x, y - 7.0, x, y, x, y + 7.0], "c")?;
     out.nums(&[x, y, x, y - 7.0, x + 10.0, y - 7.0], "c")?;
@@ -336,10 +337,9 @@ pub(super) fn stamp(annot: &Entries<'_>, fonts: &Fonts, out: &mut Out) -> Drawn 
     let Some(r) = rect(annot) else {
         return Ok(None);
     };
-    let Some(fill) = c_color(annot, false, "0 g") else {
+    let Some(color) = c_color(annot, Color::BLACK) else {
         return Ok(None);
     };
-    let stroke = c_color(annot, true, "0 G").unwrap_or_default();
     let scale = (r.width() / 190.0).min(r.height() / 50.0);
     if scale <= 0.0 {
         return Ok(None);
@@ -349,7 +349,7 @@ pub(super) fn stamp(annot: &Entries<'_>, fonts: &Fonts, out: &mut Out) -> Drawn 
         * Affine::scale(scale);
     out.op("q");
     fail(out.clip(r))?;
-    out.op(&stroke);
+    fail(out.stroke_color(&color))?;
     fail(out.stroke_state(2.0 * scale, &[]))?;
     let corners = [(-93.0, -22.0), (93.0, -22.0), (93.0, 22.0), (-93.0, 22.0)]
         .map(|(x, y)| at * Point::new(x, y));
@@ -358,7 +358,7 @@ pub(super) fn stamp(annot: &Entries<'_>, fonts: &Fonts, out: &mut Out) -> Drawn 
         fail(out.nums(&[c.x, c.y], "l"))?;
     }
     out.op("s");
-    out.op(&fill);
+    fail(out.fill_color(&color))?;
     // Baselines from the box's middle.
     let baselines: &[f32] = match (lines.len(), size as u32) {
         (2, _) => &[2.0, -15.5],

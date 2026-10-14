@@ -15,7 +15,7 @@ use crate::x_object::{FormXObject, ImageXObject, XObject};
 use crate::{BlendMode, FillRule};
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
-use hayro_syntax::object::dict::keys::{ANNOTS, F, MCID, OC};
+use hayro_syntax::object::dict::keys::{ANNOTS, MCID, OC};
 use hayro_syntax::object::{Array, Dict, Name, Object, dict_or_stream};
 use hayro_syntax::page::{Page, Resources};
 use kurbo::{Affine, Point, Shape};
@@ -168,7 +168,7 @@ pub fn interpret_page<'a>(
             annotation::Appearances::new(page.xref(), context.settings.font_resolver.clone());
         let visible = page.intersected_crop_box().to_kurbo();
         for annot in annot_arr.iter::<Dict<'_>>() {
-            let flags = annot.get::<u32>(F).unwrap_or(0);
+            let flags = annotation::flags(&annot);
             let shown = match context.settings.annotations {
                 AnnotationSelection::View => flags & (2 | 32) == 0,
                 AnnotationSelection::Print => flags & 2 == 0 && flags & 4 != 0,

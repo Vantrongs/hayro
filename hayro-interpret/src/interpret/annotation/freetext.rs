@@ -15,9 +15,10 @@
 
 use super::entries::Entries;
 use super::lines::{Ending, Paint, ending};
+use super::out::{Color, Out};
 use super::rich;
 use super::text::{self, Align, Family, Fonts, Span, Style};
-use super::{Out, Unsupported, border_width, color_of, dash, rect};
+use super::{Unsupported, border_width, color_of, dash, rect};
 use hayro_syntax::object::dict::keys::C;
 use kurbo::{Affine, Point};
 
@@ -44,18 +45,14 @@ pub(super) fn free_text(
     let mut style = Style {
         face: family.into(),
         size: size.unwrap_or(12.0),
-        color: da_color.unwrap_or_else(|| "0 g".to_owned()),
+        color: da_color.unwrap_or(Color::BLACK),
         align: match annot.int(b"Q").unwrap_or(0) {
             1 => Align::Center,
             2 => Align::Right,
             _ => Align::Left,
         },
     };
-    let border_color = style
-        .color
-        .replace("rg", "RG")
-        .replace(" g", " G")
-        .replace(" k", " K");
+    let border_color = style.color;
     // Rich text may be a stream.
     let rich = annot.text(b"RC");
     let ds = annot.text(b"DS");
@@ -98,20 +95,20 @@ pub(super) fn free_text(
         .collect();
 
     out.op("q");
-    if let Some(fill) = color_of(annot, C, false) {
-        out.op(&fill);
+    if let Some(fill) = color_of(annot, C) {
+        out.fill_color(&fill).ok_or(Unsupported::Kind)?;
         out.nums(&[inner.x0, inner.y0, inner.width(), inner.height()], "re")
             .ok_or(Unsupported::Kind)?;
         out.op("f");
     }
     if callout && (cl.len() == 2 || cl.len() == 3) && w > 0.0 {
         let paint = Paint {
-            stroke: border_color.clone(),
+            stroke: border_color,
             width: w,
             dash: Vec::new(),
             fill: None,
         };
-        out.op(&paint.stroke);
+        out.stroke_color(&paint.stroke).ok_or(Unsupported::Kind)?;
         out.stroke_state(w, &[]).ok_or(Unsupported::Kind)?;
         out.nums(&[cl[0].x, cl[0].y], "m")
             .ok_or(Unsupported::Kind)?;
@@ -122,7 +119,7 @@ pub(super) fn free_text(
         ending(Ending::of(annot)[0], cl[0], cl[1], &paint, out).ok_or(Unsupported::Kind)?;
     }
     if w > 0.0 {
-        out.op(&border_color);
+        out.stroke_color(&border_color).ok_or(Unsupported::Kind)?;
         out.stroke_state(w, &dash(annot)).ok_or(Unsupported::Kind)?;
         let b = inner.inset(-w / 2.0);
         out.nums(&[b.x0, b.y0, b.width(), b.height()], "re")
@@ -177,7 +174,7 @@ pub(super) fn free_text(
             for run in line.glyphs.chunk_by(|a, b| a.span == b.span) {
                 let span_color = &spans[run[0].span].style.color;
                 if color != Some(span_color) {
-                    out.op(span_color);
+                    out.fill_color(span_color).ok_or(Unsupported::Kind)?;
                     color = Some(span_color);
                 }
                 let glyphs: Vec<text::Glyph<'_>> = run.iter().map(|g| g.glyph.clone()).collect();
