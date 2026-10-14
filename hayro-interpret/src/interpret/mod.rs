@@ -737,7 +737,8 @@ pub fn interpret<'a>(
                         Pattern::Shading(ShadingPattern {
                             shading: Arc::new(s),
                             matrix: Affine::IDENTITY,
-                            opacity: context.get().graphics_state.non_stroke_alpha,
+                            // Set where it paints.
+                            opacity: 1.0,
                             transfer_function: transfer_function.clone(),
                         })
                     })
