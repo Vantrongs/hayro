@@ -25,6 +25,7 @@ rustc-hash = { workspace = true }
 html5ever = { workspace = true }
 
 [dev-dependencies]
+flate2 = { workspace = true, features = ["zlib-rs"] }
 image = { workspace = true, features = ["png"] }
 jpeg-encoder = "0.7"
 

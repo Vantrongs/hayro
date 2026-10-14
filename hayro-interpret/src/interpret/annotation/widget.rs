@@ -156,7 +156,6 @@ pub(super) fn widget(
 
     fail(frame(r, w, background, border, out))?;
     let value = match field.get(Inherited::Value) {
-        Value::String(s) => text::text_string(s.as_bytes()),
         Value::Name(n) => String::from_utf8_lossy(n.as_ref()).into_owned(),
         // The first of several selected values.
         Value::Array(values) => values
@@ -164,7 +163,11 @@ pub(super) fn widget(
             .string()
             .map(text::text_string)
             .unwrap_or_default(),
-        _ => String::new(),
+        // A text string or a text stream.
+        value => value
+            .text()
+            .map(|t| text::text_string(&t))
+            .unwrap_or_default(),
     };
     let pad = 2.0 * w as f32;
     let avail = (fw - 2.0 * pad).max(0.0);

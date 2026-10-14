@@ -1799,3 +1799,30 @@ fn a_damaged_annots_entry_hides_none_after_it() {
         assert_eq!(red_square_after(annots), square, "{annots}");
     }
 }
+
+/// A text field's value may be a text stream; its text is drawn as a string's is.
+#[test]
+fn a_text_field_draws_a_value_stream() {
+    let field = "/Subtype /Widget /FT /Tx /DA (/Helv 12 Tf 0 g) /Rect [20 20 180 60]";
+    let drawn = |value: &str, objects: Vec<Vec<u8>>| {
+        let pdf = annotations(
+            "/Annots [4 0 R]",
+            [
+                vec![format!("<< /Type /Annot {field} {value} >>").into_bytes()],
+                objects,
+            ]
+            .concat(),
+        );
+        let appearances =
+            Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+        match appearances.look(&annots(&pdf)[0], PAGE) {
+            Look::Generated(a) => a.content,
+            _ => panic!("{value}: not generated"),
+        }
+    };
+    let string = drawn("/V (HELLO)", vec![]);
+    assert_eq!(
+        drawn("/V 5 0 R", vec![common::stream("", b"HELLO")]),
+        string
+    );
+}

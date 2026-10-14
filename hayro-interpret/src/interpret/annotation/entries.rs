@@ -6,7 +6,7 @@
 //! number, is null, or refers to no object reads as 0 where a number is wanted, so the
 //! coordinates and colour components after it keep their meaning.
 
-use hayro_syntax::object::{Array, Dict, Name, Number, ObjRef, Object};
+use hayro_syntax::object::{Array, Dict, Name, Number, ObjRef, Object, Stream};
 use hayro_syntax::xref::XRef;
 
 /// A dictionary an annotation is drawn from: the annotation, one it refers to (its
@@ -23,9 +23,9 @@ pub(crate) enum Value<'a> {
     String(hayro_syntax::object::String<'a>),
     Array(Items<'a>),
     Dict(Entries<'a>),
-    /// A stream's decoded data.
-    Data(Vec<u8>),
-    /// Null, a reference to no object, a stream that cannot be decoded, or no entry.
+    /// A stream, decoded only where its text is read ([`Value::text`]).
+    Stream(Stream<'a>),
+    /// Null, a reference to no object, or no entry.
     Null,
 }
 
@@ -38,10 +38,7 @@ impl<'a> Value<'a> {
             Some(Object::String(s)) => Self::String(s),
             Some(Object::Array(a)) => Self::Array(Items(a)),
             Some(Object::Dict(d)) => Self::Dict(Entries(d)),
-            Some(Object::Stream(s)) => match s.decoded() {
-                Ok(data) => Self::Data(data.into_owned()),
-                Err(_) => Self::Null,
-            },
+            Some(Object::Stream(s)) => Self::Stream(s),
             Some(Object::Null(_)) | None => Self::Null,
         }
     }
@@ -76,6 +73,15 @@ impl<'a> Value<'a> {
     pub(crate) fn string(&self) -> Option<&[u8]> {
         match self {
             Self::String(s) => Some(s.as_bytes()),
+            _ => None,
+        }
+    }
+
+    /// A string's bytes, or a stream's decoded data.
+    pub(crate) fn text(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::String(s) => Some(s.as_bytes().to_vec()),
+            Self::Stream(s) => s.decoded().ok().map(std::borrow::Cow::into_owned),
             _ => None,
         }
     }
@@ -158,11 +164,7 @@ impl<'a> Entries<'a> {
 
     /// The bytes of string `key`, or the decoded data of stream `key`.
     pub(crate) fn text(&self, key: &[u8]) -> Option<Vec<u8>> {
-        match self.get(key) {
-            Value::String(s) => Some(s.as_bytes().to_vec()),
-            Value::Data(data) => Some(data),
-            _ => None,
-        }
+        self.get(key).text()
     }
 
     pub(crate) fn dict(&self, key: &[u8]) -> Option<Self> {

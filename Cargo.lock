@@ -744,6 +744,7 @@ name = "hayro-interpret"
 version = "0.8.0"
 dependencies = [
  "bitflags",
+ "flate2",
  "hayro-cmap",
  "hayro-syntax",
  "html5ever",

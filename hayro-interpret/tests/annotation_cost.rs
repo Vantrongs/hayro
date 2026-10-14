@@ -401,3 +401,53 @@ fn text_draws_only_what_its_box_shows() {
         assert!(content.len() < 100_000, "{kind}: {} bytes", content.len());
     }
 }
+
+/// A stream where a number, flags, a colour, a name or a dictionary is read is not
+/// decoded: an annotation whose entries are a stream of 32 MiB compressed to little
+/// costs what one without them does.
+#[test]
+fn a_stream_read_for_no_text_is_not_decoded() {
+    use std::io::Write;
+    let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+    zlib.write_all(&vec![0; 32 << 20]).unwrap();
+    let data = zlib.finish().unwrap();
+    let square = "/Subtype /Square /Rect [20 20 100 100]";
+    let button = "/Subtype /Widget /FT /Btn /Rect [20 20 180 60] /MK << /BG [0.5] /CA (A) >>";
+    for annot in [
+        format!("{square} /IC [1 0 0] /F 5 0 R"),
+        format!("{square} /IC 5 0 R /C [0]"),
+        format!("{square} /IC [1 0 0] /C [0] /BS 5 0 R /CA 5 0 R"),
+        format!("{square} /IC [1 0 0] /C [0] /Border [0 0 5 0 R]"),
+        "/Subtype /Line /Rect [20 20 100 100] /C [0] /L [20 20 100 100] /LE 5 0 R".to_owned(),
+        format!("{button} /Ff 5 0 R"),
+        format!("{button} /Ff 65536 /DA 5 0 R"),
+    ] {
+        let pdf = Pdf::new(common::one_page(
+            200,
+            "/Annots [4 0 R]",
+            vec![
+                format!("<< /Type /Annot {annot} >>").into_bytes(),
+                common::stream("/Filter /FlateDecode", &data),
+            ],
+        ))
+        .expect("valid pdf");
+        let annot = pdf.pages()[0]
+            .raw()
+            .get::<Array<'_>>(b"Annots")
+            .unwrap()
+            .iter::<Dict<'_>>()
+            .next()
+            .unwrap();
+        let appearances =
+            Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+        let before = allocated();
+        let _ = hayro_interpret::annotation::flattened(&annot);
+        let _ = hayro_interpret::annotation::flags(&annot);
+        assert!(
+            matches!(appearances.look(&annot, PAGE), Look::Generated(_)),
+            "{annot:?}"
+        );
+        let bytes = allocated() - before;
+        assert!(bytes < 1 << 20, "{bytes} bytes: {annot:?}");
+    }
+}
