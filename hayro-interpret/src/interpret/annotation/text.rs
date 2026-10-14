@@ -23,31 +23,20 @@ pub(super) enum Family {
     /// The face of rich text that names no family a viewer maps to a standard
     /// font ([`FontQuery::TextDefault`]).
     Text,
-    /// `ZapfDingbats`, the check box mark.
+    /// `ZapfDingbats`: the check box mark, and text in its built-in encoding.
     Dingbats,
 }
 
 impl Family {
-    /// The family a default appearance font name stands for: the base fonts of the
-    /// names Acrobat puts in `/DR` (`Helv`, `TiRo`, `Cour`, …) or a base font name,
-    /// by its family; Helvetica for any other.
+    /// The family a default appearance font name stands for, as viewers draw it:
+    /// three of the names Acrobat puts in `/DR` by their own family, whatever font
+    /// `/DR` gives them, and Helvetica for any other.
     pub(super) fn of_font_name(name: &[u8]) -> Self {
-        let name = String::from_utf8_lossy(name).to_ascii_lowercase();
-        if name.starts_with("tiro")
-            || name.starts_with("times")
-            || name.starts_with("tibo")
-            || name.starts_with("tiit")
-            || name.starts_with("tibi")
-        {
-            Self::Serif
-        } else if name.starts_with("cour")
-            || name.starts_with("cobo")
-            || name.starts_with("coit")
-            || name.starts_with("cobi")
-        {
-            Self::Mono
-        } else {
-            Self::Sans
+        match name {
+            b"TiRo" => Self::Serif,
+            b"Cour" => Self::Mono,
+            b"ZaDb" => Self::Dingbats,
+            _ => Self::Sans,
         }
     }
 }
@@ -179,6 +168,21 @@ impl Fonts {
 
     /// The glyph of `c` in `typeface`, with its advance in em.
     fn glyph(&self, typeface: Typeface, c: char) -> Result<Glyph<'_>, Unsupported> {
+        if typeface.family == Family::Dingbats {
+            // Viewers write the text's bytes in the font's own encoding; where
+            // PDFDocEncoding and Latin-1 agree, a character is its byte.
+            let code = u8::try_from(c)
+                .ok()
+                .filter(|b| matches!(b, 0x20..=0x7E | 0xA1..=0xFF));
+            return code
+                .and_then(|b| StandardFont::ZapfDingBats.code_to_name(b))
+                .and_then(|name| self.named(Family::Dingbats, name))
+                .map(|g| Glyph {
+                    space: c == ' ',
+                    ..g
+                })
+                .ok_or(Unsupported::Character(c));
+        }
         // Tabs and other controls take a space.
         let c = if c.is_control() { ' ' } else { c };
         let sans = Typeface::from(Family::Sans);
@@ -375,14 +379,10 @@ pub(super) enum Align {
 }
 
 /// The style of a default appearance string (PDF 32000-1 12.7.3.3): the font
-/// operand of `Tf` and its size, and the last colour operator. The font name is
-/// looked up in `fonts` (an `/DR /Font` dictionary) for its `/BaseFont`. A size of 0
+/// operand of `Tf` and its size, and the last colour operator. A size of 0
 /// (fit to the field) is `None`; without `Tf` the size is 12 pt, as common viewers
 /// set it.
-pub(super) fn default_appearance(
-    da: &[u8],
-    fonts: Option<&hayro_syntax::object::Dict<'_>>,
-) -> (Family, Option<f32>, Option<String>) {
+pub(super) fn default_appearance(da: &[u8]) -> (Family, Option<f32>, Option<String>) {
     let tokens: Vec<&[u8]> = da
         .split(|b| b.is_ascii_whitespace())
         .filter(|t| !t.is_empty())
@@ -401,11 +401,8 @@ pub(super) fn default_appearance(
         };
         match *op {
             b"Tf" if i >= 2 => {
-                let name = tokens[i - 2].strip_prefix(b"/").unwrap_or(tokens[i - 2]);
-                let base = fonts
-                    .and_then(|f| f.get::<hayro_syntax::object::Dict<'_>>(name))
-                    .and_then(|f| f.get::<hayro_syntax::object::Name<'_>>(b"BaseFont"));
-                family = Family::of_font_name(base.as_ref().map_or(name, |b| b.as_ref()));
+                family =
+                    Family::of_font_name(tokens[i - 2].strip_prefix(b"/").unwrap_or(tokens[i - 2]));
                 size = operands(1).map(|s| s[0]).filter(|s| *s > 0.0);
             }
             b"g" | b"rg" | b"k" => {

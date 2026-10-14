@@ -206,11 +206,6 @@ impl Appearances<'_> {
         };
         let mut out = Out::default();
         let fonts = &self.fonts;
-        let dr = self
-            .form
-            .as_ref()
-            .and_then(|f| f.get::<Dict<'_>>(b"DR"))
-            .and_then(|dr| dr.get::<Dict<'_>>(b"Font"));
         let ok = |drew: Option<()>| Ok(drew);
         let drew = match subtype.as_ref() {
             b"Square" => ok(markup::shape(annot, false, &mut out)),
@@ -241,7 +236,7 @@ impl Appearances<'_> {
             b"Caret" => ok(icons::caret(annot, &mut out)),
             b"Redact" => ok(icons::redact(annot, &mut out)),
             b"Stamp" => icons::stamp(annot, fonts, &mut out),
-            b"FreeText" => freetext::free_text(annot, dr.as_ref(), fonts, &mut out),
+            b"FreeText" => freetext::free_text(annot, fonts, &mut out),
             b"Line" => lines::line(annot, fonts, &mut out),
             b"Polygon" => ok(lines::poly(annot, true, &mut out)),
             b"PolyLine" => ok(lines::poly(annot, false, &mut out)),

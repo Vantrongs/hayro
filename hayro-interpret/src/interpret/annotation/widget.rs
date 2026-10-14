@@ -121,10 +121,7 @@ pub(super) fn widget(
         .or_else(|| form.and_then(|f| f.get::<hayro_syntax::object::String<'_>>(b"DA")))
         .map(|s| s.as_bytes().to_vec())
         .unwrap_or_default();
-    let dr = form
-        .and_then(|f| f.get::<Dict<'_>>(b"DR"))
-        .and_then(|dr| dr.get::<Dict<'_>>(b"Font"));
-    let (family, size, text_color) = text::default_appearance(&da, dr.as_ref());
+    let (family, size, text_color) = text::default_appearance(&da);
     let text_color = text_color.unwrap_or_else(|| "0 g".to_owned());
     let (fw, fh) = (fw as f32, fh as f32);
 

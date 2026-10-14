@@ -1200,6 +1200,28 @@ fn a_comment_in_rich_text_draws_nothing() {
 /// the standard fonts' bold and italic.
 #[test]
 fn rich_text_asks_for_the_face_of_each_part() {
+    let rc = "<body><p>a<b>b</b><i>c</i></p><p style=\"font-family:Times New Roman;\
+              font-weight:700\">d<i>e</i></p><p style=\"font:italic 9pt Helvetica\">f</p>\
+              <p style=\"font-family:Courier;font-weight:bold;font-style:oblique\">g</p></body>";
+    let asked = faces_asked(&format!(
+        "/Subtype /FreeText /Rect [20 20 180 180] /BS << /W 0 >> /RC ({rc})"
+    ));
+    for face in [
+        "default false false",
+        "default true false",
+        "default false true",
+        "Times-Bold",
+        "Times-BoldItalic",
+        "Helvetica-Oblique",
+        "Courier-BoldOblique",
+    ] {
+        assert!(asked.iter().any(|a| a == face), "{face}: {asked:?}");
+    }
+    assert!(!asked.iter().any(|a| a == "Times-Roman"), "{asked:?}");
+}
+
+/// The fonts the appearance of `annot` asks the font resolver for.
+fn faces_asked(annot: &str) -> Vec<String> {
     use hayro_interpret::font::FontQuery;
     use std::sync::{Arc, Mutex};
     let asked = Arc::new(Mutex::new(Vec::new()));
@@ -1215,34 +1237,44 @@ fn rich_text_asks_for_the_face_of_each_part() {
         }),
         ..Default::default()
     };
-    let rc = "<body><p>a<b>b</b><i>c</i></p><p style=\"font-family:Times New Roman;\
-              font-weight:700\">d<i>e</i></p><p style=\"font:italic 9pt Helvetica\">f</p>\
-              <p style=\"font-family:Courier;font-weight:bold;font-style:oblique\">g</p></body>";
     let file = common::one_page(
         200,
         "/Resources << >> /Annots [4 0 R]",
-        vec![
-            format!(
-                "<< /Type /Annot /Subtype /FreeText /Rect [20 20 180 180] /BS << /W 0 >> /RC ({rc}) >>"
-            )
-            .into_bytes(),
-        ],
+        vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
     );
     let pdf = Pdf::new(file).expect("valid pdf");
     common::interpret_first_page(&pdf, settings, &mut Rec::default());
-    let asked = asked.lock().unwrap();
-    for face in [
-        "default false false",
-        "default true false",
-        "default false true",
-        "Times-Bold",
-        "Times-BoldItalic",
-        "Helvetica-Oblique",
-        "Courier-BoldOblique",
+    asked.lock().unwrap().clone()
+}
+
+/// A default appearance's font is Times for `TiRo`, Courier for `Cour`,
+/// `ZapfDingbats` for `ZaDb`, and Helvetica for any other name, whatever the form's
+/// resources say it is: the faces viewers draw it in.
+#[test]
+fn a_default_appearance_font_is_one_of_four_names() {
+    for (name, face) in [
+        ("Helv", "Helvetica"),
+        ("TiRo", "Times-Roman"),
+        ("Cour", "Courier"),
+        ("ZaDb", "ZapfDingbats"),
+        ("TiBo", "Helvetica"),
+        ("CoBo", "Helvetica"),
+        ("Times-Roman", "Helvetica"),
+        ("tiro", "Helvetica"),
     ] {
-        assert!(asked.iter().any(|a| a == face), "{face}: {asked:?}");
+        for annot in [
+            "/Subtype /FreeText /Rect [20 20 180 180] /Contents (4)",
+            "/Subtype /Widget /FT /Tx /Rect [20 20 180 60] /V (4)",
+        ] {
+            let asked = faces_asked(&format!("{annot} /DA (/{name} 12 Tf 0 g)"));
+            // Helvetica may be asked as well, for glyphs the face lacks.
+            assert!(
+                asked.iter().any(|a| a == face)
+                    && asked.iter().all(|a| a == face || a == "Helvetica"),
+                "{name} in {annot}: {asked:?}"
+            );
+        }
     }
-    assert!(!asked.iter().any(|a| a == "Times-Roman"), "{asked:?}");
 }
 
 /// Rich text is aligned by its `text-align`, whatever `/Q`; a justified line

@@ -23,7 +23,6 @@ use kurbo::{Affine, Point};
 
 pub(super) fn free_text(
     annot: &Dict<'_>,
-    form_fonts: Option<&Dict<'_>>,
     fonts: &Fonts,
     out: &mut Out,
 ) -> Result<Option<()>, Unsupported> {
@@ -41,7 +40,7 @@ pub(super) fn free_text(
         _ => r,
     };
     let da = string(annot, b"DA").unwrap_or_default();
-    let (family, size, da_color) = text::default_appearance(&da, form_fonts);
+    let (family, size, da_color) = text::default_appearance(&da);
     let mut style = Style {
         face: family.into(),
         size: size.unwrap_or(12.0),
