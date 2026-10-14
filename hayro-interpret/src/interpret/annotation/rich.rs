@@ -15,6 +15,7 @@ use super::text::{Align, Family, Span, Style};
 use html5ever::interface::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use html5ever::tendril::{StrTendril, TendrilSink};
 use html5ever::{Attribute, ExpandedName, ParseOpts, QualName, ns, parse_document};
+use rustc_hash::FxHashSet;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
@@ -51,6 +52,10 @@ const SHOWN: [&str; 10] = [
 const HIDDEN: [&str; 6] = ["head", "title", "style", "script", "meta", "link"];
 
 fn parse(xhtml: &str) -> Result<Rc<Node>, Unsupported> {
+    parsed(xhtml).map(|dom| dom.document)
+}
+
+fn parsed(xhtml: &str) -> Result<Dom, Unsupported> {
     // Each node but the three the parser adds comes from at least one byte, but for
     // copies of formatting elements left open, made for each paragraph after them.
     let dom = Dom {
@@ -58,6 +63,7 @@ fn parse(xhtml: &str) -> Result<Rc<Node>, Unsupported> {
         nodes: Cell::new(0),
         max_nodes: xhtml.len() + 16,
         unsupported: Cell::new(false),
+        names_looked_at: Cell::new(0),
     };
     let mut parser = parse_document(dom, ParseOpts::default());
     // Fed in pieces, so that parsing stops soon after the document turns out to be
@@ -79,7 +85,7 @@ fn parse(xhtml: &str) -> Result<Rc<Node>, Unsupported> {
     if dom.unsupported.get() {
         return Err(Unsupported::RichText);
     }
-    Ok(dom.document)
+    Ok(dom)
 }
 
 /// The spans of the document under `document`.
@@ -118,7 +124,7 @@ fn walk(document: &Rc<Node>, base: &Style) -> Result<Vec<Span>, Unsupported> {
                 add(&mut spans, &text.borrow(), &set(&parent, lines));
                 continue;
             }
-            Kind::Element { name, attrs } => (name, attrs),
+            Kind::Element { name, attrs, .. } => (name, attrs),
             Kind::Document | Kind::Other => continue,
         };
         let tag: &str = &name.local;
@@ -505,6 +511,8 @@ enum Kind {
     Element {
         name: QualName,
         attrs: RefCell<Vec<Attribute>>,
+        /// The names of `attrs`, once attributes of a repeated tag are merged in.
+        names: RefCell<Option<FxHashSet<QualName>>>,
     },
     Text(RefCell<String>),
     /// A comment or processing instruction.
@@ -546,6 +554,8 @@ struct Dom {
     nodes: Cell<usize>,
     max_nodes: usize,
     unsupported: Cell<bool>,
+    /// The attribute names looked at to merge those of repeated tags.
+    names_looked_at: Cell<usize>,
 }
 
 impl Dom {
@@ -555,6 +565,10 @@ impl Dom {
         if node.depth.get() > MAX_DEPTH {
             self.unsupported.set(true);
         }
+    }
+
+    fn looked_at(&self, names: usize) {
+        self.names_looked_at.set(self.names_looked_at.get() + names);
     }
 
     fn counted(&self, node: Rc<Node>) -> Rc<Node> {
@@ -606,6 +620,7 @@ impl TreeSink for Dom {
         self.counted(Node::new(Kind::Element {
             name,
             attrs: RefCell::new(attrs),
+            names: RefCell::new(None),
         }))
     }
 
@@ -685,16 +700,26 @@ impl TreeSink for Dom {
         children.insert(at, node);
     }
 
+    // A repeated `<html>` or `<body>` adds the attributes the element lacks; the
+    // first of a name stays.
     fn add_attrs_if_missing(&self, target: &Rc<Node>, attrs: Vec<Attribute>) {
         let Kind::Element {
-            attrs: existing, ..
+            attrs: existing,
+            names,
+            ..
         } = &target.kind
         else {
             return;
         };
         let mut existing = existing.borrow_mut();
+        let mut names = names.borrow_mut();
+        let names = names.get_or_insert_with(|| {
+            self.looked_at(existing.len());
+            existing.iter().map(|a| a.name.clone()).collect()
+        });
+        self.looked_at(attrs.len());
         for attr in attrs {
-            if !existing.iter().any(|a| a.name == attr.name) {
+            if names.insert(attr.name.clone()) {
                 existing.push(attr);
             }
         }
@@ -724,7 +749,49 @@ mod tests {
     use super::super::Unsupported;
     use super::super::out::Color;
     use super::super::text::{Align, Family, Style, Typeface};
-    use super::{css_style, rich_text};
+    use super::{Kind, Node, css_style, parsed, rich_text};
+    use std::rc::Rc;
+
+    /// The attributes of the first `name` element under `node`, as `name=value`.
+    fn attributes(node: &Rc<Node>, name: &str) -> Option<Vec<String>> {
+        if let Kind::Element { name: n, attrs, .. } = &node.kind
+            && &*n.local == name
+        {
+            return Some(
+                attrs
+                    .borrow()
+                    .iter()
+                    .map(|a| format!("{}={}", &*a.name.local, &*a.value))
+                    .collect(),
+            );
+        }
+        node.children
+            .borrow()
+            .iter()
+            .find_map(|c| attributes(c, name))
+    }
+
+    /// A repeated `<body>` or `<html>` adds the attributes its element lacks, the
+    /// first of a name staying, at a cost that grows with their number, not its
+    /// square.
+    #[test]
+    fn repeated_tags_merge_attributes_in_linear_work() {
+        for tag in ["body", "html"] {
+            let dom = parsed(&format!("<{tag} a=1><{tag} a=2 b=3><p>A</p>")).expect("supported");
+            assert_eq!(
+                attributes(&dom.document, tag).expect("element"),
+                ["a=1", "b=3"],
+                "{tag}"
+            );
+            for n in [1_000, 10_000] {
+                let tags: String = (0..n).map(|i| format!("<{tag} a{i}=x>")).collect();
+                let dom = parsed(&format!("<{tag}>{tags}<p>A</p>")).expect("supported");
+                assert_eq!(attributes(&dom.document, tag).expect("element").len(), n);
+                let looked_at = dom.names_looked_at.get();
+                assert!(looked_at <= 2 * n, "{tag} {n}: {looked_at}");
+            }
+        }
+    }
 
     fn base() -> Style {
         Style {
