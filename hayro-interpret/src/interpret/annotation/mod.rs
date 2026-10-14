@@ -19,7 +19,7 @@
 //! resources. /CA and the highlight's Multiply
 //! blend apply to it as one transparency group.
 
-mod entries;
+pub(crate) mod entries;
 mod freetext;
 mod icons;
 mod lines;
@@ -31,8 +31,9 @@ use entries::{Entries, Items, Value};
 use text::Fonts;
 
 use crate::BlendMode;
+use crate::x_object::box_and_matrix;
 use hayro_syntax::object::dict::keys::{
-    AP, AS, BBOX, BORDER, BS, C, CA, D, F, MATRIX, N, RECT, S, SUBTYPE, W,
+    AP, AS, BORDER, BS, C, CA, D, F, N, RECT, S, SUBTYPE, W,
 };
 use hayro_syntax::object::{Dict, Name, ObjRef, Object, Stream};
 use hayro_syntax::xref::XRef;
@@ -202,18 +203,13 @@ impl<'a> Appearances<'a> {
 /// `/Rect`, or the stream has no `/BBox` that, after its `/Matrix`, encloses some
 /// area; [`Unsupported::Coordinates`] when one of its numbers cannot be written.
 fn placement(stream: &Stream<'_>, annot: &Entries<'_>) -> Result<Option<Placement>, Unsupported> {
-    let dict = Entries::new(stream.dict().clone());
-    let Some(bbox) = dict.numbers(BBOX, 4) else {
+    let Some((bbox, matrix)) = box_and_matrix(stream.dict()) else {
         return Ok(None);
-    };
-    let matrix = match dict.numbers(MATRIX, 6) {
-        Some(m) => [m[0], m[1], m[2], m[3], m[4], m[5]],
-        None => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
     };
     let Some(rect) = rect(annot) else {
         return Ok(None);
     };
-    let bbox = written_all([bbox[0], bbox[1], bbox[2], bbox[3]])?;
+    let bbox = written_all(bbox)?;
     let matrix = written_all(matrix)?;
     let affine = Affine::new(matrix.map(f64::from));
     let [x0, y0, x1, y1] = bbox.map(f64::from);

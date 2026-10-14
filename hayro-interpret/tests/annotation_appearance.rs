@@ -1247,6 +1247,30 @@ fn a_damaged_box_or_matrix_places_the_appearance_as_viewers_do() {
     );
     assert_eq!(drawn("[0 0 10]", ""), Vec::<[i32; 4]>::new());
 
+    // A form drawn by the page's content reads its box and matrix the same way.
+    let in_content = |bbox: &str, matrix: &str| {
+        let pdf = annotations(
+            "/Contents 4 0 R /Resources << /XObject << /X 5 0 R >> >>",
+            vec![
+                common::stream("", b"q 5 0 0 6 30 70 cm /X Do Q"),
+                common::stream(
+                    &format!("/Type /XObject /Subtype /Form /BBox {bbox} {matrix}"),
+                    b"0 g 0 0 4 3 re f",
+                ),
+            ],
+        );
+        let mut rec = Rec::default();
+        common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut rec);
+        fills(&rec.0).into_iter().map(|(b, _)| b).collect::<Vec<_>>()
+    };
+    let upright = vec![[30, 70, 50, 88]];
+    let flipped = vec![[30, 52, 50, 70]];
+    assert_eq!(in_content("[0 0 10 10]", ""), upright);
+    assert_eq!(in_content("[0 /x 10 10]", ""), upright);
+    assert_eq!(in_content("[0 99 0 R 10 10 7]", ""), upright);
+    assert_eq!(in_content("[0 0 10 10]", "/Matrix [1 0 0 -1 0 (bad)]"), flipped);
+    assert_eq!(in_content("[0 0 10 10]", "/Matrix [1 0 0 -1]"), flipped);
+
     // A writer gets the same box and matrix to draw the stream with.
     let pdf = annotations(
         "/Annots [4 0 R]",

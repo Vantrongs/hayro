@@ -1,5 +1,6 @@
 use super::xobject_oc;
 use crate::context::Context;
+use crate::interpret::annotation::entries::Entries;
 use crate::device::Device;
 use crate::{ClipPath, FillRule, interpret};
 use hayro_syntax::content::TypedIter;
@@ -9,6 +10,20 @@ use hayro_syntax::object::dict::keys::*;
 use hayro_syntax::page::Resources;
 use kurbo::{Affine, Rect, Shape};
 use std::borrow::Cow;
+
+/// The `/BBox` and `/Matrix` of a form, read as viewers read damaged ones: each entry
+/// keeps its place, one that is not a number reads as 0, and missing ones are 0.
+/// A form whose `/BBox` is not an array has no box and is not drawn; one whose
+/// `/Matrix` is not an array is drawn with the identity.
+pub(crate) fn box_and_matrix(dict: &Dict<'_>) -> Option<([f64; 4], [f64; 6])> {
+    let dict = Entries::new(dict.clone());
+    let b = dict.numbers(BBOX, 4)?;
+    let matrix = match dict.numbers(MATRIX, 6) {
+        Some(m) => [m[0], m[1], m[2], m[3], m[4], m[5]],
+        None => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+    };
+    Some(([b[0], b[1], b[2], b[3]], matrix))
+}
 
 pub(crate) struct FormXObject<'a> {
     pub(crate) decoded: Cow<'a, [u8]>,
@@ -21,13 +36,8 @@ pub(crate) struct FormXObject<'a> {
 
 impl<'a> FormXObject<'a> {
     pub(crate) fn new(stream: &Stream<'a>) -> Option<Self> {
-        let dict = stream.dict();
-        let matrix = Affine::new(
-            dict.get::<[f64; 6]>(MATRIX)
-                .unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
-        );
-        let bbox = dict.get::<[f32; 4]>(BBOX)?;
-        Self::placed(stream, matrix, bbox)
+        let (bbox, matrix) = box_and_matrix(stream.dict())?;
+        Self::placed(stream, Affine::new(matrix), bbox.map(|v| v as f32))
     }
 
     /// The form of `stream` drawn with `matrix` and clipped to `bbox`, whatever its

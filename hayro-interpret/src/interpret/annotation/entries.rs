@@ -1,4 +1,5 @@
-//! The entries of annotation dictionaries, read as viewers read damaged ones.
+//! The entries of annotation dictionaries and of the forms they and pages draw, read
+//! as viewers read damaged ones.
 //!
 //! Generators read an annotation only through [`Entries`], which offers no typed read
 //! that drops an array's entry: every entry keeps its place, and one that is not a
@@ -12,10 +13,10 @@ use hayro_syntax::xref::XRef;
 /// border style, its appearance characteristics, an appearance stream's), or a field
 /// above a widget.
 #[derive(Clone)]
-pub(super) struct Entries<'a>(Dict<'a>);
+pub(crate) struct Entries<'a>(Dict<'a>);
 
 /// The value of an entry or of an array's entry.
-pub(super) enum Value<'a> {
+pub(crate) enum Value<'a> {
     Number(Number),
     Bool(bool),
     Name(Name<'a>),
@@ -45,11 +46,11 @@ impl<'a> Value<'a> {
         }
     }
 
-    pub(super) fn is_null(&self) -> bool {
+    pub(crate) fn is_null(&self) -> bool {
         matches!(self, Self::Null)
     }
 
-    pub(super) fn number(&self) -> Option<f64> {
+    pub(crate) fn number(&self) -> Option<f64> {
         match self {
             Self::Number(n) => Some(n.as_f64()),
             _ => None,
@@ -57,14 +58,14 @@ impl<'a> Value<'a> {
     }
 
     /// A number as an integer, a real one truncated.
-    pub(super) fn int(&self) -> Option<i64> {
+    pub(crate) fn int(&self) -> Option<i64> {
         match self {
             Self::Number(n) => Some(n.as_i64()),
             _ => None,
         }
     }
 
-    pub(super) fn name(&self) -> Option<&[u8]> {
+    pub(crate) fn name(&self) -> Option<&[u8]> {
         match self {
             Self::Name(n) => Some(n.as_ref()),
             _ => None,
@@ -72,14 +73,14 @@ impl<'a> Value<'a> {
     }
 
     /// A string's bytes.
-    pub(super) fn string(&self) -> Option<&[u8]> {
+    pub(crate) fn string(&self) -> Option<&[u8]> {
         match self {
             Self::String(s) => Some(s.as_bytes()),
             _ => None,
         }
     }
 
-    pub(super) fn items(self) -> Option<Items<'a>> {
+    pub(crate) fn items(self) -> Option<Items<'a>> {
         match self {
             Self::Array(items) => Some(items),
             _ => None,
@@ -89,11 +90,11 @@ impl<'a> Value<'a> {
 
 /// The entries of an array, each in its place.
 #[derive(Clone)]
-pub(super) struct Items<'a>(Array<'a>);
+pub(crate) struct Items<'a>(Array<'a>);
 
 impl<'a> Items<'a> {
     /// The entries in order; one that refers to no object is [`Value::Null`].
-    pub(super) fn iter(&self) -> impl Iterator<Item = Value<'a>> + '_ {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = Value<'a>> + '_ {
         // `flex_iter` resolves references, but ends at one to no object; reading
         // it in step with the raw entries keeps every place.
         let mut resolved = self.0.flex_iter();
@@ -103,47 +104,47 @@ impl<'a> Items<'a> {
     }
 
     /// Entry `i`; [`Value::Null`] beyond the end.
-    pub(super) fn get(&self, i: usize) -> Value<'a> {
+    pub(crate) fn get(&self, i: usize) -> Value<'a> {
         self.iter().nth(i).unwrap_or(Value::Null)
     }
 
     /// The entries as numbers, one that is not a number read as 0.
-    pub(super) fn numbers(&self) -> Vec<f64> {
+    pub(crate) fn numbers(&self) -> Vec<f64> {
         self.iter().map(|v| v.number().unwrap_or(0.0)).collect()
     }
 }
 
 impl<'a> Entries<'a> {
-    pub(super) fn new(dict: Dict<'a>) -> Self {
+    pub(crate) fn new(dict: Dict<'a>) -> Self {
         Self(dict)
     }
 
     /// Entry `key`; [`Value::Null`] when there is none.
-    pub(super) fn get(&self, key: &[u8]) -> Value<'a> {
+    pub(crate) fn get(&self, key: &[u8]) -> Value<'a> {
         Value::of(self.0.get::<Object<'a>>(key))
     }
 
     /// Whether entry `key` is there and not null (PDF 32000-1 7.3.9).
-    pub(super) fn has(&self, key: &[u8]) -> bool {
+    pub(crate) fn has(&self, key: &[u8]) -> bool {
         !self.get(key).is_null()
     }
 
-    pub(super) fn number(&self, key: &[u8]) -> Option<f64> {
+    pub(crate) fn number(&self, key: &[u8]) -> Option<f64> {
         self.get(key).number()
     }
 
-    pub(super) fn int(&self, key: &[u8]) -> Option<i64> {
+    pub(crate) fn int(&self, key: &[u8]) -> Option<i64> {
         self.get(key).int()
     }
 
-    pub(super) fn bool(&self, key: &[u8]) -> Option<bool> {
+    pub(crate) fn bool(&self, key: &[u8]) -> Option<bool> {
         match self.get(key) {
             Value::Bool(b) => Some(b),
             _ => None,
         }
     }
 
-    pub(super) fn name(&self, key: &[u8]) -> Option<Name<'a>> {
+    pub(crate) fn name(&self, key: &[u8]) -> Option<Name<'a>> {
         match self.get(key) {
             Value::Name(n) => Some(n),
             _ => None,
@@ -151,17 +152,17 @@ impl<'a> Entries<'a> {
     }
 
     /// Whether entry `key` is the name `name`.
-    pub(super) fn is(&self, key: &[u8], name: &[u8]) -> bool {
+    pub(crate) fn is(&self, key: &[u8], name: &[u8]) -> bool {
         self.name(key).is_some_and(|n| n.as_ref() == name)
     }
 
     /// The bytes of string `key`.
-    pub(super) fn string(&self, key: &[u8]) -> Option<Vec<u8>> {
+    pub(crate) fn string(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.get(key).string().map(<[u8]>::to_vec)
     }
 
     /// The bytes of string `key`, or the decoded data of stream `key`.
-    pub(super) fn text(&self, key: &[u8]) -> Option<Vec<u8>> {
+    pub(crate) fn text(&self, key: &[u8]) -> Option<Vec<u8>> {
         match self.get(key) {
             Value::String(s) => Some(s.as_bytes().to_vec()),
             Value::Data(data) => Some(data),
@@ -169,20 +170,20 @@ impl<'a> Entries<'a> {
         }
     }
 
-    pub(super) fn dict(&self, key: &[u8]) -> Option<Self> {
+    pub(crate) fn dict(&self, key: &[u8]) -> Option<Self> {
         match self.get(key) {
             Value::Dict(d) => Some(d),
             _ => None,
         }
     }
 
-    pub(super) fn items(&self, key: &[u8]) -> Option<Items<'a>> {
+    pub(crate) fn items(&self, key: &[u8]) -> Option<Items<'a>> {
         self.get(key).items()
     }
 
     /// The entries of array `key` as numbers (see [`Items::numbers`]), with 0 for
     /// those it lacks up to `len`; `None` when `key` is not an array.
-    pub(super) fn numbers(&self, key: &[u8], len: usize) -> Option<Vec<f64>> {
+    pub(crate) fn numbers(&self, key: &[u8], len: usize) -> Option<Vec<f64>> {
         let mut n = self.items(key)?.numbers();
         if n.len() < len {
             n.resize(len, 0.0);
@@ -191,14 +192,14 @@ impl<'a> Entries<'a> {
     }
 
     /// The object this dictionary is, when it is one of its own.
-    pub(super) fn id(&self) -> Option<ObjRef> {
+    pub(crate) fn id(&self) -> Option<ObjRef> {
         self.0.obj_id().map(ObjRef::from)
     }
 
     /// The dictionary `/Parent` names, and the reference to it when it is an object of
     /// its own. One read through a reference is read afresh from `xref`, so that the
     /// depth it lies at costs nothing to read it.
-    pub(super) fn parent(&self, xref: &'a XRef) -> Option<(Option<ObjRef>, Self)> {
+    pub(crate) fn parent(&self, xref: &'a XRef) -> Option<(Option<ObjRef>, Self)> {
         match self.0.get_ref(b"Parent") {
             Some(r) => xref.get::<Dict<'a>>(r.into()).map(|d| (Some(r), Self(d))),
             None => self.dict(b"Parent").map(|d| (None, d)),
