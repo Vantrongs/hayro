@@ -867,7 +867,7 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 [[package]]
 name = "html5ever"
 version = "0.39.0"
-source = "git+https://github.com/Vantrongs/html5ever?rev=0c0cd6b3187f8731ab6cfb1e5c640719bebad4b1#0c0cd6b3187f8731ab6cfb1e5c640719bebad4b1"
+source = "git+https://github.com/Vantrongs/html5ever?rev=7c13a4e871b5ee30d875ec812784de3cb07a06d1#7c13a4e871b5ee30d875ec812784de3cb07a06d1"
 dependencies = [
  "log",
  "markup5ever",
@@ -1736,9 +1736,9 @@ dependencies = [
 [[package]]
 name = "string_cache"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a18596f8c785a729f2819c0f6a7eae6ebeebdfffbfe4214ae6b087f690e31901"
+source = "git+https://github.com/Vantrongs/string-cache?rev=a90cd95f5371e41aadd5c19150c2b1f71baa1142#a90cd95f5371e41aadd5c19150c2b1f71baa1142"
 dependencies = [
+ "hashbrown",
  "new_debug_unreachable",
  "parking_lot",
  "phf_shared",

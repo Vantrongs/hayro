@@ -129,6 +129,11 @@ overflow-checks = true
 zlib-rs = { git = "https://github.com/Vantrongs/zlib-rs", rev = "7a2aa9db8aaefe950749789b4cb42217744c7b67" }
 # `zune_jpeg::rows`, which grayscale JPEG rows need.
 zune-jpeg = { git = "https://github.com/Vantrongs/zune-image", rev = "67bcb66dcd6f027b9f84d9fdf3d404b5c28cfa71" }
-# A tag's duplicate attributes found through a set, so that rich text with many
-# attributes on one tag is parsed in linear time (servo/html5ever issue 796).
-html5ever = { git = "https://github.com/Vantrongs/html5ever", rev = "0c0cd6b3187f8731ab6cfb1e5c640719bebad4b1" }
+# A tag's duplicate attributes found through a set keyed by the names' text, so
+# that rich text with many attributes on one tag is parsed in linear time
+# (servo/html5ever issue 796).
+html5ever = { git = "https://github.com/Vantrongs/html5ever", rev = "7c13a4e871b5ee30d875ec812784de3cb07a06d1" }
+# Atoms longer than 7 bytes placed by a per-process random hash rather than in
+# 4,096 lists by a fixed one, so that attribute names chosen to share a list do
+# not make interning them quadratic.
+string_cache = { git = "https://github.com/Vantrongs/string-cache", rev = "a90cd95f5371e41aadd5c19150c2b1f71baa1142" }

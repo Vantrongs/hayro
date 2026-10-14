@@ -407,6 +407,15 @@ fn attributes_whose_names_hash_alike() -> String {
     attributes
 }
 
+/// One tag with attributes whose names hash alike is read in time that grows with
+/// their number: html5ever's set of a large tag's names, keyed by the names' atom
+/// hash, took 11 s for these in a debug build, and keyed by their text, 0.1 s.
+#[test]
+fn rich_text_with_a_tag_of_names_whose_atoms_hash_alike_is_read_at_a_bounded_cost() {
+    let rc = format!("<p{}>A</p>", attributes_whose_names_hash_alike());
+    assert!(look_within(3, rich(&rc)).is_ok());
+}
+
 /// A repeated tag merges in attributes whose names hash alike in time that grows
 /// with their number: a set of names keyed by their atoms' hash took 16 s for
 /// these in a debug build, and keyed by their text, 0.1 s.
@@ -416,6 +425,31 @@ fn repeated_tags_with_names_whose_atoms_hash_alike_are_merged_at_a_bounded_cost(
         "<body{}><body a=b><p>A</p>",
         attributes_whose_names_hash_alike()
     );
+    assert!(look_within(3, rich(&rc)).is_ok());
+}
+
+/// One tag with attributes whose names, longer than seven bytes, share a bucket
+/// of `string_cache` 0.9's set of atoms is read in time that grows with their number.
+/// The set put such a name in one of 4,096 lists by a hash with a fixed key, so
+/// each name stepped past all those before it: these 65 536 names took 10 s in a
+/// debug build, and 0.3 s with the set placing atoms by a per-process random hash.
+/// The file holds names `n` + 11 hex digits of a counter, found offline to share
+/// one list under the key of `web_atoms` 0.2.6's local names, as LEB128 differences
+/// between the counters.
+#[test]
+fn rich_text_with_a_tag_of_names_in_one_atom_bucket_is_read_at_a_bounded_cost() {
+    let mut attributes = String::new();
+    let (mut counter, mut delta, mut shift) = (0_u64, 0_u64, 0);
+    for byte in include_bytes!("one_bucket_attribute_names.bin") {
+        delta |= u64::from(byte & 0x7f) << shift;
+        shift += 7;
+        if byte & 0x80 == 0 {
+            counter += delta;
+            attributes.push_str(&format!(" n{counter:011x}=x"));
+            (delta, shift) = (0, 0);
+        }
+    }
+    let rc = format!("<p{attributes}>A</p>");
     assert!(look_within(3, rich(&rc)).is_ok());
 }
 
