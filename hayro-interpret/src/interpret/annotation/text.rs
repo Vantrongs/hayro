@@ -5,7 +5,7 @@ use super::{Out, Unsupported};
 use crate::FontResolverFn;
 use crate::font::blob::{CffFontBlob, OpenTypeFontBlob};
 use crate::font::{FontQuery, StandardFont, glyph_name_to_unicode};
-use kurbo::{Affine, BezPath};
+use kurbo::{Affine, BezPath, Rect};
 use rustc_hash::FxHashMap;
 use skrifa::GlyphId;
 use std::cell::OnceCell;
@@ -233,17 +233,39 @@ pub(super) fn draw(
     transform: Affine,
     out: &mut Out,
 ) -> Option<()> {
-    draw_spaced(glyphs, size, origin, 0.0, transform, out)
+    fill(glyphs, size, origin, 0.0, transform, None, out)
 }
 
-/// Fills `glyphs` at `size` with their baseline from `(x, y)`, in `transform`, each
-/// space `spacing` wider than its advance.
-pub(super) fn draw_spaced(
+/// Fills `glyphs` as [`draw`] does, each space `spacing` wider than its advance,
+/// under a clip to `clip`: a glyph wholly outside it is not written, so text
+/// running far beyond its box costs no more output than the box shows.
+pub(super) fn draw_clipped(
+    glyphs: &[Glyph<'_>],
+    size: f32,
+    origin: (f32, f32),
+    spacing: f32,
+    transform: Affine,
+    clip: Rect,
+    out: &mut Out,
+) -> Option<()> {
+    fill(
+        glyphs,
+        size,
+        origin,
+        spacing,
+        transform,
+        Some(clip.abs()),
+        out,
+    )
+}
+
+fn fill(
     glyphs: &[Glyph<'_>],
     size: f32,
     (x, y): (f32, f32),
     spacing: f32,
     transform: Affine,
+    clip: Option<Rect>,
     out: &mut Out,
 ) -> Option<()> {
     let mut x = f64::from(x);
@@ -253,8 +275,14 @@ pub(super) fn draw_spaced(
         let mut path = g.face.outline(g.id);
         if !path.elements().is_empty() {
             path.apply_affine(transform * Affine::new([scale, 0.0, 0.0, scale, x, f64::from(y)]));
-            out.path(&path)?;
-            any = true;
+            let shown = clip.is_none_or(|c| {
+                let b = path.control_box();
+                b.x1 >= c.x0 && b.x0 <= c.x1 && b.y1 >= c.y0 && b.y0 <= c.y1
+            });
+            if shown {
+                out.path(&path)?;
+                any = true;
+            }
         }
         x += f64::from(g.advance) * f64::from(size);
         if g.space {

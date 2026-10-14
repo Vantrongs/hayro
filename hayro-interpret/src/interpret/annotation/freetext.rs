@@ -209,7 +209,7 @@ pub(super) fn free_text(
                     color = Some(span_color);
                 }
                 let glyphs: Vec<text::Glyph<'_>> = run.iter().map(|g| g.glyph.clone()).collect();
-                text::draw_spaced(&glyphs, run[0].size, (x, y), spacing, frame, out)
+                text::draw_clipped(&glyphs, run[0].size, (x, y), spacing, frame, r, out)
                     .ok_or(Unsupported::Kind)?;
                 let spaces = run.iter().filter(|g| g.glyph.is_space()).count();
                 x += text::width(&glyphs, run[0].size) + spacing * spaces as f32;

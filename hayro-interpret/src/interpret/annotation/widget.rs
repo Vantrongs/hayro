@@ -230,7 +230,15 @@ pub(super) fn widget(
                     _ => continue,
                 };
                 let glyphs = fonts.shape(family, &label)?;
-                fail(text::draw(&glyphs, size, (pad, y), turn, out))?;
+                fail(text::draw_clipped(
+                    &glyphs,
+                    size,
+                    (pad, y),
+                    0.0,
+                    turn,
+                    r,
+                    out,
+                ))?;
                 y -= 1.116 * size;
             }
         }
@@ -239,11 +247,13 @@ pub(super) fn widget(
             let lines = text::lines(fonts, family, size, &value, Some(avail))?;
             let mut y = fh - pad - 1.116 * size;
             for line in &lines {
-                fail(text::draw(
+                fail(text::draw_clipped(
                     line,
                     size,
                     (align(text::width(line, size)), y),
+                    0.0,
                     turn,
+                    r,
                     out,
                 ))?;
                 y -= 1.116 * size;
@@ -260,11 +270,13 @@ pub(super) fn widget(
             let cell = fw / cells;
             for (i, g) in glyphs.iter().take(cells as usize).enumerate() {
                 let x = cell * i as f32 + (cell - g.advance * size) / 2.0;
-                fail(text::draw(
+                fail(text::draw_clipped(
                     std::slice::from_ref(g),
                     size,
                     (x, fh / 2.0 - 0.3 * size),
+                    0.0,
                     turn,
+                    r,
                     out,
                 ))?;
             }
@@ -292,11 +304,13 @@ pub(super) fn widget(
                 by_height.min(by_width).max(1.0)
             });
             let width = text::width(&glyphs, size);
-            fail(text::draw(
+            fail(text::draw_clipped(
                 &glyphs,
                 size,
                 (align(width), fh / 2.0 - 0.3 * size),
+                0.0,
                 turn,
+                r,
                 out,
             ))?;
         }

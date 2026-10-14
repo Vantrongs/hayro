@@ -199,3 +199,26 @@ fn formatting_left_open_across_paragraphs_is_unsupported_at_a_bounded_cost() {
     let rc = format!("<p>{open}{}", "</p><p>x".repeat(50_000));
     assert_eq!(look_within(20, rich(&rc)), Err(Unsupported::RichText));
 }
+
+/// Text beside or below a `FreeText`'s box is clipped away, so it is not drawn:
+/// the content stays the size of what the box shows, however long the text.
+#[test]
+fn text_draws_only_what_its_box_shows() {
+    let box_ = "/Rect [20 20 60 180] /BS << /W 0 >> /DA (/Helv 12 Tf 0 g)";
+    let options = "(A) ".repeat(100_000);
+    for (contents, kind) in [
+        ("A".repeat(200_000), "/Subtype /FreeText /Contents"),
+        ("A ".repeat(100_000), "/Subtype /FreeText /Contents"),
+        ("A".repeat(200_000), "/Subtype /Widget /FT /Tx /V"),
+        ("A".repeat(200_000), "/Subtype /Widget /FT /Tx /Ff 4096 /V"),
+        (String::new(), "/Subtype /Widget /FT /Ch /V"),
+    ] {
+        let annot = if contents.is_empty() {
+            format!("{kind} () /Opt [{options}] {box_}")
+        } else {
+            format!("{kind} ({contents}) {box_}")
+        };
+        let content = generated(&annot);
+        assert!(content.len() < 100_000, "{kind}: {} bytes", content.len());
+    }
+}
