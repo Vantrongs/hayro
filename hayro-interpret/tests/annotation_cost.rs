@@ -1,23 +1,36 @@
 //! A generated appearance costs what its visible result needs, however large the
-//! numbers in the annotation. These tests run under an allocation limit: an
-//! appearance whose cost grows with those numbers makes the allocator refuse, and
-//! the test binary aborts ("memory allocation of … bytes failed") instead of
-//! exhausting the machine's memory.
+//! numbers in the annotation, and what the file holds, however its objects refer to
+//! each other. These tests run under an allocation limit: an appearance whose cost
+//! grows with those numbers makes the allocator refuse, and the test binary aborts
+//! ("memory allocation of … bytes failed") instead of exhausting the machine's
+//! memory. Work that allocates as it goes is measured by the bytes each thread has
+//! allocated in all ([`allocated`]).
 
 use hayro_interpret::InterpreterSettings;
 use hayro_interpret::annotation::{Appearances, Look};
 use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::hayro_syntax::object::{Array, Dict};
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod common;
 
-/// The system allocator, refusing to hold more than [`LIMIT`] bytes at once.
+/// The system allocator, refusing to hold more than [`LIMIT`] bytes at once, and
+/// counting the bytes each thread allocates.
 struct Limited;
 
 const LIMIT: usize = 256 << 20;
 static HELD: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static ALLOCATED: Cell<usize> = const { Cell::new(0) };
+}
+
+/// The bytes this thread has allocated so far, freed or not.
+fn allocated() -> usize {
+    ALLOCATED.with(Cell::get)
+}
 
 // SAFETY: forwards to the system allocator, refusing some requests with null as
 // `GlobalAlloc::alloc` allows.
@@ -27,6 +40,8 @@ unsafe impl GlobalAlloc for Limited {
             HELD.fetch_sub(layout.size(), Ordering::Relaxed);
             return std::ptr::null_mut();
         }
+        // A thread being torn down has no counter left; its allocations count for none.
+        let _ = ALLOCATED.try_with(|a| a.set(a.get() + layout.size()));
         // SAFETY: the caller's layout, as `alloc` requires.
         unsafe { System.alloc(layout) }
     }
@@ -132,4 +147,110 @@ fn a_flat_squiggle_is_drawn_at_a_bounded_cost() {
     );
     let steps = content.matches(" l\n").count();
     assert!((19_000..21_000).contains(&steps), "{steps} steps");
+}
+
+/// 10^38, near the largest 32-bit number.
+fn huge() -> String {
+    format!("1{}", "0".repeat(38))
+}
+
+/// A radio button as large as a 32-bit number allows is four curves for each circle,
+/// as viewers draw it: the work does not grow with its size.
+#[test]
+fn a_huge_radio_button_costs_what_a_small_one_does() {
+    let h = huge();
+    let radio = generated(&format!(
+        "/Subtype /Widget /FT /Btn /Ff 32768 /AS /On /MK << /BG [0] /BC [1 0 0] >> \
+         /Rect [-{h} -{h} {h} {h}]"
+    ));
+    // The disc, the ring and the dot.
+    assert_eq!(radio.matches(" c\n").count(), 12, "{radio}");
+}
+
+/// So is a circle line ending of a line that wide.
+#[test]
+fn a_huge_circle_ending_costs_what_a_small_one_does() {
+    let h = huge();
+    let ending = generated(&format!(
+        "/Subtype /Line /C [0] /BS << /W {h} >> /LE [/Circle /None] /L [50 50 100 50] \
+         /Rect [0 0 200 200]"
+    ));
+    assert_eq!(ending.matches(" c\n").count(), 4, "{ending}");
+}
+
+/// Widgets below one deep chain of fields read each field once: the work grows with
+/// the fields and widgets, not with their product.
+#[test]
+fn widgets_below_one_chain_of_fields_read_each_field_once() {
+    const N: usize = 1000;
+    let mut objects = Vec::new();
+    let widgets: Vec<String> = (0..N).map(|i| format!("{} 0 R", 4 + i)).collect();
+    for _ in 0..N {
+        objects.push(
+            format!(
+                "<< /Type /Annot /Subtype /Widget /Parent {} 0 R /MK << /BG [1 0 0] >> \
+                 /Rect [10 10 110 30] >>",
+                4 + N
+            )
+            .into_bytes(),
+        );
+    }
+    for k in 0..N {
+        let n = 4 + N + k;
+        objects.push(if k == N - 1 {
+            b"<< /FT /Tx >>".to_vec()
+        } else {
+            format!("<< /Parent {} 0 R >>", n + 1).into_bytes()
+        });
+    }
+    let pdf = Pdf::new(common::one_page(
+        200,
+        &format!("/Annots [{}]", widgets.join(" ")),
+        objects,
+    ))
+    .expect("valid pdf");
+    let annots: Vec<Dict<'_>> = pdf.pages()[0]
+        .raw()
+        .get::<Array<'_>>(b"Annots")
+        .unwrap()
+        .iter::<Dict<'_>>()
+        .collect();
+    let before = allocated();
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    for annot in &annots {
+        assert!(matches!(appearances.look(annot, PAGE), Look::Generated(_)));
+    }
+    let bytes = allocated() - before;
+    // About 4 KiB a widget; reading the whole chain for each takes gigabytes.
+    assert!(bytes < 32 << 20, "{bytes} bytes");
+}
+
+/// A Squiggly quad whose top line stands still while its bottom edge runs a million
+/// points: its hundred million steps all fan out of one point on the page, more than
+/// the page can tell apart. Such a quad marks no text and is unsupported, not drawn
+/// at the cost of every step.
+#[test]
+fn a_squiggly_fanning_out_of_a_point_is_unsupported() {
+    let pdf = Pdf::new(common::one_page(
+        200,
+        "/Annots [4 0 R]",
+        vec![
+            b"<< /Type /Annot /Subtype /Squiggly /C [0] /Rect [0 0 200 200] \
+               /QuadPoints [100 100.0707 -5999900 100.0707 100 100 1000100 100] >>"
+                .to_vec(),
+        ],
+    ))
+    .expect("valid pdf");
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    let annot = pdf.pages()[0]
+        .raw()
+        .get::<Array<'_>>(b"Annots")
+        .unwrap()
+        .iter::<Dict<'_>>()
+        .next()
+        .unwrap();
+    assert!(matches!(
+        appearances.look(&annot, PAGE),
+        Look::Unsupported(hayro_interpret::annotation::Unsupported::Coordinates)
+    ));
 }

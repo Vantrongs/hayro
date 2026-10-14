@@ -4,10 +4,10 @@
 //! and diamonds and an arrow 8.8 widths long and 9 wide, are chosen so that the
 //! endings look as common viewers draw them.
 
+use super::entries::{Entries, Value};
 use super::text::{self, Family, Fonts};
-use super::{Out, Unsupported, border_width, color, dash};
+use super::{Out, Unsupported, border_width, circle, color_of, dash};
 use hayro_syntax::object::dict::keys::{C, IC};
-use hayro_syntax::object::{Array, Dict, Name, Object};
 use kurbo::{Affine, Point, Vec2};
 
 /// A line ending style.
@@ -42,15 +42,11 @@ impl Ending {
     }
 
     /// The endings of `/LE`: two names, or, for a free text callout, one.
-    pub(super) fn of(annot: &Dict<'_>) -> [Self; 2] {
-        match annot.get::<Object<'_>>(b"LE") {
-            Some(Object::Name(n)) => [Self::from_name(n.as_ref()), Self::None],
-            Some(Object::Array(a)) => {
-                let mut names = a.iter::<Name<'_>>().map(|n| Self::from_name(n.as_ref()));
-                [
-                    names.next().unwrap_or(Self::None),
-                    names.next().unwrap_or(Self::None),
-                ]
+    pub(super) fn of(annot: &Entries<'_>) -> [Self; 2] {
+        match annot.get(b"LE") {
+            Value::Name(n) => [Self::from_name(n.as_ref()), Self::None],
+            Value::Array(names) => {
+                [0, 1].map(|i| names.get(i).name().map_or(Self::None, Self::from_name))
             }
             _ => [Self::None, Self::None],
         }
@@ -60,20 +56,20 @@ impl Ending {
 /// How a shape is painted: its stroke colour and width, dash, and interior fill.
 pub(super) struct Paint {
     pub(super) stroke: String,
-    pub(super) width: f32,
-    pub(super) dash: Vec<f32>,
+    pub(super) width: f64,
+    pub(super) dash: Vec<f64>,
     pub(super) fill: Option<String>,
 }
 
 impl Paint {
     /// /C strokes at the border width with the border dash, /IC fills; `None` without
     /// a stroke colour.
-    fn of(annot: &Dict<'_>) -> Option<Self> {
+    fn of(annot: &Entries<'_>) -> Option<Self> {
         Some(Self {
-            stroke: annot.get::<Array<'_>>(C).and_then(|a| color(&a, true))?,
+            stroke: color_of(annot, C, true)?,
             width: border_width(annot),
             dash: dash(annot),
-            fill: annot.get::<Array<'_>>(IC).and_then(|a| color(&a, false)),
+            fill: color_of(annot, IC, false),
         })
     }
 
@@ -94,7 +90,7 @@ pub(super) fn ending(
     paint: &Paint,
     out: &mut Out,
 ) -> Option<()> {
-    let w = f64::from(paint.width);
+    let w = paint.width;
     let along = tip - from;
     let len = along.hypot();
     let dir = if len > 0.0 {
@@ -106,24 +102,15 @@ pub(super) fn ending(
     let fill_op = if paint.fill.is_some() { "b" } else { "s" };
     // Dashes do not apply to endings.
     out.op("[] 0 d");
-    let pt = |p: Point| [p.x as f32, p.y as f32];
+    let pt = |p: Point| [p.x, p.y];
     match ending {
         Ending::None => return Some(()),
         Ending::Square | Ending::Diamond | Ending::Circle => {
             let r = 3.0 * w;
             if ending == Ending::Circle {
-                let circle = kurbo::Circle::new(tip, r);
-                out.path(&kurbo::Shape::to_path(&circle, 0.01))?;
+                out.path(&circle(tip, r))?;
             } else if ending == Ending::Square {
-                out.nums(
-                    &[
-                        (tip.x - r) as f32,
-                        (tip.y - r) as f32,
-                        (2.0 * r) as f32,
-                        (2.0 * r) as f32,
-                    ],
-                    "re",
-                )?;
+                out.nums(&[tip.x - r, tip.y - r, 2.0 * r, 2.0 * r], "re")?;
             } else {
                 out.nums(&pt(tip + Vec2::new(0.0, r)), "m")?;
                 out.nums(&pt(tip + Vec2::new(r, 0.0)), "l")?;
@@ -170,11 +157,10 @@ pub(super) fn ending(
 }
 
 /// The numbers of `key` as points.
-fn points(annot: &Dict<'_>, key: &[u8]) -> Vec<Point> {
-    let Some(arr) = annot.get::<Array<'_>>(key) else {
+fn points(annot: &Entries<'_>, key: &[u8]) -> Vec<Point> {
+    let Some(mut n) = annot.numbers(key, 0) else {
         return Vec::new();
     };
-    let mut n = super::numbers(&arr);
     // A line has two points: coordinates it lacks are 0.
     if key == b"L" && !n.is_empty() {
         n.resize(4, 0.0);
@@ -183,19 +169,18 @@ fn points(annot: &Dict<'_>, key: &[u8]) -> Vec<Point> {
         .0
         .iter()
         .map(|[x, y]| Point::new(*x, *y))
-        .filter(|p| p.x.is_finite() && p.y.is_finite())
         .collect()
 }
 
 /// `Polygon` and `PolyLine`: `/Vertices` joined, a polygon closed and filled with /IC,
 /// a polyline with its `/LE` endings at the first and last vertex.
-pub(super) fn poly(annot: &Dict<'_>, closed: bool, out: &mut Out) -> Option<()> {
+pub(super) fn poly(annot: &Entries<'_>, closed: bool, out: &mut Out) -> Option<()> {
     let vertices = points(annot, b"Vertices");
     if vertices.len() < 2 {
         return None;
     }
-    let stroke = annot.get::<Array<'_>>(C).and_then(|a| color(&a, true));
-    let fill = annot.get::<Array<'_>>(IC).and_then(|a| color(&a, false));
+    let stroke = color_of(annot, C, true);
+    let fill = color_of(annot, IC, false);
     if closed {
         if stroke.is_none() && fill.is_none() {
             return None;
@@ -226,9 +211,9 @@ pub(super) fn poly(annot: &Dict<'_>, closed: bool, out: &mut Out) -> Option<()> 
 }
 
 fn polyline(points: &[Point], out: &mut Out) -> Option<()> {
-    out.nums(&[points[0].x as f32, points[0].y as f32], "m")?;
+    out.nums(&[points[0].x, points[0].y], "m")?;
     for p in &points[1..] {
-        out.nums(&[p.x as f32, p.y as f32], "l")?;
+        out.nums(&[p.x, p.y], "l")?;
     }
     Some(())
 }
@@ -238,7 +223,7 @@ fn polyline(points: &[Point], out: &mut Out) -> Option<()> {
 /// 12 pt Helvetica on one line, its line breaks as spaces as common viewers set it:
 /// inline, the line broken around it, or on top (`/CP`), moved by `/CO`.
 pub(super) fn line(
-    annot: &Dict<'_>,
+    annot: &Entries<'_>,
     fonts: &Fonts,
     out: &mut Out,
 ) -> Result<Option<()>, Unsupported> {
@@ -255,22 +240,17 @@ pub(super) fn line(
         Vec2::new(1.0, 0.0)
     };
     let normal = Vec2::new(-dir.y, dir.x);
-    let num = |key: &[u8]| {
-        annot
-            .get::<f64>(key)
-            .filter(|v| v.is_finite())
-            .unwrap_or(0.0)
-    };
+    let num = |key: &[u8]| annot.number(key).unwrap_or(0.0);
     let (ll, lle, llo) = (num(b"LL"), num(b"LLE").abs(), num(b"LLO").abs());
     let sign = if ll < 0.0 { -1.0 } else { 1.0 };
     let shift = normal * (sign * llo + ll);
     let (la, lb) = (a + shift, b + shift);
 
     // The caption, laid out first: an inline one breaks the line.
-    let caption = annot.get::<bool>(b"Cap").unwrap_or(false);
+    let caption = annot.bool(b"Cap").unwrap_or(false);
     let contents = annot
-        .get::<hayro_syntax::object::String<'_>>(b"Contents")
-        .map(|s| text::text_string(s.as_bytes()))
+        .string(b"Contents")
+        .map(|s| text::text_string(&s))
         .filter(|s| !s.trim().is_empty());
     let mut gap = None;
     let mut caption_glyphs = None;
@@ -279,9 +259,7 @@ pub(super) fn line(
         let one_line = contents.replace("\r\n", " ").replace(['\r', '\n'], " ");
         let glyphs = fonts.shape(Family::Sans, &one_line)?;
         let width = f64::from(text::width(&glyphs, SIZE));
-        let top = annot
-            .get::<Name<'_>>(b"CP")
-            .is_some_and(|p| p.as_ref() == b"Top");
+        let top = annot.is(b"CP", b"Top");
         let offset = points(annot, b"CO").first().copied().unwrap_or(Point::ZERO);
         let size = f64::from(SIZE);
         let mid = len / 2.0 + offset.x;
@@ -321,7 +299,7 @@ fn draw_line(
     [ll, lle, llo, sign]: [f64; 4],
     gap: Option<(f64, f64)>,
     caption: Option<(Vec<text::Glyph<'_>>, f64, f64)>,
-    annot: &Dict<'_>,
+    annot: &Entries<'_>,
     out: &mut Out,
 ) -> Option<()> {
     let along = lb - la;
@@ -336,21 +314,21 @@ fn draw_line(
         for p in [a, b] {
             let from = p + normal * (sign * llo);
             let to = p + normal * (sign * llo + ll + sign * lle);
-            out.nums(&[from.x as f32, from.y as f32], "m")?;
-            out.nums(&[to.x as f32, to.y as f32], "l")?;
+            out.nums(&[from.x, from.y], "m")?;
+            out.nums(&[to.x, to.y], "l")?;
         }
     }
     let at = |t: f64| la + dir * t;
     match gap {
         Some((g0, g1)) if g0 > 0.0 && g1 < len => {
             for (s, e) in [(0.0, g0), (g1, len)] {
-                out.nums(&[at(s).x as f32, at(s).y as f32], "m")?;
-                out.nums(&[at(e).x as f32, at(e).y as f32], "l")?;
+                out.nums(&[at(s).x, at(s).y], "m")?;
+                out.nums(&[at(e).x, at(e).y], "l")?;
             }
         }
         _ => {
-            out.nums(&[la.x as f32, la.y as f32], "m")?;
-            out.nums(&[lb.x as f32, lb.y as f32], "l")?;
+            out.nums(&[la.x, la.y], "m")?;
+            out.nums(&[lb.x, lb.y], "l")?;
         }
     }
     out.op("S");

@@ -3,13 +3,23 @@
 use hayro_write::hayro_syntax::Pdf;
 use hayro_write::hayro_syntax::object::{Dict, Name, ObjRef, Rect, Stream};
 use hayro_write::pdf_writer::{self, Content, Finish, Ref};
-use hayro_write::{ChunkSettings, ExtractionError, ExtractionQuery, extract};
+use hayro_write::{ChunkSettings, ExtractionError, ExtractionQuery, FormPlacement, extract};
 
 #[path = "../../hayro-syntax/tests/common/fixtures.rs"]
 #[allow(dead_code)]
 mod fixtures;
 
 const APPEARANCE: &[u8] = b"BT /Helv 9 Tf 2 3 Td (Approved) Tj ET";
+
+/// The box and matrix of the appearance of [`annotated`].
+const AT: FormPlacement = FormPlacement {
+    bbox: [0.0, 0.0, 80.0, 30.0],
+    matrix: [1.0, 0.0, 0.0, 1.0, 5.0, 5.0],
+};
+
+fn form(obj: u32, page: usize) -> ExtractionQuery {
+    ExtractionQuery::new_form(ObjRef::new(obj as i32, 0), page, AT)
+}
 
 /// A page with one stamp annotation (object 4) whose normal appearance (object 5)
 /// is a stream with neither /Type nor /Subtype and a font in its resources (6).
@@ -72,7 +82,7 @@ fn draw_roots(
 #[test]
 fn form_copies_an_appearance_stream_as_a_typed_form() {
     let source = annotated();
-    let (file, roots) = draw_roots(&source, &[ExtractionQuery::new_form(ObjRef::new(5, 0), 0)]);
+    let (file, roots) = draw_roots(&source, &[form(5, 0)]);
     assert!(roots[0].is_ok());
 
     let copy = Pdf::new(file).expect("the copy parses");
@@ -114,7 +124,7 @@ fn form_keeps_a_type_the_stream_already_has() {
         )],
     );
     let source = Pdf::new(file).unwrap();
-    let (file, _) = draw_roots(&source, &[ExtractionQuery::new_form(ObjRef::new(4, 0), 0)]);
+    let (file, _) = draw_roots(&source, &[form(4, 0)]);
     // pdf-writer would have written the keys twice had the copy not left them out.
     let text = String::from_utf8_lossy(&file);
     assert_eq!(text.matches("/Subtype /Form").count(), 1);
@@ -124,14 +134,7 @@ fn form_keeps_a_type_the_stream_already_has() {
 #[test]
 fn form_of_something_other_than_a_stream_is_an_error() {
     let source = annotated();
-    let (_, roots) = draw_roots(
-        &source,
-        &[
-            ExtractionQuery::new_form(ObjRef::new(4, 0), 0),
-            ExtractionQuery::new_form(ObjRef::new(99, 0), 0),
-            ExtractionQuery::new_form(ObjRef::new(5, 0), 0),
-        ],
-    );
+    let (_, roots) = draw_roots(&source, &[form(4, 0), form(99, 0), form(5, 0)]);
     assert!(matches!(
         roots[0],
         Err(ExtractionError::NotAStream(ObjRef {
@@ -141,4 +144,42 @@ fn form_of_something_other_than_a_stream_is_an_error() {
     ));
     assert!(matches!(roots[1], Err(ExtractionError::NotAStream(_))));
     assert!(roots[2].is_ok(), "one bad query does not stop the others");
+}
+
+/// The copy gets the box and matrix the caller gives, in place of the stream's: a
+/// caller that reads a damaged one as its renderer does draws the copy as it shows.
+#[test]
+fn form_gets_the_box_and_matrix_it_is_given() {
+    let file = fixtures::one_page(
+        200,
+        "",
+        vec![fixtures::stream(
+            "/BBox [0 /x 10 10] /Matrix [1 0 0 -1 0 (bad)]",
+            b"0 0 4 3 re f",
+        )],
+    );
+    let source = Pdf::new(file).unwrap();
+    let placement = FormPlacement {
+        bbox: [0.0, 0.0, 10.0, 10.0],
+        matrix: [1.0, 0.0, 0.0, -1.0, 0.0, 0.0],
+    };
+    let (file, _) = draw_roots(
+        &source,
+        &[ExtractionQuery::new_form(ObjRef::new(4, 0), 0, placement)],
+    );
+    let text = String::from_utf8_lossy(&file);
+    assert_eq!(text.matches("/BBox").count(), 1);
+    assert_eq!(text.matches("/Matrix").count(), 1);
+    let copy = Pdf::new(file.clone()).expect("the copy parses");
+    let form = copy.pages()[0]
+        .resources()
+        .x_objects
+        .get::<Stream<'_>>("X0")
+        .expect("the form is in the page's resources");
+    let bbox = form.dict().get::<Rect>(b"BBox").unwrap();
+    assert_eq!([bbox.x0, bbox.y0, bbox.x1, bbox.y1], [0.0, 0.0, 10.0, 10.0]);
+    assert_eq!(
+        form.dict().get::<[f64; 6]>(b"Matrix"),
+        Some([1.0, 0.0, 0.0, -1.0, 0.0, 0.0])
+    );
 }

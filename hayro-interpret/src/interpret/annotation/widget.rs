@@ -12,47 +12,48 @@
 //! bottom left of the field, turned with it by `/MK /R`. A widget whose `/Parent`
 //! chain loops is a broken field and draws nothing, as in common viewers.
 
+use super::entries::{Entries, Value};
 use super::text::{self, Family, Fonts, Glyph};
-use super::{FINEST, Field, Out, Unsupported, border_width, color, rect};
+use super::{FINEST, Field, Inherited, Out, Unsupported, border_width, circle, color_of, rect};
 use hayro_syntax::object::dict::keys::AS;
-use hayro_syntax::object::{Array, Dict, Name, Object};
 use kurbo::{Affine, Shape};
 
 type Drawn = Result<Option<()>, Unsupported>;
 
-/// What a widget draws on a page that shows `visible` of it; `form` is the
-/// interactive form dictionary.
+/// What a widget with the entries of `field` draws on a page that shows `visible` of
+/// it; `form` is the interactive form dictionary.
 pub(super) fn widget(
-    annot: &Dict<'_>,
-    form: Option<&Dict<'_>>,
+    annot: &Entries<'_>,
+    field: &Field<'_>,
+    form: Option<&Entries<'_>>,
     fonts: &Fonts,
     visible: kurbo::Rect,
     out: &mut Out,
 ) -> Drawn {
-    let (Some(r), Some(field)) = (rect(annot), Field::of(annot)) else {
+    let Some(r) = rect(annot) else {
         return Ok(None);
     };
-    let field_type = field.get::<Name<'_>>(b"FT");
-    let flags = field.get::<u32>(b"Ff").unwrap_or(0);
-    let mk = annot.get::<Dict<'_>>(b"MK");
-    let mk_color = |key: &[u8], stroke: bool| {
-        mk.as_ref()
-            .and_then(|mk| mk.get::<Array<'_>>(key))
-            .and_then(|a| color(&a, stroke))
-    };
+    let field_type = field.get(Inherited::Type);
+    let flags = field
+        .get(Inherited::Flags)
+        .int()
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0);
+    let mk = annot.dict(b"MK");
+    let mk_color = |key: &[u8], stroke: bool| mk.as_ref().and_then(|mk| color_of(mk, key, stroke));
     let w = border_width(annot);
     let border = mk_color(b"BC", true).filter(|_| w > 0.0);
     let background = mk_color(b"BG", false);
     let fail = |o: Option<()>| o.ok_or(Unsupported::Kind);
 
-    let kind = match field_type.as_ref().map(|n| n.as_ref()) {
+    let kind = match field_type.name() {
         Some(b"Tx") => Kind::Text,
         Some(b"Ch") if flags & (1 << 17) != 0 => Kind::Combo,
         Some(b"Ch") => Kind::List,
         Some(b"Btn") if flags & (1 << 16) != 0 => Kind::Push,
         Some(b"Btn") if flags & (1 << 15) != 0 => Kind::Radio,
         Some(b"Btn") => Kind::Check,
-        Some(b"Sig") if field.with(b"V").is_none() => return signature(r, fonts, out),
+        Some(b"Sig") if !field.has(Inherited::Value) => return signature(r, fonts, out),
         _ => return Ok(None),
     };
 
@@ -60,7 +61,7 @@ pub(super) fn widget(
     // left.
     let rotation = mk
         .as_ref()
-        .and_then(|mk| mk.get::<i64>(b"R"))
+        .and_then(|mk| mk.int(b"R"))
         .unwrap_or(0)
         .rem_euclid(360);
     let (fw, fh, turn) = match rotation {
@@ -83,9 +84,7 @@ pub(super) fn widget(
     };
 
     if matches!(kind, Kind::Check | Kind::Radio) {
-        let on = annot
-            .get::<Name<'_>>(AS)
-            .is_some_and(|state| state.as_ref() != b"Off");
+        let on = annot.name(AS).is_some_and(|state| state.as_ref() != b"Off");
         let s = fw.min(fh);
         // The square at the bottom left of the turned frame; its frame and disc look
         // the same turned, the check mark is drawn in the frame.
@@ -108,7 +107,7 @@ pub(super) fn widget(
                     .ok_or(Unsupported::Kind)?;
                 let size = s as f32;
                 out.op("0 g");
-                let origin = (w + 0.1 * size, 0.2 * size);
+                let origin = (w as f32 + 0.1 * size, 0.2 * size);
                 fail(text::draw(&[check], size, origin, turn, out))?;
             }
         }
@@ -116,14 +115,13 @@ pub(super) fn widget(
     }
 
     // The default appearance: the widget's, its field's, or the form's.
-    let da = field
-        .get::<hayro_syntax::object::String<'_>>(b"DA")
-        .or_else(|| form.and_then(|f| f.get::<hayro_syntax::object::String<'_>>(b"DA")))
-        .map(|s| s.as_bytes().to_vec())
-        .unwrap_or_default();
+    let da = match field.get(Inherited::Appearance) {
+        Value::String(s) => s.as_bytes().to_vec(),
+        _ => form.and_then(|f| f.string(b"DA")).unwrap_or_default(),
+    };
     let dr = form
-        .and_then(|f| f.get::<Dict<'_>>(b"DR"))
-        .and_then(|dr| dr.get::<Dict<'_>>(b"Font"));
+        .and_then(|f| f.dict(b"DR"))
+        .and_then(|dr| dr.dict(b"Font"));
     let (family, size, text_color) = text::default_appearance(&da, dr.as_ref());
     let text_color = text_color.unwrap_or_else(|| "0 g".to_owned());
     let (fw, fh) = (fw as f32, fh as f32);
@@ -132,21 +130,21 @@ pub(super) fn widget(
         fail(frame(r, w, background.as_deref(), border.as_deref(), out))?;
         if let Some(bg) = mk
             .as_ref()
-            .and_then(|mk| mk.get::<Array<'_>>(b"BG"))
-            .map(|a| a.iter::<f32>().collect::<Vec<_>>())
+            .and_then(|mk| mk.items(b"BG"))
+            .map(|a| a.numbers())
         {
             fail(bevel(r, w, &bg, out))?;
         }
         let caption = mk
             .as_ref()
-            .and_then(|mk| mk.get::<hayro_syntax::object::String<'_>>(b"CA"))
-            .map(|s| text::text_string(s.as_bytes()))
+            .and_then(|mk| mk.string(b"CA"))
+            .map(|s| text::text_string(&s))
             .unwrap_or_default();
         if caption.is_empty() {
             return Ok(Some(()));
         }
         let glyphs = fonts.shape(family, &caption)?;
-        let inset = 2.0 * (w + 2.0);
+        let inset = 2.0 * (w as f32 + 2.0);
         let size = size.unwrap_or_else(|| {
             let by_height = fh - inset - 8.0;
             let em = text::width(&glyphs, 1.0);
@@ -170,62 +168,53 @@ pub(super) fn widget(
     }
 
     fail(frame(r, w, background.as_deref(), border.as_deref(), out))?;
-    let value = field.get::<Object<'_>>(b"V");
-    let value = match value {
-        Some(Object::String(s)) => text::text_string(s.as_bytes()),
-        Some(Object::Name(n)) => String::from_utf8_lossy(n.as_ref()).into_owned(),
+    let value = match field.get(Inherited::Value) {
+        Value::String(s) => text::text_string(s.as_bytes()),
+        Value::Name(n) => String::from_utf8_lossy(n.as_ref()).into_owned(),
         // The first of several selected values.
-        Some(Object::Array(a)) => a
-            .iter::<hayro_syntax::object::String<'_>>()
-            .next()
-            .map(|s| text::text_string(s.as_bytes()))
+        Value::Array(values) => values
+            .get(0)
+            .string()
+            .map(text::text_string)
             .unwrap_or_default(),
         _ => String::new(),
     };
-    let pad = 2.0 * w;
+    let pad = 2.0 * w as f32;
     let avail = (fw - 2.0 * pad).max(0.0);
-    let q = field.get::<i64>(b"Q").unwrap_or(0);
+    let q = field.get(Inherited::Quadding).int().unwrap_or(0);
     let align = |width: f32| match q {
         1 => pad + (avail - width) / 2.0,
         2 => fw - pad - width,
         _ => pad,
     };
     out.op("q");
-    fail(out.nums(
-        &[
-            r.x0 as f32,
-            r.y0 as f32,
-            r.width() as f32,
-            r.height() as f32,
-        ],
-        "re",
-    ))?;
-    out.op("W n");
+    fail(out.clip(r))?;
     out.op(&text_color);
     let multiline = kind == Kind::Text && flags & (1 << 12) != 0;
     // A length beyond a 32-bit integer is no comb, as in common viewers.
     let max_len = field
-        .get::<i64>(b"MaxLen")
+        .get(Inherited::MaxLen)
+        .int()
         .filter(|n| (1..=i64::from(i32::MAX)).contains(n));
     let comb = kind == Kind::Text && flags & (1 << 24) != 0 && !multiline;
     match kind {
         Kind::List => {
             let size = size.unwrap_or(12.0);
-            let opts = field.get::<Array<'_>>(b"Opt");
-            let top_index = field.get::<u32>(b"TI").unwrap_or(0);
+            let opts = field.get(Inherited::Options).items();
+            let top_index = field
+                .get(Inherited::TopIndex)
+                .int()
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(0);
             let mut y = fh - pad - 1.116 * size;
-            for opt in opts
-                .iter()
-                .flat_map(|o| o.iter::<Object<'_>>())
-                .skip(top_index as usize)
-            {
+            for opt in opts.iter().flat_map(|o| o.iter()).skip(top_index as usize) {
                 let label = match opt {
-                    Object::String(s) => text::text_string(s.as_bytes()),
+                    Value::String(s) => text::text_string(s.as_bytes()),
                     // An export value and the text shown.
-                    Object::Array(pair) => pair
-                        .iter::<hayro_syntax::object::String<'_>>()
-                        .nth(1)
-                        .map(|s| text::text_string(s.as_bytes()))
+                    Value::Array(pair) => pair
+                        .get(1)
+                        .string()
+                        .map(text::text_string)
                         .unwrap_or_default(),
                     _ => continue,
                 };
@@ -275,7 +264,7 @@ pub(super) fn widget(
                     max_len,
                     f64::from(fw),
                     f64::from(fh),
-                    f64::from(w),
+                    w,
                     turn,
                     visible,
                     out,
@@ -325,14 +314,14 @@ fn comb_dividers(
     let step = (fw - 2.0 * w) / cells;
     let at = |u: f64, v: f64| {
         let p = turn * kurbo::Point::new(u, v);
-        [p.x as f32, p.y as f32]
+        [p.x, p.y]
     };
     if step - w < FINEST {
         // From the outer edge of the first line to that of the last, as high as the
         // lines.
         let (a, b) = (w + step, w + step * (cells - 1.0));
         let (u0, u1) = (a.min(b) - w / 2.0, a.max(b) + w / 2.0);
-        out.nums(&[(fh - 2.0 * w).abs() as f32], "w")?;
+        out.nums(&[(fh - 2.0 * w).abs()], "w")?;
         out.nums(&at(u0, fh / 2.0), "m")?;
         return out.nums(&at(u1, fh / 2.0), "l");
     }
@@ -364,37 +353,21 @@ enum Kind {
 /// The background filling `r` and the border stroked inside it.
 fn frame(
     r: kurbo::Rect,
-    w: f32,
+    w: f64,
     background: Option<&str>,
     border: Option<&str>,
     out: &mut Out,
 ) -> Option<()> {
     if let Some(bg) = background {
         out.op(bg);
-        out.nums(
-            &[
-                r.x0 as f32,
-                r.y0 as f32,
-                r.width() as f32,
-                r.height() as f32,
-            ],
-            "re",
-        )?;
+        out.nums(&[r.x0, r.y0, r.width(), r.height()], "re")?;
         out.op("f");
     }
     if let Some(bc) = border {
         out.op(bc);
         out.stroke_state(w, &[])?;
-        let b = r.inset(-f64::from(w) / 2.0);
-        out.nums(
-            &[
-                b.x0 as f32,
-                b.y0 as f32,
-                b.width() as f32,
-                b.height() as f32,
-            ],
-            "re",
-        )?;
+        let b = r.inset(-w / 2.0);
+        out.nums(&[b.x0, b.y0, b.width(), b.height()], "re")?;
         out.op("S");
     }
     Some(())
@@ -404,7 +377,7 @@ fn frame(
 /// border, and, on, a black dot half as wide as the inside of the ring.
 fn radio(
     sq: kurbo::Rect,
-    w: f32,
+    w: f64,
     background: Option<&str>,
     border: Option<&str>,
     on: bool,
@@ -412,8 +385,7 @@ fn radio(
 ) -> Option<()> {
     let c = sq.center();
     let half = sq.width() / 2.0;
-    let w = f64::from(w);
-    let disc = |r: f64, out: &mut Out| out.path(&kurbo::Circle::new(c, r).to_path(0.01));
+    let disc = |r: f64, out: &mut Out| out.path(&circle(c, r));
     if let Some(bg) = background {
         out.op(bg);
         disc(half, out)?;
@@ -421,7 +393,7 @@ fn radio(
     }
     if let Some(bc) = border {
         out.op(bc);
-        out.stroke_state(w as f32, &[])?;
+        out.stroke_state(w, &[])?;
         disc(half - w / 2.0, out)?;
         out.op("S");
     }
@@ -435,29 +407,29 @@ fn radio(
 
 /// The bevel of a push button with background `bg`: a lighter band along the top
 /// and left, a darker one along the bottom and right, 2 pt wide inside the border.
-fn bevel(r: kurbo::Rect, w: f32, bg: &[f32], out: &mut Out) -> Option<()> {
+fn bevel(r: kurbo::Rect, w: f64, bg: &[f64], out: &mut Out) -> Option<()> {
     let op = match bg.len() {
         1 => "g",
         3 => "rg",
         _ => return Some(()),
     };
+    // Clamped, so they are always written.
     let tone = |f: &dyn Fn(f32) -> f32| {
         let mut s = String::new();
         for c in bg {
-            s.push_str(&format!("{} ", f(c.clamp(0.0, 1.0))));
+            s.push_str(&format!("{} ", f(c.clamp(0.0, 1.0) as f32)));
         }
         s + op
     };
-    let w = f64::from(w);
     let o = r.inset(-w);
     let i = r.inset(-(w + 2.0));
     if o.width() <= 0.0 || o.height() <= 0.0 || i.width() <= 0.0 || i.height() <= 0.0 {
         return Some(());
     }
     let poly = |pts: &[(f64, f64)], out: &mut Out| -> Option<()> {
-        out.nums(&[pts[0].0 as f32, pts[0].1 as f32], "m")?;
+        out.nums(&[pts[0].0, pts[0].1], "m")?;
         for p in &pts[1..] {
-            out.nums(&[p.0 as f32, p.1 as f32], "l")?;
+            out.nums(&[p.0, p.1], "l")?;
         }
         out.op("h f");
         Some(())
@@ -502,9 +474,9 @@ fn signature(r: kurbo::Rect, fonts: &Fonts, out: &mut Out) -> Drawn {
     ];
     let fail = |o: Option<()>| o.ok_or(Unsupported::Kind);
     out.op("0.95 0.33 0.18 rg");
-    fail(out.nums(&[pts[0].0 as f32, pts[0].1 as f32], "m"))?;
+    fail(out.nums(&[pts[0].0, pts[0].1], "m"))?;
     for p in &pts[1..] {
-        fail(out.nums(&[p.0 as f32, p.1 as f32], "l"))?;
+        fail(out.nums(&[p.0, p.1], "l"))?;
     }
     out.op("h f");
     let glyphs = fonts.shape(Family::Sans, "SIGN")?;

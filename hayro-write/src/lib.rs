@@ -17,8 +17,8 @@ use crate::primitive::{WriteDirect, WriteIndirect};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use hayro_syntax::object::dict::keys::{
-    COLORSPACE, EXT_G_STATE, FONT, GROUP, PATTERN, PROPERTIES, RESOURCES, SHADING, SUBTYPE, TYPE,
-    XOBJECT,
+    BBOX, COLORSPACE, EXT_G_STATE, FONT, GROUP, MATRIX, PATTERN, PROPERTIES, RESOURCES, SHADING,
+    SUBTYPE, TYPE, XOBJECT,
 };
 use hayro_syntax::object::stream::DecodeFailure;
 use hayro_syntax::object::{Dict, ObjRef, Object};
@@ -72,7 +72,9 @@ pub fn extract<'a>(
                 let root_ref = ctx.new_ref();
                 write_page(page()?, root_ref, query.page_index, &mut ctx).map(|_| root_ref)
             }
-            ExtractionQueryType::Form(obj) => write_form(obj, page()?, query.page_index, &mut ctx),
+            ExtractionQueryType::Form(obj, placement) => {
+                write_form(obj, placement, page()?, query.page_index, &mut ctx)
+            }
         };
 
         ctx.root_refs.push(res);
@@ -112,8 +114,17 @@ pub enum ExtractionQueryType {
     /// Extract the page as a new page.
     Page,
     /// Extract a stream, such as an annotation's appearance, as a form `XObject`
-    /// drawn on the query's page.
-    Form(ObjRef),
+    /// drawn on the query's page, with this `/BBox` and `/Matrix`.
+    Form(ObjRef, FormPlacement),
+}
+
+/// The `/BBox` and `/Matrix` a form copied by [`ExtractionQuery::new_form`] gets.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct FormPlacement {
+    /// `[x0, y0, x1, y1]`.
+    pub bbox: [f32; 4],
+    /// `[a, b, c, d, e, f]`.
+    pub matrix: [f32; 6],
 }
 
 /// An extraction query.
@@ -135,12 +146,14 @@ impl ExtractionQuery {
     /// Create a query that copies the stream `obj`, with everything it refers to, as a
     /// form `XObject` drawn on page `page_index`. The copy is typed `/XObject /Form`
     /// whatever the stream says: annotation appearance streams may leave the type out.
+    /// It gets the `/BBox` and `/Matrix` of `placement` in place of the stream's own,
+    /// for a caller that reads those of a damaged stream as its renderer does.
     /// A stream without a /Resources dictionary uses the page's, as renderers draw an
     /// appearance with the resources of its page; its copy gets those. Queries for
-    /// the same stream share a copy where it has its own resources.
-    pub fn new_form(obj: ObjRef, page_index: usize) -> Self {
+    /// the same stream and placement share a copy where it has its own resources.
+    pub fn new_form(obj: ObjRef, page_index: usize, placement: FormPlacement) -> Self {
         Self {
-            query_type: ExtractionQueryType::Form(obj),
+            query_type: ExtractionQueryType::Form(obj, placement),
             page_index,
         }
     }
@@ -205,7 +218,7 @@ struct ExtractionContext<'a> {
     shared_streams: FxHashMap<StreamKey, Vec<(ObjRef, Ref)>>,
     /// The copies of streams form queries asked for, by the stream and, for one
     /// that takes its page's resources, the page.
-    forms: FxHashMap<(ObjRef, Option<usize>), Ref>,
+    forms: FxHashMap<(ObjRef, [u32; 10], Option<usize>), Ref>,
     /// The first part of the source that could not be read whole.
     error: Option<ExtractionError>,
     root_refs: Vec<Result<Ref, ExtractionError>>,
@@ -500,6 +513,7 @@ fn write_xobject(
 
 fn write_form(
     obj: ObjRef,
+    placement: FormPlacement,
     page: &Page<'_>,
     page_idx: usize,
     ctx: &mut ExtractionContext<'_>,
@@ -512,7 +526,14 @@ fn write_form(
     // What a renderer draws the stream with: its own resources if they are a
     // dictionary, the page's otherwise.
     let own_resources = stream.dict().get::<Dict<'_>>(RESOURCES).is_some();
-    let key = (obj, (!own_resources).then_some(page_idx));
+    let mut bits = [0; 10];
+    for (b, v) in bits
+        .iter_mut()
+        .zip(placement.bbox.iter().chain(&placement.matrix))
+    {
+        *b = v.to_bits();
+    }
+    let key = (obj, bits, (!own_resources).then_some(page_idx));
     if let Some(form_ref) = ctx.forms.get(&key) {
         return Ok(*form_ref);
     }
@@ -524,11 +545,14 @@ fn write_form(
     let mut chunk = Chunk::with_settings(ctx.chunk_settings);
     let mut form = chunk.form_xobject(form_ref, &data);
     let skip: &[&[u8]] = if own_resources {
-        &[TYPE, SUBTYPE]
+        &[TYPE, SUBTYPE, BBOX, MATRIX]
     } else {
-        &[TYPE, SUBTYPE, RESOURCES]
+        &[TYPE, SUBTYPE, BBOX, MATRIX, RESOURCES]
     };
     primitive::write_stream_dict(stream.dict(), form.deref_mut(), ctx, skip);
+    let [x0, y0, x1, y1] = placement.bbox;
+    form.bbox(Rect::new(x0, y0, x1, y1));
+    form.matrix(placement.matrix);
     if !own_resources {
         serialize_resources(page.resources(), ctx, &mut form);
     }

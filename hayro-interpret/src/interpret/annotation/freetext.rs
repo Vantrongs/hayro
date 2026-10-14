@@ -12,25 +12,25 @@
 //! is drawn for a `/CL` of two or three points. The layout and the defaults match
 //! what common viewers draw for such an annotation.
 
+use super::entries::Entries;
 use super::lines::{Ending, Paint, ending};
 use super::text::{self, Family, Fonts, Span, Style};
-use super::{Out, Unsupported, border_width, color, dash, numbers_of, rect};
+use super::{Out, Unsupported, border_width, color_of, dash, rect};
 use hayro_syntax::object::dict::keys::C;
-use hayro_syntax::object::{Array, Dict, Name, Object};
 use kurbo::{Affine, Point};
 
 pub(super) fn free_text(
-    annot: &Dict<'_>,
-    form_fonts: Option<&Dict<'_>>,
+    annot: &Entries<'_>,
+    form_fonts: Option<&Entries<'_>>,
     fonts: &Fonts,
     out: &mut Out,
 ) -> Result<Option<()>, Unsupported> {
     let Some(r) = rect(annot) else {
         return Ok(None);
     };
-    let inner = match numbers_of(annot, b"RD", 4).as_deref() {
+    let inner = match annot.numbers(b"RD", 4).as_deref() {
         Some(&[l, b, rt, t, ..])
-            if [l, b, rt, t].iter().all(|v| v.is_finite() && *v >= 0.0)
+            if [l, b, rt, t].iter().all(|v| *v >= 0.0)
                 && l + rt < r.width()
                 && b + t < r.height() =>
         {
@@ -38,7 +38,7 @@ pub(super) fn free_text(
         }
         _ => r,
     };
-    let da = string(annot, b"DA").unwrap_or_default();
+    let da = annot.text(b"DA").unwrap_or_default();
     let (family, size, da_color) = text::default_appearance(&da, form_fonts);
     let mut style = Style {
         family,
@@ -50,8 +50,9 @@ pub(super) fn free_text(
         .replace("rg", "RG")
         .replace(" g", " G")
         .replace(" k", " K");
-    let rich = string(annot, b"RC");
-    let ds = string(annot, b"DS");
+    // Rich text may be a stream.
+    let rich = annot.text(b"RC");
+    let ds = annot.text(b"DS");
     let (spans, ascent) = if rich.is_some() || ds.is_some() {
         style.family = Family::Serif;
         if let Some(ds) = &ds {
@@ -77,10 +78,9 @@ pub(super) fn free_text(
     let w = border_width(annot);
 
     // The callout line, from the point it points at to the box.
-    let callout = annot
-        .get::<Name<'_>>(b"IT")
-        .is_some_and(|it| it.as_ref() == b"FreeTextCallout");
-    let cl: Vec<Point> = numbers_of(annot, b"CL", 0)
+    let callout = annot.is(b"IT", b"FreeTextCallout");
+    let cl: Vec<Point> = annot
+        .numbers(b"CL", 0)
         .filter(|n| n.len() == 4 || n.len() == 6)
         .unwrap_or_default()
         .as_chunks::<2>()
@@ -90,18 +90,10 @@ pub(super) fn free_text(
         .collect();
 
     out.op("q");
-    if let Some(fill) = annot.get::<Array<'_>>(C).and_then(|a| color(&a, false)) {
+    if let Some(fill) = color_of(annot, C, false) {
         out.op(&fill);
-        out.nums(
-            &[
-                inner.x0 as f32,
-                inner.y0 as f32,
-                inner.width() as f32,
-                inner.height() as f32,
-            ],
-            "re",
-        )
-        .ok_or(Unsupported::Kind)?;
+        out.nums(&[inner.x0, inner.y0, inner.width(), inner.height()], "re")
+            .ok_or(Unsupported::Kind)?;
         out.op("f");
     }
     if callout && (cl.len() == 2 || cl.len() == 3) && w > 0.0 {
@@ -113,11 +105,10 @@ pub(super) fn free_text(
         };
         out.op(&paint.stroke);
         out.stroke_state(w, &[]).ok_or(Unsupported::Kind)?;
-        out.nums(&[cl[0].x as f32, cl[0].y as f32], "m")
+        out.nums(&[cl[0].x, cl[0].y], "m")
             .ok_or(Unsupported::Kind)?;
         for p in &cl[1..] {
-            out.nums(&[p.x as f32, p.y as f32], "l")
-                .ok_or(Unsupported::Kind)?;
+            out.nums(&[p.x, p.y], "l").ok_or(Unsupported::Kind)?;
         }
         out.op("S");
         ending(Ending::of(annot)[0], cl[0], cl[1], &paint, out).ok_or(Unsupported::Kind)?;
@@ -125,22 +116,14 @@ pub(super) fn free_text(
     if w > 0.0 {
         out.op(&border_color);
         out.stroke_state(w, &dash(annot)).ok_or(Unsupported::Kind)?;
-        let b = inner.inset(-f64::from(w) / 2.0);
-        out.nums(
-            &[
-                b.x0 as f32,
-                b.y0 as f32,
-                b.width() as f32,
-                b.height() as f32,
-            ],
-            "re",
-        )
-        .ok_or(Unsupported::Kind)?;
+        let b = inner.inset(-w / 2.0);
+        out.nums(&[b.x0, b.y0, b.width(), b.height()], "re")
+            .ok_or(Unsupported::Kind)?;
         out.op("S");
     }
 
     // The text, in a frame turned with the box: `(u, v)` from its bottom left.
-    let rotate = annot.get::<i64>(b"Rotate").unwrap_or(0).rem_euclid(360);
+    let rotate = annot.int(b"Rotate").unwrap_or(0).rem_euclid(360);
     let (fw, fh, frame) = match rotate {
         90 => (
             inner.height(),
@@ -163,22 +146,12 @@ pub(super) fn free_text(
             Affine::translate((inner.x0, inner.y0)),
         ),
     };
-    let pad = 2.0 * w;
+    let pad = 2.0 * w as f32;
     let avail = (fw as f32 - 2.0 * pad).max(0.0);
     let lines = text::layout(fonts, &spans, Some(avail))?;
     if lines.iter().any(|l| !l.glyphs.is_empty()) {
-        out.nums(
-            &[
-                r.x0 as f32,
-                r.y0 as f32,
-                r.width() as f32,
-                r.height() as f32,
-            ],
-            "re",
-        )
-        .ok_or(Unsupported::Kind)?;
-        out.op("W n");
-        let q = annot.get::<i64>(b"Q").unwrap_or(0);
+        out.clip(r).ok_or(Unsupported::Kind)?;
+        let q = annot.int(b"Q").unwrap_or(0);
         let mut top = fh as f32 - pad;
         let mut color = None;
         for line in &lines {
@@ -207,19 +180,10 @@ pub(super) fn free_text(
     Ok(Some(()))
 }
 
-/// The bytes of string `key`.
-fn string(annot: &Dict<'_>, key: &[u8]) -> Option<Vec<u8>> {
-    match annot.get::<Object<'_>>(key)? {
-        Object::String(s) => Some(s.as_bytes().to_vec()),
-        // Rich text may be a stream.
-        Object::Stream(s) => s.decoded().ok().map(|d| d.into_owned()),
-        _ => None,
-    }
-}
-
 /// `/Contents` as text.
-fn contents(annot: &Dict<'_>) -> String {
-    string(annot, b"Contents")
+fn contents(annot: &Entries<'_>) -> String {
+    annot
+        .text(b"Contents")
         .map(|s| text::text_string(&s))
         .unwrap_or_default()
 }

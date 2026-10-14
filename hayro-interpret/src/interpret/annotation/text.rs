@@ -248,7 +248,7 @@ pub(super) struct Style {
 /// set it.
 pub(super) fn default_appearance(
     da: &[u8],
-    fonts: Option<&hayro_syntax::object::Dict<'_>>,
+    fonts: Option<&super::entries::Entries<'_>>,
 ) -> (Family, Option<f32>, Option<String>) {
     let tokens: Vec<&[u8]> = da
         .split(|b| b.is_ascii_whitespace())
@@ -258,20 +258,24 @@ pub(super) fn default_appearance(
     let mut size = Some(12.0);
     let mut color = None;
     for (i, op) in tokens.iter().enumerate() {
+        // Numbers as PDF writes them (7.3.3), however large: one too large to draw
+        // fails the appearance where it is drawn.
         let operands = |n: usize| -> Option<Vec<f32>> {
             let from = i.checked_sub(n)?;
             tokens[from..i]
                 .iter()
-                .map(|t| std::str::from_utf8(t).ok()?.parse::<f32>().ok())
+                .map(|t| {
+                    let number = t.iter().all(|b| b.is_ascii_digit() || b"+-.".contains(b));
+                    number.then(|| std::str::from_utf8(t).ok()?.parse::<f32>().ok())?
+                })
                 .collect::<Option<Vec<f32>>>()
-                .filter(|v| v.iter().all(|n| n.is_finite()))
         };
         match *op {
             b"Tf" if i >= 2 => {
                 let name = tokens[i - 2].strip_prefix(b"/").unwrap_or(tokens[i - 2]);
                 let base = fonts
-                    .and_then(|f| f.get::<hayro_syntax::object::Dict<'_>>(name))
-                    .and_then(|f| f.get::<hayro_syntax::object::Name<'_>>(b"BaseFont"));
+                    .and_then(|f| f.dict(name))
+                    .and_then(|f| f.name(b"BaseFont"));
                 family = Family::of_font_name(base.as_ref().map_or(name, |b| b.as_ref()));
                 size = operands(1).map(|s| s[0]).filter(|s| *s > 0.0);
             }

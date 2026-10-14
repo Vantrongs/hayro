@@ -182,13 +182,19 @@ pub fn interpret_page<'a>(
             }
 
             match appearances.look(&annot, visible) {
-                annotation::Look::Stream { stream, transform } => {
-                    let Some(apx) = FormXObject::new(&stream) else {
+                annotation::Look::Stream { stream, placement } => {
+                    // The box and matrix as the placement reads them, as a writer
+                    // that copies the stream draws it.
+                    let Some(apx) = FormXObject::placed(
+                        &stream,
+                        Affine::new(placement.matrix().map(f64::from)),
+                        placement.bbox(),
+                    ) else {
                         continue;
                     };
 
                     context.save_state();
-                    context.pre_concat_affine(transform);
+                    context.pre_concat_affine(Affine::new(placement.transform().map(f64::from)));
                     context.push_root_transform();
 
                     apx.draw(resources, context, device);

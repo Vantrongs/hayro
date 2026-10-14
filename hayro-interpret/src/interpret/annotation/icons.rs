@@ -10,10 +10,11 @@
 //! a 190 × 50 stamp and scaled to fit `/Rect`; a red outline of each quadrilateral.
 //! The symbols are drawn here, each in a 10 pt square.
 
+use super::entries::Entries;
+use super::markup::{Quad, quads};
 use super::text::{self, Family, Fonts};
-use super::{Out, Unsupported, c_color, color, rect};
-use hayro_syntax::object::dict::keys::{C, QUADPOINTS};
-use hayro_syntax::object::{Array, Dict, Name};
+use super::{Out, Unsupported, c_color, color_of, rect};
+use hayro_syntax::object::dict::keys::C;
 use kurbo::{Affine, BezPath, Circle, Point, Shape};
 
 type Drawn = Result<Option<()>, Unsupported>;
@@ -31,24 +32,21 @@ pub(super) enum Icon {
 }
 
 /// The icon of a `Text`, `FileAttachment` or `Sound` annotation.
-pub(super) fn icon(annot: &Dict<'_>, kind: Icon, fonts: &Fonts, out: &mut Out) -> Drawn {
+pub(super) fn icon(annot: &Entries<'_>, kind: Icon, fonts: &Fonts, out: &mut Out) -> Drawn {
     let Some(r) = rect(annot) else {
         return Ok(None);
     };
-    let name = annot.get::<Name<'_>>(b"Name");
+    let name = annot.name(b"Name");
     let name = name.as_ref().map_or(&b""[..], |n| n.as_ref());
-    let fill = annot
-        .get::<Array<'_>>(C)
-        .and_then(|a| color(&a, false))
-        .unwrap_or_else(|| "1 g".to_owned());
-    let (x0, y1) = (r.x0 as f32, r.y1 as f32);
+    let fill = color_of(annot, C, false).unwrap_or_else(|| "1 g".to_owned());
+    let (x0, y1) = (r.x0, r.y1);
     out.op(&fill);
     out.op("0 G");
     fail(out.stroke_state(1.25, &[]))?;
     fail(out.nums(&[x0 + 0.625, y1 - 19.375, 18.75, 18.75], "re"))?;
     out.op("b");
     // The symbol's 10 pt square.
-    let at = Affine::translate((f64::from(x0) + 5.0, f64::from(y1) - 15.0));
+    let at = Affine::translate((x0 + 5.0, y1 - 15.0));
     out.op("0 g");
     let symbol = match (kind, name) {
         (Icon::Note, b"Comment") => Symbol::Comment,
@@ -257,11 +255,11 @@ impl Symbol {
 
 /// `Caret`: a 20 × 14 pt caret with concave sides, centred on `/Rect`, filled with /C
 /// (black without it).
-pub(super) fn caret(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
+pub(super) fn caret(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     let r = rect(annot)?;
     let fill = c_color(annot, false, "0 g")?;
     let c = r.center();
-    let (x, y) = (c.x as f32, c.y as f32);
+    let (x, y) = (c.x, c.y);
     out.op(&fill);
     out.nums(&[x - 10.0, y - 7.0], "m")?;
     out.nums(&[x, y - 7.0, x, y, x, y + 7.0], "c")?;
@@ -270,25 +268,34 @@ pub(super) fn caret(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
     Some(())
 }
 
-/// `Redact`: each quadrilateral's box outlined in red, or `/Rect` less a point
-/// without `/QuadPoints`.
-pub(super) fn redact(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
-    let boxes = super::markup::quads(annot);
-    let boxes = if boxes.is_empty() && annot.get::<Array<'_>>(QUADPOINTS).is_none() {
+/// `Redact`: each quadrilateral outlined in red, 1 pt wide, clipped as viewers clip it
+/// to the box of the quadrilaterals a point wider on each side; or `/Rect` less a
+/// point without `/QuadPoints`.
+pub(super) fn redact(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
+    let Some(quads) = quads(annot) else {
         let r = rect(annot)?.inset(-1.0);
-        vec![[r.x0 as f32, r.y0 as f32, r.x1 as f32, r.y1 as f32]]
-    } else {
-        boxes
+        out.op("1 0 0 RG");
+        out.stroke_state(1.0, &[])?;
+        out.nums(&[r.x0, r.y0, r.width(), r.height()], "re")?;
+        out.op("S");
+        return Some(());
     };
-    if boxes.is_empty() {
-        return None;
-    }
+    let clip = quads
+        .iter()
+        .map(|q| q.bounds(1.0))
+        .reduce(|a, b| a.union(b))?;
+    out.op("q");
+    out.clip(clip)?;
     out.op("1 0 0 RG");
     out.stroke_state(1.0, &[])?;
-    for [x0, y0, x1, y1] in boxes {
-        out.nums(&[x0, y0, x1 - x0, y1 - y0], "re")?;
+    for Quad([tl, tr, bl, br]) in quads {
+        out.nums(&[bl.x, bl.y], "m")?;
+        for p in [br, tr, tl] {
+            out.nums(&[p.x, p.y], "l")?;
+        }
+        out.op("s");
     }
-    out.op("S");
+    out.op("Q");
     Some(())
 }
 
@@ -316,9 +323,9 @@ fn stamp_text(name: &[u8]) -> Option<(&'static [&'static str], f32)> {
 /// `Stamp`: the text of its `/Name` (`Draft` without one, Table 181), a standard
 /// name in its own words and size, another name as it is, in 20 pt; in /C (black
 /// without it) in a box of the same colour, clipped to `/Rect`.
-pub(super) fn stamp(annot: &Dict<'_>, fonts: &Fonts, out: &mut Out) -> Drawn {
+pub(super) fn stamp(annot: &Entries<'_>, fonts: &Fonts, out: &mut Out) -> Drawn {
     let name = annot
-        .get::<Name<'_>>(b"Name")
+        .name(b"Name")
         .map_or_else(|| b"Draft".to_vec(), |n| n.as_ref().to_vec());
     let custom = [String::from_utf8_lossy(&name).into_owned()];
     let custom: Vec<&str> = custom.iter().map(String::as_str).collect();
@@ -341,23 +348,14 @@ pub(super) fn stamp(annot: &Dict<'_>, fonts: &Fonts, out: &mut Out) -> Drawn {
         * Affine::rotate(0.6_f64.to_radians())
         * Affine::scale(scale);
     out.op("q");
-    fail(out.nums(
-        &[
-            r.x0 as f32,
-            r.y0 as f32,
-            r.width() as f32,
-            r.height() as f32,
-        ],
-        "re",
-    ))?;
-    out.op("W n");
+    fail(out.clip(r))?;
     out.op(&stroke);
-    fail(out.stroke_state((2.0 * scale) as f32, &[]))?;
+    fail(out.stroke_state(2.0 * scale, &[]))?;
     let corners = [(-93.0, -22.0), (93.0, -22.0), (93.0, 22.0), (-93.0, 22.0)]
         .map(|(x, y)| at * Point::new(x, y));
-    fail(out.nums(&[corners[0].x as f32, corners[0].y as f32], "m"))?;
+    fail(out.nums(&[corners[0].x, corners[0].y], "m"))?;
     for c in &corners[1..] {
-        fail(out.nums(&[c.x as f32, c.y as f32], "l"))?;
+        fail(out.nums(&[c.x, c.y], "l"))?;
     }
     out.op("s");
     out.op(&fill);

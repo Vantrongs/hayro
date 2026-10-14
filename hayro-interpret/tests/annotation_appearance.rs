@@ -106,7 +106,7 @@ const BLACK: [u8; 4] = [0, 0, 0, 255];
 const RED: [u8; 4] = [255, 0, 0, 255];
 
 #[test]
-fn highlight_fills_quads_in_one_multiply_group_at_ca() {
+fn highlight_fills_each_quad_in_one_multiply_group_at_ca() {
     let ev = draw(
         &[
             "/Subtype /Highlight /F 4 /CA 0.5 /Rect [10 10 90 40] /QuadPoints [10 40 90 40 10 30 90 30 10 22 60 22 10 12 60 12]",
@@ -121,7 +121,11 @@ fn highlight_fills_quads_in_one_multiply_group_at_ca() {
                 blend: BlendMode::Multiply
             },
             Ev::Fill {
-                bbox: [8, 12, 92, 40],
+                bbox: [8, 30, 92, 40],
+                rgba: YELLOW
+            },
+            Ev::Fill {
+                bbox: [8, 12, 62, 22],
                 rgba: YELLOW
             },
             Ev::EndGroup,
@@ -156,7 +160,7 @@ fn text_lines_scale_with_the_quad() {
     );
 }
 
-/// A Squiggly quad 10^9 pt wide is drawn across the page and a step beyond, not
+/// A Squiggly quad 10^9 pt wide is drawn across the page and a few steps beyond, not
 /// along its whole width.
 #[test]
 fn a_huge_squiggly_is_drawn_across_the_page() {
@@ -165,15 +169,11 @@ fn a_huge_squiggly_is_drawn_across_the_page() {
            /QuadPoints [10 20 1000000000 20 10 10 1000000000 10]"],
         VIEW,
     );
-    assert_eq!(
-        ev,
-        vec![Ev::Stroke {
-            bbox: [10, 10, 201, 11],
-            rgba: BLACK,
-            width: 0.625,
-            dashed: false
-        }]
-    );
+    let [Ev::Stroke { bbox, width, .. }] = ev.as_slice() else {
+        panic!("{ev:?}");
+    };
+    assert_eq!(([bbox[0], bbox[1], bbox[3]], *width), ([10, 10, 11], 0.625));
+    assert!((200..=210).contains(&bbox[2]), "{bbox:?}");
 }
 
 #[test]
@@ -350,7 +350,7 @@ fn caret_is_centred_and_redact_outlines_its_area() {
                /QuadPoints [40 80 160 80 40 60 160 60 40 60 100 60 40 40 100 40]"],
             VIEW
         ),
-        vec![outline([40, 40, 160, 80])]
+        vec![outline([40, 60, 160, 80]), outline([40, 40, 100, 60])]
     );
     assert_eq!(
         draw(&["/Subtype /Redact /Rect [40 40 160 80]"], VIEW),
@@ -817,11 +817,13 @@ fn a_generated_appearance_has_its_opacity_and_blend() {
         (highlight.opacity, highlight.blend),
         (0.5, BlendMode::Multiply)
     );
-    // The sides bulge out √2/6 of the height.
+    // The sides bulge out √2/6 of the height, clipped to the quad a sixteenth of its
+    // height wider and the bulges.
     assert_eq!(
         highlight.content,
-        "1 1 0 rg\n10 30 m\n7.6429777 32.35702 7.6429777 37.64298 10 40 c\n90 40 l\n\
-         92.357025 37.64298 92.357025 32.35702 90 30 c\nh\nf\n"
+        "q\n7.642977 29.375 84.71404 11.25 re\nW n\n1 1 0 rg\n10 30 m\n\
+         7.642977 32.35702 7.642977 37.64298 10 40 c\n90 40 l\n\
+         92.357025 37.64298 92.357025 32.35702 90 30 c\nf\nQ\n"
     );
 }
 
@@ -1167,4 +1169,326 @@ fn a_coordinate_too_large_to_draw_is_unsupported() {
             .to_vec()],
     );
     assert_eq!(looks(&pdf), ["Coordinates"]);
+}
+
+/// An array's entry that refers to no object, is null or is not a number reads as 0
+/// and keeps its place, as viewers read it: the coordinates and colour components
+/// after it keep their meaning.
+#[test]
+fn a_damaged_array_entry_reads_as_zero_in_its_place() {
+    let same = |damaged: &str, read: &str| {
+        let got = draw(&[damaged], VIEW);
+        assert!(!got.is_empty(), "{damaged}");
+        assert_eq!(got, draw(&[read], VIEW), "{damaged}");
+    };
+    same(
+        "/Subtype /Square /Rect [40 99 0 R 160 80] /IC [1 0 0] /C [0]",
+        "/Subtype /Square /Rect [40 0 160 80] /IC [1 0 0] /C [0]",
+    );
+    same(
+        "/Subtype /Highlight /Rect [0 0 200 200] /QuadPoints [10 40 99 0 R 40 10 30 90 30]",
+        "/Subtype /Highlight /Rect [0 0 200 200] /QuadPoints [10 40 0 40 10 30 90 30]",
+    );
+    same(
+        "/Subtype /Ink /C [0] /Rect [0 0 200 200] /InkList [[10 10 99 0 R 50 50 50] 98 0 R [9 9 40 40]]",
+        "/Subtype /Ink /C [0] /Rect [0 0 200 200] /InkList [[10 10 0 50 50 50] [9 9 40 40]]",
+    );
+    same(
+        "/Subtype /Line /C [0] /Rect [0 0 200 200] /L [20 20 100 100] /LE [99 0 R /Circle]",
+        "/Subtype /Line /C [0] /Rect [0 0 200 200] /L [20 20 100 100] /LE [/None /Circle]",
+    );
+    for c in ["[1 null 0]", "[1 /x 0]", "[1 99 0 R 0]"] {
+        let red = "[1 0 0]";
+        for annot in [
+            "/Subtype /Line /Rect [20 20 100 100] /C {} /L [20 20 100 100]",
+            "/Subtype /Square /Rect [20 20 100 100] /IC {}",
+            "/Subtype /Ink /Rect [0 0 200 200] /C {} /InkList [[10 10 50 50]]",
+            "/Subtype /FreeText /Rect [20 20 100 100] /C {} /DA (/Helv 12 Tf 0 g)",
+            "/Subtype /Widget /FT /Tx /Rect [20 20 100 100] /MK << /BC {} /BG [0 0 1] >>",
+            "/Subtype /Widget /FT /Tx /Rect [20 20 100 100] /MK << /BC [0] /BG {} >>",
+        ] {
+            same(&annot.replace("{}", c), &annot.replace("{}", red));
+        }
+    }
+    // Four components or more are CMYK, of the first four.
+    same(
+        "/Subtype /Line /Rect [20 20 100 100] /C [1 0 0 0 0] /L [20 20 100 100]",
+        "/Subtype /Line /Rect [20 20 100 100] /C [1 0 0 0] /L [20 20 100 100]",
+    );
+}
+
+/// An appearance stream's `/BBox` and `/Matrix` are read as viewers read damaged ones:
+/// an entry that is not a number as 0, a short array with 0 for what it lacks, a
+/// `/Matrix` that is not an array as the identity. The renderer draws the stream where
+/// they put it, which is where viewers draw it.
+#[test]
+fn a_damaged_box_or_matrix_places_the_appearance_as_viewers_do() {
+    let drawn = |bbox: &str, matrix: &str| {
+        let ev = draw_objects(vec![
+            b"<< /Type /Annot /Subtype /Square /Rect [30 40 80 100] /AP << /N 5 0 R >> >>".to_vec(),
+            common::stream(&format!("/BBox {bbox} {matrix}"), b"0 g 0 0 4 3 re f"),
+        ]);
+        fills(&ev).into_iter().map(|(b, _)| b).collect::<Vec<_>>()
+    };
+    // The box 5 × 6 times larger on /Rect: a 4 × 3 fill is 20 × 18.
+    let upright = vec![[30, 40, 50, 58]];
+    let flipped = vec![[30, 82, 50, 100]];
+    assert_eq!(drawn("[0 0 10 10]", ""), upright);
+    assert_eq!(drawn("[0 /x 10 10]", ""), upright);
+    assert_eq!(drawn("[0 99 0 R 10 10 7]", ""), upright);
+    assert_eq!(drawn("[0 0 10 10]", "/Matrix (x)"), upright);
+    assert_eq!(drawn("[0 0 10 10]", "/Matrix [1 0 0 -1 0 0]"), flipped);
+    assert_eq!(drawn("[0 0 10 10]", "/Matrix [1 0 0 -1 0 (bad)]"), flipped);
+    assert_eq!(drawn("[0 0 10 10]", "/Matrix [1 0 0 -1]"), flipped);
+    // A matrix of no area, and a box of none, draw nothing.
+    assert_eq!(
+        drawn("[0 0 10 10]", "/Matrix [1 0 0]"),
+        Vec::<[i32; 4]>::new()
+    );
+    assert_eq!(drawn("[0 0 10]", ""), Vec::<[i32; 4]>::new());
+
+    // A writer gets the same box and matrix to draw the stream with.
+    let pdf = annotations(
+        "/Annots [4 0 R]",
+        vec![
+            b"<< /Type /Annot /Subtype /Square /Rect [30 40 80 100] /AP << /N 5 0 R >> >>".to_vec(),
+            common::stream("/BBox [0 /x 10 10] /Matrix [1 0 0 -1]", b"0 g 0 0 4 3 re f"),
+        ],
+    );
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    let Look::Stream { placement, .. } = appearances.look(&annots(&pdf)[0], PAGE) else {
+        panic!("an appearance stream");
+    };
+    assert_eq!(placement.bbox(), [0.0, 0.0, 10.0, 10.0]);
+    assert_eq!(placement.matrix(), [1.0, 0.0, 0.0, -1.0, 0.0, 0.0]);
+    assert_eq!(placement.transform(), [5.0, 0.0, 0.0, 6.0, 30.0, 100.0]);
+}
+
+/// A number beyond the 32-bit numbers content streams are read in fails the whole
+/// appearance, in whichever quadrilateral, path or entry it is: none is left out as
+/// if it drew nothing. So does one in where an appearance stream is placed.
+#[test]
+fn every_number_too_large_to_write_is_unsupported() {
+    const H: &str = "10000000000000000000000000000000000000000";
+    let quad = format!("/Rect [0 0 200 200] /QuadPoints [10 80 {H} 80 10 50 {H} 50]");
+    let mut cases: Vec<String> = ["Highlight", "Underline", "StrikeOut", "Squiggly", "Redact"]
+        .iter()
+        .map(|s| format!("/Subtype /{s} /C [1 0 0] {quad}"))
+        .collect();
+    cases.extend([
+        // One among quads that can be drawn.
+        format!(
+            "/Subtype /Highlight /Rect [0 0 200 200] \
+             /QuadPoints [10 50 {H} 50 10 30 200 30 10 80 90 80 10 60 90 60]"
+        ),
+        format!("/Subtype /Ink /C [0] /Rect [0 0 200 200] /InkList [[10 10 {H} 50 50 50] [10 100 50 100]]"),
+        format!("/Subtype /Square /C [0] /BS << /W {H} >> /Rect [10 10 50 50]"),
+        format!("/Subtype /Line /C [0] /Rect [0 0 200 200] /L [20 20 100 100] /LL {H}"),
+        format!("/Subtype /Polygon /C [0] /Rect [0 0 200 200] /Vertices [10 10 50 10 50 {H}]"),
+        format!("/Subtype /Widget /FT /Btn /Ff 32768 /MK << /BG [0] >> /Rect [0 0 {H} {H}]"),
+        format!("/Subtype /FreeText /Rect [0 0 200 200] /Contents (A) /DA (/Helv {H} Tf)"),
+    ]);
+    for annot in &cases {
+        let pdf = annotations(
+            "/Annots [4 0 R]",
+            vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
+        );
+        assert_eq!(looks(&pdf), ["Coordinates"], "{annot}");
+    }
+    for (rect, matrix) in [
+        (format!("[0 {H} 200]"), ""),
+        ("[0 0 200 200]".to_owned(), "/Matrix [1 0 0 1 0 1e40]"),
+        (
+            "[0 0 200 200]".to_owned(),
+            &*format!("/Matrix [1 0 0 1 0 {H}]"),
+        ),
+    ] {
+        let pdf = annotations(
+            "/Annots [4 0 R]",
+            vec![
+                format!("<< /Type /Annot /Subtype /Square /Rect {rect} /AP << /N 5 0 R >> >>")
+                    .into_bytes(),
+                common::stream(&format!("/BBox [0 0 10 10] {matrix}"), b"0 g 0 0 4 3 re f"),
+            ],
+        );
+        let expected = if matrix.contains("1e40") {
+            // Not a number: the identity.
+            "0 g 0 0 4 3 re f"
+        } else {
+            "Coordinates"
+        };
+        assert_eq!(looks(&pdf), [expected], "{rect} {matrix}");
+    }
+}
+
+/// The numbers of the path operators and line widths in `content`, in order.
+fn path_numbers(content: &str) -> Vec<f64> {
+    content
+        .lines()
+        .filter(|l| [" m", " l", " c", " w"].iter().any(|op| l.ends_with(op)))
+        .flat_map(|l| l.split(' ').filter_map(|t| t.parse::<f64>().ok()))
+        .collect()
+}
+
+fn assert_near(got: &[f64], expected: &[f64], what: &str) {
+    assert!(
+        got.len() >= expected.len() && got.iter().zip(expected).all(|(g, e)| (g - e).abs() < 1e-3),
+        "{what}: {got:?}"
+    );
+}
+
+/// Text markup on a slanted, vertical or reversed quadrilateral is drawn in the
+/// quadrilateral's own orientation, as viewers draw it: the numbers are those of the
+/// appearances a common viewer generates for these quads.
+#[test]
+fn text_markup_follows_the_orientation_of_its_quads() {
+    let content = |subtype: &str, quad: &str| {
+        generated(&format!(
+            "/Subtype /{subtype} /C [0] /Rect [0 0 200 200] /QuadPoints [{quad}]"
+        ))
+    };
+    let slanted = "30 40 100 120 45 25 115 105";
+    let vertical = "40 20 40 100 50 20 50 100";
+    let reversed = "45 25 115 105 100 120 30 40";
+    let cases: [(&str, &str, &[f64]); 12] = [
+        (
+            "Underline",
+            slanted,
+            &[1.325_825_2, 42.857_145, 27.142_857, 112.857_14, 107.142_86],
+        ),
+        (
+            "StrikeOut",
+            slanted,
+            &[1.325_825_2, 38.571_428, 31.428_572, 108.571_43, 111.428_57],
+        ),
+        (
+            "Squiggly",
+            slanted,
+            &[
+                1.325_825_2,
+                45.0,
+                25.0,
+                44.852_716,
+                29.423_508,
+                48.991_144,
+                29.561_305,
+            ],
+        ),
+        (
+            "Highlight",
+            slanted,
+            &[
+                45.0,
+                25.0,
+                37.944_36,
+                24.529_625,
+                30.470_376,
+                32.944_36,
+                30.0,
+                40.0,
+                100.0,
+                120.0,
+                107.055_64,
+                120.470_378,
+                114.529_628,
+                112.055_64,
+                115.0,
+                105.0,
+            ],
+        ),
+        (
+            "Redact",
+            slanted,
+            &[1.0, 45.0, 25.0, 115.0, 105.0, 100.0, 120.0, 30.0, 40.0],
+        ),
+        (
+            "Underline",
+            vertical,
+            &[0.625, 48.571_43, 20.0, 48.571_43, 100.0],
+        ),
+        (
+            "StrikeOut",
+            vertical,
+            &[0.625, 45.714_288, 20.0, 45.714_288, 100.0],
+        ),
+        (
+            "Squiggly",
+            vertical,
+            &[0.625, 50.0, 20.0, 48.571_43, 21.428_572, 50.0, 22.857_144],
+        ),
+        (
+            "Highlight",
+            vertical,
+            &[
+                50.0, 20.0, 47.6429, 17.642_899, 42.3571, 17.642_899, 40.0, 20.0, 40.0, 100.0,
+                42.3571, 102.3571, 47.6429, 102.3571, 50.0, 100.0,
+            ],
+        ),
+        (
+            "Redact",
+            vertical,
+            &[1.0, 50.0, 20.0, 50.0, 100.0, 40.0, 100.0, 40.0, 20.0],
+        ),
+        (
+            "Underline",
+            reversed,
+            &[6.860_780_9, 92.142_85, 106.428_57, 42.142_858, 49.285_715],
+        ),
+        (
+            "Squiggly",
+            reversed,
+            &[
+                6.860_780_9,
+                100.0,
+                120.0,
+                84.766_76,
+                97.998_76,
+                79.346_95,
+                96.396_51,
+            ],
+        ),
+    ];
+    for (subtype, quad, expected) in cases {
+        assert_near(
+            &path_numbers(&content(subtype, quad)),
+            expected,
+            &format!("{subtype} {quad}"),
+        );
+    }
+    // The zigzag ends at the first corner at or past the bottom right corner.
+    let squiggle = path_numbers(&content("Squiggly", slanted));
+    assert_eq!(squiggle.len(), 1 + 2 * 37, "{squiggle:?}");
+    assert_near(
+        &squiggle[squiggle.len() - 2..],
+        &[116.840_518, 107.103_44],
+        "end",
+    );
+    // The clip: each quad's box a line width wider, and a highlight's bulges.
+    assert!(
+        content("Underline", slanted)
+            .starts_with("q\n28.674175 23.674175 87.65165 97.65165 re\nW n\n"),
+        "{}",
+        content("Underline", slanted)
+    );
+}
+
+/// A highlight quad whose bottom edge has no length has no direction: viewers put
+/// its curves' control points at the origin, outside the clip of its quad.
+#[test]
+fn a_highlight_quad_without_a_bottom_edge_bulges_to_the_origin() {
+    let content = generated(
+        "/Subtype /Highlight /Rect [0 0 200 200] /QuadPoints [110 124 115 124 100 100 100 100]",
+    );
+    assert_near(
+        &path_numbers(&content),
+        &[
+            100.0, 100.0, 0.0, 0.0, 0.0, 0.0, 110.0, 124.0, 115.0, 124.0, 0.0, 0.0, 0.0, 0.0,
+            100.0, 100.0,
+        ],
+        &content,
+    );
+    assert!(
+        content.starts_with("q\n98.375 98.375 18.25 27.25 re\nW n\n"),
+        "{content}"
+    );
 }

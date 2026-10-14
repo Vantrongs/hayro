@@ -22,15 +22,22 @@ pub(crate) struct FormXObject<'a> {
 impl<'a> FormXObject<'a> {
     pub(crate) fn new(stream: &Stream<'a>) -> Option<Self> {
         let dict = stream.dict();
-
-        let decoded = stream.decoded().ok()?;
-        let resources = dict.get(RESOURCES).map(Resources::new);
-
         let matrix = Affine::new(
             dict.get::<[f64; 6]>(MATRIX)
                 .unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
         );
         let bbox = dict.get::<[f32; 4]>(BBOX)?;
+        Self::placed(stream, matrix, bbox)
+    }
+
+    /// The form of `stream` drawn with `matrix` and clipped to `bbox`, whatever its
+    /// own entries say.
+    pub(crate) fn placed(stream: &Stream<'a>, matrix: Affine, bbox: [f32; 4]) -> Option<Self> {
+        let dict = stream.dict();
+
+        let decoded = stream.decoded().ok()?;
+        let resources = dict.get(RESOURCES).map(Resources::new);
+
         let is_transparency_group = dict.get::<Dict<'_>>(GROUP).is_some();
 
         Some(Self {
