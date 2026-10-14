@@ -11,7 +11,7 @@ use crate::object::dict::keys::*;
 use crate::object::stream::DecodeFailure;
 use crate::object::{MaybeRef, Null, Object, ObjectIdentifier};
 use crate::reader::ReaderContext;
-use crate::sync::{FxHashSet, OnceLock};
+use crate::sync::{Arc, FxHashSet, OnceLock};
 use crate::transform::Transform;
 use crate::util::FloatExt;
 use crate::xref::XRef;
@@ -128,24 +128,43 @@ impl<'a> Node<'a> {
     }
 }
 
+/// The nodes that list a page tree entry, nearest first, as the walk of the /Kids
+/// meets them.
+struct Listing<'a> {
+    node: Node<'a>,
+    up: Option<Arc<Self>>,
+}
+
+impl<'a> Listing<'a> {
+    fn nodes(&self) -> impl Iterator<Item = &Node<'a>> {
+        core::iter::successors(Some(self), |listing| listing.up.as_deref())
+            .map(|listing| &listing.node)
+    }
+}
+
+/// A page tree entry and the nodes that list it.
+type Listed<'a> = (Node<'a>, Option<Arc<Listing<'a>>>);
+
 // The pages below `tree`, depth first. A node's kids are read the first time the
 // walk reaches it: a node listed again, as a shared subtree or in a cycle, adds
 // nothing, which keeps the walk linear in the file. A page listed again is a page
 // again, as in MuPDF.
-fn walk<'a>(tree: Node<'a>, ctx: &ReaderContext<'a>) -> Vec<Node<'a>> {
+fn walk<'a>(tree: Node<'a>, ctx: &ReaderContext<'a>) -> Vec<Listed<'a>> {
     let mut pages = vec![];
     let mut read = FxHashSet::default();
-    let mut stack: Vec<ArrayIter<'a>> = vec![];
+    let mut stack: Vec<(Arc<Listing<'a>>, ArrayIter<'a>)> = vec![];
     let mut next = Some(tree);
     loop {
         if let Some(node) = next.take() {
+            let up = stack.last().map(|(listing, _)| listing.clone());
             if !node.is_tree() {
-                pages.push(node);
+                pages.push((node, up));
             } else if node.id.is_none_or(|id| read.insert(id)) {
-                stack.push(node.kids());
+                let kids = node.kids();
+                stack.push((Arc::new(Listing { node, up }), kids));
             }
         }
-        let Some(kids) = stack.last_mut() else {
+        let Some((_, kids)) = stack.last_mut() else {
             return pages;
         };
         match kids.next() {
@@ -160,7 +179,7 @@ fn walk<'a>(tree: Node<'a>, ctx: &ReaderContext<'a>) -> Vec<Node<'a>> {
 // Every dictionary of the file that has /Contents and, if typed, is a /Page. Better
 // than nothing where the page tree is lost, though the order is the objects', which
 // may not be the document's.
-fn brute_force<'a>(xref: &'a XRef) -> Vec<Node<'a>> {
+fn brute_force<'a>(xref: &'a XRef) -> Vec<Listed<'a>> {
     let mut pages = vec![];
     for object in xref.objects() {
         if let Some(dict) = object.into_dict()
@@ -169,7 +188,7 @@ fn brute_force<'a>(xref: &'a XRef) -> Vec<Node<'a>> {
                 .get::<Name<'_>>(TYPE)
                 .is_none_or(|kind| kind.deref() == PAGE)
         {
-            pages.push(Node::page(dict.obj_id(), &dict));
+            pages.push((Node::page(dict.obj_id(), &dict), None));
         }
     }
     pages
@@ -181,17 +200,18 @@ type Inherited<'a> = [Option<Object<'a>>; 4];
 /// The entries a page inherits (the PDF specification's table 31).
 const INHERITED: [&[u8]; 4] = [MEDIA_BOX, CROP_BOX, ROTATE, RESOURCES];
 
-// Each of `entries` as a page with the entries it inherits through /Parent, as
-// MuPDF finds them once it has loaded every page, which reads these entries: by
-// then a /Parent loop any of the lookups meets has been repaired (see
-// `Inheritance`). An entry that cannot be found, because a /Parent chain loops even
-// so, is not inherited.
-fn with_inherited<'a>(entries: Vec<Node<'a>>, ctx: &ReaderContext<'a>) -> Vec<Page<'a>> {
+// Each of `entries` as a page with the entries it inherits, found as MuPDF finds
+// them once it has loaded every page, which reads these entries: by then a /Parent
+// loop any of the lookups meets has been repaired (see `Inheritance`). An entry
+// that cannot be found, because a /Parent chain loops even so, is not inherited.
+fn with_inherited<'a>(entries: Vec<Listed<'a>>, ctx: &ReaderContext<'a>) -> Vec<Page<'a>> {
     let mut tree = Inheritance::with(ctx.clone());
     let look_up = |tree: &mut Inheritance<'a>| -> Vec<Inherited<'a>> {
         entries
             .iter()
-            .map(|page| INHERITED.map(|key| tree.lookup(page, key).ok().flatten()))
+            .map(|(page, listing)| {
+                INHERITED.map(|key| tree.lookup(page, listing.as_deref(), key).ok().flatten())
+            })
             .collect()
     };
     let mut inherited = look_up(&mut tree);
@@ -199,9 +219,9 @@ fn with_inherited<'a>(entries: Vec<Node<'a>>, ctx: &ReaderContext<'a>) -> Vec<Pa
         inherited = look_up(&mut tree);
     }
     entries
-        .iter()
+        .into_iter()
         .zip(inherited)
-        .map(|(page, inherited)| Page::new(page.id, &page.dict, inherited, ctx))
+        .map(|((page, listing), inherited)| Page::new(page, listing, inherited, ctx))
         .collect()
 }
 
@@ -237,13 +257,14 @@ pub struct Page<'a> {
     rotation: Rotation,
     page_streams: OnceLock<Option<Vec<u8>>>,
     resources: Resources<'a>,
+    listing: Option<Arc<Listing<'a>>>,
     ctx: ReaderContext<'a>,
 }
 
 impl<'a> Page<'a> {
     fn new(
-        id: Option<ObjectIdentifier>,
-        dict: &Dict<'a>,
+        node: Node<'a>,
+        listing: Option<Arc<Listing<'a>>>,
         inherited: Inherited<'a>,
         reader_ctx: &ReaderContext<'a>,
     ) -> Self {
@@ -271,13 +292,14 @@ impl<'a> Page<'a> {
         );
 
         Self {
-            id,
-            inner: dict.clone(),
+            id: node.id,
+            inner: node.dict,
             media_box,
             crop_box,
             rotation,
             page_streams: OnceLock::new(),
             resources,
+            listing,
             ctx: reader_ctx.clone(),
         }
     }
@@ -905,6 +927,79 @@ mod tests {
         let page = (named(&[]), 300.0, 0);
         assert_eq!(inherited(&objects), [page.clone(), page]);
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    // Where the /Parent chain ends at an entry that has no /Parent, or a /Parent
+    // that is no dictionary, the entry inherits through the nodes that list it, as
+    // the page tree shows them: page 3 has no /Parent, page 4's /Parent is a
+    // number, and page 6's /Parent is node 5, which has no /Parent. Page 7's
+    // /Parent is a node outside the tree, which is where it inherits from.
+    #[test]
+    fn an_entry_without_a_parent_inherits_from_the_nodes_listing_it() {
+        let objects = [
+            CATALOG,
+            "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 7 0 R] /Count 4 /MediaBox [0 0 300 300] \
+             /Rotate 90 /Resources << /XObject << /F 9 0 R >> >> >>",
+            "<< /Type /Page >>",
+            "<< /Type /Page /Parent 5 >>",
+            "<< /Type /Pages /Kids [6 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 5 0 R >>",
+            "<< /Type /Page /Parent 8 0 R >>",
+            "<< /Type /Pages /Kids [] /Count 0 >>",
+        ];
+        let page = (named(&["F"]), 300.0, 1);
+        assert_eq!(
+            inherited(&objects),
+            [page.clone(), page.clone(), page, (named(&[]), A4.x1, 0)]
+        );
+    }
+
+    // The root lists node 3 first and then a chain of 255 nodes ending at node 3
+    // too. A walk that reaches node 3 first through the chain, 257 levels down,
+    // must still set the /Parent of page 4, whose /Parent is itself, below it.
+    #[test]
+    fn a_parent_loop_is_repaired_below_a_node_first_met_deep_down() {
+        let chain = 255;
+        let mut objects = vec![
+            CATALOG.to_owned(),
+            "<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 1 >>".to_owned(),
+            "<< /Type /Pages /Kids [4 0 R] /Count 1 /Resources << /XObject << /F 9 0 R >> >> >>"
+                .to_owned(),
+            "<< /Type /Page /Parent 4 0 R /MediaBox [0 0 100 100] >>".to_owned(),
+        ];
+        for i in 0..chain {
+            let next = if i + 1 < chain { 5 + i + 1 } else { 3 };
+            objects.push(pages_node("1", &format!("{next} 0 R")));
+        }
+        let objects: Vec<&str> = objects.iter().map(String::as_str).collect();
+        assert_eq!(inherited(&objects), [(named(&["F"]), 100.0, 0)]);
+    }
+
+    // A /Parent loop is repaired at any depth, past a kid that is no dictionary,
+    // into which `MuPDF` fails to write a /Parent: page 3's /Parent is itself, and
+    // the root lists a chain of 300 nodes whose last lists a page whose /Parent is
+    // itself and a reference to nothing, which is an empty page.
+    #[test]
+    fn a_parent_loop_is_repaired_at_any_depth_past_a_kid_that_is_no_dictionary() {
+        let depth = 300;
+        let mut objects = vec![
+            CATALOG.to_owned(),
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 3 /MediaBox [0 0 300 300] >>".to_owned(),
+            "<< /Type /Page /Parent 3 0 R >>".to_owned(),
+        ];
+        let page = 4 + depth;
+        for i in 0..depth {
+            let kids = if i + 1 < depth {
+                format!("{} 0 R", 5 + i)
+            } else {
+                format!("{page} 0 R 9999 0 R")
+            };
+            objects.push(pages_node("1", &kids));
+        }
+        objects.push(format!("<< /Type /Page /Parent {page} 0 R >>"));
+        let objects: Vec<&str> = objects.iter().map(String::as_str).collect();
+        let page = (named(&[]), 300.0, 0);
+        assert_eq!(inherited(&objects), [page.clone(), page.clone(), page]);
     }
 
     #[test]

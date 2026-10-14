@@ -1,6 +1,6 @@
 //! The entries a page inherits from the page tree, found as `MuPDF` finds them.
 
-use super::{Node, Page};
+use super::{Listing, Node, Page};
 use crate::object::dict::keys::{KIDS, PAGES, PARENT};
 use crate::object::{Array, Dict, MaybeRef, Null, Object};
 use crate::pdf::Pdf;
@@ -15,15 +15,17 @@ pub enum InheritanceError {
     /// The page's /Parent chain loops even after the page tree's /Parent entries
     /// are repaired.
     ParentLoop,
-    /// The repair meets a page tree entry that is no dictionary, which `MuPDF` fails
-    /// to write /Parent into.
-    Repair,
 }
 
 /// Values a page inherits through /Parent, as `pdf_dict_get_inheritable` (`MuPDF`'s
 /// `pdf-object.c`) finds them: on the page or the nearest /Parent that has the key,
 /// past a direct `null`, which `MuPDF` stores as no entry, but stopping at a reference
 /// even if it leads nowhere.
+///
+/// Where the chain ends at an entry without a /Parent, or with a /Parent that is
+/// no dictionary, the lookup goes on through the nodes the page tree lists that
+/// entry under, if it is the page or one of them, where `MuPDF` stops: a page that
+/// lost its /Parent keeps the resources and boxes the tree gives it.
 ///
 /// A /Parent chain that loops makes `MuPDF` set each page tree node's /Parent to the
 /// node that lists it (`pdf_repair_page_tree_parents` in `pdf-repair.c`), once, for
@@ -33,7 +35,7 @@ pub enum InheritanceError {
 /// looked up, as when `MuPDF` draws a page after loading them all.
 pub struct Inheritance<'a> {
     ctx: ReaderContext<'a>,
-    repaired: Option<Result<FxHashMap<Key, Node<'a>>, InheritanceError>>,
+    repaired: Option<FxHashMap<Key, Node<'a>>>,
 }
 
 /// What tells nodes apart: the object number, or for a direct dictionary its bytes.
@@ -49,11 +51,6 @@ impl<'a> Node<'a> {
             Some(id) => Key::Object(id.obj_number),
             None => Key::Direct(self.dict.data().as_ptr() as usize),
         }
-    }
-
-    // `pdf_to_num`: the object number, 0 for a direct object.
-    fn number(&self) -> i32 {
-        self.id.map_or(0, |id| id.obj_number)
     }
 }
 
@@ -77,21 +74,24 @@ impl<'a> Inheritance<'a> {
         page: &Page<'a>,
         key: &[u8],
     ) -> Result<Option<Object<'a>>, InheritanceError> {
-        self.lookup(&Node::page(page.obj_id(), page.raw()), key)
+        let listing = page.listing.as_deref();
+        self.lookup(&Node::page(page.obj_id(), page.raw()), listing, key)
     }
 
     pub(super) fn lookup(
         &mut self,
         start: &Node<'a>,
+        listing: Option<&Listing<'a>>,
         key: &[u8],
     ) -> Result<Option<Object<'a>>, InheritanceError> {
-        if let Some(found) = self.search(start, key) {
+        if let Some(found) = self.search(start, listing, key) {
             return Ok(found);
         }
-        if let Err(error) = self.repaired.get_or_insert_with(|| tree_parents(&self.ctx)) {
-            return Err(*error);
+        if self.repaired.is_none() {
+            self.repaired = Some(tree_parents(&self.ctx));
         }
-        self.search(start, key).ok_or(InheritanceError::ParentLoop)
+        self.search(start, listing, key)
+            .ok_or(InheritanceError::ParentLoop)
     }
 
     /// Whether the page tree's /Parent entries have been repaired.
@@ -100,42 +100,65 @@ impl<'a> Inheritance<'a> {
     }
 
     /// The value, or `None` if the chain loops before it is found.
-    fn search(&self, start: &Node<'a>, key: &[u8]) -> Option<Option<Object<'a>>> {
-        let repaired = self.repaired.as_ref().and_then(|r| r.as_ref().ok());
+    fn search(
+        &self,
+        start: &Node<'a>,
+        listing: Option<&Listing<'a>>,
+        key: &[u8],
+    ) -> Option<Option<Object<'a>>> {
         let mut node = start.clone();
         let mut seen = FxHashSet::default();
         loop {
             if !seen.insert(node.key()) {
                 return None;
             }
-            if node.has(key) {
-                let value = node.dict.get::<Object<'a>>(key);
-                return Some(Some(value.unwrap_or(Object::Null(Null))));
+            if let Some(value) = value(&node, key) {
+                return Some(Some(value));
             }
-            node = match repaired.and_then(|map| map.get(&node.key())) {
-                Some(parent) => parent.clone(),
-                None => match node.dict.get_raw::<Object<'a>>(PARENT) {
-                    Some(parent) => Node::new(parent, &self.ctx),
-                    None => return Some(None),
-                },
+            let parent = match self.repaired.as_ref().and_then(|map| map.get(&node.key())) {
+                Some(parent) => Some(parent.clone()),
+                None => node
+                    .dict
+                    .get_raw::<Object<'a>>(PARENT)
+                    .map(|parent| Node::new(parent, &self.ctx))
+                    .filter(|parent| parent.is_dict),
             };
+            let Some(parent) = parent else {
+                // The nodes listed above `node`: all of them for the page itself.
+                let mut above = listing.into_iter().flat_map(Listing::nodes);
+                if node.key() != start.key()
+                    && above.find(|listed| listed.key() == node.key()).is_none()
+                {
+                    return Some(None);
+                }
+                return Some(above.find_map(|listed| value(listed, key)));
+            };
+            node = parent;
         }
     }
 }
 
-// `walk_page_tree` in MuPDF's `pdf-repair.c`: each node's /Parent set to the node
-// whose /Kids lists it, depth first, the last one listing it winning; a node already
-// above itself or with 257 nodes above it is passed over (`pdf_cycle`).
+// The value `node` has for `key`, `null` for a reference to nothing.
+fn value<'a>(node: &Node<'a>, key: &[u8]) -> Option<Object<'a>> {
+    node.has(key).then(|| {
+        node.dict
+            .get::<Object<'a>>(key)
+            .unwrap_or(Object::Null(Null))
+    })
+}
+
+// Each page tree entry's /Parent set to the node whose /Kids lists it, depth first,
+// the last one listing it winning, as `MuPDF` sets them.
 //
-// MuPDF walks a node's kids again each time the node is listed, which takes time
+// `MuPDF` walks a node's kids again each time the node is listed, which takes time
 // exponential in nested sharing. The last listing that walk meets is the first one
 // met by a walk that takes each node's kids last first, so that walk, reading a
 // node's kids only the first time it meets the node, sets the same parents in time
-// linear in the nodes and listings. It differs only where passing a node over
-// depends on the path to it — a node shared within 257 levels of the cut, or a /Kids
-// cycle entered through a shared node — where a later, repeated walk of MuPDF's may
-// set parents this one does not.
-fn tree_parents<'a>(ctx: &ReaderContext<'a>) -> Result<FxHashMap<Key, Node<'a>>, InheritanceError> {
+// linear in the nodes and listings. Where this differs, it sets more parents than
+// `MuPDF`, which fails on a kid that is no dictionary and passes over a node with
+// 257 nodes above it, and which may set other parents where a /Kids cycle is
+// entered through a shared node. A kid that is no dictionary is passed over here.
+fn tree_parents<'a>(ctx: &ReaderContext<'a>) -> FxHashMap<Key, Node<'a>> {
     struct Frame<'a> {
         node: Node<'a>,
         /// The kids left, first first, taken from the end; `None` for a direct
@@ -164,36 +187,23 @@ fn tree_parents<'a>(ctx: &ReaderContext<'a>) -> Result<FxHashMap<Key, Node<'a>>,
         .get_with::<Dict<'a>>(xref.root_id(), ctx)
         .and_then(|catalog| catalog.get_raw::<Object<'a>>(PAGES))
     else {
-        return Ok(parents);
+        return parents;
     };
     let root = Node::new(root, ctx);
     let mut met = FxHashSet::default();
     met.insert(root.key());
-    let mut above = FxHashSet::default();
-    above.insert(root.number());
     let mut stack = vec![frame(root)];
     while let Some(top) = stack.last_mut() {
         let Some(kid) = top.kids.pop() else {
-            if let Some(done) = stack.pop() {
-                above.remove(&done.node.number());
-            }
+            stack.pop();
             continue;
         };
-        let Some(kid) = kid else { continue };
-        let number = kid.number();
-        if number > 0 && (stack.len() >= 257 || above.contains(&number)) {
+        // A node met before is in the map already, or on the stack, above itself.
+        let Some(kid) = kid.filter(|kid| kid.is_dict && met.insert(kid.key())) else {
             continue;
-        }
-        if !met.insert(kid.key()) {
-            continue;
-        }
-        if !kid.is_dict {
-            return Err(InheritanceError::Repair);
-        }
-        let parent = stack.last().map(|f| f.node.clone());
-        parents.insert(kid.key(), parent.expect("a frame above"));
-        above.insert(number);
+        };
+        parents.insert(kid.key(), top.node.clone());
         stack.push(frame(kid));
     }
-    Ok(parents)
+    parents
 }
