@@ -244,7 +244,8 @@ pub(super) struct Style {
 /// The style of a default appearance string (PDF 32000-1 12.7.3.3): the font
 /// operand of `Tf` and its size, and the last colour operator. The font name is
 /// looked up in `fonts` (an `/DR /Font` dictionary) for its `/BaseFont`. A size of 0
-/// (fit to the field) is `None`.
+/// (fit to the field) is `None`; without `Tf` the size is 12 pt, as common viewers
+/// set it.
 pub(super) fn default_appearance(
     da: &[u8],
     fonts: Option<&hayro_syntax::object::Dict<'_>>,
@@ -254,7 +255,7 @@ pub(super) fn default_appearance(
         .filter(|t| !t.is_empty())
         .collect();
     let mut family = Family::Sans;
-    let mut size = None;
+    let mut size = Some(12.0);
     let mut color = None;
     for (i, op) in tokens.iter().enumerate() {
         let operands = |n: usize| -> Option<Vec<f32>> {

@@ -549,6 +549,32 @@ fn widgets_show_their_value_or_state() {
     );
 }
 
+/// A default appearance without `Tf` sets text in 12 pt whatever the field's size,
+/// as viewers set it; a size of 0 fits the text to the field.
+#[test]
+fn text_without_a_font_size_is_12_pt() {
+    let tops = |da: &str| {
+        [
+            "/FT /Tx /V (HH)",
+            "/FT /Ch /Ff 131072 /V (HH)",
+            "/FT /Btn /Ff 65536 /MK << /CA (HH) >>",
+        ]
+        .map(|field| {
+            let text = fills(&draw(
+                &[&format!(
+                    "/Subtype /Widget {field} {da} /Rect [20 20 180 80]"
+                )],
+                VIEW,
+            ));
+            // The cap height of H, 0.718 em.
+            text[0].0[3] - text[0].0[1]
+        })
+    };
+    assert_eq!(tops(""), [9; 3]);
+    assert_eq!(tops("/DA (0 g)"), [9; 3]);
+    assert!(tops("/DA (/Helv 0 Tf 0 g)").iter().all(|&h| h > 20));
+}
+
 #[test]
 fn flags_and_existing_appearances_decide_what_is_generated() {
     use AnnotationSelection::{Flatten, Print, View};
