@@ -1,4 +1,5 @@
-//! Page tree entries, read through [`Nodes`], which resolves each object once.
+//! Page tree entries and the objects loading the pages reads, through [`Objects`],
+//! which resolves each object once.
 
 use crate::object::dict::keys::{KIDS, MEDIA_BOX, PAGES, TYPE};
 use crate::object::{Dict, MaybeRef, Name, Object, ObjectIdentifier};
@@ -15,11 +16,7 @@ pub(super) struct Node<'a> {
 
 impl<'a> Node<'a> {
     fn resolved(id: Option<ObjectIdentifier>, object: Option<Object<'a>>) -> Self {
-        let dict = match object {
-            Some(Object::Dict(dict)) => Some(dict),
-            Some(Object::Stream(stream)) => Some(stream.dict().clone()),
-            _ => None,
-        };
+        let dict = object.and_then(dict_of);
         Self {
             id,
             is_dict: dict.is_some(),
@@ -71,22 +68,30 @@ impl<'a> Node<'a> {
     }
 }
 
-/// The page tree entries met so far, by object: the only way from a /Kids entry,
-/// a /Parent or the catalog's /Pages to a [`Node`], so that each object of the
-/// tree is parsed once, however many entries list it or have it as /Parent.
-pub(super) struct Nodes<'a> {
-    ctx: ReaderContext<'a>,
-    nodes: FxHashMap<ObjectIdentifier, Node<'a>>,
-    /// Whether the xref table had been repaired when `nodes` were read.
-    repaired: bool,
+/// The dictionary `object` is, or a stream's, as a reference read as a dictionary
+/// finds it.
+pub(super) fn dict_of(object: Object<'_>) -> Option<Dict<'_>> {
+    match object {
+        Object::Dict(dict) => Some(dict),
+        Object::Stream(stream) => Some(stream.dict().clone()),
+        _ => None,
+    }
 }
 
-impl<'a> Nodes<'a> {
+/// The objects met so far while loading the pages, by identifier: the only way from
+/// a reference loading reads — a /Kids entry, a /Parent, the catalog's /Pages, an
+/// inherited entry, a resource category — to its object, so that each object is
+/// parsed once, however many entries refer to it.
+pub(super) struct Objects<'a> {
+    ctx: ReaderContext<'a>,
+    objects: FxHashMap<ObjectIdentifier, Option<Object<'a>>>,
+}
+
+impl<'a> Objects<'a> {
     pub(super) fn new(ctx: ReaderContext<'a>) -> Self {
         Self {
-            repaired: ctx.xref().is_repaired(),
             ctx,
-            nodes: FxHashMap::default(),
+            objects: FxHashMap::default(),
         }
     }
 
@@ -96,33 +101,36 @@ impl<'a> Nodes<'a> {
         let tree = xref
             .get_with::<Dict<'a>>(xref.root_id(), &self.ctx)?
             .get_raw::<Object<'a>>(PAGES)?;
-        Some(self.get(tree))
+        Some(self.node(tree))
     }
 
     /// The node `entry` is or refers to.
-    pub(super) fn get(&mut self, entry: MaybeRef<Object<'a>>) -> Node<'a> {
-        let id = match entry {
-            MaybeRef::Ref(id) => ObjectIdentifier::from(id),
-            MaybeRef::NotRef(object) => return Node::resolved(None, Some(object)),
+    pub(super) fn node(&mut self, entry: MaybeRef<Object<'a>>) -> Node<'a> {
+        let id = match &entry {
+            MaybeRef::Ref(id) => Some(ObjectIdentifier::from(*id)),
+            MaybeRef::NotRef(_) => None,
         };
-        self.forget_if_repaired();
-        if let Some(node) = self.nodes.get(&id) {
-            return node.clone();
-        }
-        let node = Node::resolved(Some(id), self.ctx.xref().get_with(id, &self.ctx));
-        self.forget_if_repaired();
-        self.nodes.insert(id, node.clone());
-        node
+        Node::resolved(id, self.resolve(entry))
     }
 
-    // A repaired xref table, which an object read may repair, can find other objects
-    // than the table they were read from: those are read again, as each is the first
-    // time it is met. The table is repaired once, so an object is read at most twice.
-    fn forget_if_repaired(&mut self) {
-        let repaired = self.ctx.xref().is_repaired();
-        if repaired != self.repaired {
-            self.repaired = repaired;
-            self.nodes.clear();
+    /// The object `entry` is or refers to; `None` for a reference to nothing.
+    pub(super) fn resolve(&mut self, entry: MaybeRef<Object<'a>>) -> Option<Object<'a>> {
+        match entry {
+            MaybeRef::NotRef(object) => Some(object),
+            MaybeRef::Ref(id) => {
+                let id = ObjectIdentifier::from(id);
+                let ctx = &self.ctx;
+                self.objects
+                    .entry(id)
+                    .or_insert_with(|| ctx.xref().get_with(id, ctx))
+                    .clone()
+            }
         }
+    }
+
+    /// The object `dict` has for `key`; `None` without the key, or for a reference
+    /// to nothing.
+    pub(super) fn get(&mut self, dict: &Dict<'a>, key: &[u8]) -> Option<Object<'a>> {
+        self.resolve(dict.get_raw::<Object<'a>>(key)?)
     }
 }

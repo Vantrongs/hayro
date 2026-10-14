@@ -4,17 +4,12 @@ use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 
 #[derive(Debug, Clone)]
 pub(crate) struct IndirectObject<T> {
-    id: ObjectIdentifier,
     inner: T,
 }
 
 impl<T> IndirectObject<T> {
     pub(crate) fn get(self) -> T {
         self.inner
-    }
-
-    pub(crate) fn id(&self) -> &ObjectIdentifier {
-        &self.id
     }
 }
 
@@ -40,7 +35,7 @@ where
         // We are lenient and don't require it.
         r.forward_tag(b"endobj");
 
-        Some(Self { id, inner })
+        Some(Self { inner })
     }
 }
 

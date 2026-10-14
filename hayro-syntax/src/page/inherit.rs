@@ -1,6 +1,6 @@
 //! The entries a page inherits from the page tree, found as `MuPDF` finds them.
 
-use super::{KidsStates, Node, Nodes, Page};
+use super::{KidsStates, Node, Objects, Page};
 use crate::object::dict::keys::{CROP_BOX, MEDIA_BOX, PARENT, RESOURCES, ROTATE};
 use crate::object::{MaybeRef, Null, Object, ObjectIdentifier};
 use crate::pdf::Pdf;
@@ -70,7 +70,7 @@ impl Inheritable {
 /// entries are repaired, so the lookups for all pages take time linear in the
 /// nodes the chains pass and the pages.
 pub struct Inheritance<'a> {
-    nodes: Nodes<'a>,
+    objects: Objects<'a>,
     repaired: Option<FxHashMap<Key, Node<'a>>>,
     chains: FxHashMap<Key, [Option<Chain<'a>>; 4]>,
 }
@@ -109,13 +109,13 @@ impl<'a> Node<'a> {
 impl<'a> Inheritance<'a> {
     /// No /Parent repaired yet.
     pub fn new(pdf: &'a Pdf) -> Self {
-        Self::with(Nodes::new(ReaderContext::new(pdf.xref(), false)))
+        Self::with(Objects::new(ReaderContext::new(pdf.xref(), false)))
     }
 
-    /// Resolving page tree objects through `nodes`.
-    pub(super) fn with(nodes: Nodes<'a>) -> Self {
+    /// Resolving objects through `objects`.
+    pub(super) fn with(objects: Objects<'a>) -> Self {
         Self {
-            nodes,
+            objects,
             repaired: None,
             chains: FxHashMap::default(),
         }
@@ -143,7 +143,7 @@ impl<'a> Inheritance<'a> {
     ) -> Result<Option<Object<'a>>, InheritanceError> {
         let chain = match self.chain(page, key) {
             Chain::Loop if self.repaired.is_none() => {
-                self.repaired = Some(tree_parents(&mut self.nodes));
+                self.repaired = Some(tree_parents(&mut self.objects));
                 self.chains.clear();
                 self.chain(page, key)
             }
@@ -151,20 +151,14 @@ impl<'a> Inheritance<'a> {
         };
         match chain {
             Chain::Found(value) => Ok(Some(value)),
-            Chain::End(end) => Ok(listings
-                .holder(end, page.key(), lister, key)
-                .map(|holder| self.held(holder, key))),
+            Chain::End(end) => Ok(listings.held(end, page.key(), lister, key).cloned()),
             Chain::Loop | Chain::Followed => Err(InheritanceError::ParentLoop),
         }
     }
 
-    /// The value of `key` for `holder`, which has the entry, kept with the chains, so
-    /// that it is found once however many pages inherit it.
-    fn held(&mut self, holder: &Node<'a>, key: Inheritable) -> Object<'a> {
-        match self.chain(holder, key) {
-            Chain::Found(value) => value,
-            _ => unreachable!("a chain from a node with the entry ends there"),
-        }
+    /// The objects the lookups have resolved.
+    pub(super) fn into_objects(self) -> Objects<'a> {
+        self.objects
     }
 
     /// Whether the page tree's /Parent entries have been repaired.
@@ -190,7 +184,7 @@ impl<'a> Inheritance<'a> {
                 None => {}
             }
             passed.push(at);
-            if let Some(value) = value(&node, key) {
+            if let Some(value) = value(&node, key, &mut self.objects) {
                 break Chain::Found(value);
             }
             let Some(parent) = self.parent(&node) else {
@@ -213,7 +207,7 @@ impl<'a> Inheritance<'a> {
             None => node
                 .dict()
                 .get_raw::<Object<'a>>(PARENT)
-                .map(|parent| self.nodes.get(parent))
+                .map(|parent| self.objects.node(parent))
                 .filter(Node::is_dict),
         }
     }
@@ -228,32 +222,34 @@ pub(super) struct Listings<'a> {
 }
 
 struct Listing<'a> {
-    node: Node<'a>,
     /// The index past the last node this one lists, directly or not.
     end: usize,
-    /// For each of [`Inheritable::ALL`], the index of the nearest of this node and
-    /// the nodes listing it that has the entry.
-    holders: [Option<usize>; 4],
+    /// For each of [`Inheritable::ALL`], the value of the nearest of this node and
+    /// the nodes listing it that has the entry, read once for all the pages that
+    /// inherit it.
+    held: [Option<Object<'a>>; 4],
 }
 
 impl<'a> Listings<'a> {
-    /// Reads `node`, listed under the node at `lister`, and returns its index; `None`
-    /// if it was read before, where it lists nothing again.
-    pub(super) fn read(&mut self, node: &Node<'a>, lister: Option<usize>) -> Option<usize> {
+    /// Reads `node`, listed under the node at `lister`, resolving its entries through
+    /// `objects`, and returns its index; `None` if it was read before, where it lists
+    /// nothing again.
+    pub(super) fn read(
+        &mut self,
+        node: &Node<'a>,
+        lister: Option<usize>,
+        objects: &mut Objects<'a>,
+    ) -> Option<usize> {
         let at = self.nodes.len();
         if self.at.contains_key(&node.key()) {
             return None;
         }
         self.at.insert(node.key(), at);
-        let holders = Inheritable::ALL.map(|key| match node.has(key.name()) {
-            true => Some(at),
-            false => lister.and_then(|lister| self.nodes[lister].holders[key.index()]),
+        let held = Inheritable::ALL.map(|key| match value(node, key, objects) {
+            Some(value) => Some(value),
+            None => lister.and_then(|lister| self.nodes[lister].held[key.index()].clone()),
         });
-        self.nodes.push(Listing {
-            node: node.clone(),
-            end: at + 1,
-            holders,
-        });
+        self.nodes.push(Listing { end: at + 1, held });
         Some(at)
     }
 
@@ -262,16 +258,16 @@ impl<'a> Listings<'a> {
         self.nodes[at].end = self.nodes.len();
     }
 
-    /// The node `page`, listed under the node at `lister`, inherits `key` from
+    /// The value `page`, listed under the node at `lister`, inherits for `key`
     /// through the nodes listing it above `end`, where its /Parent chain ends: all
     /// of them if `end` is the page itself, none if `end` does not list the page.
-    fn holder(
+    fn held(
         &self,
         end: Key,
         page: Key,
         lister: Option<usize>,
         key: Inheritable,
-    ) -> Option<&Node<'a>> {
+    ) -> Option<&Object<'a>> {
         let lister = lister?;
         let from = if end == page {
             lister
@@ -282,16 +278,15 @@ impl<'a> Listings<'a> {
             }
             at
         };
-        let holder = self.nodes[from].holders[key.index()]?;
-        Some(&self.nodes[holder].node)
+        self.nodes[from].held[key.index()].as_ref()
     }
 }
 
 // The value `node` has for `key`, `null` for a reference to nothing.
-fn value<'a>(node: &Node<'a>, key: Inheritable) -> Option<Object<'a>> {
+fn value<'a>(node: &Node<'a>, key: Inheritable, objects: &mut Objects<'a>) -> Option<Object<'a>> {
     node.has(key.name()).then(|| {
-        node.dict()
-            .get::<Object<'a>>(key.name())
+        objects
+            .get(node.dict(), key.name())
             .unwrap_or(Object::Null(Null))
     })
 }
@@ -311,9 +306,9 @@ fn value<'a>(node: &Node<'a>, key: Inheritable) -> Option<Object<'a>> {
 // The nodes listing one /Kids array object share the kids left in it: those that
 // one of them took were met then, so every other would pass over them. Each array
 // is thus read and stored once, however many nodes list it.
-fn tree_parents<'a>(nodes: &mut Nodes<'a>) -> FxHashMap<Key, Node<'a>> {
+fn tree_parents<'a>(objects: &mut Objects<'a>) -> FxHashMap<Key, Node<'a>> {
     let mut parents = FxHashMap::default();
-    let Some(root) = nodes.tree() else {
+    let Some(root) = objects.tree() else {
         return parents;
     };
     // The kids of each /Kids array not taken yet, first first, taken from the end;
@@ -327,7 +322,7 @@ fn tree_parents<'a>(nodes: &mut Nodes<'a>) -> FxHashMap<Key, Node<'a>> {
                     super::kids_read();
                     match kid {
                         MaybeRef::NotRef(Object::Null(_)) => None,
-                        kid => Some(nodes.get(kid)),
+                        kid => Some(objects.node(kid)),
                     }
                 })
                 .collect();

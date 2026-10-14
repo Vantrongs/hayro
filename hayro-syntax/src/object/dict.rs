@@ -242,11 +242,25 @@ fn read_inner<'a>(
         },
     )?;
 
+    #[cfg(test)]
+    PARSED.with(|parsed| {
+        let (entries, bytes) = parsed.get();
+        parsed.set((entries + offsets.len(), bytes + data.len()));
+    });
+
     Some(Dict(Inner::Some(Arc::new(Repr {
         data,
         offsets,
         ctx: ctx.clone(),
     }))))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// The entries and bytes of the dictionaries parsed on this thread, which the
+    /// tests bound to show that a dictionary many objects share is parsed once.
+    pub(crate) static PARSED: core::cell::Cell<(usize, usize)> =
+        const { core::cell::Cell::new((0, 0)) };
 }
 
 pub(crate) struct DictProbe<'a> {

@@ -24,7 +24,7 @@ mod node;
 
 use inherit::Listings;
 pub use inherit::{Inheritable, Inheritance, InheritanceError};
-use node::{Node, Nodes};
+use node::{Node, Objects, dict_of};
 
 /// A structure holding the pages of a PDF document.
 pub struct Pages<'a> {
@@ -41,13 +41,15 @@ impl<'a> Pages<'a> {
     // (`pdf_lookup_page_loc_imp`), so a damaged /Count hides pages or refuses the
     // file. The walk ignores /Count: it hides no page the /Kids hold.
     pub(crate) fn new(ctx: &ReaderContext<'a>, xref: &'a XRef) -> Option<Self> {
-        let mut nodes = Nodes::new(ctx.clone());
-        let tree = nodes.tree().filter(Node::is_dict);
-        let (mut pages, listings) = tree.map(|tree| walk(tree, &mut nodes)).unwrap_or_default();
+        let mut objects = Objects::new(ctx.clone());
+        let tree = objects.tree().filter(Node::is_dict);
+        let (mut pages, listings) = tree
+            .map(|tree| walk(tree, &mut objects))
+            .unwrap_or_default();
         if pages.is_empty() {
             pages = brute_force(xref);
         }
-        let pages = with_inherited(pages, Arc::new(listings), nodes, ctx);
+        let pages = with_inherited(pages, Arc::new(listings), objects, ctx);
 
         Some(Self { pages, xref })
     }
@@ -140,7 +142,7 @@ type Listed<'a> = (Node<'a>, Option<usize>);
 // node listing the array lists the pages read from it and goes on reading where the
 // others stopped. Each array is thus read once, and its pages listed again for each
 // node that lists it, which is the walk's output.
-fn walk<'a>(tree: Node<'a>, nodes: &mut Nodes<'a>) -> (Vec<Listed<'a>>, Listings<'a>) {
+fn walk<'a>(tree: Node<'a>, objects: &mut Objects<'a>) -> (Vec<Listed<'a>>, Listings<'a>) {
     /// A /Kids array: the entries not read yet, and the pages among those read.
     struct Kids<'a> {
         unread: ArrayIter<'a>,
@@ -160,7 +162,7 @@ fn walk<'a>(tree: Node<'a>, nodes: &mut Nodes<'a>) -> (Vec<Listed<'a>>, Listings
     let mut next = Some((tree, None));
     loop {
         if let Some((node, lister)) = next.take()
-            && let Some(at) = listings.read(&node, lister)
+            && let Some(at) = listings.read(&node, lister, objects)
         {
             let array = kids.of(&node, |unread| Kids {
                 unread,
@@ -178,7 +180,7 @@ fn walk<'a>(tree: Node<'a>, nodes: &mut Nodes<'a>) -> (Vec<Listed<'a>>, Listings
         } else if let Some(kid) = array.unread.next() {
             #[cfg(test)]
             kids_read();
-            let kid = nodes.get(kid);
+            let kid = objects.node(kid);
             if kid.is_tree() {
                 next = Some((kid, Some(*at)));
             } else {
@@ -218,13 +220,16 @@ type Inherited<'a> = [Option<Object<'a>>; 4];
 // them once it has loaded every page, which reads these entries: by then a /Parent
 // loop any of the lookups meets has been repaired (see `Inheritance`). An entry
 // that cannot be found, because a /Parent chain loops even so, is not inherited.
+//
+// Pages whose resources are one dictionary, which they share through a node, or
+// which is one object, share its categories, each read once.
 fn with_inherited<'a>(
     entries: Vec<Listed<'a>>,
     listings: Arc<Listings<'a>>,
-    nodes: Nodes<'a>,
+    objects: Objects<'a>,
     ctx: &ReaderContext<'a>,
 ) -> Vec<Page<'a>> {
-    let mut tree = Inheritance::with(nodes);
+    let mut tree = Inheritance::with(objects);
     let look_up = |tree: &mut Inheritance<'a>| -> Vec<Inherited<'a>> {
         entries
             .iter()
@@ -238,12 +243,26 @@ fn with_inherited<'a>(
     if tree.is_repaired() {
         inherited = look_up(&mut tree);
     }
+    let mut objects = tree.into_objects();
+    // By the bytes of the dictionary, which are those of one dictionary of the file.
+    let mut read = FxHashMap::<(usize, usize), Resources<'a>>::default();
     entries
         .into_iter()
         .zip(inherited)
-        .map(|((page, lister), inherited)| {
-            Page::new(page, listings.clone(), lister, inherited, ctx)
-        })
+        .map(
+            |((page, lister), [media_box, crop_box, rotate, resources])| {
+                let resources = resources.and_then(Object::into_dict).unwrap_or_default();
+                let data = resources.data();
+                let resources = read
+                    .entry((data.as_ptr() as usize, data.len()))
+                    .or_insert_with(|| {
+                        Resources::read(|key| objects.get(&resources, key).and_then(dict_of))
+                    })
+                    .clone();
+                let boxes = [media_box, crop_box, rotate];
+                Page::new(page, listings.clone(), lister, boxes, resources, ctx)
+            },
+        )
         .collect()
 }
 
@@ -291,10 +310,10 @@ impl<'a> Page<'a> {
         node: Node<'a>,
         listings: Arc<Listings<'a>>,
         lister: Option<usize>,
-        inherited: Inherited<'a>,
+        [media_box, crop_box, rotate]: [Option<Object<'a>>; 3],
+        resources: Resources<'a>,
         reader_ctx: &ReaderContext<'a>,
     ) -> Self {
-        let [media_box, crop_box, rotate, resources] = inherited;
         let rect = |entry: Option<Object<'a>>| entry.and_then(|e| Rect::try_from(e).ok());
         let media_box = rect(media_box).unwrap_or(A4);
         let crop_box = rect(crop_box).unwrap_or(media_box);
@@ -310,12 +329,6 @@ impl<'a> Page<'a> {
             270 => Rotation::FlippedHorizontal,
             _ => Rotation::None,
         };
-
-        let resources = Resources::new(
-            resources
-                .and_then(Object::into_dict)
-                .unwrap_or_else(Dict::empty),
-        );
 
         Self {
             id: node.id(),
@@ -572,22 +585,20 @@ pub struct Resources<'a> {
 impl<'a> Resources<'a> {
     /// Create a new `Resources` object.
     pub fn new(resources: Dict<'a>) -> Self {
-        let ext_g_states = resources.get::<Dict<'_>>(EXT_G_STATE).unwrap_or_default();
-        let fonts = resources.get::<Dict<'_>>(FONT).unwrap_or_default();
-        let color_spaces = resources.get::<Dict<'_>>(COLORSPACE).unwrap_or_default();
-        let x_objects = resources.get::<Dict<'_>>(XOBJECT).unwrap_or_default();
-        let patterns = resources.get::<Dict<'_>>(PATTERN).unwrap_or_default();
-        let shadings = resources.get::<Dict<'_>>(SHADING).unwrap_or_default();
-        let properties = resources.get::<Dict<'_>>(PROPERTIES).unwrap_or_default();
+        Self::read(|key| resources.get::<Dict<'_>>(key))
+    }
 
+    /// The resources whose category for each key is `category`'s.
+    fn read(mut category: impl FnMut(&[u8]) -> Option<Dict<'a>>) -> Self {
+        let mut category = |key| category(key).unwrap_or_default();
         Self {
-            ext_g_states,
-            fonts,
-            color_spaces,
-            properties,
-            x_objects,
-            patterns,
-            shadings,
+            ext_g_states: category(EXT_G_STATE),
+            fonts: category(FONT),
+            color_spaces: category(COLORSPACE),
+            x_objects: category(XOBJECT),
+            patterns: category(PATTERN),
+            shadings: category(SHADING),
+            properties: category(PROPERTIES),
         }
     }
 
@@ -1302,6 +1313,253 @@ mod tests {
         }
         out.extend(b"trailer\n<< /Root 1 0 R >>\n%%EOF\n");
         out
+    }
+
+    /// The entries and bytes of the dictionaries parsed while `file` loads and an
+    /// [`Inheritance`] of its own looks up every entry of every page, as a reader of
+    /// the pages does, once it is checked that each page has the `fonts` fonts.
+    fn parsed(file: Vec<u8>, fonts: usize) -> (usize, usize) {
+        use crate::object::dict::PARSED;
+        PARSED.set((0, 0));
+        let pdf = Pdf::new(file).unwrap();
+        let mut tree = Inheritance::new(&pdf);
+        for page in pdf.pages().iter() {
+            for key in Inheritable::ALL {
+                let _ = tree.get(page, key);
+            }
+        }
+        let parsed = PARSED.get();
+        for page in pdf.pages().iter() {
+            assert_eq!(page.resources().fonts.len(), fonts);
+        }
+        parsed
+    }
+
+    // Pages that share their resources, through a node or as one object, directly or
+    // through an object of their own, share each category, parsed once: a file with
+    // `n` pages and `n` fonts that every page has is parsed in time linear in it.
+    #[test]
+    fn resources_pages_share_are_parsed_once() {
+        let fonts = |n: usize| {
+            let names: Vec<String> = (0..n).map(|i| format!("/F{i} {i}")).collect();
+            format!("<< {} >>", names.join(" "))
+        };
+        let file = |n: usize, variant: &str| {
+            let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", i + 5)).collect();
+            let (node, own, third, fourth) = match variant {
+                "inherited, direct /Font" => (
+                    "/Resources 3 0 R".to_owned(),
+                    "",
+                    format!("<< /Font {} >>", fonts(n)),
+                    "null".to_owned(),
+                ),
+                "inherited, indirect /Font" => (
+                    "/Resources 3 0 R".to_owned(),
+                    "",
+                    "<< /Font 4 0 R >>".to_owned(),
+                    fonts(n),
+                ),
+                "inherited, written into the node" => (
+                    format!("/Resources << /Font {} >>", fonts(n)),
+                    "",
+                    "null".to_owned(),
+                    "null".to_owned(),
+                ),
+                "own, one object" => (
+                    String::new(),
+                    "/Resources 3 0 R",
+                    format!("<< /Font {} >>", fonts(n)),
+                    "null".to_owned(),
+                ),
+                "own, written into each page, indirect /Font" => (
+                    String::new(),
+                    "/Resources << /Font 4 0 R >>",
+                    "null".to_owned(),
+                    fonts(n),
+                ),
+                _ => unreachable!(),
+            };
+            let tree = format!(
+                "<< /Type /Pages /Count {n} /Kids [{}] {node} >>",
+                kids.join(" ")
+            );
+            let page = format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] {own} >>");
+            let mut objects = vec![CATALOG, &tree, &third, &fourth];
+            objects.extend(core::iter::repeat_n(page.as_str(), n));
+            pdf(&objects)
+        };
+        for variant in [
+            "inherited, direct /Font",
+            "inherited, indirect /Font",
+            "inherited, written into the node",
+            "own, one object",
+            "own, written into each page, indirect /Font",
+        ] {
+            let [small, large] = [256, 512].map(|n| parsed(file(n, variant), n));
+            assert!(
+                large.0 < small.0 * 21 / 10 && large.1 < small.1 * 21 / 10,
+                "{variant}: (entries, bytes) {small:?} for 256 pages, {large:?} for 512"
+            );
+        }
+    }
+
+    // A damaged file whose `n` pages are in one object stream, which the scan that
+    // rebuilds its table reads, uncompressed, past each page: the stream is read
+    // once, and no page is read as a stream, which searches the rest of the file.
+    #[test]
+    fn pages_in_one_object_stream_load_in_linear_time() {
+        let work = |n: usize| {
+            let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", i + 3)).collect();
+            let (mut header, mut data) = (String::new(), String::new());
+            for i in 0..n {
+                header += &format!("{} {} ", i + 3, data.len());
+                data += "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] >>\n";
+            }
+            let stream = format!(
+                "<< /Type /ObjStm /N {n} /First {} /Length {} >>\nstream\n{header}{data}\nendstream",
+                header.len(),
+                header.len() + data.len()
+            );
+            let tree = format!("<< /Type /Pages /Count {n} /Kids [{}] >>", kids.join(" "));
+            let file = recovered(&[(1, 0, CATALOG), (2, 0, &tree), (n as i32 + 3, 0, &stream)]);
+            crate::xref::OBJECT_STREAM_ENTRIES.set(0);
+            crate::object::stream::SEARCHED.set(0);
+            let pdf = Pdf::new(file).unwrap();
+            assert_eq!(pdf.pages().len(), n);
+            assert!(pdf.pages().iter().all(|page| page.media_box().x1 == 200.0));
+            (
+                crate::xref::OBJECT_STREAM_ENTRIES.get(),
+                crate::object::stream::SEARCHED.get(),
+            )
+        };
+        let [small, large] = [500, 1000].map(work);
+        assert!(
+            large.0 < small.0 * 21 / 10 && large.1 < small.1 * 21 / 10 + 100,
+            "(entries, bytes searched) {small:?} for 500 pages, {large:?} for 1000"
+        );
+    }
+
+    /// A file whose body holds `objects` in order, each a number and a body, a number
+    /// possibly twice, and whose table lists each number at its first definition; at
+    /// `objects[at]` for `(number, at)` in `misplaced`; and not at all for a number
+    /// in `unlisted`.
+    fn damaged(objects: &[(i32, &str)], misplaced: &[(i32, usize)], unlisted: &[i32]) -> Vec<u8> {
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut first = std::collections::BTreeMap::new();
+        let mut offsets = vec![];
+        for (number, body) in objects {
+            first.entry(*number).or_insert(out.len());
+            offsets.push(out.len());
+            out.extend(format!("{number} 0 obj\n{body}\nendobj\n").bytes());
+        }
+        let listed = misplaced.iter().map(|(number, _)| number);
+        let size = first.keys().chain(listed).max().unwrap() + 1;
+        let xref = out.len();
+        out.extend(format!("xref\n0 {size}\n0000000000 65535 f \n").bytes());
+        for number in 1..size {
+            let offset = match misplaced.iter().find(|(n, _)| *n == number) {
+                Some((_, at)) => Some(offsets[*at]),
+                None => first.get(&number).copied(),
+            };
+            match offset.filter(|_| !unlisted.contains(&number)) {
+                Some(offset) => out.extend(format!("{offset:010} 00000 n \n").bytes()),
+                None => out.extend(b"0000000000 65535 f \n"),
+            }
+        }
+        out.extend(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").bytes(),
+        );
+        out
+    }
+
+    // A table with an entry that does not lead to its object is rebuilt from the file
+    // before any page is read, so every page reads the rebuilt table, which takes
+    // the later of two definitions: here both pages inherit node 3's second box,
+    // though the entry that is wrong is only met on the second page.
+    #[test]
+    fn a_damaged_table_is_rebuilt_before_any_page_inherits_from_it() {
+        let file = damaged(
+            &[
+                (1, CATALOG),
+                (2, "<< /Type /Pages /Kids [4 0 R 5 0 R] /Count 2 >>"),
+                (3, "<< /Type /Pages /MediaBox [0 0 100 100] >>"),
+                (4, "<< /Type /Page /Parent 3 0 R >>"),
+                (5, "<< /Type /Page /Parent 3 0 R /Rotate 6 0 R >>"),
+                (6, "90"),
+                (3, "<< /Type /Pages /MediaBox [0 0 200 200] >>"),
+            ],
+            &[(6, 4)],
+            &[],
+        );
+        assert_eq!(inherited_in(file), [(vec![], 200.0, 0), (vec![], 200.0, 1)]);
+    }
+
+    // The root's /Resources, which the table does not list, is found in the rebuilt
+    // table by every page that inherits it.
+    #[test]
+    fn an_object_only_the_rebuilt_table_lists_is_inherited_by_every_page() {
+        let file = damaged(
+            &[
+                (1, CATALOG),
+                (
+                    2,
+                    "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /Resources 7 0 R \
+                     /MediaBox [0 0 300 300] >>",
+                ),
+                (3, "<< /Type /Page /Parent 2 0 R >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /Rotate 8 0 R >>"),
+                (7, "<< /XObject << /A 9 0 R >> >>"),
+                (8, "90"),
+            ],
+            &[(8, 2)],
+            &[7],
+        );
+        assert_eq!(
+            inherited_in(file),
+            [(named(&["A"]), 300.0, 0), (named(&["A"]), 300.0, 1)]
+        );
+    }
+
+    // Where the table names one definition of the root and the file ends with
+    // another, the pages are those of the later one, and inherit from it alone.
+    #[test]
+    fn a_root_defined_twice_is_read_from_the_rebuilt_table_alone() {
+        let file = damaged(
+            &[
+                (1, CATALOG),
+                (
+                    2,
+                    "<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 \
+                     /Resources << /XObject << /A 9 0 R >> >> >>",
+                ),
+                (3, "<< /Type /Page /Rotate 4 0 R /Resources << >> >>"),
+                (4, "90"),
+                (5, "<< /Type /Page /Parent 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>"),
+            ],
+            &[(4, 2)],
+            &[],
+        );
+        assert_eq!(inherited_in(file), [(vec![], A4.x1, 1), (vec![], A4.x1, 0)]);
+    }
+
+    // Where an entry leads to an object whose header names another object, which the
+    // table finds at its own offset, the table tells the two apart: the object is
+    // the entry's, and the table is kept, which a rebuilt table, taking the later of
+    // the two as the catalog, would lose.
+    #[test]
+    fn an_object_numbered_as_another_the_table_lists_is_the_entry_s() {
+        let file = damaged(
+            &[
+                (1, CATALOG),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /MediaBox [0 0 300 300] /Rotate 4 0 R >>"),
+                (1, "90"),
+            ],
+            &[(4, 3)],
+            &[],
+        );
+        assert_eq!(inherited_in(file), [(vec![], 300.0, 1)]);
     }
 
     // Where a damaged file holds two generations of an object, the loader keeps

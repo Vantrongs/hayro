@@ -538,7 +538,7 @@ fn parse_proper<'a>(r: &mut Reader<'a>, dict: &Dict<'a>) -> Option<Stream<'a>> {
 }
 
 fn parse_fallback<'a>(r: &mut Reader<'a>, dict: &Dict<'a>) -> Option<Stream<'a>> {
-    let stream_offset = find_needle(r.tail()?, b"stream")?;
+    let stream_offset = searched(r.tail()?, b"stream")?;
     r.read_bytes(stream_offset)?;
     r.forward_tag(b"stream")?;
 
@@ -548,7 +548,7 @@ fn parse_fallback<'a>(r: &mut Reader<'a>, dict: &Dict<'a>) -> Option<Stream<'a>>
         .or_else(|| r.forward_tag(b"\r"))?;
 
     let tail = r.tail()?;
-    let endstream_offset = find_needle(tail, b"endstream")?;
+    let endstream_offset = searched(tail, b"endstream")?;
     let data_end = trim_trailing_ascii_whitespace(&tail[..endstream_offset]);
     let data = tail.get(..data_end)?;
 
@@ -557,6 +557,20 @@ fn parse_fallback<'a>(r: &mut Reader<'a>, dict: &Dict<'a>) -> Option<Stream<'a>>
     r.forward_tag(b"endstream")?;
 
     Some(Stream::new(data, dict.clone()))
+}
+
+fn searched(data: &[u8], needle: &[u8]) -> Option<usize> {
+    let found = find_needle(data, needle);
+    #[cfg(test)]
+    SEARCHED.set(SEARCHED.get() + found.unwrap_or(data.len()));
+    found
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// The bytes searched for the keywords of streams whose /Length is wrong on this
+    /// thread, which the tests bound to show that a file is searched in linear time.
+    pub(crate) static SEARCHED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 fn trim_trailing_ascii_whitespace(data: &[u8]) -> usize {
