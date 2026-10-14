@@ -1894,3 +1894,38 @@ fn a_text_field_draws_a_value_stream() {
         string
     );
 }
+
+/// A square or circle is drawn inside its border width whether the border is drawn
+/// or not, and at least 1 wide and high however narrow its `/Rect`: the content a
+/// common viewer bakes for the same annotations.
+#[test]
+fn a_shape_lies_inside_its_border_width_and_is_never_thinner_than_1() {
+    for c in ["", "/C [0 0 1]"] {
+        let square = |rect: &str, w: &str| {
+            generated(&format!(
+                "/Subtype /Square /Rect {rect} /IC [1 0 0] {c} /BS << /W {w} >>"
+            ))
+        };
+        let op = if c.is_empty() { "f" } else { "b" };
+        for (rect, w, re) in [
+            ("[40 40 160 160]", "6", "43 43 114 114 re"),
+            ("[40 40 160 160]", "1", "40.5 40.5 119 119 re"),
+            ("[40 40 160 160]", "0", "40 40 120 120 re"),
+            ("[40 40 44 160]", "6", "43 43 1 114 re"),
+            ("[44 160 40 40]", "6", "43 43 1 114 re"),
+            ("[40 40 46.9 160]", "6", "43 43 1 114 re"),
+            ("[40 40 40 160]", "0", "40 40 1 120 re"),
+            ("[40 40 160 160]", "200", "140 140 1 1 re"),
+        ] {
+            let content = square(rect, w);
+            assert!(
+                content.contains(&format!("{re}\n{op}")),
+                "{c} {rect} {w}: {content}"
+            );
+        }
+        let circle = generated(&format!(
+            "/Subtype /Circle /Rect [40 40 44 160] /IC [1 0 0] {c} /BS << /W 6 >>"
+        ));
+        assert!(circle.contains("43.5 157 m"), "{c}: {circle}");
+    }
+}

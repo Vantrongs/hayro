@@ -14,7 +14,9 @@ use kurbo::{Point, Rect, Vec2};
 
 /// Square and Circle: /IC fills the shape, /C strokes it at the border width, inside
 /// `/Rect`. Unlike `PDFium`, an absent `/C` means no border: the spec gives it no default.
-/// A border of width 0 is the thinnest line, not none.
+/// A border of width 0 is the thinnest line, not none. As viewers draw it, the shape
+/// lies inside the border width whether a border is drawn or not, and is at least
+/// 1 wide and high, starting where the border ends, however narrow `/Rect` is.
 pub(super) fn shape(annot: &Entries<'_>, circle: bool, out: &mut Out) -> Option<()> {
     let fill = color_of(annot, IC);
     let width = border_width(annot);
@@ -22,19 +24,19 @@ pub(super) fn shape(annot: &Entries<'_>, circle: bool, out: &mut Out) -> Option<
     if fill.is_none() && stroke.is_none() {
         return None;
     }
-    let mut r = rect(annot)?;
     if let Some(stroke) = &stroke {
         out.stroke_color(stroke)?;
         out.stroke_state(width, &dash(annot))?;
-        r = r.inset(-width / 2.0);
-        if r.width() < 0.0 || r.height() < 0.0 {
-            return None;
-        }
     }
+    let r = rect(annot)?;
+    let (x0, y0) = (r.x0 + width / 2.0, r.y0 + width / 2.0);
+    let (x1, y1) = (
+        (r.x1 - width / 2.0).max(x0 + 1.0),
+        (r.y1 - width / 2.0).max(y0 + 1.0),
+    );
     if let Some(fill) = &fill {
         out.fill_color(fill)?;
     }
-    let [x0, y0, x1, y1] = [r.x0, r.y0, r.x1, r.y1];
     if circle {
         // Four cubic quarter arcs; 0.5523 ≈ 4/3·tan(π/8).
         const K: f64 = 0.5523;
