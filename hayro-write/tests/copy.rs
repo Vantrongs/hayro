@@ -252,3 +252,48 @@ fn a_page_whose_content_cannot_be_read_is_an_error() {
         );
     }
 }
+
+/// A file of `n` pages that inherit resources with `n` fonts, each in its own form.
+fn copied_with_shared_fonts(n: usize) -> (Pdf, ExtractionResult) {
+    let names: Vec<String> = (0..n).map(|i| format!("/F{i} {i}")).collect();
+    let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", i + 3)).collect();
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!(
+            "<< /Type /Pages /Count {n} /Kids [{}] /Resources << /Font << {} >> >> >>",
+            kids.join(" "),
+            names.join(" ")
+        )
+        .into_bytes(),
+    ];
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>".to_vec();
+    objects.extend(std::iter::repeat_n(page, n));
+    let source = Pdf::new(fixtures::file(&objects, "")).unwrap();
+    let queries: Vec<_> = (0..n)
+        .map(|page| ExtractionQuery::new_user_space_xobject(page, [0.0, 0.0, 200.0, 200.0]))
+        .collect();
+    let result = run(&source, &queries).unwrap();
+    (reread(&result), result)
+}
+
+// Forms of pages that share their resources share one copy of them: copying `n`
+// pages that share `n` fonts writes a file linear in `n`, and each form has them all.
+#[test]
+fn resources_pages_share_are_copied_once() {
+    let [small, large] = [256, 512].map(|n| {
+        let (copy, result) = copied_with_shared_fonts(n);
+        for root in &result.root_refs {
+            let fonts = get(&copy, root.unwrap())
+                .dict()
+                .get::<Dict<'_>>(b"Resources")
+                .and_then(|resources| resources.get::<Dict<'_>>(b"Font"))
+                .unwrap();
+            assert_eq!(fonts.len(), n);
+        }
+        result.chunk.len()
+    });
+    assert!(
+        large < small * 21 / 10,
+        "{small} bytes for 256 pages, {large} for 512"
+    );
+}

@@ -206,6 +206,9 @@ struct ExtractionContext<'a> {
     /// The copies of streams form queries asked for, by the stream and, for one
     /// that takes its page's resources, the page.
     forms: FxHashMap<(ObjRef, Option<usize>), Ref>,
+    /// The copy of each set of resources pages and forms are drawn with, by the
+    /// bytes of its categories, which pages that share their resources share.
+    resources: FxHashMap<[(usize, usize); 7], Ref>,
     /// The first part of the source that could not be read whole.
     error: Option<ExtractionError>,
     root_refs: Vec<Result<Ref, ExtractionError>>,
@@ -231,6 +234,7 @@ impl<'a> ExtractionContext<'a> {
             ref_targets: FxHashMap::default(),
             shared_streams: FxHashMap::default(),
             forms: FxHashMap::default(),
+            resources: FxHashMap::default(),
             error: None,
             pdf,
             new_ref,
@@ -538,34 +542,49 @@ fn write_form(
     Ok(form_ref)
 }
 
+/// Writes `/Resources` into `writer` as a reference to the copy of `resources`,
+/// written once however many pages and forms are drawn with them.
 fn serialize_resources(
     resources: &Resources<'_>,
     ctx: &mut ExtractionContext<'_>,
-    writer: &mut impl ResourcesExt,
+    writer: &mut pdf_writer::Dict<'_>,
 ) {
-    // Resource dictionary is always required (unless it can be inherited), so
-    // let's just be safe and always write it.
-    let mut output = writer.resources();
-
-    macro_rules! write {
-        ($name:ident, $key:expr) => {
-            if !resources.$name.is_empty() {
-                let mut dict = output.insert(Name($key)).dict();
-
-                for (name, obj) in resources.$name.entries() {
-                    obj.write_direct(dict.insert(Name(name.deref())), ctx);
+    let categories = [
+        (&resources.ext_g_states, EXT_G_STATE),
+        (&resources.shadings, SHADING),
+        (&resources.patterns, PATTERN),
+        (&resources.x_objects, XOBJECT),
+        (&resources.color_spaces, COLORSPACE),
+        (&resources.fonts, FONT),
+        (&resources.properties, PROPERTIES),
+    ];
+    let key = categories.map(|(category, _)| {
+        let data = category.data();
+        (data.as_ptr() as usize, data.len())
+    });
+    let copy = match ctx.resources.get(&key) {
+        Some(copy) => *copy,
+        None => {
+            let copy = ctx.new_ref();
+            ctx.resources.insert(key, copy);
+            let mut chunk = Chunk::with_settings(ctx.chunk_settings);
+            // Resource dictionary is always required (unless it can be inherited), so
+            // let's just be safe and always write it.
+            let mut output = chunk.indirect(copy).dict();
+            for (category, name) in categories {
+                if !category.is_empty() {
+                    let mut dict = output.insert(Name(name)).dict();
+                    for (name, obj) in category.entries() {
+                        obj.write_direct(dict.insert(Name(name.deref())), ctx);
+                    }
                 }
             }
-        };
-    }
-
-    write!(ext_g_states, EXT_G_STATE);
-    write!(shadings, SHADING);
-    write!(patterns, PATTERN);
-    write!(x_objects, XOBJECT);
-    write!(color_spaces, COLORSPACE);
-    write!(fonts, FONT);
-    write!(properties, PROPERTIES);
+            output.finish();
+            ctx.chunks.push(chunk);
+            copy
+        }
+    };
+    writer.pair(Name(RESOURCES), copy);
 }
 
 /// `data` compressed for a `FlateDecode` stream.
@@ -588,20 +607,4 @@ fn convert_rect(hy_rect: &hayro_syntax::object::Rect) -> Rect {
         hy_rect.x1 as f32,
         hy_rect.y1 as f32,
     )
-}
-
-trait ResourcesExt {
-    fn resources(&mut self) -> pdf_writer::writers::Resources<'_>;
-}
-
-impl ResourcesExt for pdf_writer::writers::Page<'_> {
-    fn resources(&mut self) -> pdf_writer::writers::Resources<'_> {
-        Self::resources(self)
-    }
-}
-
-impl ResourcesExt for pdf_writer::writers::FormXObject<'_> {
-    fn resources(&mut self) -> pdf_writer::writers::Resources<'_> {
-        Self::resources(self)
-    }
 }
