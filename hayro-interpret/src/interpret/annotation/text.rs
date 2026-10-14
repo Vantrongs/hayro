@@ -6,6 +6,8 @@ use super::out::{Color, Out};
 use crate::FontResolverFn;
 use crate::font::blob::{CffFontBlob, OpenTypeFontBlob};
 use crate::font::{FontQuery, StandardFont, glyph_name_to_unicode};
+use hayro_syntax::content::TypedIter;
+use hayro_syntax::content::ops::{TextFont, TypedInstruction};
 use kurbo::{Affine, BezPath, Rect};
 use rustc_hash::FxHashMap;
 use skrifa::GlyphId;
@@ -371,41 +373,25 @@ pub(super) enum Align {
 /// (fit to the field) is `None`; without `Tf` the size is 12 pt, as common viewers
 /// set it.
 pub(super) fn default_appearance(da: &[u8]) -> (Family, Option<f32>, Option<Color>) {
-    let tokens: Vec<&[u8]> = da
-        .split(|b| b.is_ascii_whitespace())
-        .filter(|t| !t.is_empty())
-        .collect();
     let mut family = Family::Sans;
     let mut size = Some(12.0);
     let mut color = None;
-    for (i, op) in tokens.iter().enumerate() {
-        // Numbers as PDF writes them (7.3.3), however large: one too large to draw
-        // fails the appearance where it is drawn.
-        let operands = |n: usize| -> Option<Vec<f64>> {
-            let from = i.checked_sub(n)?;
-            tokens[from..i]
-                .iter()
-                .map(|t| {
-                    let number = t.iter().all(|b| b.is_ascii_digit() || b"+-.".contains(b));
-                    number.then(|| std::str::from_utf8(t).ok()?.parse::<f64>().ok())?
-                })
-                .collect::<Option<Vec<f64>>>()
-        };
-        match *op {
-            b"Tf" if i >= 2 => {
-                family =
-                    Family::of_font_name(tokens[i - 2].strip_prefix(b"/").unwrap_or(tokens[i - 2]));
-                size = operands(1).map(|s| s[0] as f32).filter(|s| *s > 0.0);
+    // Read as content is: an operator whose operands are not what it takes is
+    // ignored. Numbers are taken however large: one too large to draw fails the
+    // appearance where it is drawn.
+    let mut ops = TypedIter::new(da);
+    while let Some(op) = ops.next() {
+        match op {
+            TypedInstruction::TextFont(TextFont(name, s)) => {
+                family = Family::of_font_name(name.as_ref());
+                size = Some(s.as_f64() as f32).filter(|s| *s > 0.0);
             }
-            b"g" | b"rg" | b"k" => {
-                let n = match *op {
-                    b"g" => 1,
-                    b"rg" => 3,
-                    _ => 4,
-                };
-                if let Some(c) = operands(n) {
-                    color = Color::of(&c);
-                }
+            TypedInstruction::NonStrokeColorDeviceGray(c) => color = Color::of(&[c.0.as_f64()]),
+            TypedInstruction::NonStrokeColorDeviceRgb(c) => {
+                color = Color::of(&[c.0, c.1, c.2].map(|n| n.as_f64()));
+            }
+            TypedInstruction::NonStrokeColorCmyk(c) => {
+                color = Color::of(&[c.0, c.1, c.2, c.3].map(|n| n.as_f64()));
             }
             _ => {}
         }

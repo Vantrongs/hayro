@@ -1806,6 +1806,28 @@ fn a_damaged_annots_entry_hides_none_after_it() {
     }
 }
 
+/// A comment in a default appearance string is white space, as in content: the
+/// size and colour around it are kept.
+#[test]
+fn a_comment_in_a_default_appearance_is_white_space() {
+    let free_text = |da: &str| {
+        generated(&format!(
+            "/Subtype /FreeText /Rect [10 10 190 190] /BS << /W 0 >> /Contents (IMPORTANT) /DA ({da})"
+        ))
+    };
+    let plain = free_text("/Helv 20 Tf 1 0 0 rg");
+    for da in [
+        "/Helv 20%comment\\nTf 1 0 0 rg",
+        "/Helv%comment\\n20 Tf 1 0 0 rg",
+        "/Helv 20 Tf %comment\\n1 0 0 rg",
+        "/Helv 20 Tf 1 0 0%comment\\nrg",
+        "%comment\\n/Helv 20 Tf 1 0 0 rg",
+    ] {
+        assert_eq!(free_text(da), plain, "{da}");
+    }
+    assert_ne!(free_text("/Helv 12 Tf 1 0 0 rg"), plain);
+}
+
 /// Field flags (`/Ff`) are read as `/F` is, as viewers read damaged ones: an integer
 /// to its low 32 bits; a real rounded half up, to its low 32 bits when that is 2^32
 /// or more away from 0, and to bit 31 alone between 2^31 and 2^32. A push button
