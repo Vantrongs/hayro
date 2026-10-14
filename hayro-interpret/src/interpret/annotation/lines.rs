@@ -174,7 +174,11 @@ fn points(annot: &Dict<'_>, key: &[u8]) -> Vec<Point> {
     let Some(arr) = annot.get::<Array<'_>>(key) else {
         return Vec::new();
     };
-    let n: Vec<f64> = arr.iter::<f64>().collect();
+    let mut n = super::numbers(&arr);
+    // A line has two points: coordinates it lacks are 0.
+    if key == b"L" && !n.is_empty() {
+        n.resize(4, 0.0);
+    }
     n.as_chunks::<2>()
         .0
         .iter()

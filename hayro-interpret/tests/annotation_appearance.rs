@@ -121,7 +121,7 @@ fn highlight_fills_quads_in_one_multiply_group_at_ca() {
                 blend: BlendMode::Multiply
             },
             Ev::Fill {
-                bbox: [10, 12, 90, 40],
+                bbox: [8, 12, 92, 40],
                 rgba: YELLOW
             },
             Ev::EndGroup,
@@ -129,38 +129,30 @@ fn highlight_fills_quads_in_one_multiply_group_at_ca() {
     );
 }
 
+/// Lines a sixteenth of the quad's height wide: an underline a seventh of it above
+/// the bottom, a strikeout three sevenths, a zigzag a seventh high.
 #[test]
-fn text_lines_follow_pdfium_geometry() {
-    let quad = "/Rect [10 10 50 20] /QuadPoints [10 20 50 20 10 10 50 10]";
-    let under = draw(&[&format!("/Subtype /Underline {quad}")], VIEW);
-    assert_eq!(
-        under,
+fn text_lines_scale_with_the_quad() {
+    let quad = "/Rect [10 10 50 24] /QuadPoints [10 24 50 24 10 10 50 10]";
+    let line = |bbox, rgba| {
         vec![Ev::Stroke {
-            bbox: [10, 11, 50, 11],
-            rgba: BLACK,
-            width: 1.0,
-            dashed: false
+            bbox,
+            rgba,
+            width: 0.875,
+            dashed: false,
         }]
+    };
+    assert_eq!(
+        draw(&[&format!("/Subtype /Underline {quad}")], VIEW),
+        line([10, 12, 50, 12], BLACK)
     );
-    let strike = draw(&[&format!("/Subtype /StrikeOut /C [1 0 0] {quad}")], VIEW);
     assert_eq!(
-        strike,
-        vec![Ev::Stroke {
-            bbox: [10, 15, 50, 15],
-            rgba: RED,
-            width: 1.0,
-            dashed: false
-        }]
+        draw(&[&format!("/Subtype /StrikeOut /C [1 0 0] {quad}")], VIEW),
+        line([10, 16, 50, 16], RED)
     );
-    let squiggle = draw(&[&format!("/Subtype /Squiggly {quad}")], VIEW);
     assert_eq!(
-        squiggle,
-        vec![Ev::Stroke {
-            bbox: [10, 10, 50, 12],
-            rgba: BLACK,
-            width: 1.0,
-            dashed: false
-        }]
+        draw(&[&format!("/Subtype /Squiggly {quad}")], VIEW),
+        line([10, 10, 50, 12], BLACK)
     );
 }
 
@@ -176,9 +168,9 @@ fn a_huge_squiggly_is_drawn_across_the_page() {
     assert_eq!(
         ev,
         vec![Ev::Stroke {
-            bbox: [10, 10, 202, 12],
+            bbox: [10, 10, 201, 11],
             rgba: BLACK,
-            width: 1.0,
+            width: 0.625,
             dashed: false
         }]
     );
@@ -208,6 +200,23 @@ fn ink_strokes_each_path_at_border_width_with_dash() {
                 dashed: true
             },
         ]
+    );
+}
+
+/// An ink path of one point is a dot: a stroke of no length with round ends.
+#[test]
+fn an_ink_point_is_a_dot() {
+    assert_eq!(
+        draw(
+            &["/Subtype /Ink /C [0] /BS << /W 4 >> /Rect [0 0 200 200] /InkList [[100 100]]"],
+            VIEW
+        ),
+        vec![Ev::Stroke {
+            bbox: [100, 100, 100, 100],
+            rgba: BLACK,
+            width: 4.0,
+            dashed: false
+        }]
     );
 }
 
@@ -435,6 +444,23 @@ fn lines_and_polygons_draw_their_points_and_endings() {
             dashed: false
         }
     );
+    // Coordinates a damaged /L lacks, or has as something else, are 0.
+    for l in ["[20 150 180]", "[20 150 180 (x)]"] {
+        let ev = draw(
+            &[&format!("/Subtype /Line /L {l} /C [0] /Rect [0 0 200 200]")],
+            VIEW,
+        );
+        assert_eq!(
+            ev,
+            vec![Ev::Stroke {
+                bbox: [20, 0, 180, 150],
+                rgba: BLACK,
+                width: 1.0,
+                dashed: false
+            }],
+            "{l}"
+        );
+    }
     // The arrow, filled with /IC.
     let arrow = fills(&ev);
     assert_eq!(arrow.len(), 1, "{ev:?}");
@@ -713,9 +739,10 @@ fn subtypes_that_draw_without_an_appearance() {
     assert_eq!(
         looks(&pdf),
         [
+            // A stamp of another name shows it; without one, Draft.
             "generated",
-            "nothing",
-            "nothing",
+            "generated",
+            "generated",
             "nothing",
             "nothing",
             "nothing",
@@ -762,5 +789,10 @@ fn a_generated_appearance_has_its_opacity_and_blend() {
         (highlight.opacity, highlight.blend),
         (0.5, BlendMode::Multiply)
     );
-    assert_eq!(highlight.content, "1 1 0 rg\n10 30 80 10 re\nf\n");
+    // The sides bulge out √2/6 of the height.
+    assert_eq!(
+        highlight.content,
+        "1 1 0 rg\n10 30 m\n7.6429777 32.35702 7.6429777 37.64298 10 40 c\n90 40 l\n\
+         92.357025 37.64298 92.357025 32.35702 90 30 c\nh\nf\n"
+    );
 }

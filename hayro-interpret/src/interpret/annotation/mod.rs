@@ -352,6 +352,17 @@ impl Out {
     }
 }
 
+/// The entries of a coordinate array, an entry that is not a number read as 0, as
+/// viewers read a damaged array, so a later coordinate keeps its place.
+fn numbers(arr: &Array<'_>) -> Vec<f64> {
+    arr.iter::<Object<'_>>()
+        .map(|o| match o {
+            Object::Number(n) => n.as_f64(),
+            _ => 0.0,
+        })
+        .collect()
+}
+
 /// `v` to a thousandth, without the trailing zeros.
 fn round(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0 + 0.0

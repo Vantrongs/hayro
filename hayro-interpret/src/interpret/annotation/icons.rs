@@ -1,6 +1,6 @@
 //! Annotations drawn as a symbol: `Text` (a note), `FileAttachment` and `Sound` as
 //! an icon of their `/Name` (PDF 32000-1 12.5.6.4, 12.5.6.15, 12.5.6.16), `Caret`
-//! (12.5.6.11), `Stamp` as its standard text (12.5.6.12, Table 181) and `Redact`
+//! (12.5.6.11), `Stamp` as the text of its name (12.5.6.12, Table 181) and `Redact`
 //! (12.5.6.23) as the outline of the area it marks.
 //!
 //! The spec leaves their look to the viewer. These follow what common viewers draw
@@ -313,14 +313,20 @@ fn stamp_text(name: &[u8]) -> Option<(&'static [&'static str], f32)> {
     })
 }
 
-/// `Stamp` of a standard name: its text in /C (black without it) in a box of the
-/// same colour; another name draws nothing.
+/// `Stamp`: the text of its `/Name` (`Draft` without one, Table 181), a standard
+/// name in its own words and size, another name as it is, in 20 pt; in /C (black
+/// without it) in a box of the same colour, clipped to `/Rect`.
 pub(super) fn stamp(annot: &Dict<'_>, fonts: &Fonts, out: &mut Out) -> Drawn {
-    let name = annot.get::<Name<'_>>(b"Name");
-    let (Some((lines, size)), Some(r)) = (
-        name.as_ref().and_then(|n| stamp_text(n.as_ref())),
-        rect(annot),
-    ) else {
+    let name = annot
+        .get::<Name<'_>>(b"Name")
+        .map_or_else(|| b"Draft".to_vec(), |n| n.as_ref().to_vec());
+    let custom = [String::from_utf8_lossy(&name).into_owned()];
+    let custom: Vec<&str> = custom.iter().map(String::as_str).collect();
+    let (lines, size): (&[&str], f32) = match stamp_text(&name) {
+        Some((lines, size)) => (lines, size),
+        None => (&custom, 20.0),
+    };
+    let Some(r) = rect(annot) else {
         return Ok(None);
     };
     let Some(fill) = c_color(annot, false, "0 g") else {
@@ -334,6 +340,17 @@ pub(super) fn stamp(annot: &Dict<'_>, fonts: &Fonts, out: &mut Out) -> Drawn {
     let at = Affine::translate(r.center().to_vec2())
         * Affine::rotate(0.6_f64.to_radians())
         * Affine::scale(scale);
+    out.op("q");
+    fail(out.nums(
+        &[
+            r.x0 as f32,
+            r.y0 as f32,
+            r.width() as f32,
+            r.height() as f32,
+        ],
+        "re",
+    ))?;
+    out.op("W n");
     out.op(&stroke);
     fail(out.stroke_state((2.0 * scale) as f32, &[]))?;
     let corners = [(-93.0, -22.0), (93.0, -22.0), (93.0, 22.0), (-93.0, 22.0)]
@@ -356,5 +373,6 @@ pub(super) fn stamp(annot: &Dict<'_>, fonts: &Fonts, out: &mut Out) -> Drawn {
         let x = -text::width(&glyphs, size) / 2.0;
         fail(text::draw(&glyphs, size, (x, *y), at, out))?;
     }
+    out.op("Q");
     Ok(Some(()))
 }

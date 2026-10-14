@@ -253,8 +253,12 @@ pub(super) fn widget(
         }
         _ if comb && max_len.is_some_and(|n| n > 0) => {
             let cells = max_len.unwrap_or(1) as f32;
-            let size = size.unwrap_or(12.0);
             let glyphs = fonts.shape(family, &value)?;
+            // Automatic: the field's height, or less for the text to fit across.
+            let size = size.unwrap_or_else(|| {
+                let em = text::width(&glyphs, 1.0);
+                if em > 0.0 { fh.min(fw / em) } else { fh }
+            });
             let cell = fw / cells;
             for (i, g) in glyphs.iter().take(cells as usize).enumerate() {
                 let x = cell * i as f32 + (cell - g.advance * size) / 2.0;

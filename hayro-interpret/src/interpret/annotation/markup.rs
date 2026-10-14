@@ -1,6 +1,8 @@
-//! The appearances `PDFium` generates for markup annotations drawn from geometry
-//! alone (`core/fpdfdoc/cpdf_generateap.cpp`, BSD-3-Clause), with their geometry and
-//! defaults.
+//! Markup annotations drawn from geometry alone. Square, Circle and Ink follow the
+//! appearances `PDFium` generates (`core/fpdfdoc/cpdf_generateap.cpp`,
+//! BSD-3-Clause), with their geometry and defaults. The text markup shapes
+//! (`Highlight`, `Underline`, `StrikeOut`, `Squiggly`) are sized from each quadrilateral's
+//! height so that they cover what common viewers draw.
 
 use super::{Out, border_width, c_color, color, dash, rect};
 use hayro_syntax::object::dict::keys::{C, IC, INKLIST, QUADPOINTS};
@@ -56,7 +58,9 @@ pub(super) fn quads(annot: &Dict<'_>) -> Vec<[f32; 4]> {
     let Some(arr) = annot.get::<Array<'_>>(QUADPOINTS) else {
         return Vec::new();
     };
-    let n: Vec<f32> = arr.iter::<f32>().collect();
+    let mut n: Vec<f32> = super::numbers(&arr).into_iter().map(|v| v as f32).collect();
+    // A last quadrilateral cut short has 0 for the coordinates it lacks.
+    n.resize(n.len().next_multiple_of(8), 0.0);
     n.as_chunks::<8>()
         .0
         .iter()
@@ -71,7 +75,8 @@ pub(super) fn quads(annot: &Dict<'_>) -> Vec<[f32; 4]> {
         .collect()
 }
 
-/// Highlight: each quad filled with /C (default yellow), blended with Multiply.
+/// Highlight: each quad filled with /C (default yellow), blended with Multiply, its
+/// left and right sides bulging out by a quarter of its height.
 pub(super) fn highlight(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
     let fill = c_color(annot, false, "1 1 0 rg")?;
     let quads = quads(annot);
@@ -80,7 +85,13 @@ pub(super) fn highlight(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
     }
     out.op(&fill);
     for [x0, y0, x1, y1] in quads {
-        out.nums(&[x0, y0, x1 - x0, y1 - y0], "re")?;
+        // The control points of a half circle's span, √2/6 of the height out.
+        let k = (y1 - y0) * std::f32::consts::SQRT_2 / 6.0;
+        out.nums(&[x0, y0], "m")?;
+        out.nums(&[x0 - k, y0 + k, x0 - k, y1 - k, x0, y1], "c")?;
+        out.nums(&[x1, y1], "l")?;
+        out.nums(&[x1 + k, y1 - k, x1 + k, y0 + k, x1, y0], "c")?;
+        out.op("h");
     }
     out.op("f");
     Some(())
@@ -92,8 +103,9 @@ pub(super) enum Line {
     Squiggle,
 }
 
-/// `Underline`, `StrikeOut` and `Squiggly`: a 1 pt line per quad in /C (default black): one
-/// unit above the bottom, through the middle, or a zigzag 2 pt high and 2 pt per step.
+/// `Underline`, `StrikeOut` and `Squiggly`: per quad, a line in /C (default black)
+/// a sixteenth of the quad's height `h` wide: `h`/7 above the bottom, 3`h`/7 above
+/// it, or a zigzag from the bottom up to `h`/7, one step per `h`/7.
 pub(super) fn text_lines(
     annot: &Dict<'_>,
     line: Line,
@@ -106,50 +118,59 @@ pub(super) fn text_lines(
         return None;
     }
     out.op(&stroke);
-    out.stroke_state(1.0, &[])?;
     for [x0, y0, x1, y1] in quads {
+        let h = y1 - y0;
+        out.stroke_state(h / 16.0, &[])?;
         match line {
-            Line::Under => {
-                out.nums(&[x0, y0 + 1.0], "m")?;
-                out.nums(&[x1, y0 + 1.0], "l")?;
-            }
-            Line::Through => {
-                let y = (y0 + y1) / 2.0;
+            Line::Under | Line::Through => {
+                let y = y0
+                    + h * if matches!(line, Line::Under) {
+                        1.0
+                    } else {
+                        3.0
+                    } / 7.0;
                 out.nums(&[x0, y], "m")?;
                 out.nums(&[x1, y], "l")?;
             }
-            Line::Squiggle => squiggle(x0, x1, y0, visible, out)?,
+            Line::Squiggle => squiggle(x0, x1, y0, f64::from(h) / 7.0, visible, out)?,
         }
         out.op("S");
     }
     Some(())
 }
 
-/// The zigzag's height and the length of one step.
-const DELTA: f64 = 2.0;
-
-/// The zigzag of a `Squiggly` quad from `x0` to `x1` above `y`: 2 pt high, one step per
-/// 2 pt from `x0` as in `PDFium`. Only its steps across `visible` and one beyond each
-/// side are drawn: the page clips the rest, and the ends cut there, with their caps
-/// and joins, lie outside it.
-fn squiggle(x0: f32, x1: f32, y: f32, visible: kurbo::Rect, out: &mut Out) -> Option<()> {
-    let (bottom, top) = (y, y + DELTA as f32);
-    if f64::from(top) + DELTA < visible.y0 || f64::from(bottom) - DELTA > visible.y1 {
+/// The zigzag of a `Squiggly` quad from `x0` to `x1` above `y`: `delta` high, one
+/// step per `delta` from `x0`, starting at the bottom. Only its steps across
+/// `visible` and one beyond each side are drawn: the page clips the rest, and the
+/// ends cut there, with their caps and joins, lie outside it.
+fn squiggle(
+    x0: f32,
+    x1: f32,
+    y: f32,
+    delta: f64,
+    visible: kurbo::Rect,
+    out: &mut Out,
+) -> Option<()> {
+    if delta <= 0.0 || !delta.is_finite() {
+        return Some(());
+    }
+    let (bottom, top) = (y, y + delta as f32);
+    if f64::from(top) + delta < visible.y0 || f64::from(bottom) - delta > visible.y1 {
         return Some(());
     }
     let (x0, x1) = (f64::from(x0), f64::from(x1));
-    // The corners lie at `x0 + 2 i`, a peak for even `i`: at `r + 2 k` for
-    // `r = x0 % 4`, a peak for even `k`. Corners near the visible range are so
-    // computed from small numbers however far `x0` lies, and in f64: in f32,
-    // `x += 2` stops advancing at 2^25.
-    let r = x0 % (2.0 * DELTA);
-    let corner = |k: f64| (r + k * DELTA) as f32;
-    let level = |k: f64| if k % 2.0 == 0.0 { top } else { bottom };
-    let first = (x0 - r) / DELTA;
+    // The corners lie at `x0 + delta i`, a trough for even `i`: at `r + delta k`
+    // for `r = x0 % (2 delta)`, a trough for even `k`. Corners near the visible
+    // range are so computed from small numbers however far `x0` lies, and in f64:
+    // in f32, `x += 2` stops advancing at 2^25.
+    let r = x0 % (2.0 * delta);
+    let corner = |k: f64| (r + k * delta) as f32;
+    let level = |k: f64| if k % 2.0 == 0.0 { bottom } else { top };
+    let first = ((x0 - r) / delta).round();
     // The last corner before `x1`, where the last, possibly partial, step starts.
-    let last = (((x1 - r) / DELTA).ceil() - 1.0).max(first);
-    let from = first.max(((visible.x0 - r) / DELTA).floor() - 1.0);
-    let beyond = ((visible.x1 - r) / DELTA).ceil() + 1.0;
+    let last = (((x1 - r) / delta).ceil() - 1.0).max(first);
+    let from = first.max(((visible.x0 - r) / delta).floor() - 1.0);
+    let beyond = ((visible.x1 - r) / delta).ceil() + 1.0;
     let to = beyond.min(last);
     let ends = beyond > last;
     if from > to || (from == to && !ends) {
@@ -164,17 +185,17 @@ fn squiggle(x0: f32, x1: f32, y: f32, visible: kurbo::Rect, out: &mut Out) -> Op
         return Some(());
     }
     // The last step keeps the slope.
-    let rise = (x1 - (r + last * DELTA)) as f32;
+    let rise = (x1 - (r + last * delta)) as f32;
     let y1 = if last % 2.0 == 0.0 {
-        top - rise
-    } else {
         bottom + rise
+    } else {
+        top - rise
     };
     out.nums(&[x1 as f32, y1], "l")
 }
 
 /// `Ink`: each `/InkList` path stroked as a polyline in /C at the border width, with
-/// the border dash. Unlike `PDFium`, an absent `/C` draws nothing: the spec gives it no
+/// the border dash, round ends and joins; a path of one point is a dot. Unlike `PDFium`, an absent `/C` draws nothing: the spec gives it no
 /// default.
 pub(super) fn ink(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
     let width = border_width(annot);
@@ -182,14 +203,21 @@ pub(super) fn ink(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
     let list = annot.get::<Array<'_>>(INKLIST)?;
     out.op(&stroke);
     out.stroke_state(width, &dash(annot))?;
+    // Round ends and corners, as a pen draws.
+    out.op("1 J 1 j");
     let mut drew = false;
     for path in list.iter::<Array<'_>>() {
-        let p: Vec<f32> = path.iter::<f32>().collect();
+        let p: Vec<f32> = super::numbers(&path)
+            .into_iter()
+            .map(|v| v as f32)
+            .collect();
         if p.len() < 2 || !p.iter().all(|v| v.is_finite()) {
             continue;
         }
         out.nums(&p[..2], "m")?;
-        for pt in p[2..].as_chunks::<2>().0 {
+        // A path of one point is a dot.
+        let rest = if p.len() < 4 { &p[..2] } else { &p[2..] };
+        for pt in rest.as_chunks::<2>().0 {
             out.nums(pt, "l")?;
         }
         out.op("S");
@@ -223,10 +251,11 @@ mod tests {
     }
 
     #[test]
-    fn squiggly_follows_pdfium_steps() {
-        let c = squiggly("10 20 15 20 10 10 15 10", PAGE);
+    fn squiggly_steps_a_seventh_of_the_height() {
+        // 14 pt high: steps of 2 pt.
+        let c = squiggly("10 24 15 24 10 10 15 10", PAGE);
         assert!(
-            c.ends_with("10 12 m\n12 10 l\n14 12 l\n15 11 l\nS\n"),
+            c.ends_with("10 10 m\n12 12 l\n14 10 l\n15 11 l\nS\n"),
             "{c}"
         );
     }
@@ -234,7 +263,7 @@ mod tests {
     #[test]
     fn squiggly_ends_at_large_coordinates() {
         // In f32, 2^25 + 2 == 2^25: positions accumulated in f32 never reach x1.
-        let c = squiggly("33554432 20 33554440 20 33554432 10 33554440 10", PAGE);
+        let c = squiggly("33554432 24 33554440 24 33554432 10 33554440 10", PAGE);
         assert_eq!(c.matches(" l\n").count(), 4, "{c}");
         assert!(c.ends_with(" l\nS\n"), "{c}");
     }
@@ -254,7 +283,7 @@ mod tests {
     #[test]
     fn a_zigzag_does_not_depend_on_the_other_quads() {
         let page = Rect::new(0.0, 0.0, 2100.0, 2100.0);
-        let quad = "1 20 2049 20 1 10 2049 10 ";
+        let quad = "1 24 2049 24 1 10 2049 10 ";
         let alone = squiggly(quad, page);
         let alone = zigzags(&alone)[0];
         assert_eq!(alone.matches(" l\n").count(), 1024);
@@ -272,7 +301,7 @@ mod tests {
         let page = Rect::new(100.0, 0.0, 712.0, 800.0);
         for x0 in ["0", "-1000000000", "-999999999"] {
             let c = squiggly(
-                &format!("{x0} 20 1000000000 20 {x0} 10 1000000000 10"),
+                &format!("{x0} 24 1000000000 24 {x0} 10 1000000000 10"),
                 page,
             );
             let corners: Vec<(f32, f32)> = c
@@ -295,11 +324,11 @@ mod tests {
             assert_eq!(corners.len(), ((last - first) / 2.0) as usize + 1, "{x0}");
             for &(x, y) in &corners {
                 let i = ((f64::from(x) - f64::from(start)) / 2.0) as i64;
-                assert_eq!(y, if i % 2 == 0 { 12.0 } else { 10.0 }, "{x0} at {x}");
+                assert_eq!(y, if i % 2 == 0 { 10.0 } else { 12.0 }, "{x0} at {x}");
             }
         }
         // Off the page, nothing.
-        let c = squiggly("0 2000 1000000000 2000 0 1990 1000000000 1990", page);
+        let c = squiggly("0 2000 1000000000 2000 0 1986 1000000000 1986", page);
         assert!(zigzags(&c).is_empty(), "{c}");
     }
 }
