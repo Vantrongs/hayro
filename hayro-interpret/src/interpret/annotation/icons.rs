@@ -10,7 +10,7 @@
 //! a 190 × 50 stamp and scaled to fit `/Rect`; a red outline of each quadrilateral.
 //! The symbols are drawn here, each in a 10 pt square.
 
-use super::text::{self, Family, Fonts};
+use super::text::{self, Family, Fonts, Typeface};
 use super::{Out, Unsupported, c_color, color, rect};
 use hayro_syntax::object::dict::keys::{C, QUADPOINTS};
 use hayro_syntax::object::{Array, Dict, Name};
@@ -369,7 +369,7 @@ pub(super) fn stamp(annot: &Dict<'_>, fonts: &Fonts, out: &mut Out) -> Drawn {
         _ => &[-7.0],
     };
     for (line, y) in lines.iter().zip(baselines) {
-        let glyphs = fonts.shape(Family::SerifBold, line)?;
+        let glyphs = fonts.shape(Typeface::SERIF_BOLD, line)?;
         let x = -text::width(&glyphs, size) / 2.0;
         fail(text::draw(&glyphs, size, (x, *y), at, out))?;
     }

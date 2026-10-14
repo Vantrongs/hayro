@@ -20,6 +20,7 @@ mod freetext;
 mod icons;
 mod lines;
 mod markup;
+mod rich;
 mod text;
 mod widget;
 
@@ -63,6 +64,10 @@ pub enum Unsupported {
     /// A coordinate it draws at is too large to write: beyond the range of the
     /// 32-bit numbers content streams are read in.
     Coordinates,
+    /// Its rich text (`/RC`) or default style (`/DS`) uses an element, attribute or
+    /// style declaration the generator cannot draw as viewers do, or nests or
+    /// repeats elements beyond what written rich text does.
+    RichText,
 }
 
 /// An appearance generated for an annotation without a usable appearance stream.

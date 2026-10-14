@@ -183,6 +183,7 @@ fn interpreter_settings() -> InterpreterSettings {
 
                 Some((get_standard(&f.pick_standard_font())?, 0))
             }
+            FontQuery::TextDefault { .. } => Some((get_standard(&query.standard_substitute())?, 0)),
         }),
         ..Default::default()
     }

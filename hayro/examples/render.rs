@@ -77,6 +77,10 @@ fn main() {
                 let name = pick_standard_font(&f.pick_standard_font());
                 load_asset(name).or_else(|| Some(f.pick_standard_font().get_font_data()))
             }
+            FontQuery::TextDefault { .. } => {
+                let s = query.standard_substitute();
+                load_asset(pick_standard_font(&s)).or_else(|| Some(s.get_font_data()))
+            }
         }),
         ..Default::default()
     };

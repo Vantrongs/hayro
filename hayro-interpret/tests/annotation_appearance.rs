@@ -1168,3 +1168,111 @@ fn a_coordinate_too_large_to_draw_is_unsupported() {
     );
     assert_eq!(looks(&pdf), ["Coordinates"]);
 }
+
+/// A comment in rich text draws nothing, whatever `>` it holds: the text after it
+/// stays on the first line, inside the box.
+#[test]
+fn a_comment_in_rich_text_draws_nothing() {
+    let rc = format!(
+        "<body style=\"font-family:Helvetica\"><p>A<!-- >{} --><span \
+         style=\"color:#ff0000\">IMPORTANT</span></p></body>",
+        "M".repeat(200)
+    );
+    let text = fills(&draw(
+        &[&format!(
+            "/Subtype /FreeText /Rect [10 80 190 140] /BS << /W 0 >> \
+             /DA (/Helv 12 Tf 0 g) /RC ({rc})"
+        )],
+        VIEW,
+    ));
+    assert_eq!(
+        text.iter().filter(|(_, c)| *c == RED).count(),
+        1,
+        "{text:?}"
+    );
+    for (bbox, _) in &text {
+        assert!(inside(*bbox, [10, 125, 190, 140]), "{text:?}");
+    }
+}
+
+/// Rich text asks the font resolver for the face of each part: the default face
+/// where it names no family the standard fonts have, in its weight and slant, and
+/// the standard fonts' bold and italic.
+#[test]
+fn rich_text_asks_for_the_face_of_each_part() {
+    use hayro_interpret::font::FontQuery;
+    use std::sync::{Arc, Mutex};
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let record = asked.clone();
+    let settings = InterpreterSettings {
+        font_resolver: Arc::new(move |query: &FontQuery| {
+            record.lock().unwrap().push(match query {
+                FontQuery::Standard(s) => s.postscript_name().to_owned(),
+                FontQuery::TextDefault { bold, italic } => format!("default {bold} {italic}"),
+                FontQuery::Fallback(_) => "fallback".to_owned(),
+            });
+            Some(query.standard_substitute().get_font_data())
+        }),
+        ..Default::default()
+    };
+    let rc = "<body><p>a<b>b</b><i>c</i></p><p style=\"font-family:Times New Roman;\
+              font-weight:700\">d<i>e</i></p><p style=\"font:italic 9pt Helvetica\">f</p>\
+              <p style=\"font-family:Courier;font-weight:bold;font-style:oblique\">g</p></body>";
+    let file = common::one_page(
+        200,
+        "/Resources << >> /Annots [4 0 R]",
+        vec![
+            format!(
+                "<< /Type /Annot /Subtype /FreeText /Rect [20 20 180 180] /BS << /W 0 >> /RC ({rc}) >>"
+            )
+            .into_bytes(),
+        ],
+    );
+    let pdf = Pdf::new(file).expect("valid pdf");
+    common::interpret_first_page(&pdf, settings, &mut Rec::default());
+    let asked = asked.lock().unwrap();
+    for face in [
+        "default false false",
+        "default true false",
+        "default false true",
+        "Times-Bold",
+        "Times-BoldItalic",
+        "Helvetica-Oblique",
+        "Courier-BoldOblique",
+    ] {
+        assert!(asked.iter().any(|a| a == face), "{face}: {asked:?}");
+    }
+    assert!(!asked.iter().any(|a| a == "Times-Roman"), "{asked:?}");
+}
+
+/// Rich text is aligned by its `text-align`, whatever `/Q`; a justified line
+/// reaches both sides of the box, the last line of its paragraph does not.
+#[test]
+fn rich_text_aligns_by_text_align_not_q() {
+    let spans = |q: u8, body: &str| {
+        let rc = format!("<body style=\"font-family:Helvetica\">{body}</body>");
+        fills(&draw(
+            &[&format!(
+                "/Subtype /FreeText /Rect [20 20 180 180] /BS << /W 0 >> /Q {q} /RC ({rc})"
+            )],
+            VIEW,
+        ))
+        .iter()
+        .map(|(b, _)| [b[0], b[2]])
+        .collect::<Vec<_>>()
+    };
+    let left = spans(1, "<p>H</p>");
+    assert_eq!(left[0][0], 21, "{left:?}");
+    let right = spans(0, "<p style=\"text-align:right\">H</p>");
+    assert_eq!(right[0][1], 179, "{right:?}");
+    let justified = spans(
+        0,
+        "<p style=\"text-align:justify\">HH HH HH HH HH HH HH HH HH HH HH HH HH</p>",
+    );
+    // The first line from side to side, the last from the left.
+    assert_eq!(
+        (justified[0][0], justified[0][1]),
+        (21, 179),
+        "{justified:?}"
+    );
+}
