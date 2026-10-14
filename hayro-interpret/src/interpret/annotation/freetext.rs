@@ -3,16 +3,18 @@
 //! The box is `/Rect` less `/RD`, filled with /C and bordered in the text colour at
 //! the border width. The text is `/Contents` in the default appearance (`/DA`:
 //! family, size, colour; 12 pt black Helvetica without one), or, with rich text
-//! (`/RC`) or a default style (`/DS`), the text of `/RC` in the style `/DS` and
-//! the rich text's first style set, over Times in the `/DA` size and colour. It is
-//! wrapped to the box less twice the border width on each side and aligned by `/Q`,
-//! its first line 0.8 em (0.9 for rich text) below that inner top, lines 1.2 em
-//! apart, turned with the box by `/Rotate`, and clipped to `/Rect`. The layout and
-//! the defaults match what common viewers draw for such an annotation.
+//! (`/RC`) or a default style (`/DS`), the text of `/RC`, each part in the style its
+//! elements set over the style `/DS` sets over Times in the `/DA` size and colour.
+//! It is wrapped to the box less twice the border width on each side and aligned
+//! by `/Q`; each line is 1.2 times its largest size high, its baseline 0.8 times
+//! that size (0.9 for rich text) below its top, the first at that inner top. The
+//! text is turned with the box by `/Rotate` and clipped to `/Rect`. A callout line
+//! is drawn for a `/CL` of two or three points. The layout and the defaults match
+//! what common viewers draw for such an annotation.
 
 use super::lines::{Ending, Paint, ending};
-use super::text::{self, Family, Fonts, Style};
-use super::{Out, Unsupported, border_width, color, dash, rect};
+use super::text::{self, Family, Fonts, Span, Style};
+use super::{Out, Unsupported, border_width, color, dash, numbers_of, rect};
 use hayro_syntax::object::dict::keys::C;
 use hayro_syntax::object::{Array, Dict, Name, Object};
 use kurbo::{Affine, Point};
@@ -26,8 +28,8 @@ pub(super) fn free_text(
     let Some(r) = rect(annot) else {
         return Ok(None);
     };
-    let inner = match annot.get::<[f64; 4]>(b"RD") {
-        Some([l, b, rt, t])
+    let inner = match numbers_of(annot, b"RD", 4).as_deref() {
+        Some(&[l, b, rt, t, ..])
             if [l, b, rt, t].iter().all(|v| v.is_finite() && *v >= 0.0)
                 && l + rt < r.width()
                 && b + t < r.height() =>
@@ -50,24 +52,27 @@ pub(super) fn free_text(
         .replace(" k", " K");
     let rich = string(annot, b"RC");
     let ds = string(annot, b"DS");
-    let (content, ascent) = if rich.is_some() || ds.is_some() {
+    let (spans, ascent) = if rich.is_some() || ds.is_some() {
         style.family = Family::Serif;
         if let Some(ds) = &ds {
             style = text::css_style(&text::text_string(ds), style);
         }
-        let content = match &rich {
-            Some(rc) => {
-                let (content, css) = text::rich_text(&text::text_string(rc));
-                if let Some(css) = css {
-                    style = text::css_style(&css, style);
-                }
-                content
-            }
-            None => contents(annot),
+        let spans = match &rich {
+            Some(rc) => text::rich_text(&text::text_string(rc), &style),
+            None => vec![Span {
+                text: contents(annot),
+                style,
+            }],
         };
-        (content, 0.9)
+        (spans, 0.9)
     } else {
-        (contents(annot), 0.8)
+        (
+            vec![Span {
+                text: contents(annot),
+                style,
+            }],
+            0.8,
+        )
     };
     let w = border_width(annot);
 
@@ -75,15 +80,13 @@ pub(super) fn free_text(
     let callout = annot
         .get::<Name<'_>>(b"IT")
         .is_some_and(|it| it.as_ref() == b"FreeTextCallout");
-    let cl: Vec<Point> = annot
-        .get::<Array<'_>>(b"CL")
-        .map(|a| a.iter::<f64>().collect::<Vec<_>>())
+    let cl: Vec<Point> = numbers_of(annot, b"CL", 0)
+        .filter(|n| n.len() == 4 || n.len() == 6)
         .unwrap_or_default()
         .as_chunks::<2>()
         .0
         .iter()
         .map(|[x, y]| Point::new(*x, *y))
-        .filter(|p| p.x.is_finite() && p.y.is_finite())
         .collect();
 
     out.op("q");
@@ -162,8 +165,8 @@ pub(super) fn free_text(
     };
     let pad = 2.0 * w;
     let avail = (fw as f32 - 2.0 * pad).max(0.0);
-    let lines = text::lines(fonts, style.family, style.size, &content, Some(avail))?;
-    if lines.iter().any(|l| !l.is_empty()) {
+    let lines = text::layout(fonts, &spans, Some(avail))?;
+    if lines.iter().any(|l| !l.glyphs.is_empty()) {
         out.nums(
             &[
                 r.x0 as f32,
@@ -175,18 +178,29 @@ pub(super) fn free_text(
         )
         .ok_or(Unsupported::Kind)?;
         out.op("W n");
-        out.op(&style.color);
         let q = annot.get::<i64>(b"Q").unwrap_or(0);
-        let mut y = fh as f32 - pad - ascent * style.size;
+        let mut top = fh as f32 - pad;
+        let mut color = None;
         for line in &lines {
-            let width = text::width(line, style.size);
-            let x = match q {
+            let width = line.width();
+            let mut x = match q {
                 1 => pad + (avail - width) / 2.0,
                 2 => fw as f32 - pad - width,
                 _ => pad,
             };
-            text::draw(line, style.size, (x, y), frame, out).ok_or(Unsupported::Kind)?;
-            y -= 1.2 * style.size;
+            let y = top - ascent * line.size;
+            // Each run of glyphs of one span in its colour and size.
+            for run in line.glyphs.chunk_by(|a, b| a.span == b.span) {
+                let span_color = &spans[run[0].span].style.color;
+                if color != Some(span_color) {
+                    out.op(span_color);
+                    color = Some(span_color);
+                }
+                let glyphs: Vec<text::Glyph<'_>> = run.iter().map(|g| g.glyph.clone()).collect();
+                text::draw(&glyphs, run[0].size, (x, y), frame, out).ok_or(Unsupported::Kind)?;
+                x += text::width(&glyphs, run[0].size);
+            }
+            top -= 1.2 * line.size;
         }
     }
     out.op("Q");

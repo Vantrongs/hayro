@@ -15,8 +15,8 @@ use crate::x_object::{FormXObject, ImageXObject, XObject};
 use crate::{BlendMode, FillRule};
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
-use hayro_syntax::object::dict::keys::{ANNOTS, F, MCID, OC, RECT};
-use hayro_syntax::object::{Array, Dict, Name, Object, Rect, dict_or_stream};
+use hayro_syntax::object::dict::keys::{ANNOTS, F, MCID, OC};
+use hayro_syntax::object::{Array, Dict, Name, Object, dict_or_stream};
 use hayro_syntax::page::{Page, Resources};
 use kurbo::{Affine, Point, Shape};
 use rustc_hash::FxHashMap;
@@ -182,16 +182,13 @@ pub fn interpret_page<'a>(
             }
 
             match appearances.look(&annot, visible) {
-                annotation::Look::Stream(stream) => {
-                    let (Some(apx), Some(rect)) =
-                        (FormXObject::new(&stream), annot.get::<Rect>(RECT))
-                    else {
+                annotation::Look::Stream { stream, transform } => {
+                    let Some(apx) = FormXObject::new(&stream) else {
                         continue;
                     };
-                    let affine = annotation::rect_transform(rect.to_kurbo(), apx.bbox, apx.matrix);
 
                     context.save_state();
-                    context.pre_concat_affine(affine);
+                    context.pre_concat_affine(transform);
                     context.push_root_transform();
 
                     apx.draw(resources, context, device);

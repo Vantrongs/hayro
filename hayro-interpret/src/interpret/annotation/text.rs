@@ -112,25 +112,26 @@ impl Fonts {
 
     /// The glyphs of `text` in `family`, each with its advance in em.
     pub(super) fn shape(&self, family: Family, text: &str) -> Result<Vec<Glyph<'_>>, Unsupported> {
-        text.chars()
-            .map(|c| {
-                // Tabs and other controls take a space.
-                let c = if c.is_control() { ' ' } else { c };
-                [family, Family::Sans]
-                    .into_iter()
-                    .find_map(|f| {
-                        let face = self.face(f)?;
-                        let (id, advance) = face.glyph(c)?;
-                        Some(Glyph { face, id, advance })
-                    })
-                    .ok_or(if self.face(Family::Sans).is_some() {
-                        Unsupported::Character(c)
-                    } else {
-                        // No fonts at all: nothing is drawable.
-                        Unsupported::Kind
-                    })
+        text.chars().map(|c| self.glyph(family, c)).collect()
+    }
+
+    /// The glyph of `c` in `family`, with its advance in em.
+    fn glyph(&self, family: Family, c: char) -> Result<Glyph<'_>, Unsupported> {
+        // Tabs and other controls take a space.
+        let c = if c.is_control() { ' ' } else { c };
+        [family, Family::Sans]
+            .into_iter()
+            .find_map(|f| {
+                let face = self.face(f)?;
+                let (id, advance) = face.glyph(c)?;
+                Some(Glyph { face, id, advance })
             })
-            .collect()
+            .ok_or(if self.face(Family::Sans).is_some() {
+                Unsupported::Character(c)
+            } else {
+                // No fonts at all: nothing is drawable.
+                Unsupported::Kind
+            })
     }
 }
 
@@ -339,54 +340,141 @@ pub(super) fn lines<'f>(
     text: &str,
     width: Option<f32>,
 ) -> Result<Vec<Vec<Glyph<'f>>>, Unsupported> {
-    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let span = Span {
+        text: text.to_owned(),
+        style: Style {
+            family,
+            size,
+            color: String::new(),
+        },
+    };
+    Ok(layout(fonts, &[span], width)?
+        .into_iter()
+        .map(|line| line.glyphs.into_iter().map(|g| g.glyph).collect())
+        .collect())
+}
+
+/// Text in one style.
+pub(super) struct Span {
+    pub(super) text: String,
+    pub(super) style: Style,
+}
+
+/// A glyph at the size of the style of span `span` it was set from.
+#[derive(Clone)]
+pub(super) struct Set<'f> {
+    pub(super) glyph: Glyph<'f>,
+    pub(super) size: f32,
+    pub(super) span: usize,
+}
+
+impl Set<'_> {
+    fn width(&self) -> f32 {
+        self.glyph.advance * self.size
+    }
+}
+
+/// A line of set text.
+pub(super) struct Line<'f> {
+    pub(super) glyphs: Vec<Set<'f>>,
+    /// The largest size on the line, or, on an empty one, its paragraph's.
+    pub(super) size: f32,
+}
+
+impl Line<'_> {
+    pub(super) fn width(&self) -> f32 {
+        self.glyphs.iter().map(Set::width).sum()
+    }
+}
+
+/// The lines of `spans`, each glyph in its span's family and size: paragraphs split
+/// at line breaks, and, with a `width`, wrapped between words, a word wider than
+/// the line between its characters.
+pub(super) fn layout<'f>(
+    fonts: &'f Fonts,
+    spans: &[Span],
+    width: Option<f32>,
+) -> Result<Vec<Line<'f>>, Unsupported> {
+    // Each character with its span; a line break is a paragraph's end.
+    let mut chars: Vec<(char, usize)> = Vec::new();
+    for (i, span) in spans.iter().enumerate() {
+        let text = span.text.replace("\r\n", "\n").replace('\r', "\n");
+        chars.extend(text.chars().map(|c| (c, i)));
+    }
     let mut out = Vec::new();
-    for paragraph in text.split('\n') {
-        let glyphs = fonts.shape(family, paragraph)?;
+    let mut start = 0;
+    for paragraph in chars.split(|(c, _)| *c == '\n') {
+        // An empty paragraph is as high as the break that ends it, or the text
+        // before it.
+        let span = paragraph
+            .first()
+            .or(chars.get(start + paragraph.len()))
+            .or(chars.last())
+            .map_or(0, |(_, span)| *span);
+        let para_size = spans.get(span).map_or(0.0, |s| s.style.size);
+        start += paragraph.len() + 1;
+        let glyphs = paragraph
+            .iter()
+            .map(|&(c, span)| {
+                let style = &spans[span].style;
+                Ok(Set {
+                    glyph: fonts.glyph(style.family, c)?,
+                    size: style.size,
+                    span,
+                })
+            })
+            .collect::<Result<Vec<_>, Unsupported>>()?;
+        let mut push = |glyphs: Vec<Set<'f>>| {
+            let size = glyphs.iter().map(|g| g.size).fold(0.0, f32::max);
+            out.push(Line {
+                size: if glyphs.is_empty() { para_size } else { size },
+                glyphs,
+            });
+        };
         let Some(width) = width else {
-            out.push(glyphs);
+            push(glyphs);
             continue;
         };
-        let chars: Vec<char> = paragraph.chars().collect();
-        let mut line: Vec<Glyph<'f>> = Vec::new();
+        let space = |k: usize| paragraph[k].0 == ' ';
+        let mut line: Vec<Set<'f>> = Vec::new();
         let mut line_width = 0.0;
         let mut i = 0;
         while i < glyphs.len() {
             // The next word with the spaces before it.
             let mut j = i;
-            while j < glyphs.len() && chars[j] == ' ' {
+            while j < glyphs.len() && space(j) {
                 j += 1;
             }
-            while j < glyphs.len() && chars[j] != ' ' {
+            while j < glyphs.len() && !space(j) {
                 j += 1;
             }
-            let word_width: f32 = glyphs[i..j].iter().map(|g| g.advance * size).sum();
+            let word_width: f32 = glyphs[i..j].iter().map(Set::width).sum();
             if line_width + word_width <= width || line.is_empty() && word_width <= width {
-                line.extend(glyphs[i..j].iter().map(Glyph::clone));
+                line.extend_from_slice(&glyphs[i..j]);
                 line_width += word_width;
                 i = j;
             } else if line.is_empty() {
                 // A word wider than the line: as much of it as fits, at least one
                 // character.
                 let mut k = i;
-                while k < j && (k == i || line_width + glyphs[k].advance * size <= width) {
-                    line_width += glyphs[k].advance * size;
+                while k < j && (k == i || line_width + glyphs[k].width() <= width) {
+                    line_width += glyphs[k].width();
                     line.push(glyphs[k].clone());
                     k += 1;
                 }
-                out.push(std::mem::take(&mut line));
+                push(std::mem::take(&mut line));
                 line_width = 0.0;
                 i = k;
             } else {
-                out.push(std::mem::take(&mut line));
+                push(std::mem::take(&mut line));
                 line_width = 0.0;
                 // The next line starts with the word, not the spaces before it.
-                while i < j && chars[i] == ' ' {
+                while i < j && space(i) {
                     i += 1;
                 }
             }
         }
-        out.push(line);
+        push(line);
     }
     Ok(out)
 }
@@ -480,14 +568,33 @@ fn css_color(value: &str) -> Option<String> {
     Some(format!("{r} {g} {b} rg"))
 }
 
-/// The text of rich text (PDF 32000-1 12.7.3.4, XHTML): paragraphs and breaks as
-/// line breaks, other whitespace kept, entities decoded; and the style attribute of its first element.
-pub(super) fn rich_text(xhtml: &str) -> (String, Option<String>) {
-    let mut text = String::new();
-    let mut style = None;
+/// The text of rich text (PDF 32000-1 12.7.3.4, XHTML) in the styles its elements
+/// set: each element's style attribute over the style of the element it is in, the
+/// outermost over `base`. Paragraphs and breaks are line breaks, other whitespace is
+/// kept, entities are decoded.
+pub(super) fn rich_text(xhtml: &str, base: &Style) -> Vec<Span> {
+    let mut spans: Vec<Span> = Vec::new();
+    let add = |spans: &mut Vec<Span>, text: &str, style: &Style| {
+        if text.is_empty() {
+            return;
+        }
+        match spans.last_mut() {
+            Some(last) if last.style == *style => last.text.push_str(text),
+            _ => spans.push(Span {
+                text: text.to_owned(),
+                style: style.clone(),
+            }),
+        }
+    };
+    // The style of each open element, outermost first.
+    let mut open = vec![base.clone()];
     let mut rest = xhtml;
     while let Some(lt) = rest.find('<') {
-        text.push_str(&decode_entities(&rest[..lt]));
+        add(
+            &mut spans,
+            &decode_entities(&rest[..lt]),
+            open.last().unwrap_or(base),
+        );
         let Some(gt) = rest[lt..].find('>') else {
             rest = "";
             break;
@@ -504,28 +611,42 @@ pub(super) fn rich_text(xhtml: &str) -> (String, Option<String>) {
             .take_while(|c| c.is_ascii_alphanumeric())
             .collect::<String>()
             .to_ascii_lowercase();
-        if !closing
-            && style.is_none()
-            && let Some(at) = tag.find("style=")
-        {
-            // The value between its quotes.
-            let mut value = tag[at + 6..].chars();
-            style = value
-                .next()
-                .and_then(|quote| value.as_str().split(quote).next())
-                .map(str::to_owned);
-        }
+        let current = open.last().unwrap_or(base).clone();
+        let at_line_start = spans.last().is_none_or(|s| s.text.ends_with('\n'));
         match name.as_str() {
             // A paragraph starts and ends a line; whitespace is kept as written.
-            "p" | "div" if !text.is_empty() && !text.ends_with('\n') => {
-                text.push('\n');
-            }
-            "br" => text.push('\n'),
+            "p" | "div" if !at_line_start => add(&mut spans, "\n", &current),
+            "br" => add(&mut spans, "\n", &current),
             _ => {}
         }
+        if closing {
+            if open.len() > 1 {
+                open.pop();
+            }
+        } else if !tag.ends_with('/') && name != "br" {
+            let style = match tag.find("style=") {
+                // The value between its quotes.
+                Some(at) => {
+                    let mut value = tag[at + 6..].chars();
+                    match value
+                        .next()
+                        .and_then(|quote| value.as_str().split(quote).next())
+                    {
+                        Some(css) => css_style(css, current),
+                        None => current,
+                    }
+                }
+                None => current,
+            };
+            open.push(style);
+        }
     }
-    text.push_str(&decode_entities(rest));
-    (text, style)
+    add(
+        &mut spans,
+        &decode_entities(rest),
+        open.last().unwrap_or(base),
+    );
+    spans
 }
 
 fn decode_entities(s: &str) -> String {
@@ -572,18 +693,61 @@ fn decode_entities(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::rich_text;
+    use super::{Family, Style, rich_text};
+
+    fn base() -> Style {
+        Style {
+            family: Family::Serif,
+            size: 12.0,
+            color: "0 g".to_owned(),
+        }
+    }
 
     /// A paragraph starts and ends a line; spaces and line breaks in the text stay.
     #[test]
     fn rich_text_keeps_whitespace_and_breaks_at_paragraphs() {
-        let (text, style) = rich_text(
+        let spans = rich_text(
             "<?xml version=\"1.0\"?><body style=\"color:#f00\"><p>A</p>  <p>  B  </p>\
              <span>C</span> D<br/>E &amp;\n F</body>",
+            &base(),
         );
+        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(text, "A\n  \n  B  \nC D\nE &\n F");
-        assert_eq!(style.as_deref(), Some("color:#f00"));
+        assert!(spans.iter().all(|s| s.style.color == "1 0 0 rg"));
         // An attribute without a value.
-        assert_eq!(rich_text("<p style=>x</p>"), ("x\n".to_owned(), None));
+        let spans = rich_text("<p style=>x</p>", &base());
+        assert_eq!((spans.len(), spans[0].text.as_str()), (1, "x\n"));
+        assert_eq!(spans[0].style, base());
+    }
+
+    /// An element's style applies to what it holds, over the style of the element it
+    /// is in; the next element starts from that again.
+    #[test]
+    fn rich_text_styles_nest() {
+        let spans = rich_text(
+            "<body style=\"font-size:10pt\"><p style=\"font-family:Helvetica\">A \
+             <span style=\"color:#ff0000\">B</span> C</p><p>D</p></body>",
+            &base(),
+        );
+        let got: Vec<(&str, Family, f32, &str)> = spans
+            .iter()
+            .map(|s| {
+                (
+                    s.text.as_str(),
+                    s.style.family,
+                    s.style.size,
+                    s.style.color.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("A ", Family::Sans, 10.0, "0 g"),
+                ("B", Family::Sans, 10.0, "1 0 0 rg"),
+                (" C\n", Family::Sans, 10.0, "0 g"),
+                ("D\n", Family::Serif, 10.0, "0 g"),
+            ]
+        );
     }
 }

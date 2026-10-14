@@ -235,8 +235,8 @@ fn polyline(points: &[Point], out: &mut Out) -> Option<()> {
 
 /// `Line`: `/L` stroked in /C, moved off its points by a leader line (`/LL`, `/LLE`,
 /// `/LLO`), with its `/LE` endings and, with `/Cap`, `/Contents` as a caption in
-/// 12 pt Helvetica: inline, the line broken around it, or on top (`/CP`), moved by
-/// `/CO`.
+/// 12 pt Helvetica on one line, its line breaks as spaces as common viewers set it:
+/// inline, the line broken around it, or on top (`/CP`), moved by `/CO`.
 pub(super) fn line(
     annot: &Dict<'_>,
     fonts: &Fonts,
@@ -276,8 +276,8 @@ pub(super) fn line(
     let mut caption_glyphs = None;
     if let (true, Some(contents)) = (caption, contents) {
         const SIZE: f32 = 12.0;
-        let line_text = contents.lines().next().unwrap_or("").to_owned();
-        let glyphs = fonts.shape(Family::Sans, &line_text)?;
+        let one_line = contents.replace("\r\n", " ").replace(['\r', '\n'], " ");
+        let glyphs = fonts.shape(Family::Sans, &one_line)?;
         let width = f64::from(text::width(&glyphs, SIZE));
         let top = annot
             .get::<Name<'_>>(b"CP")

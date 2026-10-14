@@ -630,7 +630,9 @@ fn looks(pdf: &Pdf) -> Vec<String> {
     annots(pdf)
         .iter()
         .map(|a| match appearances.look(a, PAGE) {
-            Look::Stream(s) => String::from_utf8(s.decoded().unwrap().into_owned()).unwrap(),
+            Look::Stream { stream, .. } => {
+                String::from_utf8(stream.decoded().unwrap().into_owned()).unwrap()
+            }
             Look::Generated(_) => "generated".into(),
             Look::Nothing => "nothing".into(),
             Look::Unsupported(Unsupported::Kind) => "unsupported".into(),
@@ -795,4 +797,348 @@ fn a_generated_appearance_has_its_opacity_and_blend() {
         "1 1 0 rg\n10 30 m\n7.6429777 32.35702 7.6429777 37.64298 10 40 c\n90 40 l\n\
          92.357025 37.64298 92.357025 32.35702 90 30 c\nh\nf\n"
     );
+}
+
+/// Draws the first page of a file whose page has `/Annots [4 0 R]` and `objects`
+/// numbered from 4.
+fn draw_objects(objects: Vec<Vec<u8>>) -> Vec<Ev> {
+    let pdf = annotations("/Resources << >> /Annots [4 0 R]", objects);
+    let settings = InterpreterSettings {
+        annotations: VIEW,
+        ..Default::default()
+    };
+    let mut rec = Rec::default();
+    common::interpret_first_page(&pdf, settings, &mut rec);
+    rec.0
+}
+
+/// The strokes drawn, as bounding box.
+fn strokes(ev: &[Ev]) -> Vec<[i32; 4]> {
+    ev.iter()
+        .filter_map(|e| match e {
+            Ev::Stroke { bbox, .. } => Some(*bbox),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A `/Rect` that is short, or has something other than a number, reads the
+/// coordinates it lacks as 0, as viewers read it: the annotation is drawn there,
+/// with an appearance stream or without.
+#[test]
+fn a_damaged_rect_reads_what_it_lacks_as_zero() {
+    // The border's path, half its width inside [40 0 160 80].
+    let square = draw(&["/Subtype /Square /C [1 0 0] /Rect [40 80 160]"], VIEW);
+    assert_eq!(strokes(&square), [[41, 1, 160, 80]], "{square:?}");
+    // [40 80 0 120]: the icon at the top left, (0, 120).
+    let note = fills(&draw(&["/Subtype /Text /Rect [40 80 (bad) 120]"], VIEW));
+    assert_eq!(
+        note.first().map(|f| f.0),
+        Some([1, 101, 19, 119]),
+        "{note:?}"
+    );
+    let text = fills(&draw(
+        &["/Subtype /FreeText /Rect [40 80 160] /Contents (CHECK)"],
+        VIEW,
+    ));
+    assert!(
+        text.len() == 1 && inside(text[0].0, [40, 0, 160, 80]),
+        "{text:?}"
+    );
+    let stream = draw_objects(vec![
+        b"<< /Type /Annot /Subtype /Square /Rect [40 80 160] /AP << /N 5 0 R >> >>".to_vec(),
+        common::stream("/BBox [0 0 10 10]", b"1 0 0 rg 0 0 10 10 re f"),
+    ]);
+    assert_eq!(fills(&stream), [([40, 0, 160, 80], RED)], "{stream:?}");
+}
+
+/// A line's caption keeps every line of `/Contents`, set on one line with the line
+/// breaks as spaces, as viewers draw it.
+#[test]
+fn a_caption_keeps_all_its_lines() {
+    let ev = draw(
+        &["/Subtype /Line /L [20 100 280 100] /C [0] /Cap true \
+           /Contents (FIRST\\nSECOND) /Rect [10 50 290 150]"],
+        VIEW,
+    );
+    let text = fills(&ev);
+    // "FIRST SECOND" in 12 pt Helvetica is 89.3 pt wide, centred on the line.
+    assert_eq!(text.len(), 1, "{ev:?}");
+    let [x0, _, x1, _] = text[0].0;
+    assert!(x0 <= 106 && x1 >= 193, "{text:?}");
+    // The line breaks around the whole caption, 3 pt from it: one path of two
+    // segments.
+    let content = generated(
+        "/Subtype /Line /L [20 100 280 100] /C [0] /Cap true \
+         /Contents (FIRST\\nSECOND) /Rect [10 50 290 150]",
+    );
+    let ends: Vec<i32> = content
+        .lines()
+        .take_while(|l| *l != "S")
+        .filter(|l| l.ends_with(" m") || l.ends_with(" l"))
+        .map(|l| l.split(' ').next().unwrap().parse::<f32>().unwrap().round() as i32)
+        .collect();
+    assert_eq!(ends, [20, 102, 198, 280], "{content}");
+}
+
+/// The generated content of the first annotation of a page with `annot`.
+fn generated(annot: &str) -> String {
+    let pdf = annotations(
+        "/Annots [4 0 R]",
+        vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
+    );
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    match appearances.look(&annots(&pdf)[0], PAGE) {
+        Look::Generated(a) => a.content,
+        _ => panic!("{annot}: not generated"),
+    }
+}
+
+/// A check box or radio button turned by `/MK /R` takes the square at the bottom
+/// left of its turned frame.
+#[test]
+fn check_boxes_and_radio_buttons_turn_with_the_field() {
+    let wide = "/Rect [20 100 100 140]";
+    let tall = "/Rect [20 20 60 120]";
+    for (r, rect, square) in [
+        (0, wide, [20, 100, 60, 140]),
+        (90, wide, [60, 100, 100, 140]),
+        (180, wide, [60, 100, 100, 140]),
+        (270, wide, [20, 100, 60, 140]),
+        (0, tall, [20, 20, 60, 60]),
+        (90, tall, [20, 20, 60, 60]),
+        (180, tall, [20, 80, 60, 120]),
+        (270, tall, [20, 80, 60, 120]),
+    ] {
+        for kind in ["", "/Ff 32768"] {
+            let ev = fills(&draw(
+                &[&format!(
+                    "/Subtype /Widget /FT /Btn {kind} /AS /Yes /MK << /R {r} /BG [1 1 0] >> {rect}"
+                )],
+                VIEW,
+            ));
+            assert_eq!(ev[0], (square, YELLOW), "{kind} /R {r} {rect}: {ev:?}");
+            assert!(
+                ev[1].1 == BLACK && inside(ev[1].0, square),
+                "{kind} /R {r} {rect}: {ev:?}"
+            );
+        }
+    }
+}
+
+/// Rich text keeps the size and colour of each span: a small red span after a
+/// large black one fits on the line, inside the box.
+#[test]
+fn rich_text_keeps_the_style_of_each_span() {
+    let rc = "<body><p style=\"font-family:Helvetica;font-size:12pt\"><span>A </span>\
+              <span style=\"font-size:4pt;color:#ff0000\">IMPORTANT_DIMENSION_12.5_M</span></p></body>";
+    let ev = draw(
+        &[&format!(
+            "/Subtype /FreeText /Rect [20 100 160 120] /BS << /W 0 >> /RC ({rc})"
+        )],
+        VIEW,
+    );
+    let text = fills(&ev);
+    assert_eq!(text.len(), 2, "{ev:?}");
+    assert!(text[0].1 == BLACK && text[1].1 == RED, "{ev:?}");
+    // One line, 0.9 of the largest size below the top.
+    for (bbox, _) in &text {
+        assert!(inside(*bbox, [20, 106, 160, 120]), "{text:?}");
+    }
+}
+
+/// A callout line whose `/CL` has something other than a number reads it as 0 and
+/// keeps the other points where they are; a `/CL` of neither two nor three points
+/// draws no callout, as viewers draw it.
+#[test]
+fn a_damaged_callout_keeps_its_points() {
+    let callout = |cl: &str| {
+        strokes(&draw(
+            &[&format!(
+                "/Subtype /FreeText /Rect [100 100 250 180] /IT /FreeTextCallout \
+                 /CL [{cl}] /BS << /W 3 >> /Contents (CHECK)"
+            )],
+            VIEW,
+        ))
+    };
+    let border = [102, 102, 249, 179];
+    assert_eq!(
+        callout("20 20 80 (bad) 150 120"),
+        [[20, 0, 150, 120], border]
+    );
+    assert_eq!(callout("20 20 80 40"), [[20, 20, 80, 40], border]);
+    for cl in ["20 20 80", "20 20 80 40 150", "20 20 80 40 150 120 5"] {
+        assert_eq!(callout(cl), [border], "{cl}");
+    }
+}
+
+/// Each line of rich text is 1.2 times its largest size high, its baseline 0.9 of
+/// that size below its top, as viewers lay it out: an H 10, 20 and 10 pt high on
+/// lines of their own, and a 10 pt H then a 20 pt one on a line, then a 10 pt one.
+#[test]
+fn rich_text_lines_are_as_high_as_their_largest_size() {
+    let h = |size: u32, color: &str| {
+        format!("<span style=\"font-size:{size}pt;color:{color}\">H</span>")
+    };
+    let baselines = |body: &str| {
+        let rc = format!("<body style=\"font-family:Helvetica\">{body}</body>");
+        fills(&draw(
+            &[&format!(
+                "/Subtype /FreeText /Rect [20 20 180 180] /BS << /W 0 >> /RC ({rc})"
+            )],
+            VIEW,
+        ))
+        .iter()
+        .map(|(b, _)| b[1])
+        .collect::<Vec<_>>()
+    };
+    let (r, k) = ("#ff0000", "#000000");
+    assert_eq!(
+        baselines(&format!(
+            "<p>{}</p><p>{}</p><p>{}</p>",
+            h(10, r),
+            h(20, k),
+            h(10, r)
+        )),
+        [171, 150, 135]
+    );
+    assert_eq!(
+        baselines(&format!(
+            "<p>{}{}</p><p>{}</p>",
+            h(10, r),
+            h(20, k),
+            h(10, r)
+        )),
+        [162, 162, 147]
+    );
+}
+
+/// A signature field is signed when its value, inherited or its own, is something:
+/// a null value or one that names no object is no signature.
+#[test]
+fn a_signature_with_a_null_value_is_unsigned() {
+    let sig = "/Subtype /Widget /FT /Sig /Rect [10 10 110 70]";
+    let pdf = annotations(
+        "/Annots [4 0 R 5 0 R 6 0 R 7 0 R]",
+        vec![
+            format!("<< {sig} /V null >>").into_bytes(),
+            format!("<< {sig} /V 99 0 R >>").into_bytes(),
+            format!("<< {sig} /V 8 0 R >>").into_bytes(),
+            format!("<< {sig} /V null /Parent 9 0 R >>").into_bytes(),
+            b"<< /Type /Sig >>".to_vec(),
+            b"<< /V 8 0 R >>".to_vec(),
+        ],
+    );
+    assert_eq!(
+        looks(&pdf),
+        ["generated", "generated", "nothing", "nothing"]
+    );
+}
+
+/// A widget inherits field entries through any number of `/Parent` fields, and a
+/// loop of parents ends the search.
+#[test]
+fn fields_inherit_through_deep_parents_and_loops_end() {
+    for depth in [63, 64, 100, 1000] {
+        let mut objects = vec![
+            b"<< /Type /Annot /Subtype /Widget /Parent 5 0 R /Rect [10 10 110 30] >>".to_vec(),
+        ];
+        for n in 5..5 + depth {
+            objects.push(if n == 4 + depth {
+                b"<< /FT /Tx /V (Hello) >>".to_vec()
+            } else {
+                format!("<< /Parent {} 0 R >>", n + 1).into_bytes()
+            });
+        }
+        let pdf = annotations("/Annots [4 0 R]", objects);
+        assert_eq!(looks(&pdf), ["generated"], "{depth} parents");
+    }
+    // A widget whose parents loop is a broken field, drawn as nothing even with all
+    // it needs of its own, as viewers draw it; a null entry is inherited.
+    let pdf = annotations(
+        "/Annots [4 0 R 7 0 R 9 0 R]",
+        vec![
+            b"<< /Type /Annot /Subtype /Widget /Parent 5 0 R /Rect [10 10 110 30] >>".to_vec(),
+            b"<< /Parent 6 0 R >>".to_vec(),
+            b"<< /Parent 5 0 R >>".to_vec(),
+            b"<< /Type /Annot /Subtype /Widget /FT /Tx /V (Hello) /Parent 8 0 R \
+               /Rect [10 10 110 30] >>"
+                .to_vec(),
+            b"<< /Parent 7 0 R >>".to_vec(),
+            b"<< /Type /Annot /Subtype /Widget /FT null /Parent 10 0 R /Rect [10 10 110 30] >>"
+                .to_vec(),
+            b"<< /FT /Tx /V (Hello) >>".to_vec(),
+        ],
+    );
+    assert_eq!(looks(&pdf), ["nothing", "nothing", "generated"]);
+}
+
+/// A comb field's `/MaxLen` of no cells makes no comb, as viewers read it: the value
+/// is drawn as in a plain text field (larger ones are in `annotation_cost.rs`).
+/// Cells finer than can be told apart are drawn as the band their dividers cover.
+#[test]
+fn comb_cells_follow_max_len() {
+    let comb = |max_len: &str| {
+        draw(
+            &[&format!(
+                "/Subtype /Widget /FT /Tx /Ff 16777216 /MaxLen {max_len} /V (AB) \
+                 /MK << /BC [0] >> /Rect [20 100 180 130]"
+            )],
+            VIEW,
+        )
+    };
+    // The border's path, half its width inside the field.
+    let frame = [21, 101, 180, 130];
+    for plain in ["0", "-5"] {
+        assert_eq!(strokes(&comb(plain)), [frame], "{plain}");
+    }
+    // Two cells: one divider, at the middle of the inside.
+    assert_eq!(strokes(&comb("2")), [frame, [100, 101, 100, 129]]);
+    // The dividers of 1000 cells 0.158 pt apart, 1 pt wide, cover the inside.
+    let band = comb("1000");
+    let Some(Ev::Stroke { bbox, width, .. }) = band.last() else {
+        panic!("{band:?}");
+    };
+    assert_eq!((*bbox, *width), ([21, 115, 179, 115], 28.0), "{band:?}");
+}
+
+/// A text markup quad of no height marks no text and draws nothing, as viewers draw it.
+#[test]
+fn a_quad_of_no_height_draws_nothing() {
+    let quad = "/QuadPoints [0 100 200 100 0 100 200 100] /Rect [0 100 200 101]";
+    for subtype in ["Underline", "StrikeOut", "Squiggly"] {
+        let pdf = annotations(
+            "/Annots [4 0 R]",
+            vec![format!("<< /Subtype /{subtype} /C [0] {quad} >>").into_bytes()],
+        );
+        assert_eq!(looks(&pdf), ["nothing"], "{subtype}");
+    }
+}
+
+/// An annotation without a `/Rect`, or with one that is not an array, draws nothing,
+/// as viewers draw it.
+#[test]
+fn an_annotation_without_a_rect_draws_nothing() {
+    let pdf = annotations(
+        "/Annots [4 0 R 5 0 R 6 0 R]",
+        vec![
+            b"<< /Subtype /Text >>".to_vec(),
+            b"<< /Subtype /Text /Rect 5 >>".to_vec(),
+            b"<< /Subtype /Square /C [1 0 0] /AP << /N 7 0 R >> >>".to_vec(),
+            common::stream("/BBox [0 0 10 10]", b"1 0 0 rg 0 0 10 10 re f"),
+        ],
+    );
+    assert_eq!(looks(&pdf), ["nothing", "nothing", "nothing"]);
+}
+
+/// A coordinate too large to draw makes the annotation unsupported, not empty.
+#[test]
+fn a_coordinate_too_large_to_draw_is_unsupported() {
+    let pdf = annotations(
+        "/Annots [4 0 R]",
+        vec![b"<< /Subtype /Polygon /Vertices [10 10 10000000000000000000000000000000000000000 50 50 50] \
+               /C [0] /IC [1 0 0] /Rect [0 0 200 200] >>"
+            .to_vec()],
+    );
+    assert_eq!(looks(&pdf), ["Coordinates"]);
 }

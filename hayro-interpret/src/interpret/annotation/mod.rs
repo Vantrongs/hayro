@@ -29,16 +29,21 @@ use crate::BlendMode;
 use hayro_syntax::object::dict::keys::{
     AP, AS, BBOX, BORDER, BS, C, CA, D, F, MATRIX, N, RECT, S, SUBTYPE, W,
 };
-use hayro_syntax::object::{Array, Dict, Name, Object, Rect, Stream};
+use hayro_syntax::object::{Array, Dict, Name, ObjRef, Object, Stream};
 use hayro_syntax::xref::XRef;
 use kurbo::{Affine, Shape};
 use std::fmt::Write;
 
 /// What an annotation draws.
 pub enum Look<'a> {
-    /// Its normal appearance stream, which has a `/BBox` to place it with
-    /// [`rect_transform`].
-    Stream(Stream<'a>),
+    /// Its normal appearance stream, drawn after its own `/Matrix` with `transform`,
+    /// the [`rect_transform`] that places its `/BBox` on the annotation's `/Rect`.
+    Stream {
+        /// The appearance stream.
+        stream: Stream<'a>,
+        /// From the appearance's space, after its `/Matrix`, to default user space.
+        transform: Affine,
+    },
     /// An appearance generated from its entries.
     Generated(Appearance),
     /// Nothing.
@@ -55,6 +60,9 @@ pub enum Unsupported {
     Kind,
     /// Its text has a character none of the fonts has.
     Character(char),
+    /// A coordinate it draws at is too large to write: beyond the range of the
+    /// 32-bit numbers content streams are read in.
+    Coordinates,
 }
 
 /// An appearance generated for an annotation without a usable appearance stream.
@@ -104,10 +112,10 @@ impl<'a> Appearances<'a> {
     /// with text in `fonts`.
     ///
     /// The normal appearance is `/AP /N`, or, when that is a dictionary of states, the
-    /// state `/AS` names. A stream there draws when it has a `/BBox` of some area, and
-    /// nothing otherwise. An `/AP` that is not a dictionary draws nothing. Without an
-    /// appearance there (no `/AP`, no `/N`, no stream for the state), one is generated
-    /// from the annotation's entries.
+    /// state `/AS` names. A stream there draws when it has a `/BBox` of some area and
+    /// the annotation a `/Rect`, and nothing otherwise. An `/AP` that is not a
+    /// dictionary draws nothing. Without an appearance there (no `/AP`, no `/N`, no
+    /// stream for the state), one is generated from the annotation's entries.
     pub fn look(&self, annot: &Dict<'a>, visible: kurbo::Rect) -> Look<'a> {
         match annot.get::<Object<'_>>(AP) {
             None | Some(Object::Null(_)) => {}
@@ -122,10 +130,9 @@ impl<'a> Appearances<'a> {
                     _ => None,
                 };
                 if let Some(stream) = stream {
-                    return if has_area(&stream) {
-                        Look::Stream(stream)
-                    } else {
-                        Look::Nothing
+                    return match placement(&stream, annot) {
+                        Some(transform) => Look::Stream { stream, transform },
+                        None => Look::Nothing,
                     };
                 }
             }
@@ -143,21 +150,24 @@ impl<'a> Appearances<'a> {
     }
 }
 
-/// Whether `stream` has a `/BBox` that, after its `/Matrix`, encloses some area.
-fn has_area(stream: &Stream<'_>) -> bool {
-    let Some(bbox) = stream.dict().get::<[f32; 4]>(BBOX) else {
-        return false;
-    };
+/// The transform that places appearance `stream` on the `/Rect` of `annot`, when
+/// the stream has a `/BBox` that, after its `/Matrix`, encloses some area, and the
+/// annotation has a `/Rect`.
+fn placement(stream: &Stream<'_>, annot: &Dict<'_>) -> Option<Affine> {
+    let bbox = stream.dict().get::<[f32; 4]>(BBOX)?;
     let matrix = stream
         .dict()
         .get::<[f64; 6]>(MATRIX)
         .unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-    let transform = rect_transform(
-        kurbo::Rect::new(0.0, 0.0, 1.0, 1.0),
-        bbox,
-        Affine::new(matrix),
-    );
-    transform.as_coeffs().iter().all(|v| v.is_finite())
+    let matrix = Affine::new(matrix);
+    // A box of no area maps onto no rect; a /Rect of no area maps the box onto
+    // nothing, which is drawn as such.
+    let unit = rect_transform(kurbo::Rect::new(0.0, 0.0, 1.0, 1.0), bbox, matrix);
+    let transform = rect_transform(rect(annot)?, bbox, matrix);
+    [unit, transform]
+        .iter()
+        .all(|t| t.as_coeffs().iter().all(|v| v.is_finite()))
+        .then_some(transform)
 }
 
 /// The matrix A of PDF 32000-1 12.5.5 for an appearance with `bbox` and `matrix` on
@@ -189,7 +199,7 @@ impl Appearances<'_> {
         let Some(subtype) = annot.get::<Name<'_>>(SUBTYPE) else {
             return Ok(None);
         };
-        let mut out = Out(String::new());
+        let mut out = Out::default();
         let fonts = &self.fonts;
         let dr = self
             .form
@@ -230,14 +240,20 @@ impl Appearances<'_> {
             b"Line" => lines::line(annot, fonts, &mut out),
             b"Polygon" => ok(lines::poly(annot, true, &mut out)),
             b"PolyLine" => ok(lines::poly(annot, false, &mut out)),
-            b"Widget" => widget::widget(annot, self.form.as_ref(), fonts, &mut out),
+            b"Widget" => widget::widget(annot, self.form.as_ref(), fonts, visible, &mut out),
             // Popup, Link, the media and 3D subtypes, PrinterMark, TrapNet, Watermark,
             // Projection, stamps of other names and unknown subtypes: nothing.
             _ => Ok(None),
-        }?;
+        };
+        // A number that could not be written fails the appearance, whatever the
+        // generator made of it: `None` from a generator means nothing to draw.
+        if out.failed {
+            return Err(Unsupported::Coordinates);
+        }
+        let drew = drew?;
         // An appearance that paints nothing, such as a widget with no value, border
         // or background, is no appearance.
-        let paints = out.0.lines().any(|l| {
+        let paints = out.content.lines().any(|l| {
             matches!(
                 l.rsplit(' ').next(),
                 Some("f" | "f*" | "S" | "s" | "b" | "b*" | "B" | "B*")
@@ -252,25 +268,54 @@ impl Appearances<'_> {
             BlendMode::Normal
         };
         Ok(Some(Appearance {
-            content: out.0,
+            content: out.content,
             opacity: opacity(annot),
             blend,
         }))
     }
 }
 
-/// The field dictionary a widget takes `key` from: its own, or the nearest ancestor
-/// through `/Parent` that has it (PDF 32000-1 12.7.3.1).
-fn field<'a>(annot: &Dict<'a>, key: &[u8]) -> Option<Dict<'a>> {
-    let mut node = annot.clone();
-    // A parent chain deeper than this is a loop.
-    for _ in 0..64 {
-        if node.contains_key(key) {
-            return Some(node);
+/// A widget and the fields above it through `/Parent`, from which it inherits field
+/// entries (PDF 32000-1 12.7.3.1).
+struct Field<'a>(Vec<Dict<'a>>);
+
+impl<'a> Field<'a> {
+    /// The chain of `annot`, however deep; `None` when it loops, which viewers read as
+    /// a broken field and draw nothing for.
+    fn of(annot: &Dict<'a>) -> Option<Self> {
+        let mut seen = rustc_hash::FxHashSet::default();
+        if let Some(id) = annot.obj_id() {
+            seen.insert(ObjRef::from(id));
         }
-        node = node.get::<Dict<'_>>(b"Parent")?;
+        let mut chain = vec![annot.clone()];
+        loop {
+            let node = chain.last()?;
+            // A direct parent dictionary cannot lead back to itself.
+            if let Some(parent) = node.get_ref(b"Parent")
+                && !seen.insert(parent)
+            {
+                return None;
+            }
+            let Some(parent) = node.get::<Dict<'a>>(b"Parent") else {
+                return Some(Self(chain));
+            };
+            chain.push(parent);
+        }
     }
-    None
+
+    /// The nearest dictionary in the chain with `key`; an entry that is null or names
+    /// no object is absent (PDF 32000-1 7.3.9).
+    fn with(&self, key: &[u8]) -> Option<&Dict<'a>> {
+        self.0.iter().find(|d| {
+            d.get::<Object<'_>>(key)
+                .is_some_and(|o| !matches!(o, Object::Null(_)))
+        })
+    }
+
+    /// The inherited entry `key` as a `T`.
+    fn get<T: TryFrom<Object<'a>>>(&self, key: &[u8]) -> Option<T> {
+        T::try_from(self.with(key)?.get::<Object<'a>>(key)?).ok()
+    }
 }
 
 /// /CA clamped to 0–1, 1 when absent or not a number.
@@ -283,19 +328,31 @@ fn opacity(annot: &Dict<'_>) -> f32 {
     }
 }
 
-/// Content stream text; every number written is finite.
-struct Out(String);
+/// The smallest distance generated geometry keeps apart: a hundredth of a point,
+/// finer than any printer or screen resolves (7200 dpi). Steps closer than this, of
+/// a squiggle or of comb cell dividers, are drawn as the band they cover, so the
+/// work to draw them is bounded by the size of what is visible.
+const FINEST: f64 = 0.01;
+
+/// Content stream text; every number written is finite. Writing one that is not
+/// fails the whole appearance (`failed`), whatever the generator does next.
+#[derive(Default)]
+struct Out {
+    content: String,
+    failed: bool,
+}
 
 impl Out {
     fn nums(&mut self, nums: &[f32], op: &str) -> Option<()> {
         if !nums.iter().all(|n| n.is_finite()) {
+            self.failed = true;
             return None;
         }
         for n in nums {
-            write!(self.0, "{n} ").ok()?;
+            write!(self.content, "{n} ").ok()?;
         }
-        self.0.push_str(op);
-        self.0.push('\n');
+        self.content.push_str(op);
+        self.content.push('\n');
         Some(())
     }
 
@@ -319,10 +376,16 @@ impl Out {
                 }
             };
             for p in pts {
-                if !(p.x.is_finite() && p.y.is_finite()) {
+                // In the f32 content streams are read in.
+                if !(p.x.is_finite()
+                    && p.y.is_finite()
+                    && (p.x as f32).is_finite()
+                    && (p.y as f32).is_finite())
+                {
+                    self.failed = true;
                     return None;
                 }
-                write!(self.0, "{} {} ", round(p.x), round(p.y)).ok()?;
+                write!(self.content, "{} {} ", round(p.x), round(p.y)).ok()?;
             }
             self.op(match el {
                 PathEl::MoveTo(_) => "m",
@@ -335,17 +398,17 @@ impl Out {
     }
 
     fn op(&mut self, op: &str) {
-        self.0.push_str(op);
-        self.0.push('\n');
+        self.content.push_str(op);
+        self.content.push('\n');
     }
 
     /// The stroke state every generated appearance starts from.
     fn stroke_state(&mut self, width: f32, dash: &[f32]) -> Option<()> {
         self.op("0 J 0 j 10 M");
         self.nums(&[width], "w")?;
-        self.0.push('[');
+        self.content.push('[');
         for d in dash {
-            write!(self.0, "{d} ").ok()?;
+            write!(self.content, "{d} ").ok()?;
         }
         self.op("] 0 d");
         Some(())
@@ -361,6 +424,16 @@ fn numbers(arr: &Array<'_>) -> Vec<f64> {
             _ => 0.0,
         })
         .collect()
+}
+
+/// The [`numbers`] of array `key`, padded with 0 to at least `len`; `None` when
+/// `key` is not an array.
+fn numbers_of(dict: &Dict<'_>, key: &[u8], len: usize) -> Option<Vec<f64>> {
+    let mut n = numbers(&dict.get::<Array<'_>>(key)?);
+    if n.len() < len {
+        n.resize(len, 0.0);
+    }
+    Some(n)
 }
 
 /// `v` to a thousandth, without the trailing zeros.
@@ -442,12 +515,9 @@ fn dash(annot: &Dict<'_>) -> Vec<f32> {
     }
 }
 
-/// `/Rect`, normalized, when all its numbers are finite.
+/// `/Rect`, normalized, read as viewers read a damaged one: a coordinate it lacks
+/// or that is not a number is 0. `None` when it is not an array.
 fn rect(annot: &Dict<'_>) -> Option<kurbo::Rect> {
-    use crate::util::RectExt;
-    let r = annot.get::<Rect>(RECT)?.to_kurbo().abs();
-    [r.x0, r.y0, r.x1, r.y1]
-        .iter()
-        .all(|n| n.is_finite())
-        .then_some(r)
+    let n = numbers_of(annot, RECT, 4)?;
+    Some(kurbo::Rect::new(n[0], n[1], n[2], n[3]).abs())
 }

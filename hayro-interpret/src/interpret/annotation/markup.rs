@@ -4,7 +4,7 @@
 //! (`Highlight`, `Underline`, `StrikeOut`, `Squiggly`) are sized from each quadrilateral's
 //! height so that they cover what common viewers draw.
 
-use super::{Out, border_width, c_color, color, dash, rect};
+use super::{FINEST, Out, border_width, c_color, color, dash, rect};
 use hayro_syntax::object::dict::keys::{C, IC, INKLIST, QUADPOINTS};
 use hayro_syntax::object::{Array, Dict};
 
@@ -105,7 +105,8 @@ pub(super) enum Line {
 
 /// `Underline`, `StrikeOut` and `Squiggly`: per quad, a line in /C (default black)
 /// a sixteenth of the quad's height `h` wide: `h`/7 above the bottom, 3`h`/7 above
-/// it, or a zigzag from the bottom up to `h`/7, one step per `h`/7.
+/// it, or a zigzag from the bottom up to `h`/7, one step per `h`/7. A quad of no
+/// height marks no text and draws nothing, as in common viewers.
 pub(super) fn text_lines(
     annot: &Dict<'_>,
     line: Line,
@@ -120,6 +121,9 @@ pub(super) fn text_lines(
     out.op(&stroke);
     for [x0, y0, x1, y1] in quads {
         let h = y1 - y0;
+        if h <= 0.0 {
+            continue;
+        }
         out.stroke_state(h / 16.0, &[])?;
         match line {
             Line::Under | Line::Through => {
@@ -132,7 +136,7 @@ pub(super) fn text_lines(
                 out.nums(&[x0, y], "m")?;
                 out.nums(&[x1, y], "l")?;
             }
-            Line::Squiggle => squiggle(x0, x1, y0, f64::from(h) / 7.0, visible, out)?,
+            Line::Squiggle => squiggle(x0, x1, y0, f64::from(h) / 7.0, h / 16.0, visible, out)?,
         }
         out.op("S");
     }
@@ -140,19 +144,30 @@ pub(super) fn text_lines(
 }
 
 /// The zigzag of a `Squiggly` quad from `x0` to `x1` above `y`: `delta` high, one
-/// step per `delta` from `x0`, starting at the bottom. Only its steps across
-/// `visible` and one beyond each side are drawn: the page clips the rest, and the
-/// ends cut there, with their caps and joins, lie outside it.
+/// step per `delta` from `x0`, starting at the bottom, stroked `width` wide. Only its
+/// steps across `visible` and one beyond each side are drawn: the page clips the
+/// rest, and the ends cut there, with their caps and joins, lie outside it. Steps
+/// finer than [`FINEST`] are drawn as the band they cover: a straight line as high
+/// as the zigzag with its 45° strokes, `delta` + √2 `width`.
+#[allow(clippy::too_many_arguments)]
 fn squiggle(
     x0: f32,
     x1: f32,
     y: f32,
     delta: f64,
+    width: f32,
     visible: kurbo::Rect,
     out: &mut Out,
 ) -> Option<()> {
     if delta <= 0.0 || !delta.is_finite() {
         return Some(());
+    }
+    if delta < FINEST {
+        let band = delta + std::f64::consts::SQRT_2 * f64::from(width);
+        let mid = (f64::from(y) + delta / 2.0) as f32;
+        out.nums(&[band as f32], "w")?;
+        out.nums(&[x0, mid], "m")?;
+        return out.nums(&[x1, mid], "l");
     }
     let (bottom, top) = (y, y + delta as f32);
     if f64::from(top) + delta < visible.y0 || f64::from(bottom) - delta > visible.y1 {
@@ -238,9 +253,9 @@ mod tests {
 
     fn content(annot: &str, visible: Rect) -> String {
         let dict = Dict::from_bytes(annot.as_bytes()).expect("valid dict");
-        let mut out = Out(String::new());
+        let mut out = Out::default();
         text_lines(&dict, Line::Squiggle, visible, &mut out).expect("an appearance");
-        out.0
+        out.content
     }
 
     fn squiggly(quads: &str, visible: Rect) -> String {
