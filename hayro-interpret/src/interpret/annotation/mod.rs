@@ -16,8 +16,9 @@
 //! array's entry that is not a number reads as 0 and keeps its place.
 //!
 //! A generated appearance is a content stream in default user space that needs no
-//! resources. /CA and the highlight's Multiply
-//! blend apply to it as one transparency group.
+//! resources. /CA and the highlight's Multiply blend apply to each thing it paints,
+//! as the graphics state it is drawn in, as viewers draw them: where two of its
+//! fills overlap, they blend twice.
 
 pub(crate) mod entries;
 mod freetext;
@@ -109,10 +110,13 @@ pub enum Unsupported {
 }
 
 /// An appearance generated for an annotation without a usable appearance stream.
+/// Its opacity and blend mode are the graphics state its content is drawn in (an
+/// `ExtGState` set before it, not a transparency group around it): they apply to
+/// each fill and stroke of the content on its own.
 pub struct Appearance {
     /// The content stream, in default user space; it uses no resources.
     pub content: String,
-    /// The annotation's `/CA`, clamped to 0–1.
+    /// The annotation's `/CA`, clamped to 0–1, for both fills and strokes.
     pub opacity: f32,
     /// Multiply for highlights, Normal otherwise.
     pub blend: BlendMode,

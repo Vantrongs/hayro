@@ -29,6 +29,8 @@ enum Ev {
         blend: BlendMode,
     },
     EndGroup,
+    /// The next fill or stroke blends in this mode rather than Normal.
+    Blended(BlendMode),
 }
 
 #[derive(Default)]
@@ -48,6 +50,9 @@ impl<'a> Device<'a> for Rec {
         let mut path = path.clone();
         path.apply_affine(props.transform);
         let bbox = bbox(&path);
+        if props.blend_mode != BlendMode::Normal {
+            self.0.push(Ev::Blended(props.blend_mode));
+        }
         let stroke = |s: &hayro_interpret::StrokeProps| Ev::Stroke {
             bbox,
             rgba,
@@ -105,12 +110,42 @@ const YELLOW: [u8; 4] = [255, 255, 0, 255];
 const BLACK: [u8; 4] = [0, 0, 0, 255];
 const RED: [u8; 4] = [255, 0, 0, 255];
 
+/// Each quad is filled on its own in Multiply at /CA, as viewers fill them: where
+/// quads overlap, the colour multiplies twice, rather than once for a group of
+/// them.
 #[test]
-fn highlight_fills_each_quad_in_one_multiply_group_at_ca() {
+fn highlight_fills_each_quad_in_multiply_at_ca() {
     let ev = draw(
         &[
             "/Subtype /Highlight /F 4 /CA 0.5 /Rect [10 10 90 40] /QuadPoints [10 40 90 40 10 30 90 30 10 22 60 22 10 12 60 12]",
         ],
+        VIEW,
+    );
+    let half_yellow = [255, 255, 0, 128];
+    assert_eq!(
+        ev,
+        vec![
+            Ev::Blended(BlendMode::Multiply),
+            Ev::Fill {
+                bbox: [8, 30, 92, 40],
+                rgba: half_yellow
+            },
+            Ev::Blended(BlendMode::Multiply),
+            Ev::Fill {
+                bbox: [8, 12, 62, 22],
+                rgba: half_yellow
+            },
+        ]
+    );
+}
+
+/// A translucent fill and border of one operator are drawn as viewers draw them:
+/// the border covers the fill under it rather than blending over it, as if the
+/// pair were drawn opaque and then at /CA as one.
+#[test]
+fn a_translucent_square_border_covers_its_fill() {
+    let ev = draw(
+        &["/Subtype /Square /CA 0.5 /C [0 0 1] /IC [1 0 0] /BS << /W 10 >> /Rect [20 20 180 180]"],
         VIEW,
     );
     assert_eq!(
@@ -118,15 +153,17 @@ fn highlight_fills_each_quad_in_one_multiply_group_at_ca() {
         vec![
             Ev::Group {
                 opacity: 0.5,
-                blend: BlendMode::Multiply
+                blend: BlendMode::Normal
             },
             Ev::Fill {
-                bbox: [8, 30, 92, 40],
-                rgba: YELLOW
+                bbox: [25, 25, 175, 175],
+                rgba: RED
             },
-            Ev::Fill {
-                bbox: [8, 12, 62, 22],
-                rgba: YELLOW
+            Ev::Stroke {
+                bbox: [25, 25, 175, 175],
+                rgba: [0, 0, 255, 255],
+                width: 10.0,
+                dashed: false
             },
             Ev::EndGroup,
         ]

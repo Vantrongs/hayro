@@ -1,3 +1,4 @@
+use crate::FillRule;
 use crate::color::ColorSpace;
 use crate::context::Context;
 use crate::convert::{convert_line_cap, convert_line_join};
@@ -12,7 +13,6 @@ use crate::pattern::{Pattern, ShadingPattern};
 use crate::shading::Shading;
 use crate::util::{OptionLog, RectExt};
 use crate::x_object::{FormXObject, ImageXObject, XObject};
-use crate::{BlendMode, FillRule};
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
 use hayro_syntax::object::dict::keys::{ANNOTS, MCID, OC};
@@ -211,7 +211,8 @@ pub fn interpret_page<'a>(
 }
 
 /// Draws an appearance generated for an annotation without one, from a fresh
-/// graphics state in default user space.
+/// graphics state in default user space with its opacity and blend mode, which apply
+/// to each thing it paints.
 fn draw_generated<'a>(
     appearance: &annotation::Appearance,
     resources: &Resources<'a>,
@@ -220,20 +221,18 @@ fn draw_generated<'a>(
 ) {
     context.path_mut().truncate(0);
     context.save_state();
-    context.get_mut().graphics_state = state::GraphicsState::default();
-    let group = appearance.opacity < 1.0 || appearance.blend != BlendMode::Normal;
-    if group {
-        device.push_transparency_group(appearance.opacity, None, appearance.blend);
-    }
+    context.get_mut().graphics_state = state::GraphicsState {
+        non_stroke_alpha: appearance.opacity,
+        stroke_alpha: appearance.opacity,
+        blend_mode: appearance.blend,
+        ..Default::default()
+    };
     interpret(
         TypedIter::new(appearance.content.as_bytes()),
         resources,
         context,
         device,
     );
-    if group {
-        device.pop_transparency_group();
-    }
     context.restore_state(device);
 }
 
