@@ -15,7 +15,7 @@ use crate::x_object::{FormXObject, ImageXObject, XObject};
 use crate::{BlendMode, FillRule};
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
-use hayro_syntax::object::dict::keys::{ANNOTS, AP, F, MCID, N, OC, RECT};
+use hayro_syntax::object::dict::keys::{ANNOTS, F, MCID, OC, RECT};
 use hayro_syntax::object::{Array, Dict, Name, Object, Rect, dict_or_stream};
 use hayro_syntax::page::{Page, Resources};
 use kurbo::{Affine, Point, Shape};
@@ -101,9 +101,22 @@ pub struct InterpreterSettings {
     /// Note that this feature is currently not fully implemented yet, so some
     /// annotations might be missing.
     pub render_annotations: bool,
-    /// Draw annotations as for printing: only those with the Print flag (PDF 32000-1
-    /// 12.5.3), instead of all that are not `NoView`. Hidden ones are never drawn.
-    pub annotation_print: bool,
+    /// Which annotations are drawn.
+    pub annotations: AnnotationSelection,
+}
+
+/// Which annotations a page is drawn with (PDF 32000-1 12.5.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AnnotationSelection {
+    /// As for viewing: all but those flagged Hidden or `NoView`.
+    #[default]
+    View,
+    /// As for printing: those flagged Print, but not Hidden.
+    Print,
+    /// As when annotations are flattened into page content
+    /// ([`annotation::flattened`]): all but links and those flagged Hidden or
+    /// Invisible.
+    Flatten,
 }
 
 impl Default for InterpreterSettings {
@@ -122,7 +135,7 @@ impl Default for InterpreterSettings {
             cmap_resolver: Arc::new(|_| None),
             warning_sink: Arc::new(|_| {}),
             render_annotations: true,
-            annotation_print: false,
+            annotations: AnnotationSelection::View,
         }
     }
 }
@@ -137,9 +150,9 @@ pub enum InterpreterWarning {
     UnsupportedFont,
     /// An image failed to decode.
     ImageDecodeFailure,
-    /// An annotation has an `AP` dictionary, but its normal appearance could not
-    /// be selected or loaded, so the annotation was not drawn.
-    UnresolvedAnnotationAppearance,
+    /// An annotation has no usable appearance stream, and none could be generated
+    /// for it ([`annotation::Unsupported`]), so it was not drawn.
+    UnsupportedAnnotation,
 }
 
 /// interpret the contents of the page and render them into the device.
@@ -154,41 +167,42 @@ pub fn interpret_page<'a>(
     if context.settings.render_annotations
         && let Some(annot_arr) = page.raw().get::<Array<'_>>(ANNOTS)
     {
+        let visible = page.intersected_crop_box().to_kurbo();
         for annot in annot_arr.iter::<Dict<'_>>() {
             let flags = annot.get::<u32>(F).unwrap_or(0);
-
-            // Hidden; without Print when printing; NoView when viewing.
-            if flags & 2 != 0
-                || (context.settings.annotation_print && flags & 4 == 0)
-                || (!context.settings.annotation_print && flags & 32 != 0)
-            {
+            let shown = match context.settings.annotations {
+                AnnotationSelection::View => flags & (2 | 32) == 0,
+                AnnotationSelection::Print => flags & 2 == 0 && flags & 4 != 0,
+                AnnotationSelection::Flatten => annotation::flattened(&annot),
+            };
+            if !shown {
                 continue;
             }
 
-            if let Some(apx) =
-                annotation::normal_appearance(&annot).and_then(|o| FormXObject::new(&o))
-            {
-                let Some(rect) = annot.get::<Rect>(RECT) else {
-                    continue;
-                };
-                let affine = annotation::rect_transform(rect.to_kurbo(), apx.bbox, apx.matrix);
+            match annotation::look(&annot, visible) {
+                annotation::Look::Stream(stream) => {
+                    let (Some(apx), Some(rect)) =
+                        (FormXObject::new(&stream), annot.get::<Rect>(RECT))
+                    else {
+                        continue;
+                    };
+                    let affine = annotation::rect_transform(rect.to_kurbo(), apx.bbox, apx.matrix);
 
-                context.save_state();
-                context.pre_concat_affine(affine);
-                context.push_root_transform();
+                    context.save_state();
+                    context.pre_concat_affine(affine);
+                    context.push_root_transform();
 
-                apx.draw(resources, context, device);
-                context.pop_root_transform();
-                context.restore_state(device);
-            } else if annot
-                .get::<Dict<'_>>(AP)
-                .is_some_and(|ap| ap.contains_key(N))
-            {
-                (context.settings.warning_sink)(InterpreterWarning::UnresolvedAnnotationAppearance);
-            } else if let Some(appearance) =
-                annotation::generate(&annot, page.intersected_crop_box().to_kurbo())
-            {
-                draw_generated(&appearance, resources, context, device);
+                    apx.draw(resources, context, device);
+                    context.pop_root_transform();
+                    context.restore_state(device);
+                }
+                annotation::Look::Generated(appearance) => {
+                    draw_generated(&appearance, resources, context, device);
+                }
+                annotation::Look::Nothing => {}
+                annotation::Look::Unsupported(_) => {
+                    (context.settings.warning_sink)(InterpreterWarning::UnsupportedAnnotation);
+                }
             }
         }
     }

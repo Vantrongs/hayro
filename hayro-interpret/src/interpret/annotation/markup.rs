@@ -1,242 +1,18 @@
-//! How annotations look: the appearance stream an annotation names and where it lands
-//! on the page, and, for an annotation without `/AP`, the appearance `PDFium` generates
-//! for its subtype, with its geometry and defaults (`core/fpdfdoc/cpdf_generateap.cpp`,
-//! BSD-3-Clause). `FreeText` and `Popup` get none: their appearance is laid-out text.
-//!
-//! The renderer draws annotations with these, and a writer that bakes annotations
-//! into page content can use the same to draw what the renderer shows.
-//!
-//! A generated appearance is a content stream in default user space; /CA and the
-//! highlight's Multiply blend apply to it as one transparency group.
+//! The appearances `PDFium` generates for markup annotations drawn from geometry
+//! alone (`core/fpdfdoc/cpdf_generateap.cpp`, BSD-3-Clause), with their geometry and
+//! defaults.
 
-use crate::BlendMode;
-use crate::util::RectExt;
-use hayro_syntax::object::dict::keys::{
-    AP, AS, BORDER, BS, C, CA, D, IC, INKLIST, N, QUADPOINTS, RECT, S, SUBTYPE, W,
-};
-use hayro_syntax::object::{Array, Dict, Name, Object, Rect, Stream};
-use kurbo::{Affine, Shape};
-use std::fmt::Write;
-
-/// The normal appearance stream of `annot`: `/AP /N`, or, when that is a dictionary
-/// of states, the state `/AS` names (`/Off` without `/AS`).
-pub fn normal_appearance<'a>(annot: &Dict<'a>) -> Option<Stream<'a>> {
-    // Read as `Object` first: a dictionary read as a stream may pick up the data of
-    // a stream after it in the file.
-    match annot.get::<Dict<'_>>(AP)?.get::<Object<'_>>(N)? {
-        Object::Stream(stream) => Some(stream),
-        Object::Dict(states) => annot
-            .get::<Name<'_>>(AS)
-            .and_then(|state| states.get::<Stream<'_>>(state))
-            .or_else(|| states.get::<Stream<'_>>(b"Off")),
-        _ => None,
-    }
-}
-
-/// The matrix A of PDF 32000-1 12.5.5 for an appearance with `bbox` and `matrix` on
-/// an annotation with `rect`: it maps the appearance box, transformed by `matrix`,
-/// onto `rect`. The appearance is drawn with `matrix` and then A.
-pub fn rect_transform(rect: kurbo::Rect, bbox: [f32; 4], matrix: Affine) -> Affine {
-    let [x0, y0, x1, y1] = bbox.map(f64::from);
-    let transformed = (matrix * kurbo::Rect::new(x0, y0, x1, y1).to_path(0.1)).bounding_box();
-    let (sx, sy) = (
-        rect.width() / transformed.width(),
-        rect.height() / transformed.height(),
-    );
-    Affine::new([
-        sx,
-        0.0,
-        0.0,
-        sy,
-        rect.x0 - transformed.x0 * sx,
-        rect.y0 - transformed.y0 * sy,
-    ])
-}
-
-/// An appearance generated for an annotation without `/AP`.
-pub struct Appearance {
-    /// The content stream, in default user space.
-    pub content: String,
-    /// The annotation's `/CA`, clamped to 0–1.
-    pub opacity: f32,
-    /// Multiply for highlights, Normal otherwise.
-    pub blend: BlendMode,
-}
-
-/// The appearance `PDFium` would generate for `annot`, if its subtype gets one and it
-/// paints anything, on a page that shows `visible` (in default user space) of it.
-pub fn generate(annot: &Dict<'_>, visible: kurbo::Rect) -> Option<Appearance> {
-    let subtype = annot.get::<Name<'_>>(SUBTYPE)?;
-    let mut out = Out(String::new());
-    let blend = match subtype.as_ref() {
-        b"Square" => {
-            shape(annot, false, &mut out)?;
-            BlendMode::Normal
-        }
-        b"Circle" => {
-            shape(annot, true, &mut out)?;
-            BlendMode::Normal
-        }
-        b"Highlight" => {
-            highlight(annot, &mut out)?;
-            BlendMode::Multiply
-        }
-        b"Underline" => {
-            text_lines(annot, Line::Under, visible, &mut out)?;
-            BlendMode::Normal
-        }
-        b"StrikeOut" => {
-            text_lines(annot, Line::Through, visible, &mut out)?;
-            BlendMode::Normal
-        }
-        b"Squiggly" => {
-            text_lines(annot, Line::Squiggle, visible, &mut out)?;
-            BlendMode::Normal
-        }
-        b"Ink" => {
-            ink(annot, &mut out)?;
-            BlendMode::Normal
-        }
-        b"Text" => {
-            note_icon(annot, &mut out)?;
-            BlendMode::Normal
-        }
-        _ => return None,
-    };
-    let opacity = annot.get::<f32>(CA).unwrap_or(1.0);
-    let opacity = if opacity.is_finite() {
-        opacity.clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
-    Some(Appearance {
-        content: out.0,
-        opacity,
-        blend,
-    })
-}
-
-/// Content stream text; every number written is finite.
-struct Out(String);
-
-impl Out {
-    fn nums(&mut self, nums: &[f32], op: &str) -> Option<()> {
-        if !nums.iter().all(|n| n.is_finite()) {
-            return None;
-        }
-        for n in nums {
-            write!(self.0, "{n} ").ok()?;
-        }
-        self.0.push_str(op);
-        self.0.push('\n');
-        Some(())
-    }
-
-    fn op(&mut self, op: &str) {
-        self.0.push_str(op);
-        self.0.push('\n');
-    }
-
-    /// The stroke state every generated appearance starts from.
-    fn stroke_state(&mut self, width: f32, dash: &[f32]) -> Option<()> {
-        self.op("0 J 0 j 10 M");
-        self.nums(&[width], "w")?;
-        self.0.push('[');
-        for d in dash {
-            write!(self.0, "{d} ").ok()?;
-        }
-        self.op("] 0 d");
-        Some(())
-    }
-}
-
-/// The colour operator for a colour array (gray, RGB or CMYK); `None` when the array
-/// has no components (transparent) or an invalid count.
-fn color(arr: &Array<'_>, stroke: bool) -> Option<String> {
-    let c: Vec<f32> = arr.iter::<f32>().filter(|c| c.is_finite()).collect();
-    let op = match (c.len(), stroke) {
-        (1, false) => "g",
-        (1, true) => "G",
-        (3, false) => "rg",
-        (3, true) => "RG",
-        (4, false) => "k",
-        (4, true) => "K",
-        _ => return None,
-    };
-    let mut s = String::new();
-    for n in &c {
-        write!(s, "{n} ").ok()?;
-    }
-    s.push_str(op);
-    Some(s)
-}
-
-/// /C as a colour operator: `default` when absent, `None` when it is transparent.
-fn c_color(annot: &Dict<'_>, stroke: bool, default: &str) -> Option<String> {
-    match annot.get::<Array<'_>>(C) {
-        Some(arr) => color(&arr, stroke),
-        None => Some(default.to_string()),
-    }
-}
-
-/// /BS /W, else the third /Border element, else 1.
-fn border_width(annot: &Dict<'_>) -> f32 {
-    annot
-        .get::<Dict<'_>>(BS)
-        .and_then(|bs| bs.get::<f32>(W))
-        .or_else(|| {
-            annot
-                .get::<Array<'_>>(BORDER)
-                .and_then(|b| b.iter::<f32>().nth(2))
-        })
-        .filter(|w| w.is_finite())
-        .unwrap_or(1.0)
-}
-
-/// The dash array of a dashed border style (/BS /S /D), else the fourth /Border
-/// element; at most ten entries, as in `PDFium`.
-fn dash(annot: &Dict<'_>) -> Vec<f32> {
-    let bs = annot.get::<Dict<'_>>(BS);
-    let arr = match &bs {
-        Some(bs) if bs.get::<Name<'_>>(S).is_some_and(|s| s.as_ref() == b"D") => {
-            bs.get::<Array<'_>>(D)
-        }
-        _ => annot
-            .get::<Array<'_>>(BORDER)
-            .and_then(|b| match b.iter::<Object<'_>>().nth(3)? {
-                Object::Array(a) => Some(a),
-                _ => None,
-            }),
-    };
-    let dash: Vec<f32> = arr
-        .map(|a| a.iter::<f32>().take(10).collect())
-        .unwrap_or_default();
-    // An all-zero or negative pattern draws nothing; draw solid instead.
-    if dash.iter().all(|d| d.is_finite() && *d >= 0.0) && dash.iter().any(|d| *d > 0.0) {
-        dash
-    } else {
-        Vec::new()
-    }
-}
-
-fn rect(annot: &Dict<'_>) -> Option<kurbo::Rect> {
-    let r = annot.get::<Rect>(RECT)?.to_kurbo().abs();
-    [r.x0, r.y0, r.x1, r.y1]
-        .iter()
-        .all(|n| n.is_finite())
-        .then_some(r)
-}
+use super::{Out, border_width, c_color, color, dash, rect};
+use hayro_syntax::object::dict::keys::{C, IC, INKLIST, QUADPOINTS};
+use hayro_syntax::object::{Array, Dict};
 
 /// Square and Circle: /IC fills the shape, /C strokes it at the border width, inside
 /// `/Rect`. Unlike `PDFium`, an absent `/C` means no border: the spec gives it no default.
-fn shape(annot: &Dict<'_>, circle: bool, out: &mut Out) -> Option<()> {
+/// A border of width 0 is the thinnest line, not none.
+pub(super) fn shape(annot: &Dict<'_>, circle: bool, out: &mut Out) -> Option<()> {
     let fill = annot.get::<Array<'_>>(IC).and_then(|a| color(&a, false));
     let width = border_width(annot);
-    let stroke = if width > 0.0 {
-        annot.get::<Array<'_>>(C).and_then(|a| color(&a, true))
-    } else {
-        None
-    };
+    let stroke = annot.get::<Array<'_>>(C).and_then(|a| color(&a, true));
     if fill.is_none() && stroke.is_none() {
         return None;
     }
@@ -296,7 +72,7 @@ fn quads(annot: &Dict<'_>) -> Vec<[f32; 4]> {
 }
 
 /// Highlight: each quad filled with /C (default yellow), blended with Multiply.
-fn highlight(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
+pub(super) fn highlight(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
     let fill = c_color(annot, false, "1 1 0 rg")?;
     let quads = quads(annot);
     if quads.is_empty() {
@@ -310,7 +86,7 @@ fn highlight(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
     Some(())
 }
 
-enum Line {
+pub(super) enum Line {
     Under,
     Through,
     Squiggle,
@@ -318,7 +94,12 @@ enum Line {
 
 /// `Underline`, `StrikeOut` and `Squiggly`: a 1 pt line per quad in /C (default black): one
 /// unit above the bottom, through the middle, or a zigzag 2 pt high and 2 pt per step.
-fn text_lines(annot: &Dict<'_>, line: Line, visible: kurbo::Rect, out: &mut Out) -> Option<()> {
+pub(super) fn text_lines(
+    annot: &Dict<'_>,
+    line: Line,
+    visible: kurbo::Rect,
+    out: &mut Out,
+) -> Option<()> {
     let stroke = c_color(annot, true, "0 G")?;
     let quads = quads(annot);
     if quads.is_empty() {
@@ -392,14 +173,12 @@ fn squiggle(x0: f32, x1: f32, y: f32, visible: kurbo::Rect, out: &mut Out) -> Op
     out.nums(&[x1 as f32, y1], "l")
 }
 
-/// `Ink`: each `/InkList` path stroked as a polyline in /C (default black) at the border
-/// width, with the border dash.
-fn ink(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
+/// `Ink`: each `/InkList` path stroked as a polyline in /C at the border width, with
+/// the border dash. Unlike `PDFium`, an absent `/C` draws nothing: the spec gives it no
+/// default.
+pub(super) fn ink(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
     let width = border_width(annot);
-    if width <= 0.0 {
-        return None;
-    }
-    let stroke = c_color(annot, true, "0 G")?;
+    let stroke = annot.get::<Array<'_>>(C).and_then(|a| color(&a, true))?;
     let list = annot.get::<Array<'_>>(INKLIST)?;
     out.op(&stroke);
     out.stroke_state(width, &dash(annot))?;
@@ -421,7 +200,7 @@ fn ink(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
 
 /// `Text` (a note): `PDFium`'s 20 pt note icon at the bottom left of /Rect, a yellow
 /// speech box with three black lines.
-fn note_icon(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
+pub(super) fn note_icon(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
     const SIZE: f32 = 20.0;
     const HALF: f32 = 0.5;
     const TIP: f32 = 4.0;
@@ -452,7 +231,7 @@ fn note_icon(annot: &Dict<'_>, out: &mut Out) -> Option<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::generate;
+    use super::super::{Look, look};
     use hayro_syntax::object::{Dict, FromBytes};
     use kurbo::Rect;
 
@@ -461,7 +240,10 @@ mod tests {
 
     fn content(annot: &str, visible: Rect) -> String {
         let dict = Dict::from_bytes(annot.as_bytes()).expect("valid dict");
-        generate(&dict, visible).expect("an appearance").content
+        match look(&dict, visible) {
+            Look::Generated(appearance) => appearance.content,
+            _ => panic!("an appearance"),
+        }
     }
 
     fn squiggly(quads: &str, visible: Rect) -> String {
