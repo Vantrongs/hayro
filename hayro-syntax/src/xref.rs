@@ -68,7 +68,7 @@ pub(crate) fn open(data: PdfData, password: &[u8]) -> Result<XRef, XRefError> {
     let trailer = find_last_xref_pos(data.as_ref())
         .and_then(|pos| populate_xref_impl(data.as_ref(), pos, &mut xref_map));
     let Some(trailer) = trailer else {
-        return fallback(data, password, &[]).ok_or(XRefError::Unknown);
+        return fallback(data, password, Old::default()).ok_or(XRefError::Unknown);
     };
 
     match check(&mut xref_map, data.as_ref()) {
@@ -78,11 +78,22 @@ pub(crate) fn open(data: PdfData, password: &[u8]) -> Result<XRef, XRefError> {
             XRefInput::TrailerDictData(trailer),
             password,
         ) {
-            Err(XRefError::Unknown) => fallback(data, password, &[]).ok_or(XRefError::Unknown),
+            Err(XRefError::Unknown) => {
+                fallback(data, password, Old::default()).ok_or(XRefError::Unknown)
+            }
             xref => xref,
         },
-        Err(listed) => fallback(data, password, &listed).ok_or(XRefError::Unknown),
+        Err(old) => fallback(data, password, old).ok_or(XRefError::Unknown),
     }
+}
+
+/// The entries of a table that is rebuilt.
+#[derive(Debug, Default)]
+struct Old {
+    /// Those that lead to an object that ends before the next offset any entry names.
+    listed: Vec<Listed>,
+    /// The others, each by offset: the scan reads their objects to their ends.
+    unread: Vec<(usize, ObjectIdentifier)>,
 }
 
 /// An entry of a table that is rebuilt, which leads to an object.
@@ -111,8 +122,8 @@ fn opened(_bytes: usize) {
 
 // Check that each entry leads to its object before any object is read: a table with
 // an entry that does not is rebuilt, so the table never changes once read, and every
-// value read from the document is read from the one table. Returns the entries that
-// lead to an object, for the rebuilt table, if one does not lead to its own.
+// value read from the document is read from the one table. Returns the entries, for
+// the rebuilt table, if one does not lead to its own.
 //
 // An entry leads to its object where an object whose header names it is at its offset
 // and ends before the next offset any entry names: objects of a table do not overlap.
@@ -121,7 +132,7 @@ fn opened(_bytes: usize) {
 // entry past the end of the file or in an object stream the table does not list as an
 // object (`check_xref_entry_offsets` in MuPDF's `pdf-xref.c`); an entry at offset 0 is
 // free.
-fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Vec<Listed>> {
+fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Old> {
     xref_map.retain(|_, entry| *entry != EntryType::Normal(0));
     let mut entries = vec![];
     let mut streams = vec![];
@@ -134,7 +145,7 @@ fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Vec<Listed>> {
     entries.sort_unstable_by_key(|(offset, _)| *offset);
 
     let mut sound = true;
-    let mut listed = vec![];
+    let mut old = Old::default();
     // The entries at each offset, and the next offset.
     let mut rest = entries.as_slice();
     while let Some(&(offset, _)) = rest.first() {
@@ -145,13 +156,16 @@ fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Vec<Listed>> {
             match header {
                 Some(header) => {
                     sound &= header == *id;
-                    listed.push(Listed {
+                    old.listed.push(Listed {
                         id: *id,
                         offset,
                         header,
                     });
                 }
-                None => sound = false,
+                None => {
+                    sound = false;
+                    old.unread.push((offset, *id));
+                }
             }
         }
         rest = &rest[at..];
@@ -167,7 +181,7 @@ fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Vec<Listed>> {
         Ok(())
     } else {
         warn!("xref table has an entry that does not lead to its object, rebuilding it");
-        Err(listed)
+        Err(old)
     }
 }
 
@@ -189,9 +203,9 @@ fn object_in(data: &[u8]) -> Option<ObjectIdentifier> {
 // leads to an object the scan does not find under the entry's number is kept. Such an
 // object is the entry's, not the one its header names: where the scan finds it under
 // its header's number, the scan takes the definition before it.
-fn fallback(data: PdfData, password: &[u8], listed: &[Listed]) -> Option<XRef> {
+fn fallback(data: PdfData, password: &[u8], old: Old) -> Option<XRef> {
     warn!("xref table was invalid, trying to manually build xref table");
-    let (xref_map, xref_input) = fallback_xref_map(&data, password, listed);
+    let (xref_map, xref_input) = fallback_xref_map(&data, password, old);
 
     if let Some(xref_input) = xref_input {
         warn!("rebuild xref table with {} entries", xref_map.len());
@@ -207,17 +221,51 @@ fn fallback(data: PdfData, password: &[u8], listed: &[Listed]) -> Option<XRef> {
 fn fallback_xref_map<'a>(
     data: &'a PdfData,
     password: &[u8],
-    listed: &[Listed],
+    old: Old,
 ) -> (XrefMap, Option<XRefInput<'a>>) {
     let mut scan = Scan::new(data.as_ref());
+    let mut listed = old.listed;
+    listed.extend(read_unread(data.as_ref(), &mut scan, &old.unread));
     fallback_xref_map_inner(
         data,
         &mut scan,
         ReaderContext::dummy(),
         true,
         password,
-        listed,
+        &listed,
     )
+}
+
+/// The entries of `unread`, sorted by offset, that lead to an object read to its end,
+/// as reading the entry's object does. Checking the table reads an object only up to
+/// the next offset an entry names, which another's header may be at, in a string.
+fn read_unread(
+    data: &[u8],
+    scan: &mut Scan<'_>,
+    unread: &[(usize, ObjectIdentifier)],
+) -> Vec<Listed> {
+    let mut listed = vec![];
+    let mut rest = unread;
+    while let Some(&(offset, _)) = rest.first() {
+        let at = rest.partition_point(|(other, _)| *other == offset);
+        let mut r = Reader::new(data);
+        let header = data.get(offset..).and_then(|_| {
+            r.jump(offset);
+            let header = r.read_without_context::<ObjectIdentifier>()?;
+            r.skip_white_spaces_and_comments();
+            opened(r.offset() - offset);
+            scan.object(r.offset(), Keys::Skipped).map(|_| header)
+        });
+        if let Some(header) = header {
+            listed.extend(
+                rest[..at]
+                    .iter()
+                    .map(|&(offset, id)| Listed { id, offset, header }),
+            );
+        }
+        rest = &rest[at..];
+    }
+    listed
 }
 
 fn fallback_xref_map_inner<'a>(
@@ -1862,6 +1910,20 @@ mod tests {
             one_page(file.into_bytes()),
             (600.0, 700.0, BLUE.as_bytes().to_vec())
         );
+    }
+
+    // An entry whose object holds the header another entry leads to, in a string, is
+    // kept when the table is rebuilt for it: its object is read to its end.
+    #[test]
+    fn entries_into_a_string_of_another_object_are_kept() {
+        for space in [false, true] {
+            let pdf = crate::Pdf::new(nested(30, space, false)).unwrap();
+            for number in 4..34 {
+                let id = ObjectIdentifier::new(number, 0);
+                let string = pdf.xref().get::<object::String<'_>>(id);
+                assert!(string.is_some(), "object {number}, space {space}");
+            }
+        }
     }
 
     #[test]
