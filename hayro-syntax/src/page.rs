@@ -11,7 +11,7 @@ use crate::object::dict::keys::*;
 use crate::object::stream::DecodeFailure;
 use crate::object::{MaybeRef, Null, Object, ObjectIdentifier};
 use crate::reader::ReaderContext;
-use crate::sync::{Arc, OnceLock};
+use crate::sync::{Arc, FxHashMap, OnceLock};
 use crate::transform::Transform;
 use crate::util::FloatExt;
 use crate::xref::XRef;
@@ -72,6 +72,20 @@ std::thread_local! {
     /// The entries looked up in page tree nodes on this thread, which the tests
     /// bound to show that reading the tree takes linear time.
     static LOOKUPS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    /// The /Kids entries read from their arrays and stored on this thread, which
+    /// the tests bound to show that shared arrays are read and kept once.
+    static KIDS_READ: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static KIDS_STORED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn kids_read() {
+    KIDS_READ.set(KIDS_READ.get() + 1);
+}
+
+#[cfg(test)]
+fn kids_stored(entries: usize) {
+    KIDS_STORED.set(KIDS_STORED.get() + entries);
 }
 
 /// A page tree entry: a dictionary, or an empty one for any other object.
@@ -129,12 +143,45 @@ impl<'a> Node<'a> {
             is_dict: true,
         }
     }
+}
 
-    fn kids(&self) -> ArrayIter<'a> {
-        self.dict
-            .get::<Array<'a>>(KIDS)
-            .unwrap_or_default()
-            .raw_iter()
+/// A state for each /Kids array a walk of the page tree reads: the nodes whose
+/// /Kids is the same object share one, so that the walk reads the array once
+/// however many nodes list it. The walks read /Kids only through this.
+struct KidsStates<T> {
+    states: Vec<T>,
+    shared: FxHashMap<ObjectIdentifier, usize>,
+}
+
+impl<T> Default for KidsStates<T> {
+    fn default() -> Self {
+        Self {
+            states: vec![],
+            shared: FxHashMap::default(),
+        }
+    }
+}
+
+impl<T> KidsStates<T> {
+    /// The index of the state of `node`'s /Kids, made by `new` from its entries if
+    /// there is none.
+    fn of<'a>(&mut self, node: &Node<'a>, new: impl FnOnce(ArrayIter<'a>) -> T) -> usize {
+        // The object of the /Kids array, which other nodes may list too; `None` for
+        // an array written into the node, which only it lists.
+        let id = match node.dict.get_raw::<Object<'a>>(KIDS) {
+            Some(MaybeRef::Ref(kids)) => Some(ObjectIdentifier::from(kids)),
+            _ => None,
+        };
+        if let Some(at) = id.and_then(|id| self.shared.get(&id)) {
+            return *at;
+        }
+        let at = self.states.len();
+        let kids = node.dict.get::<Array<'a>>(KIDS).unwrap_or_default();
+        self.states.push(new(kids.raw_iter()));
+        if let Some(id) = id {
+            self.shared.insert(id, at);
+        }
+        at
     }
 }
 
@@ -145,29 +192,61 @@ type Listed<'a> = (Node<'a>, Option<usize>);
 // read the first time the walk reaches it: a node listed again, as a shared subtree,
 // in a cycle or in a /Kids array that two nodes share, adds nothing, which keeps the
 // walk linear in the file. A page listed again is a page again, as in MuPDF.
+//
+// The nodes listing one /Kids array object share the entries read from it: a node
+// read from it was read then, and adds nothing when another node lists it, so each
+// node listing the array lists the pages read from it and goes on reading where the
+// others stopped. Each array is thus read once, and its pages listed again for each
+// node that lists it, which is the walk's output.
 fn walk<'a>(tree: Node<'a>, ctx: &ReaderContext<'a>) -> (Vec<Listed<'a>>, Listings<'a>) {
+    /// A /Kids array: the entries not read yet, and the pages among those read.
+    struct Kids<'a> {
+        unread: ArrayIter<'a>,
+        pages: Vec<Node<'a>>,
+    }
+
     let mut pages = vec![];
     let mut listings = Listings::default();
-    let mut stack: Vec<(usize, ArrayIter<'a>)> = vec![];
-    let mut next = Some(tree);
+    if !tree.is_tree() {
+        pages.push((tree, None));
+        return (pages, listings);
+    }
+    let mut kids = KidsStates::default();
+    // Each node whose kids are being read: its index in `listings`, the index of
+    // its /Kids in `kids`, and how many of the pages read from them it has listed.
+    let mut stack: Vec<(usize, usize, usize)> = vec![];
+    let mut next = Some((tree, None));
     loop {
-        if let Some(node) = next.take() {
-            let lister = stack.last().map(|(at, _)| *at);
-            if !node.is_tree() {
-                pages.push((node, lister));
-            } else if let Some(at) = listings.read(&node, lister) {
-                stack.push((at, node.kids()));
-            }
+        if let Some((node, lister)) = next.take()
+            && let Some(at) = listings.read(&node, lister)
+        {
+            let array = kids.of(&node, |unread| Kids {
+                unread,
+                pages: vec![],
+            });
+            stack.push((at, array, 0));
         }
-        let Some((at, kids)) = stack.last_mut() else {
+        let Some((at, array, listed)) = stack.last_mut() else {
             return (pages, listings);
         };
-        match kids.next() {
-            Some(kid) => next = Some(Node::new(kid, ctx)),
-            None => {
-                listings.close(*at);
-                stack.pop();
+        let array = &mut kids.states[*array];
+        if let Some(page) = array.pages.get(*listed) {
+            pages.push((page.clone(), Some(*at)));
+            *listed += 1;
+        } else if let Some(kid) = array.unread.next() {
+            #[cfg(test)]
+            kids_read();
+            let kid = Node::new(kid, ctx);
+            if kid.is_tree() {
+                next = Some((kid, Some(*at)));
+            } else {
+                #[cfg(test)]
+                kids_stored(1);
+                array.pages.push(kid);
             }
+        } else {
+            listings.close(*at);
+            stack.pop();
         }
     }
 }
@@ -847,7 +926,11 @@ mod tests {
     // The /XObject names of each page's resources, its MediaBox width and its
     // rotation in quarter turns.
     fn inherited(objects: &[&str]) -> Vec<(Vec<String>, f64, u8)> {
-        let pdf = Pdf::new(pdf(objects)).unwrap();
+        inherited_in(pdf(objects))
+    }
+
+    fn inherited_in(file: Vec<u8>) -> Vec<(Vec<String>, f64, u8)> {
+        let pdf = Pdf::new(file).unwrap();
         pdf.pages()
             .iter()
             .map(|page| {
@@ -1115,6 +1198,132 @@ mod tests {
         let objects: Vec<&str> = objects.iter().map(String::as_str).collect();
         let page = (depth + 4, Some(1600.0));
         assert_eq!(pages(&objects), Some(vec![page, page]));
+    }
+
+    // A root and `n` nodes all list one /Kids array object, which lists those nodes
+    // and a page: the page is a page under each, and the array is read once. With
+    // `parent_loop`, the page's /Parent is itself, which makes the lookups repair
+    // the tree, reading the array once more.
+    fn shared_kids(n: usize, parent_loop: bool) -> Vec<u8> {
+        let page = n + 4;
+        let nodes: Vec<String> = (4..page).map(|node| format!("{node} 0 R")).collect();
+        let mut objects = vec![
+            CATALOG.to_owned(),
+            "<< /Type /Pages /Kids 3 0 R /MediaBox [0 0 200 100] >>".to_owned(),
+            format!("[{} {page} 0 R]", nodes.join(" ")),
+        ];
+        objects.extend((0..n).map(|_| "<< /Type /Pages /Kids 3 0 R >>".to_owned()));
+        let parent = if parent_loop {
+            format!("/Parent {page} 0 R")
+        } else {
+            String::new()
+        };
+        objects.push(format!("<< /Type /Page {parent} >>"));
+        let objects: Vec<&str> = objects.iter().map(String::as_str).collect();
+        pdf(&objects)
+    }
+
+    // The /Kids entries read and stored for such a file grow with it, not with its
+    // square, with and without the repair.
+    #[test]
+    fn a_kids_array_many_nodes_list_is_read_and_stored_once() {
+        for parent_loop in [false, true] {
+            let counts = |n: usize| {
+                let file = shared_kids(n, parent_loop);
+                super::KIDS_READ.set(0);
+                super::KIDS_STORED.set(0);
+                let pdf = Pdf::new(file).unwrap();
+                assert_eq!(pdf.pages().len(), n + 1);
+                for page in pdf.pages().iter() {
+                    assert_eq!(page.obj_id(), Some(ObjectIdentifier::new(n as i32 + 4, 0)));
+                    assert_eq!(page.media_box().x1, 200.0);
+                }
+                (super::KIDS_READ.get(), super::KIDS_STORED.get())
+            };
+            let [small, large] = [500, 1000].map(counts);
+            assert!(
+                large.0 < small.0 * 21 / 10 && large.1 < small.1 * 21 / 10,
+                "parent loop: {parent_loop}: (read, stored) {small:?} for 500, {large:?} for 1000"
+            );
+        }
+    }
+
+    /// A damaged file without a cross-reference table, whose objects, each a number,
+    /// a generation and a body, are found by scanning it.
+    fn recovered(objects: &[(i32, i32, &str)]) -> Vec<u8> {
+        let mut out = b"%PDF-1.7\n".to_vec();
+        for (number, generation, body) in objects {
+            out.extend(format!("{number} {generation} obj\n{body}\nendobj\n").bytes());
+        }
+        out.extend(b"trailer\n<< /Root 1 0 R >>\n%%EOF\n");
+        out
+    }
+
+    // Where a damaged file holds two generations of an object, the loader keeps
+    // both, and so does the page tree: each generation of node 3 lists its own page,
+    // which inherits its own node's box and resources, through its /Parent, through
+    // the node listing it, or, where its /Parent is itself, through the repaired
+    // /Parent entries.
+    #[test]
+    fn two_generations_of_a_node_are_two_nodes() {
+        let node = |page: i32, size: i32, name: &str| {
+            format!(
+                "<< /Type /Pages /Kids [{page} 0 R] /MediaBox [0 0 {size} {size}] \
+                 /Resources << /XObject << /{name} 9 0 R >> >> >>"
+            )
+        };
+        let (first, second) = (node(4, 300, "A"), node(5, 200, "B"));
+        for parents in [["3 0 R", "3 1 R"], ["", ""], ["4 0 R", "5 0 R"]] {
+            let page = |parent: &str| match parent {
+                "" => "<< /Type /Page >>".to_owned(),
+                parent => format!("<< /Type /Page /Parent {parent} >>"),
+            };
+            let (page_4, page_5) = (page(parents[0]), page(parents[1]));
+            let file = recovered(&[
+                (1, 0, CATALOG),
+                (2, 0, "<< /Type /Pages /Kids [3 0 R 3 1 R] >>"),
+                (3, 0, &first),
+                (3, 1, &second),
+                (4, 0, &page_4),
+                (5, 0, &page_5),
+            ]);
+            assert_eq!(
+                inherited_in(file),
+                [(named(&["A"]), 300.0, 0), (named(&["B"]), 200.0, 0)],
+                "{parents:?}"
+            );
+        }
+    }
+
+    // Two generations of a page are two pages, each with its own box and resources.
+    #[test]
+    fn two_generations_of_a_page_are_two_pages() {
+        let page = |size: i32, name: &str| {
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {size} {size}] \
+                 /Resources << /XObject << /{name} 9 0 R >> >> >>"
+            )
+        };
+        let (first, second) = (page(300, "A"), page(200, "B"));
+        let file = recovered(&[
+            (1, 0, CATALOG),
+            (2, 0, "<< /Type /Pages /Kids [3 0 R 3 1 R] >>"),
+            (3, 0, &first),
+            (3, 1, &second),
+        ]);
+        let pdf = Pdf::new(file.clone()).unwrap();
+        let ids: Vec<_> = pdf.pages().iter().map(|page| page.obj_id()).collect();
+        assert_eq!(
+            ids,
+            [
+                Some(ObjectIdentifier::new(3, 0)),
+                Some(ObjectIdentifier::new(3, 1))
+            ]
+        );
+        assert_eq!(
+            inherited_in(file),
+            [(named(&["A"]), 300.0, 0), (named(&["B"]), 200.0, 0)]
+        );
     }
 
     #[test]

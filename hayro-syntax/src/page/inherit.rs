@@ -1,8 +1,8 @@
 //! The entries a page inherits from the page tree, found as `MuPDF` finds them.
 
-use super::{Node, Page};
-use crate::object::dict::keys::{CROP_BOX, KIDS, MEDIA_BOX, PAGES, PARENT, RESOURCES, ROTATE};
-use crate::object::{Array, Dict, MaybeRef, Null, Object};
+use super::{KidsStates, Node, Page};
+use crate::object::dict::keys::{CROP_BOX, MEDIA_BOX, PAGES, PARENT, RESOURCES, ROTATE};
+use crate::object::{Dict, MaybeRef, Null, Object, ObjectIdentifier};
 use crate::pdf::Pdf;
 use crate::reader::ReaderContext;
 use crate::sync::{FxHashMap, FxHashSet};
@@ -88,17 +88,19 @@ enum Chain<'a> {
     Followed,
 }
 
-/// What tells nodes apart: the object number, or for a direct dictionary its bytes.
+/// What tells nodes apart: the object number and generation, which the loader
+/// keeps apart where a damaged file holds two generations of a number, or for a
+/// direct dictionary its bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) enum Key {
-    Object(i32),
+    Object(ObjectIdentifier),
     Direct(usize),
 }
 
 impl<'a> Node<'a> {
     pub(super) fn key(&self) -> Key {
         match self.id {
-            Some(id) => Key::Object(id.obj_number),
+            Some(id) => Key::Object(id),
             None => Key::Direct(self.dict.data().as_ptr() as usize),
         }
     }
@@ -293,29 +295,11 @@ fn value<'a>(node: &Node<'a>, key: Inheritable) -> Option<Object<'a>> {
 // `MuPDF`, which fails on a kid that is no dictionary and passes over a node with
 // 257 nodes above it, and which may set other parents where a /Kids cycle is
 // entered through a shared node. A kid that is no dictionary is passed over here.
+//
+// The nodes listing one /Kids array object share the kids left in it: those that
+// one of them took were met then, so every other would pass over them. Each array
+// is thus read and stored once, however many nodes list it.
 fn tree_parents<'a>(ctx: &ReaderContext<'a>) -> FxHashMap<Key, Node<'a>> {
-    struct Frame<'a> {
-        node: Node<'a>,
-        /// The kids left, first first, taken from the end; `None` for a direct
-        /// `null`, which `MuPDF` skips.
-        kids: Vec<Option<Node<'a>>>,
-    }
-
-    let frame = |node: Node<'a>| {
-        let kids = node
-            .dict
-            .get::<Array<'a>>(KIDS)
-            .map(|kids| {
-                kids.raw_iter()
-                    .map(|kid| match kid {
-                        MaybeRef::NotRef(Object::Null(_)) => None,
-                        kid => Some(Node::new(kid, ctx)),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Frame { node, kids }
-    };
     let mut parents = FxHashMap::default();
     let xref = ctx.xref();
     let Some(root) = xref
@@ -324,12 +308,32 @@ fn tree_parents<'a>(ctx: &ReaderContext<'a>) -> FxHashMap<Key, Node<'a>> {
     else {
         return parents;
     };
+    // The kids of each /Kids array not taken yet, first first, taken from the end;
+    // `None` for a direct `null`, which `MuPDF` skips.
+    let mut kids = KidsStates::<Vec<Option<Node<'a>>>>::default();
+    let read = |kids: &mut KidsStates<_>, node: &Node<'a>| {
+        kids.of(node, |kids| {
+            let kids: Vec<_> = kids
+                .map(|kid| {
+                    #[cfg(test)]
+                    super::kids_read();
+                    match kid {
+                        MaybeRef::NotRef(Object::Null(_)) => None,
+                        kid => Some(Node::new(kid, ctx)),
+                    }
+                })
+                .collect();
+            #[cfg(test)]
+            super::kids_stored(kids.len());
+            kids
+        })
+    };
     let root = Node::new(root, ctx);
     let mut met = FxHashSet::default();
     met.insert(root.key());
-    let mut stack = vec![frame(root)];
-    while let Some(top) = stack.last_mut() {
-        let Some(kid) = top.kids.pop() else {
+    let mut stack = vec![(read(&mut kids, &root), root)];
+    while let Some((array, node)) = stack.last() {
+        let Some(kid) = kids.states[*array].pop() else {
             stack.pop();
             continue;
         };
@@ -337,8 +341,8 @@ fn tree_parents<'a>(ctx: &ReaderContext<'a>) -> FxHashMap<Key, Node<'a>> {
         let Some(kid) = kid.filter(|kid| kid.is_dict && met.insert(kid.key())) else {
             continue;
         };
-        parents.insert(kid.key(), top.node.clone());
-        stack.push(frame(kid));
+        parents.insert(kid.key(), node.clone());
+        stack.push((read(&mut kids, &kid), kid));
     }
     parents
 }
