@@ -114,8 +114,9 @@ impl RasterImage<'_> {
     }
 
     /// Identifies the pixels `with_rgba` decodes for a given `target_dimension`: the
-    /// image object ([`Stream::identity`](hayro_syntax::object::Stream::identity),
-    /// unique among the documents loaded) and the transfer function in effect. `None`
+    /// image's body ([`Stream::identity`](hayro_syntax::object::Stream::identity),
+    /// unique among the documents loaded, one for every entry leading to it) and the
+    /// transfer function in effect. `None`
     /// when there is no object to identify (an inline image) or the colour space is a
     /// name looked up in the resources where the image is drawn.
     pub fn pixels_key(&self) -> Option<u128> {

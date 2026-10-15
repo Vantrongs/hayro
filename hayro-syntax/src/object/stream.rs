@@ -22,7 +22,7 @@ use crate::sync::Arc;
 use crate::trivia::is_white_space_character;
 use crate::util::{OptionLog, find_needle};
 use crate::work::Meter;
-use crate::xref::{DocumentId, XRef};
+use crate::xref::{StreamId, XRef};
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -244,10 +244,13 @@ impl<'a> Stream<'a> {
     }
 
     /// Identifies the stream among the streams of every document loaded in this
-    /// process: its document and its object. `None` for a stream that is no object of
-    /// a loaded document (an inline image), or on a target without 64-bit atomics.
-    pub fn identity(&self) -> Option<(DocumentId, ObjectIdentifier)> {
-        Some((self.dict.ctx().xref().document_id()?, self.dict.obj_id()?))
+    /// process, by its body ([`StreamId`]): entries of a damaged table that lead to
+    /// one body find one identity. `None` for a stream that is no object of a loaded
+    /// document (an inline image, whose bytes may be freed and taken by others while a
+    /// cache holds its identity), or on a target without 64-bit atomics.
+    pub fn identity(&self) -> Option<StreamId> {
+        self.dict.obj_id()?;
+        self.dict.content_key().stream_id()
     }
 
     /// Return the object identifier of the stream.

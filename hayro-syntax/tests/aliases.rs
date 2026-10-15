@@ -4,7 +4,7 @@
 //! for all the entries is read once.
 
 use hayro_syntax::Pdf;
-use hayro_syntax::object::{Array, Name, Object, ObjectIdentifier};
+use hayro_syntax::object::{Array, Name, Object, ObjectIdentifier, Stream};
 use hayro_syntax::page::{Inheritable, Inheritance};
 
 mod common;
@@ -171,4 +171,33 @@ fn a_string_a_node_many_entries_lead_to_holds_is_decrypted_once() {
         small.peak,
         large.peak
     );
+}
+
+// A stream is identified by its body: entries of the table leading to one stream
+// object find one identity, encrypted or not, so what a cache keeps of the stream
+// is made once for all of them; two streams of the same bytes are two.
+#[test]
+fn entries_leading_to_one_stream_identify_it_once() {
+    for encrypted in [true, false] {
+        let file = rc4::file_with(
+            &[
+                Part::Object("<< /Type /Catalog /Pages 2 0 R >>", b""),
+                Part::Object("<< /Type /Pages /Kids [] /Count 0 >>", b""),
+                Part::Stream(b"0 0 1 1 re f"),
+                Part::Stream(b"0 0 1 1 re f"),
+            ],
+            &[(5, 3), (6, 3)],
+            encrypted,
+        );
+        let pdf = Pdf::new(file).unwrap();
+        let identity = |n: i32| {
+            pdf.xref()
+                .get::<Stream<'_>>(ObjectIdentifier::new(n, 0))
+                .and_then(|s| s.identity())
+                .unwrap()
+        };
+        assert_eq!(identity(5), identity(3), "encrypted: {encrypted}");
+        assert_eq!(identity(6), identity(3), "encrypted: {encrypted}");
+        assert_ne!(identity(4), identity(3), "encrypted: {encrypted}");
+    }
 }

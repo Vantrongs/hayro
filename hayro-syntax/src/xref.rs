@@ -102,6 +102,17 @@ impl<'a> ContentKey<'a> {
         (self.bytes, self.document, self.decryption)
     }
 
+    /// The bytes by where they are, with the document and the decryption, where the
+    /// document has an identifier ([`StreamId`]).
+    pub(crate) fn stream_id(&self) -> Option<StreamId> {
+        let (at, document, decryption) = self.parts();
+        Some(StreamId {
+            document: document?,
+            at,
+            decryption,
+        })
+    }
+
     /// What equality, order, and hashing compare: the bytes by where they are.
     fn parts(&self) -> ((usize, usize), Option<DocumentId>, Option<ObjectIdentifier>) {
         (
@@ -136,6 +147,19 @@ impl core::hash::Hash for ContentKey<'_> {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.parts().hash(state);
     }
+}
+
+/// Identifies a stream object among the streams of every document loaded in this
+/// process ([`Stream::identity`](crate::object::Stream::identity)): its document,
+/// where its dictionary lies in the data the document holds while it is loaded, and
+/// the object whose key decrypts it. Every entry of the table that leads to one
+/// body finds one identity, and two bodies have two; a document loaded later has
+/// another [`DocumentId`], so no identity a cache holds names another's stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StreamId {
+    document: DocumentId,
+    at: (usize, usize),
+    decryption: Option<ObjectIdentifier>,
 }
 
 #[derive(Debug, Copy, Clone)]
