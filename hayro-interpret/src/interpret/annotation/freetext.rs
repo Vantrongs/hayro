@@ -18,7 +18,9 @@ use super::lines::{Ending, Paint, ending};
 use super::out::{Color, Out};
 use super::rich;
 use super::text::{self, Align, Family, Setting, Size, Span, Style, TextBox};
-use super::{Appearances, FREE_TEXT, TextKey, Unsupported, border_width, color_of, dash, rect};
+use super::{
+    Appearances, FREE_TEXT, TEXT, TextKey, Unsupported, border_width, color_of, dash, rect,
+};
 use hayro_syntax::object::dict::keys::C;
 use kurbo::{Affine, Point, Shape};
 
@@ -49,24 +51,34 @@ pub(super) fn free_text<'a>(
         _ => Align::Left,
     };
     let border_color = color;
-    // The text is made of these entries, set once for the document whatever size,
-    // colour and alignment each annotation draws it in; rich text's relative sizes
-    // are read as the default appearance's sign allows.
+    // The text, set once for the document whatever size, colour and alignment each
+    // annotation draws it in, under the entries it is read from alone: rich text
+    // and its default style; else the default style over the contents; else the
+    // contents in the default appearance's family. Rich text's relative sizes are
+    // read as the default appearance's sign allows.
     let positive = size.is_some_and(|s| s > 0.0);
-    let key = TextKey::new(
-        [Text::Contents, Text::Rich, Text::DefaultStyle].map(|t| Some(annot.text_source(t))),
-        family.into(),
-        vec![FREE_TEXT, u64::from(positive)],
-    );
-    let text = doc.shaped(key, || {
-        let rich = annot.text(Text::Rich);
-        let ds = annot.text(Text::DefaultStyle);
-        if rich.is_none() && ds.is_none() {
-            return doc.fonts.shape_plain(family, &contents(annot));
-        }
-        let spans = rich_spans(rich.as_deref(), ds.as_deref(), positive, || contents(annot))?;
-        doc.fonts.shape_rich(&spans)
-    })?;
+    let rich = annot.has_text(Text::Rich);
+    let text = if rich || annot.has_text(Text::DefaultStyle) {
+        let read = if rich {
+            [Text::Rich, Text::DefaultStyle]
+        } else {
+            [Text::DefaultStyle, Text::Contents]
+        };
+        let key = TextKey::new(
+            read.map(|t| Some(annot.text_source(t))),
+            Family::Text.into(),
+            vec![FREE_TEXT, u64::from(positive)],
+        );
+        doc.shaped(key, || {
+            let rc = rich.then(|| annot.text(Text::Rich)).flatten();
+            let ds = annot.text(Text::DefaultStyle);
+            let spans = rich_spans(rc.as_deref(), ds.as_deref(), positive, || contents(annot))?;
+            doc.fonts.shape_rich(&spans)
+        })?
+    } else {
+        let source = annot.text_source(Text::Contents);
+        doc.plain(Some(&source), family.into(), TEXT, || contents(annot))?
+    };
     // Plain text is drawn at the default appearance's size, 12 pt for a size fit to
     // the box; rich text's base size is the default appearance's, and a size fit to
     // the box is none: it is drawn 0 high, as viewers draw it.
@@ -195,10 +207,11 @@ pub(super) fn free_text<'a>(
         frame,
         clip,
     };
+    let bound = text.bound(set.base);
     text::draw_box(
         &doc.fonts,
         std::iter::once(Ok(text)),
-        (0.0, 0.0),
+        bound,
         &set,
         avail,
         ascent,

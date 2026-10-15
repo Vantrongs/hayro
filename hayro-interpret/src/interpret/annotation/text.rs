@@ -433,6 +433,13 @@ pub(super) struct Shaped {
     /// Of each span, the largest size in points and the largest multiple of the
     /// base size from it on.
     rest: Vec<(f32, f32)>,
+    /// The same of the spans under each node of a tree over them, so that the size
+    /// of any run of spans is found by a search ([`Shaped::sizes_in`]) and the spans
+    /// a box can show among them by a descent ([`Shaped::reaching`]): node 1 is all
+    /// of them, node `n` has children `2n` and `2n + 1`, and span `s` is node
+    /// `leaves + s`.
+    sizes: Vec<(f32, f32)>,
+    leaves: usize,
     /// Whether some glyph is set in points, and some at a multiple of the base size;
     /// each such size is positive (the rich text parser refuses others).
     in_points_any: bool,
@@ -525,6 +532,8 @@ impl Fonts {
             ink: None,
             widest: 0.0,
             rest: Vec::new(),
+            sizes: Vec::new(),
+            leaves: 0,
             in_points_any: false,
             in_multiples_any: false,
             rich,
@@ -580,15 +589,27 @@ impl Fonts {
         s.split();
         let mut rest = (0.0_f32, 0.0_f32);
         s.rest = vec![(0.0, 0.0); s.styles.len()];
+        s.leaves = s.styles.len().next_power_of_two();
+        s.sizes = vec![(0.0, 0.0); 2 * s.leaves];
         for (i, style) in s.styles.iter().enumerate().rev() {
-            match style.size {
-                Size::Points(p) => rest.0 = rest.0.max(p.abs()),
-                Size::Base(k) => rest.1 = rest.1.max(k.abs()),
-            }
+            let size = match style.size {
+                Size::Points(p) => (p.abs(), 0.0),
+                Size::Base(k) => (0.0, k.abs()),
+            };
+            rest = larger(rest, size);
             s.rest[i] = rest;
+            s.sizes[s.leaves + i] = size;
+        }
+        for n in (1..s.leaves).rev() {
+            s.sizes[n] = larger(s.sizes[2 * n], s.sizes[2 * n + 1]);
         }
         Ok(s)
     }
+}
+
+/// The larger of two sizes in points and of two multiples of the base size.
+fn larger(a: (f32, f32), b: (f32, f32)) -> (f32, f32) {
+    (a.0.max(b.0), a.1.max(b.1))
 }
 
 impl Shaped {
@@ -720,6 +741,88 @@ impl Shaped {
         points.max(base.abs() * multiples)
     }
 
+    /// The largest size, either way, at base size `base`, and the box around a
+    /// glyph's origin the points of every glyph lie in, as far as it reaches up or
+    /// down, in em: the bounds of what the text can draw ([`draw_box`]).
+    pub(super) fn bound(&self, base: f32) -> (f32, f64) {
+        let ink = self.ink.map_or(0.0, |r| r.y0.abs().max(r.y1.abs()));
+        (self.rest(0, base), ink)
+    }
+
+    /// The most lines the text can be laid out in at any width: a paragraph's
+    /// lines each hold a word, but for a last one of the spaces after them.
+    fn most_lines(&self) -> usize {
+        self.words.len() + self.paragraphs.len()
+    }
+
+    /// The largest size in points and the largest multiple of the base size of
+    /// spans `spans`, found by a search of the tree of their sizes.
+    fn sizes_in(&self, spans: Range<usize>) -> (f32, f32) {
+        let (mut lo, mut hi) = (self.leaves + spans.start, self.leaves + spans.end);
+        let mut sizes = (0.0, 0.0);
+        while lo < hi {
+            work(1);
+            if lo % 2 == 1 {
+                sizes = larger(sizes, self.sizes[lo]);
+                lo += 1;
+            }
+            if hi % 2 == 1 {
+                hi -= 1;
+                sizes = larger(sizes, self.sizes[hi]);
+            }
+            (lo, hi) = (lo / 2, hi / 2);
+        }
+        sizes
+    }
+
+    /// Calls `visit`, in order, with each span of `seek.range`'s glyphs some glyph
+    /// of which can reach `seek.view` across, and with others only where the
+    /// glyphs' places skip over it, among the spans under `node`, spans `under`.
+    /// The spans under a node none of whose glyphs can reach the view at the
+    /// largest size among them are passed over together, so the work grows with
+    /// the spans that can reach it, not with those of the range.
+    fn reaching(
+        &self,
+        node: usize,
+        under: Range<usize>,
+        seek: &Seek<'_>,
+        visit: &mut dyn FnMut(usize) -> Result<(), Unsupported>,
+    ) -> Result<(), Unsupported> {
+        let (first, last) = (
+            self.starts
+                .get(under.start)
+                .copied()
+                .unwrap_or(self.chars.len()),
+            self.starts
+                .get(under.end)
+                .copied()
+                .unwrap_or(self.chars.len()),
+        );
+        let (first, last) = (first.max(seek.range.start), last.min(seek.range.end));
+        if first >= last {
+            return Ok(());
+        }
+        work(1);
+        let (points, multiples) = self.sizes[node];
+        let size = f64::from(points.max(seek.base.abs() * multiples));
+        if size == 0.0 {
+            return Ok(());
+        }
+        // The glyphs run one way, so their places lie between the first's and the
+        // last's.
+        let (a, b) = ((seek.pos)(first), (seek.pos)(last - 1));
+        let far = size * seek.reach;
+        if a.min(b) - far > seek.view.x1 || a.max(b) + far < seek.view.x0 {
+            return Ok(());
+        }
+        if under.len() == 1 {
+            return visit(under.start);
+        }
+        let middle = under.start + under.len() / 2;
+        self.reaching(2 * node, under.start..middle, seek, visit)?;
+        self.reaching(2 * node + 1, middle..under.end, seek, visit)
+    }
+
     /// The lines of the text at base size `base`: a paragraph's words wrapped to
     /// fit `width` when there is one, a word wider than a line alone on its line,
     /// overflowing it, as viewers set them. Lines are laid out as they are asked
@@ -746,14 +849,17 @@ impl Shaped {
     }
 
     /// The size of glyphs `range`: the largest, or, of negative ones, the one
-    /// furthest from 0.
+    /// furthest from 0. (Sizes in points are positive, and are never set with a
+    /// negative base size: [`Shaped::direction`].)
     fn size_of(&self, range: Range<usize>, base: f32) -> f32 {
-        let (first, last) = (self.span(range.start), self.span(range.end - 1));
-        work(last - first + 1);
-        self.styles[first..=last]
-            .iter()
-            .map(|s| s.size.at(base))
-            .fold(0.0, |a: f32, b| if b.abs() > a.abs() { b } else { a })
+        let (points, multiples) =
+            self.sizes_in(self.span(range.start)..self.span(range.end - 1) + 1);
+        let multiple = base * multiples;
+        if multiple.abs() > points {
+            multiple
+        } else {
+            points
+        }
     }
 
     /// Where the line from glyph `start` of paragraph `par` ends, and where the next
@@ -776,6 +882,17 @@ impl Shaped {
         let next = self.words.get(last + 1).filter(|w| w.start < par.end);
         (self.words[last].end, next.map_or(par.end, |w| w.start))
     }
+}
+
+/// The glyphs [`Shaped::reaching`] looks among, `range`, at base size `base`, glyph
+/// `k` at `pos(k)` across, each glyph's points within `reach` em of its origin
+/// across, and the part of their frame it looks for, `view`.
+struct Seek<'p> {
+    range: Range<usize>,
+    base: f32,
+    reach: f64,
+    pos: &'p dyn Fn(usize) -> f64,
+    view: Rect,
 }
 
 /// The lines of [`Shaped`] text ([`Shaped::lines`]).
@@ -887,10 +1004,10 @@ fn partition(n: usize, pred: impl Fn(usize) -> bool) -> usize {
 
 /// Draws glyphs `range` of `text` laid out at `set`, along the baseline from
 /// `(x, y)` in `frame`, each space a justified line stretches `spacing` wider: of
-/// those, only the glyphs whose boxes can reach `view` across, a box in the frame,
-/// are looked at, by a search, and those drawn that reach `clip`, in the content's
-/// space. The work grows with the glyphs drawn, not with the text. `color` is the
-/// fill colour set so far.
+/// those, only the spans and glyphs whose boxes can reach `view` across, a box in
+/// the frame, are looked at, by searches, and those drawn that reach `clip`, in the
+/// content's space. The work grows with the glyphs drawn, not with the text.
+/// `color` is the fill colour set so far.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_glyphs(
     fonts: &Fonts,
@@ -914,10 +1031,8 @@ pub(super) fn draw_glyphs(
     let x0 = text.x(range.start, set.base);
     let pos =
         |k: usize| x + (text.x(k, set.base) - x0) + spacing * text.stretched(range.start..k) as f64;
-    let mut span = text.span(range.start);
-    let mut i = range.start;
-    while i < range.end {
-        work(1);
+    let mut draw_span = |span: usize| -> Result<(), Unsupported> {
+        let i = text.starts[span].max(range.start);
         let end = text
             .starts
             .get(span + 1)
@@ -926,42 +1041,49 @@ pub(super) fn draw_glyphs(
             .min(range.end);
         let style = &text.styles[span];
         let size = style.size.at(set.base);
-        if size != 0.0 {
-            let s = f64::from(size);
-            let (a, b) = (ink.x0 * s, ink.x1 * s);
-            let (lo, hi) = (a.min(b), a.max(b));
-            let n = end - i;
-            // The glyphs run right at a positive size, left at a negative one.
-            let (first, last) = if size > 0.0 {
-                (
-                    partition(n, |j| pos(i + j) + hi < view.x0),
-                    partition(n, |j| pos(i + j) + lo <= view.x1),
-                )
-            } else {
-                (
-                    partition(n, |j| pos(i + j) + lo > view.x1),
-                    partition(n, |j| pos(i + j) + hi >= view.x0),
-                )
-            };
-            if first < last {
-                let c = style.color.unwrap_or(set.color);
-                if *color != Some(c) {
-                    fail(out.fill_color(&c))?;
-                    *color = Some(c);
-                }
-                let mut pen = Pen::new(frame, size, (pos(i), y));
-                for k in i + first..i + last {
-                    work(1);
-                    let g = fonts.glyph(style.face, text.chars[k])?;
-                    fail(pen.put(out, pos(k), &g.face.outline(g.id), clip))?;
-                }
-                pen.end(out);
-            }
+        if size == 0.0 {
+            return Ok(());
         }
-        i = end;
-        span += 1;
-    }
-    Ok(())
+        let s = f64::from(size);
+        let (a, b) = (ink.x0 * s, ink.x1 * s);
+        let (lo, hi) = (a.min(b), a.max(b));
+        let n = end - i;
+        // The glyphs run right at a positive size, left at a negative one.
+        let (first, last) = if size > 0.0 {
+            (
+                partition(n, |j| pos(i + j) + hi < view.x0),
+                partition(n, |j| pos(i + j) + lo <= view.x1),
+            )
+        } else {
+            (
+                partition(n, |j| pos(i + j) + lo > view.x1),
+                partition(n, |j| pos(i + j) + hi >= view.x0),
+            )
+        };
+        if first < last {
+            let c = style.color.unwrap_or(set.color);
+            if *color != Some(c) {
+                fail(out.fill_color(&c))?;
+                *color = Some(c);
+            }
+            let mut pen = Pen::new(frame, size, (pos(i), y));
+            for k in i + first..i + last {
+                work(1);
+                let g = fonts.glyph(style.face, text.chars[k])?;
+                fail(pen.put(out, pos(k), &g.face.outline(g.id), clip))?;
+            }
+            pen.end(out);
+        }
+        Ok(())
+    };
+    let seek = Seek {
+        range: range.clone(),
+        base: set.base,
+        reach: ink.x0.abs().max(ink.x1.abs()),
+        pos: &pos,
+        view,
+    };
+    text.reaching(1, 0..text.leaves, &seek, &mut draw_span)
 }
 
 /// Draws `text` on one line, line breaks as spaces, along the baseline from
@@ -1020,6 +1142,12 @@ pub(super) fn draw_rows(
     }
     // How far a glyph's points lie from its baseline, up or down.
     let reach = ink.y0.abs().max(ink.y1.abs()) * f64::from(size.abs());
+    // Line `j`'s baseline lies at `top - (j + 1) step`, and the text makes no more
+    // lines than it can at any width: none is laid out when none can reach.
+    let end = top - text.most_lines() as f64 * step;
+    if (step > 0.0 && end - reach > seen.y1) || (step < 0.0 && end + reach < seen.y0) {
+        return Ok(());
+    }
     let mut color = Some(set.color);
     for (j, line) in text
         .lines(size, Some(f64::from(avail)), Align::Left)
@@ -1098,13 +1226,15 @@ pub(super) struct TextBox {
 /// paragraphs are theirs (as list options joined with line breaks are), laid out
 /// at `set` in `avail`, each line's first baseline `ascent` times its size below
 /// its top, in `area`: the lines that can reach both its clip and `seen`, laid out
-/// up to the last that can; the sizes and glyph boxes of pieces not reached are
-/// within `later`, in points and in em around a glyph's origin, either way.
+/// up to the last that can, and of the last piece none when none can. The sizes
+/// and glyph boxes of every piece are within `bound`, in points and in em around a
+/// glyph's origin, either way ([`Shaped::bound`]): pieces drawn 0 high are not
+/// made.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_box(
     fonts: &Fonts,
     pieces: impl Iterator<Item = Result<Rc<Shaped>, Unsupported>>,
-    later: (f32, f64),
+    bound: (f32, f64),
     set: &Setting,
     avail: f32,
     ascent: f32,
@@ -1113,7 +1243,9 @@ pub(super) fn draw_box(
     out: &mut Out,
 ) -> Result<(), Unsupported> {
     let shown = area.clip.intersect(seen);
-    if !(shown.width() >= 0.0 && shown.height() >= 0.0) {
+    // A size of 0 draws nothing (and needs nothing checked: such text is never
+    // refused for the way it runs, [`Shaped::direction`]).
+    if !(shown.width() >= 0.0 && shown.height() >= 0.0) || bound.0 == 0.0 {
         return Ok(());
     }
     let view = area.frame.inverse().transform_rect_bbox(shown);
@@ -1132,10 +1264,32 @@ pub(super) fn draw_box(
             way = Some(direction);
         }
         let mut lines = text.lines(set.base, Some(f64::from(avail)), set.align);
-        if pieces.peek().is_some() {
+        let last = pieces.peek().is_none();
+        // The pieces after this one, whose sizes and glyphs are within the bound.
+        let later = if last {
+            (0.0, 0.0)
+        } else {
             lines = lines.without_last_paragraph();
-        }
+            bound
+        };
         let ink = text.ink.map_or(0.0, |r| r.y0.abs().max(r.y1.abs()));
+        if last {
+            // The last piece: its lines lie within 1.2 times its largest size of
+            // each other, as many as it can make at most, and its glyphs within
+            // its reach of their baselines; none is laid out when none can reach
+            // the view so.
+            let size = f64::from(text.rest(0, set.base));
+            let depth = text.most_lines() as f64 * 1.2 * size;
+            let (start, reach) = (f64::from(top - height), ink * size);
+            let unreached = match direction {
+                Direction::Forward => start - depth - reach > view.y1,
+                Direction::Backward => start + depth + reach < view.y0,
+                Direction::Nowhere => true,
+            };
+            if unreached {
+                return Ok(());
+            }
+        }
         for line in lines {
             let below = height + ascent * line.size;
             height += 1.2 * line.size;

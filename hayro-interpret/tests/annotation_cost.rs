@@ -917,3 +917,250 @@ fn a_drawn_glyph_costs_a_few_bytes() {
         assert!(per_glyph <= 32, "{per_glyph} bytes a glyph");
     }
 }
+
+/// A text is set once for the entries it is read from, and only those: annotations
+/// sharing rich text, each with a plain fallback of its own that the rich text
+/// hides, set the rich text once.
+#[test]
+fn a_text_is_keyed_by_the_entries_it_is_read_from() {
+    let rich = vec![format!("(<p>{}</p>)", long_text())];
+    shared_once("", &rich, |i| {
+        format!(
+            "/Subtype /FreeText /BS << /W 0 >> /RC 4 0 R /Contents (A{i}) \
+             /Rect [10 10 110 40] /DA (/Helv 12 Tf 0 g)"
+        )
+    });
+    shared_once("", &rich, |i| {
+        format!(
+            "/Subtype /Widget /FT /Tx /Ff 33554432 /V (A{i}) /RV 4 0 R \
+             /Rect [10 10 110 40] /DA (/Helv 12 Tf 0 g)"
+        )
+    });
+}
+
+/// An option held in a pair of its own, which many entries of `/Opt` refer to, is
+/// one text: lists scrolled to different entries, or holding the pair in `/Opt`
+/// arrays of their own, set it once.
+#[test]
+fn an_option_in_a_shared_pair_is_set_once() {
+    let pair = format!("[(e) ({})]", long_text());
+    let opt = format!("[{}]", vec!["5 0 R"; 200].join(" "));
+    for rich in ["", "/DS (font-size:12pt)"] {
+        shared_once("", &[opt.clone(), pair.clone()], |i| {
+            format!(
+                "/Subtype /Widget /FT /Ch /Opt 4 0 R /TI {i} {rich} /Rect [10 10 110 60] \
+                 /DA (/Helv 12 Tf 0 g)"
+            )
+        });
+        shared_once("", std::slice::from_ref(&pair), |_| {
+            format!(
+                "/Subtype /Widget /FT /Ch /Opt [4 0 R 4 0 R] {rich} /Rect [10 10 110 60] \
+                 /DA (/Helv 12 Tf 0 g)"
+            )
+        });
+    }
+}
+
+/// Rich text of 20,000 spans, one word that overflows its line: an annotation that
+/// shows the start of it sizes its line and finds the spans it draws by searches,
+/// not by a pass over the spans its box does not show.
+#[test]
+fn spans_a_box_does_not_show_are_not_walked() {
+    let spans: String = (0..10_000)
+        .map(|_| "<span style=\"color:#ff0000\">A</span><span style=\"color:#0000ff\">B</span>")
+        .collect();
+    let rich = vec![format!("(<p>{spans}</p>)")];
+    shared_once("", &rich, |_| {
+        "/Subtype /FreeText /BS << /W 0 >> /RC 4 0 R /Rect [10 10 110 40] \
+         /DA (/Helv 12 Tf 0 g)"
+            .to_owned()
+    });
+    shared_once("", &rich, |_| {
+        "/Subtype /Widget /FT /Tx /Ff 33554432 /RV 4 0 R /Rect [10 10 110 40] \
+         /DA (/Helv 12 Tf 0 g)"
+            .to_owned()
+    });
+}
+
+/// Text whose lines all lie above the page, however many it can make, is not laid
+/// out: a `FreeText` and a multiline field two million points high, plain and rich.
+#[test]
+fn text_that_cannot_reach_the_page_is_not_laid_out() {
+    let text = vec![format!("({})", long_text())];
+    let rich = vec![format!("(<p>{}</p>)", long_text())];
+    let tall = "/Rect [10 -1000000 110 1000000] /DA (/Helv 12 Tf 0 g)";
+    shared_once("", &text, |_| {
+        format!("/Subtype /FreeText /BS << /W 0 >> /Contents 4 0 R {tall}")
+    });
+    shared_once("", &rich, |_| {
+        format!("/Subtype /FreeText /BS << /W 0 >> /RC 4 0 R {tall}")
+    });
+    shared_once("", &text, |_| {
+        format!("/Subtype /Widget /FT /Tx /Ff 4096 /V 4 0 R {tall}")
+    });
+    shared_once("", &rich, |_| {
+        format!("/Subtype /Widget /FT /Tx /Ff 33554432 /RV 4 0 R {tall}")
+    });
+}
+
+/// The cost of looking `n` times at one annotation, `annot`, which a page's
+/// `/Annots` names `n` times.
+fn repeated_cost(n: usize, annot: &str) -> Cost {
+    let pdf = Pdf::new(common::one_page(
+        200,
+        &format!("/Annots [{}]", vec!["4 0 R"; n].join(" ")),
+        vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
+    ))
+    .expect("valid pdf");
+    let annots: Vec<Dict<'_>> = pdf.pages()[0]
+        .raw()
+        .get::<Array<'_>>(b"Annots")
+        .unwrap()
+        .iter::<Dict<'_>>()
+        .collect();
+    let (bytes, work) = (allocated(), work_done());
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    for a in &annots {
+        assert!(matches!(appearances.look(a, PAGE), Look::Generated(_)));
+    }
+    Cost {
+        bytes: allocated() - bytes,
+        work: work_done() - work,
+    }
+}
+
+/// Whether an annotation is an object of its own is found once for the document: an
+/// annotation `/Annots` names many times, with a long entry it does not draw, is not
+/// read again for each time.
+#[test]
+fn an_annotation_named_again_is_not_read_again() {
+    let annot = format!(
+        "/Subtype /Square /C [0] /Rect [10 10 110 40] /Unused [{}]",
+        "0 ".repeat(20_000)
+    );
+    let (one, two) = (repeated_cost(40, &annot), repeated_cost(80, &annot));
+    let (bytes, work) = (two.bytes - one.bytes, two.work - one.work);
+    assert!(
+        bytes < 40 * (16 << 10) && work < 40 * 1_000,
+        "{one:?} for 40, {two:?} for 80"
+    );
+}
+
+/// A list whose options are drawn 0 high, as with a default appearance size of 0
+/// and a default style that sets no size, draws none and looks at none: lists
+/// sharing 20,000 options cost what one without options does. The labels a list
+/// looks at are set before and cost no work, so the bytes tell.
+#[test]
+fn a_list_drawn_0_high_looks_at_no_option() {
+    let options = vec![format!(
+        "[{}]",
+        (0..20_000).map(|i| format!("(o{i}) ")).collect::<String>()
+    )];
+    shared_once("", &options, |_| {
+        "/Subtype /Widget /FT /Ch /Opt 4 0 R /DS (color:#ff0000) /Rect [10 10 110 60] \
+         /MK << /BG [1 1 0] >> /DA (/Helv 0 Tf 0 g)"
+            .to_owned()
+    });
+}
+
+/// Not a check but a measure, of what is left open: text whose box starts far
+/// above the page and reaches it is laid out from its first line for each
+/// annotation, down to the lines the page shows, as greedy line breaking at one
+/// width tells nothing of the lines at another. Prints the work and bytes of `n`
+/// `FreeText`s and multiline fields sharing a text of 3,636 words, laid out in some
+/// thousand lines above the page, each at a width of its own or all at one, and,
+/// for comparison, with the text's top on the page. `HIDDEN_PREFIX_N` runs one `n`
+/// and kind alone (`HIDDEN_PREFIX_KIND`: 0–5 in the order printed), for counting
+/// instructions with `perf stat`.
+#[test]
+#[ignore = "a measure, run by hand"]
+fn hidden_prefix_cost() {
+    let text = vec![format!("({})", long_text())];
+    let thousandths = |i: usize| format!("{}.{:03}", 100 + i / 1000, i % 1000);
+    let kinds: [(&str, Box<dyn Fn(usize) -> String>); 6] = [
+        (
+            "FreeText, widths of their own, top 15000",
+            Box::new(move |i| {
+                format!(
+                    "/Subtype /FreeText /BS << /W 0 >> /Contents 4 0 R /Rect [10 0 {} 15000] \
+                     /DA (/Helv 12 Tf 0 g)",
+                    thousandths(i)
+                )
+            }),
+        ),
+        (
+            "FreeText, one width, top 15000",
+            Box::new(|_| {
+                "/Subtype /FreeText /BS << /W 0 >> /Contents 4 0 R /Rect [10 0 110 15000] \
+                 /DA (/Helv 12 Tf 0 g)"
+                    .to_owned()
+            }),
+        ),
+        (
+            "FreeText, widths of their own, top 200",
+            Box::new(move |i| {
+                format!(
+                    "/Subtype /FreeText /BS << /W 0 >> /Contents 4 0 R /Rect [10 0 {} 200] \
+                     /DA (/Helv 12 Tf 0 g)",
+                    thousandths(i)
+                )
+            }),
+        ),
+        (
+            "multiline field, widths of their own, top 15000",
+            Box::new(move |i| {
+                format!(
+                    "/Subtype /Widget /FT /Tx /Ff 4096 /V 4 0 R /Rect [10 0 {} 15000] \
+                     /DA (/Helv 12 Tf 0 g)",
+                    thousandths(i)
+                )
+            }),
+        ),
+        (
+            "multiline field, one width, top 15000",
+            Box::new(|_| {
+                "/Subtype /Widget /FT /Tx /Ff 4096 /V 4 0 R /Rect [10 0 110 15000] \
+                 /DA (/Helv 12 Tf 0 g)"
+                    .to_owned()
+            }),
+        ),
+        (
+            "multiline field, widths of their own, top 200",
+            Box::new(move |i| {
+                format!(
+                    "/Subtype /Widget /FT /Tx /Ff 4096 /V 4 0 R /Rect [10 0 {} 200] \
+                     /DA (/Helv 12 Tf 0 g)",
+                    thousandths(i)
+                )
+            }),
+        ),
+    ];
+    let alone = std::env::var("HIDDEN_PREFIX_N")
+        .ok()
+        .and_then(|n| n.parse::<usize>().ok());
+    if let Some(n) = alone {
+        let kind: usize = std::env::var("HIDDEN_PREFIX_KIND")
+            .ok()
+            .and_then(|k| k.parse().ok())
+            .unwrap_or(0);
+        let cost = cost_of(n, "", &text, &*kinds[kind].1);
+        println!("{} n={n}: {cost:?}", kinds[kind].0);
+        return;
+    }
+    for (name, annot) in &kinds {
+        let costs: Vec<Cost> = [40, 80, 160]
+            .iter()
+            .map(|&n| cost_of(n, "", &text, &**annot))
+            .collect();
+        println!(
+            "{name}: 40 {:?}, 80 {:?}, 160 {:?}; per added annotation: work {} {}, bytes {} {}",
+            costs[0],
+            costs[1],
+            costs[2],
+            (costs[1].work - costs[0].work) / 40,
+            (costs[2].work - costs[1].work) / 80,
+            (costs[1].bytes - costs[0].bytes) / 40,
+            (costs[2].bytes - costs[1].bytes) / 80,
+        );
+    }
+}

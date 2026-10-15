@@ -180,6 +180,20 @@ enum Held {
     Item(Box<Self>, usize),
 }
 
+impl Held {
+    /// Where entry `i` of an array held at `array()` is held: the object `r` it
+    /// refers to, else its place in that array; `None` where the array is held
+    /// nowhere a key names and the entry refers to no object. A value nested in a
+    /// shared object is so known by that object and its path inside it, however it
+    /// was reached.
+    fn item(array: impl FnOnce() -> Option<Self>, r: Option<ObjRef>, i: usize) -> Option<Self> {
+        match r {
+            Some(r) => Some(Self::Object(r)),
+            None => array().map(|a| Self::Item(Box::new(a), i)),
+        }
+    }
+}
+
 /// A document's objects that its annotations refer to, read from the file once
 /// ([`Objects::new`]): reading an object costs as much as it is long, which the
 /// annotations that share it must not each pay. So each object a reference names is
@@ -202,13 +216,20 @@ type Place = (usize, usize);
 /// Entries read of a dictionary, by key.
 type Keyed<'a> = FxHashMap<Box<[u8]>, Found<'a>>;
 
+/// An entry read of an array, and the object it refers to.
+type Item<'a> = (Found<'a>, Option<ObjRef>);
+
 struct Read<'a> {
     xref: &'a XRef,
     objects: RefCell<FxHashMap<ObjRef, Found<'a>>>,
     /// The entries read of dictionaries in shared objects.
     entries: RefCell<FxHashMap<Place, Keyed<'a>>>,
-    /// The first entries read of arrays in shared objects, and whether they are all.
-    prefixes: RefCell<FxHashMap<Place, (Vec<Found<'a>>, bool)>>,
+    /// The first entries read of arrays in shared objects, each with the object it
+    /// refers to, and whether they are all.
+    prefixes: RefCell<FxHashMap<Place, (Vec<Item<'a>>, bool)>>,
+    /// Where the data of each object an annotation's own-ness was told by lies, or
+    /// `None` when it is no dictionary, array or stream ([`Objects::own`]).
+    places: RefCell<FxHashMap<ObjRef, Option<Place>>>,
 }
 
 /// An object as it was read: a string's bytes shared, as they may have been
@@ -252,6 +273,7 @@ impl<'a> Objects<'a> {
                 objects: RefCell::default(),
                 entries: RefCell::default(),
                 prefixes: RefCell::default(),
+                places: RefCell::default(),
             })),
             shared: false,
         }
@@ -281,44 +303,46 @@ impl<'a> Objects<'a> {
     }
 }
 
-/// Whether `inner` lies within `outer`, both data the document holds.
-fn within(inner: &[u8], outer: &[u8]) -> bool {
-    let (i, o) = (inner.as_ptr_range(), outer.as_ptr_range());
-    o.start <= i.start && i.end <= o.end
-}
-
 impl<'a> Objects<'a> {
     /// Whether `dict` is an object of its own, rather than held directly in another,
     /// as an annotation written into a page's `/Annots` is; `None` where the file
     /// tells neither: the object `dict` names as its own is neither it nor one that
     /// holds it. A dictionary read without objects, or of no object, is taken as
-    /// one of its own.
+    /// one of its own. Each object is read for this once for the document, and of
+    /// it only where its data lies is kept.
     fn own(&self, dict: &Dict<'a>) -> Option<bool> {
         let (Some(read), Some(id)) = (&self.read, dict.obj_id()) else {
             return Some(true);
         };
         let r = ObjRef::from(id);
-        let at = dict.data();
-        let known = read.objects.borrow().get(&r).cloned();
-        let found = known.unwrap_or_else(|| {
-            let found = Found::read(read.xref.get::<Object<'a>>(id));
-            // An object that holds annotations is kept for the others it holds;
-            // an annotation's own object, which no other reads, is not.
-            if !matches!(&found, Found::Object(Object::Dict(d)) if place(d.data()) == place(at)) {
-                read.objects.borrow_mut().insert(r, found.clone());
-            }
-            found
+        let at = place(dict.data());
+        let known = read.places.borrow().get(&r).copied();
+        let outer = known.unwrap_or_else(|| {
+            let known = read.objects.borrow().get(&r).cloned();
+            let found = known.unwrap_or_else(|| {
+                let found = Found::read(read.xref.get::<Object<'a>>(id));
+                // An object that holds annotations is kept for the others it holds;
+                // an annotation's own object, which no other reads, is not.
+                if !matches!(&found, Found::Object(Object::Dict(d)) if place(d.data()) == at) {
+                    read.objects.borrow_mut().insert(r, found.clone());
+                }
+                found
+            });
+            let outer = match &found {
+                Found::Object(Object::Dict(d)) => Some(place(d.data())),
+                Found::Object(Object::Array(a)) => Some(place(a.data())),
+                Found::Object(Object::Stream(s)) => Some(place(s.dict().data())),
+                _ => None,
+            };
+            read.places.borrow_mut().insert(r, outer);
+            outer
         });
-        let data = match &found {
-            Found::Object(Object::Dict(d)) => d.data(),
-            Found::Object(Object::Array(a)) => a.data(),
-            Found::Object(Object::Stream(s)) => s.dict().data(),
-            _ => return None,
-        };
-        if place(data) == place(at) {
+        let (start, len) = outer?;
+        if (start, len) == at {
             Some(true)
         } else {
-            within(at, data).then_some(false)
+            // Held within the object's data.
+            (start <= at.0 && at.0 + at.1 <= start + len).then_some(false)
         }
     }
 }
@@ -394,6 +418,15 @@ impl<'a> Value<'a> {
         }
     }
 
+    /// Whether [`Value::text`] gives text, told without copying it.
+    pub(crate) fn is_text(&self, entry: Text) -> bool {
+        match self {
+            Self::String(_) => true,
+            Self::Stream(s) => entry.stream() && s.decoded().is_ok(),
+            _ => false,
+        }
+    }
+
     /// The bytes of text entry `entry` whose value this is: a string's, or, where
     /// viewers read one, a stream's decoded data.
     pub(crate) fn text(&self, entry: Text) -> Option<Vec<u8>> {
@@ -428,11 +461,13 @@ impl<'a> Items<'a> {
         }
     }
 
-    /// The first `n` entries, or all when there are fewer; those after them are not
-    /// read, and in a shared object these are read once.
-    fn prefix(&self, n: usize) -> Vec<Value<'a>> {
+    /// The first `n` entries, or all when there are fewer, each with the object it
+    /// refers to; those after them are not read, and in a shared object these are
+    /// read once.
+    fn prefix(&self, n: usize) -> Vec<(Value<'a>, Option<ObjRef>)> {
         let Some(read) = self.1.read.as_ref().filter(|_| self.1.shared) else {
-            return self.iter().take(n).collect();
+            let refs = self.0.raw_iter().map(|e| e.as_obj_ref());
+            return self.iter().zip(refs).take(n).collect();
         };
         let at = place(self.0.data());
         let known = read.prefixes.borrow().get(&at).cloned();
@@ -440,10 +475,11 @@ impl<'a> Items<'a> {
             Some((found, all)) if all || found.len() >= n => found,
             _ => {
                 let mut entries = self.0.raw_iter();
-                let found: Vec<Found<'a>> = entries
+                let found: Vec<Item<'a>> = entries
                     .by_ref()
                     .take(n)
-                    .map(|e| self.1.found(read, Some(e)).0)
+                    .map(|e| (e.as_obj_ref(), e))
+                    .map(|(r, e)| (self.1.found(read, Some(e)).0, r))
                     .collect();
                 let all = found.len() < n || entries.next().is_none();
                 read.prefixes.borrow_mut().insert(at, (found.clone(), all));
@@ -454,13 +490,33 @@ impl<'a> Items<'a> {
         found
             .into_iter()
             .take(n)
-            .map(|f| Value::of(f, &self.1))
+            .map(|(f, r)| (Value::of(f, &self.1), r))
             .collect()
+    }
+
+    /// Entry `i`, and the object it refers to; [`Value::Null`] beyond the end.
+    fn entry(&self, i: usize) -> (Value<'a>, Option<ObjRef>) {
+        match &self.1.read {
+            // Of an annotation's own, the entries before it are not kept.
+            Some(read) if !self.1.shared => match self.0.raw_iter().nth(i) {
+                Some(e) => {
+                    let r = e.as_obj_ref();
+                    let (found, objects) = self.1.found(read, Some(e));
+                    (Value::of(found, &objects), r)
+                }
+                None => (Value::Null, None),
+            },
+            _ => self
+                .prefix(i + 1)
+                .into_iter()
+                .nth(i)
+                .unwrap_or((Value::Null, None)),
+        }
     }
 
     /// Entry `i`; [`Value::Null`] beyond the end.
     pub(crate) fn get(&self, i: usize) -> Value<'a> {
-        self.prefix(i + 1).into_iter().nth(i).unwrap_or(Value::Null)
+        self.entry(i).0
     }
 
     /// The entries as numbers, one that is not a number read as 0.
@@ -473,13 +529,13 @@ impl<'a> Items<'a> {
     pub(crate) fn first(&self, n: usize) -> Vec<f64> {
         self.prefix(n)
             .iter()
-            .map(|v| v.number().unwrap_or(0.0))
+            .map(|(v, _)| v.number().unwrap_or(0.0))
             .collect()
     }
 
     /// The labels of the options of `/Opt` array, held in `source`: of each entry,
     /// the text it shows, after its export value in a pair or alone, and where it is
-    /// held, so that a document sets an option many lists show once.
+    /// held ([`Held::item`]), so that a document sets an option many lists show once.
     pub(crate) fn labels(&self, source: Option<&Source>) -> Vec<Label<'a>> {
         self.0
             .raw_iter()
@@ -487,16 +543,13 @@ impl<'a> Items<'a> {
             .enumerate()
             .map(|(i, (raw, value))| {
                 super::work(1);
-                let (r, value) = match value {
+                let entry = || Held::item(|| source.map(|s| s.held.clone()), raw.as_obj_ref(), i);
+                let (held, value) = match value {
                     Value::Array(pair) => {
-                        let second = pair.0.raw_iter().nth(1);
-                        (second.and_then(|e| e.as_obj_ref()), pair.get(1))
+                        let (value, r) = pair.entry(1);
+                        (Held::item(entry, r, 1), value)
                     }
-                    value => (raw.as_obj_ref(), value),
-                };
-                let held = match r {
-                    Some(r) => Some(Held::Object(r)),
-                    None => source.map(|s| Held::Item(Box::new(s.held.clone()), i)),
+                    value => (entry(), value),
                 };
                 Label {
                     source: held.map(|held| Source { held, key: b"Opt" }),
@@ -589,6 +642,11 @@ impl<'a> Entries<'a> {
     /// The bytes of text entry `entry` ([`Value::text`]).
     pub(crate) fn text(&self, entry: Text) -> Option<Vec<u8>> {
         self.get(entry.key()).text(entry)
+    }
+
+    /// Whether text entry `entry` gives text ([`Value::is_text`]).
+    pub(crate) fn has_text(&self, entry: Text) -> bool {
+        self.get(entry.key()).is_text(entry)
     }
 
     pub(crate) fn dict(&self, key: &[u8]) -> Option<Self> {
