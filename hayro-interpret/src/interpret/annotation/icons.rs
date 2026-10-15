@@ -319,7 +319,7 @@ pub(super) fn caret(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
 /// point without `/QuadPoints`, clipped to `/Rect`.
 pub(super) fn redact(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     // Without quadrilaterals, as with an empty `/QuadPoints`, the box.
-    let Some(quads) = quads(annot).filter(|q| !q.is_empty()) else {
+    let Some(quads) = quads(annot).filter(|q| !q.all.is_empty()) else {
         // Clipped to the box, as viewers clip it, so that a box under two points
         // wide shows only the part of the outline within it.
         let r = rect(annot)?;
@@ -334,6 +334,7 @@ pub(super) fn redact(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
         return Some(());
     };
     let clip = quads
+        .all
         .iter()
         .map(|q| q.bounds(1.0))
         .reduce(|a, b| a.union(b))?;
@@ -341,7 +342,7 @@ pub(super) fn redact(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     out.clip(clip)?;
     out.op("1 0 0 RG");
     out.stroke_state(1.0, &[])?;
-    for Quad([tl, tr, bl, br]) in quads {
+    for &Quad([tl, tr, bl, br]) in &quads.all {
         out.nums(&[bl.x, bl.y], "m")?;
         for p in [br, tr, tl] {
             out.nums(&[p.x, p.y], "l")?;

@@ -6,11 +6,12 @@
 //! common viewers draw, and clipped as they clip them: to the box of the
 //! quadrilaterals, a line width wider on each side.
 
-use super::entries::{Entries, Value};
+use super::entries::{Derived, Entries, Items, Value};
 use super::out::{Color, Out};
 use super::{FINEST, Unsupported, border_width, c_color, color_of, dash, rect};
 use hayro_syntax::object::dict::keys::{C, IC, INKLIST, QUADPOINTS};
 use kurbo::{Point, Rect, Vec2};
+use std::rc::Rc;
 
 /// Square and Circle: /IC fills the shape, /C strokes it at the border width, inside
 /// `/Rect` less `/RD`. Unlike `PDFium`, an absent `/C` means no border: the spec gives
@@ -95,13 +96,25 @@ impl Quad {
     }
 }
 
-/// The quadrilaterals of `/QuadPoints`, every number in its place; a last one cut
-/// short has 0 for the coordinates it lacks. `None` when there is no such array.
-pub(super) fn quads(annot: &Entries<'_>) -> Option<Vec<Quad>> {
-    let mut n = annot.items(QUADPOINTS)?.numbers();
-    n.resize(n.len().next_multiple_of(8), 0.0);
-    Some(
-        n.as_chunks::<8>()
+/// The quadrilaterals of a `/QuadPoints` array, every number in its place; a last
+/// one cut short has 0 for the coordinates it lacks. Made once for the document
+/// ([`Derived`]), with what text markup draws of them, which annotations sharing
+/// the array each look up rather than walk it.
+pub(super) struct Quads {
+    pub(super) all: Vec<Quad>,
+    /// The box of each, a line width wider on each side; `None` when it has no
+    /// area ([`marked`]).
+    clip: Option<Rect>,
+    /// Those of some height, which a squiggly draws.
+    high: Vec<Quad>,
+}
+
+impl Derived for Quads {
+    fn derive(items: &Items<'_>) -> Self {
+        let mut n = items.numbers();
+        n.resize(n.len().next_multiple_of(8), 0.0);
+        let all: Vec<Quad> = n
+            .as_chunks::<8>()
             .0
             .iter()
             .map(|q| {
@@ -112,8 +125,18 @@ pub(super) fn quads(annot: &Entries<'_>) -> Option<Vec<Quad>> {
                     Point::new(q[6], q[7]),
                 ])
             })
-            .collect(),
-    )
+            .collect();
+        let clip = union(all.iter().map(|q| q.bounds(line_width(q))))
+            .filter(|clip| clip.width() > 0.0 && clip.height() > 0.0);
+        let high = all.iter().filter(|q| q.height() > 0.0).copied().collect();
+        Self { all, clip, high }
+    }
+}
+
+/// The quadrilaterals of `/QuadPoints` ([`Quads`]); `None` when there is no such
+/// array.
+pub(super) fn quads(annot: &Entries<'_>) -> Option<Rc<Quads>> {
+    Some(annot.items(QUADPOINTS)?.derived::<Quads>())
 }
 
 /// The width of a text markup line on `quad`: a sixteenth of its height.
@@ -129,10 +152,10 @@ fn union(boxes: impl IntoIterator<Item = Rect>) -> Option<Rect> {
 /// The quadrilaterals of a text markup annotation and the box viewers clip it to: the
 /// box of each, a line width wider on each side. `None` without quadrilaterals, or
 /// when that box has no area: quadrilaterals of no height mark no text.
-fn marked(annot: &Entries<'_>) -> Option<(Vec<Quad>, Rect)> {
+fn marked(annot: &Entries<'_>) -> Option<(Rc<Quads>, Rect)> {
     let quads = quads(annot)?;
-    let clip = union(quads.iter().map(|q| q.bounds(line_width(q))))?;
-    (clip.width() > 0.0 && clip.height() > 0.0).then_some((quads, clip))
+    let clip = quads.clip?;
+    Some((quads, clip))
 }
 
 /// Highlight: each quad filled with /C (default yellow), blended with Multiply, its
@@ -143,8 +166,9 @@ pub(super) fn highlight(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     let fill = c_color(annot, Color::Rgb([1.0, 1.0, 0.0]));
     let (quads, around) = marked(annot)?;
     let shapes: Vec<(Quad, Option<[Point; 4]>)> = quads
-        .into_iter()
-        .map(|q| {
+        .all
+        .iter()
+        .map(|&q| {
             let [tl, tr, bl, br] = q.0;
             // √2/6 of the height, on each axis of the turned quad.
             let k = q.height() * std::f64::consts::SQRT_2 / 6.0;
@@ -198,7 +222,7 @@ pub(super) fn text_lines(annot: &Entries<'_>, line: Line, out: &mut Out) -> Opti
     out.op("q");
     out.clip(clip)?;
     out.stroke_color(&stroke)?;
-    for q in &quads {
+    for q in &quads.all {
         out.stroke_state(line_width(q), &[])?;
         let (a, b) = q.across(match line {
             Line::Under => 1.0 / 7.0,
@@ -231,7 +255,8 @@ pub(super) fn squiggly(
     wrote(out.stroke_color(&stroke))?;
     if visible.overlaps(clip) {
         let shown = visible.intersect(clip);
-        for q in &quads {
+        // A quad of no height draws nothing ([`zigzag`]).
+        for q in &quads.high {
             zigzag(q, shown, out)?;
         }
     }
@@ -346,28 +371,38 @@ fn clip_line(from: Point, along: Vec2, end: f64, r: Rect) -> Option<(f64, f64)> 
 pub(super) fn ink(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     let width = border_width(annot);
     let stroke = color_of(annot, C)?;
-    let list = annot.items(INKLIST)?;
+    let paths = annot.items(INKLIST)?.derived::<Paths>();
+    if paths.0.is_empty() {
+        return None;
+    }
     out.stroke_color(&stroke)?;
     out.stroke_state(width, &dash(annot))?;
     // Round ends and corners, as a pen draws.
     out.op("1 J 1 j");
-    let mut drew = false;
-    for path in list.iter().filter_map(Value::items) {
-        let p = path.numbers();
-        if p.len() < 2 {
-            continue;
-        }
+    for p in &paths.0 {
         out.nums(&p[..2], "m")?;
         // A path of one point is a dot.
         let rest = if p.len() < 4 { &p[..2] } else { &p[2..] };
         for pt in rest.as_chunks::<2>().0 {
             out.nums(pt, "l")?;
         }
-        drew = true;
     }
     // One stroke of all paths, as viewers draw it: where paths cross, a translucent
     // ink is laid once.
-    drew.then(|| out.op("S"))
+    out.op("S");
+    Some(())
+}
+
+/// The paths of an `/InkList` that draw, the numbers of each, at least two: made
+/// once for the document ([`Derived`]), so that annotations sharing a list walk
+/// what it holds that draws nothing once.
+struct Paths(Vec<Vec<f64>>);
+
+impl Derived for Paths {
+    fn derive(items: &Items<'_>) -> Self {
+        let paths = items.iter().filter_map(Value::items).map(|p| p.numbers());
+        Self(paths.filter(|p| p.len() >= 2).collect())
+    }
 }
 
 #[cfg(test)]

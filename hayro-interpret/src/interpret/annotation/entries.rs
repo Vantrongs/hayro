@@ -16,6 +16,7 @@ use hayro_syntax::hash;
 use hayro_syntax::lost::Lost;
 use hayro_syntax::object::{Array, Dict, MaybeRef, Name, Number, ObjRef, Object, Stream};
 use hayro_syntax::xref::{ContentKey, XRef};
+use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -243,6 +244,22 @@ struct Read<'a> {
     /// Where the data of each object an annotation's own-ness was told by lies, or
     /// `None` when it is no dictionary, array or stream ([`Objects::own`]).
     places: RefCell<hash::Map<ContentKey<'a>, (Option<Place>, Lost)>>,
+    /// What is made of arrays ([`Items::derived`]), by the array and what is made,
+    /// with whether making it read a number not established ([`noting`]).
+    derived: RefCell<hash::Map<(ContentKey<'a>, TypeId), Made>>,
+}
+
+/// A value made of an array's entries ([`Derived`]), what making it lost, and whether
+/// it read a number that cannot be read as `MuPDF` reads it.
+type Made = (Rc<dyn Any>, Lost, bool);
+
+/// What is made of an array's entries alone, such as the quadrilaterals of
+/// `/QuadPoints`, kept once for the document by its type ([`Items::derived`]): so
+/// that annotations sharing a long array do not each walk it where what they draw
+/// does not grow with it. Each way of making one is a type of its own, which no
+/// other way makes.
+pub(crate) trait Derived: 'static {
+    fn derive(items: &Items<'_>) -> Self;
 }
 
 impl<'a> Read<'a> {
@@ -362,6 +379,7 @@ impl<'a> Objects<'a> {
                 entries: RefCell::default(),
                 prefixes: RefCell::default(),
                 places: RefCell::default(),
+                derived: RefCell::default(),
             })),
             shared: false,
         }
@@ -691,6 +709,43 @@ impl<'a> Items<'a> {
             })),
             None => Box::new(self.0.items::<Object<'a>>().map(Value::read)),
         }
+    }
+
+    /// `T` made of these entries ([`Derived`]), once for the document: a later use,
+    /// by any annotation, costs a lookup, and is told what making it lost and whether
+    /// it read a number not established, as the first was.
+    pub(crate) fn derived<T: Derived>(&self) -> Rc<T> {
+        let Some(read) = &self.1.read else {
+            return Rc::new(T::derive(self));
+        };
+        let key = (self.0.content_key(), TypeId::of::<T>());
+        let known = read.derived.borrow().get(&key).cloned();
+        let made = match known {
+            Some((made, lost, unreadable_)) => {
+                read.xref.note(lost);
+                if unreadable_ {
+                    unreadable();
+                }
+                made
+            }
+            None => {
+                let ((made, unreadable_), lost) = read
+                    .xref
+                    .watch(|| noting(|| Rc::new(T::derive(self)) as Rc<dyn Any>));
+                read.derived
+                    .borrow_mut()
+                    .insert(key, (made.clone(), lost, unreadable_));
+                made
+            }
+        };
+        // Kept under the type it was made as.
+        made.downcast::<T>().expect("made as T")
+    }
+
+    /// The first `n` entries, or all when there are fewer; those after them are not
+    /// read, and in a shared object these are read once.
+    pub(crate) fn head(&self, n: usize) -> Vec<Value<'a>> {
+        self.prefix(n).into_iter().map(|(v, _)| v).collect()
     }
 
     /// The first `n` entries, or all when there are fewer, each with the object it

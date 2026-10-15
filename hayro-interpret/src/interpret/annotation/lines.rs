@@ -4,7 +4,7 @@
 //! and diamonds and an arrow 8.8 widths long and 9 wide, are chosen so that the
 //! endings look as common viewers draw them.
 
-use super::entries::{Entries, Text};
+use super::entries::{Derived, Entries, Items, Text};
 use super::out::{Color, Out};
 use super::text::{self, Align, Family, Setting};
 use super::{Appearances, CAPTION, Unsupported, border_width, circle, color_of, dash};
@@ -43,12 +43,12 @@ impl Ending {
     }
 
     /// The endings of `/LE` of a line or polyline, as viewers read it: an array of
-    /// exactly two entries, each a name or none.
+    /// exactly two entries, each a name or none. Of a longer one, no entry after the
+    /// third is read.
     pub(super) fn of(annot: &Entries<'_>) -> [Self; 2] {
-        match annot.items(b"LE") {
-            Some(names) if names.iter().count() == 2 => {
-                [0, 1].map(|i| names.get(i).name().map_or(Self::None, Self::from_name))
-            }
+        let names = annot.items(b"LE").map(|i| i.head(3)).unwrap_or_default();
+        match names.as_slice() {
+            [first, last] => [first, last].map(|n| n.name().map_or(Self::None, Self::from_name)),
             _ => [Self::None, Self::None],
         }
     }
@@ -81,12 +81,19 @@ pub(super) struct Paint {
 }
 
 impl Paint {
-    /// /C strokes at the border width with the border dash, /IC fills.
+    /// /C strokes at the border width with the border dash, /IC fills. The dash
+    /// patterns only a stroke: without /C, it is not read.
     fn of(annot: &Entries<'_>) -> Self {
+        let stroke = color_of(annot, C);
+        let dash = if stroke.is_some() {
+            dash(annot)
+        } else {
+            Vec::new()
+        };
         Self {
-            stroke: color_of(annot, C),
+            stroke,
             width: border_width(annot),
-            dash: dash(annot),
+            dash,
             fill: color_of(annot, IC),
         }
     }
@@ -235,20 +242,22 @@ fn direction(v: Vec2) -> Vec2 {
     if len > 0.0 { v / len } else { Vec2::ZERO }
 }
 
-/// The numbers of `key` as points.
-fn points(annot: &Entries<'_>, key: &[u8]) -> Vec<Point> {
-    // A line has two points, as viewers read `/L`: coordinates it lacks, or all
-    // when it is not an array, are 0.
-    let n = if key == b"L" {
-        annot.numbers(key, 4).unwrap_or_else(|| vec![0.0; 4])
-    } else {
-        annot.items(key).map(|i| i.numbers()).unwrap_or_default()
-    };
+/// Numbers as points, each pair one; a last number alone is none.
+fn points(n: &[f64]) -> Vec<Point> {
     n.as_chunks::<2>()
         .0
         .iter()
         .map(|[x, y]| Point::new(*x, *y))
         .collect()
+}
+
+/// The points of `/Vertices`, made once for the document ([`Derived`]).
+struct Vertices(Vec<Point>);
+
+impl Derived for Vertices {
+    fn derive(items: &Items<'_>) -> Self {
+        Self(points(&items.numbers()))
+    }
 }
 
 /// `Polygon` and `PolyLine`: `/Vertices` joined, a polygon closed and filled with /IC,
@@ -262,7 +271,8 @@ pub(super) fn poly(
     closed: bool,
     out: &mut Out,
 ) -> Result<Option<()>, Unsupported> {
-    let vertices = points(annot, b"Vertices");
+    let vertices = annot.items(b"Vertices").map(|i| i.derived::<Vertices>());
+    let vertices = vertices.as_ref().map_or(&[][..], |v| &v.0);
     if vertices.len() < 2 {
         return Ok(None);
     }
@@ -279,7 +289,7 @@ pub(super) fn poly(
             (endings[1], vertices[n - 1], vertices[n - 2]),
         ],
     )?;
-    Ok(draw_poly(annot, &vertices, closed, endings, out))
+    Ok(draw_poly(annot, vertices, closed, endings, out))
 }
 
 /// [`Unsupported::Ending`] when a line, polyline or callout draws an ending, each
@@ -314,7 +324,13 @@ fn draw_poly(
 ) -> Option<()> {
     let stroke = color_of(annot, C);
     let fill = color_of(annot, IC);
-    if closed || endings.iter().all(|e| matches!(e, Ending::None)) {
+    let ends = endings.iter().any(|e| *e != Ending::None);
+    // A polygon draws with either colour; of a polyline, only a stroke draws the
+    // line, and a fill only its endings: without them, nothing is drawn.
+    if stroke.is_none() && (if closed { fill.is_none() } else { !ends }) {
+        return None;
+    }
+    if closed || !ends {
         let w = border_width(annot);
         let bounds = vertices.iter().fold(
             kurbo::Rect::from_points(vertices[0], vertices[0]),
@@ -323,9 +339,6 @@ fn draw_poly(
         out.clip(bounds.inflate(w, w))?;
     }
     if closed {
-        if stroke.is_none() && fill.is_none() {
-            return None;
-        }
         if let Some(stroke) = &stroke {
             out.stroke_color(stroke)?;
         }
@@ -343,8 +356,10 @@ fn draw_poly(
     }
     let paint = Paint::of(annot);
     paint.start(out)?;
-    polyline(vertices, out)?;
-    out.op(paint.stroke_op());
+    if paint.stroke.is_some() {
+        polyline(vertices, out)?;
+        out.op("S");
+    }
     let [first, last] = endings;
     let n = vertices.len();
     ending(first, vertices[0], vertices[1], &paint, out)?;
@@ -369,8 +384,9 @@ pub(super) fn line<'a>(
     visible: kurbo::Rect,
     out: &mut Out,
 ) -> Result<Option<()>, Unsupported> {
-    let paint = Paint::of(annot);
-    let ends = points(annot, b"L");
+    // A line has two points, as viewers read `/L`: coordinates it lacks, or all
+    // when it is not an array, are 0.
+    let ends = points(&annot.numbers(b"L", 4).unwrap_or_else(|| vec![0.0; 4]));
     let (a, b) = (ends[0], ends[1]);
     let len = (b - a).hypot();
     let dir = direction(b - a);
@@ -431,6 +447,8 @@ pub(super) fn line<'a>(
         }
     }
 
+    // Read only where the line is drawn.
+    let paint = Paint::of(annot);
     draw_line(
         &paint,
         [a, b],

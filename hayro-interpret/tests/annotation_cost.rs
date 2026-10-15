@@ -1677,3 +1677,67 @@ fn annotations_sharing_a_long_state_find_it_once() {
         );
     }
 }
+
+/// Distinct annotations that share a long array, an object of its own, walk it once
+/// for the document, or as far as each draws it: each costs what it draws, however
+/// long the array, where what it draws does not grow with the array. Cases: `/LE`
+/// of more than two entries, which ends nothing, of a line drawn twice and of a
+/// polyline; `/QuadPoints` of no area, of a highlight; quads of no height after one
+/// that has, of a squiggly, which draws only the one; an `/InkList` of no path;
+/// `/Vertices` of a polygon without colours, and of a polyline without a stroke
+/// colour, which fills only its endings; a dash of a line that draws nothing, with
+/// a leader line and no length, and of a line without colours.
+#[test]
+fn an_array_annotations_share_is_walked_once() {
+    let long =
+        |head: &str, entry: &str| vec![format!("[{head} {}]", vec![entry; 20_000].join(" "))];
+    let quad = "10 30 100 30 10 10 100 10";
+    let cases = [
+        (
+            long("", "/Square"),
+            "/Subtype /Line /L [10 10 100 100] /C [1 0 0] /LE 4 0 R",
+            1,
+        ),
+        (
+            long("", "/Square"),
+            "/Subtype /PolyLine /Vertices [10 10 100 100] /C [1 0 0] /LE 4 0 R",
+            1,
+        ),
+        (
+            long("", "0"),
+            "/Subtype /Highlight /Rect [0 0 200 200] /QuadPoints 4 0 R",
+            0,
+        ),
+        (
+            long(quad, "0"),
+            "/Subtype /Squiggly /Rect [0 0 200 200] /QuadPoints 4 0 R",
+            1,
+        ),
+        (long("", "null"), "/Subtype /Ink /C [0] /InkList 4 0 R", 0),
+        (long("", "50"), "/Subtype /Polygon /Vertices 4 0 R", 0),
+        (
+            long("10 10 100 10", "50"),
+            "/Subtype /PolyLine /IC [1 0 0] /LE [/Square /Square] /Vertices 4 0 R",
+            1,
+        ),
+        (
+            long("", "3"),
+            "/Subtype /Line /L [10 10 10 10] /LL 5 /C [0] /BS << /D 4 0 R >>",
+            0,
+        ),
+        (
+            long("", "3"),
+            "/Subtype /Line /L [10 10 100 100] /BS << /D 4 0 R >>",
+            0,
+        ),
+    ];
+    for (shared, annot, generated) in cases {
+        let (fewer, more) = (
+            sharing_cost(40, &shared, annot),
+            sharing_cost(80, &shared, annot),
+        );
+        assert_eq!(more.drew.generated, 80 * generated, "{annot}");
+        assert_eq!(more.drew.unsupported, 0, "{annot}");
+        costs_at_most(fewer, more, 16 << 10, 1_000, annot);
+    }
+}
