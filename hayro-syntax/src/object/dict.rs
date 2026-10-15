@@ -1,5 +1,6 @@
 //! Dictionaries.
 
+use crate::hash;
 use crate::object::macros::object;
 use crate::object::parsed::{DictNode, Node};
 use crate::object::r#ref::{MaybeRef, ObjRef};
@@ -8,7 +9,6 @@ use crate::object::{Object, ObjectLike};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::sync::Arc;
-use crate::sync::FxHashMap;
 use crate::xref::ContentKey;
 use alloc::format;
 use alloc::vec::Vec;
@@ -124,27 +124,22 @@ impl<'a> Dict<'a> {
         }
     }
 
-    /// Returns an iterator over all keys in the dictionary.
+    /// Returns an iterator over all keys in the dictionary, sorted: however the
+    /// dictionary is held, its keys come in one order, which no map's hashing
+    /// decides ([`crate::hash`]).
     pub fn keys(&self) -> impl Iterator<Item = Name<'a>> + '_ {
-        let (offsets, parsed) = match self.offsets() {
-            None => (None, None),
-            Some(Found::Offsets(offsets)) => (Some(offsets), None),
-            Some(Found::Parsed(node)) => (None, Some(node)),
+        let mut keys: Vec<Name<'a>> = match self.offsets() {
+            None => Vec::new(),
+            Some(Found::Offsets(offsets)) => offsets.keys().cloned().collect(),
+            Some(Found::Parsed(node)) => node.entries(self.data()).map(|(key, _)| key).collect(),
         };
-        let offsets = offsets
-            .into_iter()
-            .flat_map(|offsets| offsets.keys().cloned());
-        let parsed = parsed
-            .into_iter()
-            .flat_map(|node| node.entries(self.data()).map(|(key, _)| key));
-        offsets.chain(parsed)
+        keys.sort_unstable_by(|n1, n2| n1.as_ref().cmp(n2.as_ref()));
+        keys.into_iter()
     }
 
     /// An iterator over all entries in the dictionary, sorted by key.
     pub fn entries(&self) -> impl Iterator<Item = (Name<'a>, MaybeRef<Object<'a>>)> + '_ {
-        let mut sorted_keys = self.keys().collect::<Vec<_>>();
-        sorted_keys.sort_by(|n1, n2| n1.as_ref().cmp(n2.as_ref()));
-        sorted_keys.into_iter().map(|k| {
+        self.keys().map(|k| {
             let obj = self.get_raw(k.deref()).unwrap();
             (k, obj)
         })
@@ -230,28 +225,20 @@ impl Debug for Dict<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         let mut debug_struct = f.debug_struct("Dict");
 
-        match self.offsets() {
-            None => {}
-            Some(Found::Offsets(offsets)) => {
-                let mut r = Reader::new(self.data());
-
-                for (key, val) in offsets.iter() {
-                    r.jump(*val);
-                    debug_struct.field(
-                        &format!("{:?}", key.as_str()),
-                        &r.read_with_context::<MaybeRef<Object<'_>>>(&ReaderContext::dummy())
-                            .unwrap(),
-                    );
+        for key in self.keys() {
+            let value = match self.offsets() {
+                Some(Found::Offsets(offsets)) => {
+                    let mut r = Reader::new(&self.data()[offsets[&key]..]);
+                    r.read_with_context::<MaybeRef<Object<'_>>>(&ReaderContext::dummy())
+                        .unwrap()
                 }
-            }
-            Some(Found::Parsed(node)) => {
-                for (key, value) in node.entries(self.data()) {
-                    debug_struct.field(
-                        &format!("{:?}", key.as_str()),
-                        &value.item(self.data(), &ReaderContext::dummy()),
-                    );
-                }
-            }
+                Some(Found::Parsed(node)) => node
+                    .get(key.as_ref(), self.data())
+                    .unwrap()
+                    .item(self.data(), &ReaderContext::dummy()),
+                None => unreachable!(),
+            };
+            debug_struct.field(&format!("{:?}", key.as_str()), &value);
         }
 
         debug_struct.finish()
@@ -339,15 +326,15 @@ fn read_inner<'a>(
 }
 
 /// A map for where the entries of a dictionary start, or for their values.
-pub(crate) fn new_offsets<K, V>() -> FxHashMap<K, V> {
+pub(crate) fn new_offsets<K, V>() -> hash::Map<K, V> {
     // TODO: Figure out how to
     // 1) Make dictionaries easily cloneable without wrapping in Arc.
     // 2) Maybe have an efficient per-document allocator pool for hashmaps
     // that can be reused.
     #[cfg(feature = "std")]
-    return FxHashMap::with_capacity_and_hasher(8, rustc_hash::FxBuildHasher);
+    return hash::Map::with_capacity_and_hasher(8, hash::State::default());
     #[cfg(not(feature = "std"))]
-    return FxHashMap::new();
+    return hash::Map::new();
 }
 
 #[cfg(test)]
@@ -458,7 +445,7 @@ impl<'a> Repr<'a> {
 /// Where each entry's value is.
 enum Offsets<'a> {
     /// Where each starts.
-    Own(FxHashMap<Name<'a>, usize>),
+    Own(hash::Map<Name<'a>, usize>),
     /// Those of a dictionary parsed from the same bytes, which owns them.
     Of(Arc<Repr<'a>>),
     /// Each value of the body of an object, parsed once ([`crate::object::parsed`]).
@@ -468,7 +455,7 @@ enum Offsets<'a> {
 /// Where each entry's value is, however it is held.
 #[derive(Clone, Copy)]
 enum Found<'r, 'a> {
-    Offsets(&'r FxHashMap<Name<'a>, usize>),
+    Offsets(&'r hash::Map<Name<'a>, usize>),
     Parsed(&'r DictNode),
 }
 

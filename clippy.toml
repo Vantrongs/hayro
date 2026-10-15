@@ -1,0 +1,22 @@
+# Every map and set is a `hayro_syntax::hash::{Map, Set}`, hashed with keys drawn at
+# random for each, so that no file can choose keys that hash alike (see that module).
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "use hayro_syntax::hash::Map, hashed at random" },
+    { path = "std::collections::HashSet", reason = "use hayro_syntax::hash::Set, hashed at random" },
+    { path = "std::hash::BuildHasherDefault", reason = "a hasher with fixed keys: use hayro_syntax::hash" },
+    { path = "std::hash::DefaultHasher", reason = "SipHash with fixed keys: use hayro_syntax::hash::State" },
+    { path = "std::collections::hash_map::DefaultHasher", reason = "SipHash with fixed keys: use hayro_syntax::hash::State" },
+    { path = "foldhash::fast::FixedState", reason = "fixed keys: use hayro_syntax::hash" },
+    { path = "foldhash::quality::FixedState", reason = "fixed keys: use hayro_syntax::hash" },
+    { path = "foldhash::fast::SeedableRandomState", reason = "use hayro_syntax::hash" },
+    { path = "foldhash::quality::SeedableRandomState", reason = "use hayro_syntax::hash" },
+    { path = "foldhash::HashMap", reason = "use hayro_syntax::hash::Map" },
+    { path = "foldhash::HashSet", reason = "use hayro_syntax::hash::Set" },
+    { path = "rustc_hash::FxHashMap", reason = "fixed keys a file can collide: use hayro_syntax::hash::Map" },
+    { path = "rustc_hash::FxHashSet", reason = "fixed keys a file can collide: use hayro_syntax::hash::Set" },
+    { path = "rustc_hash::FxBuildHasher", reason = "fixed keys a file can collide: use hayro_syntax::hash" },
+    { path = "rustc_hash::FxHasher", reason = "fixed keys a file can collide: use hayro_syntax::hash::State" },
+    { path = "rustc_hash::FxRandomState", reason = "use hayro_syntax::hash" },
+    { path = "hashbrown::HashMap", reason = "use hayro_syntax::hash::Map" },
+    { path = "hashbrown::HashSet", reason = "use hayro_syntax::hash::Set" },
+]

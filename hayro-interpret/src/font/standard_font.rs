@@ -6,11 +6,11 @@ use crate::font::{
     Encoding, FontData, FontQuery, glyph_name_to_unicode, normalized_glyph_name, stretch_glyph,
     strip_subset_prefix,
 };
+use hayro_syntax::hash;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
 use hayro_syntax::object::dict::keys::{BASE_FONT, FONT_DESC, FONT_WEIGHT, ITALIC_ANGLE};
 use kurbo::BezPath;
-use rustc_hash::FxHashMap;
 use skrifa::GlyphId;
 use skrifa::raw::TableProvider;
 use std::cell::RefCell;
@@ -285,7 +285,7 @@ pub(crate) fn select_standard_font(
 #[derive(Debug)]
 pub(crate) enum StandardFontBlob {
     Cff(CffFontBlob),
-    Otf(OpenTypeFontBlob, FxHashMap<String, GlyphId>),
+    Otf(OpenTypeFontBlob, hash::Map<String, GlyphId>),
 }
 
 impl StandardFontBlob {
@@ -355,9 +355,9 @@ pub(crate) struct StandardKind {
     widths: Vec<Width>,
     missing_width: f32,
     fallback: bool,
-    code_to_glyph: RefCell<FxHashMap<u8, GlyphId>>,
-    glyph_to_code: RefCell<FxHashMap<GlyphId, u8>>,
-    encodings: FxHashMap<u8, String>,
+    code_to_glyph: RefCell<hash::Map<u8, GlyphId>>,
+    glyph_to_code: RefCell<hash::Map<GlyphId, u8>>,
+    encodings: hash::Map<u8, String>,
 }
 
 impl StandardKind {
@@ -392,8 +392,8 @@ impl StandardKind {
             widths,
             missing_width,
             encodings: encoding_map,
-            code_to_glyph: RefCell::new(FxHashMap::default()),
-            glyph_to_code: RefCell::new(FxHashMap::default()),
+            code_to_glyph: RefCell::new(hash::Map::default()),
+            glyph_to_code: RefCell::new(hash::Map::default()),
             fallback,
             encoding,
         })

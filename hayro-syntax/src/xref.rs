@@ -3,6 +3,7 @@
 use crate::crypto::reader::DecryptedReader;
 use crate::crypto::{DecryptionError, DecryptionTarget, Decryptor, get};
 use crate::data::{Data, Decoded};
+use crate::hash;
 use crate::lost::Lost;
 use crate::metadata::Metadata;
 use crate::object::Name;
@@ -19,7 +20,7 @@ use crate::object::{Object, ObjectLike};
 use crate::pdf::PdfVersion;
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt};
-use crate::sync::{Arc, FxHashMap, Mutex, MutexExt, OnceLock};
+use crate::sync::{Arc, Mutex, MutexExt, OnceLock};
 use crate::trivia::{is_eol_character, is_white_space_character};
 use crate::util::findr_needle;
 use crate::{PdfData, object};
@@ -147,7 +148,7 @@ pub(crate) enum XRefError {
 /// be read or has an entry that does not lead to its object, one rebuilt by a scan
 /// of the file.
 pub(crate) fn open(data: PdfData, password: &[u8]) -> Result<XRef, XRefError> {
-    let mut xref_map = FxHashMap::default();
+    let mut xref_map = hash::Map::default();
     let trailer = find_last_xref_pos(data.as_ref())
         .and_then(|pos| populate_xref_impl(data.as_ref(), pos, &mut xref_map));
     let Some(trailer) = trailer else {
@@ -235,13 +236,14 @@ fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Old> {
     xref_map.retain(|_, entry| *entry != EntryType::Normal(0));
     let mut entries = vec![];
     let mut streams = vec![];
+    #[allow(clippy::iter_over_hash_type, reason = "sorted after")]
     for (id, entry) in xref_map.iter() {
         match *entry {
             EntryType::Normal(offset) => entries.push((offset, *id)),
             EntryType::ObjStream(stream, _) => streams.push(stream),
         }
     }
-    entries.sort_unstable_by_key(|(offset, _)| *offset);
+    entries.sort_unstable();
 
     let mut sound = true;
     let mut old = Old::default();
@@ -350,7 +352,7 @@ type Unreadable = BTreeSet<ObjectIdentifier>;
 /// The identifier the header of each object of a rebuilt table names, where that is
 /// not the entry's own: an entry of the old table kept for an object headed as
 /// another. Found once, where the table is rebuilt, for every entry leading there.
-type Headers = FxHashMap<ObjectIdentifier, ObjectIdentifier>;
+type Headers = hash::Map<ObjectIdentifier, ObjectIdentifier>;
 
 /// What reading a table finds besides its entries: where the objects of the file
 /// are, which their slots end at, and, for a rebuilt table, the objects it lists
@@ -442,7 +444,7 @@ fn fallback_xref_map_inner<'a>(
     listed: &[Listed],
     unread: &[ObjectIdentifier],
 ) -> (XrefMap, Rebuilt, Option<XRefInput<'a>>) {
-    let mut xref_map = FxHashMap::default();
+    let mut xref_map = hash::Map::default();
     // Each object found, in the order of the file.
     let mut found = vec![];
     // Each header found with no object that can be read after it.
@@ -735,7 +737,7 @@ std::thread_local! {
     /// While `Some`, how often the body of each object has been read on this thread,
     /// by the entry a read of it was made for, which the tests bound to show that
     /// loading the pages reads each object once.
-    pub(crate) static RESOLVED: core::cell::RefCell<Option<FxHashMap<ObjectIdentifier, usize>>> =
+    pub(crate) static RESOLVED: core::cell::RefCell<Option<hash::Map<ObjectIdentifier, usize>>> =
         const { core::cell::RefCell::new(None) };
 }
 
@@ -1703,7 +1705,7 @@ enum EntryType {
     ObjStream(u32, u32),
 }
 
-type XrefMap = FxHashMap<ObjectIdentifier, EntryType>;
+type XrefMap = hash::Map<ObjectIdentifier, EntryType>;
 
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct TrailerData {
@@ -1734,7 +1736,7 @@ struct SomeRepr {
     headers: Arc<Headers>,
     /// What the body at each place an entry leads to holds, read once for every
     /// read of an entry leading there ([`XRef::get_with`]).
-    shapes: Arc<Mutex<FxHashMap<Place, body::Shape>>>,
+    shapes: Arc<Mutex<hash::Map<Place, body::Shape>>>,
     metadata: Arc<Metadata>,
     decryptor: Arc<Decryptor>,
     has_ocgs: bool,
@@ -2161,7 +2163,7 @@ pub(crate) struct ObjectStream {
     starts: Vec<usize>,
     /// The index of the last object of each number, built the first time an entry's
     /// index names another object.
-    by_number: OnceLock<FxHashMap<u32, usize>>,
+    by_number: OnceLock<hash::Map<u32, usize>>,
 }
 
 impl ObjectStream {
@@ -2296,7 +2298,7 @@ mod tests {
             .as_bytes(),
         );
 
-        let mut xref_map = FxHashMap::default();
+        let mut xref_map = hash::Map::default();
         let xref_pos = find_last_xref_pos(pdf.as_ref()).unwrap();
         let _result = populate_xref_impl(pdf.as_ref(), xref_pos, &mut xref_map);
     }
@@ -2394,7 +2396,7 @@ mod tests {
     #[test]
     fn opening_a_file_reads_it_in_linear_time() {
         type Family = (&'static str, fn(usize) -> Vec<u8>);
-        let families: [Family; 22] = [
+        let families: [Family; 23] = [
             // Entries at each `0` of `0…09 0 obj`: each reads a header in its slot of
             // one byte, which the next `0` ends, not on to `obj`.
             ("entries in the zeros of a header", |n| {
@@ -2477,6 +2479,20 @@ mod tests {
                     "5 0 obj [ ( ".repeat(n),
                     "% ) ".repeat(n)
                 ))
+            }),
+            // A catalog holding a dictionary of names that hash alike with a hash of
+            // fixed keys: 16 bytes, the first 8 of which cancel the seed of
+            // rustc-hash's byte hashing. With such a hash, each name inserted into
+            // the dictionary's map is compared with every one before it.
+            ("names that hash alike", |n| {
+                let mut catalog = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Test << ".to_vec();
+                for i in 0..n {
+                    catalog.push(b'/');
+                    catalog.extend(0x243f_6a88_85a3_08d3_u64.to_le_bytes());
+                    catalog.extend(format!("{i:08x} 0 ").bytes());
+                }
+                catalog.extend(b">> >>\nendobj\n");
+                file_with(&catalog, &[], true)
             }),
             // A trailer names a large catalog many times.
             ("trailers naming a large catalog", |n| {
@@ -2705,7 +2721,7 @@ mod tests {
         compressed: &[(u32, u32, u32)],
     ) -> Vec<u8> {
         let mut out = b"%PDF-1.7\n".to_vec();
-        let mut entries = FxHashMap::default();
+        let mut entries = hash::Map::default();
         for (number, object) in objects {
             entries.insert(*number, (1_u8, out.len() as u32, 0_u16));
             out.extend(format!("{number} 0 obj\n{object}\nendobj\n").bytes());
@@ -3209,7 +3225,7 @@ mod tests {
             .unwrap()
             .get::<Array<'_>>(b"List".as_slice())
             .unwrap();
-        body::BODIES.with_borrow_mut(FxHashMap::clear);
+        body::BODIES.with_borrow_mut(hash::Map::clear);
         let read: Vec<_> = list.iter_checked::<Dict<'_>>().collect();
         assert!(read.is_empty(), "{read:?}");
         let bodies =
@@ -3370,10 +3386,10 @@ mod tests {
     /// How often bodies were read, or streams' data found, while `run` ran, the most
     /// for one place.
     fn bodies_read(run: impl FnOnce()) -> usize {
-        body::BODIES.with_borrow_mut(FxHashMap::clear);
-        body::DATA_FOUND.with_borrow_mut(FxHashMap::clear);
+        body::BODIES.with_borrow_mut(hash::Map::clear);
+        body::DATA_FOUND.with_borrow_mut(hash::Map::clear);
         run();
-        let most = |map: &FxHashMap<Place, usize>| map.values().copied().max().unwrap_or(0);
+        let most = |map: &hash::Map<Place, usize>| map.values().copied().max().unwrap_or(0);
         body::BODIES
             .with_borrow(most)
             .max(body::DATA_FOUND.with_borrow(most))

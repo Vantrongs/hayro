@@ -7,12 +7,12 @@ use crate::ocg::OcgState;
 use crate::util::{BezPathExt, Float64Ext};
 use crate::{ClipPath, Device, DrawProps, FillRule, InterpreterSettings, Paint, StrokeProps};
 use hayro_syntax::content::ops::Transform;
+use hayro_syntax::hash;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
 use hayro_syntax::page::Resources;
 use hayro_syntax::xref::XRef;
 use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape};
-use rustc_hash::FxHashMap;
 use smallvec::smallvec;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -26,7 +26,7 @@ pub(crate) const MAX_NESTED_INTERPRETATION_DEPTH: u32 = 50;
 /// multiple interpreter invocations on the same document.
 #[derive(Clone)]
 pub struct InterpreterCache<'a> {
-    pub(crate) font_cache: Rc<RefCell<FxHashMap<u128, Option<Font<'a>>>>>,
+    pub(crate) font_cache: Rc<RefCell<hash::Map<u128, Option<Font<'a>>>>>,
     pub(crate) object_cache: Cache,
 }
 
@@ -40,7 +40,7 @@ impl<'a> InterpreterCache<'a> {
     /// Create a new interpreter cache.
     pub fn new() -> Self {
         Self {
-            font_cache: Rc::new(RefCell::new(FxHashMap::default())),
+            font_cache: Rc::new(RefCell::new(hash::Map::default())),
             object_cache: Cache::new(),
         }
     }

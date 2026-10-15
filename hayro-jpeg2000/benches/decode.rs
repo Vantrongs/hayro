@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -91,7 +91,7 @@ fn default_render() -> bool {
 
 fn collect_assets() -> Vec<BenchAsset> {
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let benchmark_assets = BENCHMARK_ASSETS.iter().copied().collect::<HashSet<_>>();
+    let benchmark_assets = BENCHMARK_ASSETS.iter().copied().collect::<BTreeSet<_>>();
     let mut assets = Vec::new();
 
     for (namespace, manifest_name) in INPUT_MANIFESTS {
@@ -117,7 +117,7 @@ fn collect_assets() -> Vec<BenchAsset> {
     }
 
     assets.sort_by(|a, b| a.name.cmp(&b.name));
-    let mut seen_names = HashSet::new();
+    let mut seen_names = BTreeSet::new();
     assets.retain(|asset| seen_names.insert(asset.name.clone()));
     assets
 }

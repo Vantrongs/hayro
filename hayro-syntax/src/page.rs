@@ -1,6 +1,7 @@
 //! Reading the pages of a PDF document.
 
 use crate::content::{TypedIter, UntypedIter};
+use crate::hash;
 use crate::lost::{Lost, Memo};
 use crate::object::Array;
 use crate::object::Dict;
@@ -12,7 +13,7 @@ use crate::object::dict::keys::*;
 use crate::object::stream::DecodeFailure;
 use crate::object::{MaybeRef, Null, Object, ObjectIdentifier};
 use crate::reader::ReaderContext;
-use crate::sync::{Arc, FxHashMap, OnceLock};
+use crate::sync::{Arc, OnceLock};
 use crate::transform::Transform;
 use crate::util::FloatExt;
 use crate::xref::{ContentKey, XRef};
@@ -122,14 +123,14 @@ fn kids_stored(entries: usize) {
 /// ([`ContentKey`]), which keys the states.
 struct KidsStates<'a, T> {
     states: Vec<T>,
-    shared: FxHashMap<ContentKey<'a>, usize>,
+    shared: hash::Map<ContentKey<'a>, usize>,
 }
 
 impl<T> Default for KidsStates<'_, T> {
     fn default() -> Self {
         Self {
             states: vec![],
-            shared: FxHashMap::default(),
+            shared: hash::Map::default(),
         }
     }
 }
@@ -1399,7 +1400,7 @@ mod tests {
 
     /// The objects other than the catalog that `run` resolves more than once.
     fn resolved_again(run: impl FnOnce()) -> Vec<(ObjectIdentifier, usize)> {
-        crate::xref::RESOLVED.set(Some(crate::sync::FxHashMap::default()));
+        crate::xref::RESOLVED.set(Some(crate::hash::Map::default()));
         run();
         let resolved = crate::xref::RESOLVED.take().unwrap();
         let mut again: Vec<_> = resolved

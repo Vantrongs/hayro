@@ -16,7 +16,6 @@ image = { workspace = true, features = ["png"] }
 bytemuck = { workspace = true, features = ["bytemuck_derive"] }
 vello_cpu = { workspace = true }
 pic-scale = { workspace = true }
-rustc-hash = { workspace = true }
 fearless_simd = { workspace = true }
 
 [dev-dependencies]

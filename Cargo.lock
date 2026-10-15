@@ -687,7 +687,6 @@ dependencies = [
  "kurbo",
  "log",
  "pic-scale",
- "rustc-hash",
  "vello_cpu",
 ]
 
@@ -752,7 +751,6 @@ dependencies = [
  "log",
  "moxcms",
  "phf",
- "rustc-hash",
  "siphasher",
  "skrifa 0.46.0",
  "smallvec",
@@ -801,7 +799,6 @@ dependencies = [
  "image",
  "kurbo",
  "log",
- "rustc-hash",
  "siphasher",
  "xmlwriter",
 ]
@@ -813,13 +810,13 @@ dependencies = [
  "aes",
  "cbc",
  "flate2",
+ "foldhash",
  "hayro-ccitt",
  "hayro-jbig2",
  "hayro-jpeg2000",
  "log",
  "md5",
  "memchr",
- "rustc-hash",
  "sha2",
  "smallvec",
  "zlib-rs",
@@ -854,7 +851,6 @@ dependencies = [
  "log",
  "md5",
  "pdf-writer",
- "rustc-hash",
 ]
 
 [[package]]
@@ -1459,12 +1455,6 @@ checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
 dependencies = [
  "memchr",
 ]
-
-[[package]]
-name = "rustc-hash"
-version = "2.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
 
 [[package]]
 name = "rustversion"

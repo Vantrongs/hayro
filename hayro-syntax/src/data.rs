@@ -1,7 +1,7 @@
+use crate::hash;
 use crate::lost::{Lost, Watched};
 use crate::object::ObjectIdentifier;
 use crate::reader::ReaderContext;
-use crate::sync::FxHashMap;
 use crate::sync::{Arc, Mutex, MutexExt};
 use crate::util::SegmentList;
 use crate::xref::{ObjectStream, Place};
@@ -69,7 +69,7 @@ pub(crate) struct Data {
     // what reading it lost.
     decoded: SegmentList<(Option<ObjectStream>, Lost), 32>,
     /// Where the object stream at each place is kept.
-    map: Mutex<FxHashMap<Place, usize>>,
+    map: Mutex<hash::Map<Place, usize>>,
     /// The computations being watched ([`crate::xref::XRef::watch`]).
     pub(crate) watched: Watched,
 }
@@ -86,7 +86,7 @@ impl Data {
         Self {
             data,
             decoded: SegmentList::new(),
-            map: Mutex::new(FxHashMap::default()),
+            map: Mutex::new(hash::Map::default()),
             watched: Watched::default(),
         }
     }

@@ -42,10 +42,10 @@
 //! in_linear_time`) and check that each answer is what reading the object finds
 //! (`scan_ends_objects_as_reading_them_does`).
 
+use crate::hash;
 use crate::object::dict::keys::{ROOT, TYPE};
 use crate::object::{MAX_OBJECT_NESTING_DEPTH, Name, ObjRef, Object, Skip, leaf};
 use crate::reader::{Reader, ReaderContext, ReaderExt};
-use crate::sync::FxHashMap;
 use crate::trivia::{is_eol_character, is_white_space_character};
 use alloc::collections::VecDeque;
 use alloc::vec;
@@ -322,10 +322,10 @@ pub(crate) struct Scan<'a> {
     /// is asked about after all readings that started before it, and only reads on
     /// from where it starts, so another can only meet one it starts at inside
     /// another object, after its header, or one asked about before.
-    kept: FxHashMap<usize, Outcome>,
+    kept: hash::Map<usize, Outcome>,
     /// The outcomes of the arrays and dictionaries read on from a byte in `meets`,
     /// or from where one such closes, in a state.
-    met: FxHashMap<(usize, State), Outcome>,
+    met: hash::Map<(usize, State), Outcome>,
     /// The last object the scan was asked about, and what it found: the scan that
     /// rebuilds a table asks about a header's object, then, where it is a dictionary,
     /// about it again for its keys.
@@ -397,8 +397,8 @@ impl<'a> Scan<'a> {
             meets,
             comment_ends,
             fails: Bits::new(data.len()),
-            kept: FxHashMap::default(),
-            met: FxHashMap::default(),
+            kept: hash::Map::default(),
+            met: hash::Map::default(),
             last: None,
         }
     }

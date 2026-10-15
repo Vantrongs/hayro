@@ -23,6 +23,7 @@ use crate::paint::{
     CachedNativeGradient, CachedShading, CachedShadingPattern, CachedTilingPattern,
 };
 use hayro_interpret::font::GlyphRun;
+use hayro_interpret::hayro_syntax::hash;
 use hayro_interpret::hayro_syntax::page::Page;
 use hayro_interpret::util::{Float32Ext, TransformExt};
 use hayro_interpret::{
@@ -30,7 +31,6 @@ use hayro_interpret::{
     InterpreterCache, InterpreterSettings, SoftMask, StrokeProps, interpret_page,
 };
 use kurbo::{Affine, BezPath, Cap, Join, Rect};
-use rustc_hash::FxHashMap;
 use siphasher::sip128::{Hasher128, SipHasher13};
 use std::fmt;
 use std::fmt::{Display, Formatter};
@@ -443,7 +443,7 @@ pub(crate) fn convert_transform(transform: &Affine) -> String {
 pub(crate) struct Deduplicator<T> {
     kind: char,
     vec: Vec<T>,
-    present: FxHashMap<u128, Id>,
+    present: hash::Map<u128, Id>,
 }
 
 impl<T> Default for Deduplicator<T> {
@@ -457,7 +457,7 @@ impl<T> Deduplicator<T> {
         Self {
             kind,
             vec: Vec::new(),
-            present: FxHashMap::default(),
+            present: hash::Map::default(),
         }
     }
 

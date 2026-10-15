@@ -37,7 +37,10 @@ impl Borrow<[u8]> for Name<'_> {
 }
 
 impl PartialEq for Name<'_> {
+    /// Counts the bytes compared ([`crate::work::TOLD`]): a map compares a key it
+    /// inserts with each key that hashes alike, which tests bound.
     fn eq(&self, other: &Self) -> bool {
+        crate::work::told(1 + self.len().min(other.len()));
         self.as_ref() == other.as_ref()
     }
 }

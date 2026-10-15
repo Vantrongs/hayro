@@ -11,8 +11,8 @@
 //! each of them what computing it lost, as if it had been read again ([`Memo`],
 //! [`XRef::note`]).
 
+use crate::hash;
 use crate::object::ObjectIdentifier;
-use crate::sync::FxHashMap;
 use crate::xref::XRef;
 use alloc::vec::Vec;
 
@@ -23,11 +23,11 @@ pub type Lost = Option<ObjectIdentifier>;
 /// Values computed once for the keys asked for, each with what computing it lost,
 /// which every later ask is told as the first was ([`XRef::note`]): a value read
 /// without an object is never taken for whole because it was read before.
-pub struct Memo<K, V>(FxHashMap<K, (V, Lost)>);
+pub struct Memo<K, V>(hash::Map<K, (V, Lost)>);
 
 impl<K, V> Default for Memo<K, V> {
     fn default() -> Self {
-        Self(FxHashMap::default())
+        Self(hash::Map::default())
     }
 }
 

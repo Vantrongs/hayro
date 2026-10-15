@@ -8,13 +8,13 @@
 use crate::crypto::DecryptionError::InvalidEncryption;
 use crate::crypto::aes::{AES128Cipher, AES256Cipher};
 use crate::crypto::rc4::Rc4;
+use crate::hash;
 use crate::object;
 use crate::object::dict::keys::{
     CF, CFM, ENCRYPT_META_DATA, FILTER, IDENTITY, LENGTH, O, OE, P, R, STD_CF, STM_F, STR_F, U, UE,
     V,
 };
 use crate::object::{Dict, Name, ObjectIdentifier};
-use crate::sync::HashMap;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp;
@@ -312,13 +312,13 @@ pub(crate) struct DecryptorData {
     stream_filter: CryptDictionary,
     string_filter: CryptDictionary,
     /// The crypt filters of /CF by name, `None` without /CF.
-    filters: Option<HashMap<Vec<u8>, CryptDictionary>>,
+    filters: Option<hash::Map<Vec<u8>, CryptDictionary>>,
 }
 
 impl DecryptorData {
     fn from_dict(dict: &Dict<'_>, default_length: u16) -> Option<Self> {
         let filters = dict.get::<Dict<'_>>(CF).map(|dict| {
-            let mut mappings = HashMap::new();
+            let mut mappings = hash::Map::default();
             for key in dict.keys() {
                 if let Some(dict) = dict.get::<Dict<'_>>(key.as_ref())
                     && let Some(crypt_dict) = CryptDictionary::from_dict(&dict, default_length)

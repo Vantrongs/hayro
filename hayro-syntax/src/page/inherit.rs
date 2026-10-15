@@ -1,12 +1,12 @@
 //! The entries a page inherits from the page tree, found as `MuPDF` finds them.
 
 use super::{KidsStates, Node, Objects, Page};
+use crate::hash;
 use crate::lost::Lost;
 use crate::object::dict::keys::{CROP_BOX, MEDIA_BOX, PARENT, RESOURCES, ROTATE};
 use crate::object::{MaybeRef, Null, Object, ObjectIdentifier};
 use crate::pdf::Pdf;
 use crate::reader::ReaderContext;
-use crate::sync::{FxHashMap, FxHashSet};
 use crate::xref::ContentKey;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -79,9 +79,9 @@ impl Inheritable {
 pub struct Inheritance<'a> {
     objects: Objects<'a>,
     /// The repaired /Parent entries, and what reading the page tree for them lost.
-    repaired: Option<(FxHashMap<Key<'a>, Node<'a>>, Lost)>,
+    repaired: Option<(hash::Map<Key<'a>, Node<'a>>, Lost)>,
     /// Where each node's chain leads, and what following it lost.
-    chains: FxHashMap<Key<'a>, [Option<(Chain<'a>, Lost)>; 4]>,
+    chains: hash::Map<Key<'a>, [Option<(Chain<'a>, Lost)>; 4]>,
 }
 
 /// A value of an entry a node has, `null` for a reference to nothing or to an object
@@ -130,7 +130,7 @@ impl<'a> Inheritance<'a> {
         Self {
             objects,
             repaired: None,
-            chains: FxHashMap::default(),
+            chains: hash::Map::default(),
         }
     }
 
@@ -258,7 +258,7 @@ impl<'a> Inheritance<'a> {
 #[derive(Default)]
 pub(super) struct Listings<'a> {
     nodes: Vec<Listing<'a>>,
-    at: FxHashMap<Key<'a>, usize>,
+    at: hash::Map<Key<'a>, usize>,
 }
 
 struct Listing<'a> {
@@ -349,8 +349,8 @@ fn value<'a>(node: &Node<'a>, key: Inheritable, objects: &mut Objects<'a>) -> Op
 // kids left in it: those that one of them took were met then, so every other would
 // pass over them. Each array is thus read and stored once, however many nodes list
 // it.
-fn tree_parents<'a>(objects: &mut Objects<'a>) -> FxHashMap<Key<'a>, Node<'a>> {
-    let mut parents = FxHashMap::default();
+fn tree_parents<'a>(objects: &mut Objects<'a>) -> hash::Map<Key<'a>, Node<'a>> {
+    let mut parents = hash::Map::default();
     let Some(root) = objects.tree() else {
         return parents;
     };
@@ -375,7 +375,7 @@ fn tree_parents<'a>(objects: &mut Objects<'a>) -> FxHashMap<Key<'a>, Node<'a>> {
         });
         at
     };
-    let mut met = FxHashSet::default();
+    let mut met = hash::Set::default();
     met.insert(root.key());
     let mut stack = vec![(read(&mut kids, &root), root)];
     while let Some((array, node)) = stack.last() {

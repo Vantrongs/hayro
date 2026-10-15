@@ -100,6 +100,16 @@ fn offsets(random: &mut Random, base: usize, piece: usize, count: usize) -> Vec<
         .collect()
 }
 
+/// A name of 16 bytes, the `i`th of a family whose first 8 bytes cancel the seed of
+/// rustc-hash's byte hashing, so that all hash alike with it: with a hash of fixed
+/// keys, each inserted into a map is compared with every one before it.
+fn colliding(i: usize) -> Vec<u8> {
+    let mut name = b"/".to_vec();
+    name.extend(0x243f_6a88_85a3_08d3_u64.to_le_bytes());
+    name.extend(format!("{i:08x}").bytes());
+    name
+}
+
 /// A file of a catalog, a page tree, pages that each read `/UserUnit` from an object
 /// of an object stream, damaged pieces between them, the object stream, whose header
 /// puts its objects at offsets of its data, inside a long token too, and a table,
@@ -109,7 +119,9 @@ fn offsets(random: &mut Random, base: usize, piece: usize, count: usize) -> Vec<
 /// to, each named in their resources, whose dictionary may refer to another object;
 /// a stream table has up to 100 entries leading to the first object of the object
 /// stream, each named in the pages' resources too. In some, the table's /Prev names
-/// sections nested in each other's trailer strings.
+/// sections nested in each other's trailer strings. In some, the catalog holds a
+/// dictionary of up to 3000 names that hash alike with a hash of fixed keys
+/// ([`colliding`]), and in some, the pages name their graphics states so.
 fn file(random: &mut Random) -> Vec<u8> {
     let pages = 1 + random.below(4);
     let damaged = random.chance(75);
@@ -135,25 +147,48 @@ fn file(random: &mut Random) -> Vec<u8> {
     let mut out = b"%PDF-1.7\n".to_vec();
     // Each object of the file, by number, at its offset.
     let mut objects: Vec<(u32, usize)> = vec![];
-    let mut object = |out: &mut Vec<u8>, number: u32, body: &str| {
+    let mut object = |out: &mut Vec<u8>, number: u32, body: &[u8]| {
         objects.push((number, out.len()));
-        out.extend(format!("{number} 0 obj\n{body}\nendobj\n").bytes());
+        out.extend(format!("{number} 0 obj\n").bytes());
+        out.extend(body);
+        out.extend(b"\nendobj\n");
     };
-    object(&mut out, 1, "<< /Type /Catalog /Pages 2 0 R >>");
+    let mut catalog = b"<< /Type /Catalog /Pages 2 0 R ".to_vec();
+    if random.chance(20) {
+        catalog.extend(b"/Test << ");
+        for i in 0..1 + random.below(3000) {
+            catalog.extend(colliding(i));
+            catalog.extend(b" 0 ");
+        }
+        catalog.extend(b">> ");
+    }
+    catalog.extend(b">>");
+    object(&mut out, 1, &catalog);
     let kids: Vec<String> = (0..pages).map(|p| format!("{} 0 R", 10 + p)).collect();
     object(
         &mut out,
         2,
-        &format!(
+        format!(
             "<< /Type /Pages /Kids [{}] /Count {pages} /MediaBox [0 0 600 700] >>",
             kids.join(" ")
-        ),
+        )
+        .as_bytes(),
     );
     let names: String = (0..images)
         .map(|j| format!("/A{j} {} 0 R ", 600 + j))
         .collect();
+    let collide = random.chance(30);
     let state_names: String = (0..states)
-        .map(|j| format!("/G{j} {} 0 R ", 900 + j))
+        .map(|j| match collide {
+            // The bytes of a colliding name, each escaped.
+            true => {
+                colliding(j)[1..]
+                    .iter()
+                    .fold("/".to_owned(), |name, b| name + &format!("#{b:02x}"))
+                    + &format!(" {} 0 R ", 900 + j)
+            }
+            false => format!("/G{j} {} 0 R ", 900 + j),
+        })
         .collect();
     let content = if images > 0 {
         "q 9 0 0 9 0 0 cm /A0 Do Q"
@@ -164,22 +199,24 @@ fn file(random: &mut Random) -> Vec<u8> {
         object(
             &mut out,
             10 + p as u32,
-            &format!(
+            format!(
                 "<< /Type /Page /Parent 2 0 R /CropBox [0 0 {} 500] /UserUnit {} 0 R \
                  /Resources << /XObject << {names}>> /ExtGState << {state_names}>> >> \
                  /Contents {} 0 R >>",
                 100 + p,
                 20 + unit,
                 500 + p
-            ),
+            )
+            .as_bytes(),
         );
         object(
             &mut out,
             500 + p as u32,
-            &format!(
+            format!(
                 "<< /Length {} >>\nstream\n{content}\nendstream",
                 content.len()
-            ),
+            )
+            .as_bytes(),
         );
     }
     // The image the entries numbered from 600 lead to, and its color space.
@@ -191,14 +228,15 @@ fn file(random: &mut Random) -> Vec<u8> {
         object(
             &mut out,
             6,
-            &format!(
+            format!(
                 "<< /Type /XObject /Subtype /Image /Width {len} /Height 1 \
                  /BitsPerComponent 8 /ColorSpace {space} /Length {len} >>\n\
                  stream\n{}\nendstream",
                 "g".repeat(len)
-            ),
+            )
+            .as_bytes(),
         );
-        object(&mut out, 7, "/DeviceGray");
+        object(&mut out, 7, "/DeviceGray".as_bytes());
         aliases.extend((0..images as u32).map(|j| (600 + j, at)));
     }
     // The damaged pieces, and where entries lead into them.

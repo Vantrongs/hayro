@@ -15,11 +15,11 @@ use crate::x_object::{FormXObject, ImageXObject, XObject};
 use crate::{BlendMode, FillRule};
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
+use hayro_syntax::hash;
 use hayro_syntax::object::dict::keys::{ANNOTS, AP, F, MCID, N, OC, RECT};
 use hayro_syntax::object::{Array, Dict, Name, Object, Rect, dict_or_stream};
 use hayro_syntax::page::{Page, Resources};
 use kurbo::{Affine, Point, Shape};
-use rustc_hash::FxHashMap;
 use smallvec::smallvec;
 use std::sync::Arc;
 
@@ -229,7 +229,7 @@ pub fn interpret<'a>(
     device: &mut impl Device<'a>,
 ) {
     let num_states = context.num_states();
-    let mut font_dict_cache = FxHashMap::<Name<'a>, Dict<'a>>::default();
+    let mut font_dict_cache = hash::Map::<Name<'a>, Dict<'a>>::default();
 
     context.save_state();
 

@@ -8,6 +8,7 @@ use crate::font::{
 use crate::util::OptionLog;
 use crate::{CMapResolverFn, CacheKey, FontResolverFn};
 use hayro_cmap::{BfString, CMap};
+use hayro_syntax::hash;
 use hayro_syntax::object::Array;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
@@ -15,7 +16,6 @@ use hayro_syntax::object::Object;
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::*;
 use kurbo::BezPath;
-use rustc_hash::FxHashMap;
 use skrifa::attribute::Style;
 use skrifa::raw::TableProvider;
 use skrifa::raw::tables::cmap::PlatformId;
@@ -210,13 +210,13 @@ struct EmbeddedKind {
     widths: Vec<Width>,
     missing_width: f32,
     font_flags: Option<FontFlags>,
-    glyph_names: FxHashMap<String, GlyphId>,
+    glyph_names: hash::Map<String, GlyphId>,
     encoding: Encoding,
     // Only used for PDFs that mistakenly embed a
     // CFF font.
     cff_blob: Option<CffFontBlob>,
-    differences: FxHashMap<u8, String>,
-    cached_mappings: RefCell<FxHashMap<u8, GlyphId>>,
+    differences: hash::Map<u8, String>,
+    cached_mappings: RefCell<hash::Map<u8, GlyphId>>,
     /// PostScript name from the PDF.
     postscript_name: Option<String>,
 }
@@ -255,7 +255,7 @@ impl EmbeddedKind {
             glyph_names,
             font_flags,
             encoding,
-            cached_mappings: RefCell::new(FxHashMap::default()),
+            cached_mappings: RefCell::new(hash::Map::default()),
             postscript_name,
         })
     }
@@ -431,7 +431,7 @@ impl CacheKey for TrueTypeFont {
     }
 }
 
-pub(crate) fn read_encoding(dict: &Dict<'_>) -> (Encoding, FxHashMap<u8, String>) {
+pub(crate) fn read_encoding(dict: &Dict<'_>) -> (Encoding, hash::Map<u8, String>) {
     fn get_encoding_base(dict: &Dict<'_>, name: Name<'_>) -> Encoding {
         match dict.get::<Name<'_>>(name.as_ref()) {
             Some(n) => match n.deref() {
@@ -449,7 +449,7 @@ pub(crate) fn read_encoding(dict: &Dict<'_>) -> (Encoding, FxHashMap<u8, String>
         }
     }
 
-    let mut map = FxHashMap::default();
+    let mut map = hash::Map::default();
 
     if let Some(encoding_dict) = dict.get::<Dict<'_>>(ENCODING) {
         if let Some(differences) = encoding_dict.get::<Array<'_>>(DIFFERENCES) {
@@ -480,7 +480,7 @@ pub(crate) fn read_encoding(dict: &Dict<'_>) -> (Encoding, FxHashMap<u8, String>
     } else {
         (
             get_encoding_base(dict, Name::new_unescaped(ENCODING)),
-            FxHashMap::default(),
+            hash::Map::default(),
         )
     }
 }

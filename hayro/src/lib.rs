@@ -40,13 +40,13 @@ use hayro_interpret::InterpreterCache;
 use hayro_interpret::InterpreterSettings;
 use hayro_interpret::font::GlyphRun;
 use hayro_interpret::hayro_syntax::Pdf;
+use hayro_interpret::hayro_syntax::hash;
 use hayro_interpret::hayro_syntax::page::Page;
 use hayro_interpret::util::{RectExt, TransformExt};
 use hayro_interpret::{BlendMode, Context, DrawMode, DrawProps, ImageDrawProps, SoftMask};
 use hayro_interpret::{ClipPath, interpret_page};
 use kurbo::{Affine, BezPath, Rect, Shape};
 use pic_scale::Scaler;
-use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::ops::RangeInclusive;
 use std::rc::Rc;
@@ -70,7 +70,7 @@ mod path;
 
 pub(crate) struct GlobalState {
     level: Level,
-    outline_cache: Rc<RefCell<FxHashMap<u128, Rc<BezPath>>>>,
+    outline_cache: Rc<RefCell<hash::Map<u128, Rc<BezPath>>>>,
     scaler: Scaler,
     force_image_interpolation: bool,
 }
@@ -90,7 +90,7 @@ pub(crate) struct Renderer<'a> {
     global: &'a GlobalState,
     pub(crate) ctx: &'a mut RenderContext,
     pub(crate) inside_pattern: bool,
-    pub(crate) soft_mask_cache: FxHashMap<u128, Mask>,
+    pub(crate) soft_mask_cache: hash::Map<u128, Mask>,
     pub(crate) in_type3_glyph: bool,
 }
 
@@ -100,7 +100,7 @@ impl<'r> Renderer<'r> {
             global,
             ctx,
             inside_pattern: false,
-            soft_mask_cache: FxHashMap::default(),
+            soft_mask_cache: hash::Map::default(),
             in_type3_glyph: false,
         }
     }
@@ -179,7 +179,7 @@ impl<'a, 'r> Device<'a> for Renderer<'r> {
 #[derive(Clone, Default)]
 pub struct RenderCache<'a> {
     pub(crate) interpreter_cache: InterpreterCache<'a>,
-    pub(crate) outline_cache: Rc<RefCell<FxHashMap<u128, Rc<BezPath>>>>,
+    pub(crate) outline_cache: Rc<RefCell<hash::Map<u128, Rc<BezPath>>>>,
 }
 
 impl<'a> RenderCache<'a> {
@@ -187,7 +187,7 @@ impl<'a> RenderCache<'a> {
     pub fn new() -> Self {
         Self {
             interpreter_cache: InterpreterCache::new(),
-            outline_cache: Rc::new(RefCell::new(FxHashMap::default())),
+            outline_cache: Rc::new(RefCell::new(hash::Map::default())),
         }
     }
 }

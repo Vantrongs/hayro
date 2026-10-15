@@ -4,8 +4,8 @@ use hayro_cmap::CMap;
 use hayro_jpeg2000::DecodeSettings;
 use hayro_syntax::Filter;
 use hayro_syntax::Pdf;
+use hayro_syntax::hash;
 use rayon::prelude::*;
-use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::panic::catch_unwind;
@@ -14,19 +14,19 @@ use std::sync::LazyLock;
 use std::sync::atomic::AtomicU32;
 use walkdir::WalkDir;
 
-static IGNORE_LIST: LazyLock<HashSet<String>> = LazyLock::new(|| {
+static IGNORE_LIST: LazyLock<hash::Set<String>> = LazyLock::new(|| {
     load_corpus_ignore_list().unwrap_or_else(|err| {
         panic!("failed to load ignore list: {err}");
     })
 });
 
-fn load_list(name: &str) -> std::io::Result<HashSet<String>> {
+fn load_list(name: &str) -> std::io::Result<hash::Set<String>> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("assets")
         .join(format!("{}.txt", name));
     let data = fs::read_to_string(&path)?;
 
-    let mut set = HashSet::new();
+    let mut set = hash::Set::default();
     for line in data.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with("//") {
@@ -45,19 +45,19 @@ fn load_list(name: &str) -> std::io::Result<HashSet<String>> {
     Ok(set)
 }
 
-fn load_corpus_ignore_list() -> std::io::Result<HashSet<String>> {
+fn load_corpus_ignore_list() -> std::io::Result<hash::Set<String>> {
     load_list("corpus_ignore_list")
 }
 
-fn load_jpx_list() -> std::io::Result<HashSet<String>> {
+fn load_jpx_list() -> std::io::Result<hash::Set<String>> {
     load_list("jpx_images")
 }
 
-fn load_ccitt_list() -> std::io::Result<HashSet<String>> {
+fn load_ccitt_list() -> std::io::Result<hash::Set<String>> {
     load_list("ccitt_ignore_list")
 }
 
-fn load_jbig2_list() -> std::io::Result<HashSet<String>> {
+fn load_jbig2_list() -> std::io::Result<hash::Set<String>> {
     load_list("jbig2_ignore_list")
 }
 

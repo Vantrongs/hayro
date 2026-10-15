@@ -1,10 +1,10 @@
 //! Page tree entries and the objects loading the pages reads, through [`Objects`],
 //! which resolves each object once.
 
+use crate::hash;
 use crate::object::dict::keys::{KIDS, MEDIA_BOX, PAGES, TYPE};
 use crate::object::{Dict, MaybeRef, Object, ObjectIdentifier};
 use crate::reader::ReaderContext;
-use crate::sync::FxHashMap;
 use crate::xref::{ContentKey, XRef};
 
 /// A page tree entry: a dictionary, or an empty one for any other object.
@@ -70,14 +70,14 @@ pub(super) struct Objects<'a> {
     /// The entries read from dictionaries, by what the dictionary is read from and the
     /// key, as read in the context of the first entry that read them: another entry
     /// reads them in its own ([`Object::in_context`]), which reads the same objects.
-    entries: FxHashMap<(ContentKey<'a>, &'static [u8]), Option<MaybeRef<Object<'a>>>>,
+    entries: hash::Map<(ContentKey<'a>, &'static [u8]), Option<MaybeRef<Object<'a>>>>,
 }
 
 impl<'a> Objects<'a> {
     pub(super) fn new(ctx: ReaderContext<'a>) -> Self {
         Self {
             ctx,
-            entries: FxHashMap::default(),
+            entries: hash::Map::default(),
         }
     }
 

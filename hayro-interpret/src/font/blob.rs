@@ -1,7 +1,7 @@
 use crate::font::UNITS_PER_EM;
 use crate::font::outline::OutlinePath;
+use hayro_syntax::hash;
 use kurbo::BezPath;
-use rustc_hash::FxHashMap;
 use skrifa::instance::{LocationRef, Size};
 use skrifa::metrics::GlyphMetrics;
 use skrifa::outline::{DrawSettings, Engine, HintingInstance, HintingOptions, Target};
@@ -245,10 +245,10 @@ impl OpenTypeFontBlob {
         &self.yoke.as_ref().get().glyph_metrics
     }
 
-    pub(crate) fn glyph_names(&self) -> FxHashMap<String, GlyphId> {
+    pub(crate) fn glyph_names(&self) -> hash::Map<String, GlyphId> {
         // Note: We don't call the `glyph_name` method provided by read-fonts because
         // calling it repeatedly is very slow.
-        let mut glyph_names = FxHashMap::default();
+        let mut glyph_names = hash::Map::default();
         let Ok(post) = self.font_ref().post() else {
             return glyph_names;
         };

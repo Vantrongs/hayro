@@ -47,7 +47,7 @@ flate2 = { version = "1" }
 zlib-rs = { version = "0.6.8", default-features = false, features = ["std"] }
 phf = { version = "0.13.1", default-features = false }
 moxcms = { version = "0.8.1" }
-rustc-hash = { version = "2" }
+foldhash = { version = "0.2", default-features = false, features = ["std"] }
 siphasher = "1"
 skrifa = { version = "0.46.0" }
 smallvec = { version = "1" }
@@ -95,6 +95,8 @@ clippy.debug_assert_with_mut_call = "warn"
 clippy.doc_markdown = "warn"
 clippy.fn_to_numeric_cast_any = "warn"
 clippy.infinite_loop = "warn"
+# A map hashed at random iterates in another order each run (hayro_syntax::hash).
+clippy.iter_over_hash_type = "warn"
 clippy.large_stack_arrays = "warn"
 clippy.mismatching_type_param_order = "warn"
 #clippy.missing_assert_message = "warn"

@@ -8,13 +8,13 @@
 //! to it, and a read of any type is the object the shape holds, cast to that type,
 //! so that a read of another type than the object's costs nothing to repeat.
 
+#[cfg(test)]
+use crate::hash;
 use crate::lost::Lost;
 use crate::object::parsed::{DictNode, Node};
 use crate::object::{Number, ObjectIdentifier};
 use crate::reader::{Reader, ReaderContext, ReaderExt};
 use crate::sync::Arc;
-#[cfg(test)]
-use crate::sync::FxHashMap;
 use crate::trivia::{is_eol_character, is_white_space_character};
 
 /// Where the body of an object is: the bytes it is in and where it starts in them,
@@ -136,11 +136,11 @@ impl core::fmt::Debug for Shape {
 std::thread_local! {
     /// The places whose bodies were read on this thread, how often each, which the
     /// tests bound to show that each is read once however it is asked for.
-    pub(crate) static BODIES: core::cell::RefCell<FxHashMap<Place, usize>> =
-        core::cell::RefCell::new(FxHashMap::default());
+    pub(crate) static BODIES: core::cell::RefCell<hash::Map<Place, usize>> =
+        core::cell::RefCell::new(hash::Map::default());
     /// The places whose streams' data were found on this thread, how often each.
-    pub(crate) static DATA_FOUND: core::cell::RefCell<FxHashMap<Place, usize>> =
-        core::cell::RefCell::new(FxHashMap::default());
+    pub(crate) static DATA_FOUND: core::cell::RefCell<hash::Map<Place, usize>> =
+        core::cell::RefCell::new(hash::Map::default());
 }
 
 impl Shape {

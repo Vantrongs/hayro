@@ -5,8 +5,8 @@ use crate::interpret::state::ActiveTransferFunction;
 use crate::pattern::ShadingPattern;
 use crate::shading::{ShadingFunction, ShadingType, Triangle};
 use crate::util::x_y_advances;
+use hayro_syntax::hash;
 use kurbo::{Affine, Point, Rect};
-use rustc_hash::FxHashMap;
 use smallvec::{ToSmallVec, smallvec};
 use std::sync::Arc;
 
@@ -55,7 +55,7 @@ pub struct EncodedRadialAxialShading {
 /// Encoded sampled mesh shading.
 #[derive(Clone, Debug)]
 pub struct EncodedSampledShading {
-    pub(crate) samples: Arc<FxHashMap<(u16, u16), ColorComponents>>,
+    pub(crate) samples: Arc<hash::Map<(u16, u16), ColorComponents>>,
     pub(crate) function: Option<ShadingFunction>,
 }
 
@@ -332,8 +332,8 @@ fn encode_axial_shading(
 fn sample_triangles(
     triangles: &[Triangle],
     transform: Affine,
-) -> FxHashMap<(u16, u16), ColorComponents> {
-    let mut map = FxHashMap::default();
+) -> hash::Map<(u16, u16), ColorComponents> {
+    let mut map = hash::Map::default();
 
     for t in triangles {
         let t = {

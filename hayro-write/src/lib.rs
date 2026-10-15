@@ -16,6 +16,7 @@ mod primitive;
 use crate::primitive::{WriteDirect, WriteIndirect};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
+use hayro_syntax::hash;
 use hayro_syntax::object::dict::keys::{
     COLORSPACE, EXT_G_STATE, FONT, GROUP, PATTERN, PROPERTIES, RESOURCES, SHADING, SUBTYPE, TYPE,
     XOBJECT,
@@ -26,8 +27,6 @@ use hayro_syntax::page::{ContentError, Page, Resources, Rotation};
 use hayro_syntax::work::Meter;
 use hayro_syntax::xref::ContentKey;
 use pdf_writer::{Chunk, Content, Filter, Finish, Name, Rect, Ref};
-use rustc_hash::FxHashMap;
-use std::collections::HashMap;
 use std::ops::Deref;
 use std::ops::DerefMut;
 
@@ -219,12 +218,10 @@ pub struct ExtractionResult {
     pub page_tree_parent_ref: Ref,
 }
 
-/// A stream's copied dictionary, and its data's length and hash.
-///
-/// A file can make the data of many streams hash alike, and their dictionaries
-/// too where these are hashed as the data are, so the keys are hashed at random
-/// ([`ExtractionContext::shared_streams`]) and a stream is compared with one other
-/// at most ([`primitive`]).
+/// A stream's copied dictionary, and its data's length and hash, which the map of
+/// these keys hashes with its random keys ([`hayro_syntax::hash`]), so that no file
+/// makes many streams' data hash alike; a stream is compared with one other at most
+/// ([`primitive`]).
 type StreamKey = (Vec<u8>, usize, u64);
 
 /// What an extraction copies, and what it keeps of what it copied for the queries
@@ -236,7 +233,7 @@ struct ExtractionContext<'a> {
     /// What a reference to each body an entry leads to is written as
     /// ([`hayro_syntax::xref::XRef::content_key`]), for every entry leading to it:
     /// its copy's reference, or `None` for `null`, where it cannot be read.
-    copies: FxHashMap<ContentKey<'a>, Option<Ref>>,
+    copies: hash::Map<ContentKey<'a>, Option<Ref>>,
     /// The bodies left to copy, each once: an entry leading to it, its copy, and the
     /// index of the page whose copy refers to it first.
     to_copy: Vec<(ObjRef, Ref, usize)>,
@@ -245,19 +242,19 @@ struct ExtractionContext<'a> {
     page: usize,
     /// The copies of streams whose dictionaries refer to no other object: an entry
     /// leading to the first stream copied with each key, and its copy.
-    shared_streams: HashMap<StreamKey, (ObjRef, Ref)>,
+    shared_streams: hash::Map<StreamKey, (ObjRef, Ref)>,
     /// The copies of streams form queries asked for, by the stream's body and, for
     /// one that takes its page's resources, the page.
-    forms: FxHashMap<(ContentKey<'a>, Option<usize>), Ref>,
+    forms: hash::Map<(ContentKey<'a>, Option<usize>), Ref>,
     /// The copy of each resource category dictionary pages and forms are drawn
     /// with, by what it is read from, which pages that share it share.
-    resource_categories: FxHashMap<ContentKey<'a>, Ref>,
+    resource_categories: hash::Map<ContentKey<'a>, Ref>,
     /// The first part of the source that could not be read whole.
     error: Option<ExtractionError>,
     root_refs: Vec<Result<Ref, ExtractionError>>,
     pdf: &'a Pdf,
     new_ref: Box<dyn FnMut() -> Ref + 'a>,
-    cached_content_streams: FxHashMap<usize, Ref>,
+    cached_content_streams: hash::Map<usize, Ref>,
     page_tree_parent_ref: Ref,
     chunk_settings: ChunkSettings,
     /// Counts the bytes of data hashed, compared and written.
@@ -273,16 +270,16 @@ impl<'a> ExtractionContext<'a> {
         let page_tree_parent_ref = new_ref();
         Self {
             chunks: vec![],
-            copies: FxHashMap::default(),
+            copies: hash::Map::default(),
             to_copy: Vec::new(),
             page: 0,
-            shared_streams: HashMap::new(),
-            forms: FxHashMap::default(),
-            resource_categories: FxHashMap::default(),
+            shared_streams: hash::Map::default(),
+            forms: hash::Map::default(),
+            resource_categories: hash::Map::default(),
             error: None,
             pdf,
             new_ref,
-            cached_content_streams: FxHashMap::default(),
+            cached_content_streams: hash::Map::default(),
             root_refs: Vec::new(),
             page_tree_parent_ref,
             chunk_settings,

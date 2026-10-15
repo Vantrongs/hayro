@@ -1,16 +1,16 @@
+use hayro_syntax::hash;
 use hayro_syntax::object::dict::keys::{BASE_STATE, D, OCGS, OCMD, OCPROPERTIES, OFF, ON, P, TYPE};
 use hayro_syntax::object::{Array, Dict, Name, ObjectIdentifier};
-use std::collections::HashSet;
 
 pub(crate) struct OcgState {
-    inactive_ocgs: HashSet<ObjectIdentifier>,
+    inactive_ocgs: hash::Set<ObjectIdentifier>,
     visibility_stack: Vec<bool>,
 }
 
 impl OcgState {
     fn dummy() -> Self {
         Self {
-            inactive_ocgs: HashSet::default(),
+            inactive_ocgs: hash::Set::default(),
             visibility_stack: vec![],
         }
     }
@@ -24,7 +24,7 @@ impl OcgState {
             return Self::dummy();
         };
 
-        let mut inactive = HashSet::new();
+        let mut inactive = hash::Set::default();
 
         let base_state = config
             .get::<Name<'_>>(BASE_STATE)

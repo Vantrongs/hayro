@@ -10,6 +10,7 @@
 //! reading of arrays and dictionaries that `Object::skip_with_depth` and
 //! `parse_dict_with` share), so a body parses where it skips, to the same end.
 
+use crate::hash;
 use crate::object::array::parse_array_with;
 use crate::object::dict::{new_offsets, parse_dict_with};
 use crate::object::{
@@ -17,7 +18,7 @@ use crate::object::{
     ObjectLike, String, leaf,
 };
 use crate::reader::{Reader, ReaderContext, ReaderExt};
-use crate::sync::{Arc, FxHashMap};
+use crate::sync::Arc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
@@ -83,8 +84,8 @@ pub(crate) struct ArrayNode {
 
 /// A dictionary: where it is, and each entry's value, those of a small dictionary in
 /// a list with where each key is, which takes a few dozen bytes an entry where its
-/// map takes hundreds a dictionary, in the order the map iterates them, the order
-/// every read finds.
+/// map takes hundreds a dictionary, in no particular order ([`Dict::keys`] sorts
+/// them).
 pub(crate) struct DictNode {
     span: Span,
     entries: Entries,
@@ -92,7 +93,7 @@ pub(crate) struct DictNode {
 
 enum Entries {
     List(Box<[(Text, Node)]>),
-    Map(Box<FxHashMap<Name<'static>, Node>>),
+    Map(Box<hash::Map<Name<'static>, Node>>),
 }
 
 /// At most this many entries are kept in a list, which a key is searched in entry by
@@ -150,10 +151,11 @@ impl<'a> Parse<'_, 'a> {
         let from = r.offset();
         // The entries, each key borrowed while they are few, in a map that is built
         // by the same insertions as the map of a dictionary read from its bytes, so
-        // that they are iterated in its order; past `LISTED`, the keys are held.
+        // that the last of a key's entries is its value; past `LISTED`, the keys are
+        // held.
         let mut few = new_offsets();
         let mut keys = Vec::new();
-        let mut many: Option<FxHashMap<Name<'static>, Node>> = None;
+        let mut many: Option<hash::Map<Name<'static>, Node>> = None;
         let bytes = parse_dict_with(r, false, depth + 1, Some(b"<<"), b">>", |r, key, _| {
             let value = self.item(r, from, depth + 1)?;
             match &mut many {
@@ -308,8 +310,7 @@ impl DictNode {
         }
     }
 
-    /// The entries of the dictionary whose bytes are `data`, in the order the
-    /// dictionary's map iterates them.
+    /// The entries of the dictionary whose bytes are `data`, in no particular order.
     pub(crate) fn entries<'s, 'a: 's>(
         &'s self,
         data: &'a [u8],

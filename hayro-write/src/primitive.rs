@@ -1,4 +1,5 @@
 use crate::{ExtractionContext, ExtractionError};
+use hayro_syntax::hash;
 use hayro_syntax::object;
 use hayro_syntax::object::dict::keys::{
     AF, CRYPT, DECODE_PARMS, FILTER, LAST_MODIFIED, LENGTH, METADATA, OC, OPI, PIECE_INFO, PT_DATA,
@@ -7,14 +8,13 @@ use hayro_syntax::object::dict::keys::{
 use hayro_syntax::object::{MaybeRef, Null, Number, ObjectIdentifier, Stream};
 use hayro_syntax::object::{Object, array, dict};
 use pdf_writer::{Chunk, Dict, Finish, Obj, Ref};
-use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
+use std::hash::BuildHasher;
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::sync::LazyLock;
 
-static IGNORE_KEYS: LazyLock<HashSet<&'static [u8]>> = LazyLock::new(|| {
-    let mut m = HashSet::new();
+static IGNORE_KEYS: LazyLock<hash::Set<&'static [u8]>> = LazyLock::new(|| {
+    let mut m = hash::Set::default();
 
     m.insert(METADATA);
     m.insert(STRUCT_PARENT);
@@ -84,13 +84,9 @@ fn first_target(source: object::ObjRef, ctx: &mut ExtractionContext<'_>) -> Opti
         write_stream_dict(stream.dict(), &mut dict, ctx, &[]);
         dict.finish();
         let _ = ctx.meter.work(scratch.len() + data.len());
-        let mut hasher = rustc_hash::FxHasher::default();
-        data.hash(&mut hasher);
-        let key = (
-            scratch.as_bytes().to_vec(),
-            data.len(),
-            Hasher::finish(&hasher),
-        );
+        // Hashed with the map's random keys, as the key it is part of is.
+        let hashed = ctx.shared_streams.hasher().hash_one(&*data);
+        let key = (scratch.as_bytes().to_vec(), data.len(), hashed);
         let copy = match ctx.shared_streams.get(&key) {
             Some((other, copy)) => {
                 // One comparison for each stream, however many a file makes hash
