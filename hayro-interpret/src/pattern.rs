@@ -5,9 +5,10 @@ use crate::color::{Color, ColorSpace};
 use crate::context::{Context, InterpreterCache};
 use crate::device::Device;
 use crate::font::GlyphRun;
+use crate::interpret::annotation::entries::Entries;
 use crate::interpret::state::{ActiveTransferFunction, State};
 use crate::shading::Shading;
-use crate::util::{Float32Ext, RectExt, hash128};
+use crate::util::{Float32Ext, hash128};
 use crate::x_object::soft_mask::SoftMask;
 use crate::{BlendMode, CacheKey, ClipPath, DrawMode, DrawProps, Image, ImageDrawProps};
 use crate::{FillRule, InterpreterSettings, Paint, interpret};
@@ -39,7 +40,6 @@ impl<'a> Pattern<'a> {
             Object::Dict(dict) => Some(Self::Shading(ShadingPattern::new(
                 &dict,
                 &ctx.interpreter_cache.object_cache,
-                ctx.get().graphics_state.non_stroke_alpha,
             )?)),
             Object::Stream(stream) => {
                 Some(Self::Tiling(Box::new(TilingPattern::new(stream, ctx)?)))
@@ -56,6 +56,15 @@ impl<'a> Pattern<'a> {
                 Arc::make_mut(&mut p.shading).clip_path = transformed_clip_path;
             }
             Self::Tiling(p) => p.matrix = transform * p.matrix,
+        }
+    }
+
+    /// Paints at `opacity`, the alpha of the graphics state it paints in: viewers
+    /// take it when the pattern paints, not when it is selected.
+    pub(crate) fn set_opacity(&mut self, opacity: f32) {
+        match self {
+            Self::Shading(p) => p.opacity = opacity,
+            Self::Tiling(p) => p.opacity = opacity,
         }
     }
 
@@ -82,23 +91,20 @@ pub struct ShadingPattern {
     pub shading: Arc<Shading>,
     /// A transformation matrix to apply prior to rendering.
     pub matrix: Affine,
-    /// An additional opacity to apply to the shading pattern.
+    /// The opacity the shading paints at (see [`Pattern::set_opacity`]).
     pub opacity: f32,
     /// An optional transfer function to apply to the shading's output colors.
     pub transfer_function: Option<ActiveTransferFunction>,
 }
 
 impl ShadingPattern {
-    pub(crate) fn new(dict: &Dict<'_>, cache: &Cache, opacity: f32) -> Option<Self> {
+    pub(crate) fn new(dict: &Dict<'_>, cache: &Cache) -> Option<Self> {
         let shading = dict.get::<Object<'_>>(SHADING).and_then(|o| {
             let (dict, stream) = dict_or_stream(&o)?;
 
             Shading::new(dict, stream, cache)
         })?;
-        let matrix = dict
-            .get::<[f64; 6]>(MATRIX)
-            .map(Affine::new)
-            .unwrap_or_default();
+        let matrix = Affine::new(Entries::detached(dict.clone()).matrix(MATRIX));
 
         if dict.contains_key(EXT_G_STATE) {
             warn!("shading patterns with ext_g_state are not supported yet");
@@ -106,7 +112,7 @@ impl ShadingPattern {
 
         Some(Self {
             shading: Arc::new(shading),
-            opacity,
+            opacity: 1.0,
             matrix,
             transfer_function: None,
         })
@@ -115,7 +121,11 @@ impl ShadingPattern {
 
 impl CacheKey for ShadingPattern {
     fn cache_key(&self) -> u128 {
-        hash128(&(self.shading.cache_key(), self.matrix.cache_key()))
+        hash128(&(
+            self.shading.cache_key(),
+            self.matrix.cache_key(),
+            self.opacity.to_bits(),
+        ))
     }
 }
 
@@ -132,6 +142,9 @@ pub struct TilingPattern<'a> {
     pub y_step: f32,
     /// A transformation to apply prior to rendering.
     pub matrix: Affine,
+    /// The opacity the pattern paints at, its cell as a whole (see
+    /// [`Pattern::set_opacity`]).
+    pub opacity: f32,
     stream: Stream<'a>,
     is_color: bool,
     pub(crate) stroke_paint: Color,
@@ -154,19 +167,18 @@ impl<'a> TilingPattern<'a> {
         let cache_key = stream.cache_key();
         let dict = stream.dict();
 
-        let bbox = dict.get::<hayro_syntax::object::Rect>(BBOX)?.to_kurbo();
-        let x_step = dict.get::<f32>(X_STEP)?;
-        let y_step = dict.get::<f32>(Y_STEP)?;
+        // Read as viewers read damaged ones, as forms are.
+        let entries = Entries::detached(dict.clone());
+        let bbox = entries.rect(BBOX)?;
+        let x_step = entries.number(X_STEP).unwrap_or(0.0) as f32;
+        let y_step = entries.number(Y_STEP).unwrap_or(0.0) as f32;
 
         if x_step.is_nearly_zero() || y_step.is_nearly_zero() || bbox.is_zero_area() {
             return None;
         }
 
         let is_color = dict.get::<u8>(PAINT_TYPE)? == 1;
-        let matrix = dict
-            .get::<[f64; 6]>(MATRIX)
-            .map(Affine::new)
-            .unwrap_or_default();
+        let matrix = Affine::new(entries.matrix(MATRIX));
 
         let state = ctx.get().clone();
         let ctx_bbox = ctx.bbox();
@@ -182,16 +194,10 @@ impl<'a> TilingPattern<'a> {
             .pattern_cs()
             .unwrap_or(ColorSpace::device_gray());
 
-        let non_stroking_paint = Color::new(
-            fill_cs,
-            state.graphics_state.non_stroke_color.clone(),
-            state.graphics_state.non_stroke_alpha,
-        );
-        let stroke_paint = Color::new(
-            stroke_cs,
-            state.graphics_state.stroke_color.clone(),
-            state.graphics_state.stroke_alpha,
-        );
+        // Opaque: the cell is painted at the pattern's opacity.
+        let non_stroking_paint =
+            Color::new(fill_cs, state.graphics_state.non_stroke_color.clone(), 1.0);
+        let stroke_paint = Color::new(stroke_cs, state.graphics_state.stroke_color.clone(), 1.0);
         let nesting_depth = ctx.nesting_depth() + 1;
         let resources = Resources::new(dict.get(RESOURCES).unwrap_or_default());
 
@@ -201,6 +207,7 @@ impl<'a> TilingPattern<'a> {
             x_step,
             y_step,
             matrix,
+            opacity: 1.0,
             ctx_bbox,
             is_color,
             stream,

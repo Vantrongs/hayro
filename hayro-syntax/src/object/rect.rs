@@ -60,11 +60,11 @@ impl<'a> Readable<'a> for Rect {
 }
 
 fn from_arr(array: &Array<'_>) -> Option<Rect> {
-    let mut iter = array.iter::<f32>();
-    let x0 = iter.next()? as f64;
-    let y0 = iter.next()? as f64;
-    let x1 = iter.next()? as f64;
-    let y1 = iter.next()? as f64;
+    let mut items = array.items::<f32>();
+    let x0 = items.next()?? as f64;
+    let y0 = items.next()?? as f64;
+    let x1 = items.next()?? as f64;
+    let y1 = items.next()?? as f64;
 
     Some(Rect::new(x0.min(x1), y0.min(y1), x1.max(x0), y1.max(y0)))
 }

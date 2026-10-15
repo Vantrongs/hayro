@@ -1,3 +1,4 @@
+use crate::FillRule;
 use crate::color::ColorSpace;
 use crate::context::Context;
 use crate::convert::{convert_line_cap, convert_line_join};
@@ -12,12 +13,11 @@ use crate::pattern::{Pattern, ShadingPattern};
 use crate::shading::Shading;
 use crate::util::{OptionLog, RectExt};
 use crate::x_object::{FormXObject, ImageXObject, XObject};
-use crate::{BlendMode, FillRule};
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
 use hayro_syntax::hash;
-use hayro_syntax::object::dict::keys::{ANNOTS, AP, F, MCID, N, OC, RECT};
-use hayro_syntax::object::{Array, Dict, Name, Object, Rect, dict_or_stream};
+use hayro_syntax::object::dict::keys::{ANNOTS, MCID, OC};
+use hayro_syntax::object::{Dict, Name, Object, dict_or_stream};
 use hayro_syntax::page::{Page, Resources};
 use kurbo::{Affine, Point, Shape};
 use smallvec::smallvec;
@@ -101,9 +101,22 @@ pub struct InterpreterSettings {
     /// Note that this feature is currently not fully implemented yet, so some
     /// annotations might be missing.
     pub render_annotations: bool,
-    /// Draw annotations as for printing: only those with the Print flag (PDF 32000-1
-    /// 12.5.3), instead of all that are not `NoView`. Hidden ones are never drawn.
-    pub annotation_print: bool,
+    /// Which annotations are drawn.
+    pub annotations: AnnotationSelection,
+}
+
+/// Which annotations a page is drawn with (PDF 32000-1 12.5.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AnnotationSelection {
+    /// As for viewing: all but those flagged Hidden or `NoView`.
+    #[default]
+    View,
+    /// As for printing: those flagged Print, but not Hidden.
+    Print,
+    /// As when annotations are flattened into page content for printing what the
+    /// reader sees: all but links and those flagged Hidden or Invisible, whatever
+    /// their Print and `NoView` flags.
+    Flatten,
 }
 
 impl Default for InterpreterSettings {
@@ -112,17 +125,14 @@ impl Default for InterpreterSettings {
             #[cfg(not(feature = "embed-fonts"))]
             font_resolver: Arc::new(|_| None),
             #[cfg(feature = "embed-fonts")]
-            font_resolver: Arc::new(|query| match query {
-                FontQuery::Standard(s) => Some(s.get_font_data()),
-                FontQuery::Fallback(f) => Some(f.pick_standard_font().get_font_data()),
-            }),
+            font_resolver: Arc::new(|query| Some(query.standard_substitute().get_font_data())),
             #[cfg(feature = "embed-cmaps")]
             cmap_resolver: Arc::new(hayro_cmap::load_embedded),
             #[cfg(not(feature = "embed-cmaps"))]
             cmap_resolver: Arc::new(|_| None),
             warning_sink: Arc::new(|_| {}),
             render_annotations: true,
-            annotation_print: false,
+            annotations: AnnotationSelection::View,
         }
     }
 }
@@ -137,9 +147,9 @@ pub enum InterpreterWarning {
     UnsupportedFont,
     /// An image failed to decode.
     ImageDecodeFailure,
-    /// An annotation has an `AP` dictionary, but its normal appearance could not
-    /// be selected or loaded, so the annotation was not drawn.
-    UnresolvedAnnotationAppearance,
+    /// An annotation has no usable appearance stream, and none could be generated
+    /// for it ([`annotation::Unsupported`]), so it was not drawn.
+    UnsupportedAnnotation,
 }
 
 /// interpret the contents of the page and render them into the device.
@@ -151,51 +161,51 @@ pub fn interpret_page<'a>(
     let resources = page.resources();
     interpret(page.typed_operations(), resources, context, device);
 
-    if context.settings.render_annotations
-        && let Some(annot_arr) = page.raw().get::<Array<'_>>(ANNOTS)
-    {
-        for annot in annot_arr.iter::<Dict<'_>>() {
-            let flags = annot.get::<u32>(F).unwrap_or(0);
+    if context.settings.render_annotations && page.raw().contains_key(ANNOTS) {
+        // The fields of the document's forms are read once for all its pages.
+        let appearances = annotation::Appearances::with_fields(
+            page.xref(),
+            context.settings.font_resolver.clone(),
+            context.interpreter_cache.annotation_fields.clone(),
+        );
+        let visible = page.intersected_crop_box().to_kurbo();
+        let drawn = appearances.page(page, context.settings.annotations, visible);
+        for annot in drawn.iter() {
+            match annot.look() {
+                annotation::Look::Stream { stream, placement } => {
+                    // The box and matrix as the placement reads them, as a writer
+                    // that copies the stream draws it.
+                    let Some(apx) = FormXObject::placed(
+                        stream,
+                        Affine::new(placement.matrix().map(f64::from)),
+                        placement.bbox(),
+                    ) else {
+                        continue;
+                    };
 
-            // Hidden; without Print when printing; NoView when viewing.
-            if flags & 2 != 0
-                || (context.settings.annotation_print && flags & 4 == 0)
-                || (!context.settings.annotation_print && flags & 32 != 0)
-            {
-                continue;
-            }
+                    context.save_state();
+                    context.pre_concat_affine(Affine::new(placement.transform().map(f64::from)));
+                    context.push_root_transform();
 
-            if let Some(apx) =
-                annotation::normal_appearance(&annot).and_then(|o| FormXObject::new(&o))
-            {
-                let Some(rect) = annot.get::<Rect>(RECT) else {
-                    continue;
-                };
-                let affine = annotation::rect_transform(rect.to_kurbo(), apx.bbox, apx.matrix);
-
-                context.save_state();
-                context.pre_concat_affine(affine);
-                context.push_root_transform();
-
-                apx.draw(resources, context, device);
-                context.pop_root_transform();
-                context.restore_state(device);
-            } else if annot
-                .get::<Dict<'_>>(AP)
-                .is_some_and(|ap| ap.contains_key(N))
-            {
-                (context.settings.warning_sink)(InterpreterWarning::UnresolvedAnnotationAppearance);
-            } else if let Some(appearance) =
-                annotation::generate(&annot, page.intersected_crop_box().to_kurbo())
-            {
-                draw_generated(&appearance, resources, context, device);
+                    apx.draw(resources, context, device);
+                    context.pop_root_transform();
+                    context.restore_state(device);
+                }
+                annotation::Look::Generated(appearance) => {
+                    draw_generated(appearance, resources, context, device);
+                }
+                annotation::Look::Nothing => {}
+                annotation::Look::Unsupported(_) => {
+                    (context.settings.warning_sink)(InterpreterWarning::UnsupportedAnnotation);
+                }
             }
         }
     }
 }
 
 /// Draws an appearance generated for an annotation without one, from a fresh
-/// graphics state in default user space.
+/// graphics state in default user space with its opacity and blend mode, which apply
+/// to each thing it paints.
 fn draw_generated<'a>(
     appearance: &annotation::Appearance,
     resources: &Resources<'a>,
@@ -204,20 +214,25 @@ fn draw_generated<'a>(
 ) {
     context.path_mut().truncate(0);
     context.save_state();
-    context.get_mut().graphics_state = state::GraphicsState::default();
-    let group = appearance.opacity < 1.0 || appearance.blend != BlendMode::Normal;
-    if group {
-        device.push_transparency_group(appearance.opacity, None, appearance.blend);
-    }
+    context.get_mut().graphics_state = state::GraphicsState {
+        non_stroke_alpha: appearance.opacity,
+        stroke_alpha: appearance.opacity,
+        blend_mode: appearance.blend,
+        ..Default::default()
+    };
+    let glyphs = appearance
+        .glyphs
+        .iter()
+        .map(|g| (g.name_rc(), g.clone()))
+        .collect();
+    let outer = std::mem::replace(&mut context.generated_glyphs, glyphs);
     interpret(
         TypedIter::new(appearance.content.as_bytes()),
         resources,
         context,
         device,
     );
-    if group {
-        device.pop_transparency_group();
-    }
+    context.generated_glyphs = outer;
     context.restore_state(device);
 }
 
@@ -457,7 +472,8 @@ pub fn interpret<'a>(
                 context.get_mut().graphics_state.stroke_props.dash_offset = p.1.as_f32();
                 // kurbo apparently cannot properly deal with offsets that are exactly 0.
                 context.get_mut().graphics_state.stroke_props.dash_array =
-                    p.0.iter::<f32>()
+                    p.0.items::<f32>()
+                        .map_while(|n| n)
                         .map(|n| if n == 0.0 { 0.01 } else { n })
                         .collect();
             }
@@ -668,6 +684,19 @@ pub fn interpret<'a>(
             }
             TypedInstruction::ShapeGlyph(_) => {}
             TypedInstruction::XObject(x) => {
+                // A glyph of the generated appearance being drawn.
+                let glyph = std::str::from_utf8(x.0.as_ref())
+                    .ok()
+                    .and_then(|name| context.generated_glyphs.get(name).cloned());
+                if let Some(glyph) = glyph {
+                    interpret(
+                        TypedIter::new(glyph.content().as_bytes()),
+                        resources,
+                        context,
+                        device,
+                    );
+                    continue;
+                }
                 let cache = context.interpreter_cache.object_cache.clone();
                 let warning_sink = context.settings.warning_sink.clone();
                 let transfer_function = context.get().graphics_state.transfer_function.clone();
@@ -717,7 +746,8 @@ pub fn interpret<'a>(
                         Pattern::Shading(ShadingPattern {
                             shading: Arc::new(s),
                             matrix: Affine::IDENTITY,
-                            opacity: context.get().graphics_state.non_stroke_alpha,
+                            // Set where it paints.
+                            opacity: 1.0,
                             transfer_function: transfer_function.clone(),
                         })
                     })

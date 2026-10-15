@@ -7,7 +7,9 @@ use hayro_write::hayro_syntax::object::{
 };
 use hayro_write::hayro_syntax::page::ContentError;
 use hayro_write::pdf_writer::{self, Ref};
-use hayro_write::{ChunkSettings, ExtractionError, ExtractionQuery, ExtractionResult, extract};
+use hayro_write::{
+    ChunkSettings, ExtractionError, ExtractionQuery, ExtractionResult, FormPlacement, extract,
+};
 
 #[path = "../../hayro-syntax/tests/common/fixtures.rs"]
 #[allow(dead_code)]
@@ -40,6 +42,12 @@ fn get<'a>(pdf: &'a Pdf, r: Ref) -> Stream<'a> {
         .get::<Stream<'_>>(ObjRef::new(r.get(), 0).into())
         .expect("a stream")
 }
+
+/// The box and matrix of the appearance of [`shared_stamp`].
+const AT: FormPlacement = FormPlacement {
+    bbox: [0.0, 0.0, 50.0, 50.0],
+    matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+};
 
 /// Two pages that draw the same stamp, whose appearance (object 7) has no
 /// resources and draws `/Logo`, which each page's resources give differently.
@@ -81,7 +89,7 @@ fn shared_stamp(appearance_entries: &str) -> Pdf {
 fn a_form_without_resources_takes_its_page_s() {
     let source = shared_stamp("");
     let appearance = ObjRef::new(7, 0);
-    let queries = [0, 1, 0].map(|page| ExtractionQuery::new_form(appearance, page));
+    let queries = [0, 1, 0].map(|page| ExtractionQuery::new_form(appearance, page, AT));
     let result = run(&source, &queries).unwrap();
     let roots: Vec<Ref> = result.root_refs.iter().map(|r| r.unwrap()).collect();
     assert_ne!(roots[0], roots[1], "one copy for each page's resources");
@@ -107,7 +115,7 @@ fn a_form_without_resources_takes_its_page_s() {
 fn a_form_with_its_own_resources_is_copied_once() {
     let source = shared_stamp("/Resources << /XObject << /Logo 8 0 R >> >>");
     let appearance = ObjRef::new(7, 0);
-    let queries = [0, 1].map(|page| ExtractionQuery::new_form(appearance, page));
+    let queries = [0, 1].map(|page| ExtractionQuery::new_form(appearance, page, AT));
     let result = run(&source, &queries).unwrap();
     let roots: Vec<Ref> = result.root_refs.iter().map(|r| r.unwrap()).collect();
     assert_eq!(roots[0], roots[1]);
@@ -465,7 +473,7 @@ fn a_page_drawn_with_an_object_that_cannot_be_read_is_an_error() {
             );
         }
         // An appearance drawn with the page's resources, as it has none.
-        let result = run(&source, &[ExtractionQuery::new_form(lost(7), 0)]);
+        let result = run(&source, &[ExtractionQuery::new_form(lost(7), 0, AT)]);
         assert!(
             matches!(result, Err(ExtractionError::UnreadablePage(0, id)) if id == lost(object)),
             "{node} {page} {fifth}: {:?}",
@@ -487,7 +495,7 @@ fn a_page_drawn_with_an_object_that_cannot_be_read_is_an_error() {
         fonts,
         "/Resources 5 0 R",
     );
-    let result = run(&source, &[ExtractionQuery::new_form(lost(7), 0)]);
+    let result = run(&source, &[ExtractionQuery::new_form(lost(7), 0, AT)]);
     assert!(
         matches!(result, Err(ExtractionError::UnreadablePage(0, id)) if id == lost(5)),
         "{:?}",

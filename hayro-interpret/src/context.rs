@@ -2,6 +2,7 @@ use crate::cache::{Cache, CacheKey};
 use crate::color::{Color, ColorSpace};
 use crate::convert::convert_transform;
 use crate::font::{Font, PositionedGlyph, StandardFont};
+use crate::interpret::annotation::Glyph;
 use crate::interpret::state::{ClipType, State, TextStateFont};
 use crate::ocg::OcgState;
 use crate::util::{BezPathExt, Float64Ext};
@@ -28,6 +29,8 @@ pub(crate) const MAX_NESTED_INTERPRETATION_DEPTH: u32 = 50;
 pub struct InterpreterCache<'a> {
     pub(crate) font_cache: Rc<RefCell<hash::Map<u128, Option<Font<'a>>>>>,
     pub(crate) object_cache: Cache,
+    /// The form fields read for the annotations of the document's pages.
+    pub(crate) annotation_fields: crate::interpret::annotation::Fields<'a>,
 }
 
 impl<'a> Default for InterpreterCache<'a> {
@@ -42,6 +45,7 @@ impl<'a> InterpreterCache<'a> {
         Self {
             font_cache: Rc::new(RefCell::new(hash::Map::default())),
             object_cache: Cache::new(),
+            annotation_fields: crate::interpret::annotation::Fields::default(),
         }
     }
 }
@@ -61,6 +65,9 @@ pub struct Context<'a> {
     pub(crate) ocg_state: OcgState,
     nesting_depth: u32,
     pub(crate) glyph_scratch: Vec<PositionedGlyph<'a>>,
+    /// While a generated annotation appearance is drawn, the glyphs it draws as forms
+    /// by name.
+    pub(crate) generated_glyphs: hash::Map<Rc<str>, Rc<Glyph>>,
 }
 
 impl<'a> Context<'a> {
@@ -107,6 +114,7 @@ impl<'a> Context<'a> {
             ocg_state,
             nesting_depth,
             glyph_scratch: Vec::new(),
+            generated_glyphs: hash::Map::default(),
         }
     }
 
@@ -234,6 +242,7 @@ impl<'a> Context<'a> {
 
         if data.color_space.is_pattern() || data.pattern.is_some() {
             if let Some(mut pattern) = data.pattern {
+                pattern.set_opacity(data.alpha);
                 if let Some(tf) = &data.transfer_function {
                     pattern.set_transfer_function(tf.clone());
                 }

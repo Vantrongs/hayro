@@ -1978,9 +1978,9 @@ fn populate_from_xref_stream(stream: &Stream<'_>, insert_map: &mut XrefMap) -> O
     let mut xref_reader = Reader::new(xref_data.as_ref());
 
     if let Some(arr) = stream.dict().get::<Array<'_>>(INDEX) {
-        let iter = arr.iter::<(u32, u32)>();
+        let mut pairs = arr.flex_iter();
 
-        for (start, num_elements) in iter {
+        while let Some((start, num_elements)) = pairs.next::<(u32, u32)>() {
             xref_stream_subsection(
                 &mut xref_reader,
                 start,

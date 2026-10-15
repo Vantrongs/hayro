@@ -74,7 +74,9 @@ impl<'a> Array<'a> {
         }
     }
 
-    /// Returns an iterator over the resolved objects of the array.
+    /// Returns an iterator over the entries of the array that are objects of type
+    /// `T`, references resolved. An entry of another type, or a reference to no
+    /// object, is skipped: it does not end the iteration.
     #[allow(
         private_bounds,
         reason = "users shouldn't be able to implement `ObjectLike` for custom objects."
@@ -84,7 +86,29 @@ impl<'a> Array<'a> {
         T: ObjectLike<'a>,
     {
         ResolvedArrayIter {
-            flex_iter: self.flex_iter(),
+            items: self.items(),
+        }
+    }
+
+    /// Returns an iterator with one item for each entry of the array, in its place:
+    /// the entry as an object of type `T`, references resolved, or `None` when it is
+    /// of another type or a reference to no object.
+    #[allow(
+        private_bounds,
+        reason = "users shouldn't be able to implement `ObjectLike` for custom objects."
+    )]
+    pub fn items<T>(&self) -> ArrayItems<'a, T>
+    where
+        T: ObjectLike<'a>,
+    {
+        const {
+            assert!(
+                T::ONE_ENTRY,
+                "a tuple spans several entries; read it with `flex_iter`"
+            );
+        }
+        ArrayItems {
+            raw: self.raw_iter(),
             phantom_data: PhantomData,
         }
     }
@@ -92,7 +116,7 @@ impl<'a> Array<'a> {
     /// The items of the array that are of a specific type, resolved; `Err` with an
     /// object reading an item lost ([`crate::lost`]), the one it refers to where the
     /// file lists it but it cannot be read, which the computation being watched is
-    /// told too. Unlike [`Self::iter`], an item of another type, or a reference to
+    /// told too. As in [`Self::iter`], an item of another type, or a reference to
     /// nothing, is passed over, not the end.
     #[allow(
         private_bounds,
@@ -107,6 +131,13 @@ impl<'a> Array<'a> {
             MaybeRef::Ref(r) => ctx.xref().get_checked_with(r.into(), &ctx).transpose(),
             MaybeRef::NotRef(object) => object.cast::<T>().map(Ok),
         })
+    }
+
+    /// The entries before the first one that is not a `T`, as `flex_iter` reads
+    /// them; tuples read several entries at once.
+    fn prefix<T: ObjectLike<'a>>(&self) -> impl Iterator<Item = T> + use<'a, T> {
+        let mut entries = self.flex_iter();
+        core::iter::from_fn(move || entries.next::<T>())
     }
 
     /// Return a flex iterator over the items in the array.
@@ -289,10 +320,10 @@ impl<'a> Iterator for ArrayIter<'a> {
     }
 }
 
-/// An iterator over the array that resolves objects of a specific type.
+/// An iterator over the entries of an array that are objects of a specific type
+/// (see [`Array::iter`]).
 pub struct ResolvedArrayIter<'a, T> {
-    flex_iter: FlexArrayIter<'a>,
-    phantom_data: PhantomData<T>,
+    items: ArrayItems<'a, T>,
 }
 
 impl<'a, T> Iterator for ResolvedArrayIter<'a, T>
@@ -302,7 +333,30 @@ where
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.flex_iter.next::<T>()
+        self.items.by_ref().flatten().next()
+    }
+}
+
+/// An iterator over the entries of an array, each as an object of a specific type
+/// or `None` (see [`Array::items`]).
+pub struct ArrayItems<'a, T> {
+    raw: ArrayIter<'a>,
+    phantom_data: PhantomData<T>,
+}
+
+impl<'a, T> Iterator for ArrayItems<'a, T>
+where
+    T: ObjectLike<'a>,
+{
+    type Item = Option<T>;
+
+    // Each entry read as an object and cast, as a parsed array's entries are, so
+    // that an entry of another type is passed over by the one rule that read it.
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(match self.raw.next()? {
+            MaybeRef::Ref(r) => self.raw.ctx.xref().get_with::<T>(r.into(), &self.raw.ctx),
+            MaybeRef::NotRef(object) => object.cast::<T>(),
+        })
     }
 }
 
@@ -359,7 +413,7 @@ impl<'a, T: ObjectLike<'a> + Copy + Default, const C: usize> TryFrom<Array<'a>> 
     type Error = ();
 
     fn try_from(value: Array<'a>) -> Result<Self, Self::Error> {
-        let mut iter = value.iter::<T>();
+        let mut iter = value.prefix::<T>();
 
         let mut val = [T::default(); C];
 
@@ -404,7 +458,7 @@ impl<'a, T: ObjectLike<'a>> TryFrom<Array<'a>> for Vec<T> {
     type Error = ();
 
     fn try_from(value: Array<'a>) -> Result<Self, Self::Error> {
-        Ok(value.iter::<T>().collect())
+        Ok(value.prefix::<T>().collect())
     }
 }
 
@@ -434,7 +488,7 @@ impl<'a, U: ObjectLike<'a>, T: ObjectLike<'a> + smallvec::Array<Item = U>> TryFr
     type Error = ();
 
     fn try_from(value: Array<'a>) -> Result<Self, Self::Error> {
-        Ok(value.iter::<U>().collect())
+        Ok(value.prefix::<U>().collect())
     }
 }
 
@@ -578,6 +632,34 @@ mod tests {
         let res = array_impl(b"[(Hi) /Test]trialing data").unwrap();
         assert!(matches!(res[0], Object::String(_)));
         assert!(matches!(res[1], Object::Name(_)));
+    }
+
+    fn numbers(data: &[u8]) -> Array<'_> {
+        Reader::new(data)
+            .read_with_context::<Array<'_>>(&ReaderContext::new(XRef::dummy(), false))
+            .unwrap()
+    }
+
+    #[test]
+    fn iter_skips_an_entry_of_another_type_or_a_reference_to_no_object() {
+        let array = numbers(b"[1 null 2 (x) 5 0 R 3 /N]");
+        assert_eq!(array.iter::<f32>().collect::<Vec<_>>(), [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn items_keep_each_entry_in_its_place() {
+        let array = numbers(b"[1 null 5 0 R [2] 2]");
+        assert_eq!(
+            array.items::<f32>().collect::<Vec<_>>(),
+            [Some(1.0), None, None, None, Some(2.0)]
+        );
+    }
+
+    #[test]
+    fn a_vec_is_read_up_to_the_first_entry_of_another_type() {
+        let array = numbers(b"[1 2 null 3]");
+        assert_eq!(Vec::<f32>::try_from(array.clone()), Ok(vec![1.0, 2.0]));
+        assert_eq!(<[f32; 3]>::try_from(array), Err(()));
     }
 
     #[test]

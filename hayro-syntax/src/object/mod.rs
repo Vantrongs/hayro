@@ -99,6 +99,9 @@ impl AsRef<[u8]> for Bytes<'_> {
 
 /// A trait for PDF objects.
 pub(crate) trait ObjectLike<'a>: TryFrom<Object<'a>> + Readable<'a> + Debug + Clone {
+    /// Whether it is one entry of an array; a tuple is several.
+    const ONE_ENTRY: bool = true;
+
     /// Whether a stream is read as one, its data and all: a stream whose data cannot
     /// be read is lost to such a read, where any other reads its dictionary or is
     /// of another kind.
@@ -391,11 +394,22 @@ pub(crate) fn leaf<'a, L: Leaf<'a>>(
     make: L,
 ) -> Option<L::Out> {
     Some(match r.peek_byte()? {
-        b'n' => {
-            Null::read(r, ReaderContext::dummy_ref())?;
-            make.null()
+        b'n' | b't' | b'f' => {
+            let word = match r.peek_byte()? {
+                b'n' => Null::read(r, ReaderContext::dummy_ref()).map(|_| make.null()),
+                _ => bool::read(r, ReaderContext::dummy_ref()).map(|value| make.boolean(value)),
+            };
+            match word {
+                Some(word) => word,
+                // Outside content, another word starting so is read as `null`, as
+                // other unknown words are (`trust`, not `true`).
+                None if !is_content_stream => {
+                    skip_name_like(r, false)?;
+                    make.null()
+                }
+                None => return None,
+            }
         }
-        b't' | b'f' => make.boolean(bool::read(r, ReaderContext::dummy_ref())?),
         b'/' => match r.skip::<Name<'_>>(is_content_stream) {
             Some(name) => make.name(name)?,
             None => {
@@ -550,6 +564,27 @@ mod tests {
     #[test]
     fn bool() {
         assert!(matches!(object_impl(b"true").unwrap(), Object::Boolean(_)));
+    }
+
+    /// Outside content, a word that starts as `null`, `true` or `false` do but is
+    /// none of them reads as null, as other unknown words do, so a dictionary with
+    /// one keeps its other entries.
+    #[test]
+    fn unknown_words_read_as_null() {
+        for word in [&b"two"[..], b"t", b"nul", b"fals", b"bar"] {
+            assert!(
+                matches!(object_impl(word), Some(Object::Null(_))),
+                "{word:?}"
+            );
+        }
+        let Some(Object::Dict(d)) = object_impl(b"<< /Q two /A 1 >>") else {
+            panic!("not a dictionary");
+        };
+        assert_eq!(d.get::<i32>(b"A"), Some(1));
+        let Some(Object::Array(a)) = object_impl(b"[fals 2]") else {
+            panic!("not an array");
+        };
+        assert_eq!(a.iter::<Object<'_>>().count(), 2);
     }
 
     #[test]

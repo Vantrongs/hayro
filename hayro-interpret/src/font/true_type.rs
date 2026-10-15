@@ -399,7 +399,10 @@ pub(crate) fn read_widths(dict: &Dict<'_>, descriptor: &Dict<'_>) -> Option<(Vec
     let missing_width = descriptor.get::<f32>(MISSING_WIDTH).unwrap_or(0.0);
 
     if let (Some(fc), Some(lc), Some(w)) = (first_char, last_char, widths_arr) {
-        let iter = w.iter::<f32>().take(lc.checked_sub(fc)?.checked_add(1)?);
+        let iter = w
+            .items::<f32>()
+            .map_while(|w| w)
+            .take(lc.checked_sub(fc)?.checked_add(1)?);
 
         for _ in 0..fc {
             widths.push(Width::Missing);

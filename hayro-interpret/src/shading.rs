@@ -6,12 +6,12 @@ use crate::CacheKey;
 use crate::cache::Cache;
 use crate::color::{ColorComponents, ColorSpace};
 use crate::function::{Function, StitchingBounds, Values, interpolate};
-use crate::util::{Float32Ext, PointExt, RectExt};
+use crate::interpret::annotation::entries::Entries;
+use crate::util::{Float32Ext, PointExt};
 use hayro_syntax::bit_reader::BitReader;
 use hayro_syntax::object::Array;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Object;
-use hayro_syntax::object::Rect;
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::{
     BACKGROUND, BBOX, BITS_PER_COMPONENT, BITS_PER_COORDINATE, BITS_PER_FLAG, COLORSPACE, COORDS,
@@ -148,10 +148,7 @@ impl Shading {
         let shading_type = match shading_num {
             1 => {
                 let domain = dict.get::<[f32; 4]>(DOMAIN).unwrap_or([0.0, 1.0, 0.0, 1.0]);
-                let matrix = dict
-                    .get::<[f64; 6]>(MATRIX)
-                    .map(Affine::new)
-                    .unwrap_or_default();
+                let matrix = Affine::new(Entries::detached(dict.clone()).matrix(MATRIX));
                 let function = read_function(dict, &color_space)?;
 
                 ShadingType::FunctionBased {
@@ -200,7 +197,8 @@ impl Shading {
                 let function = read_function(dict, &color_space);
                 let decode = dict
                     .get::<Array<'_>>(DECODE)?
-                    .iter::<f32>()
+                    .items::<f32>()
+                    .map_while(|n| n)
                     .collect::<Vec<_>>();
 
                 let triangles = read_free_form_triangles(
@@ -225,7 +223,8 @@ impl Shading {
                 let function = read_function(dict, &color_space);
                 let decode = dict
                     .get::<Array<'_>>(DECODE)?
-                    .iter::<f32>()
+                    .items::<f32>()
+                    .map_while(|n| n)
                     .collect::<Vec<_>>();
                 let vertices_per_row = dict.get::<u32>(VERTICES_PER_ROW)?;
 
@@ -252,7 +251,8 @@ impl Shading {
                 let function = read_function(dict, &color_space);
                 let decode = dict
                     .get::<Array<'_>>(DECODE)?
-                    .iter::<f32>()
+                    .items::<f32>()
+                    .map_while(|n| n)
                     .collect::<Vec<_>>();
 
                 let patches = read_coons_patch_mesh(
@@ -275,7 +275,8 @@ impl Shading {
                 let function = read_function(dict, &color_space);
                 let decode = dict
                     .get::<Array<'_>>(DECODE)?
-                    .iter::<f32>()
+                    .items::<f32>()
+                    .map_while(|n| n)
                     .collect::<Vec<_>>();
 
                 let patches = read_tensor_product_patch_mesh(
@@ -292,10 +293,11 @@ impl Shading {
             _ => return None,
         };
 
-        let bbox = dict.get::<Rect>(BBOX).map(|r| r.to_kurbo());
+        // Read as viewers read a damaged one, as a form's is.
+        let bbox = Entries::detached(dict.clone()).rect(BBOX);
         let background = dict
             .get::<Array<'_>>(BACKGROUND)
-            .map(|a| a.iter::<f32>().collect::<SmallVec<_>>());
+            .map(|a| a.items::<f32>().map_while(|n| n).collect::<SmallVec<_>>());
 
         Some(Self {
             cache_key,
@@ -1029,7 +1031,8 @@ fn read_tensor_product_patch_mesh(
 fn read_function(dict: &Dict<'_>, color_space: &ColorSpace) -> Option<ShadingFunction> {
     if let Some(arr) = dict.get::<Array<'_>>(FUNCTION) {
         let arr: Option<SmallVec<_>> = arr
-            .iter::<Object<'_>>()
+            .items::<Object<'_>>()
+            .map_while(|o| o)
             .map(|o| Function::new(&o))
             .collect();
         let arr = arr?;

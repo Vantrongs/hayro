@@ -40,6 +40,8 @@ where
     T: ObjectLike<'a> + Debug + Clone,
     U: ObjectLike<'a> + Debug + Clone,
 {
+    const ONE_ENTRY: bool = false;
+
     fn from_items(items: &mut Items<'_, 'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         let t = items.next_resolved::<T>(ctx)?;
         let u = items.next_resolved::<U>(ctx)?;
@@ -84,6 +86,8 @@ where
     U: ObjectLike<'a> + Debug + Clone,
     V: ObjectLike<'a> + Debug + Clone,
 {
+    const ONE_ENTRY: bool = false;
+
     fn from_items(items: &mut Items<'_, 'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         let t = items.next_resolved::<T>(ctx)?;
         let u = items.next_resolved::<U>(ctx)?;
@@ -134,6 +138,8 @@ where
     V: ObjectLike<'a> + Debug + Clone,
     W: ObjectLike<'a> + Debug + Clone,
 {
+    const ONE_ENTRY: bool = false;
+
     fn from_items(items: &mut Items<'_, 'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         let t = items.next_resolved::<T>(ctx)?;
         let u = items.next_resolved::<U>(ctx)?;
@@ -190,6 +196,8 @@ where
     W: ObjectLike<'a> + Debug + Clone,
     X: ObjectLike<'a> + Debug + Clone,
 {
+    const ONE_ENTRY: bool = false;
+
     fn from_items(items: &mut Items<'_, 'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         let t = items.next_resolved::<T>(ctx)?;
         let u = items.next_resolved::<U>(ctx)?;

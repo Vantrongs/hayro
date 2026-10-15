@@ -15,8 +15,20 @@ static POWERS_OF_10: [f64; 20] = [
 ];
 
 /// A number.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Number(pub(crate) InternalNumber);
+
+impl PartialEq for Number {
+    /// Whether the two are the same number, as [`Number::as_f64`] and
+    /// [`Number::is_integer`] tell.
+    fn eq(&self, other: &Self) -> bool {
+        match (self.0, other.0) {
+            (InternalNumber::Real(a, _), InternalNumber::Real(b, _)) => a == b,
+            (InternalNumber::Integer(a), InternalNumber::Integer(b)) => a == b,
+            _ => false,
+        }
+    }
+}
 
 impl Number {
     /// The number zero.
@@ -27,7 +39,7 @@ impl Number {
     /// Returns the number as a f64.
     pub fn as_f64(&self) -> f64 {
         match self.0 {
-            InternalNumber::Real(r) => r,
+            InternalNumber::Real(r, _) => r,
             InternalNumber::Integer(i) => i as f64,
         }
     }
@@ -35,7 +47,7 @@ impl Number {
     /// Returns the number as a f32.
     pub fn as_f32(&self) -> f32 {
         match self.0 {
-            InternalNumber::Real(r) => r as f32,
+            InternalNumber::Real(r, _) => r as f32,
             InternalNumber::Integer(i) => i as f32,
         }
     }
@@ -43,7 +55,7 @@ impl Number {
     /// Returns the number as an i64.
     pub fn as_i64(&self) -> i64 {
         match self.0 {
-            InternalNumber::Real(r) => {
+            InternalNumber::Real(r, _) => {
                 let res = r as i64;
 
                 if !(trunc_f64(r) == r) {
@@ -61,9 +73,31 @@ impl Number {
         matches!(self.0, InternalNumber::Integer(_))
     }
 
+    /// The number as `MuPDF` reads it from the digits as written, which differs from
+    /// [`Number::as_f64`] for a real (observed in `PyMuPDF` 1.28.2, through
+    /// `pdf_to_real`): an integer is a 64-bit integer, converted to a 32-bit float.
+    /// A real with up to nine characters before its point (sign and leading zeros
+    /// included) is its first nine significant digits, the rest dropped, and its
+    /// trailing zeros, times or divided by the power of ten that many places off
+    /// held to 32 bits, rounded to the nearest 32-bit float. One with ten or more is the low 32 bits of its
+    /// integer part, unsigned, as a 32-bit float, plus its fraction, whose digits are
+    /// gathered into a numerator and a power of ten in 32-bit floats, one digit at a
+    /// time, and divided, the sign applied last; so `4294967297.5` is 1.5.
+    ///
+    /// `None` where that is not established: an integer beyond 64 bits, a real whose
+    /// first significant digit lies more than 37 places after its point (`MuPDF`
+    /// reads some of these as 1), or whose digits make no number (`MuPDF` reads a
+    /// fraction of 39 or more digits after a long integer part as NaN).
+    pub fn viewer_f32(&self) -> Option<f32> {
+        match self.0 {
+            InternalNumber::Integer(i) => Some(i as f32),
+            InternalNumber::Real(_, v) => (!v.is_nan()).then_some(v),
+        }
+    }
+
     /// Create a new `Number` from an f32 number.
     pub const fn from_f32(num: f32) -> Self {
-        Self(InternalNumber::Real(num as f64))
+        Self(InternalNumber::Real(num as f64, num))
     }
 
     /// Create a new `Number` from an i32 number.
@@ -75,7 +109,7 @@ impl Number {
 impl Display for Number {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         match self.0 {
-            InternalNumber::Real(value) => write!(f, "{value:?}"),
+            InternalNumber::Real(value, _) => write!(f, "{value:?}"),
             InternalNumber::Integer(value) => write!(f, "{value}"),
         }
     }
@@ -111,6 +145,8 @@ struct Lexed {
     mantissa: u64,
     overflowed: bool,
     has_dot: bool,
+    /// Where the `.` is, when it is before `end`.
+    dot_at: usize,
     decimal_shift: u32,
     has_digits: bool,
     /// Where the digits and `.` that make the value end: at the first minus after the
@@ -145,6 +181,7 @@ fn lex<const VALUE: bool>(r: &mut Reader<'_>) -> Option<Lexed> {
         mantissa: 0,
         overflowed: false,
         has_dot: false,
+        dot_at: 0,
         decimal_shift: 0,
         has_digits: false,
         end: None,
@@ -178,6 +215,7 @@ fn lex<const VALUE: bool>(r: &mut Reader<'_>) -> Option<Lexed> {
             b'.' if !dot => {
                 dot = true;
                 lexed.has_dot = VALUE && lexed.end.is_none();
+                lexed.dot_at = r.offset();
             }
             _ => break,
         }
@@ -215,17 +253,21 @@ impl Lexed {
     #[inline(always)]
     fn value(&self, r: &Reader<'_>) -> Number {
         if !self.has_digits {
+            if self.negative && self.end.is_some() {
+                // Zero, where `MuPDF` reads `--5` as one token, -5.
+                return Number(InternalNumber::Real(0.0, f32::NAN));
+            }
             return Number(InternalNumber::Integer(0));
         }
+        // The sign, digits and `.` before the first minus after the sign.
+        let token = r
+            .range(self.start..self.end.unwrap_or_else(|| r.offset()))
+            .unwrap_or_default();
 
         let integer_overflow = !self.has_dot && self.mantissa > i64::MAX as u64;
 
         if self.overflowed || integer_overflow {
-            // The sign, digits and `.` before the first minus after the sign.
-            let number = r
-                .range(self.start..self.end.unwrap_or_else(|| r.offset()))
-                .and_then(|number| core::str::from_utf8(number).ok())
-                .unwrap_or_default();
+            let number = core::str::from_utf8(token).unwrap_or_default();
 
             if !self.has_dot
                 && let Ok(value) = number.parse::<i64>()
@@ -235,7 +277,13 @@ impl Lexed {
 
             // Digits around at most one `.`, after an optional sign, always parse.
             let value = number.parse::<f64>().unwrap_or(f64::NAN);
-            return Number(InternalNumber::Real(value));
+            // An integer beyond 64 bits has no reading established.
+            let viewer = if self.has_dot {
+                viewer_real(token)
+            } else {
+                f32::NAN
+            };
+            return Number(InternalNumber::Real(value, viewer));
         }
 
         if !self.has_dot {
@@ -260,16 +308,140 @@ impl Lexed {
                 value = -value;
             }
 
-            Number(InternalNumber::Real(value))
+            // With up to nine digits, up to 13 after the point, and up to nine
+            // characters before it, the reading is the nearest 32-bit float, which
+            // the 64-bit quotient rounds to unless it lies just between two.
+            let viewer = if self.mantissa < 1_000_000_000
+                && self.decimal_shift <= 13
+                && self.dot_at - self.start < 10
+                && !halfway(value)
+            {
+                value as f32
+            } else {
+                viewer_real(token)
+            };
+
+            Number(InternalNumber::Real(value, viewer))
         }
     }
+}
+
+/// Whether `v`, a 64-bit float within the range of normal 32-bit floats or 0, lies
+/// halfway between two 32-bit floats, where rounding it again may differ from
+/// rounding the number it was rounded from.
+fn halfway(v: f64) -> bool {
+    // The 29 bits a 32-bit float drops, at half of its last place.
+    v.to_bits() & 0x1FFF_FFFF == 0x1000_0000
+}
+
+/// [`Number::viewer_f32`] of a real written as `token`: a sign, digits, a point and
+/// digits; NaN where no reading is established.
+fn viewer_real(token: &[u8]) -> f32 {
+    let (negative, digits) = match token.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        Some((b'+', rest)) => (false, rest),
+        _ => (false, token),
+    };
+    let point = digits
+        .iter()
+        .position(|&b| b == b'.')
+        .unwrap_or(digits.len());
+    let (int, fraction) = (
+        &digits[..point],
+        digits.get(point + 1..).unwrap_or_default(),
+    );
+    let digit = |b: &u8| b.wrapping_sub(b'0');
+    let v = if token.len() - digits.len() + int.len() >= 10 {
+        let low = int.iter().fold(0_u32, |a, d| {
+            a.wrapping_mul(10).wrapping_add(u32::from(digit(d)))
+        });
+        let (mut numerator, mut power) = (0.0_f32, 1.0_f32);
+        for d in fraction {
+            numerator = numerator * 10.0 + f32::from(digit(d));
+            power *= 10.0;
+        }
+        low as f32 + numerator / power
+    } else {
+        // The first nine significant digits, `kept` of them from `lead` on.
+        let all = || int.iter().chain(fraction);
+        let Some(lead) = all().position(|&b| b != b'0') else {
+            return if negative { -0.0 } else { 0.0 };
+        };
+        let (mut m, mut kept) = (0_u32, 0_i32);
+        for d in all().skip(lead).take(9) {
+            m = m * 10 + u32::from(digit(d));
+            kept += 1;
+        }
+        // The power of ten of the first significant digit.
+        let first = int.len() as i32 - lead as i32 - 1;
+        if first < -37 {
+            return f32::NAN;
+        }
+        nearest(m, first + 1 - kept)
+    };
+    if negative { -v } else { v }
+}
+
+/// `m` times ten to the `e`, for `m` of up to nine digits and `e` from -45 to 8, as
+/// `MuPDF` reads it: `m` without its trailing zeros, times or divided by the power
+/// of ten that many places off, held to 32 bits (rounded to nearest, ties to even),
+/// then rounded to the nearest 32-bit float, ties to even.
+fn nearest(mut m: u32, mut e: i32) -> f32 {
+    if m == 0 {
+        return 0.0;
+    }
+    while m.is_multiple_of(10) {
+        m /= 10;
+        e += 1;
+    }
+    // Ten to the `|e|` as `p` times two to the `p_exp`, `p` of 32 bits.
+    let mut five: u128 = 1;
+    for _ in 0..e.unsigned_abs() {
+        five *= 5;
+    }
+    let bits = 128 - five.leading_zeros() as i32;
+    let (mut p, mut p_exp) = if bits > 32 {
+        let drop = bits - 32;
+        let (kept, rest, half) = (five >> drop, five & ((1 << drop) - 1), 1_u128 << (drop - 1));
+        let up = rest > half || (rest == half && kept & 1 == 1);
+        (kept + u128::from(up), drop + e.abs())
+    } else {
+        (five << (32 - bits), e.abs() - (32 - bits))
+    };
+    if p >> 32 != 0 {
+        p >>= 1;
+        p_exp += 1;
+    }
+    // The exact quotient or product as `q` times two to the `q_exp`, and whether
+    // anything is left below `q`.
+    let (q, q_exp, inexact) = if e < 0 {
+        let n = u128::from(m) << 64;
+        (n / p, -64 - p_exp, n % p != 0)
+    } else {
+        (u128::from(m) * p, p_exp, false)
+    };
+    let bits = 128 - q.leading_zeros() as i32;
+    let drop = bits - 24;
+    let mantissa = if drop > 0 {
+        let (kept, rest, half) = (q >> drop, q & ((1 << drop) - 1), 1_u128 << (drop - 1));
+        let up = rest > half || (rest == half && (inexact || kept & 1 == 1));
+        kept + u128::from(up)
+    } else {
+        q << -drop
+    };
+    let exp = q_exp + drop;
+    // Exact: the mantissa has at most 25 bits and the power of two lies within
+    // the range of 64-bit floats.
+    let two = f64::from_bits(((exp + 1023) as u64) << 52);
+    (mantissa as f64 * two) as f32
 }
 
 object!(Number, Number);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum InternalNumber {
-    Real(f64),
+    /// The value, and [`Number::viewer_f32`] of it, NaN where none is established.
+    Real(f64, f32),
     Integer(i64),
 }
 
@@ -424,6 +596,58 @@ mod tests {
                 .unwrap(),
             3245
         );
+    }
+
+    /// Numbers as `MuPDF` reads them, observed in `PyMuPDF` 1.28.2 through
+    /// `pdf_to_real`, by 32-bit float bits.
+    #[test]
+    fn viewer_reading() {
+        let read = |t: &str| {
+            Reader::new(t.as_bytes())
+                .read_without_context::<Number>()
+                .unwrap()
+                .viewer_f32()
+        };
+        for (token, bits) in [
+            ("0.1", 0x3DCC_CCCD_u32),
+            ("16777217.5", 0x4B80_0001),
+            // Nine significant digits, the rest dropped.
+            ("16777217.001", 0x4B80_0000),
+            ("-1000.000703157", 0xC47A_000B),
+            (".7719685138", 0x3F45_9FBA),
+            ("000000000016777217.5", 0x4B80_0000),
+            // Ten characters before the point: the low 32 bits, then the fraction.
+            ("4294967297.5", 0x3FC0_0000),
+            ("4503599627370496.25", 0x3E80_0000),
+            ("4294967296.4999999", 0x3EFF_FFFD),
+            ("4294967297.782", 0x3FE4_1894),
+            ("-695679881199.73806956042304114426", 0xCF79_C090),
+            ("2147483647.5", 0x4F00_0000),
+            ("-4294967296.", 0x8000_0000),
+            ("0000000001.5", 0x3FC0_0000),
+            ("1.5-3", 0x3FC0_0000),
+            ("-.", 0x0000_0000),
+            ("4194304.75", 0x4A80_0002),
+            (
+                "0.000000000000000000000000000000000000123456789",
+                0x0228_0A6A,
+            ),
+            ("9223372036854775807", 0x5F00_0000),
+            ("-9223372036854775808", 0xDF00_0000),
+        ] {
+            assert_eq!(read(token).map(f32::to_bits), Some(bits), "{token}");
+        }
+        for token in [
+            // A fraction of 39 digits or more after a long integer part: NaN.
+            "1000000000.1444119979317587707861942590889050111873",
+            // Read as 1, or not as the nearest float, below 1e-37.
+            "0.0000000000000000000000000000000000000000000001",
+            "0.000000000000000000000000000000000000001",
+            "9223372036854775808",
+            "--5",
+        ] {
+            assert_eq!(read(token), None, "{token}");
+        }
     }
 
     #[test]
