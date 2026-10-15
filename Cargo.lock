@@ -1736,7 +1736,7 @@ dependencies = [
 [[package]]
 name = "string_cache"
 version = "0.9.0"
-source = "git+https://github.com/Vantrongs/string-cache?rev=ca90fcf3b1e0ea54649f0ac831046b287d1d5963#ca90fcf3b1e0ea54649f0ac831046b287d1d5963"
+source = "git+https://github.com/Vantrongs/string-cache?rev=0099c3e9efeb7eb9730da33e21f516caeaf8842a#0099c3e9efeb7eb9730da33e21f516caeaf8842a"
 dependencies = [
  "hashbrown",
  "new_debug_unreachable",
