@@ -3,8 +3,8 @@
 use crate::crypto::DecryptionTarget;
 use crate::crypto::reader::DecryptedReader;
 use crate::filter::Filter;
+use crate::filter::chain::Layer;
 pub use crate::filter::chain::StrictReader;
-use crate::filter::chain::{self, Stage, Stored};
 use crate::filter::lzw_flate::{PredictorParams, Unpredictor};
 #[cfg(feature = "unsafe")]
 pub use crate::filter::reader::DecodedCheckpoint;
@@ -350,9 +350,10 @@ impl<'a> Stream<'a> {
     }
 
     /// The data [`Self::decoded_strict`] returns, read a piece at a time through all
-    /// the stream's filters, however they nest, in memory bounded by the decoders'
-    /// state and windows and buffers of [`POLL_BYTES`](crate::work::POLL_BYTES), and
-    /// the stored data, decrypted ([`StrictReader`]); decryption counts on `meter`.
+    /// the stream's filters, however they nest and however many there are, in memory
+    /// bounded by the stored data, decrypted, and the decoders' state, windows and
+    /// buffers of a bounded number of filters, besides the output of a filter that
+    /// makes little ([`StrictReader`]); decryption counts on `meter`.
     /// `Err` where `decoded_strict` fails before decoding: where the data cannot be
     /// decrypted whole, or the hook asks to stop. `Ok(None)` where a filter has no
     /// decoder that reads a piece at a time, an image filter or a predictor only the
@@ -362,60 +363,40 @@ impl<'a> Stream<'a> {
         meter: &Meter<'_>,
     ) -> Result<Option<StrictReader<'a>>, DecodeFailure> {
         let FiltersAndParams { filters, params } = self.filters_and_params();
-        let predictors = || {
-            filters
-                .iter()
-                .zip(&params)
-                .map(|(filter, params)| (*filter, PredictorParams::from_params(params)))
-        };
-        for (filter, predictor) in predictors() {
-            match filter {
-                Filter::FlateDecode | Filter::LzwDecode => {
-                    if predictor.predictor != 1 && Unpredictor::new(&predictor).is_none() {
-                        return Ok(None);
-                    }
-                }
-                Filter::AsciiHexDecode
-                | Filter::Ascii85Decode
-                | Filter::RunLengthDecode
-                | Filter::Crypt => {}
-                Filter::CcittFaxDecode
-                | Filter::Jbig2Decode
-                | Filter::DctDecode
-                | Filter::JpxDecode => return Ok(None),
-            }
-        }
-        let data = self.raw_data_metered(meter, true)?;
-        let mut stage: Box<dyn Stage + 'a> = Box::new(Stored::new(data));
-        for (filter, predictor) in predictors() {
-            stage = match filter {
+        let mut layers = Vec::with_capacity(filters.len());
+        for (filter, params) in filters.iter().zip(&params) {
+            let predictor = PredictorParams::from_params(params);
+            // `None` where only the whole decoder reverses the predictor.
+            let unpredictor = || match predictor.predictor {
+                1 => Some(None),
+                _ => Unpredictor::new(&predictor).map(|u| Some(Box::new(u))),
+            };
+            layers.push(match filter {
                 // Decrypted with the stored data.
-                Filter::Crypt => stage,
+                Filter::Crypt => continue,
                 Filter::FlateDecode => {
-                    let Some(stage) =
-                        chain::predicted(Box::new(chain::Flate::new(stage)), &predictor)
-                    else {
+                    let Some(unpredictor) = unpredictor() else {
                         return Ok(None);
                     };
-                    stage
+                    Layer::Flate(predictor, unpredictor)
                 }
                 Filter::LzwDecode => {
-                    let lzw = chain::Bytewise::lzw(stage, predictor.early_change);
-                    let Some(stage) = chain::predicted(Box::new(lzw), &predictor) else {
+                    let Some(unpredictor) = unpredictor() else {
                         return Ok(None);
                     };
-                    stage
+                    Layer::Lzw(predictor, unpredictor)
                 }
-                Filter::AsciiHexDecode => Box::new(chain::Bytewise::ascii_hex(stage)),
-                Filter::Ascii85Decode => Box::new(chain::Bytewise::ascii_85(stage)),
-                Filter::RunLengthDecode => Box::new(chain::Bytewise::run_length(stage)),
+                Filter::AsciiHexDecode => Layer::AsciiHex,
+                Filter::Ascii85Decode => Layer::Ascii85,
+                Filter::RunLengthDecode => Layer::RunLength,
                 Filter::CcittFaxDecode
                 | Filter::Jbig2Decode
                 | Filter::DctDecode
                 | Filter::JpxDecode => return Ok(None),
-            };
+            });
         }
-        Ok(Some(StrictReader::new(stage)))
+        let data = self.raw_data_metered(meter, true)?;
+        Ok(Some(StrictReader::new(data, layers)))
     }
 
     /// The decoded data, read incrementally, when the stream's filters allow it: no

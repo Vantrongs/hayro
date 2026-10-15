@@ -9,45 +9,76 @@ use alloc::vec::Vec;
 pub(crate) mod flate {
     use super::*;
     use crate::filter::lzw_flate::{PredictorParams, apply_predictor};
-    use crate::object::Dict;
 
     /// The data inflated and its predictor reversed, the work counted on `meter`;
     /// `None` once its hook asks to stop, or, if `strict`, where the data is corrupt
     /// rather than cut short (see [`fallback::decode`]).
-    #[cfg(feature = "unsafe")]
     pub(crate) fn decode(
         data: &[u8],
-        params: &Dict<'_>,
+        params: &PredictorParams,
         meter: &Meter<'_>,
         strict: bool,
     ) -> Option<Vec<u8>> {
-        let decoded = inflate(data, true, meter)
-            .or_else(|| (!meter.cancelled()).then(|| inflate(data, false, meter))?)
-            .or_else(|| {
-                if meter.cancelled() {
-                    return None;
-                }
-                warn!("flate stream is broken, decoding with fallback");
+        decode_within(data, params, meter, strict, usize::MAX).unwrap_or(None)
+    }
 
-                fallback::decode(data, meter, strict).ok()?
-            })?;
-        let params = PredictorParams::from_params(params);
-        apply_predictor(decoded, &params, meter)
+    /// A decoder made more than the limit it was given; `tried` decoders before it
+    /// found the data corrupt (zlib, then raw deflate, then the permissive one; only
+    /// the last without the `unsafe` feature).
+    pub(crate) struct Larger {
+        pub(crate) tried: usize,
+    }
+
+    /// [`decode`], stopped where a decoder made more than `limit` bytes.
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn decode_within(
+        data: &[u8],
+        params: &PredictorParams,
+        meter: &Meter<'_>,
+        strict: bool,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, Larger> {
+        let larger = |tried| move |_| Larger { tried };
+        let decoded = match inflate(data, true, meter, limit).map_err(larger(0))? {
+            Some(decoded) => decoded,
+            None if meter.cancelled() => return Ok(None),
+            None => match inflate(data, false, meter, limit).map_err(larger(1))? {
+                Some(decoded) => decoded,
+                None if meter.cancelled() => return Ok(None),
+                None => {
+                    warn!("flate stream is broken, decoding with fallback");
+                    match fallback::decode_within(data, meter, strict, limit) {
+                        Ok(Some(decoded)) => decoded,
+                        Ok(None) | Err(fallback::Stopped::Cancelled) => return Ok(None),
+                        Err(fallback::Stopped::Larger) => return Err(Larger { tried: 2 }),
+                    }
+                }
+            },
+        };
+        Ok(apply_predictor(decoded, params, meter))
     }
 
     /// `data` inflated whole, read as zlib if `zlib`, else as raw deflate, the work
     /// counted on `meter`; `None` when the data is corrupt for that format or the hook
     /// asks to stop. Data that ends before its stream does yields what it holds, and
     /// bytes after the stream's end are ignored.
+    /// `Err` once it made more than `limit` bytes.
     #[cfg(feature = "unsafe")]
-    fn inflate(data: &[u8], zlib: bool, meter: &Meter<'_>) -> Option<Vec<u8>> {
+    fn inflate(
+        data: &[u8],
+        zlib: bool,
+        meter: &Meter<'_>,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, ()> {
         let mut decoder = zlib_rs::Inflate::new(zlib, 15);
         let mut out = Vec::new();
         // The input bytes the decoder took, and those it was offered and counted.
         let (mut taken, mut offered) = (0, 0);
         loop {
             if out.len() == out.capacity() {
-                out.reserve(more_room(out.len(), taken, data.len()));
+                let room = more_room(out.len(), taken, data.len());
+                // Not much past the limit.
+                out.reserve(room.min((limit - out.len()).saturating_add(1024)));
             }
             // Input is offered half of POLL_BYTES at a time and counted before it is
             // taken, and output is made no further than the next poll, so at most
@@ -56,7 +87,9 @@ pub(crate) mod flate {
             // history window, and matches reaching back past its output read from
             // there.
             let end = data.len().min(taken + POLL_BYTES / 2);
-            meter.work(end.saturating_sub(offered)).ok()?;
+            if meter.work(end.saturating_sub(offered)).is_err() {
+                return Ok(None);
+            }
             offered = offered.max(end);
             let input = &data[taken..end];
             let len = out.len();
@@ -73,12 +106,15 @@ pub(crate) mod flate {
             let took = (decoder.total_in() - in_before) as usize;
             out.truncate(len + written);
             taken += took;
-            meter.work(written).ok()?;
+            if meter.work(written).is_err() {
+                return Ok(None);
+            }
             match status {
-                Ok(zlib_rs::Status::StreamEnd) => return Some(out),
+                Ok(_) if out.len() > limit => return Err(()),
+                Ok(zlib_rs::Status::StreamEnd) => return Ok(Some(out)),
                 Ok(_) if written > 0 || took > 0 => {}
-                Ok(_) if input.is_empty() => return Some(out),
-                _ => return None,
+                Ok(_) if input.is_empty() => return Ok(Some(out)),
+                _ => return Ok(None),
             }
         }
     }
@@ -103,25 +139,27 @@ pub(crate) mod flate {
         room.max(1024)
     }
 
-    /// The data inflated and its predictor reversed, the work counted on `meter`;
-    /// `None` once its hook asks to stop, or, if `strict`, where the data is corrupt
-    /// rather than cut short (see [`fallback::decode`]).
+    /// [`decode`], stopped where the decoder made more than `limit` bytes.
     #[cfg(not(feature = "unsafe"))]
-    pub(crate) fn decode(
+    pub(crate) fn decode_within(
         data: &[u8],
-        params: &Dict<'_>,
+        params: &PredictorParams,
         meter: &Meter<'_>,
         strict: bool,
-    ) -> Option<Vec<u8>> {
-        let decoded = fallback::decode(data, meter, strict).ok()??;
-        let params = PredictorParams::from_params(params);
-        apply_predictor(decoded, &params, meter)
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, Larger> {
+        let decoded = match fallback::decode_within(data, meter, strict, limit) {
+            Ok(Some(decoded)) => decoded,
+            Ok(None) | Err(fallback::Stopped::Cancelled) => return Ok(None),
+            Err(fallback::Stopped::Larger) => return Err(Larger { tried: 0 }),
+        };
+        Ok(apply_predictor(decoded, params, meter))
     }
 
     /// Ported from <https://github.com/mozilla/pdf.js/blob/master/src/core/flate_stream.js>
     /// TODO: Rewrite this in idiomatic Rust.
     pub(crate) mod fallback {
-        use crate::work::{Cancelled, Meter};
+        use crate::work::{Cancelled, Meter, POLL_BYTES};
         use alloc::vec;
         use alloc::vec::Vec;
 
@@ -134,11 +172,49 @@ pub(crate) mod flate {
             meter: &Meter<'_>,
             strict: bool,
         ) -> Result<Option<Vec<u8>>, Cancelled> {
+            decode_within(data, meter, strict, usize::MAX).map_err(|_| Cancelled)
+        }
+
+        /// The most bytes a step makes past the bytes it was asked for: a stored block,
+        /// or a match.
+        const BLOCK_PAST: usize = 65_535 + 258;
+
+        /// Why [`decode_within`] stopped.
+        pub(crate) enum Stopped {
+            Cancelled,
+            /// It made more than its limit.
+            Larger,
+        }
+
+        /// [`decode`], stopped once it made more than `limit` bytes.
+        pub(crate) fn decode_within(
+            data: &[u8],
+            meter: &Meter<'_>,
+            strict: bool,
+            limit: usize,
+        ) -> Result<Option<Vec<u8>>, Stopped> {
             let mut stream = FlateStream::new(Slice::new(data));
-            let stepped = stream.step(meter, usize::MAX);
+            let stepped = match limit {
+                usize::MAX => stream.step(meter, usize::MAX),
+                // In steps, the output's room grown up to the limit and what one block
+                // makes past it, rather than doubled past it.
+                _ => loop {
+                    let made = stream.output.len();
+                    let target = (2 * made).clamp(POLL_BYTES, limit + 1);
+                    stream.output.reserve_exact(target + BLOCK_PAST - made);
+                    let stepped = stream.step(meter, target);
+                    let ended = stream.done() || stream.made() == made;
+                    if stepped.is_err() || ended || stream.made() > limit {
+                        break stepped;
+                    }
+                },
+            };
             #[cfg(test)]
             WORK.set((stream.input.taken(), stream.made()));
-            stepped?;
+            stepped.map_err(|_| Stopped::Cancelled)?;
+            if stream.made() > limit {
+                return Err(Stopped::Larger);
+            }
             if stream.corrupt && strict {
                 warn!("flate stream is corrupt");
                 return Ok(None);
@@ -154,6 +230,8 @@ pub(crate) mod flate {
             fn peek(&mut self, ahead: usize, meter: &Meter<'_>) -> Option<u8>;
             /// The bytes taken so far.
             fn taken(&self) -> usize;
+            /// Takes the next bytes, at most `max` and at least one where any is left.
+            fn take(&mut self, max: usize, meter: &Meter<'_>) -> &[u8];
         }
 
         /// Bytes all at hand.
@@ -182,6 +260,12 @@ pub(crate) mod flate {
             fn taken(&self) -> usize {
                 self.at
             }
+
+            fn take(&mut self, max: usize, _: &Meter<'_>) -> &[u8] {
+                let n = max.min(self.data.len() - self.at);
+                self.at += n;
+                &self.data[self.at - n..self.at]
+            }
         }
 
         #[cfg(test)]
@@ -208,6 +292,8 @@ pub(crate) mod flate {
             /// The tables of the compressed block being decoded, and the bytes taken
             /// when it started.
             block: Option<(HuffmanTable, HuffmanTable, usize)>,
+            /// The bytes of the stored block being copied left to copy.
+            stored: usize,
             eof: bool,
             /// Whether decoding stopped at, or passed over, data that is no valid
             /// deflate, rather than at the end of the stream or of the data.
@@ -228,6 +314,7 @@ pub(crate) mod flate {
                     handed: 0,
                     started: false,
                     block: None,
+                    stored: 0,
                     eof: false,
                     corrupt: false,
                 }
@@ -257,7 +344,7 @@ pub(crate) mod flate {
 
             /// Whether all data was decoded.
             pub(crate) fn done(&self) -> bool {
-                self.started && self.block.is_none() && self.eof
+                self.started && self.block.is_none() && self.stored == 0 && self.eof
             }
 
             /// Decodes until the end of the data or of the stream, or until at least
@@ -273,6 +360,14 @@ pub(crate) mod flate {
                     self.skip_header(meter);
                 }
                 loop {
+                    if self.stored > 0 {
+                        let from = self.input.taken();
+                        let copied = self.copy_stored(meter, pending);
+                        meter.work(self.input.taken() - from + usize::from(copied))?;
+                        if !copied {
+                            return Ok(());
+                        }
+                    }
                     if let Some((lit, dist, from)) = self.block.take() {
                         if !self.read_codes(lit, dist, from, meter, pending)? {
                             return Ok(());
@@ -290,6 +385,11 @@ pub(crate) mod flate {
                     self.read_block(meter, pending)?;
                     if self.block.is_some() {
                         return Ok(());
+                    }
+                    if self.stored > 0 {
+                        // The block's header; its data count as they are copied.
+                        meter.work(self.input.taken() - from)?;
+                        continue;
                     }
                     meter.work(self.input.taken() - from + 1)?;
                 }
@@ -439,16 +539,28 @@ pub(crate) mod flate {
                         self.eof = true;
                     }
                 } else {
-                    for _ in 0..block_len {
-                        match self.input.next(meter) {
-                            Some(b) => self.output.push(b),
-                            None => {
-                                self.eof = true;
-                                return;
-                            }
-                        }
-                    }
+                    self.stored = usize::from(block_len);
                 }
+            }
+
+            /// Copies the stored block's data until at least `pending` bytes made are
+            /// not handed out: to its end, or the end of the data (true), or not (false).
+            fn copy_stored(&mut self, meter: &Meter<'_>, pending: usize) -> bool {
+                while self.stored > 0 {
+                    let room = pending.saturating_sub(self.output.len() - self.handed);
+                    if room == 0 {
+                        return false;
+                    }
+                    let bytes = self.input.take(self.stored.min(room), meter);
+                    if bytes.is_empty() {
+                        self.stored = 0;
+                        self.eof = true;
+                        return true;
+                    }
+                    self.stored -= bytes.len();
+                    self.output.extend_from_slice(bytes);
+                }
+                true
             }
 
             /// Reads the codes of a compressed block whose tables are `lit` and `dist`
@@ -774,19 +886,32 @@ pub(crate) mod flate {
 pub(crate) mod lzw {
     use crate::filter::lzw_flate::flate::fallback::{Input, Slice};
     use crate::filter::lzw_flate::{PredictorParams, apply_predictor};
-    use crate::object::Dict;
     use crate::work::Meter;
     use alloc::vec;
     use alloc::vec::Vec;
 
     /// Decode a LZW-encoded stream, its work counted on `meter`; `None` once its hook
     /// asks to stop.
-    pub(crate) fn decode(data: &[u8], params: &Dict<'_>, meter: &Meter<'_>) -> Option<Vec<u8>> {
-        let params = PredictorParams::from_params(params);
+    pub(crate) fn decode(
+        data: &[u8],
+        params: &PredictorParams,
+        meter: &Meter<'_>,
+    ) -> Option<Vec<u8>> {
+        decode_within(data, params, meter, usize::MAX).unwrap_or(None)
+    }
 
-        let decoded = decode_impl(data, params.early_change, meter)?;
+    /// [`decode`], `Err` once it made more than `limit` bytes.
+    pub(crate) fn decode_within(
+        data: &[u8],
+        params: &PredictorParams,
+        meter: &Meter<'_>,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, ()> {
+        let Some(decoded) = decode_impl(data, params.early_change, meter, limit)? else {
+            return Ok(None);
+        };
 
-        apply_predictor(decoded, &params, meter)
+        Ok(apply_predictor(decoded, params, meter))
     }
 
     const CLEAR_TABLE: usize = 256;
@@ -794,12 +919,26 @@ pub(crate) mod lzw {
     const MAX_ENTRIES: usize = 4096;
     const INITIAL_SIZE: u16 = 258;
 
-    fn decode_impl(data: &[u8], early_change: bool, meter: &Meter<'_>) -> Option<Vec<u8>> {
+    fn decode_impl(
+        data: &[u8],
+        early_change: bool,
+        meter: &Meter<'_>,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, ()> {
         let mut decoder = Decoder::new(early_change);
         let mut input = Slice::new(data);
         let mut decoded = vec![];
-        while decoder.step(&mut input, &mut decoded, meter)? {}
-        Some(decoded)
+        loop {
+            let step = decoder.step(&mut input, &mut decoded, meter);
+            if decoded.len() > limit {
+                return Err(());
+            }
+            match step {
+                Some(true) => {}
+                Some(false) => return Ok(Some(decoded)),
+                None => return Ok(None),
+            }
+        }
     }
 
     /// The decoder, a code at a time ([`Self::step`]), its codes read most
@@ -966,6 +1105,7 @@ pub(crate) mod lzw {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct PredictorParams {
     pub(crate) predictor: u8,
     pub(crate) colors: u8,
@@ -1414,13 +1554,12 @@ impl Predictor for Paeth {
 mod tests {
     use crate::filter::lzw_flate::{PredictorParams, apply_predictor, flate, lzw};
     use crate::filter::png::{self, BytesPerPixel, RowFilter};
-    use crate::object::Dict;
     use crate::work::{Meter, POLL_BYTES};
 
     #[test]
     fn decode_lzw() {
         let input = [0x80, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01];
-        let decoded = lzw::decode(&input, &Dict::default(), &Meter::default()).unwrap();
+        let decoded = lzw::decode(&input, &PredictorParams::default(), &Meter::default()).unwrap();
 
         assert_eq!(decoded, vec![45, 45, 45, 45, 45, 65, 45, 45, 45, 66]);
     }
@@ -1431,7 +1570,7 @@ mod tests {
             0x78, 0x9c, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x7, 0x0, 0x5, 0x8c, 0x1, 0xf5,
         ];
 
-        let decoded = flate::decode(&input, &Dict::default(), &Meter::default(), false).unwrap();
+        let decoded = flate::decode(&input, &PredictorParams::default(), &Meter::default(), false).unwrap();
         assert_eq!(decoded, b"Hello");
     }
 
@@ -1439,7 +1578,7 @@ mod tests {
     fn decode_flate() {
         let input = [0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x7, 0x0];
 
-        let decoded = flate::decode(&input, &Dict::default(), &Meter::default(), false).unwrap();
+        let decoded = flate::decode(&input, &PredictorParams::default(), &Meter::default(), false).unwrap();
         assert_eq!(decoded, b"Hello");
     }
 
@@ -1460,11 +1599,11 @@ mod tests {
             .read_to_end(&mut expected)
             .unwrap();
         assert!(expected.len() > POLL_BYTES && data.starts_with(&expected));
-        let decoded = flate::decode(cut, &Dict::default(), &Meter::default(), false);
+        let decoded = flate::decode(cut, &PredictorParams::default(), &Meter::default(), false);
         assert_eq!(decoded, Some(expected));
         let mut followed = encoded.clone();
         followed.extend(b"more");
-        let decoded = flate::decode(&followed, &Dict::default(), &Meter::default(), false);
+        let decoded = flate::decode(&followed, &PredictorParams::default(), &Meter::default(), false);
         assert_eq!(decoded, Some(data));
     }
 
