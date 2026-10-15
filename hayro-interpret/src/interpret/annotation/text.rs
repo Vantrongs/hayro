@@ -1752,8 +1752,39 @@ pub(super) struct Style {
     pub(super) align: Align,
 }
 
+impl Style {
+    /// This style as a key: its numbers by their bits, so that styles of the same
+    /// numbers are one key and others are not.
+    pub(super) fn key(&self) -> StyleKey {
+        let size = match self.size {
+            Size::Points(p) => (false, p.to_bits()),
+            Size::Base(k) => (true, k.to_bits()),
+        };
+        let color = match self.color {
+            Color::Gray(g) => [0, g.to_bits(), 0, 0, 0],
+            Color::Rgb([r, g, b]) => [1, r.to_bits(), g.to_bits(), b.to_bits(), 0],
+            Color::Cmyk([c, m, y, k]) => [2, c.to_bits(), m.to_bits(), y.to_bits(), k.to_bits()],
+        };
+        StyleKey {
+            face: self.face,
+            size,
+            color,
+            align: self.align,
+        }
+    }
+}
+
+/// A [`Style`] as a key ([`Style::key`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct StyleKey {
+    face: Typeface,
+    size: (bool, u32),
+    color: [u64; 5],
+    align: Align,
+}
+
 /// How a line sits between the sides of its box.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Align {
     Left,
     Center,

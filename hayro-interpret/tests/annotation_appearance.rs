@@ -1509,6 +1509,51 @@ fn entries_of_two_dictionaries_in_one_object_are_two_values() {
     }
 }
 
+/// Annotations that share a text, each with a default style (`/DS`) of its own,
+/// draw it in their own style, as each draws a text of its own: `FreeText`
+/// contents and rich text, a field's value and rich value, in either order.
+#[test]
+fn a_shared_text_is_drawn_in_each_annotations_own_style() {
+    let styles = ["font-size:10pt", "font-size:20pt; color:#ff0000"];
+    let kinds: [fn(&str, &str) -> String; 4] = [
+        |ds, text| format!("/Subtype /FreeText /DA (/Helv 12 Tf) /DS ({ds}) /Contents {text}"),
+        |ds, text| format!("/Subtype /FreeText /DA (/Helv 12 Tf) /DS ({ds}) /RC {text}"),
+        |ds, text| {
+            format!("/Subtype /Widget /FT /Tx /Ff 4096 /DA (/Helv 12 Tf) /DS ({ds}) /V {text}")
+        },
+        |ds, text| {
+            format!(
+                "/Subtype /Widget /FT /Tx /Ff 4096 /DA (/Helv 12 Tf) /DS ({ds}) /V (x) /RV {text}"
+            )
+        },
+    ];
+    let content = |look: &Look<'_>| match look {
+        Look::Generated(g) => expanded(g),
+        _ => panic!("not generated"),
+    };
+    for kind in kinds {
+        let annot = |ds: &str, text: &str| format!("{} /Rect [10 10 190 190]", kind(ds, text));
+        let text = "(<p>Hello</p>)";
+        let alone = styles.map(|ds| generated(&annot(ds, text)));
+        assert_ne!(alone[0], alone[1], "{}", annot("", text));
+        for order in [[0, 1], [1, 0]] {
+            let mut objects: Vec<Vec<u8>> = order
+                .iter()
+                .map(|&i| format!("<< /Type /Annot {} >>", annot(styles[i], "6 0 R")).into_bytes())
+                .collect();
+            objects.push(text.as_bytes().to_vec());
+            let pdf = annotations("/Annots [4 0 R 5 0 R]", objects);
+            let drawn: Vec<String> = looks_of(&pdf).iter().map(content).collect();
+            assert_eq!(
+                drawn,
+                order.map(|i| alone[i].clone()),
+                "{}",
+                annot("", text)
+            );
+        }
+    }
+}
+
 /// A widget without a `/Rect` is drawn by viewers at coordinates of ±2^32: a
 /// button, or a text or choice field with a background, covers the page there or
 /// shows nowhere, so it is unsupported; other widgets show nothing.

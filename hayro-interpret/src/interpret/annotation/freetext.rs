@@ -52,27 +52,24 @@ pub(super) fn free_text<'a>(
     };
     let border_color = color;
     // The text, set once for the document whatever size, colour and alignment each
-    // annotation draws it in, under the entries it is read from alone: rich text
-    // and its default style; else the default style over the contents; else the
-    // contents in the default appearance's family. Rich text's relative sizes are
-    // read as the default appearance's sign allows.
+    // annotation draws it in, under the entry it is read from and the style it is
+    // set in: rich text over its default style; else the contents in the default
+    // style; else the contents in the default appearance's family. Rich text's
+    // relative sizes are read as the default appearance's sign allows.
     let positive = size.is_some_and(|s| s > 0.0);
     let rich = annot.has_text(Text::Rich);
     let text = if rich || annot.has_text(Text::DefaultStyle) {
-        let read = if rich {
-            [Text::Rich, Text::DefaultStyle]
-        } else {
-            [Text::DefaultStyle, Text::Contents]
-        };
+        let style = doc.default_style(annot, positive)?;
+        let read = if rich { Text::Rich } else { Text::Contents };
         let key = TextKey::new(
-            read.map(|t| annot.source(t.key())),
+            [annot.source(read.key())],
             Family::Text.into(),
             vec![FREE_TEXT, u64::from(positive)],
-        );
+        )
+        .styled(&style);
         doc.shaped(key, || {
             let rc = rich.then(|| annot.text(Text::Rich)).flatten();
-            let ds = annot.text(Text::DefaultStyle);
-            let spans = rich_spans(rc.as_deref(), ds.as_deref(), positive, || contents(annot))?;
+            let spans = rich_spans(rc.as_deref(), &style, positive, || contents(annot))?;
             doc.fonts.shape_rich(&spans)
         })?
     } else {
@@ -227,19 +224,13 @@ pub(super) fn free_text<'a>(
 /// sizes of the line.
 pub(super) const RICH_ASCENT: f32 = 0.9;
 
-/// The spans of rich text `rc` (or, without it, the plain text `plain` gives) over
-/// default style `ds`, over the face of rich text in the base size and black, as
-/// viewers set them: the colour of the default appearance does not apply, lines are
-/// aligned by their own `text-align`, not by /Q, and a default style with a
-/// declaration that is not one (no colon) is a syntax error that drops all of it.
-/// Relative sizes are of a base size that is `positive` or not.
-pub(super) fn rich_spans(
-    rc: Option<&[u8]>,
-    ds: Option<&[u8]>,
-    positive: bool,
-    plain: impl FnOnce() -> String,
-) -> Result<Vec<Span>, Unsupported> {
-    let mut style = Style {
+/// The style default style `ds` sets over the face of rich text in the base size
+/// and black, as viewers set it: the colour of the default appearance does not
+/// apply, and a default style with a declaration that is not one (no colon) is a
+/// syntax error that drops all of it. Relative sizes are of a base size that is
+/// `positive` or not.
+pub(super) fn default_style(ds: Option<&[u8]>, positive: bool) -> Result<Style, Unsupported> {
+    let style = Style {
         face: Family::Text.into(),
         size: Size::Base(1.0),
         color: Color::BLACK,
@@ -249,17 +240,30 @@ pub(super) fn rich_spans(
         css.split(';')
             .all(|d| d.trim().is_empty() || d.contains(':'))
     });
-    if let Some(ds) = ds {
-        style = rich::css_style(&ds, style, positive)?;
+    match ds {
+        Some(ds) => rich::css_style(&ds, style, positive),
+        None => Ok(style),
     }
+}
+
+/// The spans of rich text `rc` (or, without it, the plain text `plain` gives) over
+/// `style`, a [`default_style`], as viewers set them: lines are aligned by their own
+/// `text-align`, not by /Q. Relative sizes are of a base size that is `positive` or
+/// not.
+pub(super) fn rich_spans(
+    rc: Option<&[u8]>,
+    style: &Style,
+    positive: bool,
+    plain: impl FnOnce() -> String,
+) -> Result<Vec<Span>, Unsupported> {
     match rc {
         // A zero character is drawn as a fallback glyph (observed), which the rich
         // text parser drops.
         Some(rc) if text::text_string(rc).contains('\0') => Err(Unsupported::Character('\0')),
-        Some(rc) => rich::rich_text(&text::text_string(rc), &style, positive),
+        Some(rc) => rich::rich_text(&text::text_string(rc), style, positive),
         None => Ok(vec![Span {
             text: plain(),
-            style,
+            style: style.clone(),
         }]),
     }
 }

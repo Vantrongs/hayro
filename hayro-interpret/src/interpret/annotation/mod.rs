@@ -35,7 +35,7 @@ mod widget;
 
 use entries::{Annots, Entries, Id, Items, Label, Listed, Objects, Source, StreamEntries, Value};
 use out::{Color, Out, written_all};
-use text::{Family, Fonts, Shaped, Typeface};
+use text::{Family, Fonts, Shaped, Style, StyleKey, Typeface};
 
 use super::AnnotationSelection;
 use crate::BlendMode;
@@ -341,6 +341,9 @@ struct Known<'a> {
     fields: Kept<ContentKey<'a>, Option<Field<'a>>>,
     /// Text set in its fonts, by what it is made of.
     shaped: Kept<TextKey<'a>, Result<Rc<Shaped>, Unsupported>>,
+    /// The styles default styles (`/DS`) set, by the entry that holds each and
+    /// whether relative sizes are of a positive base size.
+    styles: Kept<(Source<'a>, bool), Result<Style, Unsupported>>,
     /// The options of lists, by the entry that holds them.
     labels: Kept<Source<'a>, Rc<Vec<Label<'a>>>>,
     /// Default appearances read, by the entry that holds each, and the form's; with
@@ -358,12 +361,16 @@ type Kept<K, V> = hash::Map<K, (V, Lost)>;
 type DefaultAppearance = (Family, Option<f32>, Option<Color>);
 
 /// What text is made of, as a key for setting it once per document: the entries it
-/// is read from, the typeface it is set in, and numbers that tell apart the ways it
-/// is read ([`TEXT`] and those after it first).
+/// is read from, the typeface it is set in, the style it is set in, when one is
+/// read from an entry of its own (a default style, `/DS`), and numbers that tell
+/// apart the ways it is read ([`TEXT`] and those after it first). A style is part
+/// of the key by its value, so that annotations that each hold an equal style set
+/// a text they share once.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct TextKey<'a> {
     sources: Vec<Source<'a>>,
     face: Typeface,
+    style: Option<StyleKey>,
     numbers: Vec<u64>,
 }
 
@@ -386,7 +393,16 @@ impl<'a> TextKey<'a> {
         Self {
             sources: sources.into_iter().collect(),
             face,
+            style: None,
             numbers,
+        }
+    }
+
+    /// This key, of text set in `style`.
+    fn styled(self, style: &Style) -> Self {
+        Self {
+            style: Some(style.key()),
+            ..self
         }
     }
 }
@@ -859,6 +875,22 @@ impl<'a> Appearances<'a> {
                 &text.map(|t| text::text_string(&t)).unwrap_or_default(),
             )
         })
+    }
+
+    /// The style the default style (`/DS`) of `annot` sets, relative sizes of a base
+    /// size that is `positive` or not ([`freetext::default_style`]), read once for
+    /// the document by the entry that holds it.
+    fn default_style(&self, annot: &Entries<'a>, positive: bool) -> Result<Style, Unsupported> {
+        self.once(
+            |k| &mut k.styles,
+            Some((annot.source(entries::Text::DefaultStyle.key()), positive)),
+            || {
+                freetext::default_style(
+                    annot.text(entries::Text::DefaultStyle).as_deref(),
+                    positive,
+                )
+            },
+        )
     }
 
     /// The default appearance `read()` gives, of entry `source`, or the form's

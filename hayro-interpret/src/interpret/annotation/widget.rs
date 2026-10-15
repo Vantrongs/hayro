@@ -264,41 +264,39 @@ fn draw<'a>(
         .int(b"TI")
         .and_then(|n| usize::try_from(n).ok())
         .unwrap_or(0);
-    // What the field shows, read once for the document under the entries it is read
-    // from alone, whose values are not read for each widget: `/RV` and `/DS`; else,
-    // of a list, `/DS`, the style of its options; else `/DS` over the value.
+    // What the field shows, read once for the document under the entry it is read
+    // from and the style `/DS` sets, whose values are not read for each widget:
+    // `/RV`; else, of a list, the style alone, that of its options; else the value.
     let rich = annot.has_text(Text::RichValue);
     let shows = if matches!(kind, Kind::Text | Kind::List | Kind::Combo)
         && (rich || annot.has_text(Text::DefaultStyle))
     {
         let options = kind == Kind::List && !rich;
-        let mut read = vec![annot.source(Text::DefaultStyle.key())];
-        if rich {
-            read.push(annot.source(Text::RichValue.key()));
+        let style = doc.default_style(annot, positive)?;
+        let read = if rich {
+            Some(annot.source(Text::RichValue.key()))
         } else if !options {
-            read.push(field.source(Inherited::Value));
-        }
+            Some(field.source(Inherited::Value))
+        } else {
+            None
+        };
         let key = TextKey::new(
             read,
             Family::Text.into(),
             vec![FIELD, u64::from(options), u64::from(positive)],
-        );
+        )
+        .styled(&style);
         doc.once(
             |k| &mut k.field_text,
             Some(key),
             || {
-                let style = annot.text(Text::DefaultStyle);
                 if options {
-                    let spans =
-                        freetext::rich_spans(None, style.as_deref(), positive, String::new)?;
-                    return Ok(FieldText::Options(Rc::new(spans[0].style.clone())));
+                    return Ok(FieldText::Options(Rc::new(style)));
                 }
                 // A list shows `/RV` here; its options only without it, above.
                 let rv = rich.then(|| annot.text(Text::RichValue)).flatten();
                 let spans =
-                    freetext::rich_spans(rv.as_deref(), style.as_deref(), positive, || {
-                        value_text(field)
-                    })?;
+                    freetext::rich_spans(rv.as_deref(), &style, positive, || value_text(field))?;
                 Ok(FieldText::Rich(Rc::new(fonts.shape_rich(&spans)?)))
             },
         )?

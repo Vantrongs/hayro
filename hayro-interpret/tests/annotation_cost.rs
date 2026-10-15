@@ -781,6 +781,39 @@ fn a_shared_text_is_set_once_whatever_each_annotation_draws_it_in() {
     });
 }
 
+/// Annotations that share a text, each with a default style written in it, set the
+/// text once when their styles are equal, at either length of the text: `FreeText`
+/// contents and rich text, a field's value and rich value.
+#[test]
+fn a_shared_text_is_set_once_whatever_entry_holds_an_equal_style() {
+    for words in [long_text(), long_text().repeat(2)] {
+        let text = vec![format!("({words})")];
+        let rich = vec![format!("(<p>{words}</p>)")];
+        for ds in ["/DS ()", "/DS (font-size:12pt)"] {
+            let free_text = format!("/Subtype /FreeText /BS << /W 0 >> {ds} /DA (/Helv 12 Tf)");
+            let field = format!("/Subtype /Widget /FT /Tx {ds} /DA (/Helv 12 Tf)");
+            for (shared, annot) in [
+                (
+                    &text,
+                    format!("{free_text} /Contents 4 0 R /Rect [10 10 110 40]"),
+                ),
+                (&rich, format!("{free_text} /RC 4 0 R /Rect [10 10 110 40]")),
+                (&text, format!("{field} /V 4 0 R /Rect [10 10 110 40]")),
+                (
+                    &rich,
+                    format!("{field} /V (x) /RV 4 0 R /Rect [10 10 110 40]"),
+                ),
+                (
+                    &rich,
+                    format!("{field} /Ff 33554432 /V (x) /RV 4 0 R /Rect [10 10 110 40]"),
+                ),
+            ] {
+                shared_once("", shared, |_| annot.clone());
+            }
+        }
+    }
+}
+
 /// A list's options are read once for the document, and of them only those its box
 /// shows are set, each label once however many options or lists refer to it: the
 /// work grows with the options, not with their labels' length times their number.
