@@ -22,7 +22,7 @@ fn palette(pdf: &Pdf, page: usize) -> Vec<u8> {
 }
 
 fn palette_of(space: &Array<'_>) -> Vec<u8> {
-    match space.iter::<Object<'_>>().nth(3) {
+    match space.items::<Object<'_>>().nth(3).flatten() {
         Some(Object::String(palette)) => palette.to_vec(),
         other => panic!("no palette: {other:?}"),
     }

@@ -175,3 +175,37 @@ fn content_of_many_restarting_streams_restarts_once() {
         "64 streams: {small:?}, 128: {large:?} (written, work)"
     );
 }
+
+/// A part of an array of contents that is no stream is passed over, not the end of
+/// the content, as `MuPDF` reads it (`PyMuPDF` 1.28.2 draws the parts before and
+/// after a null, a reference to no object, a number and a dictionary). The strict
+/// reading passes over a null and a reference to no object too, and refuses a part
+/// of another kind.
+#[test]
+fn a_part_of_the_contents_that_is_no_stream_is_passed_over() {
+    let objects = || {
+        vec![
+            common::stream("", b"1 0 0 rg"),
+            common::stream("", b"0 0 10 10 re f"),
+            b"<< /A 1 >>".to_vec(),
+        ]
+    };
+    for (contents, strict) in [
+        ("[4 0 R null 9 0 R 5 0 R]", true),
+        ("[4 0 R 6 0 R 5 0 R]", false),
+        ("[4 0 R 7 5 0 R]", false),
+    ] {
+        let entries = format!("/Contents {contents}");
+        let pdf = Pdf::new(common::one_page(100, &entries, objects())).unwrap();
+        let page = &pdf.pages()[0];
+        assert_eq!(
+            page.page_stream().unwrap(),
+            b"1 0 0 rg 0 0 10 10 re f ",
+            "{contents}"
+        );
+        assert_eq!(page.try_page_stream().is_ok(), strict, "{contents}");
+        if strict {
+            assert_eq!(page.try_page_stream().unwrap(), b"1 0 0 rg 0 0 10 10 re f ");
+        }
+    }
+}

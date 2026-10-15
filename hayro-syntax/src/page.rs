@@ -559,8 +559,9 @@ impl<'a> Page<'a> {
                 } else if let Some(array) = self.inner.get::<Array<'_>>(CONTENTS) {
                     let mut decoded = Decoded::default();
                     let mut collected = vec![];
-                    // As `array.iter::<Stream>()` reads it: up to the first part that
-                    // is no stream.
+                    // A part that is no stream is passed over, as `MuPDF` passes it
+                    // over (`PyMuPDF` 1.28.2, observed): a null, a number, a dictionary,
+                    // a reference to none.
                     for item in array.raw_iter() {
                         let key = self.body_key(&item);
                         let stream = match item {
@@ -570,7 +571,7 @@ impl<'a> Page<'a> {
                             MaybeRef::NotRef(object) => object.into_stream(),
                         };
                         let Some(stream) = stream else {
-                            break;
+                            continue;
                         };
                         if let Some(data) =
                             decoded.get(key, || Some(stream.decoded().ok()?.into_owned()))
