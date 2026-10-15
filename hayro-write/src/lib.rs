@@ -23,7 +23,7 @@ use hayro_syntax::object::dict::keys::{
 };
 use hayro_syntax::object::stream::DecodeFailure;
 use hayro_syntax::object::{Dict, ObjRef, Object};
-use hayro_syntax::page::{ContentError, Page, PageKey, Resources, Rotation};
+use hayro_syntax::page::{ContentError, ContentPiece, Page, PageKey, Resources, Rotation};
 use hayro_syntax::work::Meter;
 use hayro_syntax::xref::ContentKey;
 use pdf_writer::{Chunk, Content, Filter, Finish, Name, Rect, Ref};
@@ -582,9 +582,12 @@ fn encoded_content(page: &Page<'_>, ctx: &ExtractionContext<'_>) -> Result<Vec<u
 
     let mut encoder = encoder();
     page.try_page_stream_to(
-        &mut |data| {
-            let _ = ctx.meter.work(data.len());
-            encoder.write_all(data).unwrap();
+        &mut |piece| match piece {
+            ContentPiece::Data(data) => {
+                let _ = ctx.meter.work(data.len());
+                encoder.write_all(data).unwrap();
+            }
+            ContentPiece::Restart => encoder = self::encoder(),
         },
         &ctx.meter,
     )?;

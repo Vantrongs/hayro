@@ -16,7 +16,7 @@ disallowed-types = [
     { path = "rustc_hash::FxHashSet", reason = "fixed keys a file can collide: use hayro_syntax::hash::Set" },
     { path = "rustc_hash::FxBuildHasher", reason = "fixed keys a file can collide: use hayro_syntax::hash" },
     { path = "rustc_hash::FxHasher", reason = "fixed keys a file can collide: use hayro_syntax::hash::State" },
-    { path = "rustc_hash::FxRandomState", reason = "use hayro_syntax::hash" },
+    { path = "rustc_hash::FxRandomState", reason = "use hayro_syntax::hash", allow-invalid = true },
     { path = "hashbrown::HashMap", reason = "use hayro_syntax::hash::Map" },
     { path = "hashbrown::HashSet", reason = "use hayro_syntax::hash::Set" },
 ]

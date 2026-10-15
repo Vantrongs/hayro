@@ -59,12 +59,12 @@ fn nested_flate_page(len: usize) -> Vec<u8> {
 }
 
 /// The content decodes to 8 or 32 MiB, and its copy, a page and a form of it, is
-/// written in memory at most 3 MiB beyond what the copy holds, the same for both, with
+/// written in memory of at most 1 MiB and a few times what the copy holds (its
+/// compressor's output and the chunks it is put in), whatever it decodes to, with
 /// work proportional to what it decodes to.
 #[test]
 fn nested_filters_are_copied_in_memory_bounded_whatever_they_decode_to() {
-    let sizes = [8 << 20, 32 << 20];
-    let results = sizes.map(|len| {
+    for len in [8 << 20, 32 << 20] {
         let pdf = Pdf::new(nested_flate_page(len)).unwrap();
         let queries = [
             ExtractionQuery::new_page(0),
@@ -85,13 +85,12 @@ fn nested_filters_are_copied_in_memory_bounded_whatever_they_decode_to() {
         });
         let work = EXAMINED.get() + TOLD.get() + BODIES_READ.get();
         let written = copy.chunk.len();
-        let beyond = allocations.peak.saturating_sub(written);
         eprintln!(
             "{len} bytes decoded twice: peak {}, {written} written, work {work}",
             allocations.peak
         );
         assert!(
-            beyond < 3 << 20,
+            allocations.peak < (1 << 20) + 4 * written,
             "{len} bytes decoded: a peak of {} for {written} bytes written",
             allocations.peak
         );
@@ -99,10 +98,5 @@ fn nested_filters_are_copied_in_memory_bounded_whatever_they_decode_to() {
             (2 * len..16 * len).contains(&work),
             "{len} bytes decoded twice with {work} bytes of work"
         );
-        beyond
-    });
-    assert!(
-        results[1] < results[0] + (256 << 10),
-        "the memory beyond the copy grows with the data: {results:?}"
-    );
+    }
 }

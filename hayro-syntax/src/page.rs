@@ -390,57 +390,21 @@ impl<'a> Decoded<'a> {
     }
 }
 
-/// The most decoded bytes of a page's content streams [`Page::try_page_stream_to`]
-/// holds: of a part being read, which a restart of its decoding voids before it is
-/// written, and of the parts an array of contents names more than once, kept to be
-/// written again. A part that decodes to more is decoded once to its end, which
-/// finds its decoders, then again as it is written, each time it is named.
+/// The most decoded bytes of the streams an array of contents names more than once
+/// [`Page::try_page_stream_to`] keeps, to write them again rather than decode them
+/// again; those of streams that decode to more are decoded each time they are named.
 const CONTENT_KEPT: usize = 1 << 20;
 
-/// The decoded data of `stream`, if they are at most `kept` bytes, else written to
-/// `out` as they are decoded ([`CONTENT_KEPT`]).
-fn decoded_part(
-    stream: &Stream<'_>,
-    kept: usize,
-    out: &mut dyn FnMut(&[u8]),
-    meter: &Meter<'_>,
-) -> Result<Option<Vec<u8>>, DecodeFailure> {
-    let Some(mut reader) = stream.decoded_strict_reader(meter)? else {
-        return Ok(Some(stream.decoded_strict_metered(meter)?.into_owned()));
-    };
-    let failure = |error| match error {
-        ReadError::Cancelled => DecodeFailure::Cancelled,
-        // A pass that read to the end is read again with no restart.
-        ReadError::Restarted | ReadError::Failed => DecodeFailure::StreamDecode,
-    };
-    let mut buf = vec![0; POLL_BYTES];
-    let mut data = Some(Vec::new());
-    loop {
-        match reader.read(&mut buf, meter) {
-            Ok(0) => break,
-            Ok(n) => match &mut data {
-                Some(d) if d.len() + n <= kept => d.extend_from_slice(&buf[..n]),
-                _ => data = None,
-            },
-            Err(ReadError::Restarted) => {
-                if let Some(d) = &mut data {
-                    d.clear();
-                }
-            }
-            Err(error) => return Err(failure(error)),
-        }
-    }
-    if data.is_some() {
-        return Ok(data);
-    }
-    reader.rewind();
-    loop {
-        match reader.read(&mut buf, meter) {
-            Ok(0) => return Ok(None),
-            Ok(n) => out(&buf[..n]),
-            Err(error) => return Err(failure(error)),
-        }
-    }
+/// A piece of a page's content, written as it is decoded
+/// ([`Page::try_page_stream_to`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentPiece<'d> {
+    /// The next bytes of the content.
+    Data(&'d [u8]),
+    /// Every piece written before is void, and the content is written again from its
+    /// start: a stream turned out corrupt for the decoder that read it, and is read
+    /// with the next one decoding whole would try.
+    Restart,
 }
 
 /// The rotation of the page.
@@ -603,32 +567,35 @@ impl<'a> Page<'a> {
     pub fn try_page_stream(&self) -> Result<Vec<u8>, ContentError> {
         let mut content = vec![];
         self.try_page_stream_to(
-            &mut |data| content.extend_from_slice(data),
+            &mut |piece| match piece {
+                ContentPiece::Data(data) => content.extend_from_slice(data),
+                ContentPiece::Restart => content.clear(),
+            },
             &Meter::default(),
         )?;
         Ok(content)
     }
 
     /// [`Self::try_page_stream`], written to `out` a piece at a time as it is decoded,
-    /// the work counted on `meter`: what decoding holds is bounded by the decoders'
-    /// state and 2 MiB, however much the content's filters make of its data and
-    /// however they nest. A stream an array of contents names more than once is
-    /// decoded once where it decodes to at most 1 MiB, kept to be written again.
-    /// On an error, `out` was given the content up to the part that failed, or part
-    /// of it.
+    /// the work counted on `meter`: decoding holds the decoders' state and windows
+    /// and buffers of [`POLL_BYTES`], however much the content's filters make of its
+    /// data and however they nest, and up to 1 MiB of the streams an array of
+    /// contents names more than once, each decoded once if it fits. The pieces after
+    /// the last [`ContentPiece::Restart`] are the content; on an error, `out` was
+    /// given part of it.
     pub fn try_page_stream_to(
         &self,
-        out: &mut dyn FnMut(&[u8]),
+        out: &mut dyn FnMut(ContentPiece<'_>),
         meter: &Meter<'_>,
     ) -> Result<(), ContentError> {
         let Some(contents) = self.inner.get_raw::<Object<'a>>(CONTENTS) else {
             return Ok(());
         };
-        let resolved = |object: MaybeRef<Object<'a>>| -> Result<_, ContentError> {
+        let resolved = |object: &MaybeRef<Object<'a>>| -> Result<_, ContentError> {
             match object {
-                MaybeRef::NotRef(object) => Ok((None, object)),
+                MaybeRef::NotRef(object) => Ok((None, object.clone())),
                 MaybeRef::Ref(r) => {
-                    let id = ObjectIdentifier::from(r);
+                    let id = ObjectIdentifier::from(*r);
                     match self
                         .ctx
                         .xref()
@@ -640,74 +607,104 @@ impl<'a> Page<'a> {
                 }
             }
         };
-        // Writes the data of a part, or returns them, if they are at most `kept`
-        // bytes; `None` for a `null` part.
-        let write = |(id, object): (Option<ObjectIdentifier>, Object<'a>),
-                     kept: usize,
-                     out: &mut dyn FnMut(&[u8])|
-         -> Result<Option<Option<Vec<u8>>>, ContentError> {
-            match object {
-                Object::Null(_) => Ok(None),
-                Object::Stream(stream) => decoded_part(&stream, kept, out, meter)
-                    .map(Some)
-                    .map_err(|failure| ContentError::Decode(id, failure)),
-                _ => Err(ContentError::Unreadable(id)),
-            }
+        // The parts, and whether each is followed by a space, as streams of an array
+        // must have at least one whitespace in-between.
+        let (parts, spaced) = match resolved(&contents)? {
+            (_, Object::Array(array)) => (array.raw_iter().collect::<Vec<_>>(), true),
+            _ => (vec![contents], false),
         };
-
-        match resolved(contents)? {
-            (_, Object::Array(array)) => {
-                // The bodies named more than once, and the data kept of those.
-                let mut named = hash::Map::<ContentKey<'a>, usize>::default();
-                for item in array.raw_iter() {
-                    if let Some(key) = self.body_key(&item) {
-                        *named.entry(key).or_default() += 1;
+        let keys: Vec<_> = parts.iter().map(|part| self.body_key(part)).collect();
+        let mut named = hash::Map::<ContentKey<'a>, usize>::default();
+        for key in keys.iter().flatten() {
+            *named.entry(*key).or_default() += 1;
+        }
+        // The data of parts named more than once, `None` for a `null` one.
+        let mut kept = hash::Map::<ContentKey<'a>, Option<Vec<u8>>>::default();
+        let mut kept_bytes = 0;
+        // The decoders each part's filters read with, once a restart chose them.
+        let mut chosen = vec![Vec::new(); parts.len()];
+        let mut buf = vec![0; POLL_BYTES];
+        'content: loop {
+            let mut written = false;
+            for (i, (part, key)) in parts.iter().zip(&keys).enumerate() {
+                let (id, object) = resolved(part)?;
+                if let Some(data) = key.and_then(|key| kept.get(&key)) {
+                    if let Some(data) = data {
+                        out(ContentPiece::Data(data));
+                        out(ContentPiece::Data(b" "));
+                        written = true;
                     }
+                    continue;
                 }
-                let mut decoded = hash::Map::<ContentKey<'a>, Option<Vec<u8>>>::default();
-                let mut kept = 0;
-                for item in array.raw_iter() {
-                    let key = self.body_key(&item);
-                    let part = resolved(item)?;
-                    let known = key.and_then(|key| decoded.get(&key));
-                    if let Some(data) = known {
-                        if let Some(data) = data {
-                            out(data);
-                            // Streams must have at least one whitespace in-between.
-                            out(b" ");
-                        }
-                        continue;
-                    }
-                    let repeated = key.is_some_and(|key| named[&key] > 1);
-                    let room = match repeated {
-                        true => CONTENT_KEPT - kept,
-                        false => CONTENT_KEPT,
-                    };
-                    let Some(data) = write(part, room, out)? else {
+                let stream = match object {
+                    Object::Null(_) => {
                         if let Some(key) = key {
-                            decoded.insert(key, None);
+                            kept.insert(*key, None);
                         }
                         continue;
-                    };
-                    if let Some(data) = &data {
-                        out(data);
                     }
-                    out(b" ");
-                    if let (Some(key), Some(data), true) = (key, data, repeated)
-                        && data.len() <= room
-                    {
-                        kept += data.len();
-                        decoded.insert(key, Some(data));
+                    Object::Stream(stream) => stream,
+                    _ => return Err(ContentError::Unreadable(id)),
+                };
+                let failed = |failure| ContentError::Decode(id, failure);
+                let repeated = key.is_some_and(|key| named[&key] > 1);
+                let room = if repeated {
+                    CONTENT_KEPT - kept_bytes
+                } else {
+                    0
+                };
+                let mut copy = (room > 0).then(Vec::new);
+                let keep = |copy: &mut Option<Vec<u8>>, data: &[u8]| match copy {
+                    Some(c) if c.len() + data.len() <= room => c.extend_from_slice(data),
+                    _ => *copy = None,
+                };
+                match stream
+                    .decoded_strict_reader_chosen(meter, &chosen[i])
+                    .map_err(failed)?
+                {
+                    None => {
+                        let data = stream.decoded_strict_metered(meter).map_err(failed)?;
+                        out(ContentPiece::Data(&data));
+                        written = true;
+                        keep(&mut copy, &data);
                     }
+                    Some(mut reader) => loop {
+                        match reader.read(&mut buf, meter) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                out(ContentPiece::Data(&buf[..n]));
+                                written = true;
+                                keep(&mut copy, &buf[..n]);
+                            }
+                            Err(ReadError::Restarted) => {
+                                chosen[i] = reader.choices();
+                                if written {
+                                    out(ContentPiece::Restart);
+                                    continue 'content;
+                                }
+                                if let Some(c) = &mut copy {
+                                    c.clear();
+                                }
+                            }
+                            Err(ReadError::Failed) => {
+                                return Err(failed(DecodeFailure::StreamDecode));
+                            }
+                            Err(ReadError::Cancelled) => {
+                                return Err(failed(DecodeFailure::Cancelled));
+                            }
+                        }
+                    },
                 }
-                Ok(())
-            }
-            single => {
-                if let Some(Some(data)) = write(single, CONTENT_KEPT, out)? {
-                    out(&data);
+                if spaced {
+                    out(ContentPiece::Data(b" "));
+                    written = true;
                 }
-                Ok(())
+                if let (Some(key), Some(copy)) = (key, copy) {
+                    kept_bytes += copy.len();
+                    kept.insert(*key, Some(copy));
+                }
             }
+            return Ok(());
         }
     }
 

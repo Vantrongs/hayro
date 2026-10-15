@@ -48,3 +48,86 @@ fn a_stream_named_many_times_is_decoded_once() {
         );
     }
 }
+
+fn zlib(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(data).unwrap();
+    e.finish().unwrap()
+}
+
+/// `zlib`, with a checksum that does not match: zlib rejects it at its end, after
+/// all its data, and the permissive decoder reads it.
+fn bad_checksum(data: &[u8]) -> Vec<u8> {
+    let mut encoded = zlib(data);
+    let last = encoded.len() - 1;
+    encoded[last] ^= 1;
+    encoded
+}
+
+/// Content whose streams turn out corrupt for zlib only after their data were
+/// written, alone, nested, or named twice, is written again from its start with the
+/// decoders that read it, and what is written after the last restart is the content.
+#[test]
+fn content_written_as_it_is_decoded_restarts_where_a_stream_does() {
+    use hayro_syntax::object::{ObjectIdentifier, Stream};
+    use hayro_syntax::page::ContentPiece;
+    use hayro_syntax::work::Meter;
+
+    let text: Vec<u8> = common::noise(300_000, 3)
+        .iter()
+        .map(|b| b'a' + b % 26)
+        .collect();
+    let objects = vec![
+        common::stream("/Filter /FlateDecode", &zlib(b"0 0 m 10 10 l S")),
+        common::stream("/Filter /FlateDecode", &bad_checksum(&text)),
+        common::stream(
+            "/Filter [/FlateDecode /FlateDecode]",
+            &zlib(&bad_checksum(&text[..200_000])),
+        ),
+    ];
+    for (contents, parts) in [
+        ("5 0 R", &[5][..]),
+        ("[4 0 R 5 0 R 6 0 R 4 0 R 5 0 R]", &[4, 5, 6, 4, 5][..]),
+        ("[6 0 R 6 0 R]", &[6, 6][..]),
+    ] {
+        let entries = format!("/Contents {contents}");
+        let pdf = Pdf::new(common::one_page(100, &entries, objects.clone())).unwrap();
+        let decoded = |n| {
+            let stream: Stream<'_> = pdf.xref().get(ObjectIdentifier::new(n, 0)).unwrap();
+            stream.decoded_strict().unwrap().into_owned()
+        };
+        let mut expected = Vec::new();
+        for &n in parts {
+            expected.extend(decoded(n));
+            if contents.starts_with('[') {
+                expected.push(b' ');
+            }
+        }
+        let (mut written, mut restarts) = (Vec::new(), 0);
+        pdf.pages()[0]
+            .try_page_stream_to(
+                &mut |piece| match piece {
+                    ContentPiece::Data(data) => written.extend_from_slice(data),
+                    ContentPiece::Restart => {
+                        restarts += 1;
+                        written.clear();
+                    }
+                },
+                &Meter::default(),
+            )
+            .unwrap();
+        assert!(written == expected, "{contents}: {} bytes", written.len());
+        // zlib rejects the data after it was written, raw deflate before any is; the
+        // permissive decoder reads it.
+        let (least, most) = if cfg!(feature = "unsafe") {
+            (1, 4)
+        } else {
+            (0, 0)
+        };
+        assert!(
+            (least..=most).contains(&restarts),
+            "{contents}: {restarts} restarts"
+        );
+    }
+}
