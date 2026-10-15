@@ -498,6 +498,80 @@ fn formatting_left_open_across_paragraphs_is_unsupported_at_a_bounded_cost() {
     assert_eq!(look_within(20, rich(&rc)), Err(Unsupported::RichText));
 }
 
+/// One tag with many attributes is read in time that grows with their number, not
+/// its square: 128 000 of them, 1.2 MB of text, took 8 s in a release build when
+/// each attribute was compared with every earlier one of its tag, and take 0.3 s
+/// in a debug build now.
+#[test]
+fn rich_text_with_a_tag_of_many_attributes_is_read_at_a_bounded_cost() {
+    let attributes: String = (0..128_000).map(|i| format!(" a{i}=x")).collect();
+    let rc = format!("<p{attributes}>A</p>");
+    assert!(look_within(3, rich(&rc)).is_ok());
+}
+
+/// Attributes `abc` + `z` + `abc`, for all 46 656 strings `abc` of three lowercase
+/// letters or digits, whose names all have one atom hash: `string_cache` 0.9 hashes
+/// a name of up to seven bytes to the XOR of the halves of its 64-bit atom.
+fn attributes_whose_names_hash_alike() -> String {
+    const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut attributes = String::new();
+    for a in CHARS {
+        for b in CHARS {
+            for c in CHARS {
+                let abc = String::from_utf8(vec![*a, *b, *c]).unwrap();
+                attributes.push_str(&format!(" {abc}z{abc}=x"));
+            }
+        }
+    }
+    attributes
+}
+
+/// One tag with attributes whose names hash alike is read in time that grows with
+/// their number: html5ever's set of a large tag's names, keyed by the names' atom
+/// hash, took 11 s for these in a debug build, and keyed by their text, 0.1 s.
+#[test]
+fn rich_text_with_a_tag_of_names_whose_atoms_hash_alike_is_read_at_a_bounded_cost() {
+    let rc = format!("<p{}>A</p>", attributes_whose_names_hash_alike());
+    assert!(look_within(3, rich(&rc)).is_ok());
+}
+
+/// A repeated tag merges in attributes whose names hash alike in time that grows
+/// with their number: a set of names keyed by their atoms' hash took 16 s for
+/// these in a debug build, and keyed by their text, 0.1 s.
+#[test]
+fn repeated_tags_with_names_whose_atoms_hash_alike_are_merged_at_a_bounded_cost() {
+    let rc = format!(
+        "<body{}><body a=b><p>A</p>",
+        attributes_whose_names_hash_alike()
+    );
+    assert!(look_within(3, rich(&rc)).is_ok());
+}
+
+/// One tag with attributes whose names, longer than seven bytes, share a bucket
+/// of `string_cache` 0.9's set of atoms is read in time that grows with their number.
+/// The set put such a name in one of 4,096 lists by a hash with a fixed key, so
+/// each name stepped past all those before it: these 65 536 names took 10 s in a
+/// debug build, and 0.3 s with the set placing atoms by a per-process random hash.
+/// The file holds names `n` + 11 hex digits of a counter, found offline to share
+/// one list under the key of `web_atoms` 0.2.6's local names, as LEB128 differences
+/// between the counters.
+#[test]
+fn rich_text_with_a_tag_of_names_in_one_atom_bucket_is_read_at_a_bounded_cost() {
+    let mut attributes = String::new();
+    let (mut counter, mut delta, mut shift) = (0_u64, 0_u64, 0);
+    for byte in include_bytes!("one_bucket_attribute_names.bin") {
+        delta |= u64::from(byte & 0x7f) << shift;
+        shift += 7;
+        if byte & 0x80 == 0 {
+            counter += delta;
+            attributes.push_str(&format!(" n{counter:011x}=x"));
+            (delta, shift) = (0, 0);
+        }
+    }
+    let rc = format!("<p{attributes}>A</p>");
+    assert!(look_within(3, rich(&rc)).is_ok());
+}
+
 /// Text beside or below a `FreeText`'s box is clipped away, so it is not drawn:
 /// the content stays the size of what the box shows, however long the text.
 #[test]
