@@ -12,10 +12,13 @@
 //! bottom left of the field, turned with it by `/MK /R`. A widget whose `/Parent`
 //! chain loops is a broken field and draws nothing, as in common viewers.
 
-use super::entries::{Entries, Value};
+use super::entries::{Entries, Text, Value};
+use super::freetext::{self, TextBox};
 use super::out::{Color, Out};
-use super::text::{self, Family, Fonts, Glyph};
-use super::{FINEST, Field, Inherited, Unsupported, border_width, circle, color_of, rect};
+use super::text::{self, Family, Fonts};
+use super::{
+    Appearances, FINEST, Field, Inherited, Unsupported, border_width, circle, color_of, rect,
+};
 use hayro_syntax::object::dict::keys::AS;
 use kurbo::{Affine, Shape};
 
@@ -23,17 +26,19 @@ type Drawn = Result<Option<()>, Unsupported>;
 
 /// What a widget with the entries of `field` draws on a page that shows `visible` of
 /// it; `form` is the interactive form dictionary.
+///
+/// As viewers make it, the appearance is drawn in a box of the field's size, its
+/// sides swapped for a turn (`/MK /R`) whose remainder by 360 is 90 or 270, turned
+/// by `/MK /R` and fitted into `/Rect` (PDF 32000-1 12.5.5): a field turned by
+/// another angle is tilted or squeezed, as in viewers. Everything below is drawn
+/// in that box, clipped to it.
 pub(super) fn widget(
     annot: &Entries<'_>,
     field: &Field<'_>,
-    form: Option<&Entries<'_>>,
-    fonts: &Fonts,
+    doc: &Appearances<'_>,
     visible: kurbo::Rect,
     out: &mut Out,
 ) -> Drawn {
-    let Some(r) = rect(annot) else {
-        return Ok(None);
-    };
     let field_type = field.get(Inherited::Type);
     let flags = field.get(Inherited::Flags).flags();
     let mk = annot.dict(b"MK");
@@ -41,6 +46,20 @@ pub(super) fn widget(
     let w = border_width(annot);
     let border = mk_color(b"BC").filter(|_| w > 0.0);
     let background = mk_color(b"BG");
+    let Some(r) = rect(annot) else {
+        // Without a box, viewers draw at coordinates of ±2^32: a button, or the
+        // background of a text or choice field, covers the page or shows nowhere.
+        let shows = match field_type.name() {
+            Some(b"Btn") => true,
+            Some(b"Tx" | b"Ch") => background.is_some(),
+            _ => false,
+        };
+        return if shows {
+            Err(Unsupported::Coordinates)
+        } else {
+            Ok(None)
+        };
+    };
     let fail = |o: Option<()>| o.ok_or(Unsupported::Kind);
 
     let kind = match field_type.name() {
@@ -50,42 +69,90 @@ pub(super) fn widget(
         Some(b"Btn") if flags & (1 << 16) != 0 => Kind::Push,
         Some(b"Btn") if flags & (1 << 15) != 0 => Kind::Radio,
         Some(b"Btn") => Kind::Check,
-        Some(b"Sig") if !field.has(Inherited::Value) => return signature(r, fonts, out),
+        // Signed only by a signature dictionary.
+        Some(b"Sig") if !matches!(field.get(Inherited::Value), Value::Dict(_)) => Kind::Sig,
         _ => return Ok(None),
     };
 
-    // A field turned by /MK /R lays out in a turned frame, `(u, v)` from its bottom
-    // left.
-    let rotation = mk
-        .as_ref()
-        .and_then(|mk| mk.int(b"R"))
-        .unwrap_or(0)
-        .rem_euclid(360);
-    let (fw, fh, turn) = match rotation {
-        90 => (
-            r.height(),
-            r.width(),
-            Affine::new([0.0, 1.0, -1.0, 0.0, r.x1, r.y0]),
-        ),
-        180 => (
-            r.width(),
-            r.height(),
-            Affine::new([-1.0, 0.0, 0.0, -1.0, r.x1, r.y1]),
-        ),
-        270 => (
-            r.height(),
-            r.width(),
-            Affine::new([0.0, -1.0, 1.0, 0.0, r.x0, r.y1]),
-        ),
-        _ => (r.width(), r.height(), Affine::translate((r.x0, r.y0))),
+    // The box and how it is placed: a field of no area is drawn squeezed to
+    // nothing.
+    // An unsigned signature's tag is not turned (observed).
+    let rotation = match kind {
+        Kind::Sig => 0,
+        _ => mk.as_ref().and_then(|mk| mk.int(b"R")).unwrap_or(0),
     };
+    let (fw, fh) = if matches!(rotation % 360, 90 | 270) {
+        (r.height(), r.width())
+    } else {
+        (r.width(), r.height())
+    };
+    if !(fw > 0.0 && fh > 0.0) {
+        return Ok(None);
+    }
+    let turn = turned(rotation);
+    let place = super::rect_transform(r, [0.0, 0.0, fw as f32, fh as f32], turn) * turn;
+    let bbox = kurbo::Rect::new(0.0, 0.0, fw, fh);
+    // What the page shows of the box, in the box's space.
+    let shown = (place.inverse() * visible.to_path(0.1)).bounding_box();
+    out.op("q");
+    fail(out.nums(&place.as_coeffs(), "cm"))?;
+    fail(out.clip(bbox))?;
+    let drawn = draw(
+        annot,
+        field,
+        doc,
+        kind,
+        flags,
+        mk.as_ref(),
+        w,
+        border,
+        background,
+        bbox,
+        shown,
+        out,
+    );
+    out.op("Q");
+    drawn
+}
 
+/// The turn of `degrees`, exact for the right angles.
+fn turned(degrees: i32) -> Affine {
+    match degrees.rem_euclid(360) {
+        0 => Affine::IDENTITY,
+        90 => Affine::new([0.0, 1.0, -1.0, 0.0, 0.0, 0.0]),
+        180 => Affine::new([-1.0, 0.0, 0.0, -1.0, 0.0, 0.0]),
+        270 => Affine::new([0.0, -1.0, 1.0, 0.0, 0.0, 0.0]),
+        _ => Affine::rotate(f64::from(degrees).to_radians()),
+    }
+}
+
+/// Draws the widget of [`widget`] in its box `bbox`, of which `shown` shows.
+#[allow(clippy::too_many_arguments)]
+fn draw(
+    annot: &Entries<'_>,
+    field: &Field<'_>,
+    doc: &Appearances<'_>,
+    kind: Kind,
+    flags: u32,
+    mk: Option<&Entries<'_>>,
+    w: f64,
+    border: Option<Color>,
+    background: Option<Color>,
+    bbox: kurbo::Rect,
+    shown: kurbo::Rect,
+    out: &mut Out,
+) -> Drawn {
+    let fail = |o: Option<()>| o.ok_or(Unsupported::Kind);
+    let (fonts, form) = (&doc.fonts, doc.form.as_ref());
+    let (fw, fh) = (bbox.width(), bbox.height());
+    if kind == Kind::Sig {
+        return signature(bbox, fonts, out);
+    }
     if matches!(kind, Kind::Check | Kind::Radio) {
         let on = annot.name(AS).is_some_and(|state| state.as_ref() != b"Off");
         let s = fw.min(fh);
-        // The square at the bottom left of the turned frame; its frame and disc look
-        // the same turned, the check mark is drawn in the frame.
-        let sq = (turn * kurbo::Rect::new(0.0, 0.0, s, s).to_path(0.1)).bounding_box();
+        // The square at the bottom left of the box.
+        let sq = kurbo::Rect::new(0.0, 0.0, s, s);
         if kind == Kind::Radio {
             fail(radio(sq, w, background, border, on, out))?;
         } else {
@@ -98,39 +165,45 @@ pub(super) fn widget(
                 let size = s as f32;
                 out.op("0 g");
                 let origin = (w as f32 + 0.1 * size, 0.2 * size);
-                fail(text::draw(&[check], size, origin, turn, out))?;
+                fail(text::draw(&[check], size, origin, Affine::IDENTITY, out))?;
             }
         }
         return Ok(Some(()));
     }
 
-    // The default appearance: the widget's, its field's, or the form's.
-    let da = match field.get(Inherited::Appearance) {
-        Value::String(s) => s.as_bytes().to_vec(),
-        _ => form.and_then(|f| f.string(b"DA")).unwrap_or_default(),
-    };
+    // The default appearance: of the widget or the nearest field above it that has
+    // one, its text, or none when it is not text; else the form's.
+    let da = if field.found(Inherited::Appearance) {
+        field
+            .get(Inherited::Appearance)
+            .text(Text::DefaultAppearance)
+    } else {
+        form.and_then(|f| f.text(Text::DefaultAppearance))
+    }
+    .unwrap_or_default();
     let (family, size, text_color) = text::default_appearance(&da);
     let text_color = text_color.unwrap_or(Color::BLACK);
     let (fw, fh) = (fw as f32, fh as f32);
 
     if kind == Kind::Push {
-        fail(frame(r, w, background, border, out))?;
+        // Viewers draw a push button's colours, and shade its bevel, in RGB.
+        let (background, border) = (background.map(Color::rgb), border.map(Color::rgb));
+        fail(frame(bbox, w, background, border, out))?;
         if let Some(bg) = background {
-            fail(bevel(r, w, bg, out))?;
+            fail(bevel(bbox, w, bg, out))?;
         }
-        let caption = mk
-            .as_ref()
-            .and_then(|mk| mk.string(b"CA"))
-            .map(|s| text::text_string(&s))
-            .unwrap_or_default();
+        let Some(caption) = mk.and_then(|mk| mk.text(Text::Caption)) else {
+            return Ok(Some(()));
+        };
         if caption.is_empty() {
             return Ok(Some(()));
         }
-        let glyphs = fonts.shape(family, &caption)?;
+        let source = mk.and_then(|mk| mk.source(Text::Caption.key()));
+        let run = doc.run(source, family.into(), || text::text_string(&caption))?;
         let inset = 2.0 * (w as f32 + 2.0);
+        let em = run.width(0..run.len()) as f32;
         let size = size.unwrap_or_else(|| {
             let by_height = fh - inset - 8.0;
-            let em = text::width(&glyphs, 1.0);
             let by_width = if em > 0.0 {
                 (fw - inset) / em
             } else {
@@ -138,156 +211,232 @@ pub(super) fn widget(
             };
             by_height.min(by_width).max(1.0)
         });
-        let x = (fw - text::width(&glyphs, size)) / 2.0;
+        let x = (fw - em * size) / 2.0;
         fail(out.fill_color(&text_color))?;
-        fail(text::draw(
-            &glyphs,
+        let origin = (f64::from(x), f64::from(fh / 2.0 - 0.3 * size));
+        fail(text::draw_run(
+            fonts,
+            &run,
+            0..run.len(),
             size,
-            (x, fh / 2.0 - 0.3 * size),
-            turn,
+            origin,
+            shown,
             out,
         ))?;
         return Ok(Some(()));
     }
 
-    fail(frame(r, w, background, border, out))?;
-    let value = match field.get(Inherited::Value) {
-        Value::Name(n) => String::from_utf8_lossy(n.as_ref()).into_owned(),
-        // The first of several selected values.
-        Value::Array(values) => values
-            .get(0)
-            .string()
-            .map(text::text_string)
-            .unwrap_or_default(),
-        // A text string or a text stream.
-        value => value
-            .text()
-            .map(|t| text::text_string(&t))
-            .unwrap_or_default(),
-    };
+    fail(frame(bbox, w, background, border, out))?;
+    // Text is clipped to the box inside the border.
+    let clip = bbox.inset(-w);
     let pad = 2.0 * w as f32;
+    let multiline = kind == Kind::Text && flags & (1 << 12) != 0;
+    // Rich text: the widget's own /RV or /DS, whatever its RichText flag says;
+    // viewers do not take them from the fields above it.
+    let rich = annot.text(Text::RichValue);
+    let style = annot.text(Text::DefaultStyle);
+    if kind == Kind::Text && (rich.is_some() || style.is_some()) {
+        // A size fit to the field is none: such rich text is drawn 0 high.
+        let size = size.unwrap_or(0.0);
+        let spans = freetext::rich_spans(rich.as_deref(), style.as_deref(), size, || {
+            value_text(field)
+        })?;
+        // As viewers lay rich text out: from the top less twice the border width
+        // on several lines; on one line, in a band twice the size high whose top
+        // lies 1.3 sizes and four border widths above the field's middle, of which
+        // the lines that fit are drawn. Either is as wide as the field less twice
+        // the border width on the left and four on the right, and the text is
+        // wrapped to that width.
+        let w = w as f32;
+        let (top, room) = if multiline {
+            (fh - pad, f32::INFINITY)
+        } else {
+            (1.3 * size + 4.0 * w - fh / 2.0, 2.0 * size)
+        };
+        let bottom = if multiline { -2.0 * size } else { top - room };
+        let band = kurbo::Rect::new(
+            f64::from(pad),
+            f64::from(bottom),
+            f64::from(fw - 4.0 * w),
+            f64::from(top),
+        );
+        let area = TextBox {
+            width: fw,
+            pad,
+            right: 2.0 * pad,
+            top,
+            room,
+            frame: Affine::IDENTITY,
+            clip: clip.intersect(band),
+        };
+        out.op("q");
+        freetext::draw_text(&spans, freetext::RICH_ASCENT, &area, fonts, out)?;
+        out.op("Q");
+        return Ok(Some(()));
+    }
     let avail = (fw - 2.0 * pad).max(0.0);
-    let q = field.get(Inherited::Quadding).int().unwrap_or(0);
+    let q = annot.int(b"Q").unwrap_or(0);
     let align = |width: f32| match q {
         1 => pad + (avail - width) / 2.0,
         2 => fw - pad - width,
         _ => pad,
     };
     out.op("q");
-    fail(out.clip(r))?;
+    fail(out.clip(clip))?;
     fail(out.fill_color(&text_color))?;
-    let multiline = kind == Kind::Text && flags & (1 << 12) != 0;
-    // A length beyond a 32-bit integer is no comb, as in common viewers.
-    let max_len = field
-        .get(Inherited::MaxLen)
-        .int()
-        .filter(|n| (1..=i64::from(i32::MAX)).contains(n));
     let comb = kind == Kind::Text && flags & (1 << 24) != 0 && !multiline;
+    let id = Affine::IDENTITY;
+    // What of the text the page can show: the work of drawing a value grows with
+    // that, and the value, which widgets of one field share, is set once.
+    let seen = clip.intersect(shown);
+    let source = field.source(Inherited::Value);
+    let value = || doc.run(source, family.into(), || value_text(field));
     match kind {
         Kind::List => {
             let size = size.unwrap_or(12.0);
-            let opts = field.get(Inherited::Options).items();
-            let top_index = field
-                .get(Inherited::TopIndex)
-                .int()
+            let opts = annot.items(b"Opt");
+            let top_index = annot
+                .int(b"TI")
                 .and_then(|n| u32::try_from(n).ok())
                 .unwrap_or(0);
             let mut y = fh - pad - 1.116 * size;
             for opt in opts.iter().flat_map(|o| o.iter()).skip(top_index as usize) {
+                // An option that is not text keeps its line.
                 let label = match opt {
-                    Value::String(s) => text::text_string(s.as_bytes()),
                     // An export value and the text shown.
-                    Value::Array(pair) => pair
-                        .get(1)
-                        .string()
-                        .map(text::text_string)
-                        .unwrap_or_default(),
-                    _ => continue,
+                    Value::Array(pair) => pair.get(1).text(Text::Option),
+                    opt => opt.text(Text::Option),
                 };
-                let glyphs = fonts.shape(family, &label)?;
-                fail(text::draw_clipped(
-                    &glyphs,
-                    size,
-                    (pad, y),
-                    0.0,
-                    turn,
-                    r,
-                    out,
-                ))?;
+                if let Some(label) = label {
+                    let glyphs = fonts.shape(family, &text::text_string(&label))?;
+                    fail(text::draw_clipped(
+                        &glyphs,
+                        size,
+                        (pad, y),
+                        0.0,
+                        id,
+                        clip,
+                        out,
+                    ))?;
+                }
                 y -= 1.116 * size;
             }
         }
         _ if multiline => {
             let size = size.unwrap_or(12.0);
-            let lines = text::lines(fonts, family, size, &value, Some(avail))?;
-            let mut y = fh - pad - 1.116 * size;
-            for line in &lines {
-                fail(text::draw_clipped(
-                    line,
-                    size,
-                    (align(text::width(line, size)), y),
-                    0.0,
-                    turn,
-                    r,
-                    out,
-                ))?;
-                y -= 1.116 * size;
+            let run = value()?;
+            let lines = doc.lines(source, &run, size, avail);
+            // The first line's baseline is at least a fifth of the size above the
+            // padding, however low the field (observed).
+            let top = (fh - pad).max(pad + 1.316 * size);
+            let line = |j: usize| {
+                let x = align((run.width(lines.ranges[j].clone()) * f64::from(size)) as f32);
+                let y = f64::from(top) - (j as f64 + 1.0) * f64::from(1.116 * size);
+                (f64::from(x), y)
+            };
+            let (x0, x1) = (align(0.0), align((lines.widest * f64::from(size)) as f32));
+            let span = |j: usize| (f64::from(x0.min(x1)), line(j).1);
+            // Every line lies between the first and the last, within the widest.
+            let reach = (lines.widest * f64::from(size)).abs() + f64::from((x1 - x0).abs());
+            let last = lines.ranges.len() - 1;
+            for j in [0, last] {
+                fail(text::reach(&run, size, span(j), reach, out))?;
+            }
+            for j in text::rows(
+                &run,
+                size,
+                f64::from(top),
+                f64::from(1.116 * size),
+                last,
+                seen,
+            ) {
+                let range = lines.ranges[j].clone();
+                fail(text::draw_run(fonts, &run, range, size, line(j), seen, out))?;
             }
         }
-        _ if comb && let Some(max_len) = max_len => {
-            let cells = max_len as f32;
-            let glyphs = fonts.shape(family, &value)?;
+        // A comb of cells as many as `/MaxLen`; without one, the text from the
+        // field's left edge.
+        _ if comb => {
+            let run = value()?;
+            let all = 0..run.len();
+            let max_len = field.get(Inherited::MaxLen).int().filter(|n| *n >= 1);
             // Automatic: the field's height, or less for the text to fit across.
             let size = size.unwrap_or_else(|| {
-                let em = text::width(&glyphs, 1.0);
+                let em = run.width(all.clone()) as f32;
                 if em > 0.0 { fh.min(fw / em) } else { fh }
             });
+            let Some(max_len) = max_len else {
+                // Aligned by /Q in the whole width, whatever the border (observed).
+                let width = (run.width(all.clone()) * f64::from(size)) as f32;
+                let x = match q {
+                    1 => (fw - width) / 2.0,
+                    2 => fw - width,
+                    _ => 0.0,
+                };
+                let origin = (f64::from(x), f64::from(fh / 2.0 - 0.3 * size));
+                fail(text::draw_run(fonts, &run, all, size, origin, seen, out))?;
+                out.op("Q");
+                return Ok(Some(()));
+            };
+            let cells = max_len as f32;
             let cell = fw / cells;
-            for (i, g) in glyphs.iter().take(cells as usize).enumerate() {
-                let x = cell * i as f32 + (cell - g.advance * size) / 2.0;
-                fail(text::draw_clipped(
-                    std::slice::from_ref(g),
-                    size,
-                    (x, fh / 2.0 - 0.3 * size),
-                    0.0,
-                    turn,
-                    r,
-                    out,
-                ))?;
-            }
+            // The dividers before the text, which a border wider than a cell covers.
             if let Some(border) = &border {
                 fail(out.stroke_color(border))?;
                 fail(out.stroke_state(w, &[]))?;
                 fail(comb_dividers(
-                    max_len,
+                    i64::from(max_len),
                     f64::from(fw),
                     f64::from(fh),
                     w,
-                    turn,
-                    visible,
+                    id,
+                    shown,
                     out,
                 ))?;
                 out.op("S");
             }
+            // Each glyph centred in its cell: those of the first and last cells
+            // bound where the others lie, and those whose cells the clip can show
+            // are drawn.
+            let count = run.len().min(max_len as usize);
+            let y = f64::from(fh / 2.0 - 0.3 * size);
+            let at = |i: usize| {
+                let advance = run.width(i..i + 1) as f32;
+                f64::from(cell * i as f32 + (cell - advance * size) / 2.0)
+            };
+            let slack = (run.widest() * f64::from(size)).abs() / 2.0;
+            if count > 0 {
+                for i in [0, count - 1] {
+                    fail(text::reach(&run, size, (at(i), y), slack, out))?;
+                }
+            }
+            for i in text::cells(&run, size, f64::from(cell), count, slack, seen) {
+                fail(text::draw_run(
+                    fonts,
+                    &run,
+                    i..i + 1,
+                    size,
+                    (at(i), y),
+                    seen,
+                    out,
+                ))?;
+            }
         }
+        // A line break is drawn as a space, as any control character is.
         _ => {
-            let glyphs: Vec<Glyph<'_>> = fonts.shape(family, &value.replace(['\r', '\n'], " "))?;
+            let run = value()?;
+            let all = 0..run.len();
+            let em = run.width(all.clone()) as f32;
             let size = size.unwrap_or_else(|| {
                 let by_height = fh - 2.0 * pad;
-                let em = text::width(&glyphs, 1.0);
                 let by_width = if em > 0.0 { avail / em } else { by_height };
                 by_height.min(by_width).max(1.0)
             });
-            let width = text::width(&glyphs, size);
-            fail(text::draw_clipped(
-                &glyphs,
-                size,
-                (align(width), fh / 2.0 - 0.3 * size),
-                0.0,
-                turn,
-                r,
-                out,
-            ))?;
+            let origin = (
+                f64::from(align(em * size)),
+                f64::from(fh / 2.0 - 0.3 * size),
+            );
+            fail(text::draw_run(fonts, &run, all, size, origin, seen, out))?;
         }
     }
     out.op("Q");
@@ -327,8 +476,9 @@ fn comb_dividers(
     }
     // The lines within half a width of the visible part of the frame.
     let shown = (turn.inverse() * visible.to_path(0.1)).bounding_box();
-    let first = ((shown.x0 - 1.5 * w) / step).floor().max(1.0);
-    let last = ((shown.x1 - 0.5 * w) / step).ceil().min(cells - 1.0);
+    let m = w.abs();
+    let first = ((shown.x0 - 1.5 * m) / step).floor().max(1.0);
+    let last = ((shown.x1 - 0.5 * m) / step).ceil().min(cells - 1.0);
     if first > last {
         return Some(());
     }
@@ -342,6 +492,7 @@ fn comb_dividers(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
+    Sig,
     Text,
     Combo,
     List,
@@ -408,9 +559,6 @@ fn radio(
 /// The bevel of a push button with background `bg`: a lighter band along the top
 /// and left, a darker one along the bottom and right, 2 pt wide inside the border.
 fn bevel(r: kurbo::Rect, w: f64, bg: Color, out: &mut Out) -> Option<()> {
-    if matches!(bg, Color::Cmyk(_)) {
-        return Some(());
-    }
     let o = r.inset(-w);
     let i = r.inset(-(w + 2.0));
     if o.width() <= 0.0 || o.height() <= 0.0 || i.width() <= 0.0 || i.height() <= 0.0 {
@@ -424,7 +572,7 @@ fn bevel(r: kurbo::Rect, w: f64, bg: Color, out: &mut Out) -> Option<()> {
         out.op("h f");
         Some(())
     };
-    out.fill_color(&bg.map(|c| c + (1.0 - c) / 2.0))?;
+    out.fill_color(&bg.map(|c| (c + 1.0) / 2.0))?;
     poly(
         &[
             (o.x0, o.y0),
@@ -480,4 +628,16 @@ fn signature(r: kurbo::Rect, fonts: &Fonts, out: &mut Out) -> Drawn {
         out,
     ))?;
     Ok(Some(()))
+}
+
+/// The value of the field `field` as text: a text string, or a text stream, or a
+/// name; nothing for an array of selected values, as viewers show it.
+fn value_text(field: &Field<'_>) -> String {
+    match field.get(Inherited::Value) {
+        Value::Name(n) => String::from_utf8_lossy(n.as_ref()).into_owned(),
+        value => value
+            .text(Text::FieldValue)
+            .map(|t| text::text_string(&t))
+            .unwrap_or_default(),
+    }
 }

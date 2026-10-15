@@ -162,6 +162,10 @@ impl<'a, 'r> Device<'a> for Renderer<'r> {
         Self::draw_rect(self, rect, props, draw_mode);
     }
 
+    fn knock_out(&mut self, path: &BezPath, transform: Affine, draw_mode: &DrawMode) {
+        Self::knock_out(self, path, transform, draw_mode);
+    }
+
     fn draw_glyph_run(
         &mut self,
         glyph_run: &GlyphRun<'_, 'a>,

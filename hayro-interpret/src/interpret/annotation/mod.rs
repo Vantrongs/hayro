@@ -32,11 +32,11 @@ mod widget;
 
 use entries::{Entries, Items, Value};
 use out::{Color, Out, written_all};
-use text::Fonts;
+use text::{Fonts, Lines, Run, Typeface};
 
 use crate::BlendMode;
 use crate::x_object::box_and_matrix;
-use hayro_syntax::object::dict::keys::{AP, AS, BORDER, BS, C, CA, D, F, N, RECT, S, SUBTYPE, W};
+use hayro_syntax::object::dict::keys::{AP, AS, BORDER, BS, C, CA, D, F, N, RECT, SUBTYPE, W};
 use hayro_syntax::object::{Dict, Name, ObjRef, Object, Stream};
 use hayro_syntax::xref::XRef;
 use kurbo::{Affine, Shape};
@@ -101,13 +101,19 @@ pub enum Unsupported {
     Kind,
     /// Its text has a character none of the fonts has.
     Character(char),
-    /// A coordinate it draws at is too large to write: beyond the range of the
-    /// 32-bit numbers content streams are read in.
+    /// A coordinate it draws at is too large to write: 2^23 or more, where the
+    /// 32-bit numbers content streams are read in are a unit or more apart.
     Coordinates,
     /// Its rich text (`/RC`) or default style (`/DS`) uses an element, attribute or
     /// style declaration the generator cannot draw as viewers do, or nests or
     /// repeats elements beyond what written rich text does.
     RichText,
+    /// A number it is drawn by is a real whose integer part is 2^53 or more, which
+    /// cannot be read as viewers read it (see `entries.rs`).
+    Number,
+    /// It draws a line ending at a negative border width, or along a line of no
+    /// length, which viewers clip by rules not reproduced.
+    Ending,
 }
 
 /// An appearance generated for an annotation without a usable appearance stream.
@@ -126,18 +132,20 @@ pub struct Appearance {
 /// Whether `annot` is kept when annotations are flattened into page content for
 /// printing what the reader sees: every annotation but links and those flagged
 /// Invisible or Hidden (PDF 32000-1 12.5.3), whatever their Print and `NoView` flags.
-pub fn flattened(annot: &Dict<'_>) -> bool {
+/// [`Unsupported::Number`] when its flags cannot be read as viewers read them.
+pub fn flattened(annot: &Dict<'_>) -> Result<bool, Unsupported> {
     let annot = Entries::new(annot.clone());
-    !annot.is(SUBTYPE, b"Link") && flags_of(&annot) & 3 == 0
+    Ok(!annot.is(SUBTYPE, b"Link") && flags_of(&annot)? & 3 == 0)
 }
 
-/// The annotation flags of `annot` (`/F`, PDF 32000-1 12.5.3).
-pub fn flags(annot: &Dict<'_>) -> u32 {
+/// The annotation flags of `annot` (`/F`, PDF 32000-1 12.5.3);
+/// [`Unsupported::Number`] when they cannot be read as viewers read them.
+pub fn flags(annot: &Dict<'_>) -> Result<u32, Unsupported> {
     flags_of(&Entries::new(annot.clone()))
 }
 
-fn flags_of(annot: &Entries<'_>) -> u32 {
-    annot.get(F).flags()
+fn flags_of(annot: &Entries<'_>) -> Result<u32, Unsupported> {
+    entries::read(|| annot.get(F).flags())
 }
 
 /// What the annotations of one document look like: [`Appearances::look`], with
@@ -153,12 +161,23 @@ pub struct Appearances<'a> {
     fields: Fields<'a>,
 }
 
-/// The fields of a document read so far, by reference: what the widgets below each
-/// inherit, or `None` when its `/Parent` chain loops. Shared by every
-/// [`Appearances`] of the document a renderer makes, one per page, through its
-/// document's cache.
+/// What has been read of a document's widgets so far, by reference: the fields,
+/// with what the widgets below each inherit, or `None` when its `/Parent` chain
+/// loops; and the values widgets show, set in a typeface, and their lines, so that a
+/// value many widgets share is set once. Shared by every [`Appearances`] of the
+/// document a renderer makes, one per page, through its document's cache.
 #[derive(Clone, Default)]
-pub(crate) struct Fields<'a>(Rc<RefCell<FxHashMap<ObjRef, Option<Field<'a>>>>>);
+pub(crate) struct Fields<'a>(Rc<RefCell<Known<'a>>>);
+
+#[derive(Default)]
+struct Known<'a> {
+    fields: FxHashMap<ObjRef, Option<Field<'a>>>,
+    /// By the object that holds the text and the typeface.
+    runs: FxHashMap<(ObjRef, Typeface), Result<Rc<Run>, Unsupported>>,
+    /// By the object that holds the text, the typeface, and the bits of the size
+    /// and width the lines are broken at.
+    lines: FxHashMap<(ObjRef, Typeface, u32, u32), Rc<Lines>>,
+}
 
 impl<'a> Appearances<'a> {
     /// The appearances of annotations in the document of `xref`, with text in the
@@ -192,10 +211,15 @@ impl<'a> Appearances<'a> {
     /// The normal appearance is `/AP /N`, or, when that is a dictionary of states, the
     /// state `/AS` names. A stream there draws when it has a `/BBox` that, after its
     /// `/Matrix`, has some area, and the annotation a `/Rect`, and nothing otherwise.
-    /// An `/AP` that is not a dictionary draws nothing. Without an appearance there
+    /// An `/AP` that is not a dictionary, or refers to no object, draws nothing, but on a
+    /// button widget, which viewers draw anew. Without an appearance there
     /// (no `/AP`, no `/N`, no stream for the state), one is generated from the
     /// annotation's entries.
     pub fn look(&self, annot: &Dict<'a>, visible: kurbo::Rect) -> Look<'a> {
+        entries::read(|| self.look_read(annot, visible)).unwrap_or_else(Look::Unsupported)
+    }
+
+    fn look_read(&self, annot: &Dict<'a>, visible: kurbo::Rect) -> Look<'a> {
         match annot.get::<Object<'_>>(AP) {
             None | Some(Object::Null(_)) => {}
             Some(Object::Dict(ap)) => {
@@ -216,13 +240,32 @@ impl<'a> Appearances<'a> {
                     };
                 }
             }
-            Some(_) => return Look::Nothing,
+            Some(_) => return self.not_a_dictionary(annot, visible),
         }
         if annot.contains_key(AP) && annot.get::<Object<'_>>(AP).is_none() {
             // A reference to no object.
-            return Look::Nothing;
+            return self.not_a_dictionary(annot, visible);
         }
-        match self.generate(&Entries::new(annot.clone()), visible) {
+        self.generated(&Entries::new(annot.clone()), visible)
+    }
+
+    /// What `annot`, whose `/AP` is neither a dictionary nor null, looks like:
+    /// nothing, but a button, whose appearance viewers make anew.
+    fn not_a_dictionary(&self, annot: &Dict<'a>, visible: kurbo::Rect) -> Look<'a> {
+        let annot = Entries::new(annot.clone());
+        let button = annot.is(SUBTYPE, b"Widget")
+            && self
+                .field(&annot)
+                .is_some_and(|f| f.get(Inherited::Type).name() == Some(b"Btn"));
+        if button {
+            self.generated(&annot, visible)
+        } else {
+            Look::Nothing
+        }
+    }
+
+    fn generated(&self, annot: &Entries<'a>, visible: kurbo::Rect) -> Look<'a> {
+        match self.generate(annot, visible) {
             Ok(Some(appearance)) => Look::Generated(appearance),
             Ok(None) => Look::Nothing,
             Err(why) => Look::Unsupported(why),
@@ -306,12 +349,10 @@ impl<'a> Appearances<'a> {
             b"Stamp" => icons::stamp(annot, fonts, &mut out),
             b"FreeText" => freetext::free_text(annot, fonts, &mut out),
             b"Line" => lines::line(annot, fonts, &mut out),
-            b"Polygon" => ok(lines::poly(annot, true, &mut out)),
-            b"PolyLine" => ok(lines::poly(annot, false, &mut out)),
+            b"Polygon" => lines::poly(annot, true, &mut out),
+            b"PolyLine" => lines::poly(annot, false, &mut out),
             b"Widget" => match self.field(annot) {
-                Some(field) => {
-                    widget::widget(annot, &field, self.form.as_ref(), fonts, visible, &mut out)
-                }
+                Some(field) => widget::widget(annot, &field, self, visible, &mut out),
                 // A widget whose /Parent chain loops is a broken field: nothing.
                 None => Ok(None),
             },
@@ -346,11 +387,48 @@ impl<'a> Appearances<'a> {
         }))
     }
 
+    /// `text()` set in `typeface`, made once for the document when it is held by
+    /// object `source`.
+    fn run(
+        &self,
+        source: Option<ObjRef>,
+        typeface: Typeface,
+        text: impl FnOnce() -> String,
+    ) -> Result<Rc<Run>, Unsupported> {
+        let make = || self.fonts.run(typeface, &text()).map(Rc::new);
+        let Some(source) = source else {
+            return make();
+        };
+        if let Some(run) = self.fields.0.borrow().runs.get(&(source, typeface)) {
+            return run.clone();
+        }
+        let run = make();
+        let mut known = self.fields.0.borrow_mut();
+        known.runs.insert((source, typeface), run.clone());
+        run
+    }
+
+    /// The lines of `run`, held by object `source`, at `size` broken to fit
+    /// `width` ([`text::wrap`]), made once for the document.
+    fn lines(&self, source: Option<ObjRef>, run: &Run, size: f32, width: f32) -> Rc<Lines> {
+        let make = || Rc::new(text::wrap(run, size, width));
+        let Some(source) = source else {
+            return make();
+        };
+        let key = (source, run.typeface(), size.to_bits(), width.to_bits());
+        if let Some(lines) = self.fields.0.borrow().lines.get(&key) {
+            return lines.clone();
+        }
+        let lines = make();
+        self.fields.0.borrow_mut().lines.insert(key, lines.clone());
+        lines
+    }
+
     /// The field entries widget `annot` is drawn with, however deep its `/Parent`
     /// chain; `None` when the chain loops, which viewers read as a broken field and
     /// draw nothing for. Each field above widgets is read once.
     fn field(&self, annot: &Entries<'a>) -> Option<Field<'a>> {
-        let mut known = self.fields.0.borrow_mut();
+        let known = &mut self.fields.0.borrow_mut().fields;
         let mut on_walk = rustc_hash::FxHashSet::default();
         on_walk.extend(annot.id());
         // From the widget up to the first field read before, or to the top.
@@ -381,29 +459,24 @@ impl<'a> Appearances<'a> {
     }
 }
 
-/// The field entries a widget inherits (PDF 32000-1 12.7.3.1) and is drawn with.
+/// The field entries a widget inherits (PDF 32000-1 12.7.3.1) and is drawn with,
+/// as viewers inherit them: `/Q`, `/Opt` and `/TI` they read from the widget alone.
 #[derive(Clone, Copy)]
 enum Inherited {
     Type,
     Flags,
     Value,
     Appearance,
-    Quadding,
     MaxLen,
-    Options,
-    TopIndex,
 }
 
 impl Inherited {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 5] = [
         Self::Type,
         Self::Flags,
         Self::Value,
         Self::Appearance,
-        Self::Quadding,
         Self::MaxLen,
-        Self::Options,
-        Self::TopIndex,
     ];
 
     fn key(self) -> &'static [u8] {
@@ -412,17 +485,15 @@ impl Inherited {
             Self::Flags => b"Ff",
             Self::Value => b"V",
             Self::Appearance => b"DA",
-            Self::Quadding => b"Q",
             Self::MaxLen => b"MaxLen",
-            Self::Options => b"Opt",
-            Self::TopIndex => b"TI",
         }
     }
 }
 
 /// For each [`Inherited`] entry, the nearest dictionary that has it in a widget's
-/// chain of fields through `/Parent`; an entry that is null or names no object is
-/// absent (PDF 32000-1 7.3.9).
+/// chain of fields through `/Parent`, as viewers look it up ([`Entries::present`]):
+/// a null entry is absent, one that refers to no object stops the search and reads
+/// as null.
 #[derive(Clone, Default)]
 struct Field<'a>([Option<Entries<'a>>; Inherited::ALL.len()]);
 
@@ -430,7 +501,7 @@ impl<'a> Field<'a> {
     /// The entries of `node`, a field or widget below the fields of `self`.
     fn below(&self, node: &Entries<'a>) -> Self {
         Self(std::array::from_fn(|i| {
-            if node.has(Inherited::ALL[i].key()) {
+            if node.present(Inherited::ALL[i].key()) {
                 Some(node.clone())
             } else {
                 self.0[i].clone()
@@ -439,7 +510,7 @@ impl<'a> Field<'a> {
     }
 
     /// Whether some dictionary in the chain has `key`.
-    fn has(&self, key: Inherited) -> bool {
+    fn found(&self, key: Inherited) -> bool {
         self.0[key as usize].is_some()
     }
 
@@ -447,6 +518,14 @@ impl<'a> Field<'a> {
         self.0[key as usize]
             .as_ref()
             .map_or(Value::Null, |d| d.get(key.key()))
+    }
+
+    /// The object that holds entry `key`: the one it refers to, or the dictionary
+    /// it is in; `None` for a direct dictionary.
+    fn source(&self, key: Inherited) -> Option<ObjRef> {
+        self.0[key as usize]
+            .as_ref()
+            .and_then(|d| d.source(key.key()))
     }
 }
 
@@ -493,42 +572,33 @@ fn color_of(dict: &Entries<'_>, key: &[u8]) -> Option<Color> {
     color(&dict.items(key)?)
 }
 
-/// /C as a colour: `default` when absent, `None` when it is transparent.
-fn c_color(annot: &Entries<'_>, default: Color) -> Option<Color> {
-    match annot.items(C) {
-        Some(items) => color(&items),
-        None => Some(default),
-    }
+/// /C as a colour, `default` without one: when it is absent, empty, or not an
+/// array, as viewers draw these annotations then.
+fn c_color(annot: &Entries<'_>, default: Color) -> Color {
+    color_of(annot, C).unwrap_or(default)
 }
 
-/// /BS /W, else the third /Border element, else 1; 0 strokes the thinnest line
-/// (PDF 32000-1 8.4.3.2), as does a width that is negative or not a number.
+/// /BS /W, else the third /Border element, else 1, as given: viewers write a
+/// negative width into the appearance as it is, and their renderer draws it.
 fn border_width(annot: &Entries<'_>) -> f64 {
-    let width = annot
+    annot
         .dict(BS)
         .and_then(|bs| bs.number(W))
         .or_else(|| annot.items(BORDER).and_then(|b| b.get(2).number()))
-        .unwrap_or(1.0);
-    // `max` reads no number as 0 too.
-    width.max(0.0)
+        .unwrap_or(1.0)
 }
 
-/// The dash array of a dashed border style (/BS /S /D), else the fourth /Border
-/// element; at most ten entries, as in `PDFium`.
+/// The dash array `/BS /D` when it is an array, whatever the border style `/S`,
+/// else the fourth `/Border` element, each entry in its place: viewers write it
+/// into the appearance as it is, however long, with 0 for an entry that is not a
+/// number, and draw a pattern that is all zeros or has negative entries as their
+/// renderer draws it.
 fn dash(annot: &Entries<'_>) -> Vec<f64> {
-    let items = match annot.dict(BS) {
-        Some(bs) if bs.is(S, b"D") => bs.items(D),
-        _ => annot.items(BORDER).and_then(|b| b.get(3).items()),
-    };
-    let dash: Vec<f64> = items
-        .map(|a| a.numbers().into_iter().take(10).collect())
-        .unwrap_or_default();
-    // An all-zero or negative pattern draws nothing; draw solid instead.
-    if dash.iter().all(|d| *d >= 0.0) && dash.iter().any(|d| *d > 0.0) {
-        dash
-    } else {
-        Vec::new()
-    }
+    let items = annot
+        .dict(BS)
+        .and_then(|bs| bs.items(D))
+        .or_else(|| annot.items(BORDER).and_then(|b| b.get(3).items()));
+    items.map(|a| a.numbers()).unwrap_or_default()
 }
 
 /// `/Rect`, normalized, read as viewers read a damaged one: a coordinate it lacks

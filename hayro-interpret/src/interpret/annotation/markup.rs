@@ -13,10 +13,12 @@ use hayro_syntax::object::dict::keys::{C, IC, INKLIST, QUADPOINTS};
 use kurbo::{Point, Rect, Vec2};
 
 /// Square and Circle: /IC fills the shape, /C strokes it at the border width, inside
-/// `/Rect`. Unlike `PDFium`, an absent `/C` means no border: the spec gives it no default.
-/// A border of width 0 is the thinnest line, not none. As viewers draw it, the shape
-/// lies inside the border width whether a border is drawn or not, and is at least
-/// 1 wide and high, starting where the border ends, however narrow `/Rect` is.
+/// `/Rect` less `/RD`. Unlike `PDFium`, an absent `/C` means no border: the spec gives
+/// it no default. A border of width 0 is the thinnest line, not none. As viewers draw
+/// it, each side lies inside its rectangle difference or half the border width,
+/// whichever is more, whether a border is drawn or not, and the shape is at least
+/// 1 wide and high, starting where its left and bottom sides are, however narrow
+/// `/Rect` is.
 pub(super) fn shape(annot: &Entries<'_>, circle: bool, out: &mut Out) -> Option<()> {
     let fill = color_of(annot, IC);
     let width = border_width(annot);
@@ -24,22 +26,30 @@ pub(super) fn shape(annot: &Entries<'_>, circle: bool, out: &mut Out) -> Option<
     if fill.is_none() && stroke.is_none() {
         return None;
     }
+    let r = rect(annot)?;
+    // Each side moved in by its rectangle difference (`/RD`: left, bottom, right,
+    // top; 0 for one it lacks), or by half the border width where that is more.
+    let rd = annot.numbers(b"RD", 4).unwrap_or_else(|| vec![0.0; 4]);
+    let inset = |i: usize| rd[i].max(width / 2.0);
+    let (x0, y0) = (r.x0 + inset(0), r.y0 + inset(1));
+    let (x1, y1) = (
+        (r.x1 - inset(2)).max(x0 + 1.0),
+        (r.y1 - inset(3)).max(y0 + 1.0),
+    );
+    // Viewers clip the shape to its box: `/Rect`, grown to the right and up to
+    // hold the shape and its insets where it is too small for them.
+    out.op("q");
+    out.clip(Rect::new(r.x0, r.y0, x1 + inset(2), y1 + inset(3)))?;
     if let Some(stroke) = &stroke {
         out.stroke_color(stroke)?;
         out.stroke_state(width, &dash(annot))?;
     }
-    let r = rect(annot)?;
-    let (x0, y0) = (r.x0 + width / 2.0, r.y0 + width / 2.0);
-    let (x1, y1) = (
-        (r.x1 - width / 2.0).max(x0 + 1.0),
-        (r.y1 - width / 2.0).max(y0 + 1.0),
-    );
     if let Some(fill) = &fill {
         out.fill_color(fill)?;
     }
     if circle {
-        // Four cubic quarter arcs; 0.5523 ≈ 4/3·tan(π/8).
-        const K: f64 = 0.5523;
+        // Four cubic quarter arcs, with the control point distance of [`super::circle`].
+        const K: f64 = 0.551_915;
         let (mx, my) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
         let (dx, dy) = (K * (x1 - x0) / 2.0, K * (y1 - y0) / 2.0);
         out.nums(&[mx, y1], "m")?;
@@ -55,6 +65,7 @@ pub(super) fn shape(annot: &Entries<'_>, circle: bool, out: &mut Out) -> Option<
         (true, false) => "s",
         _ => "f",
     });
+    out.op("Q");
     Some(())
 }
 
@@ -129,7 +140,7 @@ fn marked(annot: &Entries<'_>) -> Option<(Vec<Quad>, Rect)> {
 /// edge. A quad whose bottom edge has no length has no direction: viewers put the
 /// curves' control points at the origin, and so does this.
 pub(super) fn highlight(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
-    let fill = c_color(annot, Color::Rgb([1.0, 1.0, 0.0]))?;
+    let fill = c_color(annot, Color::Rgb([1.0, 1.0, 0.0]));
     let (quads, around) = marked(annot)?;
     let shapes: Vec<(Quad, Option<[Point; 4]>)> = quads
         .into_iter()
@@ -182,7 +193,7 @@ pub(super) enum Line {
 /// of the quad's height wide, across it from side to side, a seventh or three
 /// sevenths of the way up each side.
 pub(super) fn text_lines(annot: &Entries<'_>, line: Line, out: &mut Out) -> Option<()> {
-    let stroke = c_color(annot, Color::BLACK)?;
+    let stroke = c_color(annot, Color::BLACK);
     let (quads, clip) = marked(annot)?;
     out.op("q");
     out.clip(clip)?;
@@ -209,9 +220,7 @@ pub(super) fn squiggly(
     visible: Rect,
     out: &mut Out,
 ) -> Result<Option<()>, Unsupported> {
-    let Some(stroke) = c_color(annot, Color::BLACK) else {
-        return Ok(None);
-    };
+    let stroke = c_color(annot, Color::BLACK);
     let Some((quads, clip)) = marked(annot) else {
         return Ok(None);
     };
@@ -426,12 +435,17 @@ mod tests {
         }
     }
 
+    /// Where 32-bit numbers are a unit or more apart, viewers' zigzags round
+    /// otherwise than ours (in f32, 2^25 + 2 == 2^25: positions accumulated in f32
+    /// never reach x1): such a quad is not drawn but refused.
     #[test]
-    fn squiggly_ends_at_large_coordinates() {
-        // In f32, 2^25 + 2 == 2^25: positions accumulated in f32 never reach x1.
-        let c = squiggly_content("33554432 24 33554440 24 33554432 10 33554440 10", PAGE);
-        assert_eq!(c.matches(" l\n").count(), 4, "{c}");
-        assert!(c.ends_with(" l\nS\nQ\n"), "{c}");
+    fn squiggly_at_large_coordinates_is_unsupported() {
+        let annot = "<< /Subtype /Squiggly /Rect [0 0 1 1] \
+            /QuadPoints [33554432 24 33554440 24 33554432 10 33554440 10] >>";
+        let dict = Dict::from_bytes(annot.as_bytes()).expect("valid dict");
+        let mut out = Out::default();
+        let got = squiggly(&Entries::new(dict), PAGE, &mut out);
+        assert!(matches!(got, Err(super::Unsupported::Coordinates)));
     }
 
     /// A quad's zigzag is the same alone and among quads that take more than
@@ -453,17 +467,14 @@ mod tests {
         assert!(among.iter().all(|z| *z == alone[0]));
     }
 
-    /// A quad 10^9 pt wide, starting at its left end or far left of the page, draws
-    /// the steps across the page and a few beyond each side, with the corners its own
-    /// start puts them at.
+    /// A quad 4·10^6 or 8·10^6 pt wide, starting at its left end or far left of the page,
+    /// draws the steps across the page and a few beyond each side, with the corners
+    /// its own start puts them at.
     #[test]
     fn a_huge_quad_draws_the_steps_the_page_shows() {
         let page = Rect::new(100.0, 0.0, 712.0, 800.0);
-        for x0 in ["0", "-1000000000", "-999999999"] {
-            let c = squiggly_content(
-                &format!("{x0} 24 1000000000 24 {x0} 10 1000000000 10"),
-                page,
-            );
+        for x0 in ["0", "-4000000", "-3999999"] {
+            let c = squiggly_content(&format!("{x0} 24 4000000 24 {x0} 10 4000000 10"), page);
             let corners = corners(&c);
             let start: f64 = x0.parse().unwrap();
             let (first, last) = (corners[0].0, corners[corners.len() - 1].0);
@@ -476,7 +487,7 @@ mod tests {
             }
         }
         // Off the page, nothing.
-        let c = squiggly_content("0 2000 1000000000 2000 0 1986 1000000000 1986", page);
+        let c = squiggly_content("0 2000 4000000 2000 0 1986 4000000 1986", page);
         assert!(corners(&c).is_empty(), "{c}");
     }
 }

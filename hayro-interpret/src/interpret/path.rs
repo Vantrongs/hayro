@@ -22,8 +22,11 @@ pub(crate) fn stroke_path<'a>(context: &mut Context<'a>, device: &mut impl Devic
 
 /// Fills and then strokes the current path, as one operator does. Viewers paint the
 /// pair as a knockout group: where the stroke covers the fill, only the stroke shows,
-/// however translucent or blended both are. With one opacity for both, that is the
-/// pair drawn opaque in a group drawn at that opacity, blend mode and soft mask.
+/// however translucent or blended both are, its paint included (a tiling cell or a
+/// shading that paints translucently). With one opacity for both, that is the pair
+/// drawn opaque in a group drawn at that opacity, blend mode and soft mask, the
+/// stroke's area cleared of the fill before it is drawn. Opaque and unblended, viewers
+/// draw the stroke over the fill (observed in `MuPDF`).
 pub(crate) fn fill_stroke_path<'a>(
     context: &mut Context<'a>,
     device: &mut impl Device<'a>,
@@ -41,6 +44,8 @@ pub(crate) fn fill_stroke_path<'a>(
         let saved = (gs.soft_mask.take(), gs.blend_mode);
         (gs.non_stroke_alpha, gs.stroke_alpha, gs.blend_mode) = (1.0, 1.0, BlendMode::Normal);
         fill_path_impl(context, device, fill_rule, None);
+        let stroke = DrawMode::Stroke(context.stroke_props());
+        device.knock_out(context.path(), context.get().ctm, &stroke);
         stroke_path_impl(context, device, None);
         let gs = &mut context.get_mut().graphics_state;
         (gs.soft_mask, gs.blend_mode) = saved;

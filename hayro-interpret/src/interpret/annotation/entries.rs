@@ -5,15 +5,121 @@
 //! that drops an array's entry: every entry keeps its place, and one that is not a
 //! number, is null, or refers to no object reads as 0 where a number is wanted, so the
 //! coordinates and colour components after it keep their meaning.
+//!
+//! Numbers are read as `MuPDF` reads them, which is what the files are checked against
+//! (observed in `PyMuPDF` 1.28.2, which writes back the numbers it read): an integer as
+//! a 64-bit integer; a real as a 32-bit float of its integer part's low 32 bits and
+//! its fraction, so that `4294967297.5` is 1.5 and a digit string of any length
+//! fits; an integer entry of a real rounded half up, and `i32::MIN` beyond 32 bits.
+//! A real whose integer part a 64-bit float no longer holds exactly (2^53 or more)
+//! cannot be read so; reading one makes [`read`] fail with [`Unsupported::Number`].
 
+use super::Unsupported;
 use hayro_syntax::object::{Array, Dict, Name, Number, ObjRef, Object, Stream};
 use hayro_syntax::xref::XRef;
+use std::cell::Cell;
+
+thread_local! {
+    /// Whether a number that cannot be read as `MuPDF` reads it was read since
+    /// [`read`] began.
+    static UNREADABLE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `f`, which reads entries; [`Unsupported::Number`] when it read a number
+/// that cannot be read as `MuPDF` reads it, whatever `f` made of it.
+pub(crate) fn read<T>(f: impl FnOnce() -> T) -> Result<T, Unsupported> {
+    let before = UNREADABLE.with(|u| u.replace(false));
+    let value = f();
+    let unreadable = UNREADABLE.with(|u| u.replace(before));
+    if unreadable {
+        Err(Unsupported::Number)
+    } else {
+        Ok(value)
+    }
+}
+
+/// 2^53: from here on a 64-bit float does not hold every integer.
+const EXACT: f64 = 9_007_199_254_740_992.0;
+
+/// `n` as `MuPDF` reads a number where a real is wanted (see the module).
+pub(crate) fn real(n: Number) -> f64 {
+    if n.is_integer() {
+        // As a float, as `MuPDF` converts one.
+        return f64::from(n.as_i64() as f32);
+    }
+    let r = n.as_f64();
+    if r.is_nan() || r.abs() >= EXACT {
+        UNREADABLE.with(|u| u.set(true));
+        return 0.0;
+    }
+    let whole = r.abs().trunc();
+    // Exact: both are below 2^53.
+    let low = whole % 4_294_967_296.0;
+    let v = (low + (r.abs() - whole)) as f32;
+    f64::from(if r < 0.0 { -v } else { v })
+}
+
+/// `n` as `MuPDF` reads a number where an integer is wanted (see the module).
+fn int(n: Number) -> i32 {
+    if n.is_integer() {
+        // The low 32 bits.
+        return n.as_i64() as i32;
+    }
+    let rounded = (real(n) as f32 + 0.5).floor();
+    if (-2_147_483_648.0..2_147_483_648.0).contains(&rounded) {
+        rounded as i32
+    } else {
+        i32::MIN
+    }
+}
 
 /// A dictionary an annotation is drawn from: the annotation, one it refers to (its
 /// border style, its appearance characteristics, an appearance stream's), or a field
 /// above a widget.
 #[derive(Clone)]
 pub(crate) struct Entries<'a>(Dict<'a>);
+
+/// An entry that holds text, and whether viewers read a stream there as its text:
+/// only a field's value is (observed in `PyMuPDF` bake); elsewhere a stream is no
+/// text, as if the entry were absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Text {
+    /// `/Contents`.
+    Contents,
+    /// `/DA`, of an annotation, a field or the form.
+    DefaultAppearance,
+    /// `/RC`.
+    Rich,
+    /// `/DS`.
+    DefaultStyle,
+    /// `/CA` of `/MK`, a push button's caption.
+    Caption,
+    /// `/V` of a text field or choice field.
+    FieldValue,
+    /// `/RV` of a rich text field.
+    RichValue,
+    /// An entry of `/Opt`, or of a choice field's `/V` array.
+    Option,
+}
+
+impl Text {
+    pub(crate) const fn key(self) -> &'static [u8] {
+        match self {
+            Self::Contents => b"Contents",
+            Self::DefaultAppearance => b"DA",
+            Self::Rich => b"RC",
+            Self::DefaultStyle => b"DS",
+            Self::Caption => b"CA",
+            Self::FieldValue => b"V",
+            Self::RichValue => b"RV",
+            Self::Option => b"Opt",
+        }
+    }
+
+    const fn stream(self) -> bool {
+        matches!(self, Self::FieldValue)
+    }
+}
 
 /// The value of an entry or of an array's entry.
 pub(crate) enum Value<'a> {
@@ -43,44 +149,26 @@ impl<'a> Value<'a> {
         }
     }
 
-    pub(crate) fn is_null(&self) -> bool {
-        matches!(self, Self::Null)
-    }
-
+    /// A number, read as a real (see the module).
     pub(crate) fn number(&self) -> Option<f64> {
         match self {
-            Self::Number(n) => Some(n.as_f64()),
+            Self::Number(n) => Some(real(*n)),
             _ => None,
         }
     }
 
-    /// A number as an integer, a real one truncated.
-    pub(crate) fn int(&self) -> Option<i64> {
+    /// A number, read as an integer (see the module).
+    pub(crate) fn int(&self) -> Option<i32> {
         match self {
-            Self::Number(n) => Some(n.as_i64()),
+            Self::Number(n) => Some(int(*n)),
             _ => None,
         }
     }
 
-    /// A flags entry (`/F`, `/Ff`) as viewers read a damaged one: an integer to its
-    /// low 32 bits; a real rounded half up, to its low 32 bits when that is 2^32 or
-    /// more away from 0, and to bit 31 alone between 2^31 and 2^32; anything else
-    /// no flags.
+    /// A flags entry (`/F`, `/Ff`): the bits of its integer; no flags when it is not
+    /// a number.
     pub(crate) fn flags(&self) -> u32 {
-        // Truncating to 32 bits is the reading meant.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        match self {
-            Self::Number(n) if n.is_integer() => n.as_i64() as u32,
-            Self::Number(n) => {
-                let v = (n.as_f64() + 0.5).floor();
-                if (2_f64.powi(31)..2_f64.powi(32)).contains(&v.abs()) {
-                    1 << 31
-                } else {
-                    v as i64 as u32
-                }
-            }
-            _ => 0,
-        }
+        self.int().map_or(0, |i| i as u32)
     }
 
     pub(crate) fn name(&self) -> Option<&[u8]> {
@@ -90,19 +178,12 @@ impl<'a> Value<'a> {
         }
     }
 
-    /// A string's bytes.
-    pub(crate) fn string(&self) -> Option<&[u8]> {
-        match self {
-            Self::String(s) => Some(s.as_bytes()),
-            _ => None,
-        }
-    }
-
-    /// A string's bytes, or a stream's decoded data.
-    pub(crate) fn text(&self) -> Option<Vec<u8>> {
+    /// The bytes of text entry `entry` whose value this is: a string's, or, where
+    /// viewers read one, a stream's decoded data.
+    pub(crate) fn text(&self, entry: Text) -> Option<Vec<u8>> {
         match self {
             Self::String(s) => Some(s.as_bytes().to_vec()),
-            Self::Stream(s) => s.decoded().ok().map(std::borrow::Cow::into_owned),
+            Self::Stream(s) if entry.stream() => s.decoded().ok().map(std::borrow::Cow::into_owned),
             _ => None,
         }
     }
@@ -146,16 +227,21 @@ impl<'a> Entries<'a> {
         Value::of(self.0.get::<Object<'a>>(key))
     }
 
-    /// Whether entry `key` is there and not null (PDF 32000-1 7.3.9).
-    pub(crate) fn has(&self, key: &[u8]) -> bool {
-        !self.get(key).is_null()
+    /// Whether entry `key` is there as viewers look an entry up: a null value is no
+    /// entry, but a reference is one, even to no object (it then reads as null).
+    pub(crate) fn present(&self, key: &[u8]) -> bool {
+        match self.0.get::<Object<'a>>(key) {
+            Some(Object::Null(_)) => false,
+            Some(_) => true,
+            None => self.0.contains_key(key),
+        }
     }
 
     pub(crate) fn number(&self, key: &[u8]) -> Option<f64> {
         self.get(key).number()
     }
 
-    pub(crate) fn int(&self, key: &[u8]) -> Option<i64> {
+    pub(crate) fn int(&self, key: &[u8]) -> Option<i32> {
         self.get(key).int()
     }
 
@@ -178,14 +264,9 @@ impl<'a> Entries<'a> {
         self.name(key).is_some_and(|n| n.as_ref() == name)
     }
 
-    /// The bytes of string `key`.
-    pub(crate) fn string(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.get(key).string().map(<[u8]>::to_vec)
-    }
-
-    /// The bytes of string `key`, or the decoded data of stream `key`.
-    pub(crate) fn text(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.get(key).text()
+    /// The bytes of text entry `entry` ([`Value::text`]).
+    pub(crate) fn text(&self, entry: Text) -> Option<Vec<u8>> {
+        self.get(entry.key()).text(entry)
     }
 
     pub(crate) fn dict(&self, key: &[u8]) -> Option<Self> {
@@ -226,6 +307,12 @@ impl<'a> Entries<'a> {
     }
 
     /// The object this dictionary is, when it is one of its own.
+    /// The object that holds entry `key`: the one it refers to, or this dictionary;
+    /// `None` for a direct dictionary.
+    pub(crate) fn source(&self, key: &[u8]) -> Option<ObjRef> {
+        self.0.get_ref(key).or_else(|| self.id())
+    }
+
     pub(crate) fn id(&self) -> Option<ObjRef> {
         self.0.obj_id().map(ObjRef::from)
     }

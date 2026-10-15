@@ -172,14 +172,20 @@ pub fn interpret_page<'a>(
         );
         let visible = page.intersected_crop_box().to_kurbo();
         for annot in annot_arr.iter::<Dict<'_>>() {
-            let flags = annotation::flags(&annot);
-            let shown = match context.settings.annotations {
-                AnnotationSelection::View => flags & (2 | 32) == 0,
-                AnnotationSelection::Print => flags & 2 == 0 && flags & 4 != 0,
-                AnnotationSelection::Flatten => annotation::flattened(&annot),
-            };
-            if !shown {
-                continue;
+            let shown = annotation::flags(&annot).and_then(|flags| {
+                Ok(match context.settings.annotations {
+                    AnnotationSelection::View => flags & (2 | 32) == 0,
+                    AnnotationSelection::Print => flags & 2 == 0 && flags & 4 != 0,
+                    AnnotationSelection::Flatten => annotation::flattened(&annot)?,
+                })
+            });
+            match shown {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => {
+                    (context.settings.warning_sink)(InterpreterWarning::UnsupportedAnnotation);
+                    continue;
+                }
             }
 
             match appearances.look(&annot, visible) {

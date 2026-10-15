@@ -197,13 +197,13 @@ fn text_lines_scale_with_the_quad() {
     );
 }
 
-/// A Squiggly quad 10^9 pt wide is drawn across the page and a few steps beyond, not
-/// along its whole width.
+/// A Squiggly quad 4·10^6 pt wide is drawn across the page and a few steps beyond,
+/// not along its whole width.
 #[test]
 fn a_huge_squiggly_is_drawn_across_the_page() {
     let ev = draw(
         &["/Subtype /Squiggly /Rect [10 10 50 20] \
-           /QuadPoints [10 20 1000000000 20 10 10 1000000000 10]"],
+           /QuadPoints [10 20 4000000 20 10 10 4000000 10]"],
         VIEW,
     );
     let [Ev::Stroke { bbox, width, .. }] = ev.as_slice() else {
@@ -1106,6 +1106,10 @@ fn a_signature_with_a_null_value_is_unsigned() {
         looks(&pdf),
         ["generated", "generated", "nothing", "nothing"]
     );
+    // Its tag is not turned with the field (observed).
+    let tag = |mk: &str| content(&format!("{sig} {mk}"), vec![]);
+    assert_eq!(tag("/MK << /R 90 >>"), tag(""));
+    assert_eq!(tag("/MK << /R 91 >>"), tag(""));
 }
 
 /// A widget inherits field entries through any number of `/Parent` fields, and a
@@ -1167,9 +1171,14 @@ fn comb_cells_follow_max_len() {
     }
     // Two cells: one divider, at the middle of the inside.
     assert_eq!(strokes(&comb("2")), [frame, [100, 101, 100, 129]]);
-    // The dividers of 1000 cells 0.158 pt apart, 1 pt wide, cover the inside.
+    // The text over the dividers, which a border wider than a cell covers (observed).
+    assert!(matches!(comb("2").last(), Some(Ev::Fill { .. })));
+    // The dividers of 1000 cells 0.158 pt apart, 1 pt wide, cover the inside; they
+    // are drawn before the text.
     let band = comb("1000");
-    let Some(Ev::Stroke { bbox, width, .. }) = band.last() else {
+    let Some(Ev::Stroke { bbox, width, .. }) =
+        band.iter().rfind(|e| matches!(e, Ev::Stroke { .. }))
+    else {
         panic!("{band:?}");
     };
     assert_eq!((*bbox, *width), ([21, 115, 179, 115], 28.0), "{band:?}");
@@ -1204,14 +1213,186 @@ fn an_annotation_without_a_rect_draws_nothing() {
     assert_eq!(looks(&pdf), ["nothing", "nothing", "nothing"]);
 }
 
+/// A widget without a `/Rect` is drawn by viewers at coordinates of ±2^32: a
+/// button, or a text or choice field with a background, covers the page there or
+/// shows nowhere, so it is unsupported; other widgets show nothing.
+#[test]
+fn a_widget_without_a_rect_that_shows_is_unsupported() {
+    let fields = [
+        ("/FT /Tx /V (A) /MK << /BG [0.9 0.9 1] >>", "Coordinates"),
+        (
+            "/FT /Ch /V (A) /Opt [(A)] /MK << /BG [0.9] >>",
+            "Coordinates",
+        ),
+        ("/FT /Btn /AS /Yes", "Coordinates"),
+        ("/FT /Tx /V (A) /MK << /BC [0] >>", "nothing"),
+        ("/FT /Tx /V (A) /Rect 5 /MK << /BG [] >>", "nothing"),
+        ("/FT /Sig /MK << /BG [0.9] >>", "nothing"),
+    ];
+    for (field, look) in fields {
+        let pdf = annotations(
+            "/Annots [4 0 R]",
+            vec![format!("<< /Type /Annot /Subtype /Widget /T (f) {field} >>").into_bytes()],
+        );
+        assert_eq!(looks(&pdf), [look], "{field}");
+    }
+}
+
+/// A line or polyline that draws an ending at a negative border width is
+/// unsupported: viewers clip the ending by rules not reproduced. Without an ending,
+/// or at a width of 0 or more, it is drawn.
+#[test]
+fn a_line_ending_at_a_negative_width_is_unsupported() {
+    let cases = [
+        (
+            "/Subtype /Line /L [20 20 180 40] /LE [/Square /None] /BS << /W -2 >>",
+            "Ending",
+        ),
+        (
+            "/Subtype /Line /L [20 20 180 40] /LE [/None /OpenArrow] /Border [0 0 -1]",
+            "Ending",
+        ),
+        (
+            "/Subtype /PolyLine /Vertices [20 20 180 40] /LE [/Square /None] /BS << /W -2 >>",
+            "Ending",
+        ),
+        (
+            "/Subtype /Line /L [20 20 180 40] /BS << /W -2 >>",
+            "generated",
+        ),
+        (
+            "/Subtype /Line /L [20 20 180 40] /LE [/Square /None] /BS << /W 0 >>",
+            "generated",
+        ),
+        (
+            "/Subtype /PolyLine /Vertices [20 20 180 40] /BS << /W -2 >>",
+            "generated",
+        ),
+        // A polygon has no endings.
+        (
+            "/Subtype /Polygon /Vertices [20 20 180 40 20 60] /LE [/Square /None] /BS << /W -2 >>",
+            "generated",
+        ),
+    ];
+    for (annot, look) in cases {
+        let pdf = annotations(
+            "/Annots [4 0 R]",
+            vec![format!("<< /Type /Annot {annot} /C [0] /Rect [0 0 200 200] >>").into_bytes()],
+        );
+        assert_eq!(looks(&pdf), [look], "{annot}");
+    }
+}
+
+/// Rich free text is clipped to its layout box as well as to the box less the
+/// border: from the padding on the left to twice it on the right, from the
+/// padding below the top to twice the default appearance's size below the bottom
+/// (observed: `2 2 154 186 re W n` in a frame 160 high, flipped, at 14 pt), turned
+/// with the text. Plain text is not.
+#[test]
+fn rich_free_text_is_clipped_to_its_layout_box() {
+    let free_text = |entries: &str| {
+        content(
+            &format!(
+                "/Subtype /FreeText /Rect [20 20 180 180] /DA (/Helv 14 Tf 0 g) \
+                 /Contents (A) {entries}"
+            ),
+            vec![],
+        )
+    };
+    let layout = "22 -8 m\n176 -8 l\n176 178 l\n22 178 l\nh\nW n";
+    assert!(free_text("/DS (font-size:14pt)").contains(layout));
+    assert!(free_text("/RC (<p>A</p>)").contains(layout));
+    assert!(!free_text("").contains(layout));
+    let turned = "208 22 m\n208 176 l\n22 176 l\n22 22 l\nh\nW n";
+    assert!(free_text("/DS (font-size:14pt) /Rotate 90").contains(turned));
+}
+
+/// A text string that is not UTF-16 ends at its first zero byte, as viewers read
+/// it; a zero character in UTF-16 is unsupported. In `ZapfDingbats` a control
+/// character draws nothing and advances as a space (observed).
+#[test]
+fn text_ends_at_a_zero_byte() {
+    let field = |v: &str, da: &str| {
+        content(
+            &format!("/Subtype /Widget /FT /Tx /V {v} /DA ({da} 0 g) /Rect [20 80 180 120]"),
+            vec![],
+        )
+    };
+    let helv = "/Helv 14 Tf";
+    assert_eq!(field("(AB\\000CD)", helv), field("(AB)", helv));
+    assert_eq!(field("<EFBBBF4142004344>", helv), field("(AB)", helv));
+    assert_eq!(field("<FEFF0041000000420043>", helv), "Character('\\0')");
+    let free_text = |contents: &str| {
+        content(
+            &format!(
+                "/Subtype /FreeText /Rect [20 20 180 180] /DA ({helv} 0 g) /Contents {contents}"
+            ),
+            vec![],
+        )
+    };
+    assert_eq!(free_text("(AB\\000CD)"), free_text("(AB)"));
+    assert_eq!(
+        free_text("(A) /RC <FEFF0041000000420043>"),
+        "Character('\\0')"
+    );
+    let zadb = "/ZaDb 14 Tf";
+    assert_eq!(field("(a\\ra)", zadb), field("(a a)", zadb));
+    assert_eq!(field("(a\\001a)", zadb), field("(a a)", zadb));
+}
+
+/// A line of no length has no direction: viewers draw the points of an ending laid
+/// along or across it from the page's origin and clip them to a box computed
+/// otherwise, which is unsupported; an ending without a direction is drawn, and with
+/// a leader line all of it is drawn in one point, which shows nothing (observed).
+#[test]
+fn a_line_of_no_length_draws_only_endings_without_a_direction() {
+    let line = |entries: &str| {
+        content(
+            &format!(
+                "/Subtype /Line /L [50 60 50 60] /C [0] /BS << /W 3 >> /Rect [0 0 200 200] {entries}"
+            ),
+            vec![],
+        )
+    };
+    assert_eq!(line("/LE [/OpenArrow /None]"), "Ending");
+    assert_eq!(line("/LE [/None /Slash]"), "Ending");
+    assert!(line("/LE [/Square /None]").contains("41 51 18 18 re"));
+    assert_eq!(line("/LE [/Circle /OpenArrow] /LL 20"), "nothing");
+    // At the origin, the ending's points are its tip.
+    let origin = content(
+        "/Subtype /Line /L [0 0 0 0] /LE [/OpenArrow /None] /C [0] /Rect [0 0 200 200]",
+        vec![],
+    );
+    assert!(origin.contains("0 0 m\n0 0 l\n0 0 l\nS"), "{origin}");
+    let polyline = |vertices: &str| {
+        content(
+            &format!(
+                "/Subtype /PolyLine /Vertices [{vertices}] /LE [/OpenArrow /None] /C [0] \
+                 /Rect [0 0 200 200]"
+            ),
+            vec![],
+        )
+    };
+    assert_eq!(polyline("50 60 50 60 100 100"), "Ending");
+    assert_ne!(polyline("50 60 100 100 100 100"), "Ending");
+    let callout = content(
+        "/Subtype /FreeText /IT /FreeTextCallout /Rect [20 20 180 180] /RD [80 0 0 80] \
+         /CL [50 60 50 60 100 60] /LE /OpenArrow /DA (/Helv 12 Tf 1 0 0 rg) /Contents (A)",
+        vec![],
+    );
+    assert_eq!(callout, "Ending");
+}
+
 /// A coordinate too large to draw makes the annotation unsupported, not empty.
 #[test]
 fn a_coordinate_too_large_to_draw_is_unsupported() {
     let pdf = annotations(
         "/Annots [4 0 R]",
-        vec![b"<< /Subtype /Polygon /Vertices [10 10 10000000000000000000000000000000000000000 50 50 50] \
+        vec![
+            b"<< /Subtype /Polygon /Vertices [10 10 100000000 50 50 50] \
                /C [0] /IC [1 0 0] /Rect [0 0 200 200] >>"
-            .to_vec()],
+                .to_vec(),
+        ],
     );
     assert_eq!(looks(&pdf), ["Coordinates"]);
 }
@@ -1339,12 +1520,12 @@ fn a_damaged_box_or_matrix_places_the_appearance_as_viewers_do() {
     assert_eq!(placement.transform(), [5.0, 0.0, 0.0, 6.0, 30.0, 100.0]);
 }
 
-/// A number beyond the 32-bit numbers content streams are read in fails the whole
-/// appearance, in whichever quadrilateral, path or entry it is: none is left out as
+/// A number of 2^23 or more, where the 32-bit numbers content streams are read in
+/// are a unit or more apart, fails the whole appearance, in whichever quadrilateral, path or entry it is: none is left out as
 /// if it drew nothing. So does one in where an appearance stream is placed.
 #[test]
 fn every_number_too_large_to_write_is_unsupported() {
-    const H: &str = "10000000000000000000000000000000000000000";
+    const H: &str = "100000000";
     let quad = format!("/Rect [0 0 200 200] /QuadPoints [10 80 {H} 80 10 50 {H} 50]");
     let mut cases: Vec<String> = ["Highlight", "Underline", "StrikeOut", "Squiggly", "Redact"]
         .iter()
@@ -1928,4 +2109,269 @@ fn a_shape_lies_inside_its_border_width_and_is_never_thinner_than_1() {
         ));
         assert!(circle.contains("43.5 157 m"), "{c}: {circle}");
     }
+}
+
+/// What the annotation `annot` (an annotation dictionary's entries, the file's other
+/// objects numbered from 5) looks like on a 200 pt page: its generated content,
+/// `nothing`, or why it cannot be drawn.
+fn content(annot: &str, others: Vec<Vec<u8>>) -> String {
+    let mut objects = vec![format!("<< /Type /Annot {annot} >>").into_bytes()];
+    objects.extend(others);
+    let pdf = annotations("/Annots [4 0 R]", objects);
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    match appearances.look(&annots(&pdf)[0], PAGE) {
+        Look::Generated(a) => a.content,
+        Look::Nothing => "nothing".into(),
+        Look::Unsupported(why) => format!("{why:?}"),
+        Look::Stream { .. } => "stream".into(),
+    }
+}
+
+/// Flags that are reals are read as viewers read them, from the file's bytes: a
+/// real beyond the precision of 32-bit floats keeps the annotation when its bits say
+/// so (`PyMuPDF` 1.28.2 bakes a square flagged `16777217.0`), and one whose integer
+/// part a 64-bit float does not hold makes the annotation unsupported, not hidden.
+#[test]
+fn real_flags_are_read_as_viewers_read_them() {
+    let square = |flags: &str| {
+        let pdf = annotations(
+            "/Annots [4 0 R]",
+            vec![
+                format!("<< /Subtype /Square /F {flags} /IC [1 0 0] /Rect [20 20 180 180] >>")
+                    .into_bytes(),
+            ],
+        );
+        let annot = &annots(&pdf)[0];
+        hayro_interpret::annotation::flattened(annot)
+    };
+    for (flags, kept) in [
+        ("16777217.0", Ok(true)),
+        ("16777218.0", Ok(false)),
+        ("2.0", Ok(false)),
+        ("4294967296", Ok(true)),
+        ("4294967298", Ok(false)),
+        ("9223372036854775808.0", Err(Unsupported::Number)),
+        ("9223372036854775808", Err(Unsupported::Number)),
+    ] {
+        assert_eq!(square(flags), kept, "/F {flags}");
+    }
+    // The interpreter draws the square kept.
+    let drawn = draw(
+        &["/Subtype /Square /F 16777217.0 /IC [1 0 0] /Rect [20 20 180 180]"],
+        VIEW,
+    );
+    assert!(
+        drawn
+            .iter()
+            .any(|e| matches!(e, Ev::Fill { rgba: RED, .. })),
+        "{drawn:?}"
+    );
+}
+
+/// Viewers read a stream as text only where a field's value is: a `FreeText` draws
+/// its `/Contents` string whatever streams its `/RC`, `/DS` and `/DA` are, and draws
+/// no stream `/Contents`; a text field draws its stream `/V`.
+#[test]
+fn only_a_field_value_is_read_from_a_stream() {
+    let stream = |data: &str| common::stream("", data.as_bytes());
+    let plain = content(
+        "/Subtype /FreeText /Rect [20 20 180 180] /Contents (WORLD)",
+        vec![],
+    );
+    for key in ["RC", "DS", "DA"] {
+        let with = content(
+            &format!("/Subtype /FreeText /Rect [20 20 180 180] /Contents (WORLD) /{key} 5 0 R"),
+            vec![stream("<p>HELLO</p>")],
+        );
+        assert_eq!(with, plain, "/{key}");
+    }
+    let streamed = content(
+        "/Subtype /FreeText /Rect [20 20 180 180] /Contents 5 0 R",
+        vec![stream("WORLD")],
+    );
+    let none = content("/Subtype /FreeText /Rect [20 20 180 180]", vec![]);
+    assert_eq!(streamed, none);
+    let field = "/Subtype /Widget /FT /Tx /DA (/Helv 12 Tf 0 g) /Rect [20 20 180 60]";
+    assert_eq!(
+        content(&format!("{field} /V 5 0 R"), vec![stream("WORLD")]),
+        content(&format!("{field} /V (WORLD)"), vec![])
+    );
+}
+
+/// A text field's own rich value `/RV` is what viewers draw, whatever its `/V` and
+/// its `RichText` flag; one on a field above the widget is not (observed in `PyMuPDF`
+/// 1.28.2).
+#[test]
+fn a_widget_draws_its_own_rich_value() {
+    let rich = "/RV (<body><p style=\"font-size:12pt\">RICH</p></body>)";
+    let widget = |own: &str, above: &str| {
+        content(
+            &format!(
+                "/Subtype /Widget /Parent 5 0 R /DA (/Helv 12 Tf 0 g) /Rect [20 20 180 180] {own}"
+            ),
+            vec![format!("<< /FT /Tx {above} >>").into_bytes()],
+        )
+    };
+    let shown = widget(&format!("/Ff 33554432 /V (PLAIN) {rich}"), "");
+    assert_eq!(
+        widget(&format!("/Ff 33554432 /V (OTHER) {rich}"), ""),
+        shown
+    );
+    assert_eq!(widget(&format!("/V (PLAIN) {rich}"), ""), shown);
+    assert_ne!(widget("/Ff 33554432 /V (PLAIN)", ""), shown);
+    assert_eq!(
+        widget("/V (PLAIN)", &format!("/Ff 33554432 {rich}")),
+        widget("/V (PLAIN)", "/Ff 33554432")
+    );
+}
+
+/// Square and Circle are drawn inside their rectangle differences, as given or as
+/// a damaged one reads (observed: `/Rect [20 20 180 180] /RD [20 30 40 50]` bakes
+/// `40 50 100 80 re`).
+#[test]
+fn square_and_circle_are_drawn_inside_their_rectangle_differences() {
+    let square = |rd: &str| {
+        content(
+            &format!("/Subtype /Square /C [0] /IC [1 0 0] /Rect [20 20 180 180] /RD {rd}"),
+            vec![],
+        )
+    };
+    assert!(square("[20 30 40 50]").contains("40 50 100 80 re\nb\n"));
+    // A missing or damaged difference reads 0; a side is never less than half the
+    // border width in.
+    assert!(square("[20 /X 40]").contains("40 20.5 100 159 re\nb\n"));
+    let circle = content(
+        "/Subtype /Circle /C [0] /IC [1 0 0] /Rect [20 20 180 180] /RD [20 30 40 50]",
+        vec![],
+    );
+    let xs: Vec<f64> = circle
+        .lines()
+        .filter(|l| l.ends_with(" c") || l.ends_with(" m"))
+        .flat_map(|l| {
+            l.split(' ')
+                .step_by(2)
+                .filter_map(|n| n.parse().ok())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let (min, max) = xs
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+    assert_eq!((min, max), (40.0, 140.0), "{circle}");
+}
+
+/// A dash array keeps all its entries, however many (`PyMuPDF` 1.28.2 bakes all
+/// twelve).
+#[test]
+fn a_dash_array_keeps_all_its_entries() {
+    let line = content(
+        "/Subtype /Line /L [20 50 220 50] /C [0] /Rect [0 0 200 200] \
+         /BS << /W 2 /S /D /D [1 2 3 4 5 6 7 8 9 10 30 2] >>",
+        vec![],
+    );
+    assert!(
+        line.contains("[1 2 3 4 5 6 7 8 9 10 30 2 ] 0 d\n"),
+        "{line}"
+    );
+}
+
+/// The points of the glyphs in content `c`: those of the path operators after its
+/// last clip.
+fn glyph_points(c: &str) -> Vec<(f64, f64)> {
+    let text = c.rsplit("W n\n").next().unwrap();
+    text.lines()
+        .filter(|l| [" m", " l", " c"].iter().any(|op| l.ends_with(op)))
+        .flat_map(|l| {
+            let n: Vec<f64> = l.split(' ').filter_map(|n| n.parse().ok()).collect();
+            n.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|[x, y]| (*x, *y))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The y of the glyphs' points in content `c` ([`glyph_points`]).
+fn glyph_ys(c: &str) -> Vec<f64> {
+    glyph_points(c).into_iter().map(|(_, y)| y).collect()
+}
+
+/// A comb field without a usable `/MaxLen` writes its text on one line aligned by
+/// `/Q` in the field's whole width, without padding, at an automatic size as a comb
+/// does (observed: `A1B2C3` at 14 pt in a field 160 wide starts at 0, 53.932 and
+/// 107.864; at the automatic size, 40, at 11.04 aligned right).
+#[test]
+fn a_comb_without_max_len_is_aligned_by_q() {
+    let left = |q: u8, size: u8| {
+        let c = content(
+            &format!(
+                "/Subtype /Widget /FT /Tx /Ff 16777216 /MaxLen (1) /Q {q} /V (A1B2C3) \
+                 /DA (/Helv {size} Tf 0 g) /Rect [20 80 180 120] /BS << /W 3 >>"
+            ),
+            vec![],
+        );
+        glyph_points(&c)
+            .into_iter()
+            .map(|(x, _)| x)
+            .fold(f64::INFINITY, f64::min)
+    };
+    let near = |got: f64, want: f64| assert!((got - want).abs() < 0.01, "{got} != {want}");
+    let start = left(0, 14);
+    assert!((0.0..1.0).contains(&start), "{start}");
+    near(left(1, 14) - start, 53.932);
+    near(left(2, 14) - start, 107.864);
+    near(left(2, 0) - left(0, 0), 160.0 - 3.724 * 40.0);
+}
+
+/// A multiline field lays its first line out below its top padding, but its
+/// baseline at least a fifth of the size above the bottom padding, however low
+/// the field (observed: /Helv 14 Tf at 4.8 in a field 20 high, 8.8 with a border
+/// 3 wide).
+#[test]
+fn a_low_multiline_field_keeps_its_first_line_up() {
+    let baseline = |height: u32, border: &str| {
+        let c = content(
+            &format!(
+                "/Subtype /Widget /FT /Tx /Ff 4096 /V (I) /DA (/Helv 14 Tf 0 g) \
+                 /Rect [20 20 200 {}] {border}",
+                20 + height
+            ),
+            vec![],
+        );
+        glyph_ys(&c).into_iter().fold(f64::INFINITY, f64::min)
+    };
+    let near = |got: f64, want: f64| assert!((got - want).abs() < 0.01, "{got} != {want}");
+    near(baseline(40, ""), 40.0 - 2.0 - 15.624);
+    near(baseline(20, ""), 4.8);
+    near(baseline(8, ""), 4.8);
+    near(baseline(20, "/BS << /W 3 >>"), 8.8);
+}
+
+/// A negative default-appearance size is drawn as given, upside down and mirrored,
+/// not as an automatic or positive size: a `FreeText`'s text then lies above its
+/// first line, outside its box, as when baked (`PyMuPDF` 1.28.2 draws none of it).
+#[test]
+fn a_negative_text_size_is_drawn_as_given() {
+    let free_text = |da: &str| {
+        content(
+            &format!("/Subtype /FreeText /Rect [20 20 180 180] /Contents (WORLD) /DA ({da})"),
+            vec![],
+        )
+    };
+    let ys = glyph_ys;
+    let up = ys(&free_text("/Helv 12 Tf 0 g"));
+    assert!(up.iter().all(|y| (160.0..180.0).contains(y)), "{up:?}");
+    // Below a baseline at 189.2, upside down: what reaches into the box is clipped.
+    let down = ys(&free_text("/Helv -12 Tf 0 g"));
+    assert!(down.iter().all(|y| *y > 175.0), "{down:?}");
+    // A text field draws it mirrored about its baseline, not fit to the field.
+    let field = |da: &str| {
+        content(
+            &format!("/Subtype /Widget /FT /Tx /V (WORLD) /Rect [20 20 180 60] /DA ({da})"),
+            vec![],
+        )
+    };
+    assert_ne!(field("/Helv -12 Tf 0 g"), field("/Helv 0 Tf 0 g"));
+    assert_ne!(field("/Helv -12 Tf 0 g"), field("/Helv 12 Tf 0 g"));
 }

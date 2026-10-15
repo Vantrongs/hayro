@@ -2,19 +2,20 @@
 //! gives, drawn as outlines so that the appearance needs no font resources.
 
 use super::Unsupported;
+use super::entries::real;
 use super::out::{Color, Out};
 use crate::FontResolverFn;
 use crate::font::blob::{CffFontBlob, OpenTypeFontBlob};
 use crate::font::{FontQuery, StandardFont, glyph_name_to_unicode};
-use hayro_syntax::content::TypedIter;
-use hayro_syntax::content::ops::{TextFont, TypedInstruction};
 use kurbo::{Affine, BezPath, Rect};
 use rustc_hash::FxHashMap;
 use skrifa::GlyphId;
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
+use std::ops::Range;
+use std::rc::Rc;
 
 /// The font families generated text is set in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Family {
     /// Helvetica.
     Sans,
@@ -44,7 +45,7 @@ impl Family {
 }
 
 /// A family in a weight and slant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct Typeface {
     pub(super) family: Family,
     pub(super) bold: bool,
@@ -145,7 +146,7 @@ impl Fonts {
     /// embedded standard fonts are.
     pub(super) fn named(&self, family: Family, name: &str) -> Option<Glyph<'_>> {
         let face = self.face(family.into())?;
-        let Face::Cff { blob, standard, .. } = face else {
+        let Font::Cff { blob, standard, .. } = &face.font else {
             return None;
         };
         let id = blob.glyph_index_by_name(name)?;
@@ -173,6 +174,8 @@ impl Fonts {
         if typeface.family == Family::Dingbats {
             // Viewers write the text's bytes in the font's own encoding; where
             // PDFDocEncoding and Latin-1 agree, a character is its byte.
+            // A control character draws nothing and advances as a space (observed).
+            let c = if c.is_control() && c != '\0' { ' ' } else { c };
             let code = u8::try_from(c)
                 .ok()
                 .filter(|b| matches!(b, 0x20..=0x7E | 0xA1..=0xFF));
@@ -185,7 +188,11 @@ impl Fonts {
                 })
                 .ok_or(Unsupported::Character(c));
         }
-        // Tabs and other controls take a space.
+        // Tabs and other controls take a space; a zero character is drawn otherwise
+        // (as a rich text fallback, observed) and is not supported.
+        if c == '\0' {
+            return Err(Unsupported::Character(c));
+        }
         let c = if c.is_control() { ' ' } else { c };
         let sans = Typeface::from(Family::Sans);
         [typeface, sans]
@@ -239,6 +246,7 @@ pub(super) fn draw(
     transform: Affine,
     out: &mut Out,
 ) -> Option<()> {
+    let origin = (f64::from(origin.0), f64::from(origin.1));
     fill(glyphs, size, origin, 0.0, transform, None, out)
 }
 
@@ -254,29 +262,41 @@ pub(super) fn draw_clipped(
     clip: Rect,
     out: &mut Out,
 ) -> Option<()> {
+    let origin = (f64::from(origin.0), f64::from(origin.1));
     fill(glyphs, size, origin, spacing, transform, Some(clip), out)
 }
 
+/// Fills `glyphs` at `size` from `(x, y)` in `transform`, those that reach `clip`
+/// alone when there is one. A glyph is tested by the box of its outline's points
+/// before its outline is taken: one outside the clip costs no outline, and the box's
+/// corners being written stands for its points being written.
 fn fill(
     glyphs: &[Glyph<'_>],
     size: f32,
-    (x, y): (f32, f32),
+    (mut x, y): (f64, f64),
     spacing: f32,
     transform: Affine,
     clip: Option<Rect>,
     out: &mut Out,
 ) -> Option<()> {
-    let mut x = f64::from(x);
     let scale = f64::from(size) / 1000.0;
     let mut any = false;
     for g in glyphs {
-        let mut path = g.face.outline(g.id);
-        if !path.elements().is_empty() {
-            path.apply_affine(transform * Affine::new([scale, 0.0, 0.0, scale, x, f64::from(y)]));
-            any |= match clip {
-                Some(clip) => out.path_within(&path, clip)?,
-                None => out.path(&path).is_some(),
+        let outline = g.face.outline(g.id);
+        if !outline.path.elements().is_empty() {
+            let at = transform * Affine::new([scale, 0.0, 0.0, scale, x, y]);
+            let reaches = match clip {
+                Some(clip) => out.box_reaches(at, outline.ink, clip)?,
+                None => true,
             };
+            if reaches {
+                let mut path = outline.path.clone();
+                path.apply_affine(at);
+                any |= match clip {
+                    Some(clip) => out.path_within(&path, clip)?,
+                    None => out.path(&path).is_some(),
+                };
+            }
         }
         x += f64::from(g.advance) * f64::from(size);
         if g.space {
@@ -289,10 +309,287 @@ fn fill(
     Some(())
 }
 
-/// A standard font's glyphs: a bare CFF font, as the embedded standard fonts are,
-/// read by glyph name with the standard font's metrics, or an OpenType font, read by
-/// its character map.
-enum Face {
+/// Text set in one typeface, of which the part a clip shows is drawn alone
+/// ([`draw_run`], [`wrap`]): its characters, where each glyph starts, and the box
+/// around a glyph's origin the points of every one of its glyphs lie in. A value many
+/// widgets show is set once for the document.
+pub(super) struct Run {
+    typeface: Typeface,
+    chars: Vec<char>,
+    /// The advances of the glyphs before glyph `k`, in em, for `k` up to the count.
+    starts: Vec<f64>,
+    /// The box of the points of all glyphs, each at the origin, in em; `None` when
+    /// no glyph has any.
+    ink: Option<Rect>,
+    /// The largest advance, in em.
+    widest: f64,
+}
+
+impl Run {
+    pub(super) fn typeface(&self) -> Typeface {
+        self.typeface
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.chars.len()
+    }
+
+    /// The largest advance, in em.
+    pub(super) fn widest(&self) -> f64 {
+        self.widest
+    }
+
+    /// The advance of glyphs `range`, in em.
+    pub(super) fn width(&self, range: Range<usize>) -> f64 {
+        self.starts[range.end] - self.starts[range.start]
+    }
+
+    /// The box glyphs `range` at `size` from `(x, y)` lie in, given that each glyph
+    /// lies `extra` further along either way; `None` when none has points.
+    fn bounds(
+        &self,
+        range: Range<usize>,
+        size: f64,
+        (x, y): (f64, f64),
+        extra: f64,
+    ) -> Option<Rect> {
+        let ink = self.ink?;
+        let end = x + self.width(range) * size;
+        let xs = [
+            x + ink.x0 * size,
+            x + ink.x1 * size,
+            end + ink.x0 * size,
+            end + ink.x1 * size,
+        ];
+        let (x0, x1) = xs
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| {
+                (a.min(v), b.max(v))
+            });
+        let (y0, y1) = (y + ink.y0 * size, y + ink.y1 * size);
+        Some(Rect::new(x0 - extra, y0.min(y1), x1 + extra, y0.max(y1)))
+    }
+}
+
+impl Fonts {
+    /// `text` set in `typeface` as [`Fonts::shape`] sets it, as a [`Run`].
+    pub(super) fn run(
+        &self,
+        typeface: impl Into<Typeface>,
+        text: &str,
+    ) -> Result<Run, Unsupported> {
+        let typeface = typeface.into();
+        let chars: Vec<char> = text.chars().collect();
+        let mut starts = Vec::with_capacity(chars.len() + 1);
+        let (mut at, mut widest, mut ink) = (0.0, 0.0_f64, None::<Rect>);
+        starts.push(at);
+        for &c in &chars {
+            let g = self.glyph(typeface, c)?;
+            let outline = g.face.outline(g.id);
+            if !outline.path.elements().is_empty() {
+                ink = Some(ink.map_or(outline.ink, |r| r.union(outline.ink)));
+            }
+            at += f64::from(g.advance);
+            widest = widest.max(f64::from(g.advance));
+            starts.push(at);
+        }
+        Ok(Run {
+            typeface,
+            chars,
+            starts,
+            ink: ink.map(|r| r.scale_from_origin(0.001)),
+            widest,
+        })
+    }
+}
+
+/// Fills glyphs `range` of `run` at `size` with their baseline from `(x, y)`, as
+/// [`draw_clipped`] does, but only those whose box can reach `clip` are looked at:
+/// the work grows with the glyphs the clip shows, not with the run. Those not looked
+/// at are written nowhere, but where they lie must be writable, as it must be for a
+/// glyph the clip cuts away.
+pub(super) fn draw_run(
+    fonts: &Fonts,
+    run: &Run,
+    range: Range<usize>,
+    size: f32,
+    (x, y): (f64, f64),
+    clip: Rect,
+    out: &mut Out,
+) -> Option<()> {
+    let s = f64::from(size);
+    let Some(all) = run.bounds(range.clone(), s, (x, y), 0.0) else {
+        return Some(());
+    };
+    out.within(all)?;
+    let ink = run.ink?;
+    let (i0, i1) = (ink.x0 * s, ink.x1 * s);
+    let (lo, hi) = (i0.min(i1), i0.max(i1));
+    let seen = all.y1 >= clip.y0 && all.y0 <= clip.y1 && clip.x0 <= clip.x1 && clip.y0 <= clip.y1;
+    if !seen || s == 0.0 {
+        return Some(());
+    }
+    // Glyph k starts at x + (starts[k] - starts[range.start]) s; it can reach the clip
+    // when that lies in [clip.x0 - hi, clip.x1 - lo].
+    let base = run.starts[range.start];
+    let (a, b) = ((clip.x0 - hi - x) / s + base, (clip.x1 - lo - x) / s + base);
+    let (from, to) = (a.min(b), a.max(b));
+    let starts = &run.starts[range.clone()];
+    let first = range.start + starts.partition_point(|&v| v < from);
+    let last = range.start + starts.partition_point(|&v| v <= to);
+    if first >= last {
+        return Some(());
+    }
+    let glyphs = run.chars[first..last]
+        .iter()
+        .map(|&c| fonts.glyph(run.typeface, c).ok())
+        .collect::<Option<Vec<_>>>()?;
+    let origin = (x + (run.starts[first] - base) * s, y);
+    fill(
+        &glyphs,
+        size,
+        origin,
+        0.0,
+        Affine::IDENTITY,
+        Some(clip),
+        out,
+    )
+}
+
+/// The lines of a [`Run`] ([`wrap`]): ranges of its glyphs, and the advance of the
+/// widest, in em.
+pub(super) struct Lines {
+    pub(super) ranges: Vec<Range<usize>>,
+    pub(super) widest: f64,
+}
+
+/// The ink of `run`'s glyphs, at `size`, across and up from a glyph's origin.
+fn ink(run: &Run, size: f32) -> Option<(f64, f64, f64, f64)> {
+    let ink = run.ink?;
+    let s = f64::from(size);
+    let (x0, x1) = (ink.x0 * s, ink.x1 * s);
+    let (y0, y1) = (ink.y0 * s, ink.y1 * s);
+    Some((x0.min(x1), x0.max(x1), y0.min(y1), y0.max(y1)))
+}
+
+/// `None`, failing the content, when a glyph of `run` at `size` whose origin lies
+/// within `slack` of `(x, y)` across could have a point that cannot be written.
+pub(super) fn reach(
+    run: &Run,
+    size: f32,
+    (x, y): (f64, f64),
+    slack: f64,
+    out: &mut Out,
+) -> Option<()> {
+    let Some((x0, x1, y0, y1)) = ink(run, size) else {
+        return Some(());
+    };
+    out.within(Rect::new(x + x0 - slack, y + y0, x + x1 + slack, y + y1))
+}
+
+/// Of lines `0..=last` of `run` at `size`, line `j` with its baseline at
+/// `top - (j + 1) step`, those whose glyphs can reach `clip`.
+pub(super) fn rows(
+    run: &Run,
+    size: f32,
+    top: f64,
+    step: f64,
+    last: usize,
+    clip: Rect,
+) -> Range<usize> {
+    let Some((_, _, y0, y1)) = ink(run, size) else {
+        return 0..0;
+    };
+    // Line j can reach the clip when j + 1 lies between these.
+    let (a, b) = ((top + y1 - clip.y0) / step, (top + y0 - clip.y1) / step);
+    within_count(a.min(b) - 1.0, a.max(b) - 1.0, last + 1, clip)
+}
+
+/// Of `count` glyphs of `run` at `size` centred in cells `cell` wide from 0, each
+/// within `slack` of its cell's middle across, those that can reach `clip` across.
+pub(super) fn cells(
+    run: &Run,
+    size: f32,
+    cell: f64,
+    count: usize,
+    slack: f64,
+    clip: Rect,
+) -> Range<usize> {
+    let Some((x0, x1, _, _)) = ink(run, size) else {
+        return 0..0;
+    };
+    // Glyph i, its cell's middle at (i + 0.5) cell, can reach the clip when i lies
+    // between these.
+    let (a, b) = (
+        (clip.x0 - x1 - slack) / cell - 0.5,
+        (clip.x1 - x0 + slack) / cell - 0.5,
+    );
+    within_count(a.min(b), a.max(b), count, clip)
+}
+
+/// The indices from `from` up to `to` among `0..count`; none for a clip of no area
+/// or bounds that are not numbers.
+fn within_count(from: f64, to: f64, count: usize, clip: Rect) -> Range<usize> {
+    if clip.x0 > clip.x1 || clip.y0 > clip.y1 || from.is_nan() || to.is_nan() {
+        return 0..0;
+    }
+    let first = from.ceil().max(0.0);
+    let last = to.floor() + 1.0;
+    // Saturating: beyond the count is the count.
+    let (first, last) = (
+        first.min(count as f64) as usize,
+        last.clamp(0.0, count as f64) as usize,
+    );
+    first..last.max(first)
+}
+
+/// The lines of `run` at `size`, as [`layout`] breaks the text in one style to fit
+/// `width`, as ranges of its glyphs.
+pub(super) fn wrap(run: &Run, size: f32, width: f32) -> Lines {
+    let chars = &run.chars;
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut k = 0;
+    while k <= chars.len() {
+        // A paragraph ends at a line feed, a carriage return, or a CR LF pair.
+        let end = k == chars.len() || matches!(chars[k], '\n' | '\r');
+        if !end {
+            k += 1;
+            continue;
+        }
+        let ranges = breaks(
+            k - start,
+            |i| chars[start + i] == ' ',
+            |i| (run.width(start + i..start + i + 1) * f64::from(size)) as f32,
+            width,
+        );
+        out.extend(ranges.into_iter().map(|r| start + r.start..start + r.end));
+        let pair = k + 1 < chars.len() && chars[k] == '\r' && chars[k + 1] == '\n';
+        k += if pair { 2 } else { 1 };
+        start = k;
+    }
+    let widest = out.iter().map(|r| run.width(r.clone())).fold(0.0, f64::max);
+    Lines {
+        ranges: out,
+        widest,
+    }
+}
+
+/// A standard font's glyphs, each outline read once.
+struct Face {
+    font: Font,
+    outlines: RefCell<FxHashMap<GlyphId, Rc<Outline>>>,
+}
+
+/// A glyph's outline, 1000 units to the em, and the box of its points.
+struct Outline {
+    path: BezPath,
+    ink: Rect,
+}
+
+/// A bare CFF font, as the embedded standard fonts are, read by glyph name with the
+/// standard font's metrics, or an OpenType font, read by its character map.
+enum Font {
     Cff {
         blob: CffFontBlob,
         standard: StandardFont,
@@ -302,6 +599,32 @@ enum Face {
 }
 
 impl Face {
+    fn new(data: crate::font::FontData, index: u32, standard: StandardFont) -> Option<Self> {
+        Some(Self {
+            font: Font::new(data, index, standard)?,
+            outlines: RefCell::default(),
+        })
+    }
+
+    fn glyph(&self, c: char) -> Option<(GlyphId, f32)> {
+        self.font.glyph(c)
+    }
+
+    /// The outline of glyph `id`.
+    fn outline(&self, id: GlyphId) -> Rc<Outline> {
+        let mut outlines = self.outlines.borrow_mut();
+        outlines
+            .entry(id)
+            .or_insert_with(|| {
+                let path = self.font.outline(id);
+                let ink = path.control_box();
+                Rc::new(Outline { path, ink })
+            })
+            .clone()
+    }
+}
+
+impl Font {
     fn new(data: crate::font::FontData, index: u32, standard: StandardFont) -> Option<Self> {
         if let Some(blob) = CffFontBlob::new(data.clone()) {
             let mut glyphs = FxHashMap::default();
@@ -370,37 +693,76 @@ pub(super) enum Align {
 
 /// The style of a default appearance string (PDF 32000-1 12.7.3.3): the font
 /// operand of `Tf` and its size, and the last colour operator. A size of 0
-/// (fit to the field) is `None`; without `Tf` the size is 12 pt, as common viewers
-/// set it.
+/// (fit to the field) is `None`; a negative one is kept, as viewers draw it; without
+/// `Tf` the size is 12 pt, as common viewers set it.
+///
+/// Read as viewers read it: an operator takes the last name before it and the
+/// numbers since the operator before it, the first of them first, 0 for each it
+/// lacks; whatever is neither, such as an array or a stray `]`, is passed over.
 pub(super) fn default_appearance(da: &[u8]) -> (Family, Option<f32>, Option<Color>) {
+    use hayro_syntax::object::Object;
+    use hayro_syntax::reader::{Reader, ReaderExt};
     let mut family = Family::Sans;
     let mut size = Some(12.0);
     let mut color = None;
-    // Read as content is: an operator whose operands are not what it takes is
-    // ignored. Numbers are taken however large: one too large to draw fails the
-    // appearance where it is drawn.
-    let mut ops = TypedIter::new(da);
-    while let Some(op) = ops.next() {
-        match op {
-            TypedInstruction::TextFont(TextFont(name, s)) => {
-                family = Family::of_font_name(name.as_ref());
-                size = Some(s.as_f64() as f32).filter(|s| *s > 0.0);
+    let mut name = None;
+    let mut numbers: Vec<f64> = Vec::new();
+    let mut r = Reader::new(da);
+    let delimiter = |b: u8| b"()<>[]{}/%".contains(&b);
+    let white = |b: u8| b"\0\t\n\x0c\r ".contains(&b);
+    loop {
+        r.skip_white_spaces_and_comments();
+        if r.at_end() {
+            break;
+        }
+        let starts_operand = r.peek_byte().is_some_and(|b| {
+            matches!(
+                b,
+                b'/' | b'.' | b'+' | b'-' | b'0'..=b'9' | b'[' | b'<' | b'('
+            )
+        });
+        if let Some(operand) = starts_operand
+            .then(|| r.read_without_context::<Object<'_>>())
+            .flatten()
+        {
+            match operand {
+                // Only the first four are ever taken.
+                Object::Number(n) if numbers.len() < 4 => numbers.push(real(n)),
+                Object::Name(n) => name = Some(n),
+                _ => {}
             }
-            TypedInstruction::NonStrokeColorDeviceGray(c) => color = Color::of(&[c.0.as_f64()]),
-            TypedInstruction::NonStrokeColorDeviceRgb(c) => {
-                color = Color::of(&[c.0, c.1, c.2].map(|n| n.as_f64()));
+            continue;
+        }
+        let start = r.offset();
+        r.forward_while(|b| !white(b) && !delimiter(b));
+        if r.offset() == start {
+            // A delimiter that starts no operand.
+            r.forward();
+            continue;
+        }
+        let n = |i: usize| numbers.get(i).copied().unwrap_or(0.0);
+        match &da[start..r.offset()] {
+            b"Tf" => {
+                family = name
+                    .as_ref()
+                    .map_or(Family::Sans, |n| Family::of_font_name(n.as_ref()));
+                // A negative size is drawn as one, turned half round.
+                size = Some(n(0) as f32).filter(|s| *s != 0.0);
             }
-            TypedInstruction::NonStrokeColorCmyk(c) => {
-                color = Color::of(&[c.0, c.1, c.2, c.3].map(|n| n.as_f64()));
-            }
+            b"g" => color = Color::of(&[n(0)]),
+            b"rg" => color = Color::of(&[n(0), n(1), n(2)]),
+            b"k" => color = Color::of(&[n(0), n(1), n(2), n(3)]),
             _ => {}
         }
+        numbers.clear();
     }
     (family, size, color)
 }
 
 /// The text of a text string (PDF 32000-1 7.9.2.2): UTF-16BE or UTF-8 with a byte
 /// order mark, else `PDFDocEncoding` (read as Latin-1 for the printable range).
+/// Viewers end a string that is not UTF-16 at its first zero byte (observed); in
+/// UTF-16, a zero character is kept, and no font draws it ([`Fonts::shape`]).
 pub(super) fn text_string(bytes: &[u8]) -> String {
     if let Some(utf16) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         let units: Vec<u16> = utf16
@@ -413,6 +775,7 @@ pub(super) fn text_string(bytes: &[u8]) -> String {
             .map(|c| c.unwrap_or('\u{FFFD}'))
             .collect();
     }
+    let bytes = bytes.split(|&b| b == 0).next().unwrap_or_default();
     if let Some(utf8) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         return String::from_utf8_lossy(utf8).into_owned();
     }
@@ -432,31 +795,6 @@ fn pdf_doc_char(b: u8) -> char {
         0xA0 => '€',
         _ => char::from(b),
     }
-}
-
-/// The lines of `text` set in `family` at `size`: paragraphs split at line breaks,
-/// and, with a `width`, wrapped between words, a word wider than the line between
-/// its characters.
-pub(super) fn lines<'f>(
-    fonts: &'f Fonts,
-    family: Family,
-    size: f32,
-    text: &str,
-    width: Option<f32>,
-) -> Result<Vec<Vec<Glyph<'f>>>, Unsupported> {
-    let span = Span {
-        text: text.to_owned(),
-        style: Style {
-            face: family.into(),
-            size,
-            color: Color::BLACK,
-            align: Align::Left,
-        },
-    };
-    Ok(layout(fonts, &[span], width)?
-        .into_iter()
-        .map(|line| line.glyphs.into_iter().map(|g| g.glyph).collect())
-        .collect())
 }
 
 /// Text in one style.
@@ -561,7 +899,11 @@ pub(super) fn layout<'f>(
         let count = ranges.len();
         for (n, range) in ranges.into_iter().enumerate() {
             let line = glyphs[range].to_vec();
-            let size = line.iter().map(|g| g.size).fold(0.0, f32::max);
+            // The largest size, or, of negative ones, the one furthest from 0.
+            let size = line
+                .iter()
+                .map(|g| g.size)
+                .fold(0.0, |a: f32, b| if b.abs() > a.abs() { b } else { a });
             let align = match line
                 .first()
                 .map_or(para_align, |g| spans[g.span].style.align)
@@ -589,7 +931,7 @@ fn breaks(
     space: impl Fn(usize) -> bool,
     advance: impl Fn(usize) -> f32,
     width: f32,
-) -> Vec<std::ops::Range<usize>> {
+) -> Vec<Range<usize>> {
     let mut lines = Vec::new();
     // The current line, from `start` to `i`, and its width.
     let (mut start, mut line_width) = (0, 0.0_f32);
@@ -623,8 +965,59 @@ fn breaks(
 
 #[cfg(test)]
 mod tests {
-    use super::breaks;
+    use super::{Align, Color, Family, Fonts, Span, Style, breaks, layout};
     use std::cell::Cell;
+
+    /// A value set as a run breaks into the lines its text in one style lays out
+    /// into, glyph for glyph: paragraphs at LF, CR and CR LF, words wrapped, a word
+    /// wider than the line alone on its line.
+    #[test]
+    fn a_run_wraps_as_its_text_lays_out() {
+        let fonts = Fonts::new(crate::InterpreterSettings::default().font_resolver);
+        let texts = [
+            "",
+            "one",
+            "a b  c d",
+            "word\r\nnext\rthird\n\nlast",
+            "averyveryverylongword short words after it",
+            " lead",
+            "trail  ",
+            "\r\n",
+            "x\r",
+            "\n\r",
+        ];
+        for text in texts {
+            for width in [0.0, 10.0, 40.0, 1000.0] {
+                let run = fonts.run(Family::Sans, text).expect("drawable");
+                let got: Vec<(usize, f32)> = super::wrap(&run, 12.0, width)
+                    .ranges
+                    .iter()
+                    .map(|r| (r.len(), (run.width(r.clone()) * 12.0) as f32))
+                    .collect();
+                let span = Span {
+                    text: text.to_owned(),
+                    style: Style {
+                        face: Family::Sans.into(),
+                        size: 12.0,
+                        color: Color::BLACK,
+                        align: Align::Left,
+                    },
+                };
+                let expected: Vec<(usize, f32)> = layout(&fonts, &[span], Some(width))
+                    .expect("drawable")
+                    .iter()
+                    .map(|l| (l.glyphs.len(), l.width()))
+                    .collect();
+                assert_eq!(got.len(), expected.len(), "{text:?} at {width}");
+                for (g, e) in got.iter().zip(&expected) {
+                    assert!(
+                        g.0 == e.0 && (g.1 - e.1).abs() < 1e-3,
+                        "{text:?} at {width}: {got:?} {expected:?}"
+                    );
+                }
+            }
+        }
+    }
 
     /// Lines as the characters of `text` with 1-wide glyphs.
     fn wrap(text: &str, width: f32) -> Vec<String> {

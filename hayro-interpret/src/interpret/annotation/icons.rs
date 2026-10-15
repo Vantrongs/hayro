@@ -32,40 +32,43 @@ pub(super) enum Icon {
     Sound,
 }
 
-/// The icon of a `Text`, `FileAttachment` or `Sound` annotation.
+/// The icon of a `Text`, `FileAttachment` or `Sound` annotation: as viewers draw
+/// it, in a square at the top left of `/Rect` as wide as `/Rect`'s shorter side,
+/// but no less than 10 and no more than 20, set here for 20; the symbol black, or
+/// white on a box of /C whose luminance is below a quarter. The symbol is the one
+/// `/Name` names, whichever subtype names it, the subtype's own without a name,
+/// and a star for another name or a `/Name` that is not one.
 pub(super) fn icon(annot: &Entries<'_>, kind: Icon, fonts: &Fonts, out: &mut Out) -> Drawn {
     let Some(r) = rect(annot) else {
         return Ok(None);
     };
-    let name = annot.name(b"Name");
-    let name = name.as_ref().map_or(&b""[..], |n| n.as_ref());
+    let s = r.width().min(r.height()).clamp(10.0, 20.0);
+    let place = Affine::translate((r.x0, r.y1 - s)) * Affine::scale(s / 20.0);
+    let symbol = match annot.name(b"Name") {
+        Some(name) => Symbol::named(name.as_ref()),
+        None if annot.present(b"Name") => Symbol::Star,
+        None => match kind {
+            Icon::Note => Symbol::Note,
+            Icon::FileAttachment => Symbol::PushPin,
+            Icon::Sound => Symbol::Speaker,
+        },
+    };
     let fill = color_of(annot, C).unwrap_or(Color::Gray(1.0));
-    let (x0, y1) = (r.x0, r.y1);
+    out.op("q");
+    fail(out.nums(&place.as_coeffs(), "cm"))?;
     fail(out.fill_color(&fill))?;
     out.op("0 G");
     fail(out.stroke_state(1.25, &[]))?;
-    fail(out.nums(&[x0 + 0.625, y1 - 19.375, 18.75, 18.75], "re"))?;
+    fail(out.nums(&[0.625, 0.625, 18.75, 18.75], "re"))?;
     out.op("b");
+    out.op(if fill.luminance() < 0.25 {
+        "1 g"
+    } else {
+        "0 g"
+    });
     // The symbol's 10 pt square.
-    let at = Affine::translate((x0 + 5.0, y1 - 15.0));
-    out.op("0 g");
-    let symbol = match (kind, name) {
-        (Icon::Note, b"Comment") => Symbol::Comment,
-        (Icon::Note, b"Key") => Symbol::Key,
-        (Icon::Note, b"Note" | b"") => Symbol::Note,
-        (Icon::Note, b"Help") => Symbol::Glyph('?'),
-        (Icon::Note, b"Paragraph") => Symbol::Glyph('¶'),
-        (Icon::Note, b"NewParagraph") => Symbol::Triangle(0.0, 10.0),
-        (Icon::Note, b"Insert") => Symbol::Triangle(2.5, 7.5),
-        (Icon::FileAttachment, b"PushPin" | b"") => Symbol::PushPin,
-        (Icon::FileAttachment, b"Graph") => Symbol::Graph,
-        (Icon::FileAttachment, b"Paperclip") => Symbol::Paperclip,
-        (Icon::FileAttachment, b"Tag") => Symbol::Tag,
-        (Icon::Sound, b"Speaker" | b"") => Symbol::Speaker,
-        (Icon::Sound, b"Mic") => Symbol::Mic,
-        _ => Symbol::Star,
-    };
-    symbol.draw(at, fonts, out)?;
+    symbol.draw(Affine::translate((5.0, 5.0)), fonts, out)?;
+    out.op("Q");
     Ok(Some(()))
 }
 
@@ -74,7 +77,9 @@ enum Symbol {
     Comment,
     Key,
     Glyph(char),
-    /// A triangle pointing up, between these heights.
+    /// A pilcrow, its bowl on the left.
+    Paragraph,
+    /// A triangle pointing up, the square wide, between these heights.
     Triangle(f64, f64),
     Star,
     PushPin,
@@ -86,6 +91,26 @@ enum Symbol {
 }
 
 impl Symbol {
+    /// The symbol `/Name` names.
+    fn named(name: &[u8]) -> Self {
+        match name {
+            b"Comment" => Self::Comment,
+            b"Key" => Self::Key,
+            b"Note" => Self::Note,
+            b"Help" => Self::Glyph('?'),
+            b"Paragraph" => Self::Paragraph,
+            b"NewParagraph" => Self::Triangle(0.0, 10.0),
+            b"Insert" => Self::Triangle(3.75, 10.0),
+            b"PushPin" => Self::PushPin,
+            b"Graph" => Self::Graph,
+            b"Paperclip" => Self::Paperclip,
+            b"Tag" => Self::Tag,
+            b"Speaker" => Self::Speaker,
+            b"Mic" => Self::Mic,
+            _ => Self::Star,
+        }
+    }
+
     /// Fills the symbol in the 10 pt square `at` maps from (0, 0)–(10, 10).
     fn draw(&self, at: Affine, fonts: &Fonts, out: &mut Out) -> Result<(), Unsupported> {
         let mut p = BezPath::new();
@@ -156,9 +181,29 @@ impl Symbol {
                 fail(text::draw(&glyphs, size, (x, 0.3), at, out))?;
                 return Ok(());
             }
-            Self::Triangle(y0, y1) => {
-                let half = (y1 - y0) / 2.0 + 1.0;
-                poly(&mut p, &[(5.0 - half, *y0), (5.0 + half, *y0), (5.0, *y1)]);
+            Self::Triangle(y0, y1) => poly(&mut p, &[(0.0, *y0), (10.0, *y0), (5.0, *y1)]),
+            Self::Paragraph => {
+                // A bar across the top with a half disc hanging from its left end,
+                // and two stems down from it.
+                let k = 0.552 * 2.5;
+                p.move_to((8.75, 10.0));
+                p.line_to((2.5, 10.0));
+                p.curve_to((2.5 - k, 10.0), (0.0, 7.5 + k), (0.0, 7.5));
+                p.curve_to((0.0, 7.5 - k), (2.5 - k, 5.0), (2.5, 5.0));
+                for q in [
+                    (3.75, 5.0),
+                    (3.75, 0.0),
+                    (5.0, 0.0),
+                    (5.0, 8.75),
+                    (6.25, 8.75),
+                    (6.25, 0.0),
+                    (7.5, 0.0),
+                    (7.5, 8.75),
+                    (8.75, 8.75),
+                ] {
+                    p.line_to(q);
+                }
+                p.close_path();
             }
             Self::Star => {
                 let pts: Vec<(f64, f64)> = (0..10)
@@ -258,7 +303,7 @@ impl Symbol {
 /// (black without it).
 pub(super) fn caret(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     let r = rect(annot)?;
-    let fill = c_color(annot, Color::BLACK)?;
+    let fill = c_color(annot, Color::BLACK);
     let c = r.center();
     let (x, y) = (c.x, c.y);
     out.fill_color(&fill)?;
@@ -273,7 +318,8 @@ pub(super) fn caret(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
 /// to the box of the quadrilaterals a point wider on each side; or `/Rect` less a
 /// point without `/QuadPoints`.
 pub(super) fn redact(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
-    let Some(quads) = quads(annot) else {
+    // Without quadrilaterals, as with an empty `/QuadPoints`, the box.
+    let Some(quads) = quads(annot).filter(|q| !q.is_empty()) else {
         let r = rect(annot)?.inset(-1.0);
         out.op("1 0 0 RG");
         out.stroke_state(1.0, &[])?;
@@ -334,12 +380,9 @@ pub(super) fn stamp(annot: &Entries<'_>, fonts: &Fonts, out: &mut Out) -> Drawn 
         Some((lines, size)) => (lines, size),
         None => (&custom, 20.0),
     };
-    let Some(r) = rect(annot) else {
-        return Ok(None);
-    };
-    let Some(color) = c_color(annot, Color::BLACK) else {
-        return Ok(None);
-    };
+    // Without a box, viewers draw over coordinates of ±2^32.
+    let r = rect(annot).ok_or(Unsupported::Coordinates)?;
+    let color = c_color(annot, Color::BLACK);
     let scale = (r.width() / 190.0).min(r.height() / 50.0);
     if scale <= 0.0 {
         return Ok(None);

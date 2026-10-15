@@ -2,7 +2,7 @@ use crate::font::GlyphRun;
 use crate::x_object::soft_mask::SoftMask;
 use crate::{BlendMode, ClipPath, FillRule, Image};
 use crate::{DrawMode, DrawProps, ImageDrawProps};
-use kurbo::{BezPath, Rect, Shape};
+use kurbo::{Affine, BezPath, Rect, Shape};
 
 /// A trait for a device that can be used to process PDF drawing instructions.
 pub trait Device<'a> {
@@ -37,6 +37,12 @@ pub trait Device<'a> {
     fn pop_clip(&mut self);
     /// Pop the last transparency group from the blend stack.
     fn pop_transparency_group(&mut self);
+    /// Clear what the current transparency group drew where `path`, drawn with
+    /// `draw_mode` in `transform`, covers: the next element of a knockout group
+    /// (PDF 32000-1 11.4.6.2) replaces those before it there, even where its paint is
+    /// translucent. The default clears nothing, which composites that element over
+    /// the earlier ones.
+    fn knock_out(&mut self, _path: &BezPath, _transform: Affine, _draw_mode: &DrawMode) {}
     /// Draw a rectangle directly, without going through the general path pipeline.
     fn draw_rect(&mut self, rect: &Rect, props: DrawProps<'a>, draw_mode: &DrawMode) {
         self.draw_path(&rect.to_path(0.1), props, draw_mode);

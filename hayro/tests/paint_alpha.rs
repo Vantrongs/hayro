@@ -14,9 +14,10 @@ use hayro::{PixmapSettings, RenderCache, RenderSettings, render};
 mod fixtures;
 
 /// `/G` draws at alpha 0.5, `/H` at 1, `/K` strokes at 0.5 and fills at 1, `/M` in a
-/// soft mask of 50 % grey. `/S` is a red shading, `/T` a stencil and `/C` a red
-/// coloured tiling pattern, 10 pt cells filled whole; `/O` and `/Q` are the same
-/// with cells of two overlapping squares.
+/// soft mask of 50 % grey, `/X` at alpha 0.5 with Multiply. `/S` is a red shading,
+/// `/T` a stencil and `/C` a red coloured tiling pattern, 10 pt cells filled whole;
+/// `/O` and `/Q` are the same with cells of two overlapping squares; `/B` is a blue
+/// coloured tiling pattern whose cells paint at alpha 0.5.
 fn page(content: &str) -> Vec<u8> {
     let tiling = |paint_type: u8, cell: &str| {
         fixtures::stream(
@@ -28,9 +29,10 @@ fn page(content: &str) -> Vec<u8> {
         )
     };
     let resources = "/Resources << /ExtGState << /G << /ca 0.5 /CA 0.5 >> /H << /ca 1 /CA 1 >> \
-        /K << /ca 1 /CA 0.5 >> /M << /SMask << /S /Luminosity /G 8 0 R >> >> >> \
+        /K << /ca 1 /CA 0.5 >> /M << /SMask << /S /Luminosity /G 8 0 R >> >> \
+        /X << /ca 0.5 /CA 0.5 /BM /Multiply >> >> \
         /ColorSpace << /PR [/Pattern /DeviceRGB] >> \
-        /Pattern << /S 5 0 R /T 6 0 R /C 7 0 R /O 9 0 R /Q 10 0 R >> >>";
+        /Pattern << /S 5 0 R /T 6 0 R /C 7 0 R /O 9 0 R /Q 10 0 R /B 11 0 R >> >>";
     fixtures::one_page(
         100,
         &format!("/Contents 4 0 R {resources}"),
@@ -49,6 +51,11 @@ fn page(content: &str) -> Vec<u8> {
             ),
             tiling(2, "0 0 8 8 re f 2 2 8 8 re f"),
             tiling(1, "1 0 0 rg 0 0 8 8 re f 2 2 8 8 re f"),
+            fixtures::stream(
+                "/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] \
+                 /XStep 10 /YStep 10 /Resources << /ExtGState << /A << /ca 0.5 >> >> >>",
+                b"/A gs 0 0 1 rg 0 0 10 10 re f",
+            ),
         ],
     )
 }
@@ -148,6 +155,28 @@ fn a_tiling_pattern_cell_is_translucent_as_a_whole() {
             .zip(pixels(&content, &[(55, 55), (51, 51), (59, 59)]))
         {
             assert!(near(colour, HALF_RED), "{fill} at {point:?}: {colour:?}");
+        }
+    }
+}
+
+/// Filled red and stroked 10 pt wide with a pattern whose cells paint blue at alpha
+/// 0.5, by one operator: translucent or blended, where the stroke covers the fill
+/// only the stroke shows; opaque, the stroke is drawn over the fill (the colours a
+/// common viewer renders, at the overlap, the stroke outside the fill, the fill).
+#[test]
+fn a_translucent_stroke_paint_knocks_out_the_fill() {
+    let points = [(27, 50), (22, 50), (50, 50)];
+    for (gs, expected) in [
+        ("/G gs", [[192, 192, 255], [192, 192, 255], HALF_RED]),
+        ("/X gs", [[193, 193, 255], [193, 193, 255], [255, 129, 129]]),
+        ("/H gs", [[129, 0, 126], [129, 129, 255], RED]),
+    ] {
+        for op in ["b", "B"] {
+            let content = format!("{gs} 10 w 1 0 0 rg /Pattern CS /B SCN 25 25 50 50 re {op}");
+            let got = pixels(&content, &points);
+            for ((point, got), expected) in points.iter().zip(got).zip(expected) {
+                assert!(near(got, expected), "{content} at {point:?}: {got:?}");
+            }
         }
     }
 }

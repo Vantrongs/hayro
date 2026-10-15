@@ -4,12 +4,12 @@
 //! and diamonds and an arrow 8.8 widths long and 9 wide, are chosen so that the
 //! endings look as common viewers draw them.
 
-use super::entries::{Entries, Value};
+use super::entries::{Entries, Text};
 use super::out::{Color, Out};
 use super::text::{self, Family, Fonts};
 use super::{Unsupported, border_width, circle, color_of, dash};
 use hayro_syntax::object::dict::keys::{C, IC};
-use kurbo::{Affine, Point, Vec2};
+use kurbo::{Affine, BezPath, Point, Vec2};
 
 /// A line ending style.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -42,44 +42,79 @@ impl Ending {
         }
     }
 
-    /// The endings of `/LE`: two names, or, for a free text callout, one.
+    /// The endings of `/LE` of a line or polyline, as viewers read it: an array of
+    /// exactly two entries, each a name or none.
     pub(super) fn of(annot: &Entries<'_>) -> [Self; 2] {
-        match annot.get(b"LE") {
-            Value::Name(n) => [Self::from_name(n.as_ref()), Self::None],
-            Value::Array(names) => {
+        match annot.items(b"LE") {
+            Some(names) if names.iter().count() == 2 => {
                 [0, 1].map(|i| names.get(i).name().map_or(Self::None, Self::from_name))
             }
             _ => [Self::None, Self::None],
         }
     }
+
+    /// Whether this ending at `tip`, arriving from `from`, is laid along or across
+    /// a line of no length away from the page's origin, from which viewers draw
+    /// it (see [`ends_drawable`]); at the origin, it is drawn in one point.
+    pub(super) fn lost_at(self, tip: Point, from: Point) -> bool {
+        let along = !matches!(
+            self,
+            Self::None | Self::Square | Self::Circle | Self::Diamond
+        );
+        along && tip == from && tip != Point::ORIGIN
+    }
+
+    /// The ending of `/LE` of a free text callout, as viewers read it: a name, not
+    /// an array.
+    pub(super) fn of_callout(annot: &Entries<'_>) -> Self {
+        annot.get(b"LE").name().map_or(Self::None, Self::from_name)
+    }
 }
 
-/// How a shape is painted: its stroke colour and width, dash, and interior fill.
+/// How a shape is painted: its stroke colour, width and dash, and interior fill;
+/// without a stroke colour, its outlines are not drawn.
 pub(super) struct Paint {
-    pub(super) stroke: Color,
+    pub(super) stroke: Option<Color>,
     pub(super) width: f64,
     pub(super) dash: Vec<f64>,
     pub(super) fill: Option<Color>,
 }
 
 impl Paint {
-    /// /C strokes at the border width with the border dash, /IC fills; `None` without
-    /// a stroke colour.
-    fn of(annot: &Entries<'_>) -> Option<Self> {
-        Some(Self {
-            stroke: color_of(annot, C)?,
+    /// /C strokes at the border width with the border dash, /IC fills.
+    fn of(annot: &Entries<'_>) -> Self {
+        Self {
+            stroke: color_of(annot, C),
             width: border_width(annot),
             dash: dash(annot),
             fill: color_of(annot, IC),
-        })
+        }
     }
 
     fn start(&self, out: &mut Out) -> Option<()> {
-        out.stroke_color(&self.stroke)?;
+        if let Some(stroke) = &self.stroke {
+            out.stroke_color(stroke)?;
+        }
         if let Some(fill) = &self.fill {
             out.fill_color(fill)?;
         }
         out.stroke_state(self.width, &self.dash)
+    }
+
+    /// The operator that strokes an open path, or ends it unpainted.
+    fn stroke_op(&self) -> &'static str {
+        if self.stroke.is_some() { "S" } else { "n" }
+    }
+
+    /// The operator that closes, strokes and fills a closed path, as far as there
+    /// are colours to.
+    fn close_op(&self) -> &'static str {
+        match (&self.stroke, &self.fill) {
+            (Some(_), Some(_)) => "b",
+            (Some(_), None) => "s",
+            (None, Some(_)) => "h f",
+            (None, None) => "n",
+        }
     }
 }
 
@@ -91,79 +126,121 @@ pub(super) fn ending(
     paint: &Paint,
     out: &mut Out,
 ) -> Option<()> {
-    let w = paint.width;
-    let along = tip - from;
-    let len = along.hypot();
-    let dir = if len > 0.0 {
-        along / len
-    } else {
-        Vec2::new(1.0, 0.0)
+    let Some((path, closed)) = ending.path(tip, from, paint.width) else {
+        return Some(());
     };
-    let normal = Vec2::new(-dir.y, dir.x);
-    let fill_op = if paint.fill.is_some() { "b" } else { "s" };
-    // Dashes do not apply to endings.
-    out.op("[] 0 d");
-    let pt = |p: Point| [p.x, p.y];
-    match ending {
-        Ending::None => return Some(()),
-        Ending::Square | Ending::Diamond | Ending::Circle => {
-            let r = 3.0 * w;
-            if ending == Ending::Circle {
-                out.path(&circle(tip, r))?;
-            } else if ending == Ending::Square {
-                out.nums(&[tip.x - r, tip.y - r, 2.0 * r, 2.0 * r], "re")?;
-            } else {
-                out.nums(&pt(tip + Vec2::new(0.0, r)), "m")?;
-                out.nums(&pt(tip + Vec2::new(r, 0.0)), "l")?;
-                out.nums(&pt(tip + Vec2::new(0.0, -r)), "l")?;
-                out.nums(&pt(tip + Vec2::new(-r, 0.0)), "l")?;
-                out.op("h");
+    if ending == Ending::Square {
+        // A rectangle, as viewers write it: renderers stroke one of a negative
+        // width otherwise than the same path.
+        let r = path.control_box();
+        out.nums(&[r.x0, r.y0, r.width(), r.height()], "re")?;
+    } else {
+        out.path(&path)?;
+    }
+    out.op(if closed {
+        paint.close_op()
+    } else {
+        paint.stroke_op()
+    });
+    Some(())
+}
+
+impl Ending {
+    /// The path of the ending at `tip` of a line that arrives there from `from`,
+    /// drawn `width` wide, and whether it is closed; `None` for no ending.
+    fn path(self, tip: Point, from: Point, width: f64) -> Option<(BezPath, bool)> {
+        // Endings are sized for a border at least 1 wide.
+        let w = width.max(1.0);
+        // A line of no length has no direction (see [`ends_drawable`]).
+        let dir = direction(tip - from);
+        let normal = Vec2::new(-dir.y, dir.x);
+        let poly = |pts: &[Point], closed: bool| {
+            let mut p = BezPath::new();
+            p.move_to(pts[0]);
+            for q in &pts[1..] {
+                p.line_to(*q);
             }
-            out.op(fill_op);
-        }
-        Ending::OpenArrow | Ending::ClosedArrow | Ending::ROpenArrow | Ending::RClosedArrow => {
-            // The arms run back along the line, or, reversed, on beyond its end.
-            let back = if matches!(ending, Ending::OpenArrow | Ending::ClosedArrow) {
-                -dir
-            } else {
-                dir
-            };
-            let base = tip + back * (8.8 * w);
-            let (a, b) = (base + normal * (4.5 * w), base - normal * (4.5 * w));
-            out.nums(&pt(a), "m")?;
-            out.nums(&pt(tip), "l")?;
-            out.nums(&pt(b), "l")?;
-            if matches!(ending, Ending::ClosedArrow | Ending::RClosedArrow) {
-                out.op("h");
-                out.op(fill_op);
-            } else {
-                out.op("S");
+            if closed {
+                p.close_path();
             }
-        }
-        Ending::Butt => {
-            out.nums(&pt(tip + normal * (3.0 * w)), "m")?;
-            out.nums(&pt(tip - normal * (3.0 * w)), "l")?;
-            out.op("S");
-        }
-        Ending::Slash => {
-            // Across the line at 60 degrees.
-            let (sin, cos) = std::f64::consts::FRAC_PI_3.sin_cos();
-            let slant = Vec2::new(dir.x * cos - dir.y * sin, dir.x * sin + dir.y * cos);
-            out.nums(&pt(tip + slant * (5.0 * w)), "m")?;
-            out.nums(&pt(tip - slant * (5.0 * w)), "l")?;
-            out.op("S");
+            Some((p, closed))
+        };
+        let r = 3.0 * w;
+        match self {
+            Self::None => None,
+            Self::Circle => Some((circle(tip, r), true)),
+            Self::Square => poly(
+                &[(-r, -r), (r, -r), (r, r), (-r, r)].map(|(x, y)| tip + Vec2::new(x, y)),
+                true,
+            ),
+            Self::Diamond => poly(
+                &[(0.0, r), (r, 0.0), (0.0, -r), (-r, 0.0)].map(|(x, y)| tip + Vec2::new(x, y)),
+                true,
+            ),
+            Self::OpenArrow | Self::ClosedArrow | Self::ROpenArrow | Self::RClosedArrow => {
+                // The arms run back along the line, or, reversed, on beyond its end.
+                let back = if matches!(self, Self::OpenArrow | Self::ClosedArrow) {
+                    -dir
+                } else {
+                    dir
+                };
+                let base = tip + back * (8.8 * w);
+                // Drawn from the arm on the left of the arms' direction, which a dash
+                // pattern starts on, as viewers draw it.
+                let side = Vec2::new(-back.y, back.x) * (4.5 * w);
+                let closed = matches!(self, Self::ClosedArrow | Self::RClosedArrow);
+                poly(&[base + side, tip, base - side], closed)
+            }
+            Self::Butt => poly(&[tip - normal * r, tip + normal * r], false),
+            Self::Slash => {
+                // Across the line at 60 degrees.
+                let (sin, cos) = std::f64::consts::FRAC_PI_3.sin_cos();
+                let slant = Vec2::new(dir.x * cos - dir.y * sin, dir.x * sin + dir.y * cos);
+                poly(&[tip - slant * (5.0 * w), tip + slant * (5.0 * w)], false)
+            }
         }
     }
-    Some(())
+
+    /// The box viewers clip a free text callout to, which ends in this ending at
+    /// `tip`, arriving from `from`, drawn `width` wide, and holds `around` (the
+    /// box and the callout's points): with an arrow, butt or slash, all of it out
+    /// by the width as given; with a square, circle or diamond, `around` and the
+    /// shape out by its stroke (half the width, along a diagonal at the diamond's
+    /// corners); without an ending, `around`.
+    pub(super) fn callout_box(
+        self,
+        tip: Point,
+        from: Point,
+        width: f64,
+        around: kurbo::Rect,
+    ) -> kurbo::Rect {
+        let Some((path, _)) = self.path(tip, from, width) else {
+            return around;
+        };
+        let shape = path.control_box();
+        match self {
+            Self::Square | Self::Circle => around.union(shape.inflate(width / 2.0, width / 2.0)),
+            Self::Diamond => {
+                let d = width / std::f64::consts::SQRT_2;
+                around.union(shape.inflate(d, d))
+            }
+            _ => around.union(shape).inflate(width, width),
+        }
+    }
+}
+
+/// The unit vector along `v`; none, of no length, when `v` has no length.
+fn direction(v: Vec2) -> Vec2 {
+    let len = v.hypot();
+    if len > 0.0 { v / len } else { Vec2::ZERO }
 }
 
 /// The numbers of `key` as points.
 fn points(annot: &Entries<'_>, key: &[u8]) -> Vec<Point> {
-    let Some(mut n) = annot.numbers(key, 0) else {
-        return Vec::new();
-    };
-    // A line has two points: coordinates it lacks are 0.
-    if key == b"L" && !n.is_empty() {
+    let mut n = annot.numbers(key, 0).unwrap_or_default();
+    // A line has two points, as viewers read `/L`: coordinates it lacks, or all
+    // when it is not an array, are 0.
+    if key == b"L" {
         n.resize(4, 0.0);
     }
     n.as_chunks::<2>()
@@ -175,13 +252,75 @@ fn points(annot: &Entries<'_>, key: &[u8]) -> Vec<Point> {
 
 /// `Polygon` and `PolyLine`: `/Vertices` joined, a polygon closed and filled with /IC,
 /// a polyline with its `/LE` endings at the first and last vertex.
-pub(super) fn poly(annot: &Entries<'_>, closed: bool, out: &mut Out) -> Option<()> {
+///
+/// Viewers clip a polygon, and a polyline without endings, to the bounds of its
+/// vertices out by the border width as given, cutting off the tip of a sharp
+/// mitred corner there, or, for a negative width, the shape's edges.
+pub(super) fn poly(
+    annot: &Entries<'_>,
+    closed: bool,
+    out: &mut Out,
+) -> Result<Option<()>, Unsupported> {
     let vertices = points(annot, b"Vertices");
     if vertices.len() < 2 {
-        return None;
+        return Ok(None);
     }
+    let endings = if closed {
+        [Ending::None; 2]
+    } else {
+        Ending::of(annot)
+    };
+    let n = vertices.len();
+    ends_drawable(
+        annot,
+        [
+            (endings[0], vertices[0], vertices[1]),
+            (endings[1], vertices[n - 1], vertices[n - 2]),
+        ],
+    )?;
+    Ok(draw_poly(annot, &vertices, closed, endings, out))
+}
+
+/// [`Unsupported::Ending`] when a line, polyline or callout draws an ending, each
+/// at its tip arriving from a point, whose content viewers clip to a box they
+/// compute by rules not reproduced: at a negative border width, where the box
+/// shrinks (observed: at width -6, most of a square or arrow ending cut off), and
+/// for an ending laid along or across a line of no length, whose points they put
+/// at the page's origin, outside the box (observed: an open arrow at 50 60 is
+/// `0 0 m 50 60 l 0 0 l`, clipped to 44 54 56 66).
+pub(super) fn ends_drawable(
+    annot: &Entries<'_>,
+    ends: [(Ending, Point, Point); 2],
+) -> Result<(), Unsupported> {
+    if color_of(annot, C).is_none() && color_of(annot, IC).is_none() {
+        return Ok(());
+    }
+    let negative = border_width(annot) < 0.0;
+    for (ending, tip, from) in ends {
+        if ending != Ending::None && (negative || ending.lost_at(tip, from)) {
+            return Err(Unsupported::Ending);
+        }
+    }
+    Ok(())
+}
+
+fn draw_poly(
+    annot: &Entries<'_>,
+    vertices: &[Point],
+    closed: bool,
+    endings: [Ending; 2],
+    out: &mut Out,
+) -> Option<()> {
     let stroke = color_of(annot, C);
     let fill = color_of(annot, IC);
+    if closed || endings.iter().all(|e| matches!(e, Ending::None)) {
+        let w = border_width(annot);
+        let bounds = vertices.iter().fold(
+            kurbo::Rect::from_points(vertices[0], vertices[0]),
+            |b, p| b.union_pt(*p),
+        );
+        out.clip(bounds.inflate(w, w))?;
+    }
     if closed {
         if stroke.is_none() && fill.is_none() {
             return None;
@@ -193,7 +332,7 @@ pub(super) fn poly(annot: &Entries<'_>, closed: bool, out: &mut Out) -> Option<(
             out.fill_color(fill)?;
         }
         out.stroke_state(border_width(annot), &dash(annot))?;
-        polyline(&vertices, out)?;
+        polyline(vertices, out)?;
         out.op(match (&stroke, &fill) {
             (Some(_), Some(_)) => "b",
             (Some(_), None) => "s",
@@ -201,11 +340,11 @@ pub(super) fn poly(annot: &Entries<'_>, closed: bool, out: &mut Out) -> Option<(
         });
         return Some(());
     }
-    let paint = Paint::of(annot)?;
+    let paint = Paint::of(annot);
     paint.start(out)?;
-    polyline(&vertices, out)?;
-    out.op("S");
-    let [first, last] = Ending::of(annot);
+    polyline(vertices, out)?;
+    out.op(paint.stroke_op());
+    let [first, last] = endings;
     let n = vertices.len();
     ending(first, vertices[0], vertices[1], &paint, out)?;
     ending(last, vertices[n - 1], vertices[n - 2], &paint, out)
@@ -228,21 +367,28 @@ pub(super) fn line(
     fonts: &Fonts,
     out: &mut Out,
 ) -> Result<Option<()>, Unsupported> {
+    let paint = Paint::of(annot);
     let ends = points(annot, b"L");
-    let (Some(paint), [a, b, ..]) = (Paint::of(annot), ends.as_slice()) else {
-        return Ok(None);
-    };
-    let (a, b) = (*a, *b);
-    let along = b - a;
-    let len = along.hypot();
-    let dir = if len > 0.0 {
-        along / len
-    } else {
-        Vec2::new(1.0, 0.0)
-    };
+    let (a, b) = (ends[0], ends[1]);
+    let len = (b - a).hypot();
+    let dir = direction(b - a);
     let normal = Vec2::new(-dir.y, dir.x);
+    // Without a leader line, its extension and offset do not apply; with one, each
+    // is laid out on the side the leader line goes to, as given, negative or not.
     let num = |key: &[u8]| annot.number(key).unwrap_or(0.0);
-    let (ll, lle, llo) = (num(b"LL"), num(b"LLE").abs(), num(b"LLO").abs());
+    let ll = num(b"LL");
+    let (lle, llo) = if ll == 0.0 {
+        (0.0, 0.0)
+    } else {
+        (num(b"LLE"), num(b"LLO"))
+    };
+    // With a leader line, a line of no length is drawn at the origin of the page,
+    // all of it in one point (observed).
+    if ll != 0.0 && len == 0.0 {
+        return Ok(None);
+    }
+    let [first, last] = Ending::of(annot);
+    ends_drawable(annot, [(first, a, b), (last, b, a)])?;
     let sign = if ll < 0.0 { -1.0 } else { 1.0 };
     let shift = normal * (sign * llo + ll);
     let (la, lb) = (a + shift, b + shift);
@@ -250,7 +396,7 @@ pub(super) fn line(
     // The caption, laid out first: an inline one breaks the line.
     let caption = annot.bool(b"Cap").unwrap_or(false);
     let contents = annot
-        .string(b"Contents")
+        .text(Text::Contents)
         .map(|s| text::text_string(&s))
         .filter(|s| !s.trim().is_empty());
     let mut gap = None;
@@ -261,16 +407,19 @@ pub(super) fn line(
         let glyphs = fonts.shape(Family::Sans, &one_line)?;
         let width = f64::from(text::width(&glyphs, SIZE));
         let top = annot.is(b"CP", b"Top");
-        let offset = points(annot, b"CO").first().copied().unwrap_or(Point::ZERO);
+        // As viewers place it: without an offset (`/CO`, 0 for a number it lacks),
+        // inline or on top as `/CP` says; with one, moved by it from the line's
+        // middle, below the line when it moves down, whatever `/CP` says.
+        let co = annot.numbers(b"CO", 2).unwrap_or_else(|| vec![0.0; 2]);
         let size = f64::from(SIZE);
-        let mid = len / 2.0 + offset.x;
-        let rise = if top {
-            offset.y + 0.2 * size
-        } else if offset.y == 0.0 {
+        let mid = len / 2.0 + co[0];
+        let rise = if co[0] != 0.0 || co[1] != 0.0 {
+            if co[1] < 0.0 { co[1] - size } else { co[1] }
+        } else if top {
+            0.2 * size
+        } else {
             gap = Some((mid - width / 2.0 - 3.0, mid + width / 2.0 + 3.0));
             -0.3 * size
-        } else {
-            offset.y
         };
         caption_glyphs = Some((glyphs, mid - width / 2.0, rise));
     }
@@ -303,13 +452,8 @@ fn draw_line(
     annot: &Entries<'_>,
     out: &mut Out,
 ) -> Option<()> {
-    let along = lb - la;
-    let len = along.hypot();
-    let dir = if len > 0.0 {
-        along / len
-    } else {
-        Vec2::new(1.0, 0.0)
-    };
+    let len = (lb - la).hypot();
+    let dir = direction(lb - la);
     paint.start(out)?;
     if ll != 0.0 {
         for p in [a, b] {
@@ -332,7 +476,7 @@ fn draw_line(
             out.nums(&[lb.x, lb.y], "l")?;
         }
     }
-    out.op("S");
+    out.op(paint.stroke_op());
     let [first, last] = Ending::of(annot);
     ending(first, la, lb, paint, out)?;
     ending(last, lb, la, paint, out)?;

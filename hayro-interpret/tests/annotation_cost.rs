@@ -116,18 +116,19 @@ fn a_max_len_beyond_32_bits_makes_no_comb() {
 /// Of a comb field far wider than the page, only the dividers on the page are drawn.
 #[test]
 fn a_comb_wider_than_the_page_draws_the_dividers_on_it() {
-    // Cells 500 pt wide: the page shows the divider at 2 pt; the one at 502 pt is
-    // drawn too, the search for those shown keeping a step of margin.
+    // Cells 500 pt wide: the page shows the divider at 2 pt (501 in the field's frame,
+    // which starts at -499); the one at 502 pt is drawn too, the search for those
+    // shown keeping a step of margin.
     let content = generated(
-        "/Subtype /Widget /FT /Tx /Ff 16777216 /MK << /BC [0] >> /MaxLen 2000000000 \
-         /Rect [-499 100 999999999999 130]",
+        "/Subtype /Widget /FT /Tx /Ff 16777216 /MK << /BC [0] >> /MaxLen 16000 \
+         /Rect [-499 100 8000000 130]",
     );
     let starts: Vec<i64> = content
         .lines()
         .filter(|l| l.ends_with(" m"))
         .map(|l| l.split(' ').next().unwrap().parse::<f64>().unwrap().round() as i64)
         .collect();
-    assert_eq!(starts, [2, 502], "{content}");
+    assert_eq!(starts, [501, 1001], "{content}");
 }
 
 /// A squiggle whose steps are closer than can be told apart is drawn as the band
@@ -140,21 +141,21 @@ fn a_flat_squiggle_is_drawn_at_a_bounded_cost() {
     );
     assert_eq!(lines(&content), 1, "{content}");
     assert!(content.contains(" l\nS\n"), "{content}");
-    // Steps of 0.0101 pt across a quad 10^9 pt wide: about 20 000 on the page.
+    // Steps of 0.0101 pt across a quad 4·10^6 pt wide: about 20 000 on the page.
     let content = generated(
-        "/Subtype /Squiggly /C [0] /QuadPoints [0 100.0707 1000000000 100.0707 0 100 1000000000 100] \
+        "/Subtype /Squiggly /C [0] /QuadPoints [0 100.0707 4000000 100.0707 0 100 4000000 100] \
          /Rect [0 100 200 101]",
     );
     let steps = content.matches(" l\n").count();
     assert!((19_000..21_000).contains(&steps), "{steps} steps");
 }
 
-/// 10^38, near the largest 32-bit number.
+/// 4·10^6: twice it is below 2^23, from which numbers are not written.
 fn huge() -> String {
-    format!("1{}", "0".repeat(38))
+    "4000000".to_owned()
 }
 
-/// A radio button as large as a 32-bit number allows is four curves for each circle,
+/// A radio button as large as a written number allows is four curves for each circle,
 /// as viewers draw it: the work does not grow with its size.
 #[test]
 fn a_huge_radio_button_costs_what_a_small_one_does() {
@@ -167,10 +168,10 @@ fn a_huge_radio_button_costs_what_a_small_one_does() {
     assert_eq!(radio.matches(" c\n").count(), 12, "{radio}");
 }
 
-/// So is a circle line ending of a line that wide.
+/// So is a circle line ending of a line as wide as its ending allows.
 #[test]
 fn a_huge_circle_ending_costs_what_a_small_one_does() {
-    let h = huge();
+    let h = "1000000";
     let ending = generated(&format!(
         "/Subtype /Line /C [0] /BS << /W {h} >> /LE [/Circle /None] /L [50 50 100 50] \
          /Rect [0 0 200 200]"
@@ -281,6 +282,71 @@ fn pages_below_one_chain_of_fields_read_each_field_once() {
     let bytes = allocated() - before;
     // About 15 KiB a page; reading the whole chain for each page takes 1.7 GB.
     assert!(bytes < 64 << 20, "{bytes} bytes");
+}
+
+/// The bytes allocated to look at each of `n` widgets below one field whose entries
+/// are `field`, among them a value of `len` characters the widgets share, `/Rect`
+/// `rect` each: with the value set once for the document and only what the field
+/// shows of it drawn, about what one widget takes plus some 30 KiB a widget.
+fn shared_value_cost(n: usize, len: usize, field: &str, rect: &str) -> usize {
+    let value: String = "ABCD efgh ".chars().cycle().take(len).collect();
+    let widgets: Vec<String> = (0..n).map(|i| format!("{} 0 R", 5 + i)).collect();
+    let mut objects =
+        vec![format!("<< /FT /Tx /V ({value}) /DA (/Helv 12 Tf 0 g) {field} >>").into_bytes()];
+    for _ in 0..n {
+        objects.push(
+            format!("<< /Type /Annot /Subtype /Widget /Parent 4 0 R /Rect {rect} >>").into_bytes(),
+        );
+    }
+    let pdf = Pdf::new(common::one_page(
+        200,
+        &format!("/Annots [{}]", widgets.join(" ")),
+        objects,
+    ))
+    .expect("valid pdf");
+    let annots: Vec<Dict<'_>> = pdf.pages()[0]
+        .raw()
+        .get::<Array<'_>>(b"Annots")
+        .unwrap()
+        .iter::<Dict<'_>>()
+        .collect();
+    let before = allocated();
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    for annot in &annots {
+        let Look::Generated(a) = appearances.look(annot, PAGE) else {
+            panic!("{field}: not generated");
+        };
+        assert!(
+            a.content.len() < 64 << 10,
+            "{field}: {} bytes",
+            a.content.len()
+        );
+    }
+    allocated() - before
+}
+
+/// Widgets sharing one long value set it once and draw what their field shows of
+/// it: single line, multiline, comb, comb without `/MaxLen`, and on a field far wider
+/// than the page.
+#[test]
+fn widgets_sharing_a_long_value_set_it_once() {
+    const N: usize = 200;
+    const LEN: usize = 20_000;
+    for (field, rect) in [
+        ("", "[10 10 110 30]"),
+        ("/Ff 4096", "[10 10 110 60]"),
+        ("/Ff 16777216 /MaxLen 20", "[10 10 110 30]"),
+        ("/Ff 16777216", "[10 10 110 30]"),
+        ("", "[-10000 10 1000000 30]"),
+    ] {
+        let one = shared_value_cost(1, LEN, field, rect);
+        let all = shared_value_cost(N, LEN, field, rect);
+        // Setting the value for each widget allocates at least 0.5 MB a widget.
+        assert!(
+            all < one + N * (64 << 10),
+            "{field} {rect}: {one} bytes for one, {all} for {N}"
+        );
+    }
 }
 
 /// A Squiggly quad whose top line stands still while its bottom edge runs a million

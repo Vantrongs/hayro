@@ -6,12 +6,15 @@
 use super::Unsupported;
 use std::fmt::Write;
 
-/// `v` as it is written in content: a 32-bit number, the range content streams are
-/// read in. `None` beyond that range, or for no number. Every number of a generated
-/// appearance and of a [`super::Placement`] is converted here.
+/// `v` as it is written in content: a 32-bit number, the precision content streams
+/// are read in. `None` for no number, or from 2^23 on, where 32-bit numbers are a
+/// unit or more apart, so a viewer computing the appearance in them rounds its
+/// points apart from ours (observed: a circle whose border is 2^24 wide collapses to
+/// one point in `MuPDF` and is drawn). Every number of a generated appearance and of a
+/// [`super::Placement`] is converted here.
 fn written(v: f64) -> Option<f32> {
     let n = v as f32;
-    n.is_finite().then_some(n)
+    (n.abs() < 8_388_608.0).then_some(n)
 }
 
 /// [`written`] of each of `v`; [`Unsupported::Coordinates`] when one cannot be.
@@ -23,7 +26,8 @@ pub(super) fn written_all<const L: usize>(v: [f64; L]) -> Result<[f32; L], Unsup
     Ok(n)
 }
 
-/// A colour (PDF 32000-1 8.6.4): gray, RGB or CMYK components, each clamped to 0–1.
+/// A colour (PDF 32000-1 8.6.4): gray, RGB or CMYK components as given, each
+/// clamped to 0–1 where it is written, as renderers clamp it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Color {
     Gray(f64),
@@ -34,22 +38,40 @@ pub(super) enum Color {
 impl Color {
     pub(super) const BLACK: Self = Self::Gray(0.0);
 
-    /// The colour of `components`, as viewers read a colour array: gray for one, RGB
-    /// for three, CMYK of the first four for four or more; `None` for none
-    /// (transparent) or two.
+    /// The colour of `components`, as viewers read a colour array: gray of the first
+    /// for one or two, RGB for three, CMYK of the first four for four or more; `None`
+    /// for none (transparent).
     pub(super) fn of(components: &[f64]) -> Option<Self> {
-        let c = |i: usize| components[i].clamp(0.0, 1.0);
+        let c = |i: usize| components[i];
         match components.len() {
-            1 => Some(Self::Gray(c(0))),
+            0 => None,
+            1 | 2 => Some(Self::Gray(c(0))),
             3 => Some(Self::Rgb([c(0), c(1), c(2)])),
             4.. => Some(Self::Cmyk([c(0), c(1), c(2), c(3)])),
-            _ => None,
         }
     }
 
-    /// Each component through `f`, clamped.
+    /// The same colour in RGB, as viewers convert it for a push button: CMYK by
+    /// `1 - min(1, c + k)`, unclamped below.
+    pub(super) fn rgb(self) -> Self {
+        match self {
+            Self::Gray(g) => Self::Rgb([g; 3]),
+            Self::Rgb(_) => self,
+            Self::Cmyk([c, m, y, k]) => Self::Rgb([c, m, y].map(|v| 1.0 - (v + k).min(1.0))),
+        }
+    }
+
+    /// The luminance of the colour in RGB, unclamped.
+    pub(super) fn luminance(self) -> f64 {
+        match self.rgb() {
+            Self::Rgb([r, g, b]) => 0.3 * r + 0.59 * g + 0.11 * b,
+            Self::Gray(g) => g,
+            Self::Cmyk(_) => 0.0,
+        }
+    }
+
+    /// Each component through `f`.
     pub(super) fn map(self, f: impl Fn(f64) -> f64) -> Self {
-        let f = |c: f64| f(c).clamp(0.0, 1.0);
         match self {
             Self::Gray(g) => Self::Gray(f(g)),
             Self::Rgb(c) => Self::Rgb(c.map(f)),
@@ -57,11 +79,13 @@ impl Color {
         }
     }
 
-    fn components(&self) -> &[f64] {
+    /// The components, clamped to 0–1.
+    fn components(&self) -> Vec<f64> {
+        let clamped = |c: &[f64]| c.iter().map(|c| c.clamp(0.0, 1.0)).collect();
         match self {
-            Self::Gray(g) => std::slice::from_ref(g),
-            Self::Rgb(c) => c,
-            Self::Cmyk(c) => c,
+            Self::Gray(g) => clamped(&[*g]),
+            Self::Rgb(c) => clamped(c),
+            Self::Cmyk(c) => clamped(c),
         }
     }
 }
@@ -164,6 +188,43 @@ impl Out {
         }
     }
 
+    /// Whether `ink`, a box around points, after `at` can reach `clip`, as
+    /// [`Out::path_within`] tests the points; `None`, failing the content, when a
+    /// corner cannot be written, which a point inside it then may not either.
+    pub(super) fn box_reaches(
+        &mut self,
+        at: kurbo::Affine,
+        ink: kurbo::Rect,
+        clip: kurbo::Rect,
+    ) -> Option<bool> {
+        let corners = [
+            (ink.x0, ink.y0),
+            (ink.x1, ink.y0),
+            (ink.x0, ink.y1),
+            (ink.x1, ink.y1),
+        ]
+        .map(|(x, y)| at * kurbo::Point::new(x, y));
+        let b = corners
+            .iter()
+            .fold(kurbo::Rect::from_points(corners[0], corners[0]), |r, &p| {
+                r.union_pt(p)
+            });
+        self.within(b)?;
+        let c = clip.abs();
+        Some(b.x1 >= c.x0 && b.x0 <= c.x1 && b.y1 >= c.y0 && b.y0 <= c.y1)
+    }
+
+    /// `None`, failing the content, when a corner of `area` cannot be written.
+    pub(super) fn within(&mut self, area: kurbo::Rect) -> Option<()> {
+        let ok = [area.x0, area.y0, area.x1, area.y1]
+            .iter()
+            .all(|&v| written(v).is_some());
+        if !ok {
+            self.failed = true;
+        }
+        ok.then_some(())
+    }
+
     /// Operator `op`, without operands.
     pub(super) fn op(&mut self, op: &'static str) {
         self.content.push_str(op);
@@ -177,7 +238,7 @@ impl Out {
             Color::Rgb(_) => "rg",
             Color::Cmyk(_) => "k",
         };
-        self.nums(color.components(), op)
+        self.nums(&color.components(), op)
     }
 
     /// `color` as the stroke colour.
@@ -187,7 +248,7 @@ impl Out {
             Color::Rgb(_) => "RG",
             Color::Cmyk(_) => "K",
         };
-        self.nums(color.components(), op)
+        self.nums(&color.components(), op)
     }
 
     /// The stroke state every generated appearance starts from.

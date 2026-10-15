@@ -1,6 +1,8 @@
 use crate::{Renderer, convert_fill_rule};
 use hayro_interpret::{DrawMode, DrawProps, FillRule, StrokeProps};
 use kurbo::{Affine, BezPath, Point, Rect, Shape};
+use vello_cpu::color::palette::css::BLACK;
+use vello_cpu::peniko::{self, Compose, Mix};
 
 impl Renderer<'_> {
     pub(super) fn set_stroke_properties(&mut self, stroke_props: &StrokeProps, is_text: bool) {
@@ -87,6 +89,35 @@ impl Renderer<'_> {
             }
             DrawMode::Invisible => {}
         }
+    }
+
+    /// Clears the current layer where `path` drawn with `draw_mode` covers it: the
+    /// shape drawn opaque into a layer composited with `DestOut`.
+    pub(super) fn knock_out(&mut self, path: &BezPath, transform: Affine, draw_mode: &DrawMode) {
+        let erase = peniko::BlendMode::new(Mix::Normal, Compose::DestOut);
+        self.ctx.push_layer(None, Some(erase), None, None, None);
+        self.ctx.set_transform(transform);
+        self.ctx.reset_mask();
+        self.ctx.set_blend_mode(peniko::BlendMode::default());
+        self.ctx.set_paint(BLACK);
+        match draw_mode {
+            DrawMode::Fill(f) => {
+                self.ctx.set_fill_rule(convert_fill_rule(*f));
+                self.ctx.fill_path(path);
+            }
+            DrawMode::Stroke(s) => {
+                self.set_stroke_properties(s, false);
+                self.ctx.stroke_path(path);
+            }
+            DrawMode::FillAndStroke(f, s) => {
+                self.ctx.set_fill_rule(convert_fill_rule(*f));
+                self.ctx.fill_path(path);
+                self.set_stroke_properties(s, false);
+                self.ctx.stroke_path(path);
+            }
+            DrawMode::Invisible => {}
+        }
+        self.ctx.pop_layer();
     }
 
     pub(super) fn draw_rect<'a>(
