@@ -2,7 +2,7 @@
 
 use crate::crypto::reader::DecryptedReader;
 use crate::crypto::{DecryptionError, DecryptionTarget, Decryptor, get};
-use crate::data::Data;
+use crate::data::{Data, Decoded};
 use crate::lost::Lost;
 use crate::metadata::Metadata;
 use crate::object::Name;
@@ -31,8 +31,10 @@ use core::cmp::max;
 use core::iter;
 use core::ops::Deref;
 
+mod body;
 mod scan;
 
+use body::{Place, Source, Taken, Unread};
 use scan::Scan;
 
 pub(crate) const XREF_ENTRY_LEN: usize = 20;
@@ -207,7 +209,7 @@ fn opened(_bytes: usize) {
 // the rebuilt table, if one does not lead to its own.
 //
 // An entry leads to its object where an object whose header names it is at its offset
-// and reading it as the entry's object is read (`Syntax::read_from`) reads it before the
+// and reading it as the entry's object is read (`body::Shape::read`) reads it before the
 // next offset any entry names: objects of a table do not overlap.
 // So each object is read once however many entries name it, and no further than the
 // next, which reads each byte of the file once. MuPDF, too, rebuilds a table with an
@@ -287,8 +289,8 @@ fn object_in(data: &[u8]) -> Option<ObjectIdentifier> {
 
 /// The object `r` is at, after its header where `header`, and where it starts, as an
 /// entry's object is read: a dictionary, read by `dict`, or another object. This is
-/// how [`XRef::get_parsed`] reads an object (`Syntax::read_from`), keeping the
-/// dictionary, and how the table's check finds that an entry leads to one, skipping
+/// how every read of an entry reads an object's body (`body::Shape::read`), keeping
+/// the dictionary, and how the table's check finds that an entry leads to one, skipping
 /// it: a dictionary is skipped and read by one reading.
 fn read_object<'a, D>(
     r: &mut Reader<'a>,
@@ -558,8 +560,13 @@ fn fallback_xref_map_inner<'a>(
                 stream
                     .and_then(|stream| ObjectStream::new(&stream.get()))
                     .is_some_and(|objects| {
-                        objects
-                            .get::<Dict<'_>>(id, *idx, &dummy_ctx)
+                        let Some(at) = objects.offset(id, *idx) else {
+                            return false;
+                        };
+                        let mut r = Reader::new(objects.data());
+                        r.jump(at);
+                        r.skip_white_spaces_and_comments();
+                        r.read_with_context::<Dict<'_>>(&dummy_ctx)
                             .is_some_and(|catalog| has_pages(&catalog))
                     })
             }
@@ -722,13 +729,11 @@ std::thread_local! {
     /// show that each object stream is read once.
     pub(crate) static OBJECT_STREAM_ENTRIES: core::cell::Cell<usize> =
         const { core::cell::Cell::new(0) };
-    /// While `Some`, how often each object has been resolved on this thread, which
-    /// the tests bound to show that the page tree resolves each object once.
+    /// While `Some`, how often the body of each object has been read on this thread,
+    /// by the entry a read of it was made for, which the tests bound to show that
+    /// loading the pages reads each object once.
     pub(crate) static RESOLVED: core::cell::RefCell<Option<FxHashMap<ObjectIdentifier, usize>>> =
         const { core::cell::RefCell::new(None) };
-    /// How often an object was read to find out whether it is lost, which the tests
-    /// bound to show that each is read once.
-    pub(crate) static VERDICTS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 /// An xref table.
@@ -754,7 +759,7 @@ impl XRef {
             map: Arc::new(xref_map),
             unreadable: Arc::new(rebuilt.unreadable),
             headers: Arc::new(rebuilt.headers),
-            verdicts: Arc::default(),
+            shapes: Arc::default(),
             decryptor: Arc::new(Decryptor::None),
             has_ocgs: false,
             metadata: Arc::new(Metadata::default()),
@@ -837,7 +842,7 @@ impl XRef {
                 mutable.has_ocgs = has_ocgs;
                 mutable.metadata = Arc::new(metadata);
                 // What was read before the decryptor was known is not kept.
-                mutable.verdicts = Arc::default();
+                mutable.shapes = Arc::default();
             }
         }
 
@@ -922,12 +927,10 @@ impl XRef {
 
                 let mut iter = elements.into_iter();
                 let ctx = ReaderContext::new(self, false);
-                // Entries that lead to one object parse it once.
-                let mut parsed = Parsed::default();
 
                 iter::from_fn(move || {
                     for next in iter.by_ref() {
-                        if let Some(obj) = self.get_parsed(next.0, &ctx, &mut parsed) {
+                        if let Some(obj) = self.get_parsed(next.0, &ctx) {
                             return Some(obj);
                         } else {
                             // Skip invalid objects.
@@ -1086,6 +1089,9 @@ impl XRef {
     /// object. Where the table lists it but it cannot be read (as a `T` that is read
     /// with a stream's data, a stream whose data cannot be read cannot), it is `None`
     /// too, and lost: the computation being watched is told ([`Self::watch`]).
+    ///
+    /// The object is the one its body holds ([`Self::read`]), as a `T`: a stream, for
+    /// any `T` but a stream or any object, as its dictionary.
     #[allow(private_bounds)]
     pub(crate) fn get_with<'a, T>(
         &'a self,
@@ -1095,131 +1101,157 @@ impl XRef {
     where
         T: ObjectLike<'a>,
     {
-        let (repr, entry, ctx) = self.entry(id, ctx)?;
-        let object = match entry {
-            // An object is at the offset, as `check` or the scan that rebuilt the
-            // table found it; one that is not of the type the caller expects is no
-            // such object.
-            EntryType::Normal(offset) => {
-                let mut r = Reader::new(repr.data.get().as_ref());
-                r.jump(offset);
-
-                r.read_with_context::<IndirectObject<T>>(&ctx)
-                    .map(IndirectObject::get)
-            }
-            EntryType::ObjStream(stream, index) => self.compressed(id, stream, index, &ctx),
-        };
-        if object.is_none() {
-            self.read_lost(repr, id, entry, &ctx, T::STREAM);
-        }
-        object
+        let taken = if T::STREAM { Taken::Whole } else { Taken::Dict };
+        self.read(id, ctx, taken)?.cast()
     }
 
-    /// Tells the computation being watched that object `id`, at `entry`, which a read
-    /// found nothing of the type it asked for at, is lost, if it is: if it cannot be
-    /// read as an object, or, for a read of a stream with its data, if it is a
-    /// stream whose data cannot be read. What is found at each place is kept: a
-    /// place read again, under any entry, is not read whole again.
-    fn read_lost<'a>(
+    /// Object `id`, read from `ctx` as [`Self::get_with`] reads any object, but a
+    /// stream whose data cannot be read is its dictionary, as each place this is
+    /// used reads it as a dictionary, if not as another kind of object.
+    pub(crate) fn get_parsed<'a>(
+        &'a self,
+        id: ObjectIdentifier,
+        ctx: &ReaderContext<'a>,
+    ) -> Option<Object<'a>> {
+        self.read(id, ctx, Taken::Either)
+    }
+
+    /// The object entry `id` leads to, read from `ctx`, a stream taken as `taken`
+    /// says; `None` where the table does not list it, where `ctx`'s chain rejects it
+    /// or what reading it needs as a cycle, or where it is lost, which the
+    /// computation being watched is told: every read of an object goes through here.
+    fn read<'a>(
+        &'a self,
+        id: ObjectIdentifier,
+        ctx: &ReaderContext<'a>,
+        taken: Taken,
+    ) -> Option<Object<'a>> {
+        let (repr, entry, entered) = self.entry(id, ctx)?;
+        match self.body(repr, id, entry, ctx, &entered, taken) {
+            Ok(object) => Some(object),
+            Err(Unread::Rejected) => None,
+            Err(Unread::Lost(lost)) => {
+                self.note(Some(lost));
+                None
+            }
+        }
+    }
+
+    /// The object entry `id`, at `entry`, leads to, read in `entered`, the context of
+    /// the entry from `ctx` ([`Self::entry`]): the object its body holds, read once
+    /// for every entry leading to the same place and every read.
+    fn body<'a>(
         &'a self,
         repr: &'a SomeRepr,
         id: ObjectIdentifier,
         entry: EntryType,
         ctx: &ReaderContext<'a>,
-        stream: bool,
-    ) {
-        let kept = repr.verdicts.get().get(&entry).copied();
-        let verdict = kept.unwrap_or_else(|| {
-            // What a stream's /Length refers to may be read otherwise in another
-            // chain; what is lost while finding out is the read's own concern.
-            let (verdict, shared) = ctx.shared(|ctx| self.apart(|| self.verdict(id, entry, ctx)).0);
-            if shared {
-                repr.verdicts.get().insert(entry, verdict);
-            }
-            verdict
-        });
-        if verdict == Verdict::Unreadable || (stream && verdict == Verdict::StreamLost) {
-            self.note(Some(id));
-        }
-    }
-
-    /// Whether object `id`, at `entry`, can be read as an object, read from `ctx`.
-    fn verdict<'a>(
-        &'a self,
-        id: ObjectIdentifier,
-        entry: EntryType,
-        ctx: &ReaderContext<'a>,
-    ) -> Verdict {
-        #[cfg(test)]
-        VERDICTS.set(VERDICTS.get() + 1);
-        let Inner::Some(repr) = &self.0 else {
-            return Verdict::Readable;
-        };
-        match entry {
-            EntryType::Normal(offset) => {
-                let data = repr.data.get().as_ref();
-                match Syntax::read(data, offset, true, ctx) {
-                    None => Verdict::Unreadable,
-                    Some(Syntax::Stream { dict, end }) => {
-                        let mut r = Reader::new(data);
-                        r.jump(end);
-                        match Stream::after_dict(&mut r, dict) {
-                            Some(_) => Verdict::Readable,
-                            None => Verdict::StreamLost,
-                        }
+        entered: &ReaderContext<'a>,
+        taken: Taken,
+    ) -> Result<Object<'a>, Unread> {
+        let (place, data) = self.place(repr, id, entry, entered)?;
+        let kept = repr.shapes.get().get(&place).cloned();
+        let shape = match kept {
+            Some(shape) => shape,
+            None => {
+                #[cfg(test)]
+                RESOLVED.with_borrow_mut(|resolved| {
+                    if let Some(resolved) = resolved {
+                        *resolved.entry(id).or_default() += 1;
                     }
-                    Some(Syntax::Object(_)) => Verdict::Readable,
+                });
+                // Reading a body resolves nothing: no lock is held while it reads.
+                let shape = body::Shape::read(data, place, entered);
+                repr.shapes.get().entry(place).or_insert(shape).clone()
+            }
+        };
+        match shape {
+            body::Shape::Unreadable => Err(Unread::Lost(id)),
+            body::Shape::Value(value) => Ok(value.object(data, entered)),
+            body::Shape::Stream {
+                dict: shape,
+                end,
+                data: kept,
+            } => {
+                let dict = shape.object(data, entered);
+                if taken == Taken::Dict {
+                    return Ok(Object::Dict(dict));
+                }
+                let found = match kept {
+                    Some((found, lost)) => {
+                        self.note(lost);
+                        found
+                    }
+                    None => {
+                        // The data are found by /Length, which may be an object that
+                        // the chain of references reading this one rejects: they are
+                        // kept for every chain only where none does.
+                        let ((found, lost), shared) = ctx.shared(|ctx| {
+                            self.watch(|| {
+                                let entered = Self::entered(ctx, id, repr, entry);
+                                body::stream_data(data, place, end, shape.object(data, &entered))
+                            })
+                        });
+                        if shared
+                            && let Some(body::Shape::Stream { data: kept, .. }) =
+                                repr.shapes.get().get_mut(&place)
+                        {
+                            kept.get_or_insert((found, lost));
+                        }
+                        found
+                    }
+                };
+                match (found, taken) {
+                    (Some((from, to)), _) => Ok(Object::Stream(Stream::new(&data[from..to], dict))),
+                    (None, Taken::Either) => Ok(Object::Dict(dict)),
+                    (None, _) => Err(Unread::Lost(id)),
                 }
             }
-            EntryType::ObjStream(stream, index) => match self.object_stream(id, stream, ctx) {
-                // Lost with the stream, which reading it told, or a cycle.
-                None => Verdict::Readable,
-                Some(objects) => match objects.get::<Object<'a>>(id, index, ctx) {
-                    Some(_) => Verdict::Readable,
-                    None => Verdict::Unreadable,
-                },
-            },
         }
     }
 
-    /// Object `id`, as [`Self::get_with`] reads it, from what `parsed` holds of an
-    /// object read before at the same offset of the file under another entry; a
-    /// stream whose data cannot be read is its dictionary, as each place this is
-    /// used reads it as a dictionary, if not as another kind of object.
-    ///
-    /// Entries of a damaged table that lead to one object are each that object, read
-    /// in its own context, but the object's bytes are parsed once: what they hold does
-    /// not depend on the entry ([`Self::entry`]), and `parsed` keeps it.
-    pub(crate) fn get_parsed<'a>(
+    /// Where entry `id`, at `entry`, leads, read in `entered`, and the bytes the place
+    /// is in. This reads nothing of the file: the body is read at the place
+    /// ([`body::Shape::read`]).
+    fn place<'a>(
         &'a self,
+        repr: &'a SomeRepr,
         id: ObjectIdentifier,
-        ctx: &ReaderContext<'a>,
-        parsed: &mut Parsed<'a>,
-    ) -> Option<Object<'a>> {
-        let (repr, entry, ctx) = self.entry(id, ctx)?;
-        // The bytes the object is in, where it starts, and whether a header does.
-        let (data, at, header) = match entry {
-            EntryType::Normal(offset) => (repr.data.get().as_ref(), offset, true),
+        entry: EntryType,
+        entered: &ReaderContext<'a>,
+    ) -> Result<(Place, &'a [u8]), Unread> {
+        let decryption = entered.decryption();
+        match entry {
+            EntryType::Normal(at) => Ok((
+                Place {
+                    source: Source::File,
+                    at,
+                    decryption,
+                },
+                repr.data.get().as_ref(),
+            )),
             EntryType::ObjStream(stream, index) => {
-                // Lost with the stream, which reading it told, or a cycle.
-                let stream = self.object_stream(id, stream, &ctx)?;
-                let Some(at) = stream.offset(id, index) else {
-                    self.note(Some(id));
-                    return None;
+                // Generation number is implicitly 0.
+                let stream = ObjectIdentifier::new(stream as i32, 0);
+                if stream == id {
+                    warn!("object stream holding itself");
+
+                    return Err(Unread::Lost(id));
+                }
+                let (kept, objects) = match repr.data.get_with(stream, entered) {
+                    Decoded::Stream(kept, objects) => (kept, objects),
+                    Decoded::Lost(lost) => return Err(Unread::Lost(lost)),
+                    Decoded::Rejected => return Err(Unread::Rejected),
                 };
-                (stream.data.as_slice(), at, false)
+                let at = objects.offset(id, index).ok_or(Unread::Lost(id))?;
+                let place = Place {
+                    source: Source::Stream(kept),
+                    at,
+                    decryption,
+                };
+                Ok((place, repr.data.decoded(kept)))
             }
-        };
-        let object = parsed
-            .0
-            .entry(ContentKey::new(data.get(at..)?, &ctx))
-            .or_insert_with(|| Syntax::read(data, at, header, &ctx))
-            .as_ref()
-            .map(|syntax| syntax.in_context(data, &ctx));
-        if object.is_none() {
-            self.note(Some(id));
         }
-        object
     }
 
     /// The entry of object `id`, and the context to read it in, reached from `ctx`:
@@ -1227,25 +1259,11 @@ impl XRef {
     /// reached through, whatever its header says. This is the only place that names the
     /// object a context reads. An object the table lists but that cannot be read has
     /// no entry, and is lost ([`Self::watch`]).
-    ///
-    /// What is read is decrypted as the object its header names, as it was encrypted:
-    /// where entries of a damaged table lead to one object, each reads what the bytes
-    /// hold, not bytes decrypted with a key they were not encrypted with, and the
-    /// bytes alone say how they decrypt, so what is cached by them is what every entry
-    /// reads ([`ContentKey`]). The header each entry leads to is found once, where the
-    /// table is read: no entry reads it again.
     fn entry<'a>(
         &'a self,
         id: ObjectIdentifier,
         ctx: &ReaderContext<'a>,
     ) -> Option<(&'a SomeRepr, EntryType, ReaderContext<'a>)> {
-        #[cfg(test)]
-        RESOLVED.with_borrow_mut(|resolved| {
-            if let Some(resolved) = resolved {
-                *resolved.entry(id).or_default() += 1;
-            }
-        });
-
         let Inner::Some(repr) = &self.0 else {
             return None;
         };
@@ -1264,6 +1282,23 @@ impl XRef {
             return None;
         }
 
+        Some((repr, entry, Self::entered(ctx, id, repr, entry)))
+    }
+
+    /// The context entry `id`, at `entry`, is read in from `ctx`.
+    ///
+    /// What is read is decrypted as the object its header names, as it was encrypted:
+    /// where entries of a damaged table lead to one object, each reads what the bytes
+    /// hold, not bytes decrypted with a key they were not encrypted with, and the
+    /// bytes alone say how they decrypt, so what is cached by them is what every entry
+    /// reads ([`ContentKey`], [`Place`]). The header each entry leads to is found once,
+    /// where the table is read: no entry reads it again.
+    fn entered<'a>(
+        ctx: &ReaderContext<'a>,
+        id: ObjectIdentifier,
+        repr: &SomeRepr,
+        entry: EntryType,
+    ) -> ReaderContext<'a> {
         let mut ctx = ctx.clone();
         ctx.set_obj_number(id);
         if let Some(header) = repr.headers.get(&id) {
@@ -1272,114 +1307,7 @@ impl XRef {
         ctx.parent_chain_push(id);
         ctx.set_in_content_stream(false);
         ctx.set_in_object_stream(matches!(entry, EntryType::ObjStream(..)));
-        Some((repr, entry, ctx))
-    }
-
-    /// Object `id`, which its entry puts at `index` of object stream `stream`.
-    fn compressed<'a, T>(
-        &'a self,
-        id: ObjectIdentifier,
-        stream: u32,
-        index: u32,
-        ctx: &ReaderContext<'a>,
-    ) -> Option<T>
-    where
-        T: ObjectLike<'a>,
-    {
-        self.object_stream(id, stream, ctx)?.get(id, index, ctx)
-    }
-
-    /// The object stream `stream` that the entry of object `id` names.
-    fn object_stream<'a>(
-        &'a self,
-        id: ObjectIdentifier,
-        stream: u32,
-        ctx: &ReaderContext<'a>,
-    ) -> Option<&'a ObjectStream> {
-        let Inner::Some(repr) = &self.0 else {
-            return None;
-        };
-        // Generation number is implicitly 0.
-        let stream = ObjectIdentifier::new(stream as i32, 0);
-        if stream == id {
-            warn!("cycle detected in object stream");
-
-            return None;
-        }
-
-        repr.data.get_with(stream, ctx)
-    }
-}
-
-/// Whether the object at a place an entry leads to can be read as an object.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum Verdict {
-    Readable,
-    /// A stream whose dictionary can be read, but not its data.
-    StreamLost,
-    Unreadable,
-}
-
-/// What reading the object at each place of the file or of an object stream's data
-/// found, for [`XRef::get_parsed`].
-#[derive(Default)]
-pub(crate) struct Parsed<'a>(FxHashMap<ContentKey<'a>, Option<Syntax<'a>>>);
-
-/// What reading an indirect object finds whatever entry it is read for: the context
-/// an entry reads it in changes neither how it parses nor how it decrypts.
-enum Syntax<'a> {
-    /// An object, read in the context of the first entry it was read for.
-    Object(Object<'a>),
-    /// A stream's dictionary, and where the dictionary ends: the stream's data is
-    /// found by its /Length, which may be an object, read in each entry's context.
-    Stream { dict: Dict<'a>, end: usize },
-}
-
-impl<'a> Syntax<'a> {
-    /// The object at `offset` of `data`, after its header where `header`, as an object
-    /// of an object stream has none.
-    fn read(data: &'a [u8], offset: usize, header: bool, ctx: &ReaderContext<'a>) -> Option<Self> {
-        let mut r = Reader::new(data);
-        r.jump(offset);
-        Self::read_from(&mut r, header, ctx)
-    }
-
-    /// The object `r` is at, after its header where `header` ([`read_object`]); `r`
-    /// is left where it ends, a stream at its dictionary.
-    fn read_from(r: &mut Reader<'a>, header: bool, ctx: &ReaderContext<'a>) -> Option<Self> {
-        let (_, object) = read_object(r, header, ctx, |r| r.read_with_context::<Dict<'a>>(ctx))?;
-        match object {
-            // As `Object::read` reads an indirect object.
-            Ok(dict) => {
-                let end = r.offset();
-                r.skip_white_spaces_and_comments();
-                let stream = r.forward_tag(b"stream").is_some();
-                r.jump(end);
-                Some(if stream {
-                    Self::Stream { dict, end }
-                } else {
-                    Self::Object(Object::Dict(dict))
-                })
-            }
-            Err(object) => Some(Self::Object(object)),
-        }
-    }
-
-    /// The object read in `ctx`; a stream whose data cannot be read is its
-    /// dictionary ([`XRef::get_parsed`]).
-    fn in_context(&self, data: &'a [u8], ctx: &ReaderContext<'a>) -> Object<'a> {
-        match self {
-            Self::Stream { dict, end } => {
-                let mut r = Reader::new(data);
-                r.jump(*end);
-                let dict = dict.in_context(ctx);
-                match Stream::after_dict(&mut r, dict.clone()) {
-                    Some(stream) => Object::Stream(stream),
-                    None => Object::Dict(dict),
-                }
-            }
-            Self::Object(object) => object.in_context(ctx),
-        }
+        ctx
     }
 }
 
@@ -1448,9 +1376,9 @@ struct SomeRepr {
     unreadable: Arc<Unreadable>,
     /// The entries of a rebuilt table whose objects are headed as others.
     headers: Arc<Headers>,
-    /// Whether the object at each place an entry leads to, which a read of the type
-    /// it asked for did not find, can be read as an object ([`XRef::get_with`]).
-    verdicts: Arc<Mutex<FxHashMap<EntryType, Verdict>>>,
+    /// What the body at each place an entry leads to holds, read once for every
+    /// read of an entry leading there ([`XRef::get_with`]).
+    shapes: Arc<Mutex<FxHashMap<Place, body::Shape>>>,
     metadata: Arc<Metadata>,
     decryptor: Arc<Decryptor>,
     has_ocgs: bool,
@@ -1856,18 +1784,9 @@ impl ObjectStream {
         })
     }
 
-    /// Object `id`, which an entry puts at `index`.
-    fn get<'a, T>(&'a self, id: ObjectIdentifier, index: u32, ctx: &ReaderContext<'a>) -> Option<T>
-    where
-        T: ObjectLike<'a>,
-    {
-        let mut r = Reader::new(&self.data);
-        r.jump(self.offset(id, index)?);
-        r.skip_white_spaces_and_comments();
-
-        let mut ctx = ctx.clone();
-        ctx.set_in_object_stream(true);
-        r.read_with_context::<T>(&ctx)
+    /// The decoded data.
+    pub(crate) fn data(&self) -> &[u8] {
+        &self.data
     }
 
     /// Where in the data object `id` starts, which an entry puts at `index`: the
@@ -2648,9 +2567,453 @@ mod tests {
             .unwrap()
             .get::<Array<'_>>(b"List".as_slice())
             .unwrap();
-        VERDICTS.set(0);
+        body::BODIES.with_borrow_mut(FxHashMap::clear);
         let read: Vec<_> = list.iter_checked::<Dict<'_>>().collect();
         assert!(read.is_empty(), "{read:?}");
-        assert_eq!(VERDICTS.get(), 1);
+        let bodies =
+            body::BODIES.with_borrow(|bodies| bodies.values().copied().collect::<Vec<_>>());
+        assert_eq!(bodies, [1]);
+    }
+
+    /// An object stream whose header is `header` and whose objects follow it as
+    /// `objects`, with `count` objects.
+    fn object_stream_headed(header: &str, objects: &str, count: usize) -> String {
+        format!(
+            "<< /Type /ObjStm /N {count} /First {} /Length {} >>\nstream\n{header}{objects}\nendstream",
+            header.len(),
+            header.len() + objects.len()
+        )
+    }
+
+    fn id(number: i32) -> ObjectIdentifier {
+        ObjectIdentifier::new(number, 0)
+    }
+
+    // An entry into an object stream whose header puts the object past the stream's
+    // data leads to no object that can be read: the object is lost, however it is
+    // read, not missing, so a page sized or listed by it is not taken for one
+    // without it.
+    #[test]
+    fn an_object_stream_entry_past_its_data_is_lost() {
+        for (at, lost) in [(9999, true), (0, false)] {
+            let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] /CropBox 5 0 R >>";
+            let crop = object_stream_headed(&format!("5 {at} "), "[0 0 400 500]", 1);
+            let objects = vec![
+                (1, CATALOG.to_string()),
+                (2, TREE.to_string()),
+                (3, page.to_string()),
+                (4, crop),
+            ];
+            let pdf = crate::Pdf::new(file_with_stream_table(&objects, &[(5, 4, 0)])).unwrap();
+            let page = &pdf.pages()[0];
+            if lost {
+                assert_eq!(page.unreadable(), Some(id(5)));
+            } else {
+                assert_eq!(page.unreadable(), None);
+                assert_eq!(page.crop_box().x1, 400.0);
+            }
+            let xref = pdf.xref();
+            for _ in 0..2 {
+                let (_, read) = xref.watch(|| xref.get::<Array<'_>>(id(5)));
+                assert_eq!(read, lost.then_some(id(5)), "at {at}");
+            }
+
+            let tree = "<< /Type /Pages /Kids [3 0 R 6 0 R] >>";
+            let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] >>";
+            let objects = vec![
+                (1, CATALOG.to_string()),
+                (2, tree.to_string()),
+                (3, page.to_string()),
+                (4, object_stream_headed(&format!("5 {at} "), "[7 0 R]", 1)),
+                (
+                    6,
+                    "<< /Type /Pages /Parent 2 0 R /Kids 5 0 R >>".to_string(),
+                ),
+                (7, "<< /Type /Page /Parent 6 0 R >>".to_string()),
+            ];
+            let pdf = crate::Pdf::new(file_with_stream_table(&objects, &[(5, 4, 0)])).unwrap();
+            let pages = pdf.pages();
+            if lost {
+                assert_eq!((pages.len(), pages.unreadable()), (1, Some(id(5))));
+            } else {
+                assert_eq!((pages.len(), pages.unreadable()), (2, None));
+            }
+        }
+    }
+
+    // Entries the table puts at one index of an object stream, whose header lists
+    // another object there, read each the object of its own number: what one of them
+    // holds tells nothing of another, read before or after it.
+    #[test]
+    fn entries_at_one_index_of_an_object_stream_read_each_its_own_object() {
+        for broken in [true, false] {
+            let sixth = if broken { "<< /Broken >" } else { "<< /A 1 >>" };
+            let body = format!("(readable)\n{sixth}\n");
+            let header = format!("5 0 6 {} ", "(readable)\n".len());
+            for order in [[5, 6], [6, 5]] {
+                let objects = vec![
+                    (1, CATALOG.to_string()),
+                    (2, "<< /Type /Pages /Kids [] /Count 0 >>".to_string()),
+                    (
+                        3,
+                        format!("<< /List [{} 0 R {} 0 R] >>", order[0], order[1]),
+                    ),
+                    (4, object_stream_headed(&header, &body, 2)),
+                ];
+                let file = file_with_stream_table(&objects, &[(5, 4, 0), (6, 4, 0)]);
+                let pdf = crate::Pdf::new(file.clone()).unwrap();
+                let xref = pdf.xref();
+                for number in order {
+                    let (_, lost) = xref.watch(|| xref.get::<Dict<'_>>(id(number)));
+                    let expected = (broken && number == 6).then_some(id(6));
+                    assert_eq!(lost, expected, "broken: {broken}, order {order:?}");
+                }
+                let pdf = crate::Pdf::new(file).unwrap();
+                let xref = pdf.xref();
+                let list = xref.get::<Dict<'_>>(id(3)).unwrap();
+                let list = list.get::<Array<'_>>(b"List".as_slice()).unwrap();
+                let read: Vec<_> = list.iter_checked::<Dict<'_>>().collect();
+                let lost: Vec<_> = read.into_iter().filter_map(Result::err).collect();
+                assert_eq!(lost, if broken { vec![id(6)] } else { vec![] });
+            }
+        }
+    }
+
+    /// The bytes of headers read while every item of a page's /Annots, `n`
+    /// references to string 4, whose header is padded with `64 * n` spaces where
+    /// `padded`, is read as an annotation, as many times as it is listed.
+    fn annotation_header_bytes(n: usize, padded: bool) -> usize {
+        let annots = vec!["4 0 R"; n].join(" ");
+        let page =
+            format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] /Annots [{annots}] >>");
+        let pad = if padded {
+            " ".repeat(512 * n)
+        } else {
+            " ".to_string()
+        };
+        let objects = [
+            ("1 0 obj".to_string(), CATALOG),
+            ("2 0 obj".to_string(), TREE),
+            ("3 0 obj".to_string(), page.as_str()),
+            (format!("4{pad}0 obj"), "(a)"),
+        ];
+        let pdf = crate::Pdf::new(file_headed(&objects, false)).unwrap();
+        let page = &pdf.pages()[0];
+        object::HEADER_BYTES.set(0);
+        let annots = page.raw().get::<Array<'_>>(b"Annots".as_slice()).unwrap();
+        for _ in 0..2 {
+            assert_eq!(annots.iter_checked::<Dict<'_>>().count(), 0);
+            assert_eq!(annots.iter::<Dict<'_>>().count(), 0);
+        }
+        object::HEADER_BYTES.get()
+    }
+
+    // The header of an object that many references lead to, read as another kind
+    // than it is, is read once, however long: reading the references takes time
+    // linear in the file.
+    #[test]
+    fn a_header_read_for_another_kind_of_object_is_read_once() {
+        for padded in [true, false] {
+            let [small, large] = [128, 256].map(|n| annotation_header_bytes(n, padded));
+            assert!(
+                large <= small * 25 / 10,
+                "padded: {padded}: header bytes {small} for 128 references, {large} for 256"
+            );
+        }
+        assert!(annotation_header_bytes(256, true) <= 512 * 256 + 16);
+    }
+
+    /// How often bodies were read, or streams' data found, while `run` ran, the most
+    /// for one place.
+    fn bodies_read(run: impl FnOnce()) -> usize {
+        body::BODIES.with_borrow_mut(FxHashMap::clear);
+        body::DATA_FOUND.with_borrow_mut(FxHashMap::clear);
+        run();
+        let most = |map: &FxHashMap<Place, usize>| map.values().copied().max().unwrap_or(0);
+        body::BODIES
+            .with_borrow(most)
+            .max(body::DATA_FOUND.with_borrow(most))
+    }
+
+    // A number many entries of a damaged table lead to is read once for all of them,
+    // however long it is written.
+    #[test]
+    fn a_number_entries_lead_to_is_read_once_for_them_all() {
+        let n = 64;
+        let number = format!("{}42", "0".repeat(512 * n));
+        let parts = [
+            rc4::Part::Object(CATALOG, b""),
+            rc4::Part::Object(TREE, b""),
+            rc4::Part::Object("<< /Type /Page /Parent 2 0 R >>", b""),
+            rc4::Part::Object(&number, b""),
+        ];
+        let aliases: Vec<(u32, u32)> = (0..n as u32).map(|i| (5 + i, 4)).collect();
+        for encrypted in [false, true] {
+            let pdf = crate::Pdf::new(rc4::file_with(&parts, &aliases, encrypted)).unwrap();
+            let xref = pdf.xref();
+            let most = bodies_read(|| {
+                for (alias, _) in &aliases {
+                    for _ in 0..2 {
+                        let read = xref.get::<i32>(id(*alias as i32));
+                        assert_eq!(read, Some(42));
+                    }
+                }
+            });
+            assert_eq!(most, 1, "encrypted: {encrypted}");
+        }
+    }
+
+    /// A generator of the same numbers on every run.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    /// What an object of a generated file is.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Kind {
+        Dict,
+        Array,
+        Number,
+        String,
+        Name,
+        Stream,
+        /// A stream whose data cannot be read.
+        StreamLost,
+        /// An object that cannot be read.
+        Broken,
+    }
+
+    impl Kind {
+        fn body(self, rng: &mut Rng) -> String {
+            let pad = " ".repeat(rng.below(3) * 40);
+            match self {
+                Self::Dict => format!("<< /K [1{pad}2] /S (x) >>"),
+                Self::Array => format!("[1 (two){pad} /3]"),
+                Self::Number => format!("{}42", "0".repeat(rng.below(3) * 40)),
+                Self::String => format!("(s\\101{pad})"),
+                Self::Name => format!("/N{}", "#41".repeat(rng.below(3) * 10)),
+                Self::Stream => stream(&pad, "xyz"),
+                Self::StreamLost => "<< /F (elsewhere) /Length 1 >>\nstream\nx\nendstream".into(),
+                Self::Broken => format!("<< /Broken{pad} >"),
+            }
+        }
+    }
+
+    /// Reads entry `number` of `pdf` as every kind of object, twice each, and as an
+    /// item of `list` and of a dictionary, and checks that what it finds is lost
+    /// exactly where `kind` cannot be read as what is asked for, and is what reading
+    /// it as any object finds; `None` for an entry that is lost however it is read.
+    fn read_every_way(pdf: &crate::Pdf, number: i32, kind: Option<Kind>, at: &str) {
+        let xref = pdf.xref();
+        let id = id(number);
+        let lost_as = |stream: bool| match kind {
+            None | Some(Kind::Broken) => Some(id),
+            Some(Kind::StreamLost) if stream => Some(id),
+            _ => None,
+        };
+        macro_rules! read {
+            ($t:ty, $stream:expr, $kinds:expr) => {
+                for _ in 0..2 {
+                    let (read, lost) = xref.watch(|| xref.get::<$t>(id));
+                    assert_eq!(
+                        lost,
+                        lost_as($stream),
+                        "{at}: {} of {number}",
+                        stringify!($t)
+                    );
+                    let found = lost.is_none() && kind.is_some_and(|kind| $kinds.contains(&kind));
+                    assert_eq!(
+                        read.is_some(),
+                        found,
+                        "{at}: {} of {number}",
+                        stringify!($t)
+                    );
+                }
+            };
+        }
+        read!(
+            Object<'_>,
+            true,
+            [
+                Kind::Dict,
+                Kind::Array,
+                Kind::Number,
+                Kind::String,
+                Kind::Name,
+                Kind::Stream
+            ]
+        );
+        read!(Stream<'_>, true, [Kind::Stream]);
+        read!(
+            Dict<'_>,
+            false,
+            [Kind::Dict, Kind::Stream, Kind::StreamLost]
+        );
+        read!(Array<'_>, false, [Kind::Array]);
+        read!(i32, false, [Kind::Number]);
+        read!(object::Number, false, [Kind::Number]);
+        read!(object::String<'_>, false, [Kind::String]);
+        read!(Name<'_>, false, [Kind::Name]);
+        read!(bool, false, [Kind::Broken; 0]);
+        let reference = format!("[{number} 0 R]");
+        let holder = Reader::new(reference.as_bytes())
+            .read_with_context::<Array<'_>>(&ReaderContext::new(xref, false))
+            .unwrap();
+        let (_, lost) = xref.watch(|| holder.iter_checked::<Array<'_>>().count());
+        assert_eq!(lost, lost_as(false), "{at}: item {number}");
+        let (_, lost) = xref.watch(|| holder.iter::<Stream<'_>>().count());
+        assert_eq!(lost, lost_as(true), "{at}: stream item {number}");
+    }
+
+    // Every read of an object the table lists, of any kind, through any of the
+    // entries that lead to it, in the file or an object stream, whatever index or
+    // offset the entry or the stream's header gives, reads its body at most once, and
+    // a read that finds a body that cannot be read as what it asks for tells the
+    // computation being watched that the object is lost.
+    #[test]
+    fn every_read_of_an_entry_reads_its_body_once_and_tells_what_it_lost() {
+        const KINDS: [Kind; 8] = [
+            Kind::Dict,
+            Kind::Array,
+            Kind::Number,
+            Kind::String,
+            Kind::Name,
+            Kind::Stream,
+            Kind::StreamLost,
+            Kind::Broken,
+        ];
+        for seed in 1..=150_u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            // Objects of the file, from 3, and entries leading to them, which a
+            // table that is rebuilt keeps, decrypting as the object they lead to.
+            let count = 2 + rng.below(6);
+            let kinds: Vec<Kind> = (0..count).map(|_| KINDS[rng.below(8)]).collect();
+            let bodies: Vec<String> = kinds.iter().map(|kind| kind.body(&mut rng)).collect();
+            let mut parts = vec![
+                rc4::Part::Object(CATALOG, b""),
+                rc4::Part::Object("<< /Type /Pages /Kids [] /Count 0 >>", b""),
+            ];
+            parts.extend(bodies.iter().map(|body| rc4::Part::Object(body, b"")));
+            let aliases: Vec<(u32, u32)> = (0..rng.below(5))
+                .map(|i| (3 + count as u32 + i as u32, 3 + rng.below(count) as u32))
+                .collect();
+            let pads: Vec<usize> = (0..parts.len()).map(|_| rng.below(3) * 50).collect();
+            let encrypted = rng.below(2) == 0;
+            let file = rc4::file_headed(&parts, &aliases, encrypted, &|number| {
+                format!("{number}{}0 obj", " ".repeat(1 + pads[number as usize - 1]))
+            });
+            let pdf = crate::Pdf::new(file).unwrap();
+            let kind_of = |number: u32| {
+                let target = aliases
+                    .iter()
+                    .find(|(alias, _)| *alias == number)
+                    .map_or(number, |(_, target)| *target);
+                kinds[target as usize - 3]
+            };
+            let numbers: Vec<u32> = (3..3 + count as u32)
+                .chain(aliases.iter().map(|(alias, _)| *alias))
+                .collect();
+            let most = bodies_read(|| {
+                for _ in 0..2 {
+                    for &number in &numbers {
+                        let at = format!(
+                            "seed {seed}, file, {kinds:?}, aliases {aliases:?}, encrypted {encrypted}"
+                        );
+                        read_every_way(&pdf, number as i32, Some(kind_of(number)), &at);
+                    }
+                }
+            });
+            assert!(most <= 1, "seed {seed}: a body read {most} times");
+            // Entries leading to one object read the same object.
+            for (alias, target) in &aliases {
+                let xref = pdf.xref();
+                let [alias, target] =
+                    [*alias, *target].map(|n| xref.get::<Object<'_>>(id(n as i32)));
+                assert_eq!(alias, target, "seed {seed}");
+            }
+
+            // Objects of an object stream, from 10, each listed in its header at its
+            // offset, or past the stream's data, and entries putting each at its index
+            // or another, and entries putting objects the stream does not hold in it.
+            let kinds: Vec<Kind> = (0..2 + rng.below(6))
+                .map(|_| {
+                    [
+                        Kind::Dict,
+                        Kind::Array,
+                        Kind::Number,
+                        Kind::String,
+                        Kind::Name,
+                        Kind::Broken,
+                    ][rng.below(6)]
+                })
+                .collect();
+            let mut header = String::new();
+            let mut data = String::new();
+            let mut expected = vec![];
+            for (i, kind) in kinds.iter().enumerate() {
+                let past = rng.below(6) == 0;
+                let offset = if past { 100_000 } else { data.len() };
+                header += &format!("{} {offset} ", 10 + i);
+                data += &kind.body(&mut rng);
+                data.push('\n');
+                expected.push((10 + i as i32, (!past).then_some(*kind)));
+            }
+            let mut compressed: Vec<(u32, u32, u32)> = (0..kinds.len())
+                .map(|i| {
+                    let index = if rng.below(3) == 0 {
+                        rng.below(kinds.len() + 2)
+                    } else {
+                        i
+                    };
+                    (10 + i as u32, 4, index as u32)
+                })
+                .collect();
+            for extra in 0..rng.below(3) {
+                let number = 10 + kinds.len() as u32 + extra as u32;
+                compressed.push((number, 4, rng.below(kinds.len() + 1) as u32));
+                expected.push((number as i32, None));
+            }
+            let plain: Vec<Kind> = (0..rng.below(4))
+                .map(|_| {
+                    [
+                        Kind::Dict,
+                        Kind::Array,
+                        Kind::Number,
+                        Kind::String,
+                        Kind::Name,
+                        Kind::Stream,
+                        Kind::StreamLost,
+                    ][rng.below(7)]
+                })
+                .collect();
+            let mut objects = vec![
+                (1, CATALOG.to_string()),
+                (2, "<< /Type /Pages /Kids [] /Count 0 >>".to_string()),
+                (4, object_stream_headed(&header, &data, kinds.len())),
+            ];
+            for (i, kind) in plain.iter().enumerate() {
+                objects.push((30 + i as u32, kind.body(&mut rng)));
+                expected.push((30 + i as i32, Some(*kind)));
+            }
+            let pdf = crate::Pdf::new(file_with_stream_table(&objects, &compressed)).unwrap();
+            let most = bodies_read(|| {
+                for _ in 0..2 {
+                    for (number, kind) in &expected {
+                        let at = format!(
+                            "seed {seed}, object stream {header}{data}, entries {compressed:?}"
+                        );
+                        read_every_way(&pdf, *number, *kind, &at);
+                    }
+                }
+            });
+            assert!(most <= 1, "seed {seed}: a body read {most} times");
+        }
     }
 }

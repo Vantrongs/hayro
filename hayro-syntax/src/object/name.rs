@@ -87,6 +87,21 @@ impl<'a> Name<'a> {
         Some(Self(Bytes::decoded(result)))
     }
 
+    /// The name of `bytes`, decoded.
+    pub(crate) fn from_bytes(bytes: Bytes<'a>) -> Self {
+        Self(bytes)
+    }
+
+    /// The name's bytes, decoded.
+    pub(crate) fn into_bytes(self) -> Bytes<'a> {
+        self.0
+    }
+
+    /// The name, held without the data it was read from.
+    pub(crate) fn to_static(&self) -> Name<'static> {
+        Name(self.0.to_static())
+    }
+
     /// Return a string representation of the name.
     ///
     /// Returns a placeholder in case the name is not UTF-8 encoded.

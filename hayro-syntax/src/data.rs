@@ -96,18 +96,20 @@ impl Data {
         &self.data
     }
 
-    /// The object stream `id`, read once; what reading it lost is told to every
-    /// computation that asks for it ([`crate::lost`]). Where it cannot be read as an
-    /// object stream, the objects the table puts in it are lost, and so is it.
-    pub(crate) fn get_with(
-        &self,
-        id: ObjectIdentifier,
-        ctx: &ReaderContext<'_>,
-    ) -> Option<&ObjectStream> {
-        let kept = |idx: usize| {
-            let (stream, lost) = self.decoded.get(idx)?;
-            self.watched.note(*lost);
-            stream.as_ref()
+    /// The object stream `id`, read once, and where it is kept; what reading it lost
+    /// is told to every computation that asks for it ([`crate::lost`]). Where it
+    /// cannot be read as an object stream, the objects the table puts in it are
+    /// lost, and so is it.
+    pub(crate) fn get_with(&self, id: ObjectIdentifier, ctx: &ReaderContext<'_>) -> Decoded<'_> {
+        let kept = |idx: usize| match self.decoded.get(idx) {
+            Some((stream, lost)) => {
+                self.watched.note(*lost);
+                match stream {
+                    Some(stream) => Decoded::Stream(idx, stream),
+                    None => Decoded::Lost(lost.unwrap_or(id)),
+                }
+            }
+            None => Decoded::Lost(id),
         };
         if let Some(&idx) = self.map.get().get(&id) {
             return kept(idx);
@@ -131,18 +133,41 @@ impl Data {
             })
         });
         if !shared {
-            return None;
+            return Decoded::Rejected;
         }
 
         let mut locked = self.map.get();
         if let Some(&idx) = locked.get(&id) {
+            drop(locked);
             return kept(idx);
         }
 
         let idx = locked.len();
-        let (stream, _) = self.decoded.get_or_init(idx, || (stream, lost));
+        self.decoded.get_or_init(idx, || (stream, lost));
         locked.insert(id, idx);
-
-        stream.as_ref()
+        drop(locked);
+        match self.decoded.get(idx) {
+            Some((Some(stream), _)) => Decoded::Stream(idx, stream),
+            _ => Decoded::Lost(lost.unwrap_or(id)),
+        }
     }
+
+    /// The decoded data of the object stream kept at `idx` ([`Self::get_with`]).
+    pub(crate) fn decoded(&self, idx: usize) -> &[u8] {
+        match self.decoded.get(idx) {
+            Some((Some(stream), _)) => stream.data(),
+            _ => &[],
+        }
+    }
+}
+
+/// An object stream as [`Data::get_with`] finds it.
+pub(crate) enum Decoded<'a> {
+    /// Read, and kept at an index.
+    Stream(usize, &'a ObjectStream),
+    /// It cannot be read: what reading it lost, it if nothing else.
+    Lost(ObjectIdentifier),
+    /// The chain reading it rejects what reading it needs as a cycle, so it is
+    /// neither read nor lost.
+    Rejected,
 }

@@ -740,7 +740,8 @@ impl<'a> Scan<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Syntax, object_in, read_object, rebuilt_header};
+    use super::super::body::Read;
+    use super::super::{object_in, read_object, rebuilt_header};
     use super::*;
     use crate::object::Dict;
     use crate::object::ObjectIdentifier;
@@ -868,15 +869,18 @@ mod tests {
     }
 
     /// What reading the object at `at` of `data` finds, as an entry's object is read
-    /// (`Syntax::read_from`): where it ends, and for a dictionary whether it has a
+    /// (`body::Read::from`): where it ends, and for a dictionary whether it has a
     /// /Root and a /Type key.
     fn entry_read(data: &[u8], at: usize) -> Option<Found> {
         let mut r = Reader::new(data);
         r.jump(at);
-        let syntax = Syntax::read_from(&mut r, false, &ReaderContext::dummy())?;
+        let ctx = ReaderContext::dummy();
+        let syntax = Read::from(&mut r, false, &ctx, |r| {
+            r.read_with_context::<Dict<'_>>(&ctx)
+        })?;
         let dict = match &syntax {
-            Syntax::Object(Object::Dict(dict)) | Syntax::Stream { dict, .. } => Some(dict),
-            Syntax::Object(_) => None,
+            Read::Dict(dict) | Read::Stream { dict, .. } => Some(dict),
+            Read::Object(_) => None,
         };
         Some(Found {
             end: r.offset(),
@@ -886,15 +890,18 @@ mod tests {
     }
 
     /// What reading the object at `at` of `data` after its header finds, as an
-    /// entry's object is read (`Syntax::read_from`) and as `XRef::get_with` reads
+    /// entry's object is read (`body::Read::from`) and as `XRef::get_with` reads
     /// one that is not a stream (`IndirectObject`), which agree: where the object
     /// ends.
     fn headed_read(data: &[u8], at: usize) -> Option<usize> {
         let mut r = Reader::new(data);
         r.jump(at);
-        let syntax = Syntax::read_from(&mut r, true, &ReaderContext::dummy());
+        let ctx = ReaderContext::dummy();
+        let syntax = Read::from(&mut r, true, &ctx, |r| {
+            r.read_with_context::<Dict<'_>>(&ctx)
+        });
         let end = r.offset();
-        if !matches!(syntax, Some(Syntax::Stream { .. })) {
+        if !matches!(syntax, Some(Read::Stream { .. })) {
             let mut indirect = Reader::new(data);
             indirect.jump(at);
             let read =

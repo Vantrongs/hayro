@@ -59,6 +59,27 @@ impl Bytes<'_> {
     }
 }
 
+impl<'a> Bytes<'a> {
+    /// The bytes borrowed from what they were read from, or else as they are held,
+    /// which no data is needed for.
+    pub(crate) fn held(self) -> Result<&'a [u8], Bytes<'static>> {
+        match self {
+            Self::Borrowed(bytes) => Ok(bytes),
+            Self::Inline(bytes) => Err(Bytes::Inline(bytes)),
+            Self::Shared(bytes) => Err(Bytes::Shared(bytes)),
+        }
+    }
+
+    /// A copy of the bytes that needs no data to be held.
+    pub(crate) fn to_static(&self) -> Bytes<'static> {
+        match self {
+            Self::Borrowed(bytes) => Bytes::decoded(SmallVec::from_slice(bytes)),
+            Self::Inline(bytes) => Bytes::Inline(bytes.clone()),
+            Self::Shared(bytes) => Bytes::Shared(bytes.clone()),
+        }
+    }
+}
+
 impl From<Vec<u8>> for Bytes<'_> {
     fn from(bytes: Vec<u8>) -> Self {
         Self::decoded(SmallVec::from_vec(bytes))
@@ -244,7 +265,7 @@ impl<'a> ObjectLike<'a> for Object<'a> {
     const STREAM: bool = true;
 
     // Only an indirect object is a stream: a dictionary followed by `stream`, as
-    // `Syntax::read_from` in the `xref` module reads one. In an array or dictionary,
+    // `body::Read::from` in the `xref` module reads one. In an array or dictionary,
     // which reading and skipping read alike, it is a dictionary.
     fn read_indirect(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         match r.read_with_context::<Self>(ctx)? {

@@ -226,6 +226,11 @@ impl<'a> Stream<'a> {
             .map_or(DecryptionTarget::Stream, DecryptionTarget::Named)
     }
 
+    /// The stream's data as the file stores them, neither decrypted nor decoded.
+    pub(crate) fn stored(&self) -> &'a [u8] {
+        self.data
+    }
+
     /// Return the raw, underlying dictionary of the stream.
     pub fn dict(&self) -> &Dict<'a> {
         &self.dict

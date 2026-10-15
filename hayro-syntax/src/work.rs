@@ -24,6 +24,22 @@ std::thread_local! {
     pub static TOLD: Cell<usize> = const { Cell::new(0) };
 }
 
+#[cfg(all(debug_assertions, feature = "std"))]
+std::thread_local! {
+    /// The bytes of objects' bodies read on this thread, in the file, headers and
+    /// all, or in object streams, and of streams' data found: what tests bound the
+    /// work of reading objects by. Debug builds only.
+    #[doc(hidden)]
+    pub static BODIES_READ: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Counts `bytes` of objects' bodies read ([`BODIES_READ`]).
+#[inline]
+pub(crate) fn read_bodies(_bytes: usize) {
+    #[cfg(all(debug_assertions, feature = "std"))]
+    BODIES_READ.set(BODIES_READ.get() + _bytes);
+}
+
 /// The hook of a [`Meter`] asked to stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cancelled;

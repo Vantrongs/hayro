@@ -27,6 +27,14 @@ impl PartialEq for Array<'_> {
 }
 
 impl<'a> Array<'a> {
+    /// The array whose items are `data`, read in `ctx`.
+    pub(crate) fn new(data: &'a [u8], ctx: &ReaderContext<'a>) -> Self {
+        Self {
+            data,
+            ctx: ctx.clone(),
+        }
+    }
+
     /// Returns an iterator over the objects of the array.
     pub fn raw_iter(&self) -> ArrayIter<'a> {
         ArrayIter::new(self.data, &self.ctx)

@@ -55,18 +55,18 @@ impl<'a> Dict<'a> {
 
     /// Returns the number of entries in the dictionary.
     pub fn len(&self) -> usize {
-        self.offsets().map_or(0, FxHashMap::len)
+        self.offsets().map_or(0, View::len)
     }
 
     /// Return whether the dictionary is empty.
     pub fn is_empty(&self) -> bool {
-        self.offsets().is_none_or(FxHashMap::is_empty)
+        self.offsets().is_none_or(|offsets| offsets.len() == 0)
     }
 
     /// Checks whether the dictionary contains an entry with a specific key.
     pub fn contains_key(&self, key: impl AsRef<[u8]>) -> bool {
         self.offsets()
-            .is_some_and(|offsets| offsets.contains_key(key.as_ref()))
+            .is_some_and(|offsets| offsets.get(key.as_ref()).is_some())
     }
 
     /// Returns the entry of a key as a specific object, or try to resolve it in case it's
@@ -104,7 +104,7 @@ impl<'a> Dict<'a> {
 
     /// Get the object reference linked to a key.
     pub fn get_ref(&self, key: impl AsRef<[u8]>) -> Option<ObjRef> {
-        let offset = *self.offsets()?.get(key.as_ref())?;
+        let offset = self.offsets()?.get(key.as_ref())?;
 
         Reader::new(&self.data()[offset..]).read_with_context::<ObjRef>(self.ctx())
     }
@@ -113,7 +113,7 @@ impl<'a> Dict<'a> {
     pub fn keys(&self) -> impl Iterator<Item = Name<'a>> + '_ {
         self.offsets()
             .into_iter()
-            .flat_map(|offsets| offsets.keys().cloned())
+            .flat_map(|offsets| offsets.iter().map(|(key, _)| key.clone()))
     }
 
     /// An iterator over all entries in the dictionary, sorted by key.
@@ -137,7 +137,7 @@ impl<'a> Dict<'a> {
     where
         T: Readable<'a>,
     {
-        let offset = *self.offsets()?.get(key.as_ref())?;
+        let offset = self.offsets()?.get(key.as_ref())?;
 
         Reader::new(&self.data()[offset..]).read_with_context::<MaybeRef<T>>(self.ctx())
     }
@@ -149,7 +149,7 @@ impl<'a> Dict<'a> {
         }
     }
 
-    fn offsets(&self) -> Option<&FxHashMap<Name<'a>, usize>> {
+    fn offsets(&self) -> Option<View<'_, 'a>> {
         match &self.0 {
             Inner::Empty => None,
             Inner::Some(repr) => Some(repr.offsets()),
@@ -168,17 +168,56 @@ impl<'a> Dict<'a> {
         match &self.0 {
             Inner::Empty => Self::empty(),
             Inner::Some(repr) => {
-                let parsed = match &repr.offsets {
-                    Offsets::Own(_) => repr.clone(),
-                    Offsets::Of(parsed) => parsed.clone(),
+                let offsets = match &repr.offsets {
+                    Offsets::Own(_) => Offsets::Of(repr.clone()),
+                    Offsets::Of(parsed) => Offsets::Of(parsed.clone()),
+                    Offsets::Shared(offsets) => Offsets::Shared(offsets.clone()),
                 };
                 Self(Inner::Some(Arc::new(Repr {
                     data: repr.data,
-                    offsets: Offsets::Of(parsed),
+                    offsets,
                     ctx: ctx.clone(),
                 })))
             }
         }
+    }
+
+    /// Where each entry's value starts, held without the data the dictionary is
+    /// read from, for [`Self::with_offsets`].
+    pub(crate) fn static_offsets(&self) -> Kept<'static> {
+        let offsets = self.offsets().into_iter().flat_map(View::iter);
+        Kept::of(offsets.map(|(key, at)| (key.to_static(), at)).collect())
+    }
+
+    /// Reads a dictionary as [`Dict::read`] does: its bytes, and where each entry's
+    /// value starts in them, held without the data, for [`Self::with_offsets`].
+    pub(crate) fn read_static(
+        r: &mut Reader<'a>,
+        ctx: &ReaderContext<'a>,
+    ) -> Option<(&'a [u8], Kept<'static>)> {
+        let mut offsets = new_offsets();
+        let data = parse_dict_with(
+            r,
+            ctx.in_content_stream(),
+            1,
+            Some(b"<<"),
+            b">>",
+            |name, offset| {
+                offsets.insert(name.to_static(), offset);
+            },
+        )?;
+        #[cfg(test)]
+        parsed(offsets.len(), data.len());
+        Some((data, Kept::of(offsets)))
+    }
+
+    /// The dictionary `data` holds, its entries starting at `offsets`, read in `ctx`.
+    pub(crate) fn with_offsets(data: &'a [u8], offsets: Kept<'a>, ctx: &ReaderContext<'a>) -> Self {
+        Self(Inner::Some(Arc::new(Repr {
+            data,
+            offsets: Offsets::Shared(offsets),
+            ctx: ctx.clone(),
+        })))
     }
 }
 
@@ -189,8 +228,8 @@ impl Debug for Dict<'_> {
         if let Some(offsets) = self.offsets() {
             let mut r = Reader::new(self.data());
 
-            for (key, val) in offsets {
-                r.jump(*val);
+            for (key, val) in offsets.iter() {
+                r.jump(val);
                 debug_struct.field(
                     &format!("{:?}", key.as_str()),
                     &r.read_with_context::<MaybeRef<Object<'_>>>(&ReaderContext::dummy())
@@ -255,14 +294,7 @@ fn read_inner<'a>(
     start_tag: Option<&[u8]>,
     end_tag: &[u8],
 ) -> Option<Dict<'a>> {
-    // TODO: Figure out how to
-    // 1) Make dictionaries easily cloneable without wrapping in Arc.
-    // 2) Maybe have an efficient per-document allocator pool for hashmaps
-    // that can be reused.
-    #[cfg(feature = "std")]
-    let mut offsets = FxHashMap::with_capacity_and_hasher(8, rustc_hash::FxBuildHasher);
-    #[cfg(not(feature = "std"))]
-    let mut offsets = FxHashMap::new();
+    let mut offsets = new_offsets();
 
     let data = parse_dict_with(
         r,
@@ -277,16 +309,33 @@ fn read_inner<'a>(
     )?;
 
     #[cfg(test)]
-    PARSED.with(|parsed| {
-        let (entries, bytes) = parsed.get();
-        parsed.set((entries + offsets.len(), bytes + data.len()));
-    });
+    parsed(offsets.len(), data.len());
 
     Some(Dict(Inner::Some(Arc::new(Repr {
         data,
         offsets: Offsets::Own(offsets),
         ctx: ctx.clone(),
     }))))
+}
+
+/// A map for where the entries of a dictionary start.
+fn new_offsets<K>() -> FxHashMap<K, usize> {
+    // TODO: Figure out how to
+    // 1) Make dictionaries easily cloneable without wrapping in Arc.
+    // 2) Maybe have an efficient per-document allocator pool for hashmaps
+    // that can be reused.
+    #[cfg(feature = "std")]
+    return FxHashMap::with_capacity_and_hasher(8, rustc_hash::FxBuildHasher);
+    #[cfg(not(feature = "std"))]
+    return FxHashMap::new();
+}
+
+#[cfg(test)]
+fn parsed(entries: usize, bytes: usize) {
+    PARSED.with(|parsed| {
+        let (all, read) = parsed.get();
+        parsed.set((all + entries, read + bytes));
+    });
 }
 
 #[cfg(test)]
@@ -372,10 +421,12 @@ struct Repr<'a> {
 }
 
 impl<'a> Repr<'a> {
-    fn offsets(&self) -> &FxHashMap<Name<'a>, usize> {
+    fn offsets(&self) -> View<'_, 'a> {
         match &self.offsets {
-            Offsets::Own(offsets) => offsets,
+            Offsets::Own(offsets) => View::Map(offsets),
             Offsets::Of(parsed) => parsed.offsets(),
+            Offsets::Shared(Kept::List(offsets)) => View::List(offsets),
+            Offsets::Shared(Kept::Map(offsets)) => View::Map(offsets),
         }
     }
 }
@@ -385,6 +436,68 @@ enum Offsets<'a> {
     Own(FxHashMap<Name<'a>, usize>),
     /// Those of a dictionary parsed from the same bytes, which owns them.
     Of(Arc<Repr<'a>>),
+    /// Those of an object's body, which the table keeps for every read of it.
+    Shared(Kept<'a>),
+}
+
+/// Where the entries of a dictionary an object's body holds start, kept for every
+/// read of the body ([`crate::xref`]): those of a small dictionary in a list, which
+/// takes a few dozen bytes an entry where its map takes hundreds a dictionary, in
+/// the order the map iterates them, the order every read of the dictionary finds.
+#[derive(Clone)]
+pub(crate) enum Kept<'a> {
+    List(Arc<[(Name<'a>, usize)]>),
+    Map(Arc<FxHashMap<Name<'a>, usize>>),
+}
+
+impl<'a> Kept<'a> {
+    /// At most this many entries are kept in a list, which a key is searched in
+    /// entry by entry.
+    const LISTED: usize = 8;
+
+    fn of(offsets: FxHashMap<Name<'a>, usize>) -> Self {
+        if offsets.len() <= Self::LISTED {
+            Self::List(offsets.into_iter().collect())
+        } else {
+            Self::Map(Arc::new(offsets))
+        }
+    }
+}
+
+/// Where each entry's value starts, however it is held.
+#[derive(Clone, Copy)]
+enum View<'r, 'a> {
+    Map(&'r FxHashMap<Name<'a>, usize>),
+    List(&'r [(Name<'a>, usize)]),
+}
+
+impl<'r, 'a> View<'r, 'a> {
+    fn len(self) -> usize {
+        match self {
+            Self::Map(offsets) => offsets.len(),
+            Self::List(offsets) => offsets.len(),
+        }
+    }
+
+    fn get(self, key: &[u8]) -> Option<usize> {
+        match self {
+            Self::Map(offsets) => offsets.get(key).copied(),
+            Self::List(offsets) => offsets
+                .iter()
+                .find(|(name, _)| name.as_ref() == key)
+                .map(|(_, at)| *at),
+        }
+    }
+
+    /// The entries, in the order the dictionary's map iterates them.
+    fn iter(self) -> impl Iterator<Item = (&'r Name<'a>, usize)> {
+        let (map, list) = match self {
+            Self::Map(offsets) => (Some(offsets), None),
+            Self::List(offsets) => (None, Some(offsets)),
+        };
+        let map = map.into_iter().flatten().map(|(name, at)| (name, *at));
+        map.chain(list.into_iter().flatten().map(|(name, at)| (name, *at)))
+    }
 }
 
 pub(crate) struct InlineImageDict<'a>(Dict<'a>);

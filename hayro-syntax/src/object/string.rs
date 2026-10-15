@@ -21,6 +21,16 @@ impl<'a> String<'a> {
     pub fn as_bytes(&self) -> &[u8] {
         self.as_ref()
     }
+
+    /// The string of `bytes`, decoded and decrypted.
+    pub(crate) fn from_bytes(bytes: Bytes<'a>) -> Self {
+        Self(bytes)
+    }
+
+    /// The string's bytes, decoded and decrypted.
+    pub(crate) fn into_bytes(self) -> Bytes<'a> {
+        self.0
+    }
 }
 
 impl Deref for String<'_> {

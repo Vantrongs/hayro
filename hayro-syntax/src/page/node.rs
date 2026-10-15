@@ -1,12 +1,11 @@
 //! Page tree entries and the objects loading the pages reads, through [`Objects`],
 //! which resolves each object once.
 
-use crate::lost::Memo;
 use crate::object::dict::keys::{KIDS, MEDIA_BOX, PAGES, TYPE};
 use crate::object::{Dict, MaybeRef, Object, ObjectIdentifier};
 use crate::reader::ReaderContext;
 use crate::sync::FxHashMap;
-use crate::xref::{ContentKey, Parsed, XRef};
+use crate::xref::{ContentKey, XRef};
 
 /// A page tree entry: a dictionary, or an empty one for any other object.
 #[derive(Clone)]
@@ -59,19 +58,15 @@ pub(super) fn dict_of(object: Object<'_>) -> Option<Dict<'_>> {
     }
 }
 
-/// The objects met so far while loading the pages, by identifier: the only way from
-/// a reference loading reads — a /Kids entry, a /Parent, the catalog's /Pages, an
-/// inherited entry, a resource category, a member of a box — to its object, so that
-/// each object is parsed once, however many entries refer to it, and every read of
-/// it is told whether it was lost ([`Memo`]); and the only way loading reads an
-/// entry of a page tree entry's dictionary, so that each is read once, however many
-/// entries of a damaged table lead to the dictionary.
+/// The objects loading the pages reads: the only way from a reference loading reads
+/// — a /Kids entry, a /Parent, the catalog's /Pages, an inherited entry, a resource
+/// category, a member of a box — to its object, which the table reads once however
+/// many entries and references lead to it, and tells every read of it whether it was
+/// lost ([`XRef::get_with`]); and the only way loading reads an entry of a page tree
+/// entry's dictionary, so that each is read once, however many entries of a damaged
+/// table lead to the dictionary.
 pub(super) struct Objects<'a> {
     ctx: ReaderContext<'a>,
-    objects: Memo<ObjectIdentifier, Option<Object<'a>>>,
-    /// What reading the objects found at each offset of the file, so that objects
-    /// of a damaged table whose entries lead to one object are each parsed once.
-    parsed: Parsed<'a>,
     /// The entries read from dictionaries, by what the dictionary is read from and the
     /// key, as read in the context of the first entry that read them: another entry
     /// reads them in its own ([`Object::in_context`]), which reads the same objects.
@@ -82,8 +77,6 @@ impl<'a> Objects<'a> {
     pub(super) fn new(ctx: ReaderContext<'a>) -> Self {
         Self {
             ctx,
-            objects: Memo::default(),
-            parsed: Parsed::default(),
             entries: FxHashMap::default(),
         }
     }
@@ -156,14 +149,7 @@ impl<'a> Objects<'a> {
     pub(super) fn resolve(&mut self, entry: MaybeRef<Object<'a>>) -> Option<Object<'a>> {
         match entry {
             MaybeRef::NotRef(object) => Some(object),
-            MaybeRef::Ref(id) => {
-                let id = ObjectIdentifier::from(id);
-                let (ctx, parsed) = (&self.ctx, &mut self.parsed);
-                let xref = ctx.xref();
-                self.objects
-                    .get(xref, id, || xref.get_parsed(id, ctx, parsed))
-                    .clone()
-            }
+            MaybeRef::Ref(id) => self.xref().get_parsed(id.into(), &self.ctx),
         }
     }
 
