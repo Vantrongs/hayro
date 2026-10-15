@@ -73,7 +73,7 @@ impl<'a> Dict<'a> {
         match self.offsets() {
             None => false,
             Some(Found::Offsets(offsets)) => offsets.get(key.as_ref()).is_some(),
-            Some(Found::Parsed(node)) => node.get(key.as_ref()).is_some(),
+            Some(Found::Parsed(node)) => node.get(key.as_ref(), self.data()).is_some(),
         }
     }
 
@@ -117,7 +117,7 @@ impl<'a> Dict<'a> {
                 let offset = *offsets.get(key.as_ref())?;
                 Reader::new(&self.data()[offset..]).read_with_context::<ObjRef>(self.ctx())
             }
-            Found::Parsed(node) => match node.get(key.as_ref())? {
+            Found::Parsed(node) => match node.get(key.as_ref(), self.data())? {
                 Node::Ref(reference) => Some(*reference),
                 _ => None,
             },
@@ -136,7 +136,7 @@ impl<'a> Dict<'a> {
             .flat_map(|offsets| offsets.keys().cloned());
         let parsed = parsed
             .into_iter()
-            .flat_map(|node| node.entries().map(|(key, _)| key.clone()));
+            .flat_map(|node| node.entries(self.data()).map(|(key, _)| key));
         offsets.chain(parsed)
     }
 
@@ -169,7 +169,9 @@ impl<'a> Dict<'a> {
                 crate::work::lexed(r.offset());
                 value
             }
-            Found::Parsed(node) => node.get(key.as_ref())?.item_as(self.data(), self.ctx()),
+            Found::Parsed(node) => node
+                .get(key.as_ref(), self.data())?
+                .item_as(self.data(), self.ctx()),
         }
     }
 
@@ -243,7 +245,7 @@ impl Debug for Dict<'_> {
                 }
             }
             Some(Found::Parsed(node)) => {
-                for (key, value) in node.entries() {
+                for (key, value) in node.entries(self.data()) {
                     debug_struct.field(
                         &format!("{:?}", key.as_str()),
                         &value.item(self.data(), &ReaderContext::dummy()),

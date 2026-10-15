@@ -18,6 +18,7 @@ use crate::object::{
 };
 use crate::reader::{Reader, ReaderContext, ReaderExt};
 use crate::sync::{Arc, FxHashMap};
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 /// Where bytes are, from and up to, in the bytes of what holds them.
@@ -27,7 +28,7 @@ pub(crate) type Span = (usize, usize);
 #[derive(Clone)]
 pub(crate) enum Text {
     At(Span),
-    Held(Bytes<'static>),
+    Held(Arc<[u8]>),
 }
 
 impl Text {
@@ -38,14 +39,24 @@ impl Text {
                 let from = part.as_ptr() as usize - data.as_ptr() as usize - start;
                 Self::At((from, from + part.len()))
             }
-            Err(held) => Self::Held(held),
+            Err(held) => Self::Held(match held {
+                Bytes::Shared(bytes) => bytes,
+                held => Arc::from(held.as_ref()),
+            }),
         }
     }
 
     fn bytes<'a>(&self, data: &'a [u8]) -> Bytes<'a> {
         match self {
             Self::At((from, to)) => Bytes::Borrowed(&data[*from..*to]),
-            Self::Held(bytes) => bytes.clone(),
+            Self::Held(bytes) => Bytes::Shared(bytes.clone()),
+        }
+    }
+
+    fn as_slice<'s>(&'s self, data: &'s [u8]) -> &'s [u8] {
+        match self {
+            Self::At((from, to)) => &data[*from..*to],
+            Self::Held(bytes) => bytes,
         }
     }
 }
@@ -71,16 +82,17 @@ pub(crate) struct ArrayNode {
 }
 
 /// A dictionary: where it is, and each entry's value, those of a small dictionary in
-/// a list, which takes a few dozen bytes an entry where its map takes hundreds a
-/// dictionary, in the order the map iterates them, the order every read finds.
+/// a list with where each key is, which takes a few dozen bytes an entry where its
+/// map takes hundreds a dictionary, in the order the map iterates them, the order
+/// every read finds.
 pub(crate) struct DictNode {
     span: Span,
     entries: Entries,
 }
 
 enum Entries {
-    List(Vec<(Name<'static>, Node)>),
-    Map(FxHashMap<Name<'static>, Node>),
+    List(Box<[(Text, Node)]>),
+    Map(Box<FxHashMap<Name<'static>, Node>>),
 }
 
 /// At most this many entries are kept in a list, which a key is searched in entry by
@@ -136,19 +148,48 @@ impl<'a> Parse<'_, 'a> {
             return None;
         }
         let from = r.offset();
-        let mut entries = new_offsets();
+        // The entries, each key borrowed while they are few, in a map that is built
+        // by the same insertions as the map of a dictionary read from its bytes, so
+        // that they are iterated in its order; past `LISTED`, the keys are held.
+        let mut few = new_offsets();
+        let mut keys = Vec::new();
+        let mut many: Option<FxHashMap<Name<'static>, Node>> = None;
         let bytes = parse_dict_with(r, false, depth + 1, Some(b"<<"), b">>", |r, key, _| {
             let value = self.item(r, from, depth + 1)?;
-            entries.insert(key.to_static(), value);
+            match &mut many {
+                Some(many) => {
+                    many.insert(key.to_static(), value);
+                }
+                None => {
+                    keys.push(key.clone());
+                    few.insert(key, value);
+                    if few.len() > LISTED {
+                        let mut held = new_offsets();
+                        for key in keys.drain(..) {
+                            let value = few[&key].clone();
+                            held.insert(key.to_static(), value);
+                        }
+                        few.clear();
+                        many = Some(held);
+                    }
+                }
+            }
             Some(())
         })?;
+        let entries = match many {
+            Some(many) => Entries::Map(Box::new(many)),
+            None => {
+                let text = |key: Name<'a>| Text::of(key.into_bytes(), self.data, from);
+                Entries::List(
+                    few.into_iter()
+                        .map(|(key, value)| (text(key), value))
+                        .collect(),
+                )
+            }
+        };
         Some(DictNode {
             span: (from - start, from - start + bytes.len()),
-            entries: if entries.len() <= LISTED {
-                Entries::List(entries.into_iter().collect())
-            } else {
-                Entries::Map(entries)
-            },
+            entries,
         })
     }
 
@@ -256,25 +297,36 @@ impl DictNode {
         }
     }
 
-    /// The value of `key`.
-    pub(crate) fn get(&self, key: &[u8]) -> Option<&Node> {
+    /// The value of `key`, of the dictionary whose bytes are `data`.
+    pub(crate) fn get(&self, key: &[u8], data: &[u8]) -> Option<&Node> {
         match &self.entries {
             Entries::List(entries) => entries
                 .iter()
-                .find(|(name, _)| name.as_ref() == key)
+                .find(|(name, _)| name.as_slice(data) == key)
                 .map(|(_, node)| node),
             Entries::Map(entries) => entries.get(key),
         }
     }
 
-    /// The entries, in the order the dictionary's map iterates them.
-    pub(crate) fn entries(&self) -> impl Iterator<Item = (&Name<'static>, &Node)> {
+    /// The entries of the dictionary whose bytes are `data`, in the order the
+    /// dictionary's map iterates them.
+    pub(crate) fn entries<'s, 'a: 's>(
+        &'s self,
+        data: &'a [u8],
+    ) -> impl Iterator<Item = (Name<'a>, &'s Node)> + 's {
         let (list, map) = match &self.entries {
             Entries::List(entries) => (Some(entries), None),
             Entries::Map(entries) => (None, Some(entries)),
         };
-        let list = list.into_iter().flatten().map(|(name, node)| (name, node));
-        list.chain(map.into_iter().flatten())
+        let list = list
+            .into_iter()
+            .flat_map(|entries| entries.iter())
+            .map(move |(name, node)| (Name::from_bytes(name.bytes(data)), node));
+        let map = map
+            .into_iter()
+            .flat_map(|entries| entries.iter())
+            .map(|(name, node)| (name.clone(), node));
+        list.chain(map)
     }
 }
 

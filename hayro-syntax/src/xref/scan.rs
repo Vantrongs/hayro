@@ -886,10 +886,16 @@ mod tests {
             Read::Dict(dict) | Read::Stream { dict, .. } => Some(dict),
             Read::Object(_) => None,
         };
+        let has = |key: &[u8]| {
+            dict.is_some_and(|dict| {
+                let (from, to) = dict.span();
+                dict.get(key, &data[from..to]).is_some()
+            })
+        };
         Some(Found {
             end: r.offset(),
-            root: dict.is_some_and(|dict| dict.get(ROOT).is_some()),
-            kind: dict.is_some_and(|dict| dict.get(TYPE).is_some()),
+            root: has(ROOT),
+            kind: has(TYPE),
         })
     }
 
