@@ -5,7 +5,7 @@ use crate::object::macros::object;
 use crate::object::{Object, ObjectLike};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
-use crate::trivia::{is_regular_character, is_white_space_character};
+use crate::trivia::is_regular_character;
 use core::fmt::{Debug, Display, Formatter};
 
 #[rustfmt::skip]
@@ -77,35 +77,31 @@ impl Display for Number {
 }
 
 impl Skippable for Number {
-    fn skip(r: &mut Reader<'_>, _: bool) -> Option<()> {
+    // Accepts exactly the input `read_inner` accepts and stops at the same offset, but
+    // doesn't compute the value.
+    fn skip(r: &mut Reader<'_>, is_content_stream: bool) -> Option<()> {
         let has_sign = r.forward_if(|b| b == b'+' || b == b'-').is_some();
+        let start = r.offset();
 
-        // Some PDFs have weird trailing minuses, so try to accept those as well.
-        match r.peek_byte()? {
-            b'.' => {
-                r.read_byte()?;
-                // See PDFJS-9252 - treat a single . as 0.
-                r.forward_while(is_digit_or_minus);
-            }
-            b'0'..=b'9' | b'-' => {
-                r.forward_while_1(is_digit_or_minus)?;
-                if let Some(()) = r.forward_tag(b".") {
-                    r.forward_while(is_digit_or_minus);
-                }
-            }
-            // See PDFJS-bug1753983 - accept just + or - as a zero.
-            // ALso see PDFJS-bug1953099, where the sign is followed by a show
-            // text string operand, requiring us to allow '<' and '(' as well.
-            b if has_sign && (is_white_space_character(b) || matches!(b, b'(' | b'<')) => {}
-            _ => return None,
+        r.forward_while(is_digit);
+        let has_dot = r.forward_tag(b".").is_some();
+        if has_dot {
+            r.forward_while(is_digit);
         }
 
-        // See issue 994. Don't accept numbers that are followed by a regular character.
-        if r.peek_byte().is_some_and(is_regular_character) {
-            return None;
+        let has_digits = r.offset() - start > usize::from(has_dot);
+
+        if has_digits && r.forward_tag(b"-").is_some() {
+            r.forward_while(is_digit_or_minus);
         }
 
-        Some(())
+        let regular_follows = r.peek_byte().is_some_and(is_regular_character);
+        if !has_digits {
+            return ((has_sign || has_dot) && (is_content_stream || !regular_follows))
+                .then_some(());
+        }
+
+        (!regular_follows).then_some(())
     }
 }
 
@@ -203,16 +199,16 @@ impl Number {
 #[inline(always)]
 fn read_inner(r: &mut Reader<'_>, in_content_stream: bool) -> Option<Number> {
     let start_offset = r.offset();
-    let negative = match r.peek_byte()? {
+    let (has_sign, negative) = match r.peek_byte()? {
         b'-' => {
             r.forward();
-            true
+            (true, true)
         }
         b'+' => {
             r.forward();
-            false
+            (true, false)
         }
-        _ => false,
+        _ => (false, false),
     };
 
     let mut mantissa: u64 = 0;
@@ -257,10 +253,11 @@ fn read_inner(r: &mut Reader<'_>, in_content_stream: bool) -> Option<Number> {
     }
 
     if !has_digits {
-        // Treat numbers like just `-`, `+` or `-.` as zero. Outside of content streams,
-        // not if a regular character follows, for the same reason as below: `.foo` is
-        // one token, and reading it as zero would leave `foo` as the next object.
-        if (negative || has_dot)
+        // Treat numbers like just `-`, `+` or `-.` as zero. See PDFJS-9252 and
+        // PDFJS-bug1753983. Outside of content streams, not if a regular character
+        // follows, for the same reason as below: `.foo` is one token, and reading it as
+        // zero would leave `foo` as the next object.
+        if (has_sign || has_dot)
             && (in_content_stream || !r.peek_byte().is_some_and(is_regular_character))
         {
             return Some(Number(InternalNumber::Integer(0)));
@@ -271,6 +268,15 @@ fn read_inner(r: &mut Reader<'_>, in_content_stream: bool) -> Option<Number> {
     // See issue 994. Don't accept numbers that are followed by a regular character
     // without any white space in-between.
     if r.peek_byte().is_some_and(is_regular_character) {
+        return None;
+    }
+
+    if !has_digits {
+        if has_sign || has_dot {
+            // Treat numbers like just `-`, `+` or `-.` as zero. See PDFJS-9252 and
+            // PDFJS-bug1753983.
+            return Some(Number(InternalNumber::Integer(0)));
+        }
         return None;
     }
 
@@ -417,7 +423,7 @@ pub(crate) fn is_digit_or_minus(byte: u8) -> bool {
 mod tests {
     use crate::object::Number;
     use crate::reader::Reader;
-    use crate::reader::ReaderExt;
+    use crate::reader::{ReaderContext, ReaderExt};
 
     #[test]
     fn a_fraction_too_long_for_an_f64_is_zero() {
@@ -586,7 +592,7 @@ mod tests {
     fn real_failing() {
         assert!(
             Reader::new("+abc".as_bytes())
-                .read_without_context::<f32>()
+                .read_with_context::<f32>(&ReaderContext::dummy())
                 .is_none()
         );
     }
@@ -705,5 +711,53 @@ mod tests {
         let got = reader.read_without_context::<Number>().unwrap().as_f64();
         assert_eq!(got, 1.234_567_890_123_456_8e24);
         assert_eq!(reader.offset(), input.len());
+    }
+
+    #[test]
+    fn skip_matches_read() {
+        let mut inputs: Vec<Vec<u8>> = vec![vec![]];
+        let mut last = inputs.clone();
+
+        for _ in 0..7 {
+            last = last
+                .iter()
+                .flat_map(|prefix| {
+                    b"1+-.a (".iter().map(move |b| {
+                        let mut input = prefix.clone();
+                        input.push(*b);
+                        input
+                    })
+                })
+                .collect();
+            inputs.extend(last.iter().cloned());
+        }
+
+        inputs.extend(
+            [
+                "99999999999999999999",
+                "-9223372036854775808",
+                "+18446744073709551616.5",
+                "99999999999999999999.5-1-",
+                "12345678901234567890123.456",
+            ]
+            .map(|s| s.as_bytes().to_vec()),
+        );
+
+        for input in &inputs {
+            for in_content_stream in [false, true] {
+                let mut skip_reader = Reader::new(input);
+                let skipped = skip_reader.skip::<Number>(in_content_stream).is_some();
+
+                let mut read_reader = Reader::new(input);
+                let read = Number::read_in(&mut read_reader, in_content_stream).is_some();
+
+                assert_eq!(
+                    (skipped, skip_reader.offset()),
+                    (read, read_reader.offset()),
+                    "{}, in a content stream: {in_content_stream}",
+                    String::from_utf8_lossy(input)
+                );
+            }
+        }
     }
 }

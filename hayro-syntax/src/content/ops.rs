@@ -229,6 +229,32 @@ f
     }
 
     #[test]
+    fn lone_sign_is_zero() {
+        use crate::content::ops::{NextLine, ShowTexts};
+
+        // See PDFJS-bug1753983: a lone `+` or `-` is a zero.
+        for (input, operands) in [(&b"+ 3 Td"[..], [n(0), n(3)]), (b"- 3 Td", [n(0), n(3)])] {
+            let mut iter = TypedIter::new(input);
+            assert!(matches!(
+                iter.next(),
+                Some(TypedInstruction::NextLine(NextLine(a, b))) if [a, b] == operands
+            ));
+        }
+
+        // Each item that validation skipped is read.
+        for (input, len) in [(&b"[(a) + (b)] TJ"[..], 3), (b"[(a) +-1 (b)] TJ", 4)] {
+            let mut iter = TypedIter::new(input);
+            let Some(TypedInstruction::ShowTexts(ShowTexts(array))) = iter.next() else {
+                panic!("{} isn't TJ", core::str::from_utf8(input).unwrap());
+            };
+            let items = array.iter::<Object<'_>>().collect::<Vec<_>>();
+            assert_eq!(items.len(), len, "{}", core::str::from_utf8(input).unwrap());
+            assert!(matches!(items[1], Object::Number(n) if n.as_i64() == 0));
+            assert!(matches!(items[len - 1], Object::String(_)));
+        }
+    }
+
+    #[test]
     fn scn() {
         let input = b"
 0.0 scn
