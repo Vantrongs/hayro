@@ -7,6 +7,7 @@ pub use crate::object::name::Name;
 use crate::object::name::skip_name_like;
 pub use crate::object::null::Null;
 pub use crate::object::number::Number;
+pub(crate) use crate::object::number::starts_number;
 pub use crate::object::rect::Rect;
 pub use crate::object::r#ref::{MaybeRef, ObjRef};
 pub use crate::object::stream::Stream;
@@ -216,23 +217,21 @@ impl<'a> Object<'a> {
 }
 
 impl<'a> Object<'a> {
-    /// The object of the same bytes, `data` from its start, read in `ctx`: what
-    /// reading the bytes in another context found, but for what is decrypted, which
-    /// is read again where `ctx` decrypts.
-    pub(crate) fn in_context(&self, data: &'a [u8], ctx: &ReaderContext<'a>) -> Option<Self> {
-        Some(match self {
+    /// The object read in another context from the same bytes: the same object, its
+    /// dictionaries and arrays resolving references in `ctx`. A string is the same
+    /// string: the bytes say how they decrypt ([`ReaderContext::decryption`]), not
+    /// the context.
+    pub(crate) fn in_context(&self, ctx: &ReaderContext<'a>) -> Self {
+        match self {
             Self::Dict(dict) => Self::Dict(dict.in_context(ctx)),
             Self::Array(array) => Self::Array(array.in_context(ctx)),
             Self::Stream(stream) => Self::Stream(stream.in_context(ctx)),
-            Self::String(_) if ctx.xref().needs_decryption(ctx) => {
-                Reader::new(data).read_with_context::<Self>(ctx)?
-            }
             Self::Null(_)
             | Self::Boolean(_)
             | Self::Number(_)
             | Self::String(_)
             | Self::Name(_) => self.clone(),
-        })
+        }
     }
 }
 

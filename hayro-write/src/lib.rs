@@ -38,9 +38,10 @@ pub use pdf_writer::Settings as ChunkSettings;
 /// Apply the extraction queries to the given PDF and return the results.
 ///
 /// The copy never leaves out what the source draws: a page whose content cannot be
-/// read whole is an error for its query, and a stream it copies that cannot be
-/// decrypted whole, or an object the file lists but that cannot be parsed, fails
-/// the extraction. Streams whose dictionaries refer to no other object are written
+/// read whole, or that is drawn with an object the file lists but that cannot be
+/// parsed ([`Page::unreadable`]), is an error for its query, and a stream it copies
+/// that cannot be decrypted whole, or an object it copies that the file lists but
+/// that cannot be parsed, fails the extraction. Streams whose dictionaries refer to no other object are written
 /// once for all that copy to the same dictionary and data, as fonts embedded in
 /// each of several pages are.
 pub fn extract<'a>(
@@ -174,6 +175,10 @@ pub enum ExtractionError {
     NotAStream(ObjRef),
     /// The content of the page with this index cannot be read whole.
     Content(usize, ContentError),
+    /// The page with this index is drawn with an object the file lists but that
+    /// cannot be parsed: its dictionary, an entry it inherits, or a category of its
+    /// resources ([`Page::unreadable`]).
+    UnreadablePage(usize, ObjRef),
     /// A stream the copy needs cannot be decrypted whole.
     StreamData(ObjRef, DecodeFailure),
     /// An object the copy needs is listed in the file but cannot be parsed.
@@ -400,6 +405,7 @@ fn write_page<'a>(
     page_idx: usize,
     ctx: &mut ExtractionContext<'a>,
 ) -> Result<(), ExtractionError> {
+    readable(page, page_idx)?;
     let mut chunk = Chunk::with_settings(ctx.chunk_settings);
     // Note: We can cache content stream references, but _not_ the page references themselves.
     // Acrobat for some reason doesn't like duplicate page references in the page tree.
@@ -457,6 +463,7 @@ fn write_xobject<'a>(
     xobj_ref: Ref,
     ctx: &mut ExtractionContext<'a>,
 ) -> Result<(), ExtractionError> {
+    readable(page, page_idx)?;
     let content = page
         .try_page_stream()
         .map_err(|e| ExtractionError::Content(page_idx, e))?;
@@ -515,8 +522,15 @@ fn write_form<'a>(
         return Err(ExtractionError::NotAStream(obj));
     };
     // What a renderer draws the stream with: its own resources if they are a
-    // dictionary, the page's otherwise.
-    let own_resources = stream.dict().get::<Dict<'_>>(RESOURCES).is_some();
+    // dictionary, the page's otherwise; resources that cannot be read are neither.
+    let own_resources = stream
+        .dict()
+        .get_checked::<Dict<'_>>(RESOURCES)
+        .map_err(|id| ExtractionError::Unreadable(id.into()))?
+        .is_some();
+    if !own_resources {
+        readable(page, page_idx)?;
+    }
     let key = (obj, (!own_resources).then_some(page_idx));
     if let Some(form_ref) = ctx.forms.get(&key) {
         return Ok(*form_ref);
@@ -541,6 +555,14 @@ fn write_form<'a>(
     ctx.chunks.push(chunk);
 
     Ok(form_ref)
+}
+
+/// An error for a page drawn with an object that cannot be read.
+fn readable(page: &Page<'_>, page_idx: usize) -> Result<(), ExtractionError> {
+    match page.unreadable() {
+        Some(id) => Err(ExtractionError::UnreadablePage(page_idx, id.into())),
+        None => Ok(()),
+    }
 }
 
 /// Writes `/Resources` into `writer`, each category a reference to the copy of its

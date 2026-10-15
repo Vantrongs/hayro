@@ -65,6 +65,18 @@ fn hex(bytes: &[u8]) -> String {
 /// A file of `objects`, numbered from 1, the first being the catalog, whose table also
 /// lists each number `alias` of `aliases` at the offset of object `target`.
 pub(crate) fn file(objects: &[Part<'_>], aliases: &[(u32, u32)]) -> Vec<u8> {
+    file_with(objects, aliases, true)
+}
+
+/// [`file`], or where not `encrypted`, the same file with nothing encrypted.
+pub(crate) fn file_with(objects: &[Part<'_>], aliases: &[(u32, u32)], encrypted: bool) -> Vec<u8> {
+    let crypt = |number: u32, data: &[u8]| {
+        if encrypted {
+            crypt(number, data)
+        } else {
+            data.to_vec()
+        }
+    };
     let (_, owner, user) = keys();
     let mut out = b"%PDF-1.7\n".to_vec();
     let mut offsets = vec![];
@@ -106,13 +118,19 @@ pub(crate) fn file(objects: &[Part<'_>], aliases: &[(u32, u32)]) -> Vec<u8> {
         }
     }
     let id = hex(ID);
+    let encryption = if encrypted {
+        format!(
+            "/Encrypt << /Filter /Standard /V 1 /R 2 /P {PERMISSIONS} /O <{}> /U <{}> >>",
+            hex(&owner),
+            hex(&user)
+        )
+    } else {
+        String::new()
+    };
     out.extend(
         format!(
-            "trailer\n<< /Size {size} /Root 1 0 R /ID [<{id}> <{id}>] /Encrypt << /Filter \
-             /Standard /V 1 /R 2 /P {PERMISSIONS} /O <{}> /U <{}> >> >>\nstartxref\n{xref}\n\
-             %%EOF\n",
-            hex(&owner),
-            hex(&user),
+            "trailer\n<< /Size {size} /Root 1 0 R /ID [<{id}> <{id}>] {encryption} >>\n\
+             startxref\n{xref}\n%%EOF\n"
         )
         .bytes(),
     );

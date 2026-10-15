@@ -16,6 +16,9 @@ pub enum InheritanceError {
     /// The page's /Parent chain loops even after the page tree's /Parent entries
     /// are repaired.
     ParentLoop,
+    /// The entry the page inherits refers to this object, which the file lists but
+    /// which cannot be read: the value is lost.
+    Unreadable(ObjectIdentifier),
 }
 
 /// An entry a page inherits from the page tree (the PDF specification's table 31).
@@ -76,11 +79,15 @@ pub struct Inheritance<'a> {
     chains: FxHashMap<Key<'a>, [Option<Chain<'a>>; 4]>,
 }
 
+/// A value of an entry a node has: `null` for a reference to nothing, `Err` with the
+/// object a reference leads to where the file lists it but it cannot be read.
+pub(super) type Held<'a> = Result<Object<'a>, ObjectIdentifier>;
+
 /// Where a node's /Parent chain leads for one entry.
 #[derive(Clone)]
 enum Chain<'a> {
-    /// To a node with the entry: its value, `null` for a reference to nothing.
-    Found(Object<'a>),
+    /// To a node with the entry: its value.
+    Found(Held<'a>),
     /// To this node, which has no /Parent, or one that is no dictionary.
     End(Key<'a>),
     /// Round in a loop.
@@ -123,7 +130,8 @@ impl<'a> Inheritance<'a> {
     }
 
     /// The value of `key` for `page`: `None` if neither it nor a /Parent has the key,
-    /// `null` for a reference to nothing.
+    /// `null` for a reference to nothing, [`InheritanceError::Unreadable`] for one to
+    /// an object the file lists but that cannot be read.
     pub fn get(
         &mut self,
         page: &Page<'a>,
@@ -150,11 +158,12 @@ impl<'a> Inheritance<'a> {
             }
             chain => chain,
         };
-        match chain {
-            Chain::Found(value) => Ok(Some(value)),
-            Chain::End(end) => Ok(listings.held(end, page.key(), lister, key).cloned()),
-            Chain::Loop | Chain::Followed => Err(InheritanceError::ParentLoop),
-        }
+        let held = match chain {
+            Chain::Found(value) => Some(value),
+            Chain::End(end) => listings.held(end, page.key(), lister, key).cloned(),
+            Chain::Loop | Chain::Followed => return Err(InheritanceError::ParentLoop),
+        };
+        held.transpose().map_err(InheritanceError::Unreadable)
     }
 
     /// The objects the lookups have resolved.
@@ -228,7 +237,7 @@ struct Listing<'a> {
     /// For each of [`Inheritable::ALL`], the value of the nearest of this node and
     /// the nodes listing it that has the entry, read once for all the pages that
     /// inherit it.
-    held: [Option<Object<'a>>; 4],
+    held: [Option<Held<'a>>; 4],
 }
 
 impl<'a> Listings<'a> {
@@ -268,7 +277,7 @@ impl<'a> Listings<'a> {
         page: Key<'a>,
         lister: Option<usize>,
         key: Inheritable,
-    ) -> Option<&Object<'a>> {
+    ) -> Option<&Held<'a>> {
         let lister = lister?;
         let from = if end == page {
             lister
@@ -283,12 +292,12 @@ impl<'a> Listings<'a> {
     }
 }
 
-// The value `node` has for `key`, `null` for a reference to nothing.
-fn value<'a>(node: &Node<'a>, key: Inheritable, objects: &mut Objects<'a>) -> Option<Object<'a>> {
+// The value `node` has for `key`, if it has the key.
+fn value<'a>(node: &Node<'a>, key: Inheritable, objects: &mut Objects<'a>) -> Option<Held<'a>> {
     objects.has(node, key.name()).then(|| {
         objects
-            .get(node.dict(), key.name())
-            .unwrap_or(Object::Null(Null))
+            .get_checked(node.dict(), key.name())
+            .map(|value| value.unwrap_or(Object::Null(Null)))
     })
 }
 
@@ -315,8 +324,8 @@ fn tree_parents<'a>(objects: &mut Objects<'a>) -> FxHashMap<Key<'a>, Node<'a>> {
     };
     // The kids of each /Kids array not taken yet, first first, taken from the end;
     // `None` for a direct `null`, which `MuPDF` skips.
-    let mut kids = KidsStates::<Vec<Option<Node<'a>>>>::default();
-    let mut read = |kids: &mut KidsStates<_>, node: &Node<'a>| {
+    let mut kids = KidsStates::<'a, Vec<Option<Node<'a>>>>::default();
+    let mut read = |kids: &mut KidsStates<'a, _>, node: &Node<'a>| {
         let (at, _) = kids.of(node, objects, |kids, objects| {
             let kids: Vec<_> = kids
                 .map(|kid| {

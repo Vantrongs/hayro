@@ -2,7 +2,7 @@
 
 use crate::object::macros::object;
 use crate::object::r#ref::MaybeRef;
-use crate::object::{FromBytes, Object, ObjectLike};
+use crate::object::{FromBytes, Object, ObjectIdentifier, ObjectLike};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::xref::ContentKey;
@@ -42,6 +42,25 @@ impl<'a> Array<'a> {
         T: ObjectLike<'a>,
     {
         ResolvedArrayIter::new(self.data, &self.ctx)
+    }
+
+    /// The items of the array that are of a specific type, resolved; `Err` with the
+    /// object an item refers to where the file lists it but it cannot be read
+    /// ([`crate::xref::XRef::get_checked`]). Unlike [`Self::iter`], an item of
+    /// another type, or a reference to nothing, is passed over, not the end.
+    #[allow(
+        private_bounds,
+        reason = "users shouldn't be able to implement `ObjectLike` for custom objects."
+    )]
+    pub fn iter_checked<T>(&self) -> impl Iterator<Item = Result<T, ObjectIdentifier>> + 'a
+    where
+        T: ObjectLike<'a>,
+    {
+        let ctx = self.ctx.clone();
+        self.raw_iter().filter_map(move |item| match item {
+            MaybeRef::Ref(r) => ctx.xref().get_checked_with(r.into(), &ctx).transpose(),
+            MaybeRef::NotRef(object) => object.cast::<T>().map(Ok),
+        })
     }
 
     /// Return a flex iterator over the items in the array.

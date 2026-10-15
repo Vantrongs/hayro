@@ -18,7 +18,8 @@ where
     T: ObjectLike<'a>,
 {
     // The object is read in `ctx`, which names the object the table lists here
-    // (`XRef::get_with`): the header may name another, and is no identity.
+    // (`XRef::get_with`): the header may name another, and is no identity, though it
+    // names the key the object decrypts with, which `ctx` holds.
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         r.skip::<ObjectIdentifier>(false)?;
         r.skip_white_spaces_and_comments();

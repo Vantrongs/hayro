@@ -60,11 +60,13 @@ impl WriteDirect for object::ObjRef {
 /// copied once for all streams with the same copied dictionary and data.
 fn target(source: object::ObjRef, ctx: &mut ExtractionContext<'_>) -> Option<Ref> {
     let id = ObjectIdentifier::new(source.obj_number, source.gen_number);
-    let Some(object) = ctx.pdf.xref().get::<Object<'_>>(id) else {
-        if ctx.pdf.xref().has_entry(id) {
+    let object = match ctx.pdf.xref().get_checked::<Object<'_>>(id) {
+        Ok(Some(object)) => object,
+        Ok(None) => return None,
+        Err(_) => {
             ctx.fail(ExtractionError::Unreadable(source));
+            return None;
         }
-        return None;
     };
     if let Object::Stream(stream) = &object
         && !refers(stream.dict())

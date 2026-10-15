@@ -66,3 +66,37 @@ fn a_value_pages_inherit_is_held_once() {
         );
     }
 }
+
+/// The least time, of three, loading `file` and reading the box of each of its `n`
+/// pages takes, once it is checked that each is 600 × 700 pt.
+fn boxed(file: &[u8], n: usize) -> std::time::Duration {
+    (0..3)
+        .map(|_| {
+            let start = std::time::Instant::now();
+            let pdf = Pdf::new(file.to_vec()).unwrap();
+            assert_eq!(pdf.pages().len(), n);
+            for page in pdf.pages().iter() {
+                let media_box = page.media_box();
+                assert_eq!((media_box.width(), media_box.height()), (600.0, 700.0));
+            }
+            start.elapsed()
+        })
+        .min()
+        .unwrap()
+}
+
+// A box the pages inherit is made a rectangle once for all of them, however long its
+// array: loading the pages takes time that grows with the file, not with its square.
+#[test]
+fn a_box_pages_inherit_is_read_once() {
+    let [small, large] = [1024, 2048].map(|n| {
+        let file = file(n, "MediaBox", |n| {
+            format!("[0 {} 0 600 700]", " ".repeat(64 * n))
+        });
+        boxed(&file, n)
+    });
+    assert!(
+        large <= small * 3,
+        "{small:?} for 1024 pages, {large:?} for 2048"
+    );
+}

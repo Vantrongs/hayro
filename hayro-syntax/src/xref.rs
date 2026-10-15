@@ -56,18 +56,20 @@ impl DocumentId {
 
 /// Identifies what is read from bytes of a document, for a cache of what is parsed or
 /// copied from them: the bytes, by where they are, in the file or in the decoded data
-/// of an object stream; the document; and, where it is encrypted, the entry whose key
-/// decrypts their strings. The same bytes read under another entry hold other
-/// strings, so no cache keyed by this merges them, while in a document that is not
-/// encrypted the bytes are all there is to them.
+/// of an object stream; the document; and, where it is encrypted, the object whose key
+/// decrypts their strings and streams ([`ReaderContext::decryption`]).
 ///
-/// The parts are what decrypting reads too: the entry is the one strings and streams
-/// decrypt with ([`ReaderContext::decryption`]), and the crypt filter is the
-/// document's string filter, or for a stream the one its dictionary, in these bytes,
-/// names. A key is only made from bytes read in a context
+/// That object is the one whose header the bytes are under, so in a document whose
+/// objects do not overlap the bytes alone decide it, and entries of a damaged table
+/// that lead to one object find one key for what they read there. Where a damaged
+/// file nests one object's header inside another's dictionary, the bytes they share
+/// decrypt as each of them, and their keys differ.
+///
+/// The crypt filter is the document's string filter, or for a stream the one its
+/// dictionary, in these bytes, names. A key is only made from bytes read in a context
 /// ([`Dict::content_key`](crate::object::Dict::content_key),
 /// [`Array::content_key`](crate::object::Array::content_key)), so none can leave the
-/// entry out.
+/// decryption out.
 ///
 /// Two keys are equal where they name the same bytes in the same place: the key
 /// borrows them, so no other bytes can take their place while it is held. For a cache
@@ -86,17 +88,6 @@ impl<'a> ContentKey<'a> {
             bytes,
             document: ctx.xref().document_id(),
             decryption: ctx.decryption(),
-        }
-    }
-
-    /// The key of the bytes an object is parsed from, whichever entry reads them, for
-    /// [`Parsed`]: what it keeps is read out only through [`Syntax::in_context`],
-    /// which reads what decrypts in the context of the entry asking.
-    fn syntax(bytes: &'a [u8]) -> Self {
-        Self {
-            bytes,
-            document: None,
-            decryption: None,
         }
     }
 
@@ -428,25 +419,17 @@ fn fallback_xref_map_inner<'a>(
         let mut old_r = r.clone();
 
         // First try to check if we have an object identifier.
-        if r.peek_byte().is_some_and(|b: u8| b.is_ascii_digit()) {
-            if let Some(obj_id) = scan_header(&mut r) {
-                // Check that an object follows the header, read to its end however
-                // far that is, as reading it does: the scan reads each part of the
-                // file a bounded number of times however many objects it holds.
-                let mut body = r.clone();
-                body.skip_white_spaces_and_comments();
-                opened(body.offset() - r.offset());
-                if scan.object(body.offset()).is_some() {
+        if let Some(header) = rebuilt_header(&mut r, scan) {
+            match header {
+                Some((obj_id, true)) => {
                     xref_map.insert(obj_id, EntryType::Normal(cur_pos));
                     found.push((obj_id, cur_pos));
                     last_obj_num = Some(obj_id);
                     dummy_ctx.set_obj_number(obj_id);
-                } else {
-                    broken.push(obj_id);
                 }
-            } else {
+                Some((obj_id, false)) => broken.push(obj_id),
                 // There must be a white space before the next object number.
-                r.forward_while(|b| !is_white_space_character(b));
+                None => r.forward_while(|b| !is_white_space_character(b)),
             }
         } else {
             // Then, try to check whether we have a dictionary, in particular a trailer
@@ -618,6 +601,26 @@ fn fallback_xref_map_inner<'a>(
         root_ref.map(XRefInput::RootRef)
     };
     (xref_map, unreadable, input)
+}
+
+/// What a rebuild finds at `r`: `None` where no header can start, as no number can;
+/// else the header there, if any, and whether an object follows it, read to its end
+/// however far that is, as reading it does; `r` after the header. The scan reads each
+/// part of the file a bounded number of times however many objects it holds.
+fn rebuilt_header(
+    r: &mut Reader<'_>,
+    scan: &mut Scan<'_>,
+) -> Option<Option<(ObjectIdentifier, bool)>> {
+    if !r.peek_byte().is_some_and(object::starts_number) {
+        return None;
+    }
+    let Some(id) = scan_header(r) else {
+        return Some(None);
+    };
+    let mut body = r.clone();
+    body.skip_white_spaces_and_comments();
+    opened(body.offset() - r.offset());
+    Some(Some((id, scan.object(body.offset()).is_some())))
 }
 
 /// The header `r` starts with, `N G obj`, and `r` after it.
@@ -989,6 +992,44 @@ impl XRef {
         self.get_with(id, &ctx)
     }
 
+    /// Object `id` as a `T`: `Ok(None)` where the table does not list it, or it is
+    /// another kind of object; `Err(id)` where the table lists it but it cannot be read
+    /// ([`Self::has_entry`]), so that what refers to it is not taken for whole.
+    #[allow(private_bounds)]
+    pub fn get_checked<'a, T>(&'a self, id: ObjectIdentifier) -> Result<Option<T>, ObjectIdentifier>
+    where
+        T: ObjectLike<'a>,
+    {
+        self.get_checked_with(id, &ReaderContext::new(self, false))
+    }
+
+    /// [`Self::get_checked`] from `ctx`, where a reference the cycle check rejects is
+    /// `null`, as reading it is.
+    pub(crate) fn get_checked_with<'a, T>(
+        &'a self,
+        id: ObjectIdentifier,
+        ctx: &ReaderContext<'a>,
+    ) -> Result<Option<T>, ObjectIdentifier>
+    where
+        T: ObjectLike<'a>,
+    {
+        if let Some(object) = self.get_with::<T>(id, ctx) {
+            return Ok(Some(object));
+        }
+        if self.is_lost(id, ctx) && self.get_with::<Object<'a>>(id, ctx).is_none() {
+            return Err(id);
+        }
+        Ok(None)
+    }
+
+    /// Whether object `id`, which reading from `ctx` found nothing for, is lost: the
+    /// table lists it, and it is no reference back into the chain being resolved,
+    /// which reads as `null`. Every read that tells a lost object from a missing one
+    /// asks this.
+    pub(crate) fn is_lost(&self, id: ObjectIdentifier, ctx: &ReaderContext<'_>) -> bool {
+        self.has_entry(id) && !ctx.rejects(&id)
+    }
+
     /// Return the object with the given identifier.
     #[allow(private_bounds)]
     pub(crate) fn get_with<'a, T>(
@@ -1019,8 +1060,8 @@ impl XRef {
     /// object read before at the same offset of the file under another entry.
     ///
     /// Entries of a damaged table that lead to one object are each that object, read
-    /// in its own context, but the object's bytes are parsed once: `parsed` keeps
-    /// only what reading them finds under any entry, its syntax.
+    /// in its own context, but the object's bytes are parsed once: what they hold does
+    /// not depend on the entry ([`Self::entry`]), and `parsed` keeps it.
     pub(crate) fn get_parsed<'a>(
         &'a self,
         id: ObjectIdentifier,
@@ -1038,16 +1079,22 @@ impl XRef {
         };
         parsed
             .0
-            .entry(ContentKey::syntax(data.get(at..)?))
+            .entry(ContentKey::new(data.get(at..)?, &ctx))
             .or_insert_with(|| Syntax::read(data, at, header, &ctx))
             .as_ref()?
             .in_context(data, &ctx)
     }
 
     /// The entry of object `id`, and the context to read it in, reached from `ctx`:
-    /// what is read from it is decrypted, cached and checked for cycles as `id`, the
-    /// entry it is reached through, whatever its header says. This is the only place
-    /// that names the object a context reads.
+    /// what is read from it is cached and checked for cycles as `id`, the entry it is
+    /// reached through, whatever its header says. This is the only place that names the
+    /// object a context reads.
+    ///
+    /// What is read is decrypted as the object its header names, as it was encrypted:
+    /// where entries of a damaged table lead to one object, each reads what the bytes
+    /// hold, not bytes decrypted with a key they were not encrypted with, and the
+    /// bytes alone say how they decrypt, so what is cached by them is what every entry
+    /// reads ([`ContentKey`]).
     fn entry<'a>(
         &'a self,
         id: ObjectIdentifier,
@@ -1075,6 +1122,17 @@ impl XRef {
 
         let mut ctx = ctx.clone();
         ctx.set_obj_number(id);
+        if let EntryType::Normal(offset) = entry
+            && self.is_encrypted()
+            && let Some(header) = repr
+                .data
+                .get()
+                .as_ref()
+                .get(offset..)
+                .and_then(|data| Reader::new(data).read_without_context::<ObjectIdentifier>())
+        {
+            ctx.set_decryption(header);
+        }
         ctx.parent_chain_push(id);
         ctx.set_in_content_stream(false);
         ctx.set_in_object_stream(matches!(entry, EntryType::ObjStream(..)));
@@ -1123,11 +1181,10 @@ impl XRef {
 pub(crate) struct Parsed<'a>(FxHashMap<ContentKey<'a>, Option<Syntax<'a>>>);
 
 /// What reading an indirect object finds whatever entry it is read for: the context
-/// an entry reads it in does not change how it parses.
+/// an entry reads it in changes neither how it parses nor how it decrypts.
 enum Syntax<'a> {
-    /// An object, read in the context of the first entry it was read for, which
-    /// starts at `at`.
-    Object { object: Object<'a>, at: usize },
+    /// An object, read in the context of the first entry it was read for.
+    Object(Object<'a>),
     /// A stream's dictionary, and where the dictionary ends: the stream's data is
     /// found by its /Length, which may be an object, read in each entry's context.
     Stream { dict: Dict<'a>, end: usize },
@@ -1145,7 +1202,7 @@ impl<'a> Syntax<'a> {
     /// The object `r` is at, after its header where `header` ([`read_object`]); `r`
     /// is left where it ends, a stream at its dictionary.
     fn read_from(r: &mut Reader<'a>, header: bool, ctx: &ReaderContext<'a>) -> Option<Self> {
-        let (at, object) = read_object(r, header, ctx, |r| r.read_with_context::<Dict<'a>>(ctx))?;
+        let (_, object) = read_object(r, header, ctx, |r| r.read_with_context::<Dict<'a>>(ctx))?;
         match object {
             // As `Object::read` reads an indirect object.
             Ok(dict) => {
@@ -1156,13 +1213,10 @@ impl<'a> Syntax<'a> {
                 Some(if stream {
                     Self::Stream { dict, end }
                 } else {
-                    Self::Object {
-                        object: Object::Dict(dict),
-                        at,
-                    }
+                    Self::Object(Object::Dict(dict))
                 })
             }
-            Err(object) => Some(Self::Object { object, at }),
+            Err(object) => Some(Self::Object(object)),
         }
     }
 
@@ -1174,8 +1228,7 @@ impl<'a> Syntax<'a> {
                 r.jump(*end);
                 Stream::after_dict(&mut r, dict.in_context(ctx)).map(Object::Stream)
             }
-            // A string is decrypted as the object it is read for.
-            Self::Object { object, at } => object.in_context(data.get(*at..)?, ctx),
+            Self::Object(object) => Some(object.in_context(ctx)),
         }
     }
 }
@@ -2175,6 +2228,41 @@ mod tests {
         }
     }
 
+    // Wherever reading a header finds object 3, so does a rebuild that scans the file
+    // for headers: it looks for one wherever a number can start, signs included,
+    // and reads it as reading does.
+    #[test]
+    fn a_page_whose_header_numbers_are_signed_is_read() {
+        let content = stream("", BLUE);
+        let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] /Contents 4 0 R >>";
+        let mut headers = 0;
+        for number in ["3", "+3", "3-", "+3-", "03", "+03", "3.0", "+3.0", "-3"] {
+            for generation in ["0", "+0", "-0", "0-", "+0.0"] {
+                let header = format!("{number} {generation} obj");
+                let read =
+                    Reader::new(header.as_bytes()).read_without_context::<ObjectIdentifier>();
+                if read != Some(ObjectIdentifier::new(3, 0)) {
+                    continue;
+                }
+                headers += 1;
+                for broken in [false, true] {
+                    let objects = [
+                        ("1 0 obj".to_owned(), CATALOG),
+                        ("2 0 obj".to_owned(), TREE),
+                        (header.clone(), page),
+                        ("4 0 obj".to_owned(), content.as_str()),
+                    ];
+                    assert_eq!(
+                        one_page(file_headed(&objects, broken)),
+                        (600.0, 700.0, BLUE.as_bytes().to_vec()),
+                        "{header}, rebuilt: {broken}"
+                    );
+                }
+            }
+        }
+        assert_eq!(headers, 40);
+    }
+
     /// What reading the content of the one page `file` opens to finds.
     fn content_of(file: Vec<u8>) -> Result<Vec<u8>, crate::page::ContentError> {
         let pdf = crate::Pdf::new(file).unwrap();
@@ -2225,6 +2313,82 @@ mod tests {
                 );
             }
         }
+    }
+
+    // What a page is drawn with that the file lists but that cannot be read, its own
+    // dictionary, an entry it inherits or a category of its resources, stays lost: the
+    // page reads as viewers draw it, but tells what it lost, whether the table is
+    // sound or rebuilt. A reference to an object the file does not hold is still
+    // `null`, and an entry the page is not drawn with, such as /Thumb, loses nothing.
+    #[test]
+    fn what_a_page_is_drawn_with_that_cannot_be_read_is_not_taken_for_missing() {
+        let blue = stream("", BLUE);
+        let font = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";
+        let page = |entries: &str| {
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] /Contents 4 0 R {entries} >>"
+            )
+        };
+        let tree = |entries: &str| format!("<< /Type /Pages /Kids [3 0 R] /Count 1 {entries} >>");
+        let lost = Some(ObjectIdentifier::new(5, 0));
+        let cases = [
+            // The page's resources.
+            (
+                tree(""),
+                page("/Resources 5 0 R"),
+                "<< /Font << /F1 6 0 R >> /Broken >",
+                lost,
+            ),
+            // Their fonts.
+            (
+                tree(""),
+                page("/Resources << /Font 5 0 R >>"),
+                "<< /F1 6 0 R /Broken >",
+                lost,
+            ),
+            // Resources the page inherits.
+            (
+                tree("/Resources 5 0 R"),
+                page(""),
+                "<< /Font << /F1 6 0 R >> /Broken >",
+                lost,
+            ),
+            // A box it inherits.
+            (tree("/CropBox 5 0 R"), page(""), "[0 0 600 700", lost),
+            // The page itself.
+            (
+                tree(""),
+                "<< /Type /Page /MediaBox [0 0 600 700] /Contents 4 0 R /Broken >".to_owned(),
+                "null",
+                Some(ObjectIdentifier::new(3, 0)),
+            ),
+            // Resources the file does not hold, and a thumbnail that cannot be read.
+            (tree(""), page("/Resources 9 0 R"), "null", None),
+            (tree(""), page("/Thumb 5 0 R"), "<< /Broken >", None),
+            (tree("/Resources 9 0 R"), page(""), "null", None),
+        ];
+        for (tree, page, fifth, unreadable) in &cases {
+            for broken in [false, true] {
+                let file = file_of(&[CATALOG, tree, page, &blue, fifth, font], broken);
+                let pdf = crate::Pdf::new(file).unwrap();
+                let pages = pdf.pages();
+                assert_eq!(pages.len(), 1);
+                assert_eq!(
+                    pages[0].unreadable(),
+                    *unreadable,
+                    "{tree} {page} {fifth}, rebuilt: {broken}"
+                );
+            }
+        }
+        // A page the file does not hold is an empty page that lost nothing.
+        let file = file_of(
+            &[CATALOG, "<< /Type /Pages /Kids [9 0 R] /Count 1 >>"],
+            false,
+        );
+        let pdf = crate::Pdf::new(file).unwrap();
+        assert_eq!(pdf.pages().len(), 1);
+        assert_eq!(pdf.pages()[0].unreadable(), None);
+        assert!(pdf.pages()[0].raw().is_empty());
     }
 
     #[test]

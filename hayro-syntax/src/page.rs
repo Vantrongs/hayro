@@ -95,16 +95,16 @@ fn kids_stored(entries: usize) {
 /// to it, so that the walk reads the array once however many nodes list it. The walks
 /// read /Kids only through this.
 ///
-/// The state's kids are read in the context of the first node that reads them: a
-/// page written into the array is read in each listing node's ([`Self::own`]), but a
-/// node written into it is one node, walked once, though another entry leading to the
-/// array would decrypt its strings with another key.
-struct KidsStates<T> {
+/// The state's kids are read in the context of the first node that reads them, and a
+/// page written into the array in each listing node's ([`Self::own`]): what the kids
+/// hold is the same in every one, as the bytes say how they decrypt
+/// ([`ContentKey`]), which keys the states.
+struct KidsStates<'a, T> {
     states: Vec<T>,
-    shared: FxHashMap<(usize, usize), usize>,
+    shared: FxHashMap<ContentKey<'a>, usize>,
 }
 
-impl<T> Default for KidsStates<T> {
+impl<T> Default for KidsStates<'_, T> {
     fn default() -> Self {
         Self {
             states: vec![],
@@ -113,10 +113,10 @@ impl<T> Default for KidsStates<T> {
     }
 }
 
-impl<T> KidsStates<T> {
+impl<'a, T> KidsStates<'a, T> {
     /// The index of the state of `node`'s /Kids, made by `new` from its entries if
     /// there is none, and the array, read in the node's context.
-    fn of<'a>(
+    fn of(
         &mut self,
         node: &Node<'a>,
         objects: &mut Objects<'a>,
@@ -126,16 +126,15 @@ impl<T> KidsStates<T> {
             .get(node.dict(), KIDS)
             .and_then(Object::into_array)
             .unwrap_or_default();
-        let bytes = kids.data();
-        let at = match self.shared.get(&(bytes.as_ptr() as usize, bytes.len())) {
+        let key = kids.content_key();
+        let at = match self.shared.get(&key) {
             Some(at) => *at,
             None => {
                 let at = self.states.len();
                 self.states.push(new(kids.raw_iter(), objects));
                 // An empty array is no object's bytes.
-                if !bytes.is_empty() {
-                    self.shared
-                        .insert((bytes.as_ptr() as usize, bytes.len()), at);
+                if !kids.data().is_empty() {
+                    self.shared.insert(key, at);
                 }
                 at
             }
@@ -144,7 +143,7 @@ impl<T> KidsStates<T> {
     }
 
     /// `kid`, read from the array of a state as the node listing `kids` reads it.
-    fn own<'a>(kid: &Node<'a>, kids: &Array<'a>) -> Node<'a> {
+    fn own(kid: &Node<'a>, kids: &Array<'a>) -> Node<'a> {
         match kid.id() {
             None if kid.is_dict() => Node::page(None, &kid.dict().in_context(kids.ctx())),
             _ => kid.clone(),
@@ -200,7 +199,7 @@ fn walk<'a>(tree: Node<'a>, objects: &mut Objects<'a>) -> (Vec<Listed<'a>>, List
         };
         let array = &mut kids.states[*array];
         if let Some(page) = array.pages.get(*listed) {
-            pages.push((KidsStates::<Kids<'a>>::own(page, own), Some(*at)));
+            pages.push((KidsStates::<'a, Kids<'a>>::own(page, own), Some(*at)));
             *listed += 1;
         } else if let Some(kid) = array.unread.next() {
             #[cfg(test)]
@@ -239,15 +238,20 @@ fn brute_force<'a>(xref: &'a XRef) -> Vec<Listed<'a>> {
 }
 
 /// The entries a page inherits, in the order of [`Inheritable::ALL`].
-type Inherited<'a> = [Option<Object<'a>>; 4];
+type Inherited<'a> = [Result<Option<Object<'a>>, InheritanceError>; 4];
 
 // Each of `entries` as a page with the entries it inherits, found as MuPDF finds
 // them once it has loaded every page, which reads these entries: by then a /Parent
 // loop any of the lookups meets has been repaired (see `Inheritance`). An entry
 // that cannot be found, because a /Parent chain loops even so, is not inherited.
 //
-// Pages whose resources are one dictionary, which they share through a node, or
-// which is one object, share its categories, each read once.
+// What pages share is read once for all: the categories of resources that are one
+// dictionary, which they share through a node or which is one object, and the
+// rectangle of a box array.
+//
+// A page whose own dictionary, an entry it inherits, or a category of its resources
+// is an object the file lists but that cannot be read lost what it is drawn with:
+// it keeps the object ([`Page::unreadable`]).
 fn with_inherited<'a>(
     entries: Vec<Listed<'a>>,
     listings: Arc<Listings<'a>>,
@@ -259,8 +263,7 @@ fn with_inherited<'a>(
         entries
             .iter()
             .map(|(page, lister)| {
-                Inheritable::ALL
-                    .map(|key| tree.lookup(page, &listings, *lister, key).ok().flatten())
+                Inheritable::ALL.map(|key| tree.lookup(page, &listings, *lister, key))
             })
             .collect()
     };
@@ -270,23 +273,55 @@ fn with_inherited<'a>(
     }
     let mut objects = tree.into_objects();
     // By what the dictionary is read from, which pages share where they share it.
-    let mut read = FxHashMap::<ContentKey<'a>, Resources<'a>>::default();
+    let mut read =
+        FxHashMap::<ContentKey<'a>, (Resources<'a>, Option<ObjectIdentifier>)>::default();
+    let mut rects = FxHashMap::<ContentKey<'a>, Option<Rect>>::default();
+    let mut rect = |entry: &Option<Object<'a>>| match entry {
+        Some(Object::Array(array)) => *rects
+            .entry(array.content_key())
+            .or_insert_with(|| Rect::try_from(Object::Array(array.clone())).ok()),
+        _ => None,
+    };
     entries
         .into_iter()
         .zip(inherited)
-        .map(
-            |((page, lister), [media_box, crop_box, rotate, resources])| {
-                let resources = resources.and_then(Object::into_dict).unwrap_or_default();
-                let resources = read
-                    .entry(resources.content_key())
-                    .or_insert_with(|| {
-                        Resources::read(|key| objects.get(&resources, key).and_then(dict_of))
-                    })
-                    .clone();
-                let boxes = [media_box, crop_box, rotate];
-                Page::new(page, listings.clone(), lister, boxes, resources, ctx)
-            },
-        )
+        .map(|((page, lister), inherited)| {
+            let mut unreadable = page.lost();
+            let [media_box, crop_box, rotate, resources] = inherited.map(|entry| match entry {
+                Ok(value) => value,
+                Err(InheritanceError::Unreadable(id)) => {
+                    unreadable.get_or_insert(id);
+                    None
+                }
+                Err(InheritanceError::ParentLoop) => None,
+            });
+            let resources = resources.and_then(Object::into_dict).unwrap_or_default();
+            let (resources, lost) = read
+                .entry(resources.content_key())
+                .or_insert_with(|| {
+                    let mut lost = None;
+                    let resources =
+                        Resources::read(|key| match objects.get_checked(&resources, key) {
+                            Ok(category) => category.and_then(dict_of),
+                            Err(id) => {
+                                lost.get_or_insert(id);
+                                None
+                            }
+                        });
+                    (resources, lost)
+                })
+                .clone();
+            let boxes = (rect(&media_box), rect(&crop_box), rotate);
+            Page::new(
+                page,
+                listings.clone(),
+                lister,
+                boxes,
+                resources,
+                unreadable.or(lost),
+                ctx,
+            )
+        })
         .collect()
 }
 
@@ -322,6 +357,7 @@ pub struct Page<'a> {
     rotation: Rotation,
     page_streams: OnceLock<Option<Vec<u8>>>,
     resources: Resources<'a>,
+    unreadable: Option<ObjectIdentifier>,
     /// The nodes the page tree lists pages under, and the index of the one listing
     /// this page.
     listings: Arc<Listings<'a>>,
@@ -334,13 +370,13 @@ impl<'a> Page<'a> {
         node: Node<'a>,
         listings: Arc<Listings<'a>>,
         lister: Option<usize>,
-        [media_box, crop_box, rotate]: [Option<Object<'a>>; 3],
+        (media_box, crop_box, rotate): (Option<Rect>, Option<Rect>, Option<Object<'a>>),
         resources: Resources<'a>,
+        unreadable: Option<ObjectIdentifier>,
         reader_ctx: &ReaderContext<'a>,
     ) -> Self {
-        let rect = |entry: Option<Object<'a>>| entry.and_then(|e| Rect::try_from(e).ok());
-        let media_box = rect(media_box).unwrap_or(A4);
-        let crop_box = rect(crop_box).unwrap_or(media_box);
+        let media_box = media_box.unwrap_or(A4);
+        let crop_box = crop_box.unwrap_or(media_box);
 
         let rotation = match rotate
             .and_then(Object::into_i32)
@@ -362,6 +398,7 @@ impl<'a> Page<'a> {
             rotation,
             page_streams: OnceLock::new(),
             resources,
+            unreadable,
             listings,
             lister,
             ctx: reader_ctx.clone(),
@@ -427,12 +464,13 @@ impl<'a> Page<'a> {
                 MaybeRef::NotRef(object) => Ok((None, object)),
                 MaybeRef::Ref(r) => {
                     let id = ObjectIdentifier::from(r);
-                    match self.ctx.xref().get_with::<Object<'a>>(id, &self.ctx) {
-                        Some(object) => Ok((Some(id), object)),
-                        None if self.ctx.xref().has_entry(id) => {
-                            Err(ContentError::Unreadable(Some(id)))
-                        }
-                        None => Ok((Some(id), Object::Null(Null))),
+                    match self
+                        .ctx
+                        .xref()
+                        .get_checked_with::<Object<'a>>(id, &self.ctx)
+                    {
+                        Ok(object) => Ok((Some(id), object.unwrap_or(Object::Null(Null)))),
+                        Err(id) => Err(ContentError::Unreadable(Some(id))),
                     }
                 }
             }
@@ -460,6 +498,17 @@ impl<'a> Page<'a> {
             }
             single => Ok(decode(single)?.unwrap_or_default()),
         }
+    }
+
+    /// An object the page is drawn with that the file lists but that cannot be read,
+    /// if there is one: the page's own dictionary, an entry it inherits (its boxes,
+    /// rotation or resources, [`Inheritable`]) or a category of its resources. Such a page
+    /// reads as if the object were missing, as viewers draw it, so a copy of it would
+    /// lose what the source draws; [`Self::try_page_stream`] tells the same of its
+    /// content, and what the page's dictionary and resources refer to tells it
+    /// itself ([`crate::xref::XRef::get_checked`]).
+    pub fn unreadable(&self) -> Option<ObjectIdentifier> {
+        self.unreadable
     }
 
     /// Get the resources of the page.

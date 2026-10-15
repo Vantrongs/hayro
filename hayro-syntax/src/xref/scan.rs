@@ -740,7 +740,7 @@ impl<'a> Scan<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Syntax, object_in, read_object, scan_header};
+    use super::super::{Syntax, object_in, read_object, rebuilt_header};
     use super::*;
     use crate::object::Dict;
     use crate::object::ObjectIdentifier;
@@ -875,12 +875,8 @@ mod tests {
         r.jump(at);
         let syntax = Syntax::read_from(&mut r, false, &ReaderContext::dummy())?;
         let dict = match &syntax {
-            Syntax::Object {
-                object: Object::Dict(dict),
-                ..
-            }
-            | Syntax::Stream { dict, .. } => Some(dict),
-            Syntax::Object { .. } => None,
+            Syntax::Object(Object::Dict(dict)) | Syntax::Stream { dict, .. } => Some(dict),
+            Syntax::Object(_) => None,
         };
         Some(Found {
             end: r.offset(),
@@ -909,12 +905,12 @@ mod tests {
     }
 
     /// The header at `at` of `data` and whether its object is read, as rebuilding a
-    /// table finds them (`scan_header`, then the scan).
+    /// table finds them (`rebuilt_header`).
     fn headed_rebuilt(data: &[u8], scan: &mut Scan<'_>, at: usize) -> Option<ObjectIdentifier> {
         let mut r = Reader::new(data);
         r.jump(at);
-        let header = scan_header(&mut r)?;
-        scan.object(r.offset()).map(|_| header)
+        let (header, object) = rebuilt_header(&mut r, scan).flatten()?;
+        object.then_some(header)
     }
 
     /// Reads every item of `object`, an array or dictionary, and of those in it.

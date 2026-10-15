@@ -5,7 +5,12 @@ use crate::object::dict::keys::{KIDS, MEDIA_BOX, PAGES, TYPE};
 use crate::object::{Dict, MaybeRef, Object, ObjectIdentifier};
 use crate::reader::ReaderContext;
 use crate::sync::FxHashMap;
-use crate::xref::Parsed;
+use crate::xref::{ContentKey, Parsed};
+
+/// What a reference loading reads leads to: an object; `None` where the table lists
+/// no object of its number; or, as `Err`, the object the table lists but that cannot
+/// be read ([`crate::xref::XRef::get_checked`]), which what refers to it lost.
+pub(super) type Resolved<'a> = Result<Option<Object<'a>>, ObjectIdentifier>;
 
 /// A page tree entry: a dictionary, or an empty one for any other object.
 #[derive(Clone)]
@@ -13,21 +18,26 @@ pub(super) struct Node<'a> {
     id: Option<ObjectIdentifier>,
     dict: Dict<'a>,
     is_dict: bool,
+    /// Whether the entry refers to an object the file lists but that cannot be read:
+    /// as a page, it lost what it draws.
+    lost: bool,
 }
 
 impl<'a> Node<'a> {
-    fn resolved(id: Option<ObjectIdentifier>, object: Option<Object<'a>>) -> Self {
-        let dict = object.and_then(dict_of);
+    fn resolved(id: Option<ObjectIdentifier>, object: Resolved<'a>) -> Self {
+        let lost = object.is_err();
+        let dict = object.ok().flatten().and_then(dict_of);
         Self {
             id,
             is_dict: dict.is_some(),
             dict: dict.unwrap_or_else(Dict::empty),
+            lost,
         }
     }
 
     /// A page's own entry, which is a dictionary.
     pub(super) fn page(id: Option<ObjectIdentifier>, dict: &Dict<'a>) -> Self {
-        Self::resolved(id, Some(Object::Dict(dict.clone())))
+        Self::resolved(id, Ok(Some(Object::Dict(dict.clone()))))
     }
 
     /// The entry's object; `None` for one written directly into a /Kids array.
@@ -45,6 +55,11 @@ impl<'a> Node<'a> {
 
     pub(super) fn is_dict(&self) -> bool {
         self.is_dict
+    }
+
+    /// The object the entry refers to, if the file lists it but it cannot be read.
+    pub(super) fn lost(&self) -> Option<ObjectIdentifier> {
+        self.id.filter(|_| self.lost)
     }
 }
 
@@ -66,18 +81,15 @@ pub(super) fn dict_of(object: Object<'_>) -> Option<Dict<'_>> {
 /// entries of a damaged table lead to the dictionary.
 pub(super) struct Objects<'a> {
     ctx: ReaderContext<'a>,
-    objects: FxHashMap<ObjectIdentifier, Option<Object<'a>>>,
+    objects: FxHashMap<ObjectIdentifier, Resolved<'a>>,
     /// What reading the objects found at each offset of the file, so that objects
     /// of a damaged table whose entries lead to one object are each parsed once.
     parsed: Parsed<'a>,
-    /// The entries read from dictionaries, by where the dictionary's bytes are and
-    /// the key, as read in the context of the first entry that read them: another
-    /// entry reads them in its own ([`Object::in_context`]).
-    entries: FxHashMap<(Bytes, &'static [u8]), Option<MaybeRef<Object<'a>>>>,
+    /// The entries read from dictionaries, by what the dictionary is read from and the
+    /// key, as read in the context of the first entry that read them: another entry
+    /// reads them in its own ([`Object::in_context`]), which reads the same objects.
+    entries: FxHashMap<(ContentKey<'a>, &'static [u8]), Option<MaybeRef<Object<'a>>>>,
 }
-
-/// Where bytes of the file are: their address and length.
-type Bytes = (usize, usize);
 
 impl<'a> Objects<'a> {
     pub(super) fn new(ctx: ReaderContext<'a>) -> Self {
@@ -95,18 +107,15 @@ impl<'a> Objects<'a> {
         dict: &Dict<'a>,
         key: &'static [u8],
     ) -> Option<MaybeRef<Object<'a>>> {
-        let data = dict.data();
         let entry = self
             .entries
-            .entry(((data.as_ptr() as usize, data.len()), key))
+            .entry((dict.content_key(), key))
             .or_insert_with(|| dict.get_raw::<Object<'a>>(key))
             .as_ref()?;
-        match entry {
-            MaybeRef::Ref(r) => Some(MaybeRef::Ref(*r)),
-            MaybeRef::NotRef(object) => object
-                .in_context(dict.value_data(key)?, dict.ctx())
-                .map(MaybeRef::NotRef),
-        }
+        Some(match entry {
+            MaybeRef::Ref(r) => MaybeRef::Ref(*r),
+            MaybeRef::NotRef(object) => MaybeRef::NotRef(object.in_context(dict.ctx())),
+        })
     }
 
     // Whether MuPDF sees the entry: a direct `null` is stored as no entry.
@@ -149,25 +158,35 @@ impl<'a> Objects<'a> {
         Node::resolved(id, self.resolve(entry))
     }
 
-    /// The object `entry` is or refers to; `None` for a reference to nothing.
-    pub(super) fn resolve(&mut self, entry: MaybeRef<Object<'a>>) -> Option<Object<'a>> {
+    /// The object `entry` is or refers to.
+    pub(super) fn resolve(&mut self, entry: MaybeRef<Object<'a>>) -> Resolved<'a> {
         match entry {
-            MaybeRef::NotRef(object) => Some(object),
+            MaybeRef::NotRef(object) => Ok(Some(object)),
             MaybeRef::Ref(id) => {
                 let id = ObjectIdentifier::from(id);
                 let (ctx, parsed) = (&self.ctx, &mut self.parsed);
                 self.objects
                     .entry(id)
-                    .or_insert_with(|| ctx.xref().get_parsed(id, ctx, parsed))
+                    .or_insert_with(|| match ctx.xref().get_parsed(id, ctx, parsed) {
+                        None if ctx.xref().is_lost(id, ctx) => Err(id),
+                        object => Ok(object),
+                    })
                     .clone()
             }
         }
     }
 
+    /// The object `dict` has for `key`, `Ok(None)` without the key.
+    pub(super) fn get_checked(&mut self, dict: &Dict<'a>, key: &'static [u8]) -> Resolved<'a> {
+        match self.entry(dict, key) {
+            Some(entry) => self.resolve(entry),
+            None => Ok(None),
+        }
+    }
+
     /// The object `dict` has for `key`; `None` without the key, or for a reference
-    /// to nothing.
+    /// to nothing or to an object that cannot be read.
     pub(super) fn get(&mut self, dict: &Dict<'a>, key: &'static [u8]) -> Option<Object<'a>> {
-        let entry = self.entry(dict, key)?;
-        self.resolve(entry)
+        self.get_checked(dict, key).ok().flatten()
     }
 }

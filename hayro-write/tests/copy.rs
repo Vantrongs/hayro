@@ -377,18 +377,12 @@ fn page_queries(page: usize, size: [f32; 2]) -> [ExtractionQuery; 3] {
     ]
 }
 
-// Pages drawn with entries of an encrypted file's table that lead to one object keep
-// each its own colors, copied alone or together: their resources, or one category of
-// them, are copied as each entry decrypts them, not shared by their bytes.
+// Pages drawn with entries of an encrypted file's table that lead to one object are
+// copied with that object's colors, as it was encrypted, copied alone or together.
 #[test]
-fn pages_drawn_with_entries_leading_to_one_object_keep_their_colors() {
-    for (whole, alias, target) in [(true, 9, 6), (false, 8, 7)] {
+fn pages_drawn_with_entries_leading_to_one_object_are_copied_with_its_colors() {
+    for whole in [true, false] {
         let source = Pdf::new(rc4::aliased(whole)).unwrap();
-        let own = [
-            rc4::PALETTE.to_vec(),
-            rc4::crypt(alias, &rc4::crypt(target, rc4::PALETTE)),
-        ];
-        assert_ne!(own[0], own[1]);
         for pages in [&[0][..], &[1], &[0, 1], &[1, 0]] {
             for kind in 0..3 {
                 let queries: Vec<_> = pages
@@ -408,11 +402,104 @@ fn pages_drawn_with_entries_leading_to_one_object_keep_their_colors() {
                         other => panic!("no palette: {other:?}"),
                     };
                     assert_eq!(
-                        palette, own[page],
+                        palette,
+                        rc4::PALETTE,
                         "whole: {whole}, pages {pages:?}, query {kind}, page {page}"
                     );
                 }
             }
+        }
+    }
+}
+
+/// A file of one 200 × 200 pt page under a node with `node` entries, the page with
+/// `page` entries besides its type, parent, box and content, and object 5 `fifth`, a
+/// font as object 6, and as object 7 an appearance stream with `appearance` entries.
+fn drawn_with(node: &str, page: &str, fifth: &str, appearance: &str) -> Pdf {
+    Pdf::new(fixtures::file(
+        &[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            format!("<< /Type /Pages /Kids [3 0 R] /Count 1 {node} >>").into_bytes(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R {page} >>"
+            )
+            .into_bytes(),
+            fixtures::stream("", b"BT /F1 12 Tf 10 10 Td (HELLO) Tj ET"),
+            fifth.as_bytes().to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            fixtures::stream(&format!("/BBox [0 0 50 50] {appearance}"), b"0 0 5 5 re f"),
+        ],
+        "",
+    ))
+    .unwrap()
+}
+
+// A page drawn with an object the file lists but that cannot be read, its resources,
+// a category of them, resources or a box it inherits, or its own dictionary, is an
+// error for each query that copies it, rather than a copy without what it lost. So is
+// an appearance whose own resources cannot be read. An object the file does not hold,
+// or one the page is not drawn with, as /Thumb, loses nothing.
+#[test]
+fn a_page_drawn_with_an_object_that_cannot_be_read_is_an_error() {
+    let fonts = "<< /Font << /F1 6 0 R >> /Broken >";
+    let lost = |number| ObjRef::new(number, 0);
+    for (node, page, fifth, object) in [
+        ("", "/Resources 5 0 R", fonts, 5),
+        (
+            "",
+            "/Resources << /Font 5 0 R >>",
+            "<< /F1 6 0 R /Broken >",
+            5,
+        ),
+        ("/Resources 5 0 R", "", fonts, 5),
+        ("/CropBox 5 0 R", "", "[0 0 200 200", 5),
+        ("", "/Broken >", "null", 3),
+    ] {
+        let source = drawn_with(node, page, fifth, "");
+        for query in page_queries(0, [200.0, 200.0]) {
+            let result = run(&source, &[query]).unwrap();
+            assert!(
+                matches!(result.root_refs[0], Err(ExtractionError::UnreadablePage(0, id)) if id == lost(object)),
+                "{node} {page} {fifth}: {:?}",
+                result.root_refs[0]
+            );
+        }
+        // An appearance drawn with the page's resources, as it has none.
+        let result = run(&source, &[ExtractionQuery::new_form(lost(7), 0)]).unwrap();
+        assert!(
+            matches!(
+                result.root_refs[0],
+                Err(ExtractionError::UnreadablePage(0, _))
+            ),
+            "{node} {page} {fifth}: {:?}",
+            result.root_refs[0]
+        );
+    }
+    let source = drawn_with(
+        "",
+        "/Resources << /Font << /F1 6 0 R >> >>",
+        fonts,
+        "/Resources 5 0 R",
+    );
+    let result = run(&source, &[ExtractionQuery::new_form(lost(7), 0)]).unwrap();
+    assert!(
+        matches!(result.root_refs[0], Err(ExtractionError::Unreadable(id)) if id == lost(5)),
+        "{:?}",
+        result.root_refs[0]
+    );
+    for (node, page) in [
+        ("", "/Resources 9 0 R"),
+        ("/Resources 9 0 R", ""),
+        ("", "/Resources << /Font << /F1 6 0 R >> >> /Thumb 5 0 R"),
+    ] {
+        let source = drawn_with(node, page, "<< /Broken >", "");
+        for query in page_queries(0, [200.0, 200.0]) {
+            let result = run(&source, &[query]).unwrap();
+            assert!(
+                result.root_refs[0].is_ok(),
+                "{node} {page}: {:?}",
+                result.root_refs[0]
+            );
         }
     }
 }

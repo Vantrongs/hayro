@@ -118,6 +118,14 @@ struct Lexed {
     end: Option<usize>,
 }
 
+/// Whether a number can start with `byte`, as [`lex`] reads one: with a sign, a digit,
+/// a minus or a `.`. A header starts with one, so a rebuild looks for headers where
+/// this holds.
+#[inline(always)]
+pub(crate) fn starts_number(byte: u8) -> bool {
+    matches!(byte, b'0'..=b'9' | b'+' | b'-' | b'.')
+}
+
 /// Reads a number: an optional sign, then a run of digits and minuses with at most
 /// one `.` in or before it, not followed by a regular character. A sign alone is
 /// zero where no regular character follows it (PDFJS-bug1753983; PDFJS-bug1953099
@@ -127,6 +135,10 @@ struct Lexed {
 /// what is accepted and where it ends do not depend on it.
 #[inline(always)]
 fn lex<const VALUE: bool>(r: &mut Reader<'_>) -> Option<Lexed> {
+    let first = r.peek_byte()?;
+    if !starts_number(first) {
+        return None;
+    }
     let mut lexed = Lexed {
         start: r.offset(),
         negative: false,
@@ -137,7 +149,7 @@ fn lex<const VALUE: bool>(r: &mut Reader<'_>) -> Option<Lexed> {
         has_digits: false,
         end: None,
     };
-    let signed = match r.peek_byte()? {
+    let signed = match first {
         b'-' => {
             lexed.negative = true;
             r.forward();

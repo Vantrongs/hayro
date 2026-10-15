@@ -82,6 +82,25 @@ impl<'a> Dict<'a> {
         self.get_raw::<T>(key.as_ref())?.resolve(self.ctx())
     }
 
+    /// The entry of a key as a specific object, resolved: `Ok(None)` without the key,
+    /// or where it is another kind of object or a reference to an object the file
+    /// does not list; `Err` with the object a reference leads to where the file lists
+    /// it but it cannot be read ([`crate::xref::XRef::get_checked`]).
+    #[allow(
+        private_bounds,
+        reason = "users shouldn't be able to implement `ObjectLike` for custom objects."
+    )]
+    pub fn get_checked<T>(&self, key: impl AsRef<[u8]>) -> Result<Option<T>, ObjectIdentifier>
+    where
+        T: ObjectLike<'a>,
+    {
+        match self.get_raw::<T>(key.as_ref()) {
+            Some(MaybeRef::Ref(r)) => self.ctx().xref().get_checked_with(r.into(), self.ctx()),
+            Some(MaybeRef::NotRef(value)) => Ok(Some(value)),
+            None => Ok(None),
+        }
+    }
+
     /// Get the object reference linked to a key.
     pub fn get_ref(&self, key: impl AsRef<[u8]>) -> Option<ObjRef> {
         let offset = *self.offsets()?.get(key.as_ref())?;
@@ -109,11 +128,6 @@ impl<'a> Dict<'a> {
     /// Return the object identifier of the dict, if it's an indirect object.
     pub fn obj_id(&self) -> Option<ObjectIdentifier> {
         self.ctx().obj_number()
-    }
-
-    /// The bytes from where the value of `key` starts to the dictionary's end.
-    pub(crate) fn value_data(&self, key: &[u8]) -> Option<&'a [u8]> {
-        self.data().get(*self.offsets()?.get(key)?..)
     }
 
     /// Return the raw entry for a specific key.

@@ -133,6 +133,8 @@ struct ReaderContextData<'a> {
     in_content_stream: bool,
     in_object_stream: bool,
     obj_number: Option<ObjectIdentifier>,
+    /// The object whose key decrypts what is read: see [`ReaderContext::decryption`].
+    decrypt_as: Option<ObjectIdentifier>,
     parent_chain: SmallVec<[ObjectIdentifier; 8]>,
     /// While a value shared by every resolution chain is computed: the least index in
     /// the chain of an object a cycle check rejected (see [`ReaderContext::shared`]).
@@ -183,6 +185,7 @@ impl<'a> ReaderContext<'a> {
             xref,
             in_content_stream,
             obj_number: None,
+            decrypt_as: None,
             in_object_stream: false,
             parent_chain: smallvec![],
             rejected: None,
@@ -233,22 +236,44 @@ impl<'a> ReaderContext<'a> {
         }
     }
 
-    /// The entry whose key decrypts the strings and streams read in this context;
-    /// `None` where they are not decrypted. What is read depends on it, so a cache
-    /// of what is read keys by it ([`crate::xref::ContentKey`]).
+    /// The object whose key decrypts the strings and streams read in this context;
+    /// `None` where they are not decrypted. That is the object whose header the bytes
+    /// are under, whichever entry of the table they are read for ([`XRef::get_with`]
+    /// sets it): it is a function of where the bytes are, so a cache keyed by the bytes
+    /// ([`crate::xref::ContentKey`]) never holds what another entry would read
+    /// otherwise.
+    ///
+    /// [`XRef::get_with`]: crate::xref::XRef
     #[inline]
     pub(crate) fn decryption(&self) -> Option<ObjectIdentifier> {
-        if self.xref().needs_decryption(self) {
-            self.obj_number()
-        } else {
-            None
+        if !self.xref().needs_decryption(self) {
+            return None;
+        }
+        match &self.0 {
+            ReaderContextInner::Shared(inner) => inner.decrypt_as,
+            ReaderContextInner::Dummy { .. } => None,
         }
     }
 
+    /// Reads as object `id`, decrypting as it, until [`Self::set_decryption`] says
+    /// otherwise.
     #[inline]
     pub(crate) fn set_obj_number(&mut self, id: ObjectIdentifier) {
         match &mut self.0 {
-            ReaderContextInner::Shared(inner) => Arc::make_mut(inner).obj_number = Some(id),
+            ReaderContextInner::Shared(inner) => {
+                let inner = Arc::make_mut(inner);
+                inner.obj_number = Some(id);
+                inner.decrypt_as = Some(id);
+            }
+            ReaderContextInner::Dummy { .. } => {}
+        }
+    }
+
+    /// Decrypts as object `id`.
+    #[inline]
+    pub(crate) fn set_decryption(&mut self, id: ObjectIdentifier) {
+        match &mut self.0 {
+            ReaderContextInner::Shared(inner) => Arc::make_mut(inner).decrypt_as = Some(id),
             ReaderContextInner::Dummy { .. } => {}
         }
     }
