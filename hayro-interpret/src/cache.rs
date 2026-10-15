@@ -1,6 +1,6 @@
 use crate::util::hash128;
 use hayro_syntax::hash;
-use hayro_syntax::object::{Array, Dict, MaybeRef, Name, Null, ObjRef, Object, Stream};
+use hayro_syntax::object::{Array, Dict, Name, Null, Object, Stream};
 use kurbo::{Affine, Rect};
 use std::any::Any;
 use std::collections::hash_map::Entry;
@@ -128,21 +128,6 @@ impl CacheKey for Object<'_> {
             Object::Dict(d) => d.cache_key(),
             Object::Array(a) => a.cache_key(),
             Object::Stream(s) => s.cache_key(),
-        }
-    }
-}
-
-impl CacheKey for ObjRef {
-    fn cache_key(&self) -> u128 {
-        hash128(self)
-    }
-}
-
-impl<T: CacheKey> CacheKey for MaybeRef<T> {
-    fn cache_key(&self) -> u128 {
-        match self {
-            Self::Ref(r) => r.cache_key(),
-            Self::NotRef(o) => o.cache_key(),
         }
     }
 }
