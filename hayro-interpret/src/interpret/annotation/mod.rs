@@ -446,7 +446,8 @@ impl<'a> Appearances<'a> {
     ///
     /// The normal appearance is `/AP /N`, or, when that is a dictionary of states, the
     /// state `/AS` names. A stream there draws when it has a `/BBox` that, after its
-    /// `/Matrix`, has some area, and the annotation a `/Rect`, and nothing otherwise.
+    /// `/Matrix`, has some area, and nothing otherwise; without a `/Rect` it cannot
+    /// be drawn ([`placement`]).
     /// An `/AP` that is not a dictionary, or refers to no object, draws nothing, but on a
     /// button widget, which viewers draw anew. Without an appearance there
     /// (no `/AP`, no `/N`, no stream for the state), one is generated from the
@@ -670,17 +671,16 @@ impl<'a> Appearances<'a> {
     }
 }
 
-/// Where appearance `stream` is drawn on `annot`: `None` when the annotation has no
-/// `/Rect`, or the stream has no `/BBox` that, after its `/Matrix`, encloses some
-/// area; [`Unsupported::Coordinates`] when one of its numbers cannot be written.
+/// Where appearance `stream` is drawn on `annot`: `None` when the stream has no
+/// `/BBox` that, after its `/Matrix`, encloses some area; [`Unsupported::Coordinates`]
+/// when one of its numbers cannot be written, and when the annotation has no
+/// `/Rect` that is an array, where viewers place the box on one from about 2^31 to
+/// -2^31 (observed in `PyMuPDF` 1.28.2 bake), too large to write.
 fn placement(
     stream: &StreamEntries<'_>,
     annot: &Entries<'_>,
 ) -> Result<Option<Placement>, Unsupported> {
     let Some((bbox, matrix)) = box_and_matrix(&stream.dict()) else {
-        return Ok(None);
-    };
-    let Some(rect) = rect(annot) else {
         return Ok(None);
     };
     let bbox = written_all(bbox)?;
@@ -693,6 +693,7 @@ fn placement(
     if !(transformed.width() > 0.0 && transformed.height() > 0.0) {
         return Ok(None);
     }
+    let rect = rect(annot).ok_or(Unsupported::Coordinates)?;
     let transform = written_all(rect_transform(rect, bbox, affine).as_coeffs())?;
     Ok(Some(Placement {
         bbox,

@@ -1396,15 +1396,52 @@ fn a_quad_of_no_height_draws_nothing() {
 #[test]
 fn an_annotation_without_a_rect_draws_nothing() {
     let pdf = annotations(
-        "/Annots [4 0 R 5 0 R 6 0 R]",
+        "/Annots [4 0 R 5 0 R]",
         vec![
             b"<< /Subtype /Text >>".to_vec(),
             b"<< /Subtype /Text /Rect 5 >>".to_vec(),
-            b"<< /Subtype /Square /C [1 0 0] /AP << /N 7 0 R >> >>".to_vec(),
-            common::stream("/BBox [0 0 10 10]", b"1 0 0 rg 0 0 10 10 re f"),
         ],
     );
-    assert_eq!(looks(&pdf), ["nothing", "nothing", "nothing"]);
+    assert_eq!(looks(&pdf), ["nothing", "nothing"]);
+}
+
+/// An appearance stream on an annotation without a `/Rect` that is an array (none,
+/// null, another object, a reference to no object or to one that is no array) is
+/// drawn by viewers onto a box from about 2^31 to -2^31: `PyMuPDF` 1.28.2 bake
+/// writes `-4294967500 0 0 -4294967500 2147483500 2147483500 cm` for a `/BBox` of
+/// `[0 0 1 1]`, which covers the page or lands far off it as the box and matrix
+/// fall. That is too large to write, so it cannot be drawn, written in place or an
+/// object of its own. A stream whose box encloses no area draws nothing there, as
+/// it does on a `/Rect`; an empty `/Rect` reads as `[0 0 0 0]` and draws nothing at
+/// a matrix of zeros.
+#[test]
+fn an_appearance_stream_without_a_usable_rect_is_unsupported() {
+    let stream = |bbox: &str| common::stream(&format!("/BBox {bbox}"), b"1 0 0 rg 0 0 1 1 re f");
+    for (rect, bbox, look) in [
+        ("", "[0 0 1 1]", "Coordinates"),
+        ("/Rect null", "[0 0 1 1]", "Coordinates"),
+        ("/Rect 5", "[0 0 1 1]", "Coordinates"),
+        ("/Rect 9 0 R", "[0 0 1 1]", "Coordinates"),
+        ("/Rect 6 0 R", "[0 0 1 1]", "Coordinates"),
+        ("/Rect (abc)", "[0 0 1 1]", "Coordinates"),
+        ("/Rect /R", "[0 0 1 1]", "Coordinates"),
+        ("/Rect << >>", "[0 0 10 20]", "Coordinates"),
+        ("", "[0 0 0 0]", "nothing"),
+        ("", "null", "nothing"),
+        ("/Rect []", "[0 0 1 1]", "1 0 0 rg 0 0 1 1 re f"),
+    ] {
+        let annot = format!("<< /Type /Annot /Subtype /Square {rect} /AP << /N 5 0 R >> >>");
+        let own = annotations(
+            "/Annots [4 0 R]",
+            vec![annot.clone().into_bytes(), stream(bbox), b"7".to_vec()],
+        );
+        let written = annotations(
+            &format!("/Annots [{annot}]"),
+            vec![b"null".to_vec(), stream(bbox), b"7".to_vec()],
+        );
+        assert_eq!(looks(&own), [look], "{rect} {bbox}");
+        assert_eq!(looks(&written), [look], "written: {rect} {bbox}");
+    }
 }
 
 /// A push button `/MK << /CA (X) >>` with `rect` draws its caption X as this.
