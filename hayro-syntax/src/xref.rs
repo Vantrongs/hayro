@@ -19,7 +19,7 @@ use crate::object::{DateTime, Dict};
 use crate::object::{Object, ObjectLike};
 use crate::pdf::PdfVersion;
 use crate::reader::Reader;
-use crate::reader::{Readable, ReaderContext, ReaderExt};
+use crate::reader::{Link, Readable, ReaderContext, ReaderExt};
 use crate::sync::{Arc, Mutex, MutexExt, OnceLock};
 use crate::trivia::{is_eol_character, is_white_space_character};
 use crate::util::findr_needle;
@@ -1198,9 +1198,10 @@ impl XRef {
     }
 
     /// The object entry `id` leads to, read from `ctx`, a stream taken as `taken`
-    /// says; `None` where the table does not list it, where `ctx`'s chain rejects it
-    /// or what reading it needs as a cycle, or where it is lost, which the
-    /// computation being watched is told: every read of an object goes through here.
+    /// says; `None` where the table does not list it, where `ctx`'s chain rejects its
+    /// body or what reading it needs as a cycle ([`Link`]), or where it is lost, which
+    /// the computation being watched is told: every read of an object goes through
+    /// here.
     fn read<'a>(
         &'a self,
         id: ObjectIdentifier,
@@ -1220,7 +1221,8 @@ impl XRef {
 
     /// The object entry `id`, at `entry`, leads to, read in `entered`, the context of
     /// the entry from `ctx` ([`Self::entry`]): the object its body holds, read once
-    /// for every entry leading to the same place and every read.
+    /// for every entry leading to the same place and every read. A body `ctx`'s chain
+    /// is reading already is a cycle, through whichever entry it is reached.
     fn body<'a>(
         &'a self,
         repr: &'a SomeRepr,
@@ -1231,12 +1233,21 @@ impl XRef {
         taken: Taken,
     ) -> Result<Object<'a>, Unread> {
         let (place, data, slot) = self.place(repr, id, entry, entered)?;
-        self.at_place(repr, id, entry, (place, data, slot), ctx, entered, taken)
+        let link = place.link();
+        if ctx.rejects(&link) {
+            warn!("cycle detected in indirect object: {id:?}");
+
+            return Err(Unread::Rejected);
+        }
+        let mut entered = entered.clone();
+        entered.parent_chain_push(link);
+        self.at_place(repr, id, entry, (place, data, slot), ctx, &entered, taken)
     }
 
     /// The object the body at `place`, in `data`, whose slot ends at `slot`, holds,
     /// read for entry `id`, at `entry`, in `entered`, the context of the entry from
-    /// `ctx`: read once for every entry leading there and every read.
+    /// `ctx` whose chain holds the body: read once for every entry leading there and
+    /// every read.
     #[allow(clippy::too_many_arguments)]
     fn at_place<'a>(
         &'a self,
@@ -1286,7 +1297,8 @@ impl XRef {
                         // kept for every chain only where none does.
                         let ((found, lost), shared) = ctx.shared(|ctx| {
                             self.watch(|| {
-                                let entered = Self::entered(ctx, id, repr, entry);
+                                let mut entered = Self::entered(ctx, id, repr, entry);
+                                entered.parent_chain_push(place.link());
                                 let dict = Dict::parsed(data, shape, &entered);
                                 repr.stream_data(data, place, slot, end, &dict)
                             })
@@ -1369,12 +1381,16 @@ impl XRef {
         let Some(&entry) = repr.map.get(&stream) else {
             return Err(Unread::Lost(stream));
         };
+        let mut entered = Self::entered(ctx, stream, repr, entry);
         // A stream in another is found by reading that one, which the chain stops
-        // where it is read already.
-        if matches!(entry, EntryType::ObjStream(..)) && ctx.rejects(&stream) {
-            return Err(Unread::Rejected);
+        // where it is finding the stream already.
+        if matches!(entry, EntryType::ObjStream(..)) {
+            let locating = Link::Locating(stream);
+            if ctx.rejects(&locating) {
+                return Err(Unread::Rejected);
+            }
+            entered.parent_chain_push(locating);
         }
-        let entered = Self::entered(ctx, stream, repr, entry);
         let place = self.place(repr, stream, entry, &entered)?;
         self.decoded(repr, stream, entry, place, ctx)
     }
@@ -1395,10 +1411,12 @@ impl XRef {
         ctx: &ReaderContext<'a>,
     ) -> Result<(usize, &'a ObjectStream), Unread> {
         let decoded = repr.data.object_stream(place.0, stream, ctx, |ctx| {
-            if ctx.rejects(&stream) {
+            let link = place.0.link();
+            if ctx.rejects(&link) {
                 return None;
             }
-            let entered = Self::entered(ctx, stream, repr, entry);
+            let mut entered = Self::entered(ctx, stream, repr, entry);
+            entered.parent_chain_push(link);
             let read = |taken| self.at_place(repr, stream, entry, place, ctx, &entered, taken);
             match read(Taken::Contained) {
                 Ok(Object::Stream(contained)) => {
@@ -1439,11 +1457,11 @@ impl XRef {
         Some(objects)
     }
 
-    /// The entry of object `id`, and the context to read it in, reached from `ctx`:
-    /// what is read from it is cached and checked for cycles as `id`, the entry it is
-    /// reached through, whatever its header says. This is the only place that names the
-    /// object a context reads. An object the table lists but that cannot be read has
-    /// no entry, and is lost ([`Self::watch`]).
+    /// The entry of object `id`, and the context to find its place in, reached from
+    /// `ctx`: what is read from it is decrypted as its header says and named `id`,
+    /// the entry it is reached through, but checked for cycles by its body
+    /// ([`Self::body`]). An object the table lists but that cannot be read has no
+    /// entry, and is lost ([`Self::watch`]).
     fn entry<'a>(
         &'a self,
         id: ObjectIdentifier,
@@ -1461,16 +1479,11 @@ impl XRef {
             return None;
         };
 
-        if ctx.rejects(&id) {
-            warn!("cycle detected in indirect object: {id:?}");
-
-            return None;
-        }
-
         Some((repr, entry, Self::entered(ctx, id, repr, entry)))
     }
 
-    /// The context entry `id`, at `entry`, is read in from `ctx`.
+    /// The context entry `id`, at `entry`, is read in from `ctx`, but for the link to
+    /// what it reads, which the caller adds to the chain once it knows it ([`Link`]).
     ///
     /// What is read is decrypted as the object its header names, as it was encrypted:
     /// where entries of a damaged table lead to one object, each reads what the bytes
@@ -1489,7 +1502,6 @@ impl XRef {
         if let Some(header) = repr.headers.get(&id) {
             ctx.set_decryption(*header);
         }
-        ctx.parent_chain_push(id);
         ctx.set_in_content_stream(false);
         ctx.set_in_object_stream(matches!(entry, EntryType::ObjStream(..)));
         ctx

@@ -135,11 +135,35 @@ struct ReaderContextData<'a> {
     obj_number: Option<ObjectIdentifier>,
     /// The object whose key decrypts what is read: see [`ReaderContext::decryption`].
     decrypt_as: Option<ObjectIdentifier>,
-    parent_chain: SmallVec<[ObjectIdentifier; 8]>,
+    parent_chain: SmallVec<[Link; 8]>,
     /// While a value shared by every resolution chain is computed: the least index in
     /// the chain of an object a cycle check rejected (see [`ReaderContext::shared`]).
     rejected: Option<Arc<Rejected>>,
 }
+
+/// What a chain of references is resolving, which a cycle check rejects where the
+/// chain reaches it again.
+///
+/// A body is named by where its bytes are (`Place::link`), not by the entry of the
+/// table read to reach it: every entry leading to one body is one link, so what is
+/// read from the body, which a cache keyed by the body keeps for every entry
+/// ([`crate::xref::ContentKey`], [`crate::xref::StreamId`]), is read alike through
+/// any of them. A reference back to a body being read is a cycle by whichever entry
+/// it names. Sixteen bytes, as a chain is copied with each context that extends it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Link {
+    /// The body at this offset of the file.
+    File(usize),
+    /// The body at this offset of the decoded data of the object stream kept at
+    /// this index ([`crate::data::Data::object_stream`], which keeps fewer than
+    /// 2^32).
+    Stream(u32, usize),
+    /// Where the object stream with this number is, which takes reading the object
+    /// stream the table puts it in: there is no place to name until that is read.
+    Locating(ObjectIdentifier),
+}
+
+const _: () = assert!(size_of::<Link>() == 16);
 
 /// The least index in a resolution chain of an object a cycle check rejected.
 #[derive(Debug)]
@@ -294,13 +318,13 @@ impl<'a> ReaderContext<'a> {
         }
     }
 
-    /// Whether `id` is being resolved already in this context's chain, which a cycle
+    /// Whether `link` is being resolved already in this context's chain, which a cycle
     /// check rejects: a value computed for [`Self::shared`] notes where.
     #[inline]
-    pub(crate) fn rejects(&self, id: &ObjectIdentifier) -> bool {
+    pub(crate) fn rejects(&self, link: &Link) -> bool {
         match &self.0 {
             ReaderContextInner::Shared(inner) => {
-                let Some(index) = inner.parent_chain.iter().position(|other| other == id) else {
+                let Some(index) = inner.parent_chain.iter().position(|other| other == link) else {
                     return false;
                 };
                 if let Some(rejected) = &inner.rejected {
@@ -312,20 +336,19 @@ impl<'a> ReaderContext<'a> {
         }
     }
 
-    /// The value `compute` finds for an object `id` it resolves first, from this
-    /// context, and whether every resolution chain finds it, so that it may be kept
-    /// for all.
+    /// The value `compute` finds for a body it resolves first, from this context, and
+    /// whether every resolution chain finds it, so that it may be kept for all.
     ///
-    /// A cycle check rejects an object already being resolved in the chain, so what
-    /// is computed from `id` depends on the chain where a check rejected an object
-    /// the chain held before `id` would be resolved, `id` itself included where the
-    /// chain holds it already; a check rejecting `id` or an object resolved from it
-    /// after that rejects it from any chain.
+    /// A cycle check rejects a link already being resolved in the chain ([`Link`]),
+    /// so what is computed from the body depends on the chain where a check rejected
+    /// a link the chain held before the body would be resolved, the body itself
+    /// included where the chain holds it already; a check rejecting the body or a link
+    /// resolved from it after that rejects it from any chain.
     pub(crate) fn shared<T>(&self, compute: impl FnOnce(&Self) -> T) -> (T, bool) {
         let ReaderContextInner::Shared(inner) = &self.0 else {
             return (compute(self), true);
         };
-        // The index `id` is resolved at.
+        // The index the body is resolved at.
         let own = inner.parent_chain.len();
         let rejected = Arc::new(Rejected::new());
         let mut ctx = self.clone();
@@ -347,9 +370,9 @@ impl<'a> ReaderContext<'a> {
     }
 
     #[inline]
-    pub(crate) fn parent_chain_push(&mut self, id: ObjectIdentifier) {
+    pub(crate) fn parent_chain_push(&mut self, link: Link) {
         match &mut self.0 {
-            ReaderContextInner::Shared(inner) => Arc::make_mut(inner).parent_chain.push(id),
+            ReaderContextInner::Shared(inner) => Arc::make_mut(inner).parent_chain.push(link),
             ReaderContextInner::Dummy { .. } => {}
         }
     }

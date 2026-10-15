@@ -9,7 +9,7 @@ use kurbo::{Affine, Rect};
 
 #[path = "../../../hayro-syntax/tests/common/fixtures.rs"]
 mod fixtures;
-pub(crate) use fixtures::{file, one_page, stream};
+pub(crate) use fixtures::{file, file_with_aliases, one_page, one_page_objects, stream};
 
 /// Interprets the first page of `pdf` into `device` in PDF user space (y up), so
 /// coordinates read like the numbers in the file.

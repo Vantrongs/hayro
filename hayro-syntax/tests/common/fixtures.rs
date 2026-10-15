@@ -32,6 +32,36 @@ pub(crate) fn file(objects: &[Vec<u8>], trailer: &str) -> Vec<u8> {
     out
 }
 
+/// A file of `objects` numbered from 1, as [`file`] writes them, whose table
+/// also lists objects from `objects.len() + 1` on, one for each of `aliases`, at the
+/// place of object `aliases[i]`. Those entries do not lead to their objects, so the
+/// file is read by a scan, which finds no object of theirs and keeps them: each
+/// leads to the body of the object whose place it names.
+pub(crate) fn file_with_aliases(objects: Vec<Vec<u8>>, aliases: &[usize]) -> Vec<u8> {
+    let size = objects.len() + aliases.len() + 1;
+    let held: usize = objects.iter().map(Vec::len).sum();
+    let mut out = Vec::with_capacity(held + 32 * objects.len() + 20 * size + 128);
+    out.extend_from_slice(b"%PDF-1.7\n");
+    let mut offsets = Vec::new();
+    for (i, o) in objects.into_iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend_from_slice(&o);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let aliased: Vec<usize> = aliases.iter().map(|a| offsets[a - 1]).collect();
+    offsets.extend(aliased);
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+    for o in offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
 /// The catalog, page tree and dictionary of one `size` × `size` pt page with `entries`
 /// besides its type, parent and media box: objects 1 to 3.
 pub(crate) fn one_page_objects(size: u32, entries: &str) -> Vec<Vec<u8>> {

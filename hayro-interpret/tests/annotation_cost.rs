@@ -1358,7 +1358,9 @@ fn what_annotations_share_is_read_once_however_reached() {
         sharing_cost(80, &bbox, stream),
     );
     assert_eq!(more.drew.streams, 80);
-    costs_at_most(fewer, more, 8 << 10, 1_000, "a shared /BBox");
+    // About 8.5 KiB an annotation, most of it the contexts its objects are read in,
+    // whose chains of references name each body by 16 bytes.
+    costs_at_most(fewer, more, 10 << 10, 1_000, "a shared /BBox");
     let name = vec![long_name()];
     let subtype = "/Subtype 4 0 R /Rect [10 10 110 40]";
     let (fewer, more) = (
@@ -1574,39 +1576,9 @@ fn shared_state_cost(n: usize, len: usize, state: &str) -> Listed {
     listed(&pdf, |appearances| drew(appearances, page, PAGE))
 }
 
-/// A file of `objects` numbered from 1, as `common::file` writes them, whose table
-/// also lists objects from `objects.len() + 1` on, one for each of `aliases`, at the
-/// place of object `aliases[i]`. Those entries do not lead to their objects, so the
-/// file is read by a scan, which finds no object of theirs and keeps them: each
-/// leads to the body of the object whose place it names.
-fn file_with_aliases(objects: Vec<Vec<u8>>, aliases: &[usize]) -> Vec<u8> {
-    let size = objects.len() + aliases.len() + 1;
-    let held: usize = objects.iter().map(Vec::len).sum();
-    let mut out = Vec::with_capacity(held + 32 * objects.len() + 20 * size + 128);
-    out.extend_from_slice(b"%PDF-1.7\n");
-    let mut offsets = Vec::new();
-    for (i, o) in objects.into_iter().enumerate() {
-        offsets.push(out.len());
-        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
-        out.extend_from_slice(&o);
-        out.extend_from_slice(b"\nendobj\n");
-    }
-    let aliased: Vec<usize> = aliases.iter().map(|a| offsets[a - 1]).collect();
-    offsets.extend(aliased);
-    let xref = out.len();
-    out.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
-    for o in offsets {
-        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
-    }
-    out.extend_from_slice(
-        format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
-    );
-    out
-}
-
 /// The cost of a page with `n` annotations whose states, `/AS`, each name a long
 /// name of `len` bytes, object 4, through an entry of the table of its own that
-/// leads to it ([`file_with_aliases`]), or, not `aliased`, all through `4 0 R`, and
+/// leads to it ([`common::file_with_aliases`]), or, not `aliased`, all through `4 0 R`, and
 /// share their appearances, `/AP 5 0 R`, whose `/N` holds that state as `state`.
 fn aliased_state_cost(n: usize, len: usize, state: &str, aliased: bool) -> Listed {
     let name = format!("/{}", "A".repeat(len));
@@ -1630,7 +1602,7 @@ fn aliased_state_cost(n: usize, len: usize, state: &str, aliased: bool) -> Liste
         .into_bytes()
     }));
     let aliases = if aliased { vec![4; n] } else { vec![] };
-    let pdf = Pdf::new(file_with_aliases(objects, &aliases)).expect("valid pdf");
+    let pdf = Pdf::new(common::file_with_aliases(objects, &aliases)).expect("valid pdf");
     let xref = pdf.xref();
     for i in 0..aliases.len() {
         let alias = ObjectIdentifier::new((first + i) as i32, 0);

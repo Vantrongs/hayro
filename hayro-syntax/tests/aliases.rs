@@ -201,3 +201,43 @@ fn entries_leading_to_one_stream_identify_it_once() {
         assert_ne!(identity(4), identity(3), "encrypted: {encrypted}");
     }
 }
+
+// A stream reads what its dictionary refers to alike through every entry leading to
+// it, so that one identity is one decoding: a reference back to the stream itself, by
+// another entry leading to it, is a cycle through either entry. Here /DecodeParms
+// names the stream, whose dictionary sets a predictor that would turn [65, 1] into
+// [65, 66]; MuPDF (PyMuPDF 1.28.2) reads [65, 1] through object 3.
+#[test]
+fn a_stream_reads_its_parameters_alike_through_every_entry_leading_to_it() {
+    // zlib of [65, 1].
+    const DATA: &[u8] = &[120, 156, 115, 100, 4, 0, 0, 133, 0, 67];
+    for encrypted in [true, false] {
+        for parms in ["4 0 R", "3 0 R"] {
+            let entries =
+                format!("/Filter /FlateDecode /DecodeParms {parms} /Predictor 2 /Columns 2");
+            let file = rc4::file_with(
+                &[
+                    Part::Object("<< /Type /Catalog /Pages 2 0 R >>", b""),
+                    Part::Object("<< /Type /Pages /Kids [] /Count 0 >>", b""),
+                    Part::StreamWith(&entries, DATA),
+                ],
+                &[(4, 3)],
+                encrypted,
+            );
+            let pdf = Pdf::new(file).unwrap();
+            let stream = |n: i32| {
+                pdf.xref()
+                    .get::<Stream<'_>>(ObjectIdentifier::new(n, 0))
+                    .unwrap()
+            };
+            for n in [3, 4] {
+                assert_eq!(
+                    stream(n).decoded().unwrap().as_ref(),
+                    [65, 1],
+                    "encrypted: {encrypted}, /DecodeParms {parms}, read as {n}"
+                );
+            }
+            assert_eq!(stream(3).identity(), stream(4).identity());
+        }
+    }
+}

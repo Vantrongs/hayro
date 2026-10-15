@@ -309,3 +309,66 @@ fn a_texel_past_a_masks_data_holds_a_piece() {
     assert_eq!(data, &[0]);
     assert!(*peak < 1 << 20, "peak {peak} bytes");
 }
+
+/// The pixels and `pixels_key` of each raster image drawn.
+#[derive(Default)]
+struct Pixels(Vec<(Option<u128>, Vec<u8>)>);
+
+impl<'a> Device<'a> for Pixels {
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
+    fn draw_glyph_run(&mut self, _: &GlyphRun<'_, 'a>, _: DrawProps<'a>, _: &DrawMode) {}
+    fn draw_image(&mut self, image: Image<'a, '_>, _: ImageDrawProps<'a>) {
+        if let Image::Raster(r) = image {
+            let key = r.pixels_key();
+            r.with_rgba(
+                |image, _| {
+                    self.0.push((
+                        key,
+                        match image {
+                            ImageData::Rgb(d) => d.data,
+                            ImageData::Luma(d) => d.data,
+                        },
+                    ));
+                },
+                None,
+            );
+        }
+    }
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
+    fn knock_out(&mut self, _: &BezPath, _: kurbo::Affine, _: &DrawMode) {}
+}
+
+/// An image drawn through two entries of the table that lead to it, its `/DecodeParms`
+/// naming the second entry, has one key and the same pixels through both, in either
+/// order: a reference from the image back to itself is a cycle by either entry, so
+/// the predictor its own dictionary sets, which would make [65, 66] of [65, 1], is
+/// not applied (`MuPDF`, `PyMuPDF` 1.28.2, reads [65, 1] through the first entry).
+#[test]
+fn an_image_drawn_through_two_entries_decodes_alike() {
+    // zlib of [65, 1].
+    const DATA: &[u8] = &[120, 156, 115, 100, 4, 0, 0, 133, 0, 67];
+    for content in ["/A Do /B Do", "/B Do /A Do"] {
+        let mut objects = common::one_page_objects(
+            100,
+            "/Contents 4 0 R /Resources << /XObject << /A 5 0 R /B 6 0 R >> >>",
+        );
+        objects.extend([
+            common::stream("", content.as_bytes()),
+            image(
+                "/Width 2 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 \
+                 /Filter /FlateDecode /DecodeParms 6 0 R /Predictor 2 /Columns 2",
+                DATA,
+            ),
+        ]);
+        let pdf = Pdf::new(common::file_with_aliases(objects, &[5])).expect("valid pdf");
+        let mut pixels = Pixels::default();
+        common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut pixels);
+        let [first, second] = pixels.0.try_into().expect("two images");
+        assert!(first.0.is_some(), "{content}");
+        assert_eq!(first, second, "{content}");
+        assert_eq!(first.1, [65, 1], "{content}");
+    }
+}

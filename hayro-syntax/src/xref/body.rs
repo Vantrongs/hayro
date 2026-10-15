@@ -13,7 +13,7 @@ use crate::hash;
 use crate::lost::Lost;
 use crate::object::parsed::{DictNode, Node};
 use crate::object::{Number, ObjectIdentifier};
-use crate::reader::{Reader, ReaderContext, ReaderExt};
+use crate::reader::{Link, Reader, ReaderContext, ReaderExt};
 use crate::sync::Arc;
 use crate::trivia::{is_eol_character, is_white_space_character};
 
@@ -37,6 +37,18 @@ pub(crate) struct Place {
     pub(super) source: Source,
     pub(super) at: usize,
     pub(super) decryption: Option<ObjectIdentifier>,
+}
+
+impl Place {
+    /// The place as a link of a chain of references ([`Link`]): the same for every
+    /// entry leading here, whatever key decrypts what is read.
+    pub(crate) fn link(&self) -> Link {
+        match self.source {
+            Source::File => Link::File(self.at),
+            // The list keeping object streams holds fewer than 2^32.
+            Source::Stream(kept) => Link::Stream(kept as u32, self.at),
+        }
+    }
 }
 
 /// The bytes an object is in.

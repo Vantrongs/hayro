@@ -8,6 +8,9 @@ pub(crate) enum Part<'a> {
     Object(&'a str, &'a [u8]),
     /// A stream holding `data`, encrypted.
     Stream(&'a [u8]),
+    /// A stream holding `data`, encrypted, its dictionary holding `entries` too.
+    #[allow(dead_code)]
+    StreamWith(&'a str, &'a [u8]),
 }
 
 const PADDING: [u8; 32] = [
@@ -103,9 +106,13 @@ pub(crate) fn file_headed(
                     .replace("STRING", &format!("<{}>", hex(&crypt(number, string))))
                     .bytes(),
             ),
-            Part::Stream(data) => {
+            Part::Stream(data) | Part::StreamWith(_, data) => {
+                let entries = match part {
+                    Part::StreamWith(entries, _) => format!("{entries} "),
+                    _ => String::new(),
+                };
                 let data = crypt(number, data);
-                out.extend(format!("<< /Length {} >>\nstream\n", data.len()).bytes());
+                out.extend(format!("<< {entries}/Length {} >>\nstream\n", data.len()).bytes());
                 out.extend(data);
                 out.extend(b"\nendstream");
             }

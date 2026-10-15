@@ -130,7 +130,7 @@ impl Data {
             self.watched.watch(true, || {
                 let objects = decode(ctx);
                 // Unless the chain being read rejects it, as a cycle.
-                if objects.is_none() && !ctx.rejects(&id) {
+                if objects.is_none() && !ctx.rejects(&place.link()) {
                     self.watched.note(Some(id));
                 }
                 objects
