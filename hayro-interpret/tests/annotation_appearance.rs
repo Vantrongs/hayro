@@ -2644,3 +2644,33 @@ fn an_annotation_that_is_no_object_of_its_own_is_drawn_only_by_its_stream() {
     );
     assert_eq!(looks(&pdf), ["nothing", "0 0 80 30 re f"]);
 }
+
+/// Text whose last lines reach the page from far above is drawn however its line
+/// heights round as they add up: `FreeText`s 240,257 and 432,300 pt high, of
+/// 16,662 and 30,000 words `A`, one a line, whose last lines show at the top of the
+/// page (`PyMuPDF` 1.28.2 bake draws them). Ten line breaks after the last word add
+/// lines below it and change nothing drawn.
+#[test]
+fn the_last_lines_of_a_tall_text_are_drawn() {
+    for (rect, words) in [("10 -100 19 240157", 16_662), ("10 0 20 432300", 30_000)] {
+        let raw = |breaks: &str| {
+            let annot = format!(
+                "<< /Type /Annot /Subtype /FreeText /BS << /W 0 >> /Rect [{rect}] \
+                 /DA (/Helv 12 Tf 0 g) /Contents ({}{breaks}) >>",
+                vec!["A"; words].join(" ")
+            );
+            let pdf = annotations("/Annots [4 0 R]", vec![annot.into_bytes()]);
+            let appearances =
+                Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+            match appearances.look(&annots(&pdf)[0], PAGE) {
+                Look::Generated(a) => a.content,
+                Look::Nothing => "nothing".into(),
+                Look::Unsupported(why) => format!("{why:?}"),
+                Look::Stream { .. } => "stream".into(),
+            }
+        };
+        let (drawn, control) = (raw(""), raw(&"\\n".repeat(10)));
+        assert!(drawn.contains(" Do"), "{rect}: {drawn}");
+        assert_eq!(drawn, control, "{rect}");
+    }
+}

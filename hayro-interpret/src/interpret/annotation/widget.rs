@@ -273,11 +273,11 @@ fn draw<'a>(
         && (rich || annot.has_text(Text::DefaultStyle))
     {
         let options = kind == Kind::List && !rich;
-        let mut read = vec![Some(annot.text_source(Text::DefaultStyle))];
+        let mut read = vec![annot.source(Text::DefaultStyle.key())];
         if rich {
-            read.push(Some(annot.text_source(Text::RichValue)));
+            read.push(annot.source(Text::RichValue.key()));
         } else if !options {
-            read.push(field.text_source(Inherited::Value, Text::FieldValue, annot));
+            read.push(field.source(Inherited::Value));
         }
         let key = TextKey::new(
             read,
@@ -421,14 +421,18 @@ fn draw<'a>(
             let labels = doc.labels(annot.source(b"Opt"), || annot.items(b"Opt"));
             let labels = labels.get(top_index..).unwrap_or_default();
             let (top, step) = (f64::from(fh - pad), f64::from(1.116 * size));
-            if let Some(last) = labels.len().checked_sub(1) {
-                for i in text::rows_of(fonts.bound(face), size, top, step, last, seen) {
-                    let label = doc.label(&labels[i], face)?;
-                    let origin = (f64::from(pad), top - (i as f64 + 1.0) * step);
-                    let at = set(size);
-                    text::draw_line(fonts, &label, &at, origin, Affine::IDENTITY, seen, out)?;
-                }
-            }
+            text::draw_options(
+                fonts,
+                |i| doc.label(&labels[i], face),
+                labels.len(),
+                face,
+                &set(size),
+                f64::from(pad),
+                top,
+                step,
+                seen,
+                out,
+            )?;
         }
         _ if multiline => {
             let size = size.unwrap_or(12.0);

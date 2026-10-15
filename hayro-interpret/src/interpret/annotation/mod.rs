@@ -344,7 +344,7 @@ impl<'a> Appearances<'a> {
     }
 
     fn look_read(&self, annot: &Dict<'a>, visible: kurbo::Rect) -> Look<'a> {
-        let entries = Entries::of(annot.clone(), &self.objects);
+        let entries = self.objects.annotation(annot.clone());
         match entries.get(AP) {
             // A reference to no object.
             Value::Null if entries.present(AP) => return self.not_a_dictionary(annot, visible),
@@ -382,7 +382,7 @@ impl<'a> Appearances<'a> {
     /// What `annot`, whose `/AP` is neither a dictionary nor null, looks like:
     /// nothing, but a button, whose appearance viewers make anew.
     fn not_a_dictionary(&self, annot: &Dict<'a>, visible: kurbo::Rect) -> Look<'a> {
-        let annot = Entries::of(annot.clone(), &self.objects);
+        let annot = self.objects.annotation(annot.clone());
         let button = annot.is(SUBTYPE, b"Widget")
             && self
                 .field(&annot)
@@ -721,21 +721,6 @@ impl<'a> Field<'a> {
         self.0[key as usize]
             .as_ref()
             .map_or(Value::Null, |d| d.get(key.key()))
-    }
-
-    /// Where text entry `entry` is held, as [`Field::source`] gives it, but for an
-    /// entry of widget `annot` itself, its text ([`Entries::text_source`]): what many
-    /// widgets share is held above them.
-    fn text_source(
-        &self,
-        key: Inherited,
-        entry: entries::Text,
-        annot: &Entries<'_>,
-    ) -> Option<Source> {
-        match &self.0[key as usize] {
-            Some(d) if d.id().is_some() && d.id() == annot.id() => Some(d.text_source(entry)),
-            _ => self.source(key),
-        }
     }
 
     /// Where entry `key` is held ([`Entries::source`]): in the nearest dictionary

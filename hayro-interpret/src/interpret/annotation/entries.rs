@@ -151,8 +151,9 @@ impl Text {
 
 /// Entry `key` as a key for what a document makes of its value once: where the
 /// value is held (the object it refers to, the object of the dictionary it lies
-/// in, or nowhere, when the entry is absent), or its text, and the entry's key, so
-/// that two entries with the same source have the same value and are read alike.
+/// in, or nowhere, when the entry is absent), never the value itself, and the
+/// entry's key, so that two entries with the same source have the same value and
+/// are read alike, and telling them apart costs nothing however long the value.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Source {
     held: Held,
@@ -174,8 +175,6 @@ enum Held {
     Object(ObjRef),
     In(ObjRef),
     Absent,
-    Text(Option<Vec<u8>>),
-    Name(Vec<u8>),
     /// Entry `n` of the array held there.
     Item(Box<Self>, usize),
 }
@@ -199,9 +198,10 @@ impl Held {
 /// annotations that share it must not each pay. So each object a reference names is
 /// read once, and so is each entry read of a dictionary that lies in one, and the
 /// first entries read of an array there; an annotation's own entries, which no
-/// other annotation reads, are read as they are wanted. Read without them
-/// ([`Objects::default`]), as boxes and matrices outside annotations are, each
-/// reference is followed afresh.
+/// other annotation reads, are read as they are wanted, but those of one a page
+/// names again, which are kept as a shared object's ([`Objects::annotation`]). Read
+/// without them ([`Objects::default`]), as boxes and matrices outside annotations
+/// are, each reference is followed afresh.
 #[derive(Clone, Default)]
 pub(crate) struct Objects<'a> {
     read: Option<Rc<Read<'a>>>,
@@ -304,6 +304,22 @@ impl<'a> Objects<'a> {
 }
 
 impl<'a> Objects<'a> {
+    /// The entries of annotation `dict`: read as they are wanted the first time it
+    /// is looked at, and, once [`Objects::own`] has told of its object, as a shared
+    /// object's are, each read once and kept, so that an annotation a page's
+    /// `/Annots` names many times reads none of its entries again however long.
+    pub(crate) fn annotation(&self, dict: Dict<'a>) -> Entries<'a> {
+        let seen = match (&self.read, dict.obj_id()) {
+            (Some(read), Some(id)) => read.places.borrow().contains_key(&ObjRef::from(id)),
+            _ => false,
+        };
+        let objects = Self {
+            read: self.read.clone(),
+            shared: self.shared || seen,
+        };
+        Entries(dict, objects)
+    }
+
     /// Whether `dict` is an object of its own, rather than held directly in another,
     /// as an annotation written into a page's `/Annots` is; `None` where the file
     /// tells neither: the object `dict` names as its own is neither it nor one that
@@ -686,7 +702,9 @@ impl<'a> Entries<'a> {
     }
 
     /// Where entry `key`'s value is held ([`Source`]); `None` for a value in a direct
-    /// dictionary, which no key names. The value is not read.
+    /// dictionary, which no key names. The value is not read: a text many
+    /// annotations share is so known by the object that holds it, and one an
+    /// annotation holds itself by that annotation, however long.
     pub(crate) fn source(&self, key: &'static [u8]) -> Option<Source> {
         let held = if let Some(r) = self.0.get_ref(key) {
             Held::Object(r)
@@ -696,21 +714,6 @@ impl<'a> Entries<'a> {
             Held::In(self.id()?)
         };
         Some(Source { held, key })
-    }
-
-    /// Text entry `entry` as a source: the object it refers to, read once for the
-    /// document, or, in the dictionary itself, its text or name, which annotations
-    /// sharing it then share however they are held.
-    pub(crate) fn text_source(&self, entry: Text) -> Source {
-        let key = entry.key();
-        let held = match self.0.get_ref(key) {
-            Some(r) => Held::Object(r),
-            None => match self.get(key) {
-                Value::Name(n) => Held::Name(n.as_ref().to_vec()),
-                value => Held::Text(value.text(entry)),
-            },
-        };
-        Source { held, key }
     }
 
     /// Whether this dictionary is an object of its own ([`Objects`]), rather than

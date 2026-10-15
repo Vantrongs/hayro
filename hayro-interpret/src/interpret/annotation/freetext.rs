@@ -65,7 +65,7 @@ pub(super) fn free_text<'a>(
             [Text::DefaultStyle, Text::Contents]
         };
         let key = TextKey::new(
-            read.map(|t| Some(annot.text_source(t))),
+            read.map(|t| annot.source(t.key())),
             Family::Text.into(),
             vec![FREE_TEXT, u64::from(positive)],
         );
@@ -76,8 +76,8 @@ pub(super) fn free_text<'a>(
             doc.fonts.shape_rich(&spans)
         })?
     } else {
-        let source = annot.text_source(Text::Contents);
-        doc.plain(Some(&source), family.into(), TEXT, || contents(annot))?
+        let source = annot.source(Text::Contents.key());
+        doc.plain(source.as_ref(), family.into(), TEXT, || contents(annot))?
     };
     // Plain text is drawn at the default appearance's size, 12 pt for a size fit to
     // the box; rich text's base size is the default appearance's, and a size fit to

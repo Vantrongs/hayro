@@ -5,6 +5,13 @@
 //! Text an entry holds is set once for the document ([`Shaped`]), whatever size,
 //! width and box each annotation that shows it lays it out in; each lays out lines
 //! only up to the last its box can show, and draws only the glyphs that can show.
+//!
+//! What a glyph shows is decided once, by [`Pen`], as every glyph drawn passes its
+//! test ([`reaches`]). Each search or bound that passes over lines, spans or glyphs
+//! without drawing them ([`skips`]) is a test that, in the same rounded arithmetic
+//! as the layout's and the pen's, implies the pen's for each of them: what it
+//! passes over, the pen would not have drawn. Tests draw with and without them and
+//! compare.
 
 use super::entries::operand_real;
 use super::out::{Color, Out};
@@ -259,9 +266,10 @@ pub(super) fn draw(
         return Some(());
     }
     let (mut x, y) = (f64::from(origin.0), f64::from(origin.1));
-    let mut pen = Pen::new(transform, size, (x, y));
+    let mut pen = Pen::new(transform, size, (x, y), EVERYWHERE);
+    let mut brush = Brush::new(None, None);
     for g in glyphs {
-        pen.put(out, x, &g.face.outline(g.id), EVERYWHERE)?;
+        pen.put(out, x, &g.face.outline(g.id), EVERYWHERE, &mut brush)?;
         x += f64::from(g.advance) * f64::from(size);
     }
     pen.end(out);
@@ -281,33 +289,51 @@ const EVERYWHERE: Rect = Rect::new(
 /// clip as its form, moved along from the glyph before it ([`Out::form`]), so that
 /// a glyph costs a few bytes of content however often it is drawn. The numbers a
 /// viewer computes a glyph's place from are those written, so each must be
-/// writable; a glyph is tested by the box of its outline's points, whose corners
-/// must be writable where it lies, as its points then are.
+/// writable; a glyph is tested by the box of its outline's points, first in the
+/// frame against a box there that holds what the clip shows ([`reaches`]), then
+/// where it lies, whose corners must be writable, as its points then are.
 pub(super) struct Pen {
     frame: Affine,
+    size: f64,
     scale: f64,
     origin: (f64, f64),
+    view: Rect,
     /// Where across the last glyph written lies; `None` before the first.
     at: Option<f64>,
 }
 
 impl Pen {
-    /// A pen for glyphs at `size` (not 0) along the baseline from `origin` in `frame`.
-    pub(super) fn new(frame: Affine, size: f32, origin: (f64, f64)) -> Self {
+    /// A pen for glyphs at `size` (not 0) along the baseline from `origin` in `frame`,
+    /// of which those that can reach `view`, in the frame, are tested further.
+    pub(super) fn new(frame: Affine, size: f32, origin: (f64, f64), view: Rect) -> Self {
         Self {
             frame,
+            size: f64::from(size),
             scale: f64::from(size) / 1000.0,
             origin,
+            view,
             at: None,
         }
     }
 
     /// Writes the glyph of `outline` with its origin `x` across, when it can reach
-    /// `clip`, in the content's space.
-    fn put(&mut self, out: &mut Out, x: f64, outline: &Outline, clip: Rect) -> Option<()> {
+    /// `clip`, in the content's space; what `brush` holds back is set before the
+    /// first glyph written. At a size that is no number, the box's corners cannot
+    /// be written, which fails the content, wherever the glyph lies.
+    fn put(
+        &mut self,
+        out: &mut Out,
+        x: f64,
+        outline: &Outline,
+        clip: Rect,
+        brush: &mut Brush,
+    ) -> Option<()> {
         let Some(form) = &outline.form else {
             return Some(());
         };
+        if self.size.is_finite() && !reaches(outline.em, self.size, (x, self.origin.1), self.view) {
+            return Some(());
+        }
         let (s, y) = (self.scale, self.origin.1);
         let at = self.frame * Affine::new([s, 0.0, 0.0, s, x, y]);
         if !out.box_reaches(at, outline.ink, clip)? {
@@ -316,6 +342,7 @@ impl Pen {
         let from = match self.at {
             Some(from) => from,
             None => {
+                brush.ready(out)?;
                 out.op("q");
                 let start = self.frame * Affine::new([s, 0.0, 0.0, s, self.origin.0, y]);
                 out.nums(&start.as_coeffs(), "cm")?;
@@ -337,6 +364,73 @@ impl Pen {
             out.op("Q");
         }
     }
+}
+
+/// Whether a glyph whose points lie in `em`, in em around its origin, at `size`,
+/// its origin at `(x, y)`, can reach `view`, all in one frame: not when its box
+/// lies wholly to one side of the view. A bound that passes over glyphs implies
+/// this for each by computing the same sums from numbers no nearer the view: a
+/// place no nearer, a size no smaller, a box no smaller ([`skips`]). A sum that is
+/// no number can reach.
+fn reaches(em: Rect, size: f64, (x, y): (f64, f64), view: Rect) -> bool {
+    let (x0, x1) = (em.x0 * size, em.x1 * size);
+    let (y0, y1) = (em.y0 * size, em.y1 * size);
+    let left = x + x0 < view.x0 && x + x1 < view.x0;
+    let right = x + x0 > view.x1 && x + x1 > view.x1;
+    let below = y + y0 < view.y0 && y + y1 < view.y0;
+    let above = y + y0 > view.y1 && y + y1 > view.y1;
+    !(left || right || below || above)
+}
+
+/// What glyphs drawn so far have set, and what the next glyph written needs set
+/// first: a clip, set once, and the fill colour; so text that writes no glyph
+/// writes nothing else either, whatever was passed over to find that.
+pub(super) struct Brush {
+    clip: Option<Rect>,
+    color: Option<Color>,
+    want: Option<Color>,
+}
+
+impl Brush {
+    /// A brush that sets `clip` before the first glyph, with fill colour `color` set.
+    pub(super) fn new(clip: Option<Rect>, color: Option<Color>) -> Self {
+        Self {
+            clip,
+            color,
+            want: color,
+        }
+    }
+
+    /// Sets what the next glyph needs.
+    fn ready(&mut self, out: &mut Out) -> Option<()> {
+        if let Some(clip) = self.clip.take() {
+            out.clip(clip)?;
+        }
+        if let Some(want) = self.want
+            && self.color != Some(want)
+        {
+            out.fill_color(&want)?;
+            self.color = Some(want);
+        }
+        Some(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether text is drawn without the searches and bounds that pass over what
+    /// cannot show, for tests to compare.
+    static EXHAUSTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether lines, spans and glyphs that cannot show are passed over by searches
+/// and bounds; each such skip is proven by [`reaches`] (see the module), and tests
+/// compare drawing with and without them.
+fn skips() -> bool {
+    #[cfg(test)]
+    return !EXHAUSTIVE.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    true
 }
 
 /// How large text is set: in points, or as a multiple of the size it is laid out at
@@ -804,16 +898,20 @@ impl Shaped {
         }
         work(1);
         let (points, multiples) = self.sizes[node];
+        // No glyph under the node is larger: |base k| <= |base| max k, as rounded.
         let size = f64::from(points.max(seek.base.abs() * multiples));
-        if size == 0.0 {
-            return Ok(());
-        }
-        // The glyphs run one way, so their places lie between the first's and the
-        // last's.
-        let (a, b) = ((seek.pos)(first), (seek.pos)(last - 1));
-        let far = size * seek.reach;
-        if a.min(b) - far > seek.view.x1 || a.max(b) + far < seek.view.x0 {
-            return Ok(());
+        if skips() && size.is_finite() {
+            if size == 0.0 {
+                return Ok(());
+            }
+            // The glyphs run one way, so their places lie between the first's and
+            // the last's; a glyph's points lie within `far` of its place, as its
+            // box's corners are found ([`reaches`]): |e s| <= reach size.
+            let (a, b) = ((seek.pos)(first), (seek.pos)(last - 1));
+            let far = size * seek.reach;
+            if a.min(b) - far > seek.view.x1 || a.max(b) + far < seek.view.x0 {
+                return Ok(());
+            }
         }
         if under.len() == 1 {
             return visit(under.start);
@@ -926,7 +1024,8 @@ impl Iterator for Lines<'_> {
 
     fn next(&mut self) -> Option<LaidLine> {
         let text = self.text;
-        if self.at.is_none() && self.base == 0.0 && self.paragraph < self.last_paragraph {
+        if skips() && self.at.is_none() && self.base == 0.0 && self.paragraph < self.last_paragraph
+        {
             // Paragraphs without glyphs sized in points are lines 0 high that draw
             // nothing: passed over at once.
             self.paragraph = text.in_points[self.paragraph];
@@ -1020,7 +1119,7 @@ pub(super) fn draw_glyphs(
     view: Rect,
     clip: Rect,
     out: &mut Out,
-    color: &mut Option<Color>,
+    brush: &mut Brush,
 ) -> Result<(), Unsupported> {
     let Some(ink) = text.ink else {
         return Ok(());
@@ -1048,8 +1147,11 @@ pub(super) fn draw_glyphs(
         let (a, b) = (ink.x0 * s, ink.x1 * s);
         let (lo, hi) = (a.min(b), a.max(b));
         let n = end - i;
-        // The glyphs run right at a positive size, left at a negative one.
-        let (first, last) = if size > 0.0 {
+        // The glyphs run right at a positive size, left at a negative one, and the
+        // corners of each glyph's box lie between `lo` and `hi` of its place.
+        let (first, last) = if !skips() || !s.is_finite() {
+            (0, n)
+        } else if size > 0.0 {
             (
                 partition(n, |j| pos(i + j) + hi < view.x0),
                 partition(n, |j| pos(i + j) + lo <= view.x1),
@@ -1061,16 +1163,12 @@ pub(super) fn draw_glyphs(
             )
         };
         if first < last {
-            let c = style.color.unwrap_or(set.color);
-            if *color != Some(c) {
-                fail(out.fill_color(&c))?;
-                *color = Some(c);
-            }
-            let mut pen = Pen::new(frame, size, (pos(i), y));
+            brush.want = Some(style.color.unwrap_or(set.color));
+            let mut pen = Pen::new(frame, size, (pos(i), y), view);
             for k in i + first..i + last {
                 work(1);
                 let g = fonts.glyph(style.face, text.chars[k])?;
-                fail(pen.put(out, pos(k), &g.face.outline(g.id), clip))?;
+                fail(pen.put(out, pos(k), &g.face.outline(g.id), clip, brush))?;
             }
             pen.end(out);
         }
@@ -1102,7 +1200,6 @@ pub(super) fn draw_line(
     }
     text.direction(set.base)?;
     let view = frame.inverse().transform_rect_bbox(seen);
-    let mut color = Some(set.color);
     draw_glyphs(
         fonts,
         text,
@@ -1114,7 +1211,7 @@ pub(super) fn draw_line(
         view,
         seen,
         out,
-        &mut color,
+        &mut Brush::new(None, Some(set.color)),
     )
 }
 
@@ -1140,21 +1237,26 @@ pub(super) fn draw_rows(
     if size == 0.0 || !(seen.width() >= 0.0 && seen.height() >= 0.0) {
         return Ok(());
     }
-    // How far a glyph's points lie from its baseline, up or down.
+    // How far a glyph's points lie from its baseline, up or down, as the pen finds
+    // them ([`reaches`]): |e s| <= reach.
     let reach = ink.y0.abs().max(ink.y1.abs()) * f64::from(size.abs());
-    // Line `j`'s baseline lies at `top - (j + 1) step`, and the text makes no more
-    // lines than it can at any width: none is laid out when none can reach.
-    let end = top - text.most_lines() as f64 * step;
-    if (step > 0.0 && end - reach > seen.y1) || (step < 0.0 && end + reach < seen.y0) {
+    let baseline = |j: usize| top - (j as f64 + 1.0) * step;
+    // The text makes no more lines than it can at any width, and its baselines, as
+    // computed, run one way: none is laid out when the last it can make lies
+    // wholly before the view.
+    let last = baseline(text.most_lines() - 1);
+    let before = (step > 0.0 && last - reach > seen.y1) || (step < 0.0 && last + reach < seen.y0);
+    if skips() && before {
         return Ok(());
     }
-    let mut color = Some(set.color);
+    let mut brush = Brush::new(None, Some(set.color));
     for (j, line) in text
         .lines(size, Some(f64::from(avail)), Align::Left)
         .enumerate()
     {
-        let y = top - (j as f64 + 1.0) * step;
-        if !line.glyphs.is_empty() && y + reach >= seen.y0 && y - reach <= seen.y1 {
+        let y = baseline(j);
+        let near = !(y + reach < seen.y0 || y - reach > seen.y1);
+        if !skips() || (!line.glyphs.is_empty() && near) {
             let x = f64::from(align(line.width as f32));
             draw_glyphs(
                 fonts,
@@ -1167,13 +1269,14 @@ pub(super) fn draw_rows(
                 seen,
                 seen,
                 out,
-                &mut color,
+                &mut brush,
             )?;
         }
-        // The lines after it lie further on, down at a positive size, up at a
+        // The lines after it lie from the next on, down at a positive size, up at a
         // negative one.
-        let next = y - step;
-        if (step > 0.0 && next + reach < seen.y0) || (step < 0.0 && next - reach > seen.y1) {
+        let next = baseline(j + 1);
+        let past = (step > 0.0 && next + reach < seen.y0) || (step < 0.0 && next - reach > seen.y1);
+        if skips() && past {
             break;
         }
     }
@@ -1194,19 +1297,110 @@ pub(super) fn draw_comb(
     out: &mut Out,
 ) -> Result<(), Unsupported> {
     let size = set.base;
-    if size == 0.0 || count == 0 {
+    if size == 0.0 || count == 0 || !(seen.width() >= 0.0 && seen.height() >= 0.0) {
         return Ok(());
     }
-    let at = |i: usize| f64::from(cell * i as f32 + (cell - text.advance(i) * size) / 2.0);
-    let slack = (text.widest() * f64::from(size)).abs() / 2.0;
+    let start = |i: usize| cell * i as f32;
+    let middle = |advance: f32| (cell - advance * size) / 2.0;
+    let at = |i: usize| f64::from(start(i) + middle(text.advance(i)));
     let face = text.styles[0].face;
-    let mut pen = Pen::new(Affine::IDENTITY, size, (at(0), y));
-    for i in cells(text.ink, size, f64::from(cell), count, slack, seen) {
+    let mut pen = Pen::new(Affine::IDENTITY, size, (at(0), y), seen);
+    let mut brush = Brush::new(None, None);
+    let cells = if skips() {
+        cells(text, size, cell, &start, &middle, count, seen)
+    } else {
+        0..count
+    };
+    for i in cells {
         work(1);
         let g = fonts.glyph(face, text.chars[i])?;
-        fail(pen.put(out, at(i), &g.face.outline(g.id), seen))?;
+        fail(pen.put(out, at(i), &g.face.outline(g.id), seen, &mut brush))?;
     }
     pen.end(out);
+    Ok(())
+}
+
+/// Of the first `count` glyphs of `text` at `size`, glyph `i` at `start(i)` and
+/// `middle` of its advance across, those that can reach `clip` across. Each sum
+/// and product rounds no nearer than its operands lie, so glyph `i` lies between
+/// where glyphs of the advances either side of every one would, places that run
+/// one way as `i` grows, as cells do (`cell` is not negative): a glyph found to lie
+/// wholly to one side so lies there as the pen finds it ([`reaches`]).
+fn cells(
+    text: &Shaped,
+    size: f32,
+    cell: f32,
+    start: &dyn Fn(usize) -> f32,
+    middle: &dyn Fn(f32) -> f32,
+    count: usize,
+    clip: Rect,
+) -> Range<usize> {
+    let Some((x0, x1, _, _)) = scaled(text.ink, size) else {
+        return 0..0;
+    };
+    let widest = text.widest() as f32;
+    let (a, b) = (middle(-widest), middle(widest));
+    let (lo, hi) = (a.min(b), a.max(b));
+    if !(cell >= 0.0 && [lo, hi].iter().all(|v| v.is_finite()) && x0.is_finite() && x1.is_finite())
+    {
+        return 0..count;
+    }
+    let first = partition(count, |i| f64::from(start(i) + hi) + x1 < clip.x0);
+    let last = partition(count, |i| f64::from(start(i) + lo) + x0 <= clip.x1);
+    first..last.max(first)
+}
+
+/// Draws options, `count` of them, each the text `label(i)` gives, set in `face`
+/// and drawn at `set`, option `i` on one line from `pad` across with its baseline
+/// at `top - (i + 1) step`: those whose lines can reach `seen`, found by searches,
+/// the others not made.
+pub(super) fn draw_options(
+    fonts: &Fonts,
+    label: impl Fn(usize) -> Result<Rc<Shaped>, Unsupported>,
+    count: usize,
+    face: Typeface,
+    set: &Setting,
+    pad: f64,
+    top: f64,
+    step: f64,
+    seen: Rect,
+    out: &mut Out,
+) -> Result<(), Unsupported> {
+    if !(seen.width() >= 0.0 && seen.height() >= 0.0) {
+        return Ok(());
+    }
+    let baseline = |i: usize| top - (i as f64 + 1.0) * step;
+    // The points of every glyph of an option lie within the font's box ([`Fonts::bound`]),
+    // and the baselines, as computed, run down at a positive step and up at a
+    // negative one: an option whose box lies wholly above or below the view draws
+    // nothing ([`reaches`]).
+    let rows = match scaled(fonts.bound(face), set.base) {
+        _ if !skips() => 0..count,
+        None => 0..0,
+        Some((_, _, y0, y1)) if y0.is_finite() && y1.is_finite() => {
+            let above = |i: usize| baseline(i) + y0 > seen.y1;
+            let below = |i: usize| baseline(i) + y1 < seen.y0;
+            let (first, last) = if step >= 0.0 {
+                (partition(count, above), partition(count, |i| !below(i)))
+            } else {
+                (partition(count, below), partition(count, |i| !above(i)))
+            };
+            first..last.max(first)
+        }
+        Some(_) => 0..count,
+    };
+    for i in rows {
+        let label = label(i)?;
+        draw_line(
+            fonts,
+            &label,
+            set,
+            (pad, baseline(i)),
+            Affine::IDENTITY,
+            seen,
+            out,
+        )?;
+    }
     Ok(())
 }
 
@@ -1224,12 +1418,12 @@ pub(super) struct TextBox {
 
 /// Draws texts `pieces`, each made when its lines are reached, as one text whose
 /// paragraphs are theirs (as list options joined with line breaks are), laid out
-/// at `set` in `avail`, each line's first baseline `ascent` times its size below
-/// its top, in `area`: the lines that can reach both its clip and `seen`, laid out
-/// up to the last that can, and of the last piece none when none can. The sizes
-/// and glyph boxes of every piece are within `bound`, in points and in em around a
-/// glyph's origin, either way ([`Shaped::bound`]): pieces drawn 0 high are not
-/// made.
+/// at `set` in `avail`, each line's first baseline `ascent` (not negative) times its
+/// size below its top, in `area`: the lines that can reach both its clip and
+/// `seen`, laid out up to the last that can, and of the last piece none when none
+/// can. The sizes and glyph boxes of every piece are within `bound`, in points and
+/// in em around a glyph's origin, either way ([`Shaped::bound`]): pieces drawn 0
+/// high are not made.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_box(
     fonts: &Fonts,
@@ -1243,14 +1437,17 @@ pub(super) fn draw_box(
     out: &mut Out,
 ) -> Result<(), Unsupported> {
     let shown = area.clip.intersect(seen);
+    if !(shown.width() >= 0.0 && shown.height() >= 0.0) {
+        return Ok(());
+    }
     // A size of 0 draws nothing (and needs nothing checked: such text is never
     // refused for the way it runs, [`Shaped::direction`]).
-    if !(shown.width() >= 0.0 && shown.height() >= 0.0) || bound.0 == 0.0 {
+    if skips() && bound.0 == 0.0 {
         return Ok(());
     }
     let view = area.frame.inverse().transform_rect_bbox(shown);
     let (pad, top) = (f64::from(area.pad), area.top);
-    let (mut clipped, mut color) = (false, None);
+    let mut brush = Brush::new(Some(area.clip), None);
     let (mut height, mut filled) = (0.0_f32, f32::NEG_INFINITY);
     let mut way = None;
     let mut pieces = pieces.peekable();
@@ -1273,20 +1470,16 @@ pub(super) fn draw_box(
             bound
         };
         let ink = text.ink.map_or(0.0, |r| r.y0.abs().max(r.y1.abs()));
-        if last {
-            // The last piece: its lines lie within 1.2 times its largest size of
-            // each other, as many as it can make at most, and its glyphs within
-            // its reach of their baselines; none is laid out when none can reach
-            // the view so.
-            let size = f64::from(text.rest(0, set.base));
-            let depth = text.most_lines() as f64 * 1.2 * size;
-            let (start, reach) = (f64::from(top - height), ink * size);
-            let unreached = match direction {
-                Direction::Forward => start - depth - reach > view.y1,
-                Direction::Backward => start + depth + reach < view.y0,
-                Direction::Nowhere => true,
+        // The last piece: none of its lines is laid out when none can reach the view.
+        if skips() && last {
+            let depth = Depth {
+                top,
+                height,
+                lines: text.most_lines(),
+                size: text.rest(0, set.base),
+                ascent,
             };
-            if unreached {
+            if depth.cannot_reach(direction, ink, view) {
                 return Ok(());
             }
         }
@@ -1300,11 +1493,10 @@ pub(super) fn draw_box(
             }
             let y = f64::from(top - below);
             let reach = ink * f64::from(line.size.abs());
-            if line.size != 0.0
+            let near = line.size != 0.0
                 && !line.glyphs.is_empty()
-                && y + reach >= view.y0
-                && y - reach <= view.y1
-            {
+                && !(y + reach < view.y0 || y - reach > view.y1);
+            if near || !skips() {
                 let width = line.width as f32;
                 let spaces = text.stretched(line.glyphs.clone());
                 let (x0, spacing) = match line.align {
@@ -1314,10 +1506,6 @@ pub(super) fn draw_box(
                     Align::Justify if spaces == 0 => (0.0, 0.0),
                     Align::Justify => (0.0, ((avail - width) / spaces as f32).max(0.0)),
                 };
-                if !clipped {
-                    fail(out.clip(area.clip))?;
-                    clipped = true;
-                }
                 draw_glyphs(
                     fonts,
                     &text,
@@ -1329,23 +1517,76 @@ pub(super) fn draw_box(
                     view,
                     shown,
                     out,
-                    &mut color,
+                    &mut brush,
                 )?;
             }
             // The lines after this one lie below the top of the next, at a positive
-            // size, or above it, at a negative one, by no more than their glyphs
-            // reach.
+            // size, or above it, at a negative one (the next adds a height and an
+            // ascent of its sign, and a rounded sum lies no nearer than its terms),
+            // by no more than their glyphs reach.
             let rest = f64::from(text.rest(line.glyphs.end, set.base).max(later.0));
             let reach = rest * ink.max(later.1);
             let next = f64::from(top - height);
-            match direction {
-                Direction::Forward if next + reach < view.y0 => return Ok(()),
-                Direction::Backward if next - reach > view.y1 => return Ok(()),
-                _ => {}
+            let past = match direction {
+                Direction::Forward => next + reach < view.y0,
+                Direction::Backward => next - reach > view.y1,
+                Direction::Nowhere => false,
+            };
+            if skips() && past {
+                return Ok(());
             }
         }
     }
     Ok(())
+}
+
+/// Where the lines of the last text [`draw_box`] lays out can lie: from `height`
+/// below `top`, at most `lines` of them, each sized at most `size` either way, its
+/// height 1.2 times its size and its baseline `ascent` times its size below its top.
+struct Depth {
+    top: f32,
+    height: f32,
+    lines: usize,
+    size: f32,
+    ascent: f32,
+}
+
+impl Depth {
+    /// Whether no line can reach `view` with glyphs whose points lie within `ink`
+    /// times its size of its baseline, the lines leaving the view behind as they
+    /// go `direction`, as [`draw_box`] computes their baselines and the pen tests
+    /// their glyphs ([`reaches`]).
+    ///
+    /// Heights add up in 32-bit floats, each sum and product rounded to within
+    /// u = 2^-24 of itself, or e = 2^-149 among subnormal numbers:
+    /// |r(x)| <= |x| (1 + u) + e. After k lines, each r(1.2 s) <= t = r(1.2 size)
+    /// high, |height| <= (|h| + k (t + e)) (1 + u)^k; a baseline lies that and
+    /// r(ascent size) more below the top, rounded, and is rounded once more as it
+    /// is taken from the top. The bound is computed in 64-bit floats with u doubled
+    /// and (1 + u)^k as exp(k u), which leaves more room than their own rounding
+    /// takes, so it never falls short of where the lines can lie.
+    fn cannot_reach(&self, direction: Direction, ink: f64, view: Rect) -> bool {
+        // Twice u, and e.
+        const U: f64 = 1.0 / 8_388_608.0;
+        const E: f64 = 1.401_298_464_324_817e-45;
+        let n = self.lines as f64;
+        let t = f64::from(1.2 * self.size);
+        let ascent = f64::from(self.ascent.abs() * self.size);
+        let height = (f64::from(self.height).abs() + n * (t + E)) * (n * U).exp();
+        let depth = (height + ascent) * (1.0 + U) + E;
+        let top = f64::from(self.top);
+        let far = depth + U * (top.abs() + depth) + E;
+        let reach = ink * f64::from(self.size) * (1.0 + U);
+        // Beyond, a height may round to no number, and the lines to anywhere.
+        if !(far < f64::from(f32::MAX) && reach.is_finite()) {
+            return false;
+        }
+        match direction {
+            Direction::Forward => top - far - reach > view.y1,
+            Direction::Backward => top + far + reach < view.y0,
+            Direction::Nowhere => true,
+        }
+    }
 }
 
 /// `ink`, a box in em around a glyph's origin, at `size`, as `(x0, x1, y0, y1)`.
@@ -1355,64 +1596,6 @@ fn scaled(ink: Option<Rect>, size: f32) -> Option<(f64, f64, f64, f64)> {
     let (x0, x1) = (ink.x0 * s, ink.x1 * s);
     let (y0, y1) = (ink.y0 * s, ink.y1 * s);
     Some((x0.min(x1), x0.max(x1), y0.min(y1), y0.max(y1)))
-}
-
-/// Of lines `0..=last` at `size`, line `j` with its baseline at
-/// `top - (j + 1) step`, whose glyphs' points lie in `ink`, in em around each
-/// glyph's origin, those whose glyphs can reach `clip`.
-pub(super) fn rows_of(
-    ink: Option<Rect>,
-    size: f32,
-    top: f64,
-    step: f64,
-    last: usize,
-    clip: Rect,
-) -> Range<usize> {
-    let Some((_, _, y0, y1)) = scaled(ink, size) else {
-        return 0..0;
-    };
-    // Line j can reach the clip when j + 1 lies between these.
-    let (a, b) = ((top + y1 - clip.y0) / step, (top + y0 - clip.y1) / step);
-    within_count(a.min(b) - 1.0, a.max(b) - 1.0, last + 1, clip)
-}
-
-/// Of `count` glyphs whose points lie in `ink`, in em around each glyph's origin, at
-/// `size` centred in cells `cell` wide from 0, each within `slack` of its cell's
-/// middle across, those that can reach `clip` across.
-fn cells(
-    ink: Option<Rect>,
-    size: f32,
-    cell: f64,
-    count: usize,
-    slack: f64,
-    clip: Rect,
-) -> Range<usize> {
-    let Some((x0, x1, _, _)) = scaled(ink, size) else {
-        return 0..0;
-    };
-    // Glyph i, its cell's middle at (i + 0.5) cell, can reach the clip when i lies
-    // between these.
-    let (a, b) = (
-        (clip.x0 - x1 - slack) / cell - 0.5,
-        (clip.x1 - x0 + slack) / cell - 0.5,
-    );
-    within_count(a.min(b), a.max(b), count, clip)
-}
-
-/// The indices from `from` up to `to` among `0..count`; none for a clip of no area
-/// or bounds that are not numbers.
-fn within_count(from: f64, to: f64, count: usize, clip: Rect) -> Range<usize> {
-    if clip.x0 > clip.x1 || clip.y0 > clip.y1 || from.is_nan() || to.is_nan() {
-        return 0..0;
-    }
-    let first = from.ceil().max(0.0);
-    let last = to.floor() + 1.0;
-    // Saturating: beyond the count is the count.
-    let (first, last) = (
-        first.min(count as f64) as usize,
-        last.clamp(0.0, count as f64) as usize,
-    );
-    first..last.max(first)
 }
 
 /// A standard font's glyphs, each outline read once, and the typeface it was loaded
@@ -1425,11 +1608,13 @@ struct Face {
     bound: OnceCell<Option<Rect>>,
 }
 
-/// A glyph's outline, 1000 units to the em, the box of its points, and the form it is
-/// drawn as (`None` when it has no points).
+/// A glyph's outline, 1000 units to the em, the box of its points, that box in em
+/// (scaled as [`Shaped`] and [`Face::bound`] scale theirs, so that theirs hold it in
+/// the same numbers), and the form it is drawn as (`None` when it has no points).
 struct Outline {
     path: BezPath,
     ink: Rect,
+    em: Rect,
     form: Option<Rc<super::Glyph>>,
 }
 
@@ -1499,7 +1684,13 @@ impl Face {
                     })
                     .flatten()
                     .map(Rc::new);
-                Rc::new(Outline { path, ink, form })
+                let em = ink.scale_from_origin(0.001);
+                Rc::new(Outline {
+                    path,
+                    ink,
+                    em,
+                    form,
+                })
             })
             .clone()
     }
@@ -1786,11 +1977,513 @@ mod tests {
             let shaped = fonts
                 .shape_plain(Family::Sans, &"ab ".repeat(n))
                 .expect("drawable");
-            let before = super::super::work_done();
+            let before = work_done();
             let first = shaped.lines(12.0, Some(100.0), Align::Left).next().unwrap();
-            costs.push(super::super::work_done() - before);
+            costs.push(work_done() - before);
             assert!(first.glyphs.len() < 30, "{n}");
         }
         assert!(costs[1] < costs[0] + 20, "{costs:?}");
+    }
+
+    use super::super::work_done;
+    use super::{
+        Color, Direction, Out, Setting, Shaped, Size, Span, Style, TextBox, Typeface, draw_box,
+        draw_comb, draw_line, draw_options, draw_rows,
+    };
+    use kurbo::{Affine, Rect};
+    use std::rc::Rc;
+
+    /// Numbers for the cases below, the same on every run.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn pick<T: Clone>(&mut self, of: &[T]) -> T {
+            of[self.below(of.len())].clone()
+        }
+    }
+
+    /// What `draw` writes: its content and the glyphs it names, or why it fails.
+    fn written(draw: impl FnOnce(&mut Out) -> Result<(), super::Unsupported>) -> String {
+        let mut out = Out::default();
+        let drew = draw(&mut out);
+        match (drew, out.finish()) {
+            (Ok(()), Ok((content, glyphs))) => {
+                let names: Vec<&str> = glyphs.iter().map(|g| g.name()).collect();
+                format!("{content}{names:?}")
+            }
+            (Err(why), _) | (_, Err(why)) => format!("{why:?}"),
+        }
+    }
+
+    /// What `draw` writes with the searches and bounds that pass over what cannot
+    /// show, and without them, and the work each took: the same, or the case
+    /// fails. Returns whether passing over took less work.
+    fn same(
+        case: &str,
+        draw: impl Fn(&mut Out) -> Result<(), super::Unsupported>,
+    ) -> (bool, String) {
+        let before = work_done();
+        let fast = written(&draw);
+        let quick = work_done() - before;
+        super::EXHAUSTIVE.with(|e| e.set(true));
+        let before = work_done();
+        let all = written(&draw);
+        let slow = work_done() - before;
+        super::EXHAUSTIVE.with(|e| e.set(false));
+        assert!(
+            fast == all,
+            "{case}:\nwith skips:    {fast}\nwithout skips: {all}"
+        );
+        (quick < slow, fast)
+    }
+
+    fn fonts() -> Fonts {
+        Fonts::new(crate::InterpreterSettings::default().font_resolver)
+    }
+
+    /// Words of a few letters wide and narrow, spaces, and line breaks of each kind.
+    fn plain_text(rng: &mut Rng, words: usize) -> String {
+        let mut text = String::new();
+        for _ in 0..words {
+            for _ in 0..1 + rng.below(6) {
+                text.push(rng.pick(&['A', 'i', 'W', 'm', '.', '-', 'g']));
+            }
+            text.push_str(rng.pick(&[" ", " ", " ", "  ", "\n", "\r\n", "\r", "\n\n"]));
+        }
+        text
+    }
+
+    /// Rich text spans of sizes in points and multiples of the base size, faces,
+    /// colours and alignments; multiples alone when `multiples`.
+    fn rich_spans(rng: &mut Rng, multiples: bool) -> Vec<Span> {
+        (0..1 + rng.below(12))
+            .map(|_| {
+                let size = if multiples || rng.below(2) == 0 {
+                    Size::Base(rng.pick(&[0.5, 1.0, 2.5, 0.0001]))
+                } else {
+                    Size::Points(rng.pick(&[1.0, 6.0, 12.0, 40.0, 1e-30]))
+                };
+                let words = 1 + rng.below(5);
+                Span {
+                    text: plain_text(rng, words),
+                    style: Style {
+                        face: Typeface {
+                            family: rng.pick(&[Family::Sans, Family::Serif, Family::Mono]),
+                            bold: rng.below(2) == 0,
+                            italic: rng.below(2) == 0,
+                        },
+                        size,
+                        color: rng.pick(&[Color::Rgb([1.0, 0.0, 0.0]), Color::Gray(0.5)]),
+                        align: rng.pick(&[
+                            Align::Left,
+                            Align::Center,
+                            Align::Right,
+                            Align::Justify,
+                        ]),
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// Frames a box is laid out in: as is, moved, turned by right angles as
+    /// `FreeText` turns them, and by others.
+    fn frame(rng: &mut Rng) -> Affine {
+        rng.pick(&[
+            Affine::IDENTITY,
+            Affine::translate((10.0, -100.0)),
+            Affine::new([0.0, 1.0, -1.0, 0.0, 150.0, 20.0]),
+            Affine::new([-1.0, 0.0, 0.0, -1.0, 190.0, 180.0]),
+            Affine::new([0.0, -1.0, 1.0, 0.0, 10.0, 170.0]),
+            Affine::translate((40.0, 30.0)) * Affine::rotate(0.5),
+            Affine::translate((100.0, 300.0)) * Affine::rotate(-2.1),
+        ])
+    }
+
+    fn rect(rng: &mut Rng) -> Rect {
+        let (x, y) = (
+            rng.pick(&[-60.0, 0.0, 10.0, 150.0]),
+            rng.pick(&[-400.0, 0.0, 30.0, 170.0]),
+        );
+        let (w, h) = (
+            rng.pick(&[0.0, 9.0, 120.0, 500.0]),
+            rng.pick(&[0.0, 15.0, 160.0, 900.0]),
+        );
+        Rect::new(x, y, x + w, y + h)
+    }
+
+    const PAGE: Rect = Rect::new(0.0, 0.0, 200.0, 200.0);
+
+    fn seen(rng: &mut Rng) -> Rect {
+        rng.pick(&[
+            PAGE,
+            Rect::new(50.0, 50.0, 60.0, 60.0),
+            Rect::new(0.0, 150.0, 200.0, 200.0),
+            Rect::new(-1e4, -1e4, 1e4, 1e4),
+        ])
+    }
+
+    /// The text of words `A` on lines of their own: `n` of them, and `breaks` more
+    /// line breaks after them.
+    fn column(n: usize, breaks: usize) -> String {
+        vec!["A"; n].join(" ") + &"\n".repeat(breaks)
+    }
+
+    /// One text in a box, as a `FreeText` lays it out, with and without the bounds.
+    fn one_box(
+        fonts: &Fonts,
+        case: &str,
+        text: &Rc<Shaped>,
+        set: &Setting,
+        avail: f32,
+        area: &TextBox,
+        seen: Rect,
+    ) -> (bool, String) {
+        same(case, |out| {
+            draw_box(
+                fonts,
+                std::iter::once(Ok(text.clone())),
+                text.bound(set.base),
+                set,
+                avail,
+                0.8,
+                area,
+                seen,
+                out,
+            )
+        })
+    }
+
+    /// Text laid out in a box draws the same with and without the searches and
+    /// bounds that pass over lines, spans and glyphs that cannot show: plain and
+    /// rich text, sizes in points and multiples of the base size, positive,
+    /// negative, 0 and tiny base sizes, boxes turned any way, one or several texts
+    /// one after another, and texts of many thousand lines whose heights round as
+    /// they add up, such as those whose last lines alone reach the page.
+    #[test]
+    fn boxes_draw_the_same_with_and_without_skips() {
+        let fonts = fonts();
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let (mut skipped, mut drew, mut failed) = (0, 0, 0);
+        for case in 0..20_000 {
+            let base = rng.pick(&[12.0, 1.0, 0.5, 40.0, 0.0, -12.0, -0.7, 1e-30]);
+            let pieces: Vec<Rc<Shaped>> = (0..1 + rng.below(3))
+                .map(|_| {
+                    let (plain, words) = (rng.below(2) == 0, 1 + rng.below(40));
+                    let multiples = base < 0.0 || rng.below(3) == 0;
+                    let shaped = if plain {
+                        fonts.shape_plain(Family::Sans, &plain_text(&mut rng, words))
+                    } else {
+                        fonts.shape_rich(&rich_spans(&mut rng, multiples))
+                    };
+                    Rc::new(shaped.expect("drawable"))
+                })
+                .collect();
+            let bound = pieces.iter().fold((0.0_f32, 0.0_f64), |(s, i), p| {
+                let (ps, pi) = p.bound(base);
+                (s.max(ps), i.max(pi))
+            });
+            let set = Setting {
+                base,
+                color: Color::Gray(0.0),
+                align: rng.pick(&[Align::Left, Align::Center, Align::Right, Align::Justify]),
+            };
+            let avail = rng.pick(&[0.0, 8.0, 60.0, 200.0, 1000.0]);
+            let area = TextBox {
+                pad: rng.pick(&[0.0, 2.0]),
+                top: rng.pick(&[40.0, 120.0, 200.0, 200.0, 400.0, 5000.0, -20.0, -300.0]),
+                room: rng.pick(&[f32::INFINITY, f32::INFINITY, 30.0, 300.0]),
+                frame: frame(&mut rng),
+                clip: if rng.below(3) == 0 {
+                    rect(&mut rng)
+                } else {
+                    Rect::new(-20.0, -20.0, 220.0, 220.0)
+                },
+            };
+            let seen = seen(&mut rng);
+            let ascent = rng.pick(&[0.8, 0.9]);
+            let (quick, drawn) = same(&format!("case {case}"), |out| {
+                draw_box(
+                    &fonts,
+                    pieces.iter().cloned().map(Ok),
+                    bound,
+                    &set,
+                    avail,
+                    ascent,
+                    &area,
+                    seen,
+                    out,
+                )
+            });
+            skipped += usize::from(quick);
+            drew += usize::from(drawn.contains(" Do"));
+            failed += usize::from(!drawn.contains('['));
+        }
+        assert!(
+            skipped > 5000 && drew > 3000 && failed < 2000,
+            "of 20,000, {skipped} passed over something, {drew} drew, {failed} failed"
+        );
+
+        // Words `A`, one a line, in boxes so tall that their last lines alone show
+        // at the top of the page; ten line breaks after them change nothing drawn.
+        let set = Setting {
+            base: 12.0,
+            color: Color::Gray(0.0),
+            align: Align::Left,
+        };
+        for (rect, words) in [
+            ([10.0, -100.0, 19.0, 240157.0], 16_662),
+            ([10.0, 0.0, 20.0, 432300.0], 30_000),
+        ] {
+            let inner = Rect::new(rect[0], rect[1], rect[2], rect[3]);
+            let area = TextBox {
+                pad: 0.0,
+                top: inner.height() as f32,
+                room: f32::INFINITY,
+                frame: Affine::translate((inner.x0, inner.y0)),
+                clip: inner,
+            };
+            let avail = inner.width() as f32;
+            let drawn: Vec<String> = [0, 10]
+                .into_iter()
+                .map(|breaks| {
+                    let text = Rc::new(
+                        fonts
+                            .shape_plain(Family::Sans, &column(words, breaks))
+                            .unwrap(),
+                    );
+                    one_box(
+                        &fonts,
+                        &format!("{rect:?}, {breaks} breaks"),
+                        &text,
+                        &set,
+                        avail,
+                        &area,
+                        PAGE,
+                    )
+                    .1
+                })
+                .collect();
+            assert!(drawn[0].contains(" Do"), "{rect:?}: {}", drawn[0]);
+            assert_eq!(drawn[0], drawn[1], "{rect:?}");
+        }
+
+        // Many thousand lines whose last alone reach the page, at sizes where their
+        // heights round as they add up: plain text going down, to the page's top,
+        // plain text at a negative size going up, to its bottom, and rich text of
+        // two sizes going down.
+        let cases = [
+            (16_662, 12.0, false),
+            (30_000, 12.0, false),
+            (100_000, 12.0, false),
+            (60_000, 1.0, false),
+            (50_000, 0.3, false),
+            (200_000, 5.5, false),
+            (20_000, -12.0, false),
+            (20_000, 12.0, true),
+        ];
+        for (words, base, rich) in cases {
+            let text = Rc::new(if rich {
+                let spans: Vec<Span> = (0..words)
+                    .map(|i| Span {
+                        text: "A\n".into(),
+                        style: Style {
+                            face: Family::Sans.into(),
+                            size: Size::Points(if i % 2 == 0 { 12.0 } else { 7.0 }),
+                            color: Color::Gray(0.0),
+                            align: Align::Left,
+                        },
+                    })
+                    .collect();
+                fonts.shape_rich(&spans).unwrap()
+            } else if base < 0.0 {
+                fonts
+                    .shape_plain(Family::Sans, &vec!["A"; words].join("\n"))
+                    .unwrap()
+            } else {
+                fonts.shape_plain(Family::Sans, &column(words, 0)).unwrap()
+            });
+            let set = Setting {
+                base,
+                color: Color::Gray(0.0),
+                align: Align::Left,
+            };
+            // One word a line.
+            let avail = 9.0 * base.abs() / 12.0;
+            // How far below the top the last line's baseline lies, laid out as
+            // `draw_box` lays it out.
+            let (mut height, mut below) = (0.0_f32, 0.0_f32);
+            for line in text.lines(base, Some(f64::from(avail)), Align::Left) {
+                below = height + 0.8 * line.size;
+                height += 1.2 * line.size;
+            }
+            let forward = text.direction(base).unwrap() == Direction::Forward;
+            // The last baseline about where the last glyphs' boxes, above the
+            // baseline going down and below it going up, start to reach the page.
+            let ends: &[f32] = if forward {
+                &[180.0, 199.0, 200.0, 200.5, 203.0, 209.0, 220.0]
+            } else {
+                &[-20.0, -12.0, -1.0, -0.1, 0.0, 3.0, 10.0]
+            };
+            let mut drew = 0;
+            for &end in ends {
+                let area = TextBox {
+                    pad: 0.0,
+                    top: end + below,
+                    room: f32::INFINITY,
+                    frame: Affine::translate((10.0, 0.0)),
+                    clip: Rect::new(-1e6, -1e6, 1e6, 1e6),
+                };
+                let case = format!("{words} at {base}, last at {end}");
+                let (_, drawn) = one_box(&fonts, &case, &text, &set, avail, &area, PAGE);
+                assert!(drawn.ends_with(']'), "{case}: {drawn}");
+                drew += usize::from(drawn.contains(" Do"));
+            }
+            assert!((1..ends.len()).contains(&drew), "{words} at {base}: {drew}");
+        }
+    }
+
+    /// The other ways text is drawn draw the same with and without the searches
+    /// that pass over what cannot show: lines of a multiline field, a line, a
+    /// comb's cells, and a list's options, at positive, negative and small sizes,
+    /// near and far, and in many thousand rows or cells.
+    #[test]
+    fn rows_lines_combs_and_options_draw_the_same_with_and_without_skips() {
+        let fonts = fonts();
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        let (mut skipped, mut drew) = ([0; 4], [0; 4]);
+        for case in 0..10_000 {
+            let size: f32 = rng.pick(&[12.0, 1.0, 0.5, 40.0, -12.0, 1e-30, 300.0]);
+            let words = 1 + rng.below(60);
+            let text = fonts
+                .shape_plain(Family::Sans, &plain_text(&mut rng, words))
+                .unwrap();
+            let set = Setting {
+                base: size,
+                color: Color::Gray(0.0),
+                align: Align::Left,
+            };
+            let seen = seen(&mut rng);
+            let top = rng.pick(&[100.0, 200.0, 1e4, -50.0, 1e6]);
+            let step = f64::from(1.116 * size);
+            let avail = rng.pick(&[0.0, 8.0, 60.0, 190.0]);
+            let pad = rng.pick(&[0.0, 2.0]);
+            let rows = same(&format!("rows {case}"), |out| {
+                draw_rows(
+                    &fonts,
+                    &text,
+                    &set,
+                    avail,
+                    top,
+                    step,
+                    |w| pad + (avail - w) / 2.0,
+                    seen,
+                    out,
+                )
+            });
+            let origin = (
+                rng.pick(&[-500.0, 0.0, 20.0, 150.0]),
+                rng.pick(&[-10.0, 20.0, 190.0]),
+            );
+            let frame = frame(&mut rng);
+            let line = same(&format!("line {case}"), |out| {
+                draw_line(&fonts, &text, &set, origin, frame, seen, out)
+            });
+            let cell = rng.pick(&[0.0, 0.01, 7.5, 40.0, 1e5]);
+            let count = text.len().min(rng.pick(&[1, 5, 30, 1000]));
+            let y = rng.pick(&[-30.0, 10.0, 100.0, 195.0]);
+            let comb = same(&format!("comb {case}"), |out| {
+                draw_comb(&fonts, &text, &set, count, cell, y, seen, out)
+            });
+            let labels: Vec<Rc<Shaped>> = (0..rng.pick(&[1, 3, 40, 300]))
+                .map(|_| {
+                    let words = 1 + rng.below(3);
+                    let label = plain_text(&mut rng, words);
+                    Rc::new(fonts.shape_plain(Family::Sans, &label).unwrap())
+                })
+                .collect();
+            let options = same(&format!("options {case}"), |out| {
+                draw_options(
+                    &fonts,
+                    |i| Ok(labels[i].clone()),
+                    labels.len(),
+                    Family::Sans.into(),
+                    &set,
+                    f64::from(pad),
+                    top,
+                    step,
+                    seen,
+                    out,
+                )
+            });
+            for (k, (quick, drawn)) in [rows, line, comb, options].into_iter().enumerate() {
+                skipped[k] += usize::from(quick);
+                drew[k] += usize::from(drawn.contains(" Do"));
+            }
+        }
+        assert!(
+            skipped.iter().chain(&drew).all(|&n| n > 1000),
+            "of 10,000 rows, lines, combs and options, {skipped:?} passed over something, \
+             {drew:?} drew"
+        );
+
+        // Many rows, cells and options, of which the page shows the last: where
+        // each lies is rounded as it is far from the first.
+        let set = Setting {
+            base: 12.0,
+            color: Color::Gray(0.0),
+            align: Align::Left,
+        };
+        let step = f64::from(1.116_f32 * 12.0);
+        let n = 200_000;
+        let text = fonts.shape_plain(Family::Sans, &column(n, 0)).unwrap();
+        let label = Rc::new(fonts.shape_plain(Family::Sans, "Wm").unwrap());
+        let mut drew = 0;
+        for shift in [-20.0, -0.5, 0.0, 7.0, 100.0, 199.0, 200.5, 230.0] {
+            let top = n as f64 * step + shift;
+            let rows = same(&format!("rows {shift}"), |out| {
+                draw_rows(&fonts, &text, &set, 9.0, top, step, |_| 0.0, PAGE, out)
+            });
+            let options = same(&format!("options {shift}"), |out| {
+                draw_options(
+                    &fonts,
+                    |_| Ok(label.clone()),
+                    n,
+                    Family::Sans.into(),
+                    &set,
+                    2.0,
+                    top,
+                    step,
+                    PAGE,
+                    out,
+                )
+            });
+            drew += usize::from(rows.1.contains(" Do")) + usize::from(options.1.contains(" Do"));
+        }
+        let word = fonts
+            .shape_plain(Family::Sans, &"AWi".repeat(100_000))
+            .unwrap();
+        for cell in [0.001_f32, 0.0137, 7.0] {
+            let last = f64::from(cell) * word.len() as f64;
+            for at in [last - 150.0, last - 0.5 * f64::from(cell), last + 3.0] {
+                let seen = Rect::new(at, 0.0, at + 200.0, 200.0);
+                let comb = same(&format!("comb {cell} at {at}"), |out| {
+                    draw_comb(&fonts, &word, &set, word.len(), cell, 100.0, seen, out)
+                });
+                drew += usize::from(comb.1.contains(" Do"));
+            }
+        }
+        assert!(drew > 10, "{drew}");
     }
 }

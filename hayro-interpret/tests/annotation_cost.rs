@@ -1046,6 +1046,34 @@ fn an_annotation_named_again_is_not_read_again() {
     );
 }
 
+/// An annotation `/Annots` names many times reads the text it holds itself once,
+/// not once each time: a `FreeText` with rich text and a rich text field with a
+/// rich value, each written in the annotation, one word of 20,000 characters whose
+/// start alone its box shows, cost for each time named again what drawing that
+/// start does.
+#[test]
+fn a_text_held_in_an_annotation_named_again_is_not_read_again() {
+    let word = "ABCD\\)efg".repeat(2_222);
+    for annot in [
+        format!(
+            "/Subtype /FreeText /BS << /W 0 >> /RC (<p>{word}</p>) /Rect [10 10 110 40] \
+             /DA (/Helv 12 Tf 0 g)"
+        ),
+        format!(
+            "/Subtype /Widget /FT /Tx /Ff 33554432 /RV (<p>{word}</p>) /Rect [10 10 110 40] \
+             /DA (/Helv 12 Tf 0 g)"
+        ),
+    ] {
+        let (one, two) = (repeated_cost(40, &annot), repeated_cost(80, &annot));
+        let (bytes, work) = (two.bytes - one.bytes, two.work - one.work);
+        assert!(
+            bytes < 40 * (16 << 10) && work < 40 * 1_000,
+            "{one:?} for 40, {two:?} for 80: {}",
+            &annot[..30]
+        );
+    }
+}
+
 /// A list whose options are drawn 0 high, as with a default appearance size of 0
 /// and a default style that sets no size, draws none and looks at none: lists
 /// sharing 20,000 options cost what one without options does. The labels a list

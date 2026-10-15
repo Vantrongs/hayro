@@ -402,8 +402,8 @@ pub(super) fn line<'a>(
     let mut caption_text = None;
     if caption {
         const SIZE: f32 = 12.0;
-        let source = annot.text_source(Text::Contents);
-        let text = doc.plain(Some(&source), Family::Sans.into(), CAPTION, || {
+        let source = annot.source(Text::Contents.key());
+        let text = doc.plain(source.as_ref(), Family::Sans.into(), CAPTION, || {
             annot
                 .text(Text::Contents)
                 .map(|s| text::text_string(&s))
