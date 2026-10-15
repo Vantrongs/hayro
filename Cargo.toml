@@ -136,4 +136,4 @@ html5ever = { git = "https://github.com/Vantrongs/html5ever", rev = "7c13a4e871b
 # Atoms longer than 7 bytes placed by a per-process random hash rather than in
 # 4,096 lists by a fixed one, so that attribute names chosen to share a list do
 # not make interning them quadratic.
-string_cache = { git = "https://github.com/Vantrongs/string-cache", rev = "d8b56a437074400c0274f198b55d5df61c0c4b77" }
+string_cache = { git = "https://github.com/Vantrongs/string-cache", rev = "ca90fcf3b1e0ea54649f0ac831046b287d1d5963" }
