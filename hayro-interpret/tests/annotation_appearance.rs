@@ -2872,6 +2872,29 @@ fn what_reading_annotations_lost_is_told_each_time() {
     let both = |page: &'static str| [page, page];
     for (catalog, pages, objects, lose) in [
         ("", both("/Annots 9 0 R"), vec![], [true, true]),
+        // Written in place, an annotation is drawn only by its appearance, and
+        // where it has one its /Rect is read.
+        (
+            "",
+            [
+                "/Annots [<< /Type /Annot /Subtype /Square /Rect 9 0 R /AP << /N 5 0 R >> >>]",
+                "/Annots [6 0 R]",
+            ],
+            vec![
+                "<< /BBox [0 0 1 1] /Length 12 >>\nstream\n0 0 1 1 re f\nendstream",
+                &clean,
+            ],
+            [true, false],
+        ),
+        (
+            "",
+            [
+                "/Annots [<< /Type /Annot /Subtype /Square /Rect 9 0 R /C 9 0 R >>]",
+                "/Annots [6 0 R]",
+            ],
+            vec!["null", &clean],
+            [false, false],
+        ),
         (
             "",
             both("/Annots 5 0 R"),
