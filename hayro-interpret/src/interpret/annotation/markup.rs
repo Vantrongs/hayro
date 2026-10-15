@@ -8,7 +8,7 @@
 
 use super::entries::{Derived, Entries, Items, Value};
 use super::out::{Color, Out};
-use super::{FINEST, Unsupported, border_width, c_color, color_of, dash, rect};
+use super::{MOST_PIECES, Unsupported, border_width, c_color, color_of, dash, rect};
 use hayro_syntax::object::dict::keys::{C, IC, INKLIST, QUADPOINTS};
 use kurbo::{Point, Rect, Vec2};
 use std::rc::Rc;
@@ -272,15 +272,14 @@ pub(super) fn squiggly(
 ///
 /// Only its steps that can reach `shown`, the part of the page the clip lets show,
 /// are drawn, with one more on each side: the rest is clipped, and the ends cut there,
-/// with their caps and joins, lie outside it. Steps finer than [`FINEST`] are drawn
-/// as the band they cover: a straight line as high as the zigzag with its 45°
-/// strokes, a seventh of `h` + √2 times the line width.
+/// with their caps and joins, lie outside it. Every step is drawn as it is, however
+/// fine: the content can be scaled and zoomed any amount.
 ///
 /// The steps that can reach `shown` are those whose corners on the bottom edge lie
-/// within the zigzag's largest height of it. For quads whose sides are about as long
-/// as each other, as those of text are, they are at most the steps across `shown`
-/// and a few more; a quad whose sides differ a thousandfold or more can make them
-/// many more than `shown` could tell apart, and is [`Unsupported::Coordinates`].
+/// within the zigzag's largest height of it: about 7 times as many as the quad's
+/// height goes into the length of it `shown` holds. A quad that would draw more than
+/// [`MOST_PIECES`] is [`Unsupported::Coordinates`]: one whose part on the page is
+/// more than about 37 000 times as long as high, which no text is.
 fn zigzag(q: &Quad, shown: Rect, out: &mut Out) -> Result<(), Unsupported> {
     let wrote = |o: Option<()>| o.ok_or(Unsupported::Coordinates);
     let [_, _, bl, br] = q.0;
@@ -302,18 +301,6 @@ fn zigzag(q: &Quad, shown: Rect, out: &mut Out) -> Result<(), Unsupported> {
     // The corners are `delta` apart along the bottom edge, at `t = k delta / len`.
     let steps = (len / delta).ceil();
     let end = steps * delta / len;
-    if delta < FINEST {
-        let band = delta + std::f64::consts::SQRT_2 * width;
-        let (a, b) = (
-            bottom(0.0).midpoint(top(0.0)),
-            bottom(end).midpoint(top(end)),
-        );
-        wrote(out.nums(&[band], "w"))?;
-        wrote(out.nums(&[a.x, a.y], "m"))?;
-        wrote(out.nums(&[b.x, b.y], "l"))?;
-        out.op("S");
-        return Ok(());
-    }
     let reach = (top(0.0) - bottom(0.0))
         .hypot()
         .max((top(end) - bottom(end)).hypot())
@@ -323,8 +310,7 @@ fn zigzag(q: &Quad, shown: Rect, out: &mut Out) -> Result<(), Unsupported> {
     };
     let first = ((t0 * len / delta).floor() - 1.0).max(0.0);
     let last = ((t1 * len / delta).ceil() + 1.0).min(steps);
-    let most = 2.0 * (shown.width().hypot(shown.height()) / FINEST) + 16.0;
-    if last - first > most {
+    if last - first > MOST_PIECES {
         return Err(Unsupported::Coordinates);
     }
     let corner = |k: f64| {

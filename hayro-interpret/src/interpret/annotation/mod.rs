@@ -1063,11 +1063,11 @@ fn opacity(annot: &Entries<'_>) -> f32 {
     }
 }
 
-/// The smallest distance generated geometry keeps apart: a hundredth of a point,
-/// finer than any printer or screen resolves (7200 dpi). Steps closer than this, of
-/// a squiggle or of comb cell dividers, are drawn as the band they cover, so the
-/// work to draw them is bounded by the size of what is visible.
-const FINEST: f64 = 0.01;
+/// The most pieces one shape of repeated pieces draws where the page can show it
+/// (the steps of a squiggle, the dividers of a comb field): 5 to 10 MB of content.
+/// The pieces are drawn each, however small, as the content can be scaled and
+/// zoomed any amount; a shape that would draw more is [`Unsupported::Coordinates`].
+const MOST_PIECES: f64 = 262_144.0;
 
 /// A circle as viewers draw one: four cubic quarter arcs from its top, clockwise, so
 /// that it costs the same at any size.

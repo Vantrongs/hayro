@@ -1347,7 +1347,7 @@ fn fields_inherit_through_deep_parents_and_loops_end() {
 
 /// A comb field's `/MaxLen` of no cells makes no comb, as viewers read it: the value
 /// is drawn as in a plain text field (larger ones are in `annotation_cost.rs`).
-/// Cells finer than can be told apart are drawn as the band their dividers cover.
+/// Dividers that touch are drawn as the band they cover.
 #[test]
 fn comb_cells_follow_max_len() {
     let comb = |max_len: &str| {

@@ -143,7 +143,7 @@ impl Out {
         Some(())
     }
 
-    /// `path` as path construction operators, to a thousandth of a point.
+    /// `path` as path construction operators.
     pub(super) fn path(&mut self, path: &kurbo::BezPath) -> Option<()> {
         use kurbo::PathEl;
         let mut last = kurbo::Point::ZERO;
@@ -163,8 +163,8 @@ impl Out {
                 }
             };
             for p in pts {
-                self.num(round(p.x))?;
-                self.num(round(p.y))?;
+                self.num(p.x)?;
+                self.num(p.y)?;
             }
             self.op(match el {
                 PathEl::MoveTo(_) => "m",
@@ -257,9 +257,4 @@ impl Out {
         self.op("W n");
         Some(())
     }
-}
-
-/// `v` to a thousandth, without the trailing zeros.
-fn round(v: f64) -> f64 {
-    (v * 1000.0).round() / 1000.0 + 0.0
 }

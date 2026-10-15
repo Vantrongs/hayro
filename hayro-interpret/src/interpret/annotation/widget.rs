@@ -17,8 +17,8 @@ use super::freetext;
 use super::out::{Color, Out};
 use super::text::{self, Align, Family, Fonts, Setting, Shaped, Style, TextBox};
 use super::{
-    Appearances, FIELD, FINEST, Field, Inherited, TEXT, TextKey, Unsupported, border_width, circle,
-    color_of, rect,
+    Appearances, FIELD, Field, Inherited, MOST_PIECES, TEXT, TextKey, Unsupported, border_width,
+    circle, color_of, rect,
 };
 use hayro_syntax::object::dict::keys::AS;
 use kurbo::{Affine, Shape};
@@ -485,17 +485,14 @@ fn draw<'a>(
             // The dividers before the text, which a border wider than a cell covers.
             if let Some(border) = &border {
                 fail(out.stroke_color(border))?;
-                fail(out.stroke_state(w, &[]))?;
-                fail(comb_dividers(
+                comb_dividers(
                     i64::from(max_len),
                     f64::from(fw),
                     f64::from(fh),
                     w,
-                    Affine::IDENTITY,
                     shown,
                     out,
-                ))?;
-                out.op("S");
+                )?;
             }
             // Each glyph centred in its cell: those whose cells the clip can show
             // are drawn.
@@ -531,51 +528,58 @@ fn draw<'a>(
     Ok(Some(()))
 }
 
-/// The lines between the `cells` cells of a comb field `fw` × `fh` in frame `turn`,
-/// inside its border of width `w`, stroked `w` wide, those `visible` shows. Lines
-/// whose gaps are finer than [`FINEST`] are drawn as the band they cover, one
-/// stroke as wide, so the work does not grow with `cells` beyond what is visible.
+/// The lines between the `cells` cells of a comb field `fw` × `fh`, inside its
+/// border of width `w`, stroked `w` wide with butt caps (line `i` covers
+/// `w + step i ± w/2` across and `w..fh - w` up, `step` = `(fw - 2w) / cells`),
+/// those `shown` shows.
+///
+/// Lines that touch or overlap cover one band, drawn as one stroke as wide. Lines
+/// apart are drawn each, however close: the content can be scaled and zoomed any
+/// amount, and one stroke dashed `[w, step - w]`, which covers the same rectangles,
+/// is drawn solid, or not at all, by viewers once its dashes are finer than a pixel,
+/// where separate lines are grey (observed). More than [`MOST_PIECES`] lines shown are
+/// [`Unsupported::Coordinates`]. Lines of no height draw nothing.
 fn comb_dividers(
     cells: i64,
     fw: f64,
     fh: f64,
     w: f64,
-    turn: Affine,
-    visible: kurbo::Rect,
+    shown: kurbo::Rect,
     out: &mut Out,
-) -> Option<()> {
+) -> Result<(), Unsupported> {
+    let wrote = |o: Option<()>| o.ok_or(Unsupported::Coordinates);
     let cells = cells as f64;
-    if cells < 2.0 {
-        return Some(());
+    let height = (fh - 2.0 * w).abs();
+    if cells < 2.0 || height == 0.0 {
+        return Ok(());
     }
     let step = (fw - 2.0 * w) / cells;
-    let at = |u: f64, v: f64| {
-        let p = turn * kurbo::Point::new(u, v);
-        [p.x, p.y]
-    };
-    if step - w < FINEST {
-        // From the outer edge of the first line to that of the last, as high as the
-        // lines.
+    if step.abs() <= w {
+        // From the outer edge of the first line to that of the last.
         let (a, b) = (w + step, w + step * (cells - 1.0));
-        let (u0, u1) = (a.min(b) - w / 2.0, a.max(b) + w / 2.0);
-        out.nums(&[(fh - 2.0 * w).abs()], "w")?;
-        out.nums(&at(u0, fh / 2.0), "m")?;
-        return out.nums(&at(u1, fh / 2.0), "l");
+        wrote(out.stroke_state(height, &[]))?;
+        wrote(out.nums(&[a.min(b) - w / 2.0, fh / 2.0], "m"))?;
+        wrote(out.nums(&[a.max(b) + w / 2.0, fh / 2.0], "l"))?;
+        out.op("S");
+        return Ok(());
     }
     // The lines within half a width of the visible part of the frame.
-    let shown = (turn.inverse() * visible.to_path(0.1)).bounding_box();
-    let m = w.abs();
-    let first = ((shown.x0 - 1.5 * m) / step).floor().max(1.0);
-    let last = ((shown.x1 - 0.5 * m) / step).ceil().min(cells - 1.0);
+    let first = ((shown.x0 - 1.5 * w) / step).floor().max(1.0);
+    let last = ((shown.x1 - 0.5 * w) / step).ceil().min(cells - 1.0);
     if first > last {
-        return Some(());
+        return Ok(());
     }
+    if last - first >= MOST_PIECES {
+        return Err(Unsupported::Coordinates);
+    }
+    wrote(out.stroke_state(w, &[]))?;
     for i in 0..=(last - first) as u64 {
         let u = w + step * (first + i as f64);
-        out.nums(&at(u, w), "m")?;
-        out.nums(&at(u, fh - w), "l")?;
+        wrote(out.nums(&[u, w], "m"))?;
+        wrote(out.nums(&[u, fh - w], "l"))?;
     }
-    Some(())
+    out.op("S");
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

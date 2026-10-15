@@ -99,17 +99,34 @@ fn lines(content: &str) -> usize {
     content.lines().filter(|l| l.ends_with(" m")).count()
 }
 
-/// Comb cells closer than can be told apart are drawn as the band their dividers
-/// cover, at a cost that does not grow with `/MaxLen`.
+/// Comb dividers that touch are drawn as the band they cover, at a cost that does
+/// not grow with `/MaxLen`; dividers apart are drawn each, however close, those the
+/// page shows, and a comb that would draw more than 262 144 is refused.
 #[test]
-fn a_comb_of_billions_of_cells_is_drawn_as_its_band() {
-    let comb = "/Subtype /Widget /FT /Tx /Ff 16777216 /MK << /BC [0] >>";
-    for (max_len, w) in [("2147483647", "1"), ("100000000", "0.000001")] {
-        let content = generated(&format!(
-            "{comb} /MaxLen {max_len} /BS << /W {w} >> /Rect [20 100 180 130]"
+fn comb_dividers_are_drawn_each_unless_they_touch() {
+    let comb = |max_len: &str, w: &str, rect: &str| {
+        let pdf = one_annotation(&format!(
+            "/Subtype /Widget /FT /Tx /Ff 16777216 /MK << /BC [0] >> /MaxLen {max_len} \
+             /BS << /W {w} >> /Rect {rect}"
         ));
-        assert_eq!(lines(&content), 1, "{max_len}: {content}");
-    }
+        match first_look(&pdf) {
+            Look::Generated(a) => Ok(lines(&a.content)),
+            Look::Unsupported(why) => Err(why),
+            _ => panic!("{max_len} {w}: drawn otherwise"),
+        }
+    };
+    let field = "[20 100 180 130]";
+    // The band (the border is a rectangle).
+    assert_eq!(comb("2147483647", "1", field), Ok(1));
+    // Dividers 0.001 pt wide, 0.005 pt apart, each shown: as many as /MaxLen less one.
+    assert_eq!(comb("32000", "0.001", field), Ok(31_999));
+    // Of a field 160 times as wide as the page, with dividers about 1 pt apart, the
+    // 199 on the page and the next.
+    assert_eq!(comb("32000", "0.001", "[0 100 32000 130]"), Ok(200));
+    assert_eq!(
+        comb("100000000", "0.000001", field),
+        Err(Unsupported::Coordinates)
+    );
 }
 
 /// A comb field's `/MaxLen` beyond a 32-bit integer makes no comb, as viewers read
@@ -145,23 +162,32 @@ fn a_comb_wider_than_the_page_draws_the_dividers_on_it() {
     assert_eq!(starts, [501, 1001], "{content}");
 }
 
-/// A squiggle whose steps are closer than can be told apart is drawn as the band
-/// it covers; one of steps just apart is drawn across the page only.
+/// A squiggle is drawn step by step, however fine, across the page only; one that
+/// would draw more than 262 144 steps there is refused.
 #[test]
 fn a_flat_squiggle_is_drawn_at_a_bounded_cost() {
-    let content = generated(
-        "/Subtype /Squiggly /C [0] /QuadPoints [0 0.000000000001 200 0.000000000001 0 0 200 0] \
-         /Rect [0 0 200 1]",
+    let steps = |quad: &str| {
+        let pdf = one_annotation(&format!(
+            "/Subtype /Squiggly /C [0] /QuadPoints [{quad}] /Rect [0 0 200 200]"
+        ));
+        match first_look(&pdf) {
+            Look::Generated(a) => Ok(a.content.matches(" l\n").count()),
+            Look::Unsupported(why) => Err(why),
+            _ => panic!("{quad}: drawn otherwise"),
+        }
+    };
+    // Steps of 0.001 pt across a quad 4·10^6 pt wide: about 200 000 on the page.
+    let n = steps("0 100.007 4000000 100.007 0 100 4000000 100").unwrap();
+    assert!((199_000..201_000).contains(&n), "{n} steps");
+    // Steps of 0.0001 pt: about 2 000 000.
+    assert_eq!(
+        steps("0 100.0007 4000000 100.0007 0 100 4000000 100"),
+        Err(Unsupported::Coordinates)
     );
-    assert_eq!(lines(&content), 1, "{content}");
-    assert!(content.contains(" l\nS\n"), "{content}");
-    // Steps of 0.0101 pt across a quad 4·10^6 pt wide: about 20 000 on the page.
-    let content = generated(
-        "/Subtype /Squiggly /C [0] /QuadPoints [0 100.0707 4000000 100.0707 0 100 4000000 100] \
-         /Rect [0 100 200 101]",
+    assert_eq!(
+        steps("0 0.000000000001 200 0.000000000001 0 0 200 0"),
+        Err(Unsupported::Coordinates)
     );
-    let steps = content.matches(" l\n").count();
-    assert!((19_000..21_000).contains(&steps), "{steps} steps");
 }
 
 /// 4·10^6: twice it is below 2^23, from which numbers are not written.
