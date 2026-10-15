@@ -14,7 +14,7 @@ use crate::object::Dict;
 use crate::object::Name;
 use crate::object::dict::InlineImageDict;
 use crate::object::dict::keys::{DECODE_PARMS, DP, F, FILTER, IDENTITY, LENGTH, NAME, TYPE};
-use crate::object::{Array, ObjectIdentifier};
+use crate::object::{Array, MaybeRef, ObjectIdentifier};
 use crate::object::{Object, ObjectLike, ObjectRefLike};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
@@ -35,9 +35,136 @@ mod jpeg;
 #[cfg(feature = "images")]
 pub use jpeg::{JpegCheckpoint, JpegInput, JpegRows};
 
-struct FiltersAndParams<'a> {
-    filters: SmallVec<[Filter; 2]>,
-    params: SmallVec<[Dict<'a>; 2]>,
+/// A stream's filters, each entry in its place with the parameters in the same
+/// place ([`Stream::filter_entries`]), read one at a time: what reading them holds
+/// does not grow with their number.
+#[derive(Clone, Debug)]
+pub struct FilterEntries<'a> {
+    /// The key the filters are read from: /Filter, or /F, its abbreviation.
+    pub key: &'static [u8],
+    list: List<'a>,
+    params_key: &'static [u8],
+    dict: Dict<'a>,
+}
+
+#[derive(Clone, Debug)]
+enum List<'a> {
+    None,
+    /// A filter given by name, as written.
+    Named(MaybeRef<Object<'a>>),
+    Listed(Array<'a>),
+}
+
+/// An entry of a stream's filters ([`FilterEntries`]).
+#[derive(Clone, Debug)]
+pub struct FilterEntry<'a> {
+    /// The filter the entry names; `None` where it names none, which decoding
+    /// passes over in its place: an entry that is no name, a reference to no
+    /// object, or a name of no filter.
+    pub filter: Option<Filter>,
+    /// The entry as written.
+    pub written: MaybeRef<Object<'a>>,
+    /// The entry of the parameters in the same place, as written; `None` where
+    /// they have none there.
+    pub params_written: Option<MaybeRef<Object<'a>>>,
+    /// The parameters, resolved: empty where they are no dictionary.
+    pub params: Dict<'a>,
+    /// Whether the parameters are reached through a reference: their entry, or
+    /// the array of parameters it is in.
+    pub params_by_reference: bool,
+}
+
+impl<'a> FilterEntries<'a> {
+    /// The filters of a stream with dictionary `dict`, read as `MuPDF` reads them
+    /// (`PyMuPDF` 1.28.2, observed): an entry of the array of filters that names
+    /// no filter is passed over in its place, so that the parameters stay with
+    /// their filters. The parameters are /DP where the dictionary has that key
+    /// with another value than `null`, of whatever type, else `/DecodeParms`; a
+    /// dictionary for a filter given by name, an array of them, in the filters'
+    /// places, for an array of filters, and none where they are of another kind.
+    pub fn of(dict: &Dict<'a>) -> Self {
+        let named = |key| dict.get::<Name<'_>>(key).map(|_| key);
+        let listed = |key| dict.get::<Array<'_>>(key).map(|_| key);
+        let params_key = match dict.get_raw::<Object<'_>>(DP) {
+            None | Some(MaybeRef::NotRef(Object::Null(_))) => DECODE_PARMS,
+            Some(_) => DP,
+        };
+        let (key, list) = if let Some(key) = named(F).or_else(|| named(FILTER)) {
+            let written = dict.get_raw::<Object<'a>>(key);
+            (key, written.map_or(List::None, List::Named))
+        } else if let Some(key) = listed(F).or_else(|| listed(FILTER)) {
+            let array = dict.get::<Array<'a>>(key);
+            (key, array.map_or(List::None, List::Listed))
+        } else {
+            (FILTER, List::None)
+        };
+        Self {
+            key,
+            list,
+            params_key,
+            dict: dict.clone(),
+        }
+    }
+
+    /// The entries in order, each with the parameters in its place.
+    pub fn entries(&self) -> impl Iterator<Item = FilterEntry<'a>> + '_ {
+        let dict = &self.dict;
+        // Each written entry resolved in the context of the object holding it.
+        let entry = |written: MaybeRef<Object<'a>>,
+                     ctx: &ReaderContext<'a>,
+                     params_written: Option<(MaybeRef<Object<'a>>, &ReaderContext<'a>)>,
+                     listed_by_reference: bool| {
+            let filter = written
+                .clone()
+                .resolve(ctx)
+                .and_then(Object::into_name)
+                .and_then(Filter::from_name);
+            let params_by_reference =
+                listed_by_reference || matches!(params_written, Some((MaybeRef::Ref(_), _)));
+            let params = params_written
+                .clone()
+                .and_then(|(p, ctx)| p.resolve(ctx))
+                .and_then(Object::into_dict)
+                .unwrap_or_default();
+            FilterEntry {
+                filter,
+                written,
+                params_written: params_written.map(|(p, _)| p),
+                params,
+                params_by_reference,
+            }
+        };
+        let (named, listed) = match &self.list {
+            List::None => (None, None),
+            List::Named(written) => {
+                let params = dict.get_raw::<Object<'a>>(self.params_key);
+                let params = params.map(|p| (p, dict.ctx()));
+                (
+                    Some(entry(written.clone(), dict.ctx(), params, false)),
+                    None,
+                )
+            }
+            List::Listed(filters) => {
+                let by_reference = dict.get_ref(self.params_key).is_some();
+                let params = dict.get::<Array<'a>>(self.params_key);
+                let mut params_written = params.as_ref().map(Array::raw_iter);
+                let entries = filters.raw_iter().map(move |written| {
+                    let params_written = params_written
+                        .as_mut()
+                        .and_then(Iterator::next)
+                        .zip(params.as_ref().map(Array::ctx));
+                    entry(written, filters.ctx(), params_written, by_reference)
+                });
+                (None, Some(entries))
+            }
+        };
+        named.into_iter().chain(listed.into_iter().flatten())
+    }
+
+    /// The entries that name a filter, the ones decoding applies.
+    pub fn applied(&self) -> impl Iterator<Item = (Filter, FilterEntry<'a>)> + '_ {
+        self.entries().filter_map(|e| Some((e.filter?, e)))
+    }
 }
 
 /// A stream of arbitrary data.
@@ -77,58 +204,10 @@ impl<'a> Stream<'a> {
         Self { dict, data }
     }
 
-    fn filters_and_params(&self) -> FiltersAndParams<'a> {
-        let mut collected_filters = SmallVec::new();
-        let mut collected_params = SmallVec::new();
-
-        if let Some(filter) = self
-            .dict
-            .get::<Name<'_>>(F)
-            .or_else(|| self.dict.get::<Name<'_>>(FILTER))
-            .and_then(Filter::from_name)
-        {
-            let params = self
-                .dict
-                .get::<Dict<'_>>(DP)
-                .or_else(|| self.dict.get::<Dict<'_>>(DECODE_PARMS))
-                .unwrap_or_default();
-
-            collected_filters.push(filter);
-            collected_params.push(params);
-        } else if let Some(filters) = self
-            .dict
-            .get::<Array<'_>>(F)
-            .or_else(|| self.dict.get::<Array<'_>>(FILTER))
-        {
-            // The filters up to the first entry that is not a name.
-            let filters = Vec::<Name<'_>>::try_from(filters).unwrap_or_default();
-            // Each in the place of its filter; one that is null or refers to no
-            // object is the default.
-            let mut params = self
-                .dict
-                .get::<Array<'_>>(DP)
-                .or_else(|| self.dict.get::<Array<'_>>(DECODE_PARMS))
-                .map(|a| a.items::<Object<'_>>());
-
-            for filter in filters.into_iter().map(Filter::from_name) {
-                let params = params
-                    .as_mut()
-                    .and_then(|p| p.next())
-                    .flatten()
-                    .and_then(|p| p.into_dict())
-                    .unwrap_or_default();
-
-                if let Some(filter) = filter {
-                    collected_filters.push(filter);
-                    collected_params.push(params);
-                }
-            }
-        }
-
-        FiltersAndParams {
-            filters: collected_filters,
-            params: collected_params,
-        }
+    /// The stream's filters with their parameters, each in its place, as decoding
+    /// reads them ([`FilterEntries::of`]).
+    pub fn filter_entries(&self) -> FilterEntries<'a> {
+        FilterEntries::of(&self.dict)
     }
 
     /// Return the raw, decrypted data of the stream, empty where decryption fails.
@@ -208,16 +287,16 @@ impl<'a> Stream<'a> {
         {
             return Ok(None);
         }
-        let FiltersAndParams { filters, params } = self.filters_and_params();
-        if !filters.contains(&Filter::Crypt) {
+        let filters = self.filter_entries();
+        if !filters.applied().any(|(f, _)| f == Filter::Crypt) {
             return Ok(ctx.decryption().map(|id| (id, None)));
         }
         let mut named = None;
-        for (i, (filter, params)) in filters.iter().zip(&params).enumerate() {
-            if *filter != Filter::Crypt {
+        for (i, (filter, entry)) in filters.applied().enumerate() {
+            if filter != Filter::Crypt {
                 continue;
             }
-            match params.get::<Name<'a>>(NAME) {
+            match entry.params.get::<Name<'a>>(NAME) {
                 Some(name) if name.deref() != IDENTITY => {
                     let id = ctx.decryption().filter(|_| i == 0);
                     named = Some((id.ok_or(DecodeFailure::Decryption)?, Some(name)));
@@ -264,7 +343,7 @@ impl<'a> Stream<'a> {
 
     /// Return the filters that are applied to the stream.
     pub fn filters(&self) -> SmallVec<[Filter; 2]> {
-        self.filters_and_params().filters
+        self.filter_entries().applied().map(|(f, _)| f).collect()
     }
 
     /// Return the decoded data of the stream.
@@ -320,22 +399,18 @@ impl<'a> Stream<'a> {
         strict: bool,
     ) -> Result<FilterResult<'a>, DecodeFailure> {
         let data = self.raw_data_metered(meter, strict)?;
-        let filters_and_params = self.filters_and_params();
+        let filters = self.filter_entries();
 
         let mut current: Option<FilterResult<'a>> = None;
 
-        for (filter, params) in filters_and_params
-            .filters
-            .iter()
-            .zip(filters_and_params.params.iter())
-        {
-            if *filter == Filter::Crypt {
+        for (filter, entry) in filters.applied() {
+            if filter == Filter::Crypt {
                 // Decrypted with the raw data.
                 continue;
             }
             let new = filter.apply(
                 current.as_ref().map(|c| c.data.as_ref()).unwrap_or(&data),
-                params,
+                &entry.params,
                 image_params,
                 meter,
                 strict,
@@ -363,9 +438,10 @@ impl<'a> Stream<'a> {
         &self,
         meter: &Meter<'_>,
     ) -> Result<Option<StrictReader<'a>>, DecodeFailure> {
-        let FiltersAndParams { filters, params } = self.filters_and_params();
-        let mut layers = Vec::with_capacity(filters.len());
-        for (filter, params) in filters.iter().zip(&params) {
+        let filters = self.filter_entries();
+        let mut layers = Vec::new();
+        for (filter, entry) in filters.applied() {
+            let params = &entry.params;
             // The parameters and the reversal of the predictor; `None` where whole
             // decoding refuses the parameters or only it reverses the predictor.
             let predicted = || {
@@ -434,11 +510,12 @@ impl<'a> Stream<'a> {
     /// The predictor of the one Flate filter, `Some(None)` for no filter, `None` when
     /// the filters cannot be read incrementally.
     fn reader_filter(&self) -> Option<Option<PredictorParams>> {
-        let FiltersAndParams { filters, params } = self.filters_and_params();
-        match filters.as_slice() {
-            [] => Some(None),
-            [Filter::FlateDecode] => {
-                let params = PredictorParams::from_params(&params[0])?;
+        let filters = self.filter_entries();
+        let mut applied = filters.applied();
+        match (applied.next(), applied.next()) {
+            (None, _) => Some(None),
+            (Some((Filter::FlateDecode, entry)), None) => {
+                let params = PredictorParams::from_params(&entry.params)?;
                 if params.predictor != 1 {
                     Unpredictor::new(&params)?;
                 }

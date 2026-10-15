@@ -2376,6 +2376,10 @@ mod tests {
                 "/Filter /Crypt /DecodeParms << /Name /Identity >>",
                 "/Filter /Crypt",
                 "/Filter [/Crypt] /DecodeParms [<< /Name /Identity >>]",
+                // An entry of the filters that names none keeps the parameters in
+                // their places.
+                "/Filter [null /Crypt] /DecodeParms [null << /Name /Identity >>]",
+                "/Filter [null /Crypt]",
             ] {
                 let page = page("[4 0 R 5 0 R]");
                 let file = aes128(&[

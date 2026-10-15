@@ -478,3 +478,121 @@ fn data_cut_short_in_other_filters_keep_what_they_hold() {
         }
     }
 }
+
+/// What a filter list decodes to (see [`FILTER_CASES`]).
+#[derive(Clone, Copy, Debug)]
+enum Data {
+    /// [`ROWS`] compressed with zlib.
+    Flate,
+    /// The zlib data in hexadecimal.
+    Hex,
+}
+
+/// Two rows of five bytes under PNG filter 0.
+const ROWS: &[u8] = b"\x00HELLO\x00WORLD";
+
+/// What `PyMuPDF` decodes a case to.
+#[derive(Clone, Copy, Debug)]
+enum Out {
+    /// [`ROWS`]: Flate applied without the predictor.
+    Rows,
+    /// The rows with the predictor reversed.
+    Predicted,
+    /// The data as stored: no filter applied.
+    Stored,
+}
+
+/// A stream's entries (object 3), its data, objects 4 on, and what `PyMuPDF` 1.28.2
+/// decodes it to (`Document::xref_stream`).
+#[rustfmt::skip]
+const FILTER_CASES: &[(&str, Data, &[&str], Out)] = &[
+    ("/Filter [/FlateDecode]", Data::Flate, &[], Out::Rows),
+    ("/Filter [null /FlateDecode]", Data::Flate, &[], Out::Rows),
+    ("/Filter [/FlateDecode null]", Data::Flate, &[], Out::Rows),
+    ("/Filter [1 /FlateDecode]", Data::Flate, &[], Out::Rows),
+    ("/Filter [(AHx) /FlateDecode]", Data::Flate, &[], Out::Rows),
+    ("/Filter [/Foo /FlateDecode]", Data::Flate, &[], Out::Rows),
+    ("/Filter [/FlateDecode /Foo]", Data::Flate, &[], Out::Rows),
+    ("/Filter [[/FlateDecode]]", Data::Flate, &[], Out::Stored),
+    ("/Filter [4 0 R]", Data::Flate, &["/FlateDecode"], Out::Rows),
+    ("/Filter [8 0 R /FlateDecode]", Data::Flate, &[], Out::Rows),
+    ("/Filter [4 0 R /FlateDecode]", Data::Flate, &["null"], Out::Rows),
+    ("/Filter [/Crypt /FlateDecode]", Data::Flate, &[], Out::Rows),
+    ("/Filter [null /Crypt /FlateDecode]", Data::Flate, &[], Out::Rows),
+    ("/Filter [/AHx null /Fl]", Data::Hex, &[], Out::Rows),
+    ("/Filter 4 0 R", Data::Flate, &["[/FlateDecode]"], Out::Rows),
+    ("/Filter 5", Data::Flate, &[], Out::Stored),
+    ("/Filter /Foo", Data::Flate, &[], Out::Stored),
+    ("/Filter [/Foo]", Data::Flate, &[], Out::Stored),
+    ("/Filter [/FlateDecode] /DecodeParms [<< /Predictor 12 /Columns 5 >>]", Data::Flate, &[], Out::Predicted),
+    ("/Filter [/FlateDecode] /DecodeParms << /Predictor 12 /Columns 5 >>", Data::Flate, &[], Out::Rows),
+    ("/Filter /FlateDecode /DecodeParms [<< /Predictor 12 /Columns 5 >>]", Data::Flate, &[], Out::Rows),
+    ("/Filter /FlateDecode /DecodeParms null", Data::Flate, &[], Out::Rows),
+    ("/Filter [null /FlateDecode] /DecodeParms [null << /Predictor 12 /Columns 5 >>]", Data::Flate, &[], Out::Predicted),
+    ("/Filter [null /FlateDecode] /DecodeParms [<< /Predictor 12 /Columns 5 >>]", Data::Flate, &[], Out::Rows),
+    ("/Filter [/Foo /FlateDecode] /DecodeParms [null << /Predictor 12 /Columns 5 >>]", Data::Flate, &[], Out::Predicted),
+    ("/Filter [/Foo /FlateDecode] /DecodeParms [<< /Predictor 12 /Columns 5 >>]", Data::Flate, &[], Out::Rows),
+    ("/Filter [1 /FlateDecode] /DecodeParms [null << /Predictor 12 /Columns 5 >>]", Data::Flate, &[], Out::Predicted),
+    ("/Filter [/AHx /Fl] /DecodeParms [1 << /Predictor 12 /Columns 5 >>]", Data::Hex, &[], Out::Predicted),
+    ("/Filter [/AHx /Fl] /DecodeParms [<< /Predictor 12 /Columns 5 >>]", Data::Hex, &[], Out::Rows),
+    ("/Filter [/AHx /Fl] /DecodeParms [null 4 0 R]", Data::Hex, &["<< /Predictor 12 /Columns 5 >>"], Out::Predicted),
+    ("/Filter [/AHx /Fl] /DecodeParms [8 0 R << /Predictor 12 /Columns 5 >>]", Data::Hex, &[], Out::Predicted),
+    ("/Filter [/AHx /Fl] /DecodeParms [[] << /Predictor 12 /Columns 5 >>]", Data::Hex, &[], Out::Predicted),
+    ("/Filter [/FlateDecode] /DecodeParms 4 0 R", Data::Flate, &["[<< /Predictor 12 /Columns 5 >>]"], Out::Predicted),
+    ("/Filter [/FlateDecode] /DecodeParms 4 0 R", Data::Flate, &["[5 0 R]", "<< /Predictor 12 /Columns 5 >>"], Out::Predicted),
+    ("/Filter 4 0 R /DecodeParms << /Predictor 12 /Columns 5 >>", Data::Flate, &["/FlateDecode"], Out::Predicted),
+    ("/Filter [null /Crypt /FlateDecode] /DP [null null << /Predictor 12 /Columns 5 >>]", Data::Flate, &[], Out::Predicted),
+    ("/Filter [null /FlateDecode] /DP [null null << /Predictor 12 /Columns 5 >>]", Data::Flate, &[], Out::Rows),
+    ("/Filter /FlateDecode /DP << /Predictor 12 /Columns 5 >> /DecodeParms << /Predictor 1 >>", Data::Flate, &[], Out::Predicted),
+    ("/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 5 >> /DP << /Predictor 1 >>", Data::Flate, &[], Out::Rows),
+    ("/Filter /FlateDecode /DP 5 /DecodeParms << /Predictor 12 /Columns 5 >>", Data::Flate, &[], Out::Rows),
+    ("/Filter /FlateDecode /DP (x) /DecodeParms << /Predictor 12 /Columns 5 >>", Data::Flate, &[], Out::Rows),
+    ("/Filter /FlateDecode /DP null /DecodeParms << /Predictor 12 /Columns 5 >>", Data::Flate, &[], Out::Predicted),
+    ("/Filter /FlateDecode /DP 8 0 R /DecodeParms << /Predictor 12 /Columns 5 >>", Data::Flate, &[], Out::Rows),
+    ("/Filter /FlateDecode /DP 4 0 R /DecodeParms << /Predictor 12 /Columns 5 >>", Data::Flate, &["null"], Out::Rows),
+    ("/Filter /FlateDecode /DP 4 0 R /DecodeParms << /Predictor 1 >>", Data::Flate, &["<< /Predictor 12 /Columns 5 >>"], Out::Predicted),
+    ("/Filter /FlateDecode /DP [<< /Predictor 12 /Columns 5 >>] /DecodeParms << /Predictor 1 >>", Data::Flate, &[], Out::Rows),
+    ("/Filter [/FlateDecode] /DP [null] /DecodeParms [<< /Predictor 12 /Columns 5 >>]", Data::Flate, &[], Out::Rows),
+    ("/Filter [/FlateDecode] /DP << /Predictor 12 /Columns 5 >> /DecodeParms [<< /Predictor 1 >>]", Data::Flate, &[], Out::Rows),
+    ("/Filter [/FlateDecode] /DP 5 /DecodeParms [<< /Predictor 12 /Columns 5 >>]", Data::Flate, &[], Out::Rows),
+    ("/Filter [/FlateDecode] /DP null /DecodeParms [<< /Predictor 12 /Columns 5 >>]", Data::Flate, &[], Out::Predicted),
+    ("/Filter [/FlateDecode] /DP 8 0 R /DecodeParms [<< /Predictor 12 /Columns 5 >>]", Data::Flate, &[], Out::Rows),
+    ("/Filter [/FlateDecode] /DecodeParms [<< /Predictor 12 /Columns 5 >>] /DP []", Data::Flate, &[], Out::Rows),
+];
+
+#[test]
+fn filters_keep_their_parameters_in_place_as_mupdf_reads_them() {
+    let zlib_rows = zlib(ROWS);
+    let mut differ = Vec::new();
+    for &(dict, data, extra, expected) in FILTER_CASES {
+        let data = match data {
+            Data::Flate => zlib_rows.clone(),
+            Data::Hex => {
+                let mut hex: Vec<u8> = zlib_rows
+                    .iter()
+                    .flat_map(|b| format!("{b:02x}").into_bytes())
+                    .collect();
+                hex.push(b'>');
+                hex
+            }
+        };
+        let expected = match expected {
+            Out::Rows => ROWS,
+            Out::Predicted => b"HELLOWORLD",
+            Out::Stored => &data,
+        };
+        let mut objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec(),
+            common::stream(dict, &data),
+        ];
+        objects.extend(extra.iter().map(|e| e.as_bytes().to_vec()));
+        let pdf = Pdf::new(common::file(&objects, "")).unwrap();
+        for (reading, got) in every_reading(&object_3(&pdf)) {
+            if got.as_deref() != Some(expected) {
+                differ.push(format!("{dict} {extra:?}: {reading} gives {got:?}"));
+            }
+        }
+    }
+    assert!(differ.is_empty(), "{differ:#?}");
+}

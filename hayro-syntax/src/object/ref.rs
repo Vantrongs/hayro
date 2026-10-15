@@ -72,7 +72,7 @@ impl Readable<'_> for ObjRef {
 }
 
 /// A struct that is either an object or a reference to an object.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum MaybeRef<T> {
     /// A reference to an object.
     Ref(ObjRef),
