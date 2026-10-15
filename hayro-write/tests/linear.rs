@@ -371,8 +371,10 @@ fn worked(file: Vec<u8>) -> (usize, usize) {
 // once, however many entries lead to it, its stream data hashed and written once.
 // So the copy, of each page once, holds each object it draws with once, its data
 // as stored and its dictionary rewritten, and each page's content once: no more
-// than a few bytes for each byte of the file, as nothing the pages draw with is
-// compressed.
+// than a few bytes for each byte of the file, where, as here, nothing the pages draw
+// with is compressed, no two pages are one page object, no content array names a
+// stream twice, and no two streams drawn share data. Where they do, the copy holds
+// what the file means, which grows faster than the file.
 #[test]
 fn reading_a_damaged_file_works_on_it_a_bounded_number_of_times() {
     let mut random = Random(0x11ea_f00d);
