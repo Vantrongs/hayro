@@ -180,3 +180,19 @@ fn a_translucent_stroke_paint_knocks_out_the_fill() {
         }
     }
 }
+
+/// Filled and stroked in red by one operator at alpha 0.5, the stroke's inner edge
+/// halfway across a pixel: the fill is knocked out by the stroke's coverage and the
+/// stroke then drawn over it, so the pixel is lighter than the shape's inside, as a
+/// common viewer draws it (`PyMuPDF` 1.28.2: 255, 161, 161 there, 255, 129, 129
+/// inside), rather than even with the inside, as a knockout group's compositing by
+/// shape would make it (PDF 32000-1 11.4.6.2).
+#[test]
+fn a_knocked_out_fill_shows_lighter_at_the_stroke_edge_as_viewers_draw_it() {
+    let content = "/G gs 10 w 1 0 0 RG 1 0 0 rg 25.5 25.5 50 50 re B";
+    let [edge, inside] = pixels(content, &[(30, 50), (50, 50)])[..] else {
+        unreachable!()
+    };
+    assert!(near(edge, [255, 161, 161]), "{edge:?}");
+    assert!(near(inside, HALF_RED), "{inside:?}");
+}
