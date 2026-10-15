@@ -596,3 +596,102 @@ fn entries_leading_to_one_image_copy_it_once() {
         );
     }
 }
+
+/// A page the page tree lists `n` times (`/Kids [3 0 R 3 0 R …]`), its content `len`
+/// bytes of comment lines of random digits, which deflate cannot hide the repetition
+/// of, drawn with a graphics state.
+fn repeated_page(n: usize, len: usize) -> Vec<u8> {
+    let mut random = Random(0x6b1d5);
+    let mut content = String::new();
+    while content.len() < len {
+        content += &format!(
+            "% {:08x}{:08x}\n",
+            random.below(1 << 30),
+            random.below(1 << 30)
+        );
+    }
+    listed(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+            (
+                2,
+                format!(
+                    "<< /Type /Pages /Kids [{}] /Count {n} >>",
+                    "3 0 R ".repeat(n)
+                ),
+            ),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] \
+                 /Resources << /ExtGState << /G0 4 0 R >> >> /Contents 5 0 R >>"
+                    .to_owned(),
+            ),
+            (4, "<< /CA 0.5 >>".to_owned()),
+            (
+                5,
+                format!(
+                    "<< /Length {} >>\nstream\n{content}\nendstream",
+                    content.len()
+                ),
+            ),
+        ],
+        0,
+    )
+}
+
+// A page the page tree lists many times is many pages, each with its own page
+// object, but what they draw is one: each query that copies one of them as a form
+// gets the one form copied for all, and every page copied as a page draws the one
+// content copied for all, so the work and the copy grow with the file, not with the
+// pages times their content: the copy holds the content three times, as a page's
+// and as a form placed each way.
+#[test]
+fn a_page_listed_many_times_is_copied_once() {
+    let [small, large] = [128, 256].map(|n| {
+        let file = repeated_page(n, 64 * 1024);
+        let size = file.len();
+        count();
+        let pdf = Pdf::new(file).unwrap();
+        let pages = pdf.pages();
+        assert_eq!(pages.len(), n);
+        let queries: Vec<_> = (0..n)
+            .flat_map(|i| {
+                [
+                    ExtractionQuery::new_page(i),
+                    ExtractionQuery::new_xobject(i),
+                    ExtractionQuery::new_user_space_xobject(i, [0.0, 0.0, 600.0, 700.0]),
+                ]
+            })
+            .collect();
+        let mut next = Ref::new(1);
+        let copy = extract(
+            &pdf,
+            Box::new(|| next.bump()),
+            ChunkSettings::default(),
+            &queries,
+        )
+        .unwrap();
+        let (work, written) = (counted(), copy.chunk.len());
+        let roots: Vec<Ref> = copy.root_refs.iter().map(|r| r.unwrap()).collect();
+        let kind = |k: usize| roots.iter().skip(k).step_by(3).collect::<Vec<_>>();
+        let (page_copies, forms, user_space) = (kind(0), kind(1), kind(2));
+        assert!(forms.iter().all(|form| *form == forms[0]));
+        assert!(user_space.iter().all(|form| *form == user_space[0]));
+        let distinct: std::collections::BTreeSet<_> = page_copies.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            n,
+            "each page copied as a page is its own object"
+        );
+        assert!(
+            work <= 16 * size && written <= 4 * size,
+            "{n} pages: {work} steps and {written} bytes written for {size} bytes"
+        );
+        eprintln!("{n} pages: {work} steps, {written} bytes written for {size}");
+        (work, written)
+    });
+    assert!(
+        large.0 <= small.0 * 25 / 10 && large.1 <= small.1 * 25 / 10,
+        "{small:?} for 128 pages, {large:?} for 256"
+    );
+}

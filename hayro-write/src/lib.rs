@@ -23,7 +23,7 @@ use hayro_syntax::object::dict::keys::{
 };
 use hayro_syntax::object::stream::DecodeFailure;
 use hayro_syntax::object::{Dict, ObjRef, Object};
-use hayro_syntax::page::{ContentError, Page, Resources, Rotation};
+use hayro_syntax::page::{ContentError, Page, PageKey, Resources, Rotation};
 use hayro_syntax::work::Meter;
 use hayro_syntax::xref::ContentKey;
 use pdf_writer::{Chunk, Content, Filter, Finish, Name, Rect, Ref};
@@ -74,19 +74,16 @@ pub fn extract<'a>(
         ctx.page = query.page_index;
         let (res, lost) = xref.watch(|| match query.query_type {
             ExtractionQueryType::XObject => {
-                let root_ref = ctx.new_ref();
-                write_xobject(page()?, query.page_index, None, root_ref, &mut ctx).map(|_| root_ref)
+                write_xobject(page()?, query.page_index, None, &mut ctx)
             }
             ExtractionQueryType::UserSpaceXObject(bbox) => {
-                let root_ref = ctx.new_ref();
-                write_xobject(page()?, query.page_index, Some(bbox), root_ref, &mut ctx)
-                    .map(|_| root_ref)
+                write_xobject(page()?, query.page_index, Some(bbox), &mut ctx)
             }
             ExtractionQueryType::Page => {
                 let root_ref = ctx.new_ref();
                 write_page(page()?, root_ref, query.page_index, &mut ctx).map(|_| root_ref)
             }
-            ExtractionQueryType::Form(obj) => write_form(obj, page()?, query.page_index, &mut ctx),
+            ExtractionQueryType::Form(obj) => write_form(obj, page()?, &mut ctx),
         });
         if let Some(id) = lost {
             ctx.fail(match res {
@@ -158,7 +155,8 @@ impl ExtractionQuery {
     /// whatever the stream says: annotation appearance streams may leave the type out.
     /// A stream without a /Resources dictionary uses the page's, as renderers draw an
     /// appearance with the resources of its page; its copy gets those. Queries for
-    /// the same stream share a copy where it has its own resources.
+    /// the same stream share a copy where it has its own resources, or where their
+    /// pages draw the same ([`hayro_syntax::page::PageKey`]).
     pub fn new_form(obj: ObjRef, page_index: usize) -> Self {
         Self {
             query_type: ExtractionQueryType::Form(obj),
@@ -166,7 +164,9 @@ impl ExtractionQuery {
         }
     }
 
-    /// Create a new `XObject` extraction query with the given page index.
+    /// Create a new `XObject` extraction query with the given page index. Queries of
+    /// pages that draw the same ([`hayro_syntax::page::PageKey`]) share one copy, as
+    /// those of [`Self::new_user_space_xobject`] with the same box do.
     pub fn new_xobject(page_index: usize) -> Self {
         Self {
             query_type: ExtractionQueryType::XObject,
@@ -244,8 +244,12 @@ struct ExtractionContext<'a> {
     /// leading to the first stream copied with each key, and its copy.
     shared_streams: hash::Map<StreamKey, (ObjRef, Ref)>,
     /// The copies of streams form queries asked for, by the stream's body and, for
-    /// one that takes its page's resources, the page.
-    forms: hash::Map<(ContentKey<'a>, Option<usize>), Ref>,
+    /// one that takes its page's resources, what the page draws.
+    forms: hash::Map<(ContentKey<'a>, Option<PageKey<'a>>), Ref>,
+    /// The copy of each page as a form, by what it draws and where the query places
+    /// it, or why its content cannot be copied: one for all queries of pages the
+    /// page tree lists with one dictionary under the same resources and boxes.
+    page_forms: hash::Map<(PageKey<'a>, Placement), Result<Ref, ContentError>>,
     /// The copy of each resource category dictionary pages and forms are drawn
     /// with, by what it is read from, which pages that share it share.
     resource_categories: hash::Map<ContentKey<'a>, Ref>,
@@ -254,7 +258,10 @@ struct ExtractionContext<'a> {
     root_refs: Vec<Result<Ref, ExtractionError>>,
     pdf: &'a Pdf,
     new_ref: Box<dyn FnMut() -> Ref + 'a>,
-    cached_content_streams: hash::Map<usize, Ref>,
+    /// The content of each page copied as a page, by what the page draws: each
+    /// copy is a page object of its own, as Acrobat does not take one page object
+    /// listed twice in a page tree, but pages that draw the same share their content.
+    page_contents: hash::Map<PageKey<'a>, Ref>,
     page_tree_parent_ref: Ref,
     chunk_settings: ChunkSettings,
     /// Counts the bytes of data hashed, compared and written.
@@ -275,11 +282,12 @@ impl<'a> ExtractionContext<'a> {
             page: 0,
             shared_streams: hash::Map::default(),
             forms: hash::Map::default(),
+            page_forms: hash::Map::default(),
             resource_categories: hash::Map::default(),
             error: None,
             pdf,
             new_ref,
-            cached_content_streams: hash::Map::default(),
+            page_contents: hash::Map::default(),
             root_refs: Vec::new(),
             page_tree_parent_ref,
             chunk_settings,
@@ -438,20 +446,18 @@ fn write_page<'a>(
 ) -> Result<(), ExtractionError> {
     drawn_with(page, ctx);
     let mut chunk = Chunk::with_settings(ctx.chunk_settings);
-    // Note: We can cache content stream references, but _not_ the page references themselves.
-    // Acrobat for some reason doesn't like duplicate page references in the page tree.
-    let stream_ref = if let Some(cached) = ctx.cached_content_streams.get(&page_idx) {
+    let key = page.key();
+    let stream_ref = if let Some(cached) = ctx.page_contents.get(&key) {
         *cached
     } else {
-        let content = page
-            .try_page_stream()
-            .map_err(|e| ExtractionError::Content(page_idx, e))?;
+        let content =
+            encoded_content(page, ctx).map_err(|e| ExtractionError::Content(page_idx, e))?;
         let stream_ref = ctx.new_ref();
 
         chunk
-            .stream(stream_ref, &deflate_encode(&content))
+            .stream(stream_ref, &content)
             .filter(Filter::FlateDecode);
-        ctx.cached_content_streams.insert(page_idx, stream_ref);
+        ctx.page_contents.insert(key, stream_ref);
 
         stream_ref
     };
@@ -485,21 +491,49 @@ fn write_page<'a>(
     Ok(())
 }
 
+/// Where a query places a page copied as a form.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Placement {
+    /// By hayro's reading of the page's boxes.
+    Boxes,
+    /// In the page's user space, clipped to this box, its numbers' bits.
+    UserSpace([u32; 4]),
+}
+
 /// The page as a form: placed by hayro's reading of its boxes, or, with `bbox`, in
-/// its user space clipped to `bbox`.
+/// its user space clipped to `bbox`; one copy for all queries of pages that draw the
+/// same ([`hayro_syntax::page::PageKey`]) placed alike.
 fn write_xobject<'a>(
     page: &Page<'a>,
     page_idx: usize,
     bbox: Option<[f32; 4]>,
-    xobj_ref: Ref,
     ctx: &mut ExtractionContext<'a>,
-) -> Result<(), ExtractionError> {
+) -> Result<Ref, ExtractionError> {
     drawn_with(page, ctx);
-    let content = page
-        .try_page_stream()
-        .map_err(|e| ExtractionError::Content(page_idx, e))?;
+    let placement = bbox.map_or(Placement::Boxes, |bbox| {
+        Placement::UserSpace(bbox.map(f32::to_bits))
+    });
+    let key = (page.key(), placement);
+    let copy = match ctx.page_forms.get(&key) {
+        Some(copy) => *copy,
+        None => {
+            let copy = copy_xobject(page, bbox, ctx);
+            ctx.page_forms.insert(key, copy);
+            copy
+        }
+    };
+    copy.map_err(|e| ExtractionError::Content(page_idx, e))
+}
+
+/// [`write_xobject`] for the first query of what the page draws placed so.
+fn copy_xobject<'a>(
+    page: &Page<'a>,
+    bbox: Option<[f32; 4]>,
+    ctx: &mut ExtractionContext<'a>,
+) -> Result<Ref, ContentError> {
+    let xobj_ref = ctx.new_ref();
+    let encoded_stream = encoded_content(page, ctx)?;
     let mut chunk = Chunk::with_settings(ctx.chunk_settings);
-    let encoded_stream = deflate_encode(&content);
     let mut x_object = chunk.form_xobject(xobj_ref, &encoded_stream);
     x_object.deref_mut().filter(Filter::FlateDecode);
 
@@ -538,13 +572,18 @@ fn write_xobject<'a>(
     x_object.finish();
     ctx.push(chunk);
 
-    Ok(())
+    Ok(xobj_ref)
+}
+
+/// The page's content, compressed.
+fn encoded_content(page: &Page<'_>, _ctx: &ExtractionContext<'_>) -> Result<Vec<u8>, ContentError> {
+    let content = page.try_page_stream()?;
+    Ok(deflate_encode(&content))
 }
 
 fn write_form<'a>(
     obj: ObjRef,
     page: &Page<'a>,
-    page_idx: usize,
     ctx: &mut ExtractionContext<'a>,
 ) -> Result<Ref, ExtractionError> {
     // Read as `Object` first: a dictionary read as a stream may pick up the data of a
@@ -563,7 +602,7 @@ fn write_form<'a>(
     if !own_resources {
         drawn_with(page, ctx);
     }
-    let key = (body, (!own_resources).then_some(page_idx));
+    let key = (body, (!own_resources).then(|| page.key()));
     if let Some(form_ref) = ctx.forms.get(&key) {
         return Ok(*form_ref);
     }

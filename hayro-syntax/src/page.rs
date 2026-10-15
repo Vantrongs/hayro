@@ -354,6 +354,54 @@ pub enum ContentError {
     Decode(Option<ObjectIdentifier>, DecodeFailure),
 }
 
+/// Identifies what a page draws and where, for a cache of what is copied or drawn of
+/// pages: its dictionary's bytes ([`Dict::content_key`]), which hold its content and
+/// what else it names, the resource categories it is drawn with, its own or
+/// inherited, its media and crop boxes and its rotation. Pages the page tree lists
+/// with one dictionary, under the same inherited resources and boxes, have equal
+/// keys, so that one copy of what they draw serves them all.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct PageKey<'a> {
+    dict: ContentKey<'a>,
+    resources: [ContentKey<'a>; 7],
+    boxes: [u64; 8],
+    rotation: u8,
+}
+
+/// The decoded data of each body an array of contents names, decoded once however
+/// many times it names it.
+#[derive(Default)]
+struct Decoded<'a>(hash::Map<ContentKey<'a>, Option<Vec<u8>>>, Option<Vec<u8>>);
+
+impl<'a> Decoded<'a> {
+    /// The data of the body `key` names, `decode`d the first time it is asked for;
+    /// a part with no key is decoded each time.
+    fn get(
+        &mut self,
+        key: Option<ContentKey<'a>>,
+        decode: impl FnOnce() -> Option<Vec<u8>>,
+    ) -> Option<&[u8]> {
+        self.try_get::<()>(key, || Ok(decode())).ok().flatten()
+    }
+
+    /// [`Self::get`], where decoding can fail, which is not kept.
+    fn try_get<E>(
+        &mut self,
+        key: Option<ContentKey<'a>>,
+        decode: impl FnOnce() -> Result<Option<Vec<u8>>, E>,
+    ) -> Result<Option<&[u8]>, E> {
+        let Some(key) = key else {
+            self.1 = decode()?;
+            return Ok(self.1.as_deref());
+        };
+        if !self.0.contains_key(&key) {
+            let data = decode()?;
+            self.0.insert(key, data);
+        }
+        Ok(self.0[&key].as_deref())
+    }
+}
+
 /// The rotation of the page.
 #[derive(Debug, Copy, Clone)]
 pub enum Rotation {
@@ -425,6 +473,29 @@ impl<'a> Page<'a> {
         }
     }
 
+    /// What the page draws and where ([`PageKey`]).
+    pub fn key(&self) -> PageKey<'a> {
+        let r = &self.resources;
+        let corners = |rect: Rect| [rect.x0, rect.y0, rect.x1, rect.y1].map(f64::to_bits);
+        let [m0, m1, m2, m3] = corners(self.media_box);
+        let [c0, c1, c2, c3] = corners(self.crop_box);
+        PageKey {
+            dict: self.inner.content_key(),
+            resources: [
+                &r.ext_g_states,
+                &r.fonts,
+                &r.properties,
+                &r.color_spaces,
+                &r.x_objects,
+                &r.patterns,
+                &r.shadings,
+            ]
+            .map(Dict::content_key),
+            boxes: [m0, m1, m2, m3, c0, c1, c2, c3],
+            rotation: self.rotation as u8,
+        }
+    }
+
     /// The page object's identifier; `None` for a page written directly into a /Kids
     /// array. A /Kids entry that is not a dictionary is a page with no entries.
     pub fn obj_id(&self) -> Option<ObjectIdentifier> {
@@ -439,26 +510,36 @@ impl<'a> Page<'a> {
     }
 
     /// Return the decoded content stream of the page; what reading it lost is told
-    /// to the computation being watched each time ([`crate::lost`]).
+    /// to the computation being watched each time ([`crate::lost`]). A stream an
+    /// array of contents names more than once is decoded once.
     pub fn page_stream(&self) -> Option<&[u8]> {
-        let convert_single = |s: Stream<'_>| {
-            let data = s.decoded().ok()?;
-            Some(data.into_owned())
-        };
-
         let (data, lost) = self.page_streams.get_or_init(|| {
             self.xref().watch(|| {
                 if let Some(stream) = self.inner.get::<Stream<'_>>(CONTENTS) {
-                    convert_single(stream)
+                    Some(stream.decoded().ok()?.into_owned())
                 } else if let Some(array) = self.inner.get::<Array<'_>>(CONTENTS) {
-                    let streams = array.iter::<Stream<'_>>().flat_map(convert_single);
-
+                    let mut decoded = Decoded::default();
                     let mut collected = vec![];
-
-                    for stream in streams {
-                        collected.extend(stream);
-                        // Streams must have at least one whitespace in-between.
-                        collected.push(b' ');
+                    // As `array.iter::<Stream>()` reads it: up to the first part that
+                    // is no stream.
+                    for item in array.raw_iter() {
+                        let key = self.body_key(&item);
+                        let stream = match item {
+                            MaybeRef::Ref(r) => {
+                                self.xref().get_with::<Stream<'_>>(r.into(), array.ctx())
+                            }
+                            MaybeRef::NotRef(object) => object.into_stream(),
+                        };
+                        let Some(stream) = stream else {
+                            break;
+                        };
+                        if let Some(data) =
+                            decoded.get(key, || Some(stream.decoded().ok()?.into_owned()))
+                        {
+                            collected.extend_from_slice(data);
+                            // Streams must have at least one whitespace in-between.
+                            collected.push(b' ');
+                        }
                     }
 
                     Some(collected)
@@ -476,7 +557,9 @@ impl<'a> Page<'a> {
     /// The decoded content of the page, as [`Self::page_stream`] joins it, or the
     /// first part that cannot be read: unlike `page_stream`, which leaves such a part
     /// out, so that a page that lost content is not taken for a whole one. A missing
-    /// or `null` /Contents, or a part that is `null`, is no content.
+    /// or `null` /Contents, or a part that is `null`, is no content. A stream an
+    /// array of contents names more than once is decoded once, though the content
+    /// holds it each time.
     pub fn try_page_stream(&self) -> Result<Vec<u8>, ContentError> {
         let Some(contents) = self.inner.get_raw::<Object<'a>>(CONTENTS) else {
             return Ok(vec![]);
@@ -508,10 +591,14 @@ impl<'a> Page<'a> {
 
         match resolved(contents)? {
             (_, Object::Array(array)) => {
+                let mut decoded = Decoded::default();
                 let mut collected = vec![];
                 for item in array.raw_iter() {
-                    if let Some(data) = decode(resolved(item)?)? {
-                        collected.extend(data);
+                    let key = self.body_key(&item);
+                    let part = resolved(item)?;
+                    let data = decoded.try_get(key, || decode(part))?;
+                    if let Some(data) = data {
+                        collected.extend_from_slice(data);
                         // Streams must have at least one whitespace in-between.
                         collected.push(b' ');
                     }
@@ -519,6 +606,14 @@ impl<'a> Page<'a> {
                 Ok(collected)
             }
             single => Ok(decode(single)?.unwrap_or_default()),
+        }
+    }
+
+    /// The body a part of an array of contents leads to, where it is a reference.
+    fn body_key<T>(&self, item: &MaybeRef<T>) -> Option<ContentKey<'a>> {
+        match item {
+            MaybeRef::Ref(r) => self.ctx.xref().content_key((*r).into()),
+            MaybeRef::NotRef(_) => None,
         }
     }
 
