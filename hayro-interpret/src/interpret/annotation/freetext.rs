@@ -69,12 +69,12 @@ pub(super) fn free_text<'a>(
         .styled(&style);
         doc.shaped(key, || {
             let rc = rich.then(|| annot.text(Text::Rich)).flatten();
-            let spans = rich_spans(rc.as_deref(), &style, positive, || contents(annot))?;
+            let spans = rich_spans(rc.as_deref(), &style, positive, || Ok(contents(annot)))?;
             doc.fonts.shape_rich(&spans)
         })?
     } else {
         let source = annot.source(Text::Contents.key());
-        doc.plain(source, family.into(), TEXT, || contents(annot))?
+        doc.plain(source, family.into(), TEXT, || Ok(contents(annot)))?
     };
     // Plain text is drawn at the default appearance's size, 12 pt for a size fit to
     // the box; rich text's base size is the default appearance's, and a size fit to
@@ -254,7 +254,7 @@ pub(super) fn rich_spans(
     rc: Option<&[u8]>,
     style: &Style,
     positive: bool,
-    plain: impl FnOnce() -> String,
+    plain: impl FnOnce() -> Result<String, Unsupported>,
 ) -> Result<Vec<Span>, Unsupported> {
     match rc {
         // A zero character is drawn as a fallback glyph (observed), which the rich
@@ -262,7 +262,7 @@ pub(super) fn rich_spans(
         Some(rc) if text::text_string(rc).contains('\0') => Err(Unsupported::Character('\0')),
         Some(rc) => rich::rich_text(&text::text_string(rc), style, positive),
         None => Ok(vec![Span {
-            text: plain(),
+            text: plain()?,
             style: style.clone(),
         }]),
     }

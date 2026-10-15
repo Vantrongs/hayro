@@ -140,6 +140,11 @@ pub enum Unsupported {
     /// It draws a line ending at a negative border width, or along a line of no
     /// length, which viewers clip by rules not reproduced.
     Ending,
+    /// Its field value, `/V`, is a stream whose data do not decode, or are encoded
+    /// otherwise than by Flate alone: viewers show part of damaged data by rules of
+    /// their decoders' buffering, and read data cut short in other filters otherwise,
+    /// which the generator does not reproduce.
+    ValueStream,
 }
 
 /// An appearance generated for an annotation without a usable appearance stream.
@@ -847,10 +852,10 @@ impl<'a> Appearances<'a> {
         source: Source<'a>,
         face: Typeface,
         way: u64,
-        text: impl FnOnce() -> String,
+        text: impl FnOnce() -> Result<String, Unsupported>,
     ) -> Result<Rc<Shaped>, Unsupported> {
         let key = TextKey::new([source], face, vec![way]);
-        self.shaped(key, || self.fonts.shape_plain(face, &text()))
+        self.shaped(key, || self.fonts.shape_plain(face, &text()?))
     }
 
     /// The labels of the options of `/Opt`, of entry `source`, read once for the
@@ -871,7 +876,7 @@ impl<'a> Appearances<'a> {
     fn label(&self, label: &Label<'a>, face: Typeface) -> Result<Rc<Shaped>, Unsupported> {
         let key = TextKey::new([label.source], face, vec![OPTION]);
         self.shaped(key, || {
-            let text = label.value.text(entries::Text::Option);
+            let text = label.value.text();
             self.fonts.shape_plain(
                 face,
                 &text.map(|t| text::text_string(&t)).unwrap_or_default(),

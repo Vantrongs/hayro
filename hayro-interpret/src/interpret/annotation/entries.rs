@@ -12,8 +12,10 @@
 //! reading is not established makes [`read`] fail with [`Unsupported::Number`].
 
 use super::Unsupported;
+use hayro_syntax::Filter;
 use hayro_syntax::hash;
 use hayro_syntax::lost::Lost;
+use hayro_syntax::object::dict::keys::{DECODE_PARMS, DP};
 use hayro_syntax::object::{Array, Dict, MaybeRef, Name, Number, ObjRef, Object, Stream};
 use hayro_syntax::xref::{ContentKey, XRef};
 use std::any::{Any, TypeId};
@@ -103,9 +105,9 @@ fn int(n: Number) -> i32 {
 #[derive(Clone)]
 pub(crate) struct Entries<'a>(Dict<'a>, Objects<'a>);
 
-/// An entry that holds text, and whether viewers read a stream there as its text:
-/// only a field's value is (observed in `PyMuPDF` bake); elsewhere a stream is no
-/// text, as if the entry were absent.
+/// An entry that holds text: a string. A stream there is no text, as if the entry
+/// were absent (observed in `PyMuPDF` bake); only a field's value is read from a
+/// stream too ([`Value::field_text`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Text {
     /// `/Contents`.
@@ -118,12 +120,8 @@ pub(crate) enum Text {
     DefaultStyle,
     /// `/CA` of `/MK`, a push button's caption.
     Caption,
-    /// `/V` of a text field or choice field.
-    FieldValue,
     /// `/RV` of a rich text field.
     RichValue,
-    /// An entry of `/Opt`, or of a choice field's `/V` array.
-    Option,
 }
 
 impl Text {
@@ -134,14 +132,8 @@ impl Text {
             Self::Rich => b"RC",
             Self::DefaultStyle => b"DS",
             Self::Caption => b"CA",
-            Self::FieldValue => b"V",
             Self::RichValue => b"RV",
-            Self::Option => b"Opt",
         }
-    }
-
-    const fn stream(self) -> bool {
-        matches!(self, Self::FieldValue)
     }
 }
 
@@ -605,7 +597,7 @@ pub(crate) enum Value<'a> {
     String(Rc<hayro_syntax::object::String<'a>>),
     Array(Items<'a>),
     Dict(Entries<'a>),
-    /// A stream, decoded only where its text is read ([`Value::text`]).
+    /// A stream, decoded only where its text is read ([`Value::field_text`]).
     Stream(StreamEntries<'a>),
     /// Null, a reference to no object, or no entry.
     Null,
@@ -667,24 +659,45 @@ impl<'a> Value<'a> {
     }
 
     /// Whether [`Value::text`] gives text, told without copying it.
-    pub(crate) fn is_text(&self, entry: Text) -> bool {
+    pub(crate) fn is_text(&self) -> bool {
+        matches!(self, Self::String(_))
+    }
+
+    /// The bytes of a text entry ([`Text`]) whose value this is: a string's.
+    pub(crate) fn text(&self) -> Option<Vec<u8>> {
         match self {
-            Self::String(_) => true,
-            Self::Stream(s) => entry.stream() && s.0.decoded().is_ok(),
-            _ => false,
+            Self::String(s) => Some(s.as_bytes().to_vec()),
+            _ => None,
         }
     }
 
-    /// The bytes of text entry `entry` whose value this is: a string's, or, where
-    /// viewers read one, a stream's decoded data.
-    pub(crate) fn text(&self, entry: Text) -> Option<Vec<u8>> {
-        match self {
-            Self::String(s) => Some(s.as_bytes().to_vec()),
-            Self::Stream(s) if entry.stream() => {
-                s.0.decoded().ok().map(std::borrow::Cow::into_owned)
-            }
-            _ => None,
+    /// The bytes of a text or choice field's value, `/V`, whose value this is: a
+    /// string's, or a stream's data. Viewers (`PyMuPDF` bake, observed) show the data
+    /// as decoding them whole makes them ([`Stream::decoded_strict`]) where they are
+    /// stored as they are or by Flate alone, damaged or cut short. Elsewhere,
+    /// [`Unsupported::ValueStream`]: where the data do not decode, viewers show what
+    /// their decoder made before it failed, in pieces of their own buffering; and data
+    /// cut short in another filter or a predictor's row are read otherwise by them (a
+    /// half byte of hexadecimal, a group of base-85 without its end, a cut run, a
+    /// partial row), which a value in such a stream, which writers do not make, is not
+    /// told apart from.
+    pub(crate) fn field_text(&self) -> Result<Option<Vec<u8>>, Unsupported> {
+        let stream = match self {
+            Self::String(s) => return Ok(Some(s.as_bytes().to_vec())),
+            Self::Stream(s) => &s.0,
+            _ => return Ok(None),
+        };
+        let dict = stream.dict();
+        if !matches!(stream.filters().as_slice(), [] | [Filter::FlateDecode])
+            || dict.contains_key(DECODE_PARMS)
+            || dict.contains_key(DP)
+        {
+            return Err(Unsupported::ValueStream);
         }
+        stream
+            .decoded_strict()
+            .map(|data| Some(data.into_owned()))
+            .map_err(|_| Unsupported::ValueStream)
     }
 
     pub(crate) fn items(self) -> Option<Items<'a>> {
@@ -974,12 +987,12 @@ impl<'a> Entries<'a> {
 
     /// The bytes of text entry `entry` ([`Value::text`]).
     pub(crate) fn text(&self, entry: Text) -> Option<Vec<u8>> {
-        self.get(entry.key()).text(entry)
+        self.get(entry.key()).text()
     }
 
     /// Whether text entry `entry` gives text ([`Value::is_text`]).
     pub(crate) fn has_text(&self, entry: Text) -> bool {
-        self.get(entry.key()).is_text(entry)
+        self.get(entry.key()).is_text()
     }
 
     pub(crate) fn dict(&self, key: &[u8]) -> Option<Self> {

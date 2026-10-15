@@ -420,11 +420,11 @@ pub(super) fn line<'a>(
         const SIZE: f32 = 12.0;
         let source = annot.source(Text::Contents.key());
         let text = doc.plain(source, Family::Sans.into(), CAPTION, || {
-            annot
+            Ok(annot
                 .text(Text::Contents)
                 .map(|s| text::text_string(&s))
                 .map(|c| c.replace("\r\n", " ").replace(['\r', '\n'], " "))
-                .unwrap_or_default()
+                .unwrap_or_default())
         })?;
         if !text.is_blank() {
             let width = f64::from(text.width(0..text.len(), SIZE) as f32);

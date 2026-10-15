@@ -189,9 +189,7 @@ fn draw<'a>(
     // once for the document.
     let (family, size, text_color) = if field.found(Inherited::Appearance) {
         doc.default_appearance(Some(field.source(Inherited::Appearance)), || {
-            field
-                .get(Inherited::Appearance)
-                .text(Text::DefaultAppearance)
+            field.get(Inherited::Appearance).text()
         })
     } else {
         doc.default_appearance(None, || form.and_then(|f| f.text(Text::DefaultAppearance)))
@@ -216,9 +214,10 @@ fn draw<'a>(
         };
         let source = mk.source(Text::Caption.key());
         let caption = doc.plain(source, face, TEXT, || {
-            mk.text(Text::Caption)
+            Ok(mk
+                .text(Text::Caption)
                 .map(|c| text::text_string(&c))
-                .unwrap_or_default()
+                .unwrap_or_default())
         })?;
         if caption.len() == 0 {
             return Ok(Some(()));
@@ -719,14 +718,15 @@ fn signature(r: kurbo::Rect, fonts: &Fonts, out: &mut Out) -> Drawn {
     Ok(Some(()))
 }
 
-/// The value of the field `field` as text: a text string, or a text stream, or a
-/// name; nothing for an array of selected values, as viewers show it.
-fn value_text(field: &Field<'_>) -> String {
-    match field.get(Inherited::Value) {
+/// The value of the field `field` as text: a text string, or a text stream
+/// ([`Value::field_text`]), or a name; nothing for an array of selected values, as
+/// viewers show it.
+fn value_text(field: &Field<'_>) -> Result<String, Unsupported> {
+    Ok(match field.get(Inherited::Value) {
         Value::Name(n) => String::from_utf8_lossy(n.as_ref()).into_owned(),
         value => value
-            .text(Text::FieldValue)
+            .field_text()?
             .map(|t| text::text_string(&t))
             .unwrap_or_default(),
-    }
+    })
 }

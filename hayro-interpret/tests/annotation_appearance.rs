@@ -2401,29 +2401,133 @@ fn a_damaged_field_flags_entry_reads_as_viewers_read_it() {
     }
 }
 
-/// A text field's value may be a text stream; its text is drawn as a string's is.
+/// zlib of `HELLO WORLD`.
+const HELLO_WORLD: &[u8] = &[
+    120, 156, 243, 112, 245, 241, 241, 87, 8, 247, 15, 242, 113, 1, 0, 18, 139, 3, 29,
+];
+
+/// A text or choice field's value may be a stream, whose data, stored as they are or
+/// by Flate alone, are the text as decoding them whole makes them, which is what
+/// `PyMuPDF` 1.28.2 bake draws for each value here: a damaged checksum is ignored, data
+/// cut short end the text, and an unknown filter passes the data on. Where they do
+/// not decode, bake draws what its decoder made before it failed, in pieces of 256
+/// bytes (none of these short ones, but a prefix of a long value), or, for a damaged
+/// Flate, what a lenient decoder makes of the rest; and it reads data cut short in
+/// other filters or a predictor's row otherwise (a cut run of `RunLength` here, which
+/// it shows none of): a value in a stream that does not decode or is encoded
+/// otherwise is unsupported, and the split refuses the page, for every way the value
+/// is drawn.
 #[test]
-fn a_text_field_draws_a_value_stream() {
-    let field = "/Subtype /Widget /FT /Tx /DA (/Helv 12 Tf 0 g) /Rect [20 20 180 60]";
-    let drawn = |value: &str, objects: Vec<Vec<u8>>| {
-        let pdf = annotations(
-            "/Annots [4 0 R]",
-            [
-                vec![format!("<< /Type /Annot {field} {value} >>").into_bytes()],
-                objects,
-            ]
-            .concat(),
-        );
-        match first_look(&pdf) {
-            Look::Generated(a) => a.content.clone(),
-            _ => panic!("{value}: not generated"),
+fn a_field_value_stream_is_its_text_where_it_decodes_and_unsupported_where_not() {
+    let mut bad_sum = HELLO_WORLD.to_vec();
+    *bad_sum.last_mut().unwrap() ^= 1;
+    let damaged: Vec<u8> = HELLO_WORLD[..6]
+        .iter()
+        .copied()
+        .chain(HELLO_WORLD[6..].iter().map(|b| b ^ 0x5A))
+        .collect();
+    let mut hex_then_bad = b"48454C4C4F20574F524C44".to_vec();
+    hex_then_bad.extend(b"GG>");
+    let shown: [(&str, &str, &[u8]); 5] = [
+        ("(HELLO WORLD)", "", b"HELLO WORLD"),
+        ("(HELLO WORLD)", "/Filter /FlateDecode", HELLO_WORLD),
+        ("(HELLO WORLD)", "/Filter /FlateDecode", &bad_sum),
+        ("(HELLO)", "/Filter /FlateDecode", &HELLO_WORLD[..8]),
+        ("(HELLO WORLD)", "/Filter /Foo", b"HELLO WORLD"),
+    ];
+    // zlib of `HELLO WORLD` under the PNG Up predictor, rows of 5.
+    let up = [
+        120, 156, 99, 242, 112, 245, 241, 241, 103, 186, 33, 196, 204, 246, 151, 73, 5, 0, 25, 187,
+        3, 143,
+    ];
+    let refused: [(&str, &[u8]); 10] = [
+        ("/Filter /AHx", b"48454C4C4F20574F524C44>"),
+        (
+            "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 5 >>",
+            &up,
+        ),
+        ("/Filter /RL", b"\x04HELLO\x04HE"),
+        ("/Filter /AHx", b"GG"),
+        ("/Filter /AHx", &hex_then_bad),
+        ("/Filter /FlateDecode", &damaged),
+        ("/Filter /FlateDecode", b"garbage"),
+        ("/Filter /A85", b"87cURD]i,\"Ebo80vvv~>"),
+        ("/Filter /LZW", b"garbage"),
+        ("/Filter /DCT", b"garbage"),
+    ];
+    let field = "/Subtype /Widget /DA (/Helv 12 Tf 0 g) /Rect [20 20 180 60]";
+    for kind in [
+        "/FT /Tx",
+        "/FT /Tx /Ff 4096",
+        "/FT /Tx /Ff 16777216 /MaxLen 12",
+        "/FT /Tx /Ff 4096 /DS (font-size:10pt)",
+        "/FT /Ch /Ff 131072",
+    ] {
+        let look = |value: &str, objects: Vec<Vec<u8>>| {
+            let pdf = annotations(
+                "/Annots [4 0 R]",
+                [
+                    vec![format!("<< /Type /Annot {field} {kind} /V {value} >>").into_bytes()],
+                    objects,
+                ]
+                .concat(),
+            );
+            match first_look(&pdf) {
+                Look::Generated(a) => Ok(a.content.clone()),
+                Look::Unsupported(why) => Err(why),
+                _ => panic!("{kind} {value}: neither generated nor unsupported"),
+            }
+        };
+        for (text, filter, data) in shown {
+            assert_eq!(
+                look("5 0 R", vec![common::stream(filter, data)]),
+                look(text, vec![]),
+                "{kind}: {filter} {data:?}"
+            );
         }
+        for (filter, data) in refused {
+            assert_eq!(
+                look("5 0 R", vec![common::stream(filter, data)]),
+                Err(Unsupported::ValueStream),
+                "{kind}: {filter} {data:?}"
+            );
+        }
+    }
+}
+
+/// A value that cannot be decoded is unsupported each time it is drawn, by whichever
+/// field or widget, in either order, while a field without a value next to it is
+/// drawn: what the document keeps of the value tells its failure apart from an
+/// absent value.
+#[test]
+fn a_value_that_cannot_be_decoded_is_unsupported_wherever_it_is_drawn_again() {
+    let widget = |value: &str| {
+        format!(
+            "<< /Type /Annot /Subtype /Widget /FT /Tx /DA (/Helv 12 Tf 0 g) \
+             /Rect [20 20 180 60] {value} >>"
+        )
+        .into_bytes()
     };
-    let string = drawn("/V (HELLO)", vec![]);
-    assert_eq!(
-        drawn("/V 5 0 R", vec![common::stream("", b"HELLO")]),
-        string
-    );
+    for order in ["4 0 R 5 0 R 6 0 R", "6 0 R 5 0 R 4 0 R"] {
+        let pdf = annotations(
+            &format!("/Annots [{order}]"),
+            vec![
+                widget("/V 7 0 R"),
+                widget("/MK << /BG [1 0 0] >>"),
+                widget("/V 7 0 R"),
+                common::stream("/Filter /AHx", b"GG"),
+            ],
+        );
+        let mut looks = looks(&pdf);
+        if order.starts_with('6') {
+            looks.reverse();
+        }
+        assert_eq!(
+            looks,
+            ["ValueStream", "generated", "ValueStream"],
+            "{order}"
+        );
+    }
 }
 
 /// A square or circle is drawn inside its border width whether the border is drawn
@@ -3106,6 +3210,42 @@ fn what_reading_annotations_lost_is_told_each_time() {
                     );
                 }
             }
+        }
+    }
+}
+
+/// Two widgets drawn by one appearance stream through two entries of the table that
+/// lead to it, the stream's `/DecodeParms` naming the second entry, draw what it holds
+/// alike, `A!`, in either order, and two fields valued by it are both unsupported, a
+/// value with decode parameters being one: a reference from the stream back to
+/// itself is a cycle by either entry, so the predictor its own dictionary sets, which
+/// would read `Ab`, is not applied (`MuPDF`, `PyMuPDF` 1.28.2, reads `A!` through the
+/// first entry).
+#[test]
+fn widgets_drawn_by_one_stream_through_two_entries_draw_it_alike() {
+    // zlib of `A!`.
+    const DATA: &[u8] = &[120, 156, 115, 84, 4, 0, 0, 165, 0, 99];
+    let widget = |entries: &str| {
+        format!(
+            "<< /Type /Annot /Subtype /Widget /FT /Tx /DA (/Helv 12 Tf 0 g) \
+             /Rect [20 20 180 60] {entries} >>"
+        )
+        .into_bytes()
+    };
+    for (entries, drawn) in [("/AP << /N {} 0 R >>", "A!"), ("/V {} 0 R", "ValueStream")] {
+        for order in ["4 0 R 5 0 R", "5 0 R 4 0 R"] {
+            let mut objects = common::one_page_objects(200, &format!("/Annots [{order}]"));
+            objects.extend([
+                widget(&entries.replace("{}", "6")),
+                widget(&entries.replace("{}", "7")),
+                common::stream(
+                    "/Subtype /Form /BBox [0 0 10 10] /Filter /FlateDecode \
+                     /DecodeParms 7 0 R /Predictor 2 /Columns 2",
+                    DATA,
+                ),
+            ]);
+            let pdf = Pdf::new(common::file_with_aliases(objects, &[6])).expect("valid pdf");
+            assert_eq!(looks(&pdf), [drawn; 2], "{entries}, {order}");
         }
     }
 }
