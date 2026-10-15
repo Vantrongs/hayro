@@ -403,7 +403,7 @@ pub(super) fn line<'a>(
     if caption {
         const SIZE: f32 = 12.0;
         let source = annot.source(Text::Contents.key());
-        let text = doc.plain(source.as_ref(), Family::Sans.into(), CAPTION, || {
+        let text = doc.plain(source, Family::Sans.into(), CAPTION, || {
             annot
                 .text(Text::Contents)
                 .map(|s| text::text_string(&s))

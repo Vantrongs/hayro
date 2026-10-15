@@ -8,6 +8,7 @@
 
 use hayro_interpret::annotation::{Appearances, Drawn, Look, Unsupported, work_done};
 use hayro_interpret::hayro_syntax::Pdf;
+use hayro_interpret::hayro_syntax::object::ObjectIdentifier;
 use hayro_interpret::hayro_syntax::page::Page;
 use hayro_interpret::hayro_syntax::work;
 use hayro_interpret::{AnnotationSelection, InterpreterSettings};
@@ -1538,6 +1539,110 @@ fn shared_state_cost(n: usize, len: usize, state: &str) -> Listed {
     .expect("valid pdf");
     let page = &pdf.pages()[0];
     listed(&pdf, |appearances| drew(appearances, page, PAGE))
+}
+
+/// A file of `objects` numbered from 1, as `common::file` writes them, whose table
+/// also lists objects from `objects.len() + 1` on, one for each of `aliases`, at the
+/// place of object `aliases[i]`. Those entries do not lead to their objects, so the
+/// file is read by a scan, which finds no object of theirs and keeps them: each
+/// leads to the body of the object whose place it names.
+fn file_with_aliases(objects: Vec<Vec<u8>>, aliases: &[usize]) -> Vec<u8> {
+    let size = objects.len() + aliases.len() + 1;
+    let held: usize = objects.iter().map(Vec::len).sum();
+    let mut out = Vec::with_capacity(held + 32 * objects.len() + 20 * size + 128);
+    out.extend_from_slice(b"%PDF-1.7\n");
+    let mut offsets = Vec::new();
+    for (i, o) in objects.into_iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend_from_slice(&o);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let aliased: Vec<usize> = aliases.iter().map(|a| offsets[a - 1]).collect();
+    offsets.extend(aliased);
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+    for o in offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
+/// The cost of a page with `n` annotations whose states, `/AS`, each name a long
+/// name of `len` bytes, object 4, through an entry of the table of its own that
+/// leads to it ([`file_with_aliases`]), or, not `aliased`, all through `4 0 R`, and
+/// share their appearances, `/AP 5 0 R`, whose `/N` holds that state as `state`.
+fn aliased_state_cost(n: usize, len: usize, state: &str, aliased: bool) -> Listed {
+    let name = format!("/{}", "A".repeat(len));
+    let states = format!("<< /N << /Off 6 0 R {name} {state} >> >>").into_bytes();
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots 7 0 R >>".to_vec(),
+        name.into_bytes(),
+        states,
+        common::stream("/Subtype /Form /BBox [0 0 10 10]", b"0 0 m 10 10 l S"),
+    ];
+    let first = 8 + n;
+    let refs: Vec<String> = (0..n).map(|i| format!("{} 0 R", 8 + i)).collect();
+    objects.push(format!("[{}]", refs.join(" ")).into_bytes());
+    objects.extend((0..n).map(|i| {
+        let state = if aliased { first + i } else { 4 };
+        format!(
+            "<< /Type /Annot /Subtype /Square /C [0] /Rect [10 10 110 40] /AS {state} 0 R /AP 5 0 R >>"
+        )
+        .into_bytes()
+    }));
+    let aliases = if aliased { vec![4; n] } else { vec![] };
+    let pdf = Pdf::new(file_with_aliases(objects, &aliases)).expect("valid pdf");
+    let xref = pdf.xref();
+    for i in 0..aliases.len() {
+        let alias = ObjectIdentifier::new((first + i) as i32, 0);
+        assert!(xref.content_key(alias).is_some());
+        assert_eq!(
+            xref.content_key(alias),
+            xref.content_key(ObjectIdentifier::new(4, 0))
+        );
+    }
+    let page = &pdf.pages()[0];
+    listed(&pdf, |appearances| drew(appearances, page, PAGE))
+}
+
+/// Annotations whose states are one long name reached through entries of the table
+/// of their own, which a damaged table keeps, draw what those that name it through
+/// one entry draw, and find it once: each costs a lookup, whatever the name's
+/// length, for a state that is a stream that draws and one that is no stream.
+/// Hashing and comparing the name for each, which no counter sees, would take a
+/// quarter of a second or more for 200 more of 8 MB.
+#[test]
+fn annotations_whose_states_are_one_name_through_many_entries_find_it_once() {
+    for state in ["6 0 R", "1"] {
+        let len = 8 << 20;
+        let one = aliased_state_cost(240, len, state, false);
+        let (fewer, more) = (
+            aliased_state_cost(40, len, state, true),
+            aliased_state_cost(240, len, state, true),
+        );
+        assert_eq!(more.drew, one.drew, "{state}");
+        let (bytes, work, looked, secs) = (
+            more.bytes - fewer.bytes,
+            more.work - fewer.work,
+            more.examined - fewer.examined,
+            more.secs - fewer.secs,
+        );
+        if std::env::var_os("COST_REPORT").is_some() {
+            println!(
+                "CASE aliased {state}: +200: {bytes} bytes, {work} work, {looked} examined, {secs:.4} s"
+            );
+        }
+        assert!(
+            bytes < 200 * (16 << 10) && work < 200 * 1_000 && looked < 200 * 1_000 && secs < 0.1,
+            "{state}: {fewer:?} {more:?}"
+        );
+    }
 }
 
 /// Annotations that share a state, a long name, and the states it names one of,

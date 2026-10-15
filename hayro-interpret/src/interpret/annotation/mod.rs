@@ -43,7 +43,7 @@ use crate::x_object::box_and_matrix;
 use hayro_syntax::hash;
 use hayro_syntax::lost::Lost;
 use hayro_syntax::object::dict::keys::{AP, AS, BORDER, BS, C, CA, D, F, N, RECT, SUBTYPE, W};
-use hayro_syntax::object::{Name, ObjRef, Stream};
+use hayro_syntax::object::{Name, Stream};
 use hayro_syntax::page::Page;
 use hayro_syntax::xref::{ContentKey, XRef};
 use kurbo::{Affine, Shape};
@@ -304,7 +304,7 @@ pub struct Appearances<'a> {
 }
 
 /// What has been read of a document for its annotations so far: its objects, each
-/// read once ([`Objects`]); the fields, by reference, with what the widgets below
+/// read once ([`Objects`]); the fields, by what each is read from, with what the widgets below
 /// each inherit, or `None` when its `/Parent` chain loops; default appearances and
 /// list options, by the entry that holds them; and text set in its fonts, so that
 /// what many annotations share is read and set once. Shared by every
@@ -336,18 +336,19 @@ struct Known<'a> {
     pages: Kept<(Id<'a>, AnnotationSelection, View), Rc<[Drawn<'a>]>>,
     /// The states `/AS` entries held in objects of their own name, by the
     /// dictionary of states and the entry ([`Appearances::state`]).
-    states: Kept<(ContentKey<'a>, Source), State<'a>>,
-    fields: Kept<ObjRef, Option<Field<'a>>>,
+    states: Kept<(ContentKey<'a>, Source<'a>), State<'a>>,
+    /// Each field and widget above a widget, by the dictionary it is read from.
+    fields: Kept<ContentKey<'a>, Option<Field<'a>>>,
     /// Text set in its fonts, by what it is made of.
-    shaped: Kept<TextKey, Result<Rc<Shaped>, Unsupported>>,
+    shaped: Kept<TextKey<'a>, Result<Rc<Shaped>, Unsupported>>,
     /// The options of lists, by the entry that holds them.
-    labels: Kept<Source, Rc<Vec<Label<'a>>>>,
+    labels: Kept<Source<'a>, Rc<Vec<Label<'a>>>>,
     /// Default appearances read, by the entry that holds each, and the form's; with
     /// whether reading each met a number whose reading is not established.
-    appearances: Kept<Source, (DefaultAppearance, bool)>,
+    appearances: Kept<Source<'a>, (DefaultAppearance, bool)>,
     form_appearance: Option<((DefaultAppearance, bool), Lost)>,
     /// What text and choice fields show, by what it is made of.
-    field_text: Kept<TextKey, Result<widget::FieldText, Unsupported>>,
+    field_text: Kept<TextKey<'a>, Result<widget::FieldText, Unsupported>>,
 }
 
 /// Values found once for the document, each with what finding it lost.
@@ -360,8 +361,8 @@ type DefaultAppearance = (Family, Option<f32>, Option<Color>);
 /// is read from, the typeface it is set in, and numbers that tell apart the ways it
 /// is read ([`TEXT`] and those after it first).
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct TextKey {
-    sources: Vec<Source>,
+struct TextKey<'a> {
+    sources: Vec<Source<'a>>,
     face: Typeface,
     numbers: Vec<u64>,
 }
@@ -374,19 +375,19 @@ const FREE_TEXT: u64 = 2;
 const FIELD: u64 = 3;
 const OPTION: u64 = 4;
 
-impl TextKey {
-    /// The key of text read from entries `sources`, none of them in a direct
-    /// dictionary, in `face` and the way `numbers` tell.
+impl<'a> TextKey<'a> {
+    /// The key of text read from entries `sources`, in `face` and the way `numbers`
+    /// tell.
     fn new(
-        sources: impl IntoIterator<Item = Option<Source>>,
+        sources: impl IntoIterator<Item = Source<'a>>,
         face: Typeface,
         numbers: Vec<u64>,
-    ) -> Option<Self> {
-        Some(Self {
-            sources: sources.into_iter().collect::<Option<_>>()?,
+    ) -> Self {
+        Self {
+            sources: sources.into_iter().collect(),
             face,
             numbers,
-        })
+        }
     }
 }
 
@@ -637,9 +638,8 @@ impl<'a> Appearances<'a> {
                 _ => State::Absent,
             }
         };
-        let key = annot
-            .source(AS)
-            .filter(|s| s.is_object())
+        let key = Some(annot.source(AS))
+            .filter(Source::is_object)
             .map(|s| (states.content_key(), s));
         self.once(|k| &mut k.states, key, find)
     }
@@ -815,22 +815,22 @@ impl<'a> Appearances<'a> {
     /// The text `make` sets, made once for the document under `key`.
     fn shaped(
         &self,
-        key: Option<TextKey>,
+        key: TextKey<'a>,
         make: impl FnOnce() -> Result<Shaped, Unsupported>,
     ) -> Result<Rc<Shaped>, Unsupported> {
-        self.once(|k| &mut k.shaped, key, || make().map(Rc::new))
+        self.once(|k| &mut k.shaped, Some(key), || make().map(Rc::new))
     }
 
-    /// `text()` set in `face` as plain text, read as `way` ([`TEXT`] or
-    /// [`CAPTION`]), made once for the document when its entry has a source.
+    /// `text()`, of entry `source`, set in `face` as plain text, read as `way`
+    /// ([`TEXT`] or [`CAPTION`]), made once for the document.
     fn plain(
         &self,
-        source: Option<&Source>,
+        source: Source<'a>,
         face: Typeface,
         way: u64,
         text: impl FnOnce() -> String,
     ) -> Result<Rc<Shaped>, Unsupported> {
-        let key = TextKey::new([source.cloned()], face, vec![way]);
+        let key = TextKey::new([source], face, vec![way]);
         self.shaped(key, || self.fonts.shape_plain(face, &text()))
     }
 
@@ -838,26 +838,19 @@ impl<'a> Appearances<'a> {
     /// document ([`Items::labels`]); none is set.
     fn labels(
         &self,
-        source: Option<Source>,
+        source: Source<'a>,
         items: impl FnOnce() -> Option<Items<'a>>,
     ) -> Rc<Vec<Label<'a>>> {
         self.once(
             |k| &mut k.labels,
-            source.clone(),
-            || {
-                Rc::new(
-                    items()
-                        .map(|i| i.labels(source.as_ref()))
-                        .unwrap_or_default(),
-                )
-            },
+            Some(source),
+            || Rc::new(items().map(|i| i.labels()).unwrap_or_default()),
         )
     }
 
-    /// Option `label` set in `face` as plain text, once for the document when it has
-    /// a source.
+    /// Option `label` set in `face` as plain text, once for the document.
     fn label(&self, label: &Label<'a>, face: Typeface) -> Result<Rc<Shaped>, Unsupported> {
-        let key = TextKey::new([label.source.clone()], face, vec![OPTION]);
+        let key = TextKey::new([label.source], face, vec![OPTION]);
         self.shaped(key, || {
             let text = label.value.text(entries::Text::Option);
             self.fonts.shape_plain(
@@ -867,16 +860,15 @@ impl<'a> Appearances<'a> {
         })
     }
 
-    /// The default appearance `read()` gives, of entry `source`, read once for the
-    /// document when it has a source (the form's when `form`).
+    /// The default appearance `read()` gives, of entry `source`, or the form's
+    /// without one, read once for the document.
     fn default_appearance(
         &self,
-        source: Option<Source>,
-        form: bool,
+        source: Option<Source<'a>>,
         read: impl FnOnce() -> Option<Vec<u8>>,
     ) -> DefaultAppearance {
         let make = || entries::noting(|| text::default_appearance(&read().unwrap_or_default()));
-        let (da, unreadable) = if form {
+        let (da, unreadable) = if source.is_none() {
             let known = self.fields.0.borrow().form_appearance;
             let (made, lost) = known.unwrap_or_else(|| {
                 let made = self.xref.watch(make);
@@ -896,32 +888,31 @@ impl<'a> Appearances<'a> {
 
     /// The field entries widget `annot` is drawn with, however deep its `/Parent`
     /// chain; `None` when the chain loops, which viewers read as a broken field and
-    /// draw nothing for. Each field above widgets is read once, and kept with what
-    /// reading it and the fields above it lost.
+    /// draw nothing for. Each field above widgets is read once, by the dictionary it
+    /// is read from however it is reached, and kept with what reading it and the
+    /// fields above it lost.
     fn field(&self, annot: &Entries<'a>) -> Option<Field<'a>> {
         let mut on_walk = hash::Set::default();
-        on_walk.extend(annot.id());
+        on_walk.insert(annot.content_key());
         // From the widget up to the first field read before, or to the top; what
         // reading the walk lost is lost to each field on it.
-        let mut walk: Vec<(Option<ObjRef>, Entries<'a>)> = vec![(None, annot.clone())];
+        let mut walk: Vec<(Option<ContentKey<'a>>, Entries<'a>)> = vec![(None, annot.clone())];
         let (mut field, lost) = self.xref.watch(|| {
             loop {
                 let node = &walk[walk.len() - 1].1;
-                let Some((id, parent)) = node.parent() else {
+                let Some(parent) = node.parent() else {
                     break Some(Field::default());
                 };
-                // A direct parent dictionary cannot lead back to itself.
-                if let Some(id) = id {
-                    let known = self.fields.0.borrow().fields.get(&id).cloned();
-                    if let Some((field, lost)) = known {
-                        self.xref.note(lost);
-                        break field;
-                    }
-                    if !on_walk.insert(id) {
-                        break None;
-                    }
+                let id = parent.content_key();
+                let known = self.fields.0.borrow().fields.get(&id).cloned();
+                if let Some((field, lost)) = known {
+                    self.xref.note(lost);
+                    break field;
                 }
-                walk.push((id, parent));
+                if !on_walk.insert(id) {
+                    break None;
+                }
+                walk.push((Some(id), parent));
             }
         });
         let (fields, lost) = self.xref.watch(|| {
@@ -1004,10 +995,10 @@ impl<'a> Field<'a> {
 
     /// Where entry `key` is held ([`Entries::source`]): in the nearest dictionary
     /// that has it, or absent from all.
-    fn source(&self, key: Inherited) -> Option<Source> {
+    fn source(&self, key: Inherited) -> Source<'a> {
         match &self.0[key as usize] {
             Some(d) => d.source(key.key()),
-            None => Some(Source::absent(key.key())),
+            None => Source::absent(key.key()),
         }
     }
 }

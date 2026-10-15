@@ -41,7 +41,7 @@ pub(super) fn free_text<'a>(
     // negative, as viewers lay it out.
     let rd = annot.numbers(b"RD", 4).unwrap_or_else(|| vec![0.0; 4]);
     let inner = kurbo::Rect::new(r.x0 + rd[0], r.y0 + rd[1], r.x1 - rd[2], r.y1 - rd[3]);
-    let (family, size, da_color) = doc.default_appearance(annot.source(b"DA"), false, || {
+    let (family, size, da_color) = doc.default_appearance(Some(annot.source(b"DA")), || {
         annot.text(Text::DefaultAppearance)
     });
     let color = da_color.unwrap_or(Color::BLACK);
@@ -77,7 +77,7 @@ pub(super) fn free_text<'a>(
         })?
     } else {
         let source = annot.source(Text::Contents.key());
-        doc.plain(source.as_ref(), family.into(), TEXT, || contents(annot))?
+        doc.plain(source, family.into(), TEXT, || contents(annot))?
     };
     // Plain text is drawn at the default appearance's size, 12 pt for a size fit to
     // the box; rich text's base size is the default appearance's, and a size fit to

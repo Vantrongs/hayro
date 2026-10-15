@@ -146,7 +146,7 @@ fn draw<'a>(
     doc: &Appearances<'a>,
     kind: Kind,
     flags: u32,
-    mk: Option<&Entries<'_>>,
+    mk: Option<&Entries<'a>>,
     w: f64,
     border: Option<Color>,
     background: Option<Color>,
@@ -188,15 +188,13 @@ fn draw<'a>(
     // one, its text, or none when it is not text; else the form's. Each is read
     // once for the document.
     let (family, size, text_color) = if field.found(Inherited::Appearance) {
-        doc.default_appearance(field.source(Inherited::Appearance), false, || {
+        doc.default_appearance(Some(field.source(Inherited::Appearance)), || {
             field
                 .get(Inherited::Appearance)
                 .text(Text::DefaultAppearance)
         })
     } else {
-        doc.default_appearance(None, true, || {
-            form.and_then(|f| f.text(Text::DefaultAppearance))
-        })
+        doc.default_appearance(None, || form.and_then(|f| f.text(Text::DefaultAppearance)))
     };
     let text_color = text_color.unwrap_or(Color::BLACK);
     let (fw, fh) = (fw as f32, fh as f32);
@@ -217,7 +215,7 @@ fn draw<'a>(
             return Ok(Some(()));
         };
         let source = mk.source(Text::Caption.key());
-        let caption = doc.plain(source.as_ref(), face, TEXT, || {
+        let caption = doc.plain(source, face, TEXT, || {
             mk.text(Text::Caption)
                 .map(|c| text::text_string(&c))
                 .unwrap_or_default()
@@ -287,7 +285,7 @@ fn draw<'a>(
         );
         doc.once(
             |k| &mut k.field_text,
-            key,
+            Some(key),
             || {
                 let style = annot.text(Text::DefaultStyle);
                 if options {
@@ -407,7 +405,7 @@ fn draw<'a>(
     // that, and the value, which widgets of one field share, is set once.
     let seen = clip.intersect(shown);
     let source = field.source(Inherited::Value);
-    let value = || doc.plain(source.as_ref(), face, TEXT, || value_text(field));
+    let value = || doc.plain(source, face, TEXT, || value_text(field));
     let set = |size: f32| Setting {
         base: size,
         color: text_color,

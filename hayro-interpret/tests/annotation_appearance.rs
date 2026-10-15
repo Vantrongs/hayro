@@ -1407,6 +1407,71 @@ fn an_annotation_without_a_rect_draws_nothing() {
     assert_eq!(looks(&pdf), ["nothing", "nothing", "nothing"]);
 }
 
+/// A push button `/MK << /CA (X) >>` with `rect` draws its caption X as this.
+fn caption(rect: &str, x: &str) -> String {
+    generated(&format!(
+        "/Subtype /Widget /FT /Btn /Ff 65536 /T (c) /Rect {rect} /DA (/Helv 20 Tf 0 g) /MK << /CA ({x}) >>"
+    ))
+}
+
+/// Two entries with the same key in two dictionaries of one object are two values:
+/// button 4 is captioned by the `/CA` of its own `/MK`, AAAA, and button 5, whose
+/// `/MK` is object 4, by object 4's own `/CA`, BBBB. `PyMuPDF` 1.28.2 bake draws
+/// AAAA at the left and BBBB at the right in either order of `/Annots`, and on two
+/// pages, each button on its own.
+#[test]
+fn entries_of_two_dictionaries_in_one_object_are_two_values() {
+    let (left, right) = ("[10 100 80 140]", "[100 100 170 140]");
+    let (a, b) = (caption(left, "AAAA"), caption(right, "BBBB"));
+    assert_ne!(a, caption(left, "BBBB"));
+    let button = |rect: &str, mk: &str, ca: &str| {
+        format!(
+            "<< /Type /Annot /Subtype /Widget /FT /Btn /Ff 65536 /T (c) /Rect {rect} /DA (/Helv 20 Tf 0 g) /MK {mk} {ca} >>"
+        )
+        .into_bytes()
+    };
+    let four = button(left, "<< /CA (AAAA) >>", "/CA (BBBB)");
+    let five = button(right, "4 0 R", "");
+    let content = |look: &Look<'_>| match look {
+        Look::Generated(g) => expanded(g),
+        _ => panic!("not generated"),
+    };
+    for (annots, expected) in [("[4 0 R 5 0 R]", [&a, &b]), ("[5 0 R 4 0 R]", [&b, &a])] {
+        let pdf = annotations(
+            &format!("/Annots {annots}"),
+            vec![four.clone(), five.clone()],
+        );
+        let drawn: Vec<String> = looks_of(&pdf).iter().map(content).collect();
+        assert_eq!(drawn, expected.map(String::clone), "{annots}");
+    }
+    let pdf = Pdf::new(common::file(
+        &[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [4 0 R] >>".to_vec(),
+            four,
+            five,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [5 0 R] >>".to_vec(),
+        ],
+        "",
+    ))
+    .expect("valid pdf");
+    let pages = pdf.pages();
+    for order in [[0, 1], [1, 0]] {
+        let appearances =
+            Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+        for i in order {
+            let drawn = appearances.page(&pages[i], VIEW, PAGE);
+            assert_eq!(drawn.len(), 1);
+            assert_eq!(
+                &content(drawn[0].look()),
+                [&a, &b][i],
+                "page {i} of {order:?}"
+            );
+        }
+    }
+}
+
 /// A widget without a `/Rect` is drawn by viewers at coordinates of ±2^32: a
 /// button, or a text or choice field with a background, covers the page there or
 /// shows nowhere, so it is unsupported; other widgets show nothing.
