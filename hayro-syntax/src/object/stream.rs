@@ -460,21 +460,45 @@ impl<'a> Stream<'a> {
 
     /// The stream of `dict`, read from `r` after the dictionary.
     pub(crate) fn after_dict(r: &mut Reader<'a>, dict: Dict<'a>) -> Option<Self> {
+        let offset = r.offset();
+        Self::by_length(r, &dict)?
+            .or_else(|| {
+                r.jump(offset);
+                Self::searched_for(r, &dict)
+            })
+            .error_none("was unable to manually parse the stream")
+    }
+
+    /// The stream of `dict`, read from `r` after the dictionary, where its /Length
+    /// leads to `endstream`, `r` after it; `None` for a stream of an external file,
+    /// which is not read.
+    pub(crate) fn by_length(r: &mut Reader<'a>, dict: &Dict<'a>) -> Option<Option<Self>> {
+        Self::by_length_ending(r, dict, |r| {
+            r.skip_white_spaces();
+            r.forward_tag(b"endstream")
+        })
+    }
+
+    /// [`Self::by_length`], where `ends` moves `r` from the end of the data past the
+    /// white space and the `endstream` after them, if they are there.
+    pub(crate) fn by_length_ending(
+        r: &mut Reader<'a>,
+        dict: &Dict<'a>,
+        ends: impl FnOnce(&mut Reader<'a>) -> Option<()>,
+    ) -> Option<Option<Self>> {
         if dict.contains_key(F) {
             warn!("encountered stream referencing external file, which is unsupported");
 
             return None;
         }
+        Some(parse_proper(r, dict, ends))
+    }
 
-        let offset = r.offset();
-        parse_proper(r, &dict)
-            .or_else(|| {
-                warn!("failed to parse stream, trying to parse it manually");
-
-                r.jump(offset);
-                parse_fallback(r, &dict)
-            })
-            .error_none("was unable to manually parse the stream")
+    /// The stream of `dict`, read from `r` after the dictionary, up to the first
+    /// `endstream`, where /Length does not lead to one ([`Self::by_length`]).
+    pub(crate) fn searched_for(r: &mut Reader<'a>, dict: &Dict<'a>) -> Option<Self> {
+        warn!("failed to parse stream, trying to parse it manually");
+        parse_fallback(r, dict)
     }
 }
 
@@ -537,7 +561,11 @@ impl FilterResult<'_> {
     }
 }
 
-fn parse_proper<'a>(r: &mut Reader<'a>, dict: &Dict<'a>) -> Option<Stream<'a>> {
+fn parse_proper<'a>(
+    r: &mut Reader<'a>,
+    dict: &Dict<'a>,
+    ends: impl FnOnce(&mut Reader<'a>) -> Option<()>,
+) -> Option<Stream<'a>> {
     let length = dict.get::<u32>(LENGTH)?;
 
     r.skip_white_spaces_and_comments();
@@ -546,8 +574,7 @@ fn parse_proper<'a>(r: &mut Reader<'a>, dict: &Dict<'a>) -> Option<Stream<'a>> {
         .or_else(|| r.forward_tag(b"\r\n"))
         .or_else(|| r.forward_tag(b"\r"))?;
     let data = r.read_bytes(length as usize)?;
-    r.skip_white_spaces();
-    r.forward_tag(b"endstream")?;
+    ends(r)?;
 
     Some(Stream::new(data, dict.clone()))
 }
@@ -574,7 +601,7 @@ fn parse_fallback<'a>(r: &mut Reader<'a>, dict: &Dict<'a>) -> Option<Stream<'a>>
     Some(Stream::new(data, dict.clone()))
 }
 
-fn searched(data: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn searched(data: &[u8], needle: &[u8]) -> Option<usize> {
     let found = find_needle(data, needle);
     #[cfg(test)]
     SEARCHED.set(SEARCHED.get() + found.unwrap_or(data.len()));
@@ -588,7 +615,7 @@ std::thread_local! {
     pub(crate) static SEARCHED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
-fn trim_trailing_ascii_whitespace(data: &[u8]) -> usize {
+pub(crate) fn trim_trailing_ascii_whitespace(data: &[u8]) -> usize {
     let mut end = data.len();
 
     while data

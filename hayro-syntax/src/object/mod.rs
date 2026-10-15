@@ -32,6 +32,7 @@ mod tuple;
 
 pub(crate) mod indirect;
 pub(crate) mod name;
+pub(crate) mod parsed;
 
 pub mod array;
 pub mod dict;
@@ -106,6 +107,12 @@ pub(crate) trait ObjectLike<'a>: TryFrom<Object<'a>> + Readable<'a> + Debug + Cl
     /// Reads the object an indirect object holds, after its header.
     fn read_indirect(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         r.read_with_context::<Self>(ctx)
+    }
+
+    /// Reads the object the items of a parsed array start with, as [`Readable::read`]
+    /// reads it from the array's bytes: one item, which is no reference.
+    fn from_items(items: &mut parsed::Items<'_, 'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
+        items.next_as::<Self>(ctx)
     }
 }
 

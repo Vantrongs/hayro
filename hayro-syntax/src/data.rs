@@ -1,6 +1,5 @@
 use crate::lost::{Lost, Watched};
 use crate::object::ObjectIdentifier;
-use crate::object::Stream;
 use crate::reader::ReaderContext;
 use crate::sync::FxHashMap;
 use crate::sync::{Arc, Mutex, MutexExt};
@@ -123,7 +122,7 @@ impl Data {
             self.watched.watch(true, || {
                 let objects = ctx
                     .xref()
-                    .get_with::<Stream<'_>>(id, ctx)
+                    .object_stream_with(id, ctx)
                     .and_then(|stream| ObjectStream::new(&stream));
                 // Unless the chain being read rejects it, as a cycle.
                 if objects.is_none() && !ctx.rejects(&id) {
@@ -149,14 +148,6 @@ impl Data {
         match self.decoded.get(idx) {
             Some((Some(stream), _)) => Decoded::Stream(idx, stream),
             _ => Decoded::Lost(lost.unwrap_or(id)),
-        }
-    }
-
-    /// The decoded data of the object stream kept at `idx` ([`Self::get_with`]).
-    pub(crate) fn decoded(&self, idx: usize) -> &[u8] {
-        match self.decoded.get(idx) {
-            Some((Some(stream), _)) => stream.data(),
-            _ => &[],
         }
     }
 }

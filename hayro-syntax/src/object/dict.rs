@@ -1,6 +1,7 @@
 //! Dictionaries.
 
 use crate::object::macros::object;
+use crate::object::parsed::{DictNode, Node};
 use crate::object::r#ref::{MaybeRef, ObjRef};
 use crate::object::{Name, ObjectIdentifier};
 use crate::object::{Object, ObjectLike};
@@ -55,18 +56,25 @@ impl<'a> Dict<'a> {
 
     /// Returns the number of entries in the dictionary.
     pub fn len(&self) -> usize {
-        self.offsets().map_or(0, View::len)
+        match self.offsets() {
+            None => 0,
+            Some(Found::Offsets(offsets)) => offsets.len(),
+            Some(Found::Parsed(node)) => node.len(),
+        }
     }
 
     /// Return whether the dictionary is empty.
     pub fn is_empty(&self) -> bool {
-        self.offsets().is_none_or(|offsets| offsets.len() == 0)
+        self.len() == 0
     }
 
     /// Checks whether the dictionary contains an entry with a specific key.
     pub fn contains_key(&self, key: impl AsRef<[u8]>) -> bool {
-        self.offsets()
-            .is_some_and(|offsets| offsets.get(key.as_ref()).is_some())
+        match self.offsets() {
+            None => false,
+            Some(Found::Offsets(offsets)) => offsets.get(key.as_ref()).is_some(),
+            Some(Found::Parsed(node)) => node.get(key.as_ref()).is_some(),
+        }
     }
 
     /// Returns the entry of a key as a specific object, or try to resolve it in case it's
@@ -104,16 +112,32 @@ impl<'a> Dict<'a> {
 
     /// Get the object reference linked to a key.
     pub fn get_ref(&self, key: impl AsRef<[u8]>) -> Option<ObjRef> {
-        let offset = self.offsets()?.get(key.as_ref())?;
-
-        Reader::new(&self.data()[offset..]).read_with_context::<ObjRef>(self.ctx())
+        match self.offsets()? {
+            Found::Offsets(offsets) => {
+                let offset = *offsets.get(key.as_ref())?;
+                Reader::new(&self.data()[offset..]).read_with_context::<ObjRef>(self.ctx())
+            }
+            Found::Parsed(node) => match node.get(key.as_ref())? {
+                Node::Ref(reference) => Some(*reference),
+                _ => None,
+            },
+        }
     }
 
     /// Returns an iterator over all keys in the dictionary.
     pub fn keys(&self) -> impl Iterator<Item = Name<'a>> + '_ {
-        self.offsets()
+        let (offsets, parsed) = match self.offsets() {
+            None => (None, None),
+            Some(Found::Offsets(offsets)) => (Some(offsets), None),
+            Some(Found::Parsed(node)) => (None, Some(node)),
+        };
+        let offsets = offsets
             .into_iter()
-            .flat_map(|offsets| offsets.iter().map(|(key, _)| key.clone()))
+            .flat_map(|offsets| offsets.keys().cloned());
+        let parsed = parsed
+            .into_iter()
+            .flat_map(|node| node.entries().map(|(key, _)| key.clone()));
+        offsets.chain(parsed)
     }
 
     /// An iterator over all entries in the dictionary, sorted by key.
@@ -135,11 +159,18 @@ impl<'a> Dict<'a> {
     #[allow(private_bounds)]
     pub fn get_raw<T>(&self, key: impl AsRef<[u8]>) -> Option<MaybeRef<T>>
     where
-        T: Readable<'a>,
+        T: ObjectLike<'a>,
     {
-        let offset = self.offsets()?.get(key.as_ref())?;
-
-        Reader::new(&self.data()[offset..]).read_with_context::<MaybeRef<T>>(self.ctx())
+        match self.offsets()? {
+            Found::Offsets(offsets) => {
+                let offset = *offsets.get(key.as_ref())?;
+                let mut r = Reader::new(&self.data()[offset..]);
+                let value = r.read_with_context::<MaybeRef<T>>(self.ctx());
+                crate::work::lexed(r.offset());
+                value
+            }
+            Found::Parsed(node) => node.get(key.as_ref())?.item_as(self.data(), self.ctx()),
+        }
     }
 
     pub(crate) fn ctx(&self) -> &ReaderContext<'a> {
@@ -149,7 +180,7 @@ impl<'a> Dict<'a> {
         }
     }
 
-    fn offsets(&self) -> Option<View<'_, 'a>> {
+    fn offsets(&self) -> Option<Found<'_, 'a>> {
         match &self.0 {
             Inner::Empty => None,
             Inner::Some(repr) => Some(repr.offsets()),
@@ -171,7 +202,7 @@ impl<'a> Dict<'a> {
                 let offsets = match &repr.offsets {
                     Offsets::Own(_) => Offsets::Of(repr.clone()),
                     Offsets::Of(parsed) => Offsets::Of(parsed.clone()),
-                    Offsets::Shared(offsets) => Offsets::Shared(offsets.clone()),
+                    Offsets::Parsed(node) => Offsets::Parsed(node.clone()),
                 };
                 Self(Inner::Some(Arc::new(Repr {
                     data: repr.data,
@@ -182,40 +213,12 @@ impl<'a> Dict<'a> {
         }
     }
 
-    /// Where each entry's value starts, held without the data the dictionary is
-    /// read from, for [`Self::with_offsets`].
-    pub(crate) fn static_offsets(&self) -> Kept<'static> {
-        let offsets = self.offsets().into_iter().flat_map(View::iter);
-        Kept::of(offsets.map(|(key, at)| (key.to_static(), at)).collect())
-    }
-
-    /// Reads a dictionary as [`Dict::read`] does: its bytes, and where each entry's
-    /// value starts in them, held without the data, for [`Self::with_offsets`].
-    pub(crate) fn read_static(
-        r: &mut Reader<'a>,
-        ctx: &ReaderContext<'a>,
-    ) -> Option<(&'a [u8], Kept<'static>)> {
-        let mut offsets = new_offsets();
-        let data = parse_dict_with(
-            r,
-            ctx.in_content_stream(),
-            1,
-            Some(b"<<"),
-            b">>",
-            |name, offset| {
-                offsets.insert(name.to_static(), offset);
-            },
-        )?;
-        #[cfg(test)]
-        parsed(offsets.len(), data.len());
-        Some((data, Kept::of(offsets)))
-    }
-
-    /// The dictionary `data` holds, its entries starting at `offsets`, read in `ctx`.
-    pub(crate) fn with_offsets(data: &'a [u8], offsets: Kept<'a>, ctx: &ReaderContext<'a>) -> Self {
+    /// The dictionary parsed as `node`, which `data` holds, read in `ctx`.
+    pub(crate) fn parsed(data: &'a [u8], node: Arc<DictNode>, ctx: &ReaderContext<'a>) -> Self {
+        let (from, to) = node.span();
         Self(Inner::Some(Arc::new(Repr {
-            data,
-            offsets: Offsets::Shared(offsets),
+            data: &data[from..to],
+            offsets: Offsets::Parsed(node),
             ctx: ctx.clone(),
         })))
     }
@@ -225,16 +228,27 @@ impl Debug for Dict<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         let mut debug_struct = f.debug_struct("Dict");
 
-        if let Some(offsets) = self.offsets() {
-            let mut r = Reader::new(self.data());
+        match self.offsets() {
+            None => {}
+            Some(Found::Offsets(offsets)) => {
+                let mut r = Reader::new(self.data());
 
-            for (key, val) in offsets.iter() {
-                r.jump(val);
-                debug_struct.field(
-                    &format!("{:?}", key.as_str()),
-                    &r.read_with_context::<MaybeRef<Object<'_>>>(&ReaderContext::dummy())
-                        .unwrap(),
-                );
+                for (key, val) in offsets.iter() {
+                    r.jump(*val);
+                    debug_struct.field(
+                        &format!("{:?}", key.as_str()),
+                        &r.read_with_context::<MaybeRef<Object<'_>>>(&ReaderContext::dummy())
+                            .unwrap(),
+                    );
+                }
+            }
+            Some(Found::Parsed(node)) => {
+                for (key, value) in node.entries() {
+                    debug_struct.field(
+                        &format!("{:?}", key.as_str()),
+                        &value.item(self.data(), &ReaderContext::dummy()),
+                    );
+                }
             }
         }
 
@@ -276,7 +290,7 @@ impl Skippable for Dict<'_> {
             depth + 1,
             Some(b"<<"),
             b">>",
-            |_, _| (),
+            |r, _, _| skip_value(r, is_content_stream, depth + 1),
         )
         .map(|_| ())
     }
@@ -295,21 +309,25 @@ fn read_inner<'a>(
     end_tag: &[u8],
 ) -> Option<Dict<'a>> {
     let mut offsets = new_offsets();
+    let in_content_stream = ctx.in_content_stream();
+    let depth = usize::from(start_tag.is_some());
 
     let data = parse_dict_with(
         r,
-        ctx.in_content_stream(),
-        usize::from(start_tag.is_some()),
+        in_content_stream,
+        depth,
         start_tag,
         end_tag,
         #[inline]
-        |name, offset| {
+        |r, name, offset| {
             offsets.insert(name, offset);
+            skip_value(r, in_content_stream, depth)
         },
     )?;
 
     #[cfg(test)]
     parsed(offsets.len(), data.len());
+    crate::work::lexed(data.len());
 
     Some(Dict(Inner::Some(Arc::new(Repr {
         data,
@@ -318,8 +336,8 @@ fn read_inner<'a>(
     }))))
 }
 
-/// A map for where the entries of a dictionary start.
-fn new_offsets<K>() -> FxHashMap<K, usize> {
+/// A map for where the entries of a dictionary start, or for their values.
+pub(crate) fn new_offsets<K, V>() -> FxHashMap<K, V> {
     // TODO: Figure out how to
     // 1) Make dictionaries easily cloneable without wrapping in Arc.
     // 2) Maybe have an efficient per-document allocator pool for hashmaps
@@ -347,11 +365,12 @@ std::thread_local! {
         const { core::cell::Cell::new((0, 0)) };
 }
 
-/// Reads a dictionary, calling `on_entry` with each key and where its value starts:
-/// the one way a dictionary is read, whether it is kept or skipped. A key is a name
-/// whose `#` escapes are hex; another token in its place, such as a name with other
-/// escapes, is skipped as an object. Values are skipped, as objects `depth` deep.
-fn parse_dict_with<'a, F>(
+/// Reads a dictionary, calling `on_entry` with each key and where its value starts,
+/// which reads the value, as an object `depth` deep: the one way a dictionary is
+/// read, whether it is kept, skipped or parsed. A key is a name whose `#` escapes
+/// are hex; another token in its place, such as a name with other escapes, is
+/// skipped as an object.
+pub(crate) fn parse_dict_with<'a, F>(
     r: &mut Reader<'a>,
     in_content_stream: bool,
     depth: usize,
@@ -360,7 +379,7 @@ fn parse_dict_with<'a, F>(
     mut on_entry: F,
 ) -> Option<&'a [u8]>
 where
-    F: FnMut(Name<'a>, usize),
+    F: FnMut(&mut Reader<'a>, Name<'a>, usize) -> Option<()>,
 {
     let dict_data = r.tail()?;
     let start_offset = r.offset();
@@ -401,15 +420,19 @@ where
             // whether the object is `null` before inserting it, but that caused problems
             // in some test cases where encryption + object streams are involved (as we would
             // attempt to read an object stream before having resolved the encryption dictionary).
-            on_entry(name, offset);
-
-            if in_content_stream {
-                r.skip_with_depth::<Object<'_>>(in_content_stream, depth)?;
-            } else {
-                r.skip_with_depth::<MaybeRef<Object<'_>>>(in_content_stream, depth)?;
-            }
+            on_entry(r, name, offset)?;
         }
     }
+}
+
+/// Skips the value of an entry, as an object `depth` deep.
+fn skip_value(r: &mut Reader<'_>, in_content_stream: bool, depth: usize) -> Option<()> {
+    if in_content_stream {
+        r.skip_with_depth::<Object<'_>>(in_content_stream, depth)?;
+    } else {
+        r.skip_with_depth::<MaybeRef<Object<'_>>>(in_content_stream, depth)?;
+    }
+    Some(())
 }
 
 object!(Dict<'a>, Dict);
@@ -421,83 +444,30 @@ struct Repr<'a> {
 }
 
 impl<'a> Repr<'a> {
-    fn offsets(&self) -> View<'_, 'a> {
+    fn offsets(&self) -> Found<'_, 'a> {
         match &self.offsets {
-            Offsets::Own(offsets) => View::Map(offsets),
+            Offsets::Own(offsets) => Found::Offsets(offsets),
             Offsets::Of(parsed) => parsed.offsets(),
-            Offsets::Shared(Kept::List(offsets)) => View::List(offsets),
-            Offsets::Shared(Kept::Map(offsets)) => View::Map(offsets),
+            Offsets::Parsed(node) => Found::Parsed(node),
         }
     }
 }
 
-/// Where each entry's value starts.
+/// Where each entry's value is.
 enum Offsets<'a> {
+    /// Where each starts.
     Own(FxHashMap<Name<'a>, usize>),
     /// Those of a dictionary parsed from the same bytes, which owns them.
     Of(Arc<Repr<'a>>),
-    /// Those of an object's body, which the table keeps for every read of it.
-    Shared(Kept<'a>),
+    /// Each value of the body of an object, parsed once ([`crate::object::parsed`]).
+    Parsed(Arc<DictNode>),
 }
 
-/// Where the entries of a dictionary an object's body holds start, kept for every
-/// read of the body ([`crate::xref`]): those of a small dictionary in a list, which
-/// takes a few dozen bytes an entry where its map takes hundreds a dictionary, in
-/// the order the map iterates them, the order every read of the dictionary finds.
-#[derive(Clone)]
-pub(crate) enum Kept<'a> {
-    List(Arc<[(Name<'a>, usize)]>),
-    Map(Arc<FxHashMap<Name<'a>, usize>>),
-}
-
-impl<'a> Kept<'a> {
-    /// At most this many entries are kept in a list, which a key is searched in
-    /// entry by entry.
-    const LISTED: usize = 8;
-
-    fn of(offsets: FxHashMap<Name<'a>, usize>) -> Self {
-        if offsets.len() <= Self::LISTED {
-            Self::List(offsets.into_iter().collect())
-        } else {
-            Self::Map(Arc::new(offsets))
-        }
-    }
-}
-
-/// Where each entry's value starts, however it is held.
+/// Where each entry's value is, however it is held.
 #[derive(Clone, Copy)]
-enum View<'r, 'a> {
-    Map(&'r FxHashMap<Name<'a>, usize>),
-    List(&'r [(Name<'a>, usize)]),
-}
-
-impl<'r, 'a> View<'r, 'a> {
-    fn len(self) -> usize {
-        match self {
-            Self::Map(offsets) => offsets.len(),
-            Self::List(offsets) => offsets.len(),
-        }
-    }
-
-    fn get(self, key: &[u8]) -> Option<usize> {
-        match self {
-            Self::Map(offsets) => offsets.get(key).copied(),
-            Self::List(offsets) => offsets
-                .iter()
-                .find(|(name, _)| name.as_ref() == key)
-                .map(|(_, at)| *at),
-        }
-    }
-
-    /// The entries, in the order the dictionary's map iterates them.
-    fn iter(self) -> impl Iterator<Item = (&'r Name<'a>, usize)> {
-        let (map, list) = match self {
-            Self::Map(offsets) => (Some(offsets), None),
-            Self::List(offsets) => (None, Some(offsets)),
-        };
-        let map = map.into_iter().flatten().map(|(name, at)| (name, *at));
-        map.chain(list.into_iter().flatten().map(|(name, at)| (name, *at)))
-    }
+enum Found<'r, 'a> {
+    Offsets(&'r FxHashMap<Name<'a>, usize>),
+    Parsed(&'r DictNode),
 }
 
 pub(crate) struct InlineImageDict<'a>(Dict<'a>);

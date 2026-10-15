@@ -27,10 +27,28 @@ std::thread_local! {
 #[cfg(all(debug_assertions, feature = "std"))]
 std::thread_local! {
     /// The bytes of objects' bodies read on this thread, in the file, headers and
-    /// all, or in object streams, and of streams' data found: what tests bound the
-    /// work of reading objects by. Debug builds only.
+    /// all, or in object streams, and around streams' data found, with the file
+    /// once where `endstream` is looked for in it: what tests bound the work of
+    /// reading objects by. Debug builds only.
     #[doc(hidden)]
     pub static BODIES_READ: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(all(debug_assertions, feature = "std"))]
+std::thread_local! {
+    /// The bytes of arrays' items and dictionaries' values read from their bytes on
+    /// this thread, which no read of an object's body does, as it reads what the
+    /// body was parsed into once: what tests bound the work of reading what objects
+    /// hold by, with [`BODIES_READ`]. Debug builds only.
+    #[doc(hidden)]
+    pub static LEXED: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Counts `bytes` of arrays' items or dictionaries' values read ([`LEXED`]).
+#[inline]
+pub(crate) fn lexed(_bytes: usize) {
+    #[cfg(all(debug_assertions, feature = "std"))]
+    LEXED.set(LEXED.get() + _bytes);
 }
 
 /// Counts `bytes` of objects' bodies read ([`BODIES_READ`]).

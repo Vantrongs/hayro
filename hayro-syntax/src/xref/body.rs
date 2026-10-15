@@ -9,11 +9,10 @@
 //! so that a read of another type than the object's costs nothing to repeat.
 
 use crate::lost::Lost;
-use crate::object::dict::Kept;
-use crate::object::{
-    Array, Bytes, Dict, Name, Null, Number, Object, ObjectIdentifier, Stream, String,
-};
+use crate::object::ObjectIdentifier;
+use crate::object::parsed::{DictNode, Node};
 use crate::reader::{Reader, ReaderContext, ReaderExt};
+use crate::sync::Arc;
 #[cfg(test)]
 use crate::sync::FxHashMap;
 
@@ -21,6 +20,17 @@ use crate::sync::FxHashMap;
 /// its header and all for an object of the file, and the object whose key decrypts
 /// it ([`ReaderContext::decryption`]). Every entry that leads to one place reads
 /// one object there, which is read once ([`Shape`]).
+///
+/// A body is read only within its slot: from its place up to the next place an entry
+/// of the table, or the header of an object stream, names in the same bytes, or their
+/// end ([`super::XRef::place`]). A body that does not end in its slot cannot be
+/// read. So the places of one buffer lex disjoint bytes, and reading every body of a
+/// buffer, keeping what it holds, takes time and memory linear in the buffer, however
+/// the objects of a damaged file overlap; the table's check reads a file's objects by
+/// the same rule ([`super::check`]). A stream's data, which are not lexed, nor copied,
+/// may reach past the slot ([`super::Layout::stream_data`]); those of an object
+/// stream, which are decoded and kept, end at another stream's place
+/// ([`Taken::Contained`]).
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) struct Place {
     pub(super) source: Source,
@@ -63,24 +73,35 @@ pub(super) enum Taken {
     /// With its data, or as its dictionary where they cannot be read, as loading
     /// the pages reads it, whose reads look at dictionaries, arrays and numbers.
     Either,
+    /// As an object stream: with its data, cut at the next place that holds a
+    /// stream, if they reach it. Its data are decoded and kept, so the data of the
+    /// object streams of a file must be disjoint for what is kept to be linear in
+    /// the file, and those of streams at different places are only where none
+    /// reaches another's place.
+    Contained,
 }
 
-/// What the body at a place holds, without the bytes it is read from, which every
-/// read of the place makes an object of.
+/// Where the data of a stream are, from and up to, and where they are cut as an
+/// object stream's ([`Taken::Contained`]).
+pub(super) type DataAt = (usize, usize, usize);
+
+/// What the body at a place holds, parsed once with every array and dictionary in
+/// it ([`crate::object::parsed`]), which every read of the place, and of anything in
+/// it, makes an object of without lexing the body again.
 #[derive(Clone)]
 pub(super) enum Shape {
     /// Nothing that can be read as an object: a header or a body that does not
-    /// parse.
+    /// parse in its slot.
     Unreadable,
     /// An object that is no stream.
-    Value(Value),
+    Value(Node),
     /// A stream: its dictionary, where the dictionary ends, and where its data are,
     /// with what finding them lost, once found the same way from every chain of
     /// references (the data are found by /Length, which may be an object).
     Stream {
-        dict: DictShape,
+        dict: Arc<DictNode>,
         end: usize,
-        data: Option<(Option<Span>, Lost)>,
+        data: Option<(Option<DataAt>, Lost)>,
     },
 }
 
@@ -94,36 +115,6 @@ impl core::fmt::Debug for Shape {
     }
 }
 
-/// Where bytes are, from and up to.
-pub(super) type Span = (usize, usize);
-
-/// An object that is no stream, without the bytes it is read from.
-#[derive(Clone)]
-pub(super) enum Value {
-    Null,
-    Boolean(bool),
-    Number(Number),
-    String(Text),
-    Name(Text),
-    /// An array's items.
-    Array(Span),
-    Dict(DictShape),
-}
-
-/// The bytes of a string or name: where they are, or decoded.
-#[derive(Clone)]
-pub(super) enum Text {
-    At(Span),
-    Held(Bytes<'static>),
-}
-
-/// A dictionary: its bytes, and where each entry's value starts in them.
-#[derive(Clone)]
-pub(super) struct DictShape {
-    span: Span,
-    offsets: Kept<'static>,
-}
-
 #[cfg(test)]
 std::thread_local! {
     /// The places whose bodies were read on this thread, how often each, which the
@@ -135,16 +126,10 @@ std::thread_local! {
         core::cell::RefCell::new(FxHashMap::default());
 }
 
-/// Where `part`, which `data` holds, is in it.
-fn span(data: &[u8], part: &[u8]) -> Span {
-    let start = part.as_ptr() as usize - data.as_ptr() as usize;
-    (start, start + part.len())
-}
-
 impl Shape {
-    /// What the body at `place` holds: the object `data` holds there, after a
-    /// header in the file, read in `ctx` as an entry leading to it reads it, which
-    /// resolves nothing.
+    /// What the body at `place` holds: the object `data`, which ends where the
+    /// place's slot does, holds there, after a header in the file, read in `ctx` as an
+    /// entry leading to it reads it, which resolves nothing.
     pub(super) fn read<'a>(data: &'a [u8], place: Place, ctx: &ReaderContext<'a>) -> Self {
         #[cfg(test)]
         BODIES.with_borrow_mut(|bodies| *bodies.entry(place).or_default() += 1);
@@ -153,23 +138,19 @@ impl Shape {
         };
         r.jump(place.at);
         let header = place.source == Source::File;
-        let read = Read::from(&mut r, header, ctx, |r| Dict::read_static(r, ctx));
+        let read = Read::from(
+            &mut r,
+            header,
+            |r| DictNode::read(r, data, ctx),
+            |r| Node::read(r, data, ctx),
+        );
         crate::work::read_bodies(r.offset() - place.at);
         match read {
             None => Self::Unreadable,
-            Some(Read::Object(object)) => Self::Value(Value::of(data, object)),
-            Some(Read::Dict((bytes, offsets))) => Self::Value(Value::Dict(DictShape {
-                span: span(data, bytes),
-                offsets,
-            })),
-            Some(Read::Stream {
-                dict: (bytes, offsets),
-                end,
-            }) => Self::Stream {
-                dict: DictShape {
-                    span: span(data, bytes),
-                    offsets,
-                },
+            Some(Read::Object(node)) => Self::Value(node),
+            Some(Read::Dict(dict)) => Self::Value(Node::Dict(Arc::new(dict))),
+            Some(Read::Stream { dict, end }) => Self::Stream {
+                dict: Arc::new(dict),
                 end,
                 data: None,
             },
@@ -178,10 +159,10 @@ impl Shape {
 }
 
 /// What reading the body of an object finds, whatever entry it is read for, a
-/// dictionary as `D`.
-pub(super) enum Read<'a, D> {
+/// dictionary as `D`, another object as `O`.
+pub(super) enum Read<O, D> {
     /// An object that is no stream nor dictionary.
-    Object(Object<'a>),
+    Object(O),
     /// A dictionary.
     Dict(D),
     /// A stream's dictionary, and where the dictionary ends: the stream's data are
@@ -190,18 +171,18 @@ pub(super) enum Read<'a, D> {
     Stream { dict: D, end: usize },
 }
 
-impl<'a, D> Read<'a, D> {
+impl<O, D> Read<O, D> {
     /// The body `r` is at, after its header where `header` ([`super::read_object`]),
-    /// a dictionary read by `dict`; `r` is left where it ends, a stream at its
-    /// dictionary's end.
-    pub(super) fn from(
+    /// a dictionary read by `dict`, another object by `object`; `r` is left where it
+    /// ends, a stream at its dictionary's end.
+    pub(super) fn from<'a>(
         r: &mut Reader<'a>,
         header: bool,
-        ctx: &ReaderContext<'a>,
         dict: impl FnOnce(&mut Reader<'a>) -> Option<D>,
+        object: impl FnOnce(&mut Reader<'a>) -> Option<O>,
     ) -> Option<Self> {
-        let (_, object) = super::read_object(r, header, ctx, dict)?;
-        match object {
+        let (_, read) = super::read_object(r, header, dict, object)?;
+        match read {
             // As `Object::read_indirect` reads an indirect object; an object stream
             // holds none, but reads one so too.
             Ok(dict) => {
@@ -218,76 +199,4 @@ impl<'a, D> Read<'a, D> {
             Err(object) => Some(Self::Object(object)),
         }
     }
-}
-
-impl Value {
-    fn of<'a>(data: &'a [u8], object: Object<'a>) -> Self {
-        let text = |bytes: Bytes<'a>| match bytes.held() {
-            Ok(bytes) => Text::At(span(data, bytes)),
-            Err(held) => Text::Held(held),
-        };
-        match object {
-            Object::Null(_) => Self::Null,
-            Object::Boolean(value) => Self::Boolean(value),
-            Object::Number(number) => Self::Number(number),
-            Object::String(string) => Self::String(text(string.into_bytes())),
-            Object::Name(name) => Self::Name(text(name.into_bytes())),
-            Object::Array(array) => Self::Array(span(data, array.data())),
-            Object::Dict(dict) => Self::Dict(DictShape::of(data, &dict)),
-            // Read only after a dictionary, which `Shape::read` reads itself.
-            Object::Stream(stream) => Self::Dict(DictShape::of(data, stream.dict())),
-        }
-    }
-
-    /// The object, its bytes in `data`, read in `ctx`.
-    pub(super) fn object<'a>(&self, data: &'a [u8], ctx: &ReaderContext<'a>) -> Object<'a> {
-        let bytes = |text: &Text| match text {
-            Text::At((from, to)) => Bytes::Borrowed(&data[*from..*to]),
-            Text::Held(bytes) => bytes.clone(),
-        };
-        match self {
-            Self::Null => Object::Null(Null),
-            Self::Boolean(value) => Object::Boolean(*value),
-            Self::Number(number) => Object::Number(*number),
-            Self::String(text) => Object::String(String::from_bytes(bytes(text))),
-            Self::Name(text) => Object::Name(Name::from_bytes(bytes(text))),
-            Self::Array((from, to)) => Object::Array(Array::new(&data[*from..*to], ctx)),
-            Self::Dict(dict) => Object::Dict(dict.object(data, ctx)),
-        }
-    }
-}
-
-impl DictShape {
-    fn of<'a>(data: &'a [u8], dict: &Dict<'a>) -> Self {
-        Self {
-            span: span(data, dict.data()),
-            offsets: dict.static_offsets(),
-        }
-    }
-
-    /// The dictionary, its bytes in `data`, read in `ctx`.
-    pub(super) fn object<'a>(&self, data: &'a [u8], ctx: &ReaderContext<'a>) -> Dict<'a> {
-        let (from, to) = self.span;
-        Dict::with_offsets(&data[from..to], self.offsets.clone(), ctx)
-    }
-}
-
-/// The data of the stream at `place` whose dictionary, `dict`, ends at `end` of
-/// `data`, as [`Stream::after_dict`] finds them; where they are in `data`.
-pub(super) fn stream_data<'a>(
-    data: &'a [u8],
-    place: Place,
-    end: usize,
-    dict: Dict<'a>,
-) -> Option<Span> {
-    #[cfg(test)]
-    DATA_FOUND.with_borrow_mut(|found| *found.entry(place).or_default() += 1);
-    #[cfg(not(test))]
-    let _ = place;
-    let mut r = Reader::new(data);
-    r.jump(end);
-    let stream = Stream::after_dict(&mut r, dict);
-    crate::work::read_bodies(r.offset().saturating_sub(end));
-    let stream = stream?;
-    Some(span(data, stream.stored()))
 }

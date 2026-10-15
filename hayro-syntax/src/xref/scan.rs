@@ -746,6 +746,7 @@ mod tests {
     use crate::object::Dict;
     use crate::object::ObjectIdentifier;
     use crate::object::indirect::IndirectObject;
+    use crate::object::parsed::{DictNode, Node};
     use alloc::string::String;
 
     /// A generator of pseudo-random numbers, the same in every run.
@@ -875,17 +876,20 @@ mod tests {
         let mut r = Reader::new(data);
         r.jump(at);
         let ctx = ReaderContext::dummy();
-        let syntax = Read::from(&mut r, false, &ctx, |r| {
-            r.read_with_context::<Dict<'_>>(&ctx)
-        })?;
+        let syntax = Read::from(
+            &mut r,
+            false,
+            |r| DictNode::read(r, data, &ctx),
+            |r| Node::read(r, data, &ctx),
+        )?;
         let dict = match &syntax {
             Read::Dict(dict) | Read::Stream { dict, .. } => Some(dict),
             Read::Object(_) => None,
         };
         Some(Found {
             end: r.offset(),
-            root: dict.is_some_and(|dict| dict.contains_key(ROOT)),
-            kind: dict.is_some_and(|dict| dict.contains_key(TYPE)),
+            root: dict.is_some_and(|dict| dict.get(ROOT).is_some()),
+            kind: dict.is_some_and(|dict| dict.get(TYPE).is_some()),
         })
     }
 
@@ -897,9 +901,12 @@ mod tests {
         let mut r = Reader::new(data);
         r.jump(at);
         let ctx = ReaderContext::dummy();
-        let syntax = Read::from(&mut r, true, &ctx, |r| {
-            r.read_with_context::<Dict<'_>>(&ctx)
-        });
+        let syntax = Read::from(
+            &mut r,
+            true,
+            |r| DictNode::read(r, data, &ctx),
+            |r| Node::read(r, data, &ctx),
+        );
         let end = r.offset();
         if !matches!(syntax, Some(Read::Stream { .. })) {
             let mut indirect = Reader::new(data);
@@ -942,9 +949,12 @@ mod tests {
     fn checked(data: &[u8], at: usize) -> Option<usize> {
         let mut r = Reader::new(data);
         r.jump(at);
-        read_object(&mut r, false, &ReaderContext::dummy(), |r| {
-            r.skip::<Dict<'_>>(false)
-        })
+        read_object(
+            &mut r,
+            false,
+            |r| r.skip::<Dict<'_>>(false),
+            |r| r.read_with_context::<Object<'_>>(&ReaderContext::dummy()),
+        )
         .map(|_| r.offset())
     }
 
@@ -1020,6 +1030,25 @@ mod tests {
             let mut r = Reader::new(&data);
             r.jump(at);
             if let Some(object) = r.read_with_context::<Object<'_>>(&ReaderContext::dummy()) {
+                // And parsing the object finds what reading it does, to the same end.
+                let end = r.offset();
+                let mut parse = Reader::new(&data);
+                parse.jump(at);
+                let ctx = ReaderContext::dummy();
+                let node = Node::read(&mut parse, &data, &ctx);
+                assert_eq!(
+                    parse.offset(),
+                    end,
+                    "case {case}, parse at {at} of {:?}",
+                    shown()
+                );
+                let parsed = node.map(|node| format!("{}", node.object(&data, &ctx)));
+                assert_eq!(
+                    parsed,
+                    Some(format!("{object}")),
+                    "case {case}, parse at {at} of {:?}",
+                    shown()
+                );
                 read_items(object);
             }
             // An object after a header: its header and object are read alike by
