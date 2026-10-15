@@ -3,6 +3,8 @@
 use crate::crypto::DecryptionTarget;
 use crate::crypto::reader::DecryptedReader;
 use crate::filter::Filter;
+pub use crate::filter::chain::StrictReader;
+use crate::filter::chain::{self, Stage, Stored};
 use crate::filter::lzw_flate::{PredictorParams, Unpredictor};
 #[cfg(feature = "unsafe")]
 pub use crate::filter::reader::DecodedCheckpoint;
@@ -22,6 +24,7 @@ use crate::util::{OptionLog, find_needle};
 use crate::work::Meter;
 use crate::xref::{DocumentId, XRef};
 use alloc::borrow::Cow;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
 use core::ops::Deref;
@@ -283,6 +286,16 @@ impl<'a> Stream<'a> {
             .map(|r| r.data)
     }
 
+    /// [`Self::decoded_strict`], its work counted on `meter`, a bounded amount at a
+    /// time: [`DecodeFailure::Cancelled`] once the meter's hook asks to stop.
+    pub fn decoded_strict_metered(
+        &self,
+        meter: &Meter<'_>,
+    ) -> Result<Cow<'a, [u8]>, DecodeFailure> {
+        self.decode(&ImageDecodeParams::default(), meter, true)
+            .map(|r| r.data)
+    }
+
     /// [`Self::decoded_image`], its work counted on `meter`, a bounded amount at a
     /// time: [`DecodeFailure::Cancelled`] once the meter's hook asks to stop.
     pub fn decoded_image_metered(
@@ -327,6 +340,75 @@ impl<'a> Stream<'a> {
             data,
             image_data: None,
         }))
+    }
+
+    /// The data [`Self::decoded_strict`] returns, read a piece at a time through all
+    /// the stream's filters, however they nest, in memory bounded by the decoders'
+    /// state and windows and buffers of [`POLL_BYTES`](crate::work::POLL_BYTES), and
+    /// the stored data, decrypted ([`StrictReader`]); decryption counts on `meter`.
+    /// `Err` where `decoded_strict` fails before decoding: where the data cannot be
+    /// decrypted whole, or the hook asks to stop. `Ok(None)` where a filter has no
+    /// decoder that reads a piece at a time, an image filter or a predictor only the
+    /// whole decoder reverses: the caller decodes whole then.
+    pub fn decoded_strict_reader(
+        &self,
+        meter: &Meter<'_>,
+    ) -> Result<Option<StrictReader<'a>>, DecodeFailure> {
+        let FiltersAndParams { filters, params } = self.filters_and_params();
+        let predictors = || {
+            filters
+                .iter()
+                .zip(&params)
+                .map(|(filter, params)| (*filter, PredictorParams::from_params(params)))
+        };
+        for (filter, predictor) in predictors() {
+            match filter {
+                Filter::FlateDecode | Filter::LzwDecode => {
+                    if predictor.predictor != 1 && Unpredictor::new(&predictor).is_none() {
+                        return Ok(None);
+                    }
+                }
+                Filter::AsciiHexDecode
+                | Filter::Ascii85Decode
+                | Filter::RunLengthDecode
+                | Filter::Crypt => {}
+                Filter::CcittFaxDecode
+                | Filter::Jbig2Decode
+                | Filter::DctDecode
+                | Filter::JpxDecode => return Ok(None),
+            }
+        }
+        let data = self.raw_data_metered(meter, true)?;
+        let mut stage: Box<dyn Stage + 'a> = Box::new(Stored::new(data));
+        for (filter, predictor) in predictors() {
+            stage = match filter {
+                // Decrypted with the stored data.
+                Filter::Crypt => stage,
+                Filter::FlateDecode => {
+                    let Some(stage) =
+                        chain::predicted(Box::new(chain::Flate::new(stage)), &predictor)
+                    else {
+                        return Ok(None);
+                    };
+                    stage
+                }
+                Filter::LzwDecode => {
+                    let lzw = chain::Bytewise::lzw(stage, predictor.early_change);
+                    let Some(stage) = chain::predicted(Box::new(lzw), &predictor) else {
+                        return Ok(None);
+                    };
+                    stage
+                }
+                Filter::AsciiHexDecode => Box::new(chain::Bytewise::ascii_hex(stage)),
+                Filter::Ascii85Decode => Box::new(chain::Bytewise::ascii_85(stage)),
+                Filter::RunLengthDecode => Box::new(chain::Bytewise::run_length(stage)),
+                Filter::CcittFaxDecode
+                | Filter::Jbig2Decode
+                | Filter::DctDecode
+                | Filter::JpxDecode => return Ok(None),
+            };
+        }
+        Ok(Some(StrictReader::new(stage)))
     }
 
     /// The decoded data, read incrementally, when the stream's filters allow it: no

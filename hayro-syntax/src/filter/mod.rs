@@ -4,6 +4,7 @@ mod ascii_85;
 pub(crate) mod ascii_hex;
 #[cfg(feature = "images")]
 mod ccitt;
+pub(crate) mod chain;
 #[cfg(feature = "images")]
 mod dct;
 #[cfg(feature = "images")]

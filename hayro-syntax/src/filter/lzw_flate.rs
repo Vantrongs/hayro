@@ -134,83 +134,178 @@ pub(crate) mod flate {
             meter: &Meter<'_>,
             strict: bool,
         ) -> Result<Option<Vec<u8>>, Cancelled> {
-            let (decoded, corrupt) = flate_decode(data, meter)?;
-            if corrupt && strict {
+            let mut stream = FlateStream::new(Slice::new(data));
+            let stepped = stream.step(meter, usize::MAX);
+            #[cfg(test)]
+            WORK.set((stream.input.taken(), stream.made()));
+            stepped?;
+            if stream.corrupt && strict {
                 warn!("flate stream is corrupt");
                 return Ok(None);
             }
-            Ok(Some(decoded))
+            Ok(Some(core::mem::take(&mut stream.output)))
         }
 
-        /// The data decoded, and whether decoding met data that is no valid deflate.
-        fn flate_decode(data: &[u8], meter: &Meter<'_>) -> Result<(Vec<u8>, bool), Cancelled> {
-            if data.len() >= 2 {
-                let cmf = data[0];
-                let flg = data[1];
+        /// Where the decoder takes its bytes from, one at a time.
+        pub(crate) trait Input {
+            /// The next byte; `None` at the end.
+            fn next(&mut self, meter: &Meter<'_>) -> Option<u8>;
+            /// The byte `ahead` bytes after the next one, which stays next.
+            fn peek(&mut self, ahead: usize, meter: &Meter<'_>) -> Option<u8>;
+            /// The bytes taken so far.
+            fn taken(&self) -> usize;
+        }
 
-                if (cmf & 0x0f) == 0x08
-                    && ((cmf as u16) << 8 | flg as u16).is_multiple_of(31)
-                    && (flg & 0x20) == 0
-                {
-                    let mut stream = FlateStream::new(&data[2..], meter);
-                    return stream.decode();
-                }
+        /// Bytes all at hand.
+        pub(crate) struct Slice<'a> {
+            data: &'a [u8],
+            at: usize,
+        }
+
+        impl<'a> Slice<'a> {
+            pub(crate) fn new(data: &'a [u8]) -> Self {
+                Self { data, at: 0 }
+            }
+        }
+
+        impl Input for Slice<'_> {
+            fn next(&mut self, _: &Meter<'_>) -> Option<u8> {
+                let byte = *self.data.get(self.at)?;
+                self.at += 1;
+                Some(byte)
             }
 
-            let mut stream = FlateStream::new(data, meter);
-            stream.decode()
+            fn peek(&mut self, ahead: usize, _: &Meter<'_>) -> Option<u8> {
+                self.data.get(self.at + ahead).copied()
+            }
+
+            fn taken(&self) -> usize {
+                self.at
+            }
         }
 
         #[cfg(test)]
         std::thread_local! {
-            /// The bytes the last decoder dropped on this thread took and made.
+            /// The bytes the last whole decoding on this thread took and made.
             pub(crate) static WORK: core::cell::Cell<(usize, usize)> =
                 const { core::cell::Cell::new((0, 0)) };
         }
 
-        #[cfg(test)]
-        impl Drop for FlateStream<'_, '_> {
-            fn drop(&mut self) {
-                WORK.set((self.pos, self.output.len()));
-            }
-        }
-
-        struct FlateStream<'a, 'm> {
-            data: &'a [u8],
-            pos: usize,
+        /// The decoder, which can stop between two codes and go on later
+        /// ([`Self::step`]), so that it is read a part at a time: its output is the
+        /// history back references reach into, then the bytes not handed out yet.
+        pub(crate) struct FlateStream<I: Input> {
+            pub(crate) input: I,
             code_buf: u32,
             code_size: u8,
+            /// The bytes made, from the `dropped`th on.
             output: Vec<u8>,
+            dropped: usize,
+            /// The bytes of `output` handed out ([`Self::hand`]).
+            handed: usize,
+            /// Whether the zlib header was looked for.
+            started: bool,
+            /// The tables of the compressed block being decoded, and the bytes taken
+            /// when it started.
+            block: Option<(HuffmanTable, HuffmanTable, usize)>,
             eof: bool,
             /// Whether decoding stopped at, or passed over, data that is no valid
             /// deflate, rather than at the end of the stream or of the data.
-            corrupt: bool,
-            meter: &'m Meter<'m>,
+            pub(crate) corrupt: bool,
         }
 
-        impl<'a, 'm> FlateStream<'a, 'm> {
-            fn new(data: &'a [u8], meter: &'m Meter<'m>) -> Self {
-                FlateStream {
-                    data,
-                    pos: 0,
+        /// The farthest a back reference reaches.
+        const WINDOW: usize = 32 * 1024;
+
+        impl<I: Input> FlateStream<I> {
+            pub(crate) fn new(input: I) -> Self {
+                Self {
+                    input,
                     code_buf: 0,
                     code_size: 0,
                     output: Vec::new(),
+                    dropped: 0,
+                    handed: 0,
+                    started: false,
+                    block: None,
                     eof: false,
                     corrupt: false,
-                    meter,
                 }
             }
 
-            /// Each block counts the bytes it took, and at least one.
-            fn decode(&mut self) -> Result<(Vec<u8>, bool), Cancelled> {
-                while !self.eof && self.pos < self.data.len() {
-                    let pos = self.pos;
-                    self.read_block()?;
-                    self.meter.work(self.pos - pos + 1)?;
-                }
+            /// The bytes made in all.
+            fn made(&self) -> usize {
+                self.dropped + self.output.len()
+            }
 
-                Ok((core::mem::take(&mut self.output), self.corrupt))
+            /// The bytes made and not handed out yet.
+            pub(crate) fn pending(&self) -> &[u8] {
+                &self.output[self.handed..]
+            }
+
+            /// Hands out `n` pending bytes, and drops what back references can no
+            /// longer reach of what was handed out.
+            pub(crate) fn hand(&mut self, n: usize) {
+                self.handed += n;
+                if self.handed >= 2 * WINDOW {
+                    let drop = self.handed - WINDOW;
+                    self.output.drain(..drop);
+                    self.dropped += drop;
+                    self.handed -= drop;
+                }
+            }
+
+            /// Whether all data was decoded.
+            pub(crate) fn done(&self) -> bool {
+                self.started && self.block.is_none() && self.eof
+            }
+
+            /// Decodes until the end of the data or of the stream, or until at least
+            /// `pending` bytes made are not handed out: each block counts the bytes it
+            /// took, and at least one, when it ends.
+            pub(crate) fn step(
+                &mut self,
+                meter: &Meter<'_>,
+                pending: usize,
+            ) -> Result<(), Cancelled> {
+                if !self.started {
+                    self.started = true;
+                    self.skip_header(meter);
+                }
+                loop {
+                    if let Some((lit, dist, from)) = self.block.take() {
+                        if !self.read_codes(lit, dist, from, meter, pending)? {
+                            return Ok(());
+                        }
+                        meter.work(self.input.taken() - from + 1)?;
+                    }
+                    if self.eof || self.input.peek(0, meter).is_none() {
+                        self.eof = true;
+                        return Ok(());
+                    }
+                    if self.output.len() - self.handed >= pending {
+                        return Ok(());
+                    }
+                    let from = self.input.taken();
+                    self.read_block(meter, pending)?;
+                    if self.block.is_some() {
+                        return Ok(());
+                    }
+                    meter.work(self.input.taken() - from + 1)?;
+                }
+            }
+
+            /// Takes a zlib header, if the data starts with one.
+            fn skip_header(&mut self, meter: &Meter<'_>) {
+                if let (Some(cmf), Some(flg)) =
+                    (self.input.peek(0, meter), self.input.peek(1, meter))
+                    && (cmf & 0x0f) == 0x08
+                    && ((cmf as u16) << 8 | flg as u16).is_multiple_of(31)
+                    && (flg & 0x20) == 0
+                {
+                    self.input.next(meter);
+                    self.input.next(meter);
+                }
             }
 
             /// Stops decoding at data that is no valid deflate.
@@ -219,34 +314,9 @@ pub(crate) mod flate {
                 self.eof = true;
             }
 
-            fn get_byte(&mut self) -> Option<u8> {
-                if self.pos >= self.data.len() {
-                    None
-                } else {
-                    let byte = self.data[self.pos];
-                    self.pos += 1;
-                    Some(byte)
-                }
-            }
-
-            fn peek_byte(&self) -> Option<u8> {
-                if self.pos >= self.data.len() {
-                    None
-                } else {
-                    Some(self.data[self.pos])
-                }
-            }
-
-            fn get_bytes(&mut self, n: usize) -> Vec<u8> {
-                let end = (self.pos + n).min(self.data.len());
-                let bytes = self.data[self.pos..end].to_vec();
-                self.pos = end;
-                bytes
-            }
-
-            fn get_bits(&mut self, bits: u8) -> Option<u32> {
+            fn get_bits(&mut self, bits: u8, meter: &Meter<'_>) -> Option<u32> {
                 while self.code_size < bits {
-                    let b = self.get_byte()?;
+                    let b = self.input.next(meter)?;
                     self.code_buf |= (b as u32) << self.code_size;
                     self.code_size += 8;
                 }
@@ -258,12 +328,12 @@ pub(crate) mod flate {
                 Some(result)
             }
 
-            fn get_code(&mut self, table: &HuffmanTable) -> Option<u16> {
+            fn get_code(&mut self, table: &HuffmanTable, meter: &Meter<'_>) -> Option<u16> {
                 let codes = &table.codes;
                 let max_len = table.max_len;
 
                 while self.code_size < max_len {
-                    if let Some(b) = self.get_byte() {
+                    if let Some(b) = self.input.next(meter) {
                         self.code_buf |= (b as u32) << self.code_size;
                         self.code_size += 8;
                     } else {
@@ -291,9 +361,12 @@ pub(crate) mod flate {
                 Some(code_val as u16)
             }
 
-            fn read_block(&mut self) -> Result<(), Cancelled> {
+            /// Reads a block, or, for a compressed one, its tables and its codes up to
+            /// `pending` bytes not handed out ([`Self::read_codes`]).
+            fn read_block(&mut self, meter: &Meter<'_>, pending: usize) -> Result<(), Cancelled> {
+                let from = self.input.taken();
                 // Read block header
-                let hdr = match self.get_bits(3) {
+                let hdr = match self.get_bits(3, meter) {
                     Some(h) => h,
                     None => {
                         warn!("bad block header in flate stream");
@@ -309,9 +382,24 @@ pub(crate) mod flate {
                 let hdr = hdr >> 1;
 
                 match hdr {
-                    0 => self.read_uncompressed_block(),
-                    1 => return self.read_compressed_block(true),
-                    2 => return self.read_compressed_block(false),
+                    0 => self.read_uncompressed_block(meter),
+                    1 | 2 => {
+                        let (lit, dist) = if hdr == 1 {
+                            (get_fixed_lit_table(), get_fixed_dist_table())
+                        } else {
+                            match self.read_dynamic_tables(meter) {
+                                Some(tables) => tables,
+                                None => {
+                                    self.eof = true;
+                                    return Ok(());
+                                }
+                            }
+                        };
+                        meter.work(lit.codes.len() + dist.codes.len())?;
+                        if !self.read_codes(lit, dist, from, meter, pending)? {
+                            return Ok(());
+                        }
+                    }
                     _ => {
                         warn!("unknown block type in flate stream");
                         self.corrupt();
@@ -320,49 +408,24 @@ pub(crate) mod flate {
                 Ok(())
             }
 
-            fn read_uncompressed_block(&mut self) {
+            fn read_uncompressed_block(&mut self, meter: &Meter<'_>) {
                 // Skip any remaining bits in current byte
                 self.code_buf = 0;
                 self.code_size = 0;
 
-                let len_low = match self.get_byte() {
-                    Some(b) => b as u16,
-                    None => {
-                        warn!("bad block header in flate stream");
-                        self.eof = true;
-                        return;
+                let mut bytes = [0_u16; 4];
+                for byte in &mut bytes {
+                    match self.input.next(meter) {
+                        Some(b) => *byte = b as u16,
+                        None => {
+                            warn!("bad block header in flate stream");
+                            self.eof = true;
+                            return;
+                        }
                     }
-                };
-
-                let len_high = match self.get_byte() {
-                    Some(b) => b as u16,
-                    None => {
-                        warn!("bad block header in flate stream");
-                        self.eof = true;
-                        return;
-                    }
-                };
-
+                }
+                let [len_low, len_high, nlen_low, nlen_high] = bytes;
                 let block_len = len_low | (len_high << 8);
-
-                let nlen_low = match self.get_byte() {
-                    Some(b) => b as u16,
-                    None => {
-                        warn!("bad block header in flate stream");
-                        self.eof = true;
-                        return;
-                    }
-                };
-
-                let nlen_high = match self.get_byte() {
-                    Some(b) => b as u16,
-                    None => {
-                        warn!("bad block header in flate stream");
-                        self.eof = true;
-                        return;
-                    }
-                };
-
                 let check = nlen_low | (nlen_high << 8);
 
                 if check != !block_len && (block_len != 0 || check != 0) {
@@ -372,72 +435,76 @@ pub(crate) mod flate {
                 }
 
                 if block_len == 0 {
-                    if self.peek_byte().is_none() {
+                    if self.input.peek(0, meter).is_none() {
                         self.eof = true;
                     }
                 } else {
-                    let block = self.get_bytes(block_len as usize);
-                    self.output.extend_from_slice(&block);
-                    if block.len() < block_len as usize {
-                        self.eof = true;
+                    for _ in 0..block_len {
+                        match self.input.next(meter) {
+                            Some(b) => self.output.push(b),
+                            None => {
+                                self.eof = true;
+                                return;
+                            }
+                        }
                     }
                 }
             }
 
-            /// Counts the tables it builds and each code's output.
-            fn read_compressed_block(&mut self, fixed: bool) -> Result<(), Cancelled> {
-                let (lit_code_table, dist_code_table) = if fixed {
-                    (get_fixed_lit_table(), get_fixed_dist_table())
-                } else {
-                    match self.read_dynamic_tables() {
-                        Some(tables) => tables,
-                        None => {
-                            self.eof = true;
-                            return Ok(());
-                        }
-                    }
-                };
-                self.meter
-                    .work(lit_code_table.codes.len() + dist_code_table.codes.len())?;
-
+            /// Reads the codes of a compressed block whose tables are `lit` and `dist`
+            /// and which started when `from` bytes were taken: to its end (true), or
+            /// until `pending` bytes made are not handed out, keeping the block to go
+            /// on with (false). Counts each code's output.
+            fn read_codes(
+                &mut self,
+                lit_code_table: HuffmanTable,
+                dist_code_table: HuffmanTable,
+                from: usize,
+                meter: &Meter<'_>,
+                pending: usize,
+            ) -> Result<bool, Cancelled> {
                 loop {
-                    let code1 = match self.get_code(&lit_code_table) {
+                    if self.output.len() - self.handed >= pending {
+                        self.block = Some((lit_code_table, dist_code_table, from));
+                        return Ok(false);
+                    }
+                    let code1 = match self.get_code(&lit_code_table, meter) {
                         Some(c) => c,
                         None => {
                             self.eof = true;
-                            return Ok(());
+                            return Ok(true);
                         }
                     };
 
                     if code1 < 256 {
                         self.output.push(code1 as u8);
-                        self.meter.work(1)?;
+                        meter.work(1)?;
                     } else if code1 == 256 {
-                        return Ok(());
+                        return Ok(true);
                     } else {
                         let code1 = code1 - 257;
                         let Some(&length_info) = LENGTH_DECODE.get(code1 as usize) else {
                             warn!("invalid length code {} in flate stream", code1 + 257);
                             self.corrupt();
-                            return Ok(());
+                            return Ok(true);
                         };
                         let extra_bits = (length_info >> 16) as u8;
                         let mut length = (length_info & 0xffff) as usize;
 
                         if extra_bits > 0 {
-                            if let Some(extra) = self.get_bits(extra_bits) {
+                            if let Some(extra) = self.get_bits(extra_bits, meter) {
                                 length += extra as usize;
                             } else {
                                 self.eof = true;
-                                return Ok(());
+                                return Ok(true);
                             }
                         }
 
-                        let dist_code = match self.get_code(&dist_code_table) {
+                        let dist_code = match self.get_code(&dist_code_table, meter) {
                             Some(c) => c,
                             None => {
                                 self.eof = true;
-                                return Ok(());
+                                return Ok(true);
                             }
                         };
 
@@ -447,7 +514,7 @@ pub(crate) mod flate {
                                 warn!("invalid distance code {} in flate stream", dist_code);
 
                                 self.corrupt();
-                                return Ok(());
+                                return Ok(true);
                             }
                         };
 
@@ -455,40 +522,42 @@ pub(crate) mod flate {
                         let mut distance = (dist_info & 0xffff) as usize;
 
                         if extra_bits > 0 {
-                            if let Some(extra) = self.get_bits(extra_bits) {
+                            if let Some(extra) = self.get_bits(extra_bits, meter) {
                                 distance += extra as usize;
                             } else {
                                 self.eof = true;
-                                return Ok(());
+                                return Ok(true);
                             }
                         }
 
-                        // Copy from previous output
-                        let start = self.output.len().wrapping_sub(distance);
-                        if start >= self.output.len() {
-                            // A distance back past the start of the output.
+                        // Copy from previous output; a distance back past the start of
+                        // the output copies nothing.
+                        if distance > self.made() {
                             self.corrupt = true;
-                        }
-                        for _ in 0..length {
-                            if start < self.output.len() {
+                        } else {
+                            for _ in 0..length {
                                 let byte = self.output[self.output.len() - distance];
                                 self.output.push(byte);
                             }
                         }
-                        self.meter.work(length + 1)?;
+                        meter.work(length + 1)?;
                     }
                 }
             }
 
-            fn read_dynamic_tables(&mut self) -> Option<(HuffmanTable, HuffmanTable)> {
-                let num_lit_codes = self.get_bits(5)? as usize + 257;
-                let num_dist_codes = self.get_bits(5)? as usize + 1;
-                let num_code_len_codes = self.get_bits(4)? as usize + 4;
+            fn read_dynamic_tables(
+                &mut self,
+                meter: &Meter<'_>,
+            ) -> Option<(HuffmanTable, HuffmanTable)> {
+                let num_lit_codes = self.get_bits(5, meter)? as usize + 257;
+                let num_dist_codes = self.get_bits(5, meter)? as usize + 1;
+                let num_code_len_codes = self.get_bits(4, meter)? as usize + 4;
 
                 // Build code length code table
                 let mut code_len_code_lengths = vec![0_u8; 19];
                 for i in 0..num_code_len_codes {
-                    code_len_code_lengths[CODE_LEN_CODE_MAP[i] as usize] = self.get_bits(3)? as u8;
+                    code_len_code_lengths[CODE_LEN_CODE_MAP[i] as usize] =
+                        self.get_bits(3, meter)? as u8;
                 }
 
                 let code_len_table = generate_huffman_table(&code_len_code_lengths);
@@ -499,7 +568,7 @@ pub(crate) mod flate {
                 let mut i = 0;
 
                 while i < total_codes {
-                    let code = self.get_code(&code_len_table)?;
+                    let code = self.get_code(&code_len_table, meter)?;
 
                     match code {
                         0..=15 => {
@@ -508,7 +577,7 @@ pub(crate) mod flate {
                         }
                         16 => {
                             // Repeat previous
-                            let repeat_count = self.get_bits(2)? as usize + 3;
+                            let repeat_count = self.get_bits(2, meter)? as usize + 3;
                             let prev = if i > 0 { code_lengths[i - 1] } else { 0 };
                             for _ in 0..repeat_count {
                                 if i < total_codes {
@@ -519,7 +588,7 @@ pub(crate) mod flate {
                         }
                         17 => {
                             // Repeat zero 3-10 times
-                            let repeat_count = self.get_bits(3)? as usize + 3;
+                            let repeat_count = self.get_bits(3, meter)? as usize + 3;
                             for _ in 0..repeat_count {
                                 if i < total_codes {
                                     code_lengths[i] = 0;
@@ -529,7 +598,7 @@ pub(crate) mod flate {
                         }
                         18 => {
                             // Repeat zero 11-138 times
-                            let repeat_count = self.get_bits(7)? as usize + 11;
+                            let repeat_count = self.get_bits(7, meter)? as usize + 11;
                             for _ in 0..repeat_count {
                                 if i < total_codes {
                                     code_lengths[i] = 0;
@@ -703,7 +772,7 @@ pub(crate) mod flate {
 }
 
 pub(crate) mod lzw {
-    use crate::bit_reader::BitReader;
+    use crate::filter::lzw_flate::flate::fallback::{Input, Slice};
     use crate::filter::lzw_flate::{PredictorParams, apply_predictor};
     use crate::object::Dict;
     use crate::work::Meter;
@@ -726,29 +795,71 @@ pub(crate) mod lzw {
     const INITIAL_SIZE: u16 = 258;
 
     fn decode_impl(data: &[u8], early_change: bool, meter: &Meter<'_>) -> Option<Vec<u8>> {
-        let mut table = Table::new(early_change);
-        let mut bit_size = table.code_length();
-        let mut reader = BitReader::new(data);
+        let mut decoder = Decoder::new(early_change);
+        let mut input = Slice::new(data);
         let mut decoded = vec![];
-        let mut prev = None;
+        while decoder.step(&mut input, &mut decoded, meter)? {}
+        Some(decoded)
+    }
 
-        loop {
+    /// The decoder, a code at a time ([`Self::step`]), its codes read most
+    /// significant bit first.
+    pub(crate) struct Decoder {
+        table: Table,
+        bit_size: u8,
+        prev: Option<usize>,
+        /// Bits taken from the input and not read yet, the last `bits` of `buffer`.
+        buffer: u64,
+        bits: u8,
+    }
+
+    impl Decoder {
+        pub(crate) fn new(early_change: bool) -> Self {
+            let table = Table::new(early_change);
+            Self {
+                bit_size: table.code_length(),
+                table,
+                prev: None,
+                buffer: 0,
+                bits: 0,
+            }
+        }
+
+        /// The next `bit_size` bits; `None` where the input ends first.
+        fn code(&mut self, input: &mut impl Input, meter: &Meter<'_>) -> Option<usize> {
+            while self.bits < self.bit_size {
+                self.buffer = (self.buffer << 8) | u64::from(input.next(meter)?);
+                self.bits += 8;
+            }
+            self.bits -= self.bit_size;
+            Some(((self.buffer >> self.bits) & ((1 << self.bit_size) - 1)) as usize)
+        }
+
+        /// Decodes the next code into `decoded`: false at the end of the data,
+        /// `None` where it is invalid or the meter's hook asks to stop.
+        pub(crate) fn step(
+            &mut self,
+            input: &mut impl Input,
+            decoded: &mut Vec<u8>,
+            meter: &Meter<'_>,
+        ) -> Option<bool> {
             meter.work(1).ok()?;
-            let next = match reader.read(bit_size) {
-                Some(code) => code as usize,
+            let next = match self.code(input, meter) {
+                Some(code) => code,
                 None => {
                     warn!("premature EOF in LZW stream, EOD code missing");
-                    return Some(decoded);
+                    return Some(false);
                 }
             };
+            let table = &mut self.table;
 
             match next {
                 CLEAR_TABLE => {
                     table.clear();
-                    prev = None;
-                    bit_size = table.code_length();
+                    self.prev = None;
+                    self.bit_size = table.code_length();
                 }
-                EOD => return Some(decoded),
+                EOD => return Some(false),
                 new => {
                     if new > table.size() {
                         warn!("invalid LZW code: {} (table size: {})", new, table.size());
@@ -761,11 +872,12 @@ pub(crate) mod lzw {
                         meter.work(entry.len()).ok()?;
                         decoded.extend_from_slice(entry);
 
-                        if let Some(prev_code) = prev {
+                        if let Some(prev_code) = self.prev {
                             table.register(prev_code, first_byte);
                         }
-                    } else if new == table.size() && prev.is_some() {
-                        let prev_code = prev.unwrap();
+                    } else if new == table.size()
+                        && let Some(prev_code) = self.prev
+                    {
                         let prev_entry = table.get(prev_code)?;
                         let first_byte = prev_entry[0];
 
@@ -777,10 +889,11 @@ pub(crate) mod lzw {
                         return None;
                     }
 
-                    bit_size = table.code_length();
-                    prev = Some(new);
+                    self.bit_size = table.code_length();
+                    self.prev = Some(new);
                 }
             }
+            Some(true)
         }
     }
 

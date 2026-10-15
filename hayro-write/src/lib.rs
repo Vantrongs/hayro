@@ -575,10 +575,20 @@ fn copy_xobject<'a>(
     Ok(xobj_ref)
 }
 
-/// The page's content, compressed.
-fn encoded_content(page: &Page<'_>, _ctx: &ExtractionContext<'_>) -> Result<Vec<u8>, ContentError> {
-    let content = page.try_page_stream()?;
-    Ok(deflate_encode(&content))
+/// The page's content, compressed as it is decoded, so that what it decodes to is
+/// never held whole ([`Page::try_page_stream_to`]); the work counted on the meter.
+fn encoded_content(page: &Page<'_>, ctx: &ExtractionContext<'_>) -> Result<Vec<u8>, ContentError> {
+    use std::io::Write;
+
+    let mut encoder = encoder();
+    page.try_page_stream_to(
+        &mut |data| {
+            let _ = ctx.meter.work(data.len());
+            encoder.write_all(data).unwrap();
+        },
+        &ctx.meter,
+    )?;
+    Ok(encoder.finish().unwrap())
 }
 
 fn write_form<'a>(
@@ -687,11 +697,16 @@ fn category_copy<'a>(category: &Dict<'a>, ctx: &mut ExtractionContext<'a>) -> Re
 pub fn deflate_encode(data: &[u8]) -> Vec<u8> {
     use std::io::Write;
 
-    const COMPRESSION_LEVEL: u8 = 4;
     let _ = Meter::default().work(data.len());
-    let mut e = ZlibEncoder::new(Vec::new(), Compression::new(COMPRESSION_LEVEL as u32));
+    let mut e = encoder();
     e.write_all(data).unwrap();
     e.finish().unwrap()
+}
+
+/// The compressor of [`deflate_encode`].
+fn encoder() -> ZlibEncoder<Vec<u8>> {
+    const COMPRESSION_LEVEL: u32 = 4;
+    ZlibEncoder::new(Vec::new(), Compression::new(COMPRESSION_LEVEL))
 }
 
 fn convert_rect(hy_rect: &hayro_syntax::object::Rect) -> Rect {

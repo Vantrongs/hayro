@@ -32,7 +32,7 @@ fn a_stream_named_many_times_is_decoded_once() {
         let pdf = Pdf::new(common::one_page(100, &entries, vec![content.clone()])).unwrap();
         let page = &pdf.pages()[0];
         let expected: Vec<u8> = (0..n)
-            .flat_map(|_| data.iter().copied().chain([b' ']))
+            .flat_map(|_| data.iter().copied().chain(*b" "))
             .collect();
         TOLD.set(0);
         assert_eq!(page.try_page_stream().unwrap(), expected);
