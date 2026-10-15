@@ -326,4 +326,9 @@ impl<'a, T: Device<'a>> Device<'a> for StencilPatternDevice<'a, '_, T> {
     }
 
     fn pop_transparency_group(&mut self) {}
+
+    // Groups are not drawn here, so the pair's fill lies in no group of its own:
+    // clearing in the device drawn into would clear what was drawn before the pair
+    // as well.
+    fn knock_out(&mut self, _: &BezPath, _: Affine, _: &DrawMode) {}
 }

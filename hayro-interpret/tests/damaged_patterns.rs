@@ -60,6 +60,7 @@ impl<'a> Device<'a> for Rec {
     fn draw_image(&mut self, _: Image<'a, '_>, _: ImageDrawProps<'a>) {}
     fn pop_clip(&mut self) {}
     fn pop_transparency_group(&mut self) {}
+    fn knock_out(&mut self, _: &BezPath, _: Affine, _: &DrawMode) {}
 }
 
 /// What a page filling a square with pattern object `pattern` paints.

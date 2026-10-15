@@ -79,6 +79,7 @@ impl<'a> Device<'a> for Rec {
     fn pop_transparency_group(&mut self) {
         self.0.push(Ev::EndGroup);
     }
+    fn knock_out(&mut self, _: &BezPath, _: Affine, _: &DrawMode) {}
 }
 
 /// Draws a 200 × 200 pt page with these annotation dictionaries.

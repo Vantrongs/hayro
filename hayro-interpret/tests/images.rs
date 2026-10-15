@@ -43,6 +43,7 @@ impl<'a> Device<'a> for Decoded {
     }
     fn pop_clip(&mut self) {}
     fn pop_transparency_group(&mut self) {}
+    fn knock_out(&mut self, _: &BezPath, _: kurbo::Affine, _: &DrawMode) {}
 }
 
 /// A 100 × 100 pt page with `content`, `resources`, and `objects` numbered from 5.
@@ -151,6 +152,7 @@ impl<'a> Device<'a> for Keys {
     }
     fn pop_clip(&mut self) {}
     fn pop_transparency_group(&mut self) {}
+    fn knock_out(&mut self, _: &BezPath, _: kurbo::Affine, _: &DrawMode) {}
 }
 
 /// Drawing one image object twice gives one key; another object with the same
@@ -250,6 +252,7 @@ impl<'a> Device<'a> for Requested {
     }
     fn pop_clip(&mut self) {}
     fn pop_transparency_group(&mut self) {}
+    fn knock_out(&mut self, _: &BezPath, _: kurbo::Affine, _: &DrawMode) {}
 }
 
 /// One output texel over rows two million samples wide, with a soft mask as wide,

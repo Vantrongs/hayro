@@ -1,5 +1,6 @@
 //! A path filled and stroked by one operator is painted as viewers paint it: where
-//! the stroke covers the fill, only the stroke shows, however translucent both are.
+//! the stroke covers the fill, only the stroke shows, however translucent both are;
+//! the fill is cleared there before the stroke is drawn.
 
 use hayro_interpret::font::GlyphRun;
 use hayro_interpret::hayro_syntax::Pdf;
@@ -7,7 +8,7 @@ use hayro_interpret::{
     BlendMode, ClipPath, Device, DrawMode, DrawProps, Image, ImageDrawProps, InterpreterSettings,
     Paint, SoftMask,
 };
-use kurbo::BezPath;
+use kurbo::{Affine, BezPath};
 
 mod common;
 
@@ -24,6 +25,8 @@ enum Ev {
         blend: BlendMode,
     },
     EndGroup,
+    /// A clearing of the group by a stroke.
+    KnockOut,
 }
 
 #[derive(Default)]
@@ -60,6 +63,10 @@ impl<'a> Device<'a> for Rec {
     fn pop_transparency_group(&mut self) {
         self.0.push(Ev::EndGroup);
     }
+    fn knock_out(&mut self, _: &BezPath, _: Affine, mode: &DrawMode) {
+        assert!(matches!(mode, DrawMode::Stroke(_)), "{mode:?}");
+        self.0.push(Ev::KnockOut);
+    }
 }
 
 /// What `content` draws on a page whose `/G` graphics state is `gs`.
@@ -93,6 +100,7 @@ fn a_translucent_fill_and_stroke_are_one_group() {
             [
                 Ev::Group { opacity, blend },
                 opaque(false),
+                Ev::KnockOut,
                 opaque(true),
                 Ev::EndGroup
             ],

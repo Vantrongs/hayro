@@ -40,9 +40,9 @@ pub trait Device<'a> {
     /// Clear what the current transparency group drew where `path`, drawn with
     /// `draw_mode` in `transform`, covers: the next element of a knockout group
     /// (PDF 32000-1 11.4.6.2) replaces those before it there, even where its paint is
-    /// translucent. The default clears nothing, which composites that element over
-    /// the earlier ones.
-    fn knock_out(&mut self, _path: &BezPath, _transform: Affine, _draw_mode: &DrawMode) {}
+    /// translucent. It has no default: a device that clears nothing composites that
+    /// element over the earlier ones, which shows what it should hide.
+    fn knock_out(&mut self, path: &BezPath, transform: Affine, draw_mode: &DrawMode);
     /// Draw a rectangle directly, without going through the general path pipeline.
     fn draw_rect(&mut self, rect: &Rect, props: DrawProps<'a>, draw_mode: &DrawMode) {
         self.draw_path(&rect.to_path(0.1), props, draw_mode);
@@ -67,4 +67,5 @@ impl Device<'_> for DummyDevice {
     fn draw_image(&mut self, _: Image<'_, '_>, _: ImageDrawProps<'_>) {}
     fn pop_clip(&mut self) {}
     fn pop_transparency_group(&mut self) {}
+    fn knock_out(&mut self, _: &BezPath, _: Affine, _: &DrawMode) {}
 }

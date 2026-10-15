@@ -132,4 +132,5 @@ impl Device<'_> for ImageExtractor {
             }
         }
     }
+    fn knock_out(&mut self, _: &BezPath, _: Affine, _: &DrawMode) {}
 }

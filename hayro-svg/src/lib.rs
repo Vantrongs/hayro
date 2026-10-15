@@ -360,6 +360,10 @@ impl<'a> Device<'a> for SvgRenderer<'a> {
     fn pop_transparency_group(&mut self) {
         self.xml.end_element();
     }
+
+    // Not drawn: the fill is written by now, and SVG draws an element only over what
+    // is drawn before it, so the fill shows under a translucent stroke paint.
+    fn knock_out(&mut self, _: &BezPath, _: Affine, _: &DrawMode) {}
 }
 
 impl<'a> SvgRenderer<'a> {
