@@ -2,7 +2,8 @@
 //! row cut short is kept, every row filter and pixel size is unfiltered a byte at a
 //! time, its parameters are read as `MuPDF` reads them, and parameters it refuses fail
 //! decoding; by whole decoding, strict and lenient, and by the readers that decode a
-//! piece at a time.
+//! piece at a time. Data cut short in the other filters keep what they hold, where
+//! `MuPDF` reads less or adds a byte.
 
 use hayro_syntax::Pdf;
 use hayro_syntax::object::stream::ReadError;
@@ -439,6 +440,41 @@ fn predictor_parameters_mupdf_refuses_fail_decoding() {
         let (dict, readings) = decoded(&format!("/Predictor 1 {rest}"));
         for (how, read) in readings {
             assert_eq!(read.as_deref(), Some(&rows[..]), "{dict}: {how}");
+        }
+    }
+}
+
+/// Data cut short keep every byte they hold, by every way of decoding, where
+/// `PyMuPDF` 1.28.2 reads otherwise: an odd final hex digit is padded with 0 (as the
+/// PDF specification says; `MuPDF` drops it), ASCII85 without `~>` keeps its last
+/// group (`MuPDF` reads 24 of these 26 bytes), and LZW codes cut short within a code
+/// give the codes read whole (`MuPDF` appends a byte 0xFF for the leftover bits, which
+/// in a page content turns a last `f` into `f\xff` and loses the fill).
+#[test]
+fn data_cut_short_in_other_filters_keep_what_they_hold() {
+    let body = b"HELLO ABCDEFGHIJKLMNOPQRST";
+    let hex: String = body.iter().map(|b| format!("{b:02x}")).collect();
+    let lzw_cut = {
+        let full = lzw(body);
+        full[..full.len() - 2].to_vec()
+    };
+    for (filter, data, expected) in [
+        (
+            "/AHx",
+            hex.as_bytes()[..hex.len() - 1].to_vec(),
+            [&body[..25], b"P"].concat(),
+        ),
+        (
+            "/A85",
+            b"84?3G:EVqi6UX@47n?3D92&&T:Jand;cE".to_vec(),
+            body.to_vec(),
+        ),
+        ("/LZW", lzw_cut, body[..25].to_vec()),
+    ] {
+        let dict = format!("/Filter {filter}");
+        let pdf = stream_file(&dict, &data);
+        for (how, read) in every_reading(&object_3(&pdf)) {
+            assert_eq!(read.as_deref(), Some(&expected[..]), "{dict}: {how}");
         }
     }
 }
