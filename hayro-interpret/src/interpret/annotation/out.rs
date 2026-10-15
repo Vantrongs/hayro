@@ -2,9 +2,13 @@
 //! [`Out`], whose text they cannot reach: operators are fixed text, and every number,
 //! a coordinate or a colour component, is converted by [`written`], so that one that
 //! cannot be written fails the whole appearance instead of reaching the content.
+//! A glyph is written once, as a form the content draws wherever the glyph is
+//! ([`Out::form`]).
 
-use super::Unsupported;
+use super::{Glyph, Unsupported};
+use rustc_hash::FxHashSet;
 use std::fmt::Write;
+use std::rc::Rc;
 
 /// `v` as it is written in content: a 32-bit number, the precision content streams
 /// are read in. `None` for no number, or from 2^23 on, where 32-bit numbers are a
@@ -79,19 +83,6 @@ impl Color {
         }
     }
 
-    /// The colour as numbers that tell colours apart: its kind, then its components'
-    /// bits.
-    pub(super) fn bits(&self) -> Vec<u64> {
-        let (kind, c): (u64, &[f64]) = match self {
-            Self::Gray(g) => (1, std::slice::from_ref(g)),
-            Self::Rgb(c) => (3, c),
-            Self::Cmyk(c) => (4, c),
-        };
-        std::iter::once(kind)
-            .chain(c.iter().map(|v| v.to_bits()))
-            .collect()
-    }
-
     /// The components, clamped to 0–1.
     fn components(&self) -> Vec<f64> {
         let clamped = |c: &[f64]| c.iter().map(|c| c.clamp(0.0, 1.0)).collect();
@@ -109,15 +100,29 @@ impl Color {
 pub(super) struct Out {
     content: String,
     failed: bool,
+    /// The glyphs drawn, each once, and their names.
+    glyphs: Vec<Rc<Glyph>>,
+    named: FxHashSet<Rc<str>>,
 }
 
 impl Out {
-    /// The content written; [`Unsupported::Coordinates`] when a number could not be.
-    pub(super) fn finish(self) -> Result<String, Unsupported> {
+    /// The content written and the glyphs it draws; [`Unsupported::Coordinates`]
+    /// when a number could not be written.
+    pub(super) fn finish(self) -> Result<(String, Vec<Rc<Glyph>>), Unsupported> {
         if self.failed {
             Err(Unsupported::Coordinates)
         } else {
-            Ok(self.content)
+            Ok((self.content, self.glyphs))
+        }
+    }
+
+    /// Draws the form of `glyph` where the current transform puts it ([`super::text::Pen`]).
+    pub(super) fn form(&mut self, glyph: &Rc<Glyph>) {
+        self.content.push('/');
+        self.content.push_str(&glyph.name);
+        self.op(" Do");
+        if self.named.insert(glyph.name.clone()) {
+            self.glyphs.push(glyph.clone());
         }
     }
 
@@ -171,39 +176,9 @@ impl Out {
         Some(())
     }
 
-    /// `path` as [`Out::path`] writes it, unless it lies wholly outside `clip`, where
-    /// nothing of it would show; whether it was written. Its numbers pass [`written`]
-    /// either way, so that clipping a path away never hides one that cannot be
-    /// written.
-    pub(super) fn path_within(&mut self, path: &kurbo::BezPath, clip: kurbo::Rect) -> Option<bool> {
-        use kurbo::PathEl;
-        for el in path.elements() {
-            let pts: &[kurbo::Point] = match el {
-                PathEl::MoveTo(p) | PathEl::LineTo(p) => &[*p],
-                PathEl::QuadTo(c, p) => &[*c, *p],
-                PathEl::CurveTo(a, b, p) => &[*a, *b, *p],
-                PathEl::ClosePath => &[],
-            };
-            if pts
-                .iter()
-                .any(|p| written(p.x).is_none() || written(p.y).is_none())
-            {
-                self.failed = true;
-                return None;
-            }
-        }
-        let (b, c) = (path.control_box(), clip.abs());
-        if b.x1 >= c.x0 && b.x0 <= c.x1 && b.y1 >= c.y0 && b.y0 <= c.y1 {
-            self.path(path)?;
-            Some(true)
-        } else {
-            Some(false)
-        }
-    }
-
-    /// Whether `ink`, a box around points, after `at` can reach `clip`, as
-    /// [`Out::path_within`] tests the points; `None`, failing the content, when a
-    /// corner cannot be written, which a point inside it then may not either.
+    /// Whether `ink`, a box around points, after `at` can reach `clip`; `None`,
+    /// failing the content, when a corner cannot be written, which a point inside it
+    /// then may not either.
     pub(super) fn box_reaches(
         &mut self,
         at: kurbo::Affine,

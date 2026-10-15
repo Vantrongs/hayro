@@ -7,7 +7,7 @@
 //! allocated in all ([`allocated`]).
 
 use hayro_interpret::InterpreterSettings;
-use hayro_interpret::annotation::{Appearances, Look, Unsupported};
+use hayro_interpret::annotation::{Appearances, Look, Unsupported, work_done};
 use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::hayro_syntax::object::{Array, Dict};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -589,5 +589,331 @@ fn a_stream_read_for_no_text_is_not_decoded() {
         );
         let bytes = allocated() - before;
         assert!(bytes < 1 << 20, "{bytes} bytes: {annot:?}");
+    }
+}
+
+/// What looking at annotations costs: the bytes allocated, and the units of work
+/// done ([`hayro_interpret::annotation::work_done`]).
+#[derive(Debug, Clone, Copy)]
+struct Cost {
+    bytes: usize,
+    work: u64,
+}
+
+/// The cost of looking at each of `n` annotations `annot(i)` on a 200 pt page of a
+/// file whose catalog has `catalog` besides its pages, and whose objects from 4 are
+/// `shared`, the annotations after them. None may be unsupported.
+fn cost_of(n: usize, catalog: &str, shared: &[String], annot: &dyn Fn(usize) -> String) -> Cost {
+    let first = 4 + shared.len();
+    let refs: Vec<String> = (0..n).map(|i| format!("{} 0 R", first + i)).collect();
+    let mut objects = vec![
+        format!("<< /Type /Catalog /Pages 2 0 R {catalog} >>").into_bytes(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [{}] >>",
+            refs.join(" ")
+        )
+        .into_bytes(),
+    ];
+    objects.extend(shared.iter().map(|s| s.clone().into_bytes()));
+    objects.extend((0..n).map(|i| format!("<< /Type /Annot {} >>", annot(i)).into_bytes()));
+    let pdf = Pdf::new(common::file(&objects, "")).expect("valid pdf");
+    let annots: Vec<Dict<'_>> = pdf.pages()[0]
+        .raw()
+        .get::<Array<'_>>(b"Annots")
+        .unwrap()
+        .iter::<Dict<'_>>()
+        .collect();
+    let (bytes, work) = (allocated(), work_done());
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    for a in &annots {
+        match appearances.look(a, PAGE) {
+            Look::Generated(g) => assert!(g.content.len() < 64 << 10, "{}", annot(0)),
+            Look::Unsupported(why) => panic!("{why:?}: {}", annot(0)),
+            _ => {}
+        }
+    }
+    Cost {
+        bytes: allocated() - bytes,
+        work: work_done() - work,
+    }
+}
+
+/// Asserts that twice as many annotations `annot(i)` sharing `shared` cost no more
+/// than drawing what the added ones show: about 64 KiB and some thousands of units
+/// of work each, however long what they share. Annotations that each set, lay out or
+/// read the whole of a shared entry of 20,000 characters or numbers take ten times
+/// that.
+fn shared_once(catalog: &str, shared: &[String], annot: impl Fn(usize) -> String) {
+    const N: usize = 40;
+    let (one, two) = (
+        cost_of(N, catalog, shared, &annot),
+        cost_of(2 * N, catalog, shared, &annot),
+    );
+    let (bytes, work) = (two.bytes - one.bytes, two.work - one.work);
+    assert!(
+        bytes < N * (64 << 10) && work < (N * 4_000) as u64,
+        "{}: {one:?} for {N}, {two:?} for {}",
+        annot(0),
+        2 * N
+    );
+}
+
+/// A long text of words, 20,000 characters as written, with escapes, so that
+/// reading it allocates.
+fn long_text() -> String {
+    "ABCD efg\\) ".repeat(1_818)
+}
+
+/// Annotations that share a text set it once for the document, and lay out and
+/// draw only what each shows, whatever width, box, size, colour or alignment each
+/// draws it in: `FreeText` contents and rich text, a field's value and rich value,
+/// a push button's caption and a line's caption.
+#[test]
+fn a_shared_text_is_set_once_whatever_each_annotation_draws_it_in() {
+    let text = vec![format!("({})", long_text())];
+    let rich = vec![format!("(<p>{}</p>)", long_text())];
+    let thousandths = |i: usize| format!("{}.{:03}", 100 + i / 1000, i % 1000);
+    let free_text = "/Subtype /FreeText /BS << /W 0 >>";
+    shared_once("", &text, |i| {
+        format!(
+            "{free_text} /Contents 4 0 R /Rect [10 10 {} 40] /DA (/Helv 12 Tf 0 g)",
+            thousandths(i)
+        )
+    });
+    shared_once("", &text, |i| {
+        format!(
+            "{free_text} /Contents 4 0 R /Rect [10 10 110 40] /DA (/Helv {} Tf 0 g)",
+            thousandths(i)
+        )
+    });
+    shared_once("", &text, |i| {
+        format!(
+            "{free_text} /Contents 4 0 R /Rect [10 10 110 40] /Q {} /DA (/Helv 12 Tf 0.{i:03} g)",
+            i % 3
+        )
+    });
+    shared_once("", &rich, |i| {
+        format!(
+            "{free_text} /RC 4 0 R /Rect [10 10 {} 40] /DA (/Helv 12 Tf 0 g)",
+            thousandths(i)
+        )
+    });
+    shared_once("", &rich, |i| {
+        format!(
+            "{free_text} /RC 4 0 R /Rect [10 10 110 40] /DA (/Helv {} Tf 0 g)",
+            thousandths(i)
+        )
+    });
+    let field = "/Subtype /Widget /FT /Tx";
+    for flags in ["", "/Ff 4096", "/Ff 16777216 /MaxLen 20", "/Ff 16777216"] {
+        shared_once("", &text, |i| {
+            format!(
+                "{field} {flags} /V 4 0 R /Rect [10 10 {} 40] /DA (/Helv {} Tf 0 g)",
+                thousandths(i),
+                thousandths(i).replace("100.", "10.")
+            )
+        });
+    }
+    shared_once("", &rich, |i| {
+        format!(
+            "{field} /Ff 33554432 /V (x) /RV 4 0 R /Rect [10 10 {} 40] /DA (/Helv {} Tf 0 g)",
+            thousandths(i),
+            thousandths(i).replace("100.", "10.")
+        )
+    });
+    shared_once("", &text, |i| {
+        format!(
+            "/Subtype /Widget /FT /Btn /Ff 65536 /MK << /CA 4 0 R >> /Rect [10 10 {} 40]",
+            thousandths(i)
+        )
+    });
+    shared_once("", &text, |i| {
+        format!(
+            "/Subtype /Line /C [0] /Cap true /Contents 4 0 R /L [20 100 {} 100] /Rect [0 0 200 200]",
+            thousandths(i)
+        )
+    });
+}
+
+/// A list's options are read once for the document, and of them only those its box
+/// shows are set, each label once however many options or lists refer to it: the
+/// work grows with the options, not with their labels' length times their number.
+#[test]
+fn a_list_sets_only_the_options_it_shows() {
+    let label = format!("({})", long_text());
+    for opt in [
+        |n: usize| vec!["4 0 R"; n].join(" "),
+        |n: usize| vec!["[(e) 4 0 R]"; n].join(" "),
+    ] {
+        for rich in ["", "/DS (font-size:12pt)"] {
+            let cost = |n: usize| {
+                cost_of(1, "", std::slice::from_ref(&label), &|_| {
+                    format!(
+                        "/Subtype /Widget /FT /Ch /Opt [{}] {rich} /Rect [10 10 110 60] \
+                         /DA (/Helv 12 Tf 0 g)",
+                        opt(n)
+                    )
+                })
+            };
+            let (one, two) = (cost(1000), cost(2000));
+            // Some 100 bytes an option, kept for the document, and work for the
+            // dozen bytes it is written in; setting each option would take some
+            // 20,000 characters' worth.
+            assert!(
+                two.bytes - one.bytes < 1000 * 512 && two.work - one.work < 1000 * 64,
+                "{rich}: {one:?} {two:?}"
+            );
+        }
+    }
+    // Lists sharing the options, scrolled by /TI to each option in turn.
+    let options = vec![format!("[{}]", vec!["5 0 R"; 200].join(" ")), label];
+    for rich in ["", "/DS (font-size:12pt)"] {
+        shared_once("", &options, |i| {
+            format!(
+                "/Subtype /Widget /FT /Ch /Opt 4 0 R /TI {i} {rich} /Rect [10 10 110 60] \
+                 /DA (/Helv 12 Tf 0 g)"
+            )
+        });
+    }
+}
+
+/// Annotations that share an object read it once for the document: a default
+/// appearance of their own, a field's, or the form's; a border style, appearance
+/// characteristics or appearance dictionary of 20,000 entries; a `/Rect`, colour,
+/// `/RD` or `/CL` that refers to an array of 20,000 numbers.
+#[test]
+fn a_shared_entry_is_read_once_or_as_far_as_needed() {
+    let da = format!("({}/Helv 12 Tf 0 g)", "0 g ".repeat(5_000));
+    shared_once("", std::slice::from_ref(&da), |i| {
+        format!("/Subtype /FreeText /Rect [10 10 110 40] /Contents (A{i}) /DA 4 0 R")
+    });
+    shared_once("", &[format!("<< /FT /Tx /DA {da} >>")], |i| {
+        format!("/Subtype /Widget /Parent 4 0 R /V (A{i}) /Rect [10 10 110 40]")
+    });
+    shared_once(&format!("/AcroForm << /DA {da} >>"), &[], |i| {
+        format!("/Subtype /Widget /FT /Tx /V (A{i}) /Rect [10 10 110 40]")
+    });
+    // Dictionaries of 20,000 entries: a border style, appearance characteristics,
+    // appearance states.
+    let many = |entries: &str| {
+        let mut d = format!("<< {entries}");
+        for i in 0..20_000 {
+            d.push_str(&format!(" /K{i} 0"));
+        }
+        d + " >>"
+    };
+    shared_once("", &[many("/W 2")], |_| {
+        "/Subtype /Square /C [0] /Rect [10 10 110 40] /BS 4 0 R".to_owned()
+    });
+    shared_once("", &[many("/BG [1 0 0]")], |_| {
+        "/Subtype /Widget /FT /Btn /Ff 65536 /Rect [10 10 110 40] /MK 4 0 R".to_owned()
+    });
+    shared_once("", &[format!("<< /N {} >>", many(""))], |_| {
+        "/Subtype /Square /C [0] /Rect [10 10 110 40] /AP 4 0 R /AS /Off".to_owned()
+    });
+    let numbers = format!("[10 10 110 40 {}]", "0 ".repeat(20_000));
+    shared_once("", std::slice::from_ref(&numbers), |_| {
+        "/Subtype /Square /C [0] /Rect 4 0 R".to_owned()
+    });
+    shared_once("", std::slice::from_ref(&numbers), |_| {
+        "/Subtype /Square /C 4 0 R /IC 4 0 R /Rect [10 10 110 40]".to_owned()
+    });
+    shared_once("", std::slice::from_ref(&numbers), |i| {
+        format!("/Subtype /FreeText /Rect [10 10 110 40] /RD 4 0 R /Contents (A{i})")
+    });
+    shared_once("", &[numbers], |i| {
+        format!(
+            "/Subtype /FreeText /IT /FreeTextCallout /CL 4 0 R /Rect [10 10 110 40] /Contents (A{i})"
+        )
+    });
+}
+
+/// Text in a negative size (upside down, its lines going up) is laid out as far as
+/// its box shows, as text in a positive one is; rich text with sizes both ways,
+/// which no producer writes and whose lines no search bounds, is unsupported.
+#[test]
+fn text_in_a_negative_size_is_laid_out_as_far_as_it_shows() {
+    let text = vec![format!("({})", long_text().replace(' ', "\\n"))];
+    shared_once("", &text, |_| {
+        "/Subtype /FreeText /Contents 4 0 R /Rect [10 10 110 40] /DA (/Helv -12 Tf 0 g)".to_owned()
+    });
+    shared_once("", &text, |_| {
+        "/Subtype /Widget /FT /Tx /Ff 4096 /V 4 0 R /Rect [10 10 110 40] /DA (/Helv 12 Tf 0 g)"
+            .to_owned()
+    });
+    shared_once("", &text, |_| {
+        "/Subtype /Widget /FT /Tx /Ff 4096 /V 4 0 R /Rect [10 10 110 40] /DA (/Helv -12 Tf 0 g)"
+            .to_owned()
+    });
+    let mixed = format!(
+        "/Subtype /FreeText /Rect [10 10 110 40] /DA (/Helv -12 Tf) \
+         /RC (<p>{}<span style=\"font-size:12pt\">A</span></p>)",
+        long_text()
+    );
+    let pdf = Pdf::new(common::one_page(
+        200,
+        "/Annots [4 0 R]",
+        vec![format!("<< /Type /Annot {mixed} >>").into_bytes()],
+    ))
+    .expect("valid pdf");
+    let annot = pdf.pages()[0]
+        .raw()
+        .get::<Array<'_>>(b"Annots")
+        .unwrap()
+        .iter::<Dict<'_>>()
+        .next()
+        .unwrap();
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    assert!(matches!(
+        appearances.look(&annot, PAGE),
+        Look::Unsupported(Unsupported::RichText)
+    ));
+}
+
+/// A glyph is written once for an appearance, as a form, and each place it is drawn
+/// costs a few bytes: a comb of 10,000 cells, all shown, and a `FreeText` full of
+/// text, each some 30 bytes a glyph drawn, as `bake` writes some 11 (before either
+/// is compressed).
+#[test]
+fn a_drawn_glyph_costs_a_few_bytes() {
+    let value: String = "ABCDEFGHIJ0123456789"
+        .chars()
+        .cycle()
+        .take(10_000)
+        .collect();
+    for annot in [
+        format!(
+            "/Subtype /Widget /FT /Tx /Ff 16777216 /MaxLen 10000 /V ({value}) \
+             /DA (/Helv 0 Tf 0 g) /Rect [0 0 200 30]"
+        ),
+        format!(
+            "/Subtype /FreeText /Rect [0 0 200 200] /DA (/Helv 4 Tf 0 g) /Contents ({})",
+            long_text()
+        ),
+    ] {
+        let pdf = Pdf::new(common::one_page(
+            200,
+            "/Annots [4 0 R]",
+            vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
+        ))
+        .expect("valid pdf");
+        let a = pdf.pages()[0]
+            .raw()
+            .get::<Array<'_>>(b"Annots")
+            .unwrap()
+            .iter::<Dict<'_>>()
+            .next()
+            .unwrap();
+        let appearances =
+            Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+        let Look::Generated(g) = appearances.look(&a, PAGE) else {
+            panic!("{annot}: not generated")
+        };
+        let drawn = g.content.matches(" Do\n").count();
+        assert!(drawn > 1_000, "{drawn}");
+        assert!(g.glyphs.len() <= 20, "{}", g.glyphs.len());
+        let per_glyph = g.content.len() / drawn;
+        assert!(per_glyph <= 32, "{per_glyph} bytes a glyph");
     }
 }

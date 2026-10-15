@@ -98,7 +98,7 @@ impl Quad {
 /// The quadrilaterals of `/QuadPoints`, every number in its place; a last one cut
 /// short has 0 for the coordinates it lacks. `None` when there is no such array.
 pub(super) fn quads(annot: &Entries<'_>) -> Option<Vec<Quad>> {
-    let mut n = annot.numbers(QUADPOINTS, 0)?;
+    let mut n = annot.items(QUADPOINTS)?.numbers();
     n.resize(n.len().next_multiple_of(8), 0.0);
     Some(
         n.as_chunks::<8>()
@@ -388,7 +388,7 @@ mod tests {
         squiggly(&Entries::new(dict), visible, &mut out)
             .expect("drawable")
             .expect("an appearance");
-        out.finish().expect("written")
+        out.finish().expect("written").0
     }
 
     /// The corners of the zigzags drawn in `c`.

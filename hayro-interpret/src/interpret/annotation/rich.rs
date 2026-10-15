@@ -11,7 +11,7 @@
 
 use super::Unsupported;
 use super::out::Color;
-use super::text::{Align, Family, Span, Style};
+use super::text::{Align, Family, Size, Span, Style};
 use html5ever::interface::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use html5ever::tendril::{StrTendril, TendrilSink};
 use html5ever::{Attribute, ExpandedName, ParseOpts, QualName, ns, parse_document};
@@ -29,14 +29,18 @@ const MAX_DEPTH: usize = 256;
 /// style over the style of the element it is in, the outermost over `base`.
 /// Paragraphs (`p`, `div`) start and end a line, as does `br`; other whitespace is
 /// kept. A line is aligned by the `text-align` of the paragraph it is in.
-pub(super) fn rich_text(xhtml: &str, base: &Style) -> Result<Vec<Span>, Unsupported> {
-    walk(&parse(xhtml)?, base)
+pub(super) fn rich_text(
+    xhtml: &str,
+    base: &Style,
+    positive: bool,
+) -> Result<Vec<Span>, Unsupported> {
+    walk(&parse(xhtml)?, base, positive)
 }
 
 /// `style` with the declarations of the CSS declaration list `css` (a `/DS`).
-pub(super) fn css_style(css: &str, mut style: Style) -> Result<Style, Unsupported> {
+pub(super) fn css_style(css: &str, mut style: Style, positive: bool) -> Result<Style, Unsupported> {
     let size = style.size;
-    if declarations(css, &mut style, size)? {
+    if declarations(css, &mut style, size, positive)? {
         Ok(style)
     } else {
         Err(Unsupported::RichText)
@@ -89,7 +93,7 @@ fn parsed(xhtml: &str) -> Result<Dom, Unsupported> {
 }
 
 /// The spans of the document under `document`.
-fn walk(document: &Rc<Node>, base: &Style) -> Result<Vec<Span>, Unsupported> {
+fn walk(document: &Rc<Node>, base: &Style, positive: bool) -> Result<Vec<Span>, Unsupported> {
     enum Step {
         Enter(Rc<Node>),
         /// The end of an element; a paragraph ends its line.
@@ -141,7 +145,7 @@ fn walk(document: &Rc<Node>, base: &Style) -> Result<Vec<Span>, Unsupported> {
         for attr in attrs.borrow().iter() {
             let value: &str = &attr.value;
             match &*attr.name.local {
-                "style" => shown &= declarations(value, &mut style, parent.size)?,
+                "style" => shown &= declarations(value, &mut style, parent.size, positive)?,
                 // Presentational attributes viewers draw by.
                 "align" | "hidden" | "bgcolor" | "background" | "text" => {
                     return Err(Unsupported::RichText);
@@ -201,9 +205,14 @@ fn end_line(spans: &mut Vec<Span>, style: &Style) {
 }
 
 /// Applies the CSS declarations of a `style` attribute to `style`, the element's
-/// style so far; `parent` is the size relative sizes are of. Whether the element is
-/// shown.
-fn declarations(css: &str, style: &mut Style, parent: f32) -> Result<bool, Unsupported> {
+/// style so far; `parent` is the size relative sizes are of, and `positive` whether
+/// the base size is. Whether the element is shown.
+fn declarations(
+    css: &str,
+    style: &mut Style,
+    parent: Size,
+    positive: bool,
+) -> Result<bool, Unsupported> {
     let unsupported = Err(Unsupported::RichText);
     if css.contains("/*") || css.contains(['"', '\'']) && !quotes_balanced(css) {
         return unsupported;
@@ -223,11 +232,11 @@ fn declarations(css: &str, style: &mut Style, parent: f32) -> Result<bool, Unsup
             .strip_suffix("!important")
             .map_or(value, str::trim_end);
         match property {
-            "font-size" => style.size = font_size(value, parent)?,
+            "font-size" => style.size = font_size(value, parent, positive)?,
             "font-family" => style.face.family = family(value)?,
             "font-weight" => style.face.bold = bold(value)?,
             "font-style" => style.face.italic = italic(value)?,
-            "font" => font(value, style, parent)?,
+            "font" => font(value, style, parent, positive)?,
             "color" => style.color = color(value)?,
             "text-align" => {
                 style.align = match value {
@@ -324,17 +333,22 @@ fn zero(value: &str) -> bool {
 }
 
 /// A `font-size`: points (`px` counted as points, as common viewers do), or `em`
-/// and `%` of `parent`. A size too large to write is kept: text drawn in it fails
+/// and `%` of `parent`, which must be positive (a relative size of the base size
+/// is when `positive`). A size too large to write is kept: text drawn in it fails
 /// the appearance as every number too large to write does.
-fn font_size(value: &str, parent: f32) -> Result<f32, Unsupported> {
+fn font_size(value: &str, parent: Size, positive: bool) -> Result<Size, Unsupported> {
     let (n, unit) = number(value).ok_or(Unsupported::RichText)?;
     let size = match unit.to_ascii_lowercase().as_str() {
-        "pt" | "px" => n,
-        "em" => n * parent,
-        "%" => n * parent / 100.0,
+        "pt" | "px" => Size::Points(n),
+        "em" => parent.times(n),
+        "%" => parent.percent(n),
         _ => return Err(Unsupported::RichText),
     };
-    if size > 0.0 {
+    let ok = match size {
+        Size::Points(p) => p > 0.0,
+        Size::Base(k) => positive && k > 0.0,
+    };
+    if ok {
         Ok(size)
     } else {
         Err(Unsupported::RichText)
@@ -406,7 +420,7 @@ fn italic(value: &str) -> Result<bool, Unsupported> {
 /// and weight keywords, a size (with `/normal` line height), and the family names
 /// in the remaining words. Style and weight not given are normal, a family not
 /// given the default; a size not given stays.
-fn font(value: &str, style: &mut Style, parent: f32) -> Result<(), Unsupported> {
+fn font(value: &str, style: &mut Style, parent: Size, positive: bool) -> Result<(), Unsupported> {
     let (mut bold, mut italic) = (false, false);
     let mut words = Vec::new();
     for word in value.split_whitespace() {
@@ -423,7 +437,7 @@ fn font(value: &str, style: &mut Style, parent: f32) -> Result<(), Unsupported> 
                         if line_height != "normal" {
                             return Err(Unsupported::RichText);
                         }
-                        style.size = font_size(size, parent)?;
+                        style.size = font_size(size, parent, positive)?;
                     }
                 }
             }
@@ -748,7 +762,7 @@ impl TreeSink for Dom {
 mod tests {
     use super::super::Unsupported;
     use super::super::out::Color;
-    use super::super::text::{Align, Family, Style, Typeface};
+    use super::super::text::{Align, Family, Size, Style, Typeface};
     use super::{Kind, Node, css_style, parsed, rich_text};
     use std::rc::Rc;
 
@@ -796,7 +810,7 @@ mod tests {
     fn base() -> Style {
         Style {
             face: Family::Text.into(),
-            size: 12.0,
+            size: Size::Base(1.0),
             color: Color::BLACK,
             align: Align::Left,
         }
@@ -805,13 +819,13 @@ mod tests {
     const RED: Color = Color::Rgb([1.0, 0.0, 0.0]);
 
     fn text(xhtml: &str) -> String {
-        let spans = rich_text(xhtml, &base()).expect("supported");
+        let spans = rich_text(xhtml, &base(), true).expect("supported");
         spans.iter().map(|s| s.text.as_str()).collect()
     }
 
     /// Each span's text with its face, size, colour and alignment.
     fn styled(xhtml: &str) -> Vec<(String, Typeface, f32, Color, Align)> {
-        rich_text(xhtml, &base())
+        rich_text(xhtml, &base(), true)
             .expect("supported")
             .into_iter()
             .map(|s| {
@@ -821,7 +835,7 @@ mod tests {
                     color,
                     align,
                 } = s.style;
-                (s.text, face, size, color, align)
+                (s.text, face, size.at(12.0), color, align)
             })
             .collect()
     }
@@ -1039,15 +1053,17 @@ mod tests {
         let style = css_style(
             "font: Helvetica,sans-serif 12.0pt; text-align:left; color:#FF0000",
             base(),
+            true,
         )
         .unwrap();
         assert_eq!(
-            (style.face, style.size, style.color, style.align),
+            (style.face, style.size.at(12.0), style.color, style.align),
             (SANS, 12.0, RED, Align::Left)
         );
-        let style = css_style("font: bold Helvetica 18pt; text-align:center", base()).unwrap();
+        let style =
+            css_style("font: bold Helvetica 18pt; text-align:center", base(), true).unwrap();
         assert_eq!(
-            (style.face, style.size, style.align),
+            (style.face, style.size.at(12.0), style.align),
             (SANS_BOLD, 18.0, Align::Center)
         );
     }
@@ -1117,7 +1133,7 @@ mod tests {
             "<svg><text>x</text></svg>",
         ] {
             assert_eq!(
-                rich_text(xhtml, &base()).err(),
+                rich_text(xhtml, &base(), true).err(),
                 Some(Unsupported::RichText),
                 "{xhtml}"
             );
@@ -1134,7 +1150,10 @@ mod tests {
     #[test]
     fn deep_nesting_is_unsupported() {
         let deep = format!("{}x", "<span>".repeat(300));
-        assert_eq!(rich_text(&deep, &base()).err(), Some(Unsupported::RichText));
+        assert_eq!(
+            rich_text(&deep, &base(), true).err(),
+            Some(Unsupported::RichText)
+        );
         let shallow = format!("{}x", "<span>".repeat(200));
         assert_eq!(text(&shallow), "x");
     }

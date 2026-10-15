@@ -2,6 +2,7 @@ use crate::cache::{Cache, CacheKey};
 use crate::color::{Color, ColorSpace};
 use crate::convert::convert_transform;
 use crate::font::{Font, PositionedGlyph, StandardFont};
+use crate::interpret::annotation::Glyph;
 use crate::interpret::state::{ClipType, State, TextStateFont};
 use crate::ocg::OcgState;
 use crate::util::{BezPathExt, Float64Ext};
@@ -64,6 +65,9 @@ pub struct Context<'a> {
     pub(crate) ocg_state: OcgState,
     nesting_depth: u32,
     pub(crate) glyph_scratch: Vec<PositionedGlyph<'a>>,
+    /// While a generated annotation appearance is drawn, the glyphs it draws as forms
+    /// by name.
+    pub(crate) generated_glyphs: FxHashMap<Rc<str>, Rc<Glyph>>,
 }
 
 impl<'a> Context<'a> {
@@ -110,6 +114,7 @@ impl<'a> Context<'a> {
             ocg_state,
             nesting_depth,
             glyph_scratch: Vec::new(),
+            generated_glyphs: FxHashMap::default(),
         }
     }
 

@@ -301,6 +301,26 @@ fn fills(ev: &[Ev]) -> Vec<([i32; 4], [u8; 4])> {
         .collect()
 }
 
+/// The fills of `ev` with each glyph's merged into its run: consecutive fills of
+/// one colour on one line, as a box around them all.
+fn runs(ev: &[Ev]) -> Vec<([i32; 4], [u8; 4])> {
+    let mut runs: Vec<([i32; 4], [u8; 4])> = Vec::new();
+    for (b, c) in fills(ev) {
+        match runs.last_mut() {
+            Some((r, rc)) if *rc == c && b[1] <= r[3] && r[1] <= b[3] => {
+                *r = [
+                    r[0].min(b[0]),
+                    r[1].min(b[1]),
+                    r[2].max(b[2]),
+                    r[3].max(b[3]),
+                ];
+            }
+            _ => runs.push((b, c)),
+        }
+    }
+    runs
+}
+
 /// Whether box `b` lies inside `outer`.
 fn inside(b: [i32; 4], outer: [i32; 4]) -> bool {
     b[0] >= outer[0] && b[1] >= outer[1] && b[2] <= outer[2] && b[3] <= outer[3]
@@ -408,7 +428,7 @@ fn a_standard_stamp_is_its_name_in_a_tilted_box() {
         "{bbox:?}"
     );
     // Two lines of text, in /C.
-    let text = fills(&ev);
+    let text = runs(&ev);
     assert_eq!(text.len(), 2, "{ev:?}");
     assert!(
         text.iter().all(|&(b, c)| c == RED && inside(b, bbox)),
@@ -449,7 +469,7 @@ fn free_text_fills_its_box_and_writes_in_the_default_appearance() {
         ]
     );
     // "Hi" from 2 pt inside the border, its baseline 0.8 em below that.
-    let text = fills(&ev[2..]);
+    let text = runs(&ev[2..]);
     assert_eq!(text.len(), 1, "{ev:?}");
     assert!(
         inside(text[0].0, [12, 48, 30, 58]) && text[0].0[1] == 48,
@@ -544,7 +564,7 @@ fn widgets_show_their_value_or_state() {
             },
         ]
     );
-    let text = fills(&field[2..]);
+    let text = runs(&field[2..]);
     assert!(
         text.len() == 1 && text[0].1 == BLUE && inside(text[0].0, [12, 12, 60, 28]),
         "{field:?}"
@@ -569,7 +589,7 @@ fn widgets_show_their_value_or_state() {
         "{radio:?}"
     );
     // An unsigned signature field: an orange tag at the top left with white text.
-    let sig = fills(&draw(
+    let sig = runs(&draw(
         &["/Subtype /Widget /FT /Sig /Rect [10 10 110 70]"],
         VIEW,
     ));
@@ -1017,7 +1037,7 @@ fn a_damaged_rect_reads_what_it_lacks_as_zero() {
         Some([1, 101, 19, 119]),
         "{note:?}"
     );
-    let text = fills(&draw(
+    let text = runs(&draw(
         &["/Subtype /FreeText /Rect [40 80 160] /Contents (CHECK)"],
         VIEW,
     ));
@@ -1041,7 +1061,7 @@ fn a_caption_keeps_all_its_lines() {
            /Contents (FIRST\\nSECOND) /Rect [10 50 290 150]"],
         VIEW,
     );
-    let text = fills(&ev);
+    let text = runs(&ev);
     // "FIRST SECOND" in 12 pt Helvetica is 89.3 pt wide, centred on the line.
     assert_eq!(text.len(), 1, "{ev:?}");
     let [x0, _, x1, _] = text[0].0;
@@ -1069,9 +1089,62 @@ fn generated(annot: &str) -> String {
     );
     let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
     match appearances.look(&annots(&pdf)[0], PAGE) {
-        Look::Generated(a) => a.content,
+        Look::Generated(a) => expanded(&a),
         _ => panic!("{annot}: not generated"),
     }
+}
+
+/// The content of `a` with each glyph it draws written in place: the points of its
+/// outline mapped by the transforms of the run of glyphs it is in (a `q`, the
+/// run's `cm`s and the glyphs' `Do`s, then `Q`), which are left out, so that they
+/// lie in the space the run is drawn in.
+fn expanded(a: &hayro_interpret::annotation::Appearance) -> String {
+    let lines: Vec<&str> = a.content.lines().collect();
+    let mut out = String::new();
+    let mut run: Option<Affine> = None;
+    for (i, &line) in lines.iter().enumerate() {
+        if line == "q" {
+            let starts_run = lines[i + 1..]
+                .iter()
+                .find(|l| !l.ends_with(" cm"))
+                .is_some_and(|l| l.ends_with(" Do"))
+                && lines.get(i + 1).is_some_and(|l| l.ends_with(" cm"));
+            if starts_run {
+                run = Some(Affine::IDENTITY);
+                continue;
+            }
+        }
+        let Some(ctm) = run.as_mut() else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        if line == "Q" {
+            run = None;
+            continue;
+        }
+        if let Some(m) = line.strip_suffix(" cm") {
+            let m: Vec<f64> = m.split(' ').map(|n| n.parse().unwrap()).collect();
+            *ctm *= Affine::new([m[0], m[1], m[2], m[3], m[4], m[5]]);
+            continue;
+        }
+        let name = line
+            .strip_prefix('/')
+            .and_then(|l| l.strip_suffix(" Do"))
+            .unwrap();
+        let glyph = a.glyphs.iter().find(|g| g.name() == name).unwrap();
+        for l in glyph.content().lines() {
+            let mut words: Vec<&str> = l.split(' ').collect();
+            let op = words.pop().unwrap();
+            for p in words.chunks(2) {
+                let q = *ctm * kurbo::Point::new(p[0].parse().unwrap(), p[1].parse().unwrap());
+                out.push_str(&format!("{} {} ", q.x, q.y));
+            }
+            out.push_str(op);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// A check box or radio button turned by `/MK /R` takes the square at the bottom
@@ -1118,7 +1191,7 @@ fn rich_text_keeps_the_style_of_each_span() {
         )],
         VIEW,
     );
-    let text = fills(&ev);
+    let text = runs(&ev);
     assert_eq!(text.len(), 2, "{ev:?}");
     assert!(text[0].1 == BLACK && text[1].1 == RED, "{ev:?}");
     // One line, 0.9 of the largest size below the top.
@@ -1649,14 +1722,8 @@ fn every_number_too_large_to_write_is_unsupported() {
         format!("/Subtype /Line /C [0] /Rect [0 0 200 200] /L [20 20 100 100] /LL {H}"),
         format!("/Subtype /Polygon /C [0] /Rect [0 0 200 200] /Vertices [10 10 50 10 50 {H}]"),
         format!("/Subtype /Widget /FT /Btn /Ff 32768 /MK << /BG [0] >> /Rect [0 0 {H} {H}]"),
-        format!("/Subtype /FreeText /Rect [0 0 200 200] /Contents (A) /DA (/Helv {H} Tf)"),
-        // Text clipped away is checked as text drawn is.
-        format!("/Subtype /Widget /FT /Tx /V (A) /DA (/Helv {H} Tf) /Rect [10 10 100 30]"),
-        format!("/Subtype /Widget /FT /Tx /Ff 4096 /V (A) /DA (/Helv {H} Tf) /Rect [10 10 100 30]"),
-        format!(
-            "/Subtype /FreeText /Rect [0 0 200 200] /RC (<p style=\"font-size:{H}pt\">A</p>)"
-        ),
-        format!("/Subtype /FreeText /Rect [0 0 200 200] /DS (font-size:{H}pt) /Contents (A)"),
+        // A glyph whose box covers the field.
+        format!("/Subtype /Widget /FT /Tx /Q 1 /V (A) /DA (/Helv {H} Tf) /Rect [10 10 100 30]"),
     ]);
     for annot in &cases {
         let pdf = annotations(
@@ -1664,6 +1731,23 @@ fn every_number_too_large_to_write_is_unsupported() {
             vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
         );
         assert_eq!(looks(&pdf), ["Coordinates"], "{annot}");
+    }
+    // Text that lies wholly outside its box, below or above it, is not written, so
+    // where it would lie need not be writable: bake draws these as it draws them
+    // without the text.
+    for annot in [
+        format!("/Subtype /FreeText /Rect [0 0 200 200] /Contents (A) /DA (/Helv {H} Tf)"),
+        format!("/Subtype /Widget /FT /Tx /Ff 4096 /V (A) /DA (/Helv {H} Tf) /Rect [10 10 100 30]"),
+        // Its left side bearing at this size puts it right of the field.
+        format!("/Subtype /Widget /FT /Tx /V (A) /DA (/Helv {H} Tf) /Rect [10 10 100 30]"),
+        format!("/Subtype /FreeText /Rect [0 0 200 200] /RC (<p style=\"font-size:{H}pt\">A</p>)"),
+        format!("/Subtype /FreeText /Rect [0 0 200 200] /DS (font-size:{H}pt) /Contents (A)"),
+    ] {
+        let drawn = content(&annot, vec![]);
+        assert!(
+            drawn == "nothing" || drawn.contains(" re\n") && !drawn.contains(" Do"),
+            "{annot}: {drawn}"
+        );
     }
     for (rect, matrix) in [
         (format!("[0 {H} 200]"), ""),
@@ -1872,7 +1956,7 @@ fn a_comment_in_rich_text_draws_nothing() {
          style=\"color:#ff0000\">IMPORTANT</span></p></body>",
         "M".repeat(200)
     );
-    let text = fills(&draw(
+    let text = runs(&draw(
         &[&format!(
             "/Subtype /FreeText /Rect [10 80 190 140] /BS << /W 0 >> \
              /DA (/Helv 12 Tf 0 g) /RC ({rc})"
@@ -1977,7 +2061,7 @@ fn a_default_appearance_font_is_one_of_four_names() {
 fn rich_text_aligns_by_text_align_not_q() {
     let spans = |q: u8, body: &str| {
         let rc = format!("<body style=\"font-family:Helvetica\">{body}</body>");
-        fills(&draw(
+        runs(&draw(
             &[&format!(
                 "/Subtype /FreeText /Rect [20 20 180 180] /BS << /W 0 >> /Q {q} /RC ({rc})"
             )],
@@ -2005,7 +2089,7 @@ fn rich_text_aligns_by_text_align_not_q() {
 
 /// The lines of a `FreeText` in `/Rect [20 20 180 180]`: the bottom of each fill.
 fn free_text_rows(entries: &str) -> Vec<i32> {
-    fills(&draw(
+    runs(&draw(
         &[&format!(
             "/Subtype /FreeText /Rect [20 20 180 180] /BS << /W 0 >> {entries}"
         )],
@@ -2227,7 +2311,7 @@ fn content(annot: &str, others: Vec<Vec<u8>>) -> String {
     let pdf = annotations("/Annots [4 0 R]", objects);
     let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
     match appearances.look(&annots(&pdf)[0], PAGE) {
-        Look::Generated(a) => a.content,
+        Look::Generated(a) => expanded(&a),
         Look::Nothing => "nothing".into(),
         Look::Unsupported(why) => format!("{why:?}"),
         Look::Stream { .. } => "stream".into(),
@@ -2257,7 +2341,10 @@ fn real_flags_are_read_as_viewers_read_them() {
         ("2.0", Ok(false)),
         ("4294967296", Ok(true)),
         ("4294967298", Ok(false)),
-        ("9223372036854775808.0", Err(Unsupported::Number)),
+        // MuPDF reads the low 32 bits of a long integer part, then the fraction.
+        ("9223372036854775808.0", Ok(true)),
+        ("4294967296.4999999", Ok(true)),
+        ("4294967297.5", Ok(false)),
         ("9223372036854775808", Err(Unsupported::Number)),
     ] {
         assert_eq!(square(flags), kept, "/F {flags}");
@@ -2481,4 +2568,79 @@ fn a_negative_text_size_is_drawn_as_given() {
     };
     assert_ne!(field("/Helv -12 Tf 0 g"), field("/Helv 0 Tf 0 g"));
     assert_ne!(field("/Helv -12 Tf 0 g"), field("/Helv 12 Tf 0 g"));
+}
+
+/// A real is read from its digits as viewers read it, not from the nearest 64-bit
+/// float, which loses the fraction of a large one: `/CA 4503599627370496.25` is
+/// 0.25 (2^52 and a quarter, whose low 32 bits are 0), as bake draws it.
+#[test]
+fn a_real_is_read_from_its_digits() {
+    for (ca, opacity) in [
+        ("4503599627370496.25", 0.25),
+        ("4294967296.4999999", 0.4999999),
+        ("9007199254740992.75", 0.75),
+    ] {
+        let pdf = annotations(
+            "/Annots [4 0 R]",
+            vec![
+                format!("<< /Subtype /Square /IC [1 0 0] /CA {ca} /Rect [10 10 90 40] >>")
+                    .into_bytes(),
+            ],
+        );
+        let appearances =
+            Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+        let Look::Generated(square) = appearances.look(&annots(&pdf)[0], PAGE) else {
+            panic!("/CA {ca}: a square is generated");
+        };
+        assert_eq!(square.opacity, opacity, "/CA {ca}");
+    }
+}
+
+/// In a default appearance, viewers read a real as its value, not as they read one
+/// in a dictionary: `4294967296.5` is past 4 billion there, and one beyond 32-bit
+/// floats is read as neither (observed). Where the two readings differ, the
+/// appearance is unsupported; where they agree, it is drawn.
+#[test]
+fn a_default_appearance_number_read_differently_elsewhere_is_unsupported() {
+    let free_text = |da: &str| {
+        format!("<< /Subtype /FreeText /Rect [10 10 190 90] /Contents (MMMM) /DA ({da}) >>")
+    };
+    let big = "1000000000000000000000000000000000000000.0";
+    let cases = [
+        ("/Helv 12 Tf 0 0 1 rg", "generated"),
+        ("/Helv 12.5 Tf 0.25 g", "generated"),
+        ("/Helv 4294967308 Tf 0 g", "generated"),
+        ("/Helv 4294967308.0 Tf 0 g", "Number"),
+        ("/Helv 12 Tf 4294967296.5 g", "Number"),
+        (&format!("/Helv {big} Tf 0 g"), "Number"),
+        (&format!("/Helv 12 Tf {big} g"), "Number"),
+    ];
+    for (da, look) in cases {
+        let pdf = annotations("/Annots [4 0 R]", vec![free_text(da).into_bytes()]);
+        assert_eq!(looks(&pdf), [look], "/DA ({da})");
+    }
+}
+
+/// An annotation written into a page's `/Annots` itself, rather than an object of
+/// its own, is drawn by its appearance stream, and nothing is generated for it, as
+/// bake draws it (observed); so is one in an `/Annots` array of its own.
+#[test]
+fn an_annotation_that_is_no_object_of_its_own_is_drawn_only_by_its_stream() {
+    let square = "<< /Type /Annot /Subtype /Square /IC [1 0 0] /Rect [10 10 90 40] >>";
+    let with_stream = "<< /Type /Annot /Subtype /Square /Rect [10 10 90 40] /AP << /N 4 0 R >> >>";
+    let field = "<< /Type /Annot /Subtype /Widget /FT /Tx /V (A) /Rect [10 10 90 40] >>";
+    let stream = common::stream("/BBox [0 0 80 30]", b"0 0 80 30 re f");
+    let pdf = annotations(
+        &format!("/Annots [{square} {with_stream} {field} 5 0 R]"),
+        vec![stream.clone(), square.as_bytes().to_vec()],
+    );
+    assert_eq!(
+        looks(&pdf),
+        ["nothing", "0 0 80 30 re f", "nothing", "generated"]
+    );
+    let pdf = annotations(
+        "/Annots 5 0 R",
+        vec![stream, format!("[{square} {with_stream}]").into_bytes()],
+    );
+    assert_eq!(looks(&pdf), ["nothing", "0 0 80 30 re f"]);
 }

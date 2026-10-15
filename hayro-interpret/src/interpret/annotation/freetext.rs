@@ -17,17 +17,17 @@ use super::entries::{Entries, Text};
 use super::lines::{Ending, Paint, ending};
 use super::out::{Color, Out};
 use super::rich;
-use super::text::{self, Align, Family, Span, Style, TextBox};
-use super::{Appearances, Spans, TextKey, Unsupported, border_width, color_of, dash, rect};
+use super::text::{self, Align, Family, Setting, Size, Span, Style, TextBox};
+use super::{Appearances, FREE_TEXT, TextKey, Unsupported, border_width, color_of, dash, rect};
 use hayro_syntax::object::dict::keys::C;
 use kurbo::{Affine, Point, Shape};
 
 /// The appearance of `FreeText` `annot`, of which the page shows `visible`; text the
 /// page does not show is not drawn, and text many annotations share is laid out
 /// once for `doc`'s document.
-pub(super) fn free_text(
-    annot: &Entries<'_>,
-    doc: &Appearances<'_>,
+pub(super) fn free_text<'a>(
+    annot: &Entries<'a>,
+    doc: &Appearances<'a>,
     visible: kurbo::Rect,
     out: &mut Out,
 ) -> Result<Option<()>, Unsupported> {
@@ -39,56 +39,57 @@ pub(super) fn free_text(
     // negative, as viewers lay it out.
     let rd = annot.numbers(b"RD", 4).unwrap_or_else(|| vec![0.0; 4]);
     let inner = kurbo::Rect::new(r.x0 + rd[0], r.y0 + rd[1], r.x1 - rd[2], r.y1 - rd[3]);
-    let da = annot.text(Text::DefaultAppearance).unwrap_or_default();
-    let (family, size, da_color) = text::default_appearance(&da);
-    let style = Style {
-        face: family.into(),
-        size: size.unwrap_or(12.0),
-        color: da_color.unwrap_or(Color::BLACK),
-        align: match annot.int(b"Q").unwrap_or(0) {
-            1 => Align::Center,
-            2 => Align::Right,
-            _ => Align::Left,
-        },
+    let (family, size, da_color) = doc.default_appearance(annot.source(b"DA"), false, || {
+        annot.text(Text::DefaultAppearance)
+    });
+    let color = da_color.unwrap_or(Color::BLACK);
+    let align = match annot.int(b"Q").unwrap_or(0) {
+        1 => Align::Center,
+        2 => Align::Right,
+        _ => Align::Left,
     };
-    let border_color = style.color;
-    // The text is made of these entries in the default appearance's style.
-    let mut numbers = vec![
-        size.map_or(u64::MAX, |s| u64::from(s.to_bits())),
-        u64::from(style.align as u8),
-    ];
-    numbers.extend(da_color.map_or(vec![0], |c| c.bits()));
+    let border_color = color;
+    // The text is made of these entries, set once for the document whatever size,
+    // colour and alignment each annotation draws it in; rich text's relative sizes
+    // are read as the default appearance's sign allows.
+    let positive = size.is_some_and(|s| s > 0.0);
     let key = TextKey::new(
         [Text::Contents, Text::Rich, Text::DefaultStyle].map(|t| Some(annot.text_source(t))),
-        style.face,
-        numbers,
+        family.into(),
+        vec![FREE_TEXT, u64::from(positive)],
     );
-    let spans = doc.spans(key.as_ref(), || {
+    let text = doc.shaped(key, || {
         let rich = annot.text(Text::Rich);
         let ds = annot.text(Text::DefaultStyle);
         if rich.is_none() && ds.is_none() {
-            let text = contents(annot);
-            return Ok(Spans {
-                spans: vec![Span { text, style }],
-                rich: false,
-            });
+            return doc.fonts.shape_plain(family, &contents(annot));
         }
-        // A size fit to the box is none for rich text: it is drawn 0 high, as
-        // viewers draw it; plain text takes 12 pt.
-        let spans = rich_spans(rich.as_deref(), ds.as_deref(), size.unwrap_or(0.0), || {
-            contents(annot)
-        })?;
-        Ok(Spans { spans, rich: true })
+        let spans = rich_spans(rich.as_deref(), ds.as_deref(), positive, || contents(annot))?;
+        doc.fonts.shape_rich(&spans)
     })?;
+    // Plain text is drawn at the default appearance's size, 12 pt for a size fit to
+    // the box; rich text's base size is the default appearance's, and a size fit to
+    // the box is none: it is drawn 0 high, as viewers draw it.
+    let set = Setting {
+        base: if text.rich {
+            size.unwrap_or(0.0)
+        } else {
+            size.unwrap_or(12.0)
+        },
+        color,
+        align,
+    };
     // Rich text is laid out in a box of its own, sized by the default appearance's.
-    let rich_size = spans.rich.then(|| size.unwrap_or(0.0));
-    let ascent = if spans.rich { RICH_ASCENT } else { 0.8 };
+    let rich_size = text.rich.then(|| size.unwrap_or(0.0));
+    let ascent = if text.rich { RICH_ASCENT } else { 0.8 };
     let w = border_width(annot);
 
     // The callout line, from the point it points at to the box.
     let callout = annot.is(b"IT", b"FreeTextCallout");
+    // Of more than six, none are read beyond the seventh.
     let cl: Vec<Point> = annot
-        .numbers(b"CL", 0)
+        .items(b"CL")
+        .map(|items| items.first(7))
         .filter(|n| n.len() == 4 || n.len() == 6)
         .unwrap_or_default()
         .as_chunks::<2>()
@@ -187,7 +188,6 @@ pub(super) fn free_text(
     // Rich text is laid out to twice the padding from the right (observed).
     let right = if rich_size.is_some() { 2.0 * pad } else { pad };
     let avail = (fw as f32 - pad - right).max(0.0);
-    let laid = doc.laid(key.as_ref(), &spans, avail, ascent)?;
     let area = TextBox {
         pad,
         top: fh as f32 - pad,
@@ -195,7 +195,17 @@ pub(super) fn free_text(
         frame,
         clip,
     };
-    laid.draw(&area, visible, &doc.fonts, out)?;
+    text::draw_box(
+        &doc.fonts,
+        std::iter::once(Ok(text)),
+        (0.0, 0.0),
+        &set,
+        avail,
+        ascent,
+        &area,
+        visible,
+        out,
+    )?;
     out.op("Q");
     Ok(Some(()))
 }
@@ -205,19 +215,20 @@ pub(super) fn free_text(
 pub(super) const RICH_ASCENT: f32 = 0.9;
 
 /// The spans of rich text `rc` (or, without it, the plain text `plain` gives) over
-/// default style `ds`, over the face of rich text in `size` and black, as viewers
-/// set them: the colour of the default appearance does not apply, lines are
+/// default style `ds`, over the face of rich text in the base size and black, as
+/// viewers set them: the colour of the default appearance does not apply, lines are
 /// aligned by their own `text-align`, not by /Q, and a default style with a
 /// declaration that is not one (no colon) is a syntax error that drops all of it.
+/// Relative sizes are of a base size that is `positive` or not.
 pub(super) fn rich_spans(
     rc: Option<&[u8]>,
     ds: Option<&[u8]>,
-    size: f32,
+    positive: bool,
     plain: impl FnOnce() -> String,
 ) -> Result<Vec<Span>, Unsupported> {
     let mut style = Style {
         face: Family::Text.into(),
-        size,
+        size: Size::Base(1.0),
         color: Color::BLACK,
         align: Align::Left,
     };
@@ -226,13 +237,13 @@ pub(super) fn rich_spans(
             .all(|d| d.trim().is_empty() || d.contains(':'))
     });
     if let Some(ds) = ds {
-        style = rich::css_style(&ds, style)?;
+        style = rich::css_style(&ds, style, positive)?;
     }
     match rc {
         // A zero character is drawn as a fallback glyph (observed), which the rich
         // text parser drops.
         Some(rc) if text::text_string(rc).contains('\0') => Err(Unsupported::Character('\0')),
-        Some(rc) => rich::rich_text(&text::text_string(rc), &style),
+        Some(rc) => rich::rich_text(&text::text_string(rc), &style, positive),
         None => Ok(vec![Span {
             text: plain(),
             style,

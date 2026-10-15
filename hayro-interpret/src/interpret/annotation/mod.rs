@@ -10,15 +10,17 @@
 //! BSD-3-Clause; its license is in the repository's `NOTICE.md`). The layout of the
 //! other generators, which the spec leaves to the viewer, is written here and sized
 //! to match the rendered output of common viewers; each module says what it draws.
-//! Text is drawn as glyph outlines from the standard fonts the font resolver gives.
+//! Text is drawn as glyph outlines from the standard fonts the font resolver gives,
+//! each glyph a form written once and placed where it is drawn.
 //!
 //! Annotation dictionaries are read as viewers read damaged ones (`entries.rs`): an
 //! array's entry that is not a number reads as 0 and keeps its place.
 //!
 //! A generated appearance is a content stream in default user space that needs no
-//! resources. /CA and the highlight's Multiply blend apply to each thing it paints,
-//! as the graphics state it is drawn in, as viewers draw them: where two of its
-//! fills overlap, they blend twice.
+//! resources but the forms of the glyphs it draws ([`Glyph`]), each written once. /CA
+//! and the highlight's Multiply blend apply to each thing it paints, as the graphics
+//! state it is drawn in, as viewers draw them: where two of its fills overlap, they
+//! blend twice.
 
 pub(crate) mod entries;
 mod freetext;
@@ -30,19 +32,37 @@ mod rich;
 mod text;
 mod widget;
 
-use entries::{Entries, Items, Source, Value};
+use entries::{Entries, Items, Label, Objects, Source, Value};
 use out::{Color, Out, written_all};
-use text::{Fonts, Laid, Lines, Run, Span, Typeface};
+use text::{Family, Fonts, Shaped, Typeface};
 
 use crate::BlendMode;
 use crate::x_object::box_and_matrix;
 use hayro_syntax::object::dict::keys::{AP, AS, BORDER, BS, C, CA, D, F, N, RECT, SUBTYPE, W};
-use hayro_syntax::object::{Dict, Name, ObjRef, Object, Stream};
+use hayro_syntax::object::{Dict, Name, Number, ObjRef, Stream};
 use hayro_syntax::xref::XRef;
 use kurbo::{Affine, Shape};
 use rustc_hash::FxHashMap;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+
+thread_local! {
+    static WORK: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Counts `n` units of the work of generating appearances ([`work_done`]).
+fn work(n: usize) {
+    WORK.with(|w| w.set(w.get().saturating_add(n as u64)));
+}
+
+/// The units of work generating appearances has done on this thread so far: each
+/// glyph set or drawn, line laid out, step of a search over text, option and number
+/// read, and part of a default appearance string read. The work an appearance takes
+/// grows with what it draws and with what the file holds, not with the times
+/// annotations share an entry; tests bound it.
+pub fn work_done() -> u64 {
+    WORK.with(Cell::get)
+}
 
 /// What an annotation draws.
 pub enum Look<'a> {
@@ -105,11 +125,12 @@ pub enum Unsupported {
     /// 32-bit numbers content streams are read in are a unit or more apart.
     Coordinates,
     /// Its rich text (`/RC`) or default style (`/DS`) uses an element, attribute or
-    /// style declaration the generator cannot draw as viewers do, or nests or
-    /// repeats elements beyond what written rich text does.
+    /// style declaration the generator cannot draw as viewers do, nests or repeats
+    /// elements beyond what written rich text does, or sets text both in sizes in
+    /// points and in a negative default appearance size, which run opposite ways.
     RichText,
-    /// A number it is drawn by is a real whose integer part is 2^53 or more, which
-    /// cannot be read as viewers read it (see `entries.rs`).
+    /// A number it is drawn by has digits whose reading by viewers is not
+    /// established (see `entries.rs`).
     Number,
     /// It draws a line ending at a negative border width, or along a line of no
     /// length, which viewers clip by rules not reproduced.
@@ -121,12 +142,64 @@ pub enum Unsupported {
 /// `ExtGState` set before it, not a transparency group around it): they apply to
 /// each fill and stroke of the content on its own.
 pub struct Appearance {
-    /// The content stream, in default user space; it uses no resources.
+    /// The content stream, in default user space; it uses no resources but the
+    /// glyphs of [`Appearance::glyphs`], each drawn as a form `XObject` with `/name Do`.
     pub content: String,
+    /// The glyphs the content draws, each once.
+    pub glyphs: Vec<Rc<Glyph>>,
     /// The annotation's `/CA`, clamped to 0–1, for both fills and strokes.
     pub opacity: f32,
     /// Multiply for highlights, Normal otherwise.
     pub blend: BlendMode,
+}
+
+/// A glyph of generated text, which an [`Appearance`]'s content draws as a form
+/// `XObject` with `/name Do` in a space of 1000 units to the em: its outline, filled,
+/// in that space, and the box of its points. Its name is the same wherever the
+/// [`Appearances`] that made it draw it, so that a writer writes it once.
+#[derive(Debug)]
+pub struct Glyph {
+    name: Rc<str>,
+    content: String,
+    bbox: [f32; 4],
+}
+
+impl Glyph {
+    /// The glyph named `name` with outline `path` and the box `ink` of its points;
+    /// `None` when a number of them cannot be written.
+    fn new(name: String, path: &kurbo::BezPath, ink: kurbo::Rect) -> Option<Self> {
+        let mut out = Out::default();
+        out.path(path)?;
+        out.op("f");
+        let (content, _) = out.finish().ok()?;
+        let bbox =
+            written_all([ink.x0.floor(), ink.y0.floor(), ink.x1.ceil(), ink.y1.ceil()]).ok()?;
+        Some(Self {
+            name: name.into(),
+            content,
+            bbox,
+        })
+    }
+
+    /// The name the content draws it by.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn name_rc(&self) -> Rc<str> {
+        self.name.clone()
+    }
+
+    /// Its outline as a content stream that fills it, in a space of 1000 units to the
+    /// em.
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    /// The box its points lie in, in that space.
+    pub fn bbox(&self) -> [f32; 4] {
+        self.bbox
+    }
 }
 
 /// Whether `annot` is kept when annotations are flattened into page content for
@@ -134,18 +207,17 @@ pub struct Appearance {
 /// Invisible or Hidden (PDF 32000-1 12.5.3), whatever their Print and `NoView` flags.
 /// [`Unsupported::Number`] when its flags cannot be read as viewers read them.
 pub fn flattened(annot: &Dict<'_>) -> Result<bool, Unsupported> {
-    let annot = Entries::new(annot.clone());
-    Ok(!annot.is(SUBTYPE, b"Link") && flags_of(&annot)? & 3 == 0)
+    let link = annot
+        .get::<Name<'_>>(SUBTYPE)
+        .is_some_and(|n| n.as_ref() == b"Link");
+    Ok(!link && flags(annot)? & 3 == 0)
 }
 
 /// The annotation flags of `annot` (`/F`, PDF 32000-1 12.5.3);
 /// [`Unsupported::Number`] when they cannot be read as viewers read them.
 pub fn flags(annot: &Dict<'_>) -> Result<u32, Unsupported> {
-    flags_of(&Entries::new(annot.clone()))
-}
-
-fn flags_of(annot: &Entries<'_>) -> Result<u32, Unsupported> {
-    entries::read(|| annot.get(F).flags())
+    // Read as a number, so that an object of another kind is not read whole.
+    entries::read(|| entries::flags(annot.get::<Number>(F)))
 }
 
 /// What the annotations of one document look like: [`Appearances::look`], with
@@ -154,57 +226,46 @@ fn flags_of(annot: &Entries<'_>) -> Result<u32, Unsupported> {
 /// interactive form. Make one per document: fonts are loaded once, and each field
 /// above widgets is read once, however many pages its widgets are on.
 pub struct Appearances<'a> {
-    xref: &'a XRef,
+    objects: Objects<'a>,
     fonts: Fonts,
     /// The interactive form dictionary (`/AcroForm`).
     form: Option<Entries<'a>>,
     fields: Fields<'a>,
 }
 
-/// What has been read of a document's widgets so far, by reference: the fields,
-/// with what the widgets below each inherit, or `None` when its `/Parent` chain
-/// loops; and the values widgets show, set in a typeface, and their lines, so that a
-/// value many widgets share is set once. Shared by every [`Appearances`] of the
-/// document a renderer makes, one per page, through its document's cache.
+/// What has been read of a document for its annotations so far: its objects, each
+/// read once ([`Objects`]); the fields, by reference, with what the widgets below
+/// each inherit, or `None` when its `/Parent` chain loops; default appearances and
+/// list options, by the entry that holds them; and text set in its fonts, so that
+/// what many annotations share is read and set once. Shared by every
+/// [`Appearances`] of the document a renderer makes, one per page, through its
+/// document's cache.
 #[derive(Clone, Default)]
 pub(crate) struct Fields<'a>(Rc<RefCell<Known<'a>>>);
 
 #[derive(Default)]
 struct Known<'a> {
+    /// The document's objects, each read once.
+    objects: Option<Objects<'a>>,
     fields: FxHashMap<ObjRef, Option<Field<'a>>>,
-    /// By the entry that holds the text and the typeface.
-    runs: FxHashMap<(Source, Typeface), Result<Rc<Run>, Unsupported>>,
-    /// By the entry that holds the text, the typeface, and the bits of the size
-    /// and width the lines are broken at.
-    lines: FxHashMap<(Source, Typeface, u32, u32), Rc<Lines>>,
-    /// Text in its styles, and laid out to the bits of a width, by what it is made of.
-    spans: FxHashMap<TextKey, Result<Rc<Spans>, Unsupported>>,
-    laid: FxHashMap<(TextKey, u32), Result<Rc<Laid>, Unsupported>>,
-    /// The options of lists, by the entry that holds them and the typeface.
-    options: FxHashMap<(Source, Typeface), Rc<Options>>,
+    /// Text set in its fonts, by what it is made of.
+    shaped: FxHashMap<TextKey, Result<Rc<Shaped>, Unsupported>>,
+    /// The options of lists, by the entry that holds them.
+    labels: FxHashMap<Source, Rc<Vec<Label<'a>>>>,
+    /// Default appearances read, by the entry that holds each, and the form's; with
+    /// whether reading each met a number whose reading is not established.
+    appearances: FxHashMap<Source, (DefaultAppearance, bool)>,
+    form_appearance: Option<(DefaultAppearance, bool)>,
+    /// What text and choice fields show, by what it is made of.
+    field_text: FxHashMap<TextKey, Result<widget::FieldText, Unsupported>>,
 }
 
-/// The labels of a list's options, each set as a [`Run`] (`None` for one that is
-/// not text or cannot be set), and why each that cannot be set cannot, in order.
-struct Options {
-    labels: Vec<Option<Rc<Run>>>,
-    errors: Vec<(usize, Unsupported)>,
-    /// The box around a glyph's origin the points of every label's glyphs lie in,
-    /// and the widest label's advance, in em.
-    ink: Option<kurbo::Rect>,
-    widest: f64,
-}
+/// A default appearance as [`text::default_appearance`] reads it.
+type DefaultAppearance = (Family, Option<f32>, Option<Color>);
 
-impl Options {
-    /// Why the first label from option `from` on cannot be set, if one cannot.
-    fn error_from(&self, from: usize) -> Option<Unsupported> {
-        let i = self.errors.partition_point(|(i, _)| *i < from);
-        self.errors.get(i).map(|(_, e)| *e)
-    }
-}
-
-/// What text in styles is made of, as a key for making it once per document: the
-/// entries it is read from, and the numbers of the styles it is set in.
+/// What text is made of, as a key for setting it once per document: the entries it
+/// is read from, the typeface it is set in, and numbers that tell apart the ways it
+/// is read ([`TEXT`] and those after it first).
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct TextKey {
     sources: Vec<Source>,
@@ -212,9 +273,17 @@ struct TextKey {
     numbers: Vec<u64>,
 }
 
+/// The ways text is read: plain text, a line's caption on one line, rich text of a
+/// `FreeText`, rich text of a field, a list's option.
+const TEXT: u64 = 0;
+const CAPTION: u64 = 1;
+const FREE_TEXT: u64 = 2;
+const FIELD: u64 = 3;
+const OPTION: u64 = 4;
+
 impl TextKey {
     /// The key of text read from entries `sources`, none of them in a direct
-    /// dictionary, in `face` and the styles `numbers` tell apart.
+    /// dictionary, in `face` and the way `numbers` tell.
     fn new(
         sources: impl IntoIterator<Item = Option<Source>>,
         face: Typeface,
@@ -226,12 +295,6 @@ impl TextKey {
             numbers,
         })
     }
-}
-
-/// Text in its styles, and whether it is rich text (`/RC`, `/RV` or `/DS`).
-struct Spans {
-    spans: Vec<Span>,
-    rich: bool,
 }
 
 impl<'a> Appearances<'a> {
@@ -248,12 +311,18 @@ impl<'a> Appearances<'a> {
         font_resolver: crate::FontResolverFn,
         fields: Fields<'a>,
     ) -> Self {
+        let objects = fields
+            .0
+            .borrow_mut()
+            .objects
+            .get_or_insert_with(|| Objects::new(xref))
+            .clone();
         let form = xref
             .get::<Dict<'a>>(xref.root_id())
-            .and_then(|root| root.get::<Dict<'a>>(b"AcroForm"))
-            .map(Entries::new);
+            .map(|root| Entries::of(root, &objects))
+            .and_then(|root| root.dict(b"AcroForm"));
         Self {
-            xref,
+            objects,
             fonts: Fonts::new(font_resolver),
             form,
             fields,
@@ -275,21 +344,22 @@ impl<'a> Appearances<'a> {
     }
 
     fn look_read(&self, annot: &Dict<'a>, visible: kurbo::Rect) -> Look<'a> {
-        match annot.get::<Object<'_>>(AP) {
-            None | Some(Object::Null(_)) => {}
-            Some(Object::Dict(ap)) => {
-                // Read as `Object` first: a dictionary read as a stream may pick up the
-                // data of a stream after it in the file.
-                let stream = match ap.get::<Object<'_>>(N) {
-                    Some(Object::Stream(stream)) => Some(stream),
-                    Some(Object::Dict(states)) => match annot.get::<Name<'_>>(AS) {
-                        Some(state) => match states.get::<Object<'_>>(state.as_ref()) {
-                            Some(Object::Stream(stream)) => Some(stream),
+        let entries = Entries::of(annot.clone(), &self.objects);
+        match entries.get(AP) {
+            // A reference to no object.
+            Value::Null if entries.present(AP) => return self.not_a_dictionary(annot, visible),
+            Value::Null => {}
+            Value::Dict(ap) => {
+                // Each read as any object: a dictionary read as a stream may pick up
+                // the data of a stream after it in the file.
+                let stream = match ap.get(N) {
+                    Value::Stream(stream) => Some(stream),
+                    Value::Dict(states) => match entries.name(AS) {
+                        Some(state) => match states.get(state.as_ref()) {
+                            Value::Stream(stream) => Some(stream),
                             // A state that is there but is no stream, a reference to
                             // no object among them, draws nothing (observed).
-                            _ if Entries::new(states).present(state.as_ref()) => {
-                                return Look::Nothing;
-                            }
+                            _ if states.present(state.as_ref()) => return Look::Nothing,
                             _ => None,
                         },
                         None => None,
@@ -297,26 +367,22 @@ impl<'a> Appearances<'a> {
                     _ => None,
                 };
                 if let Some(stream) = stream {
-                    return match placement(&stream, &Entries::new(annot.clone())) {
+                    return match placement(&stream, &entries) {
                         Ok(Some(placement)) => Look::Stream { stream, placement },
                         Ok(None) => Look::Nothing,
                         Err(why) => Look::Unsupported(why),
                     };
                 }
             }
-            Some(_) => return self.not_a_dictionary(annot, visible),
+            _ => return self.not_a_dictionary(annot, visible),
         }
-        if annot.contains_key(AP) && annot.get::<Object<'_>>(AP).is_none() {
-            // A reference to no object.
-            return self.not_a_dictionary(annot, visible);
-        }
-        self.generated(&Entries::new(annot.clone()), visible)
+        self.generated(&entries, visible)
     }
 
     /// What `annot`, whose `/AP` is neither a dictionary nor null, looks like:
     /// nothing, but a button, whose appearance viewers make anew.
     fn not_a_dictionary(&self, annot: &Dict<'a>, visible: kurbo::Rect) -> Look<'a> {
-        let annot = Entries::new(annot.clone());
+        let annot = Entries::of(annot.clone(), &self.objects);
         let button = annot.is(SUBTYPE, b"Widget")
             && self
                 .field(&annot)
@@ -328,7 +394,15 @@ impl<'a> Appearances<'a> {
         }
     }
 
+    /// The appearance generated for `annot`: none for one held directly in a page's
+    /// `/Annots` rather than an object of its own, which viewers draw only by its
+    /// appearance stream (observed in `PyMuPDF` bake).
     fn generated(&self, annot: &Entries<'a>, visible: kurbo::Rect) -> Look<'a> {
+        match annot.own() {
+            Some(true) => {}
+            Some(false) => return Look::Nothing,
+            None => return Look::Unsupported(Unsupported::Kind),
+        }
         match self.generate(annot, visible) {
             Ok(Some(appearance)) => Look::Generated(appearance),
             Ok(None) => Look::Nothing,
@@ -412,7 +486,7 @@ impl<'a> Appearances<'a> {
             b"Redact" => ok(icons::redact(annot, &mut out)),
             b"Stamp" => icons::stamp(annot, fonts, &mut out),
             b"FreeText" => freetext::free_text(annot, self, visible, &mut out),
-            b"Line" => lines::line(annot, fonts, &mut out),
+            b"Line" => lines::line(annot, self, visible, &mut out),
             b"Polygon" => lines::poly(annot, true, &mut out),
             b"PolyLine" => lines::poly(annot, false, &mut out),
             b"Widget" => match self.field(annot) {
@@ -426,16 +500,17 @@ impl<'a> Appearances<'a> {
         };
         // A number that could not be written fails the appearance, whatever the
         // generator made of it: `None` from a generator means nothing to draw.
-        let content = out.finish()?;
+        let (content, glyphs) = out.finish()?;
         let drew = drew?;
         // An appearance that paints nothing, such as a widget with no value, border
         // or background, is no appearance.
-        let paints = content.lines().any(|l| {
-            matches!(
-                l.rsplit(' ').next(),
-                Some("f" | "f*" | "S" | "s" | "b" | "b*" | "B" | "B*")
-            )
-        });
+        let paints = !glyphs.is_empty()
+            || content.lines().any(|l| {
+                matches!(
+                    l.rsplit(' ').next(),
+                    Some("f" | "f*" | "S" | "s" | "b" | "b*" | "B" | "B*")
+                )
+            });
         if drew.is_none() || !paints {
             return Ok(None);
         }
@@ -446,6 +521,7 @@ impl<'a> Appearances<'a> {
         };
         Ok(Some(Appearance {
             content,
+            glyphs,
             opacity: opacity(annot),
             blend,
         }))
@@ -471,99 +547,84 @@ impl<'a> Appearances<'a> {
         made
     }
 
-    /// `text()` set in `typeface`, made once for the document when its entry has a
-    /// source.
-    fn run(
+    /// The text `make` sets, made once for the document under `key`.
+    fn shaped(
+        &self,
+        key: Option<TextKey>,
+        make: impl FnOnce() -> Result<Shaped, Unsupported>,
+    ) -> Result<Rc<Shaped>, Unsupported> {
+        self.once(|k| &mut k.shaped, key, || make().map(Rc::new))
+    }
+
+    /// `text()` set in `face` as plain text, read as `way` ([`TEXT`] or
+    /// [`CAPTION`]), made once for the document when its entry has a source.
+    fn plain(
         &self,
         source: Option<&Source>,
-        typeface: Typeface,
+        face: Typeface,
+        way: u64,
         text: impl FnOnce() -> String,
-    ) -> Result<Rc<Run>, Unsupported> {
-        self.once(
-            |k| &mut k.runs,
-            source.map(|s| (s.clone(), typeface)),
-            || self.fonts.run(typeface, &text()).map(Rc::new),
-        )
+    ) -> Result<Rc<Shaped>, Unsupported> {
+        let key = TextKey::new([source.cloned()], face, vec![way]);
+        self.shaped(key, || self.fonts.shape_plain(face, &text()))
     }
 
-    /// The lines of `run`, of the entry `source`, at `size` broken to fit `width`
-    /// ([`text::wrap`]), made once for the document.
-    fn lines(&self, source: Option<&Source>, run: &Run, size: f32, width: f32) -> Rc<Lines> {
-        self.once(
-            |k| &mut k.lines,
-            source.map(|s| (s.clone(), run.typeface(), size.to_bits(), width.to_bits())),
-            || Rc::new(text::wrap(run, size, width)),
-        )
-    }
-
-    /// The spans `make` reads, made once for the document under `key`.
-    fn spans(
-        &self,
-        key: Option<&TextKey>,
-        make: impl FnOnce() -> Result<Spans, Unsupported>,
-    ) -> Result<Rc<Spans>, Unsupported> {
-        self.once(|k| &mut k.spans, key.cloned(), || make().map(Rc::new))
-    }
-
-    /// `spans`, made under `key`, laid out in `avail` with each line's first baseline
-    /// `ascent` times its size below its top, once for the document.
-    fn laid(
-        &self,
-        key: Option<&TextKey>,
-        spans: &Spans,
-        avail: f32,
-        ascent: f32,
-    ) -> Result<Rc<Laid>, Unsupported> {
-        // The ascent follows from what the spans are.
-        self.once(
-            |k| &mut k.laid,
-            key.map(|k| (k.clone(), avail.to_bits())),
-            || Laid::new(&self.fonts, &spans.spans, avail, ascent).map(Rc::new),
-        )
-    }
-
-    /// The options of `/Opt`, of entry `source`, in `typeface`, made once for the
-    /// document: of each, the text shown, after its export value or alone.
-    fn options<'b>(
+    /// The labels of the options of `/Opt`, of entry `source`, read once for the
+    /// document ([`Items::labels`]); none is set.
+    fn labels(
         &self,
         source: Option<Source>,
-        typeface: Typeface,
-        items: impl FnOnce() -> Option<Items<'b>>,
-    ) -> Rc<Options> {
+        items: impl FnOnce() -> Option<Items<'a>>,
+    ) -> Rc<Vec<Label<'a>>> {
         self.once(
-            |k| &mut k.options,
-            source.map(|s| (s, typeface)),
+            |k| &mut k.labels,
+            source.clone(),
             || {
-                let mut options = Options {
-                    labels: Vec::new(),
-                    errors: Vec::new(),
-                    ink: None,
-                    widest: 0.0,
-                };
-                for (i, opt) in items().iter().flat_map(Items::iter).enumerate() {
-                    let label = match opt {
-                        Value::Array(pair) => pair.get(1).text(entries::Text::Option),
-                        opt => opt.text(entries::Text::Option),
-                    };
-                    let run = label.map(|l| self.fonts.run(typeface, &text::text_string(&l)));
-                    options.labels.push(match run {
-                        Some(Ok(run)) => {
-                            if let Some(ink) = run.ink() {
-                                options.ink = Some(options.ink.map_or(ink, |i| i.union(ink)));
-                            }
-                            options.widest = options.widest.max(run.width(0..run.len()));
-                            Some(Rc::new(run))
-                        }
-                        Some(Err(e)) => {
-                            options.errors.push((i, e));
-                            None
-                        }
-                        None => None,
-                    });
-                }
-                Rc::new(options)
+                Rc::new(
+                    items()
+                        .map(|i| i.labels(source.as_ref()))
+                        .unwrap_or_default(),
+                )
             },
         )
+    }
+
+    /// Option `label` set in `face` as plain text, once for the document when it has
+    /// a source.
+    fn label(&self, label: &Label<'a>, face: Typeface) -> Result<Rc<Shaped>, Unsupported> {
+        let key = TextKey::new([label.source.clone()], face, vec![OPTION]);
+        self.shaped(key, || {
+            let text = label.value.text(entries::Text::Option);
+            self.fonts.shape_plain(
+                face,
+                &text.map(|t| text::text_string(&t)).unwrap_or_default(),
+            )
+        })
+    }
+
+    /// The default appearance `read()` gives, of entry `source`, read once for the
+    /// document when it has a source (the form's when `form`).
+    fn default_appearance(
+        &self,
+        source: Option<Source>,
+        form: bool,
+        read: impl FnOnce() -> Option<Vec<u8>>,
+    ) -> DefaultAppearance {
+        let make = || entries::noting(|| text::default_appearance(&read().unwrap_or_default()));
+        let (da, unreadable) = if form {
+            let known = self.fields.0.borrow().form_appearance;
+            known.unwrap_or_else(|| {
+                let made = make();
+                self.fields.0.borrow_mut().form_appearance = Some(made);
+                made
+            })
+        } else {
+            self.once(|k| &mut k.appearances, source, make)
+        };
+        if unreadable {
+            entries::unreadable();
+        }
+        da
     }
 
     /// The field entries widget `annot` is drawn with, however deep its `/Parent`
@@ -577,7 +638,7 @@ impl<'a> Appearances<'a> {
         let mut walk: Vec<(Option<ObjRef>, Entries<'a>)> = vec![(None, annot.clone())];
         let mut field = loop {
             let node = &walk[walk.len() - 1].1;
-            let Some((id, parent)) = node.parent(self.xref) else {
+            let Some((id, parent)) = node.parent() else {
                 break Some(Field::default());
             };
             // A direct parent dictionary cannot lead back to itself.
@@ -720,9 +781,9 @@ fn circle(c: kurbo::Point, r: f64) -> kurbo::BezPath {
 }
 
 /// The colour of colour array `items` ([`Color::of`]), each component that is not a
-/// number read as 0.
+/// number read as 0; components after the fourth are not read.
 fn color(items: &Items<'_>) -> Option<Color> {
-    Color::of(&items.numbers())
+    Color::of(&items.first(4))
 }
 
 /// The colour of array `key` of `dict`, `None` when it is not an array or transparent.

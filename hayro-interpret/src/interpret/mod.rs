@@ -237,12 +237,19 @@ fn draw_generated<'a>(
         blend_mode: appearance.blend,
         ..Default::default()
     };
+    let glyphs = appearance
+        .glyphs
+        .iter()
+        .map(|g| (g.name_rc(), g.clone()))
+        .collect();
+    let outer = std::mem::replace(&mut context.generated_glyphs, glyphs);
     interpret(
         TypedIter::new(appearance.content.as_bytes()),
         resources,
         context,
         device,
     );
+    context.generated_glyphs = outer;
     context.restore_state(device);
 }
 
@@ -694,6 +701,19 @@ pub fn interpret<'a>(
             }
             TypedInstruction::ShapeGlyph(_) => {}
             TypedInstruction::XObject(x) => {
+                // A glyph of the generated appearance being drawn.
+                let glyph = std::str::from_utf8(x.0.as_ref())
+                    .ok()
+                    .and_then(|name| context.generated_glyphs.get(name).cloned());
+                if let Some(glyph) = glyph {
+                    interpret(
+                        TypedIter::new(glyph.content().as_bytes()),
+                        resources,
+                        context,
+                        device,
+                    );
+                    continue;
+                }
                 let cache = context.interpreter_cache.object_cache.clone();
                 let warning_sink = context.settings.warning_sink.clone();
                 let transfer_function = context.get().graphics_state.transfer_function.clone();

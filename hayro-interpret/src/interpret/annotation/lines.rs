@@ -6,8 +6,8 @@
 
 use super::entries::{Entries, Text};
 use super::out::{Color, Out};
-use super::text::{self, Family, Fonts};
-use super::{Unsupported, border_width, circle, color_of, dash};
+use super::text::{self, Align, Family, Setting};
+use super::{Appearances, CAPTION, Unsupported, border_width, circle, color_of, dash};
 use hayro_syntax::object::dict::keys::{C, IC};
 use kurbo::{Affine, BezPath, Point, Vec2};
 
@@ -237,12 +237,13 @@ fn direction(v: Vec2) -> Vec2 {
 
 /// The numbers of `key` as points.
 fn points(annot: &Entries<'_>, key: &[u8]) -> Vec<Point> {
-    let mut n = annot.numbers(key, 0).unwrap_or_default();
     // A line has two points, as viewers read `/L`: coordinates it lacks, or all
     // when it is not an array, are 0.
-    if key == b"L" {
-        n.resize(4, 0.0);
-    }
+    let n = if key == b"L" {
+        annot.numbers(key, 4).unwrap_or_else(|| vec![0.0; 4])
+    } else {
+        annot.items(key).map(|i| i.numbers()).unwrap_or_default()
+    };
     n.as_chunks::<2>()
         .0
         .iter()
@@ -362,9 +363,10 @@ fn polyline(points: &[Point], out: &mut Out) -> Option<()> {
 /// `/LLO`), with its `/LE` endings and, with `/Cap`, `/Contents` as a caption in
 /// 12 pt Helvetica on one line, its line breaks as spaces as common viewers set it:
 /// inline, the line broken around it, or on top (`/CP`), moved by `/CO`.
-pub(super) fn line(
-    annot: &Entries<'_>,
-    fonts: &Fonts,
+pub(super) fn line<'a>(
+    annot: &Entries<'a>,
+    doc: &Appearances<'a>,
+    visible: kurbo::Rect,
     out: &mut Out,
 ) -> Result<Option<()>, Unsupported> {
     let paint = Paint::of(annot);
@@ -393,35 +395,40 @@ pub(super) fn line(
     let shift = normal * (sign * llo + ll);
     let (la, lb) = (a + shift, b + shift);
 
-    // The caption, laid out first: an inline one breaks the line.
+    // The caption, laid out first: an inline one breaks the line. Its text, on one
+    // line, is set once for the document, and only what the page shows of it drawn.
     let caption = annot.bool(b"Cap").unwrap_or(false);
-    let contents = annot
-        .text(Text::Contents)
-        .map(|s| text::text_string(&s))
-        .filter(|s| !s.trim().is_empty());
     let mut gap = None;
-    let mut caption_glyphs = None;
-    if let (true, Some(contents)) = (caption, contents) {
+    let mut caption_text = None;
+    if caption {
         const SIZE: f32 = 12.0;
-        let one_line = contents.replace("\r\n", " ").replace(['\r', '\n'], " ");
-        let glyphs = fonts.shape(Family::Sans, &one_line)?;
-        let width = f64::from(text::width(&glyphs, SIZE));
-        let top = annot.is(b"CP", b"Top");
-        // As viewers place it: without an offset (`/CO`, 0 for a number it lacks),
-        // inline or on top as `/CP` says; with one, moved by it from the line's
-        // middle, below the line when it moves down, whatever `/CP` says.
-        let co = annot.numbers(b"CO", 2).unwrap_or_else(|| vec![0.0; 2]);
-        let size = f64::from(SIZE);
-        let mid = len / 2.0 + co[0];
-        let rise = if co[0] != 0.0 || co[1] != 0.0 {
-            if co[1] < 0.0 { co[1] - size } else { co[1] }
-        } else if top {
-            0.2 * size
-        } else {
-            gap = Some((mid - width / 2.0 - 3.0, mid + width / 2.0 + 3.0));
-            -0.3 * size
-        };
-        caption_glyphs = Some((glyphs, mid - width / 2.0, rise));
+        let source = annot.text_source(Text::Contents);
+        let text = doc.plain(Some(&source), Family::Sans.into(), CAPTION, || {
+            annot
+                .text(Text::Contents)
+                .map(|s| text::text_string(&s))
+                .map(|c| c.replace("\r\n", " ").replace(['\r', '\n'], " "))
+                .unwrap_or_default()
+        })?;
+        if !text.is_blank() {
+            let width = f64::from(text.width(0..text.len(), SIZE) as f32);
+            let top = annot.is(b"CP", b"Top");
+            // As viewers place it: without an offset (`/CO`, 0 for a number it lacks),
+            // inline or on top as `/CP` says; with one, moved by it from the line's
+            // middle, below the line when it moves down, whatever `/CP` says.
+            let co = annot.numbers(b"CO", 2).unwrap_or_else(|| vec![0.0; 2]);
+            let size = f64::from(SIZE);
+            let mid = len / 2.0 + co[0];
+            let rise = if co[0] != 0.0 || co[1] != 0.0 {
+                if co[1] < 0.0 { co[1] - size } else { co[1] }
+            } else if top {
+                0.2 * size
+            } else {
+                gap = Some((mid - width / 2.0 - 3.0, mid + width / 2.0 + 3.0));
+                -0.3 * size
+            };
+            caption_text = Some((text, mid - width / 2.0, rise));
+        }
     }
 
     draw_line(
@@ -431,11 +438,22 @@ pub(super) fn line(
         normal,
         [ll, lle, llo, sign],
         gap,
-        caption_glyphs,
         annot,
         out,
     )
     .ok_or(Unsupported::Kind)?;
+    if let Some((text, x, rise)) = caption_text {
+        out.op("0 g");
+        let dir = direction(lb - la);
+        let frame = Affine::new([dir.x, dir.y, normal.x, normal.y, la.x, la.y]);
+        let set = Setting {
+            base: 12.0,
+            color: Color::Gray(0.0),
+            align: Align::Left,
+        };
+        let origin = (f64::from(x as f32), f64::from(rise as f32));
+        text::draw_line(&doc.fonts, &text, &set, origin, frame, visible, out)?;
+    }
     Ok(Some(()))
 }
 
@@ -448,7 +466,6 @@ fn draw_line(
     normal: Vec2,
     [ll, lle, llo, sign]: [f64; 4],
     gap: Option<(f64, f64)>,
-    caption: Option<(Vec<text::Glyph<'_>>, f64, f64)>,
     annot: &Entries<'_>,
     out: &mut Out,
 ) -> Option<()> {
@@ -480,11 +497,5 @@ fn draw_line(
     let [first, last] = Ending::of(annot);
     ending(first, la, lb, paint, out)?;
     ending(last, lb, la, paint, out)?;
-
-    if let Some((glyphs, x, rise)) = caption {
-        out.op("0 g");
-        let frame = Affine::new([dir.x, dir.y, normal.x, normal.y, la.x, la.y]);
-        text::draw(&glyphs, 12.0, (x as f32, rise as f32), frame, out)?;
-    }
     Some(())
 }
