@@ -14,7 +14,7 @@
 use super::Unsupported;
 use hayro_syntax::object::{Array, Dict, MaybeRef, Name, Null, Number, ObjRef, Object, Stream};
 use hayro_syntax::xref::XRef;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -230,6 +230,8 @@ struct Read<'a> {
     /// Where the data of each object an annotation's own-ness was told by lies, or
     /// `None` when it is no dictionary, array or stream ([`Objects::own`]).
     places: RefCell<FxHashMap<ObjRef, Option<Place>>>,
+    /// Where each annotation looked at lies ([`Objects::annotation`]).
+    looked: RefCell<FxHashSet<Place>>,
 }
 
 /// An object as it was read: a string's bytes shared, as they may have been
@@ -274,6 +276,7 @@ impl<'a> Objects<'a> {
                 entries: RefCell::default(),
                 prefixes: RefCell::default(),
                 places: RefCell::default(),
+                looked: RefCell::default(),
             })),
             shared: false,
         }
@@ -305,14 +308,14 @@ impl<'a> Objects<'a> {
 
 impl<'a> Objects<'a> {
     /// The entries of annotation `dict`: read as they are wanted the first time it
-    /// is looked at, and, once [`Objects::own`] has told of its object, as a shared
-    /// object's are, each read once and kept, so that an annotation a page's
-    /// `/Annots` names many times reads none of its entries again however long.
+    /// is looked at, and from the second on as a shared object's are, each read
+    /// once and kept, so that an annotation a page's `/Annots` names many times
+    /// reads none of its entries again however long, whatever its look comes to.
     pub(crate) fn annotation(&self, dict: Dict<'a>) -> Entries<'a> {
-        let seen = match (&self.read, dict.obj_id()) {
-            (Some(read), Some(id)) => read.places.borrow().contains_key(&ObjRef::from(id)),
-            _ => false,
-        };
+        let seen = self
+            .read
+            .as_ref()
+            .is_some_and(|read| !read.looked.borrow_mut().insert(place(dict.data())));
         let objects = Self {
             read: self.read.clone(),
             shared: self.shared || seen,

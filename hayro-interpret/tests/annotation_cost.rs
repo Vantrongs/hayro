@@ -1004,8 +1004,14 @@ fn text_that_cannot_reach_the_page_is_not_laid_out() {
 }
 
 /// The cost of looking `n` times at one annotation, `annot`, which a page's
-/// `/Annots` names `n` times.
+/// `/Annots` names `n` times, each look generating its appearance.
 fn repeated_cost(n: usize, annot: &str) -> Cost {
+    repeated_look_cost(n, annot, |look| matches!(look, Look::Generated(_)))
+}
+
+/// The cost of looking `n` times at one annotation, `annot`, which a page's
+/// `/Annots` names `n` times, each look as `expected` tells.
+fn repeated_look_cost(n: usize, annot: &str, expected: fn(&Look<'_>) -> bool) -> Cost {
     let pdf = Pdf::new(common::one_page(
         200,
         &format!("/Annots [{}]", vec!["4 0 R"; n].join(" ")),
@@ -1021,7 +1027,7 @@ fn repeated_cost(n: usize, annot: &str) -> Cost {
     let (bytes, work) = (allocated(), work_done());
     let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
     for a in &annots {
-        assert!(matches!(appearances.look(a, PAGE), Look::Generated(_)));
+        assert!(expected(&appearances.look(a, PAGE)));
     }
     Cost {
         bytes: allocated() - bytes,
@@ -1072,6 +1078,27 @@ fn a_text_held_in_an_annotation_named_again_is_not_read_again() {
             &annot[..30]
         );
     }
+}
+
+/// An annotation `/Annots` names many times is read once whatever its look comes
+/// to: one whose appearance is a long string, no dictionary, draws nothing before
+/// any generator runs, and is not read again for each time.
+#[test]
+fn an_annotation_that_draws_nothing_named_again_is_not_read_again() {
+    let annot = format!(
+        "/Subtype /Square /Rect [10 10 110 40] /C [1 0 0] /AP ({})",
+        "ABCD\\)efg".repeat(2_222)
+    );
+    let nothing = |look: &Look<'_>| matches!(look, Look::Nothing);
+    let (one, two) = (
+        repeated_look_cost(40, &annot, nothing),
+        repeated_look_cost(80, &annot, nothing),
+    );
+    let (bytes, work) = (two.bytes - one.bytes, two.work - one.work);
+    assert!(
+        bytes < 40 * (16 << 10) && work < 40 * 1_000,
+        "{one:?} for 40, {two:?} for 80"
+    );
 }
 
 /// A list whose options are drawn 0 high, as with a default appearance size of 0
