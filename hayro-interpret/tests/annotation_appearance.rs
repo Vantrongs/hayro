@@ -2784,3 +2784,56 @@ fn an_entry_written_null_is_absent_and_one_referred_to_is_there() {
         assert_eq!(widget(v, object), expected, "{v} ({object})");
     }
 }
+
+// `/Annots` arrays whose entries the reader reads as other objects than they look:
+// a dictionary followed by the word `stream`, a name with a bad escape. Each such
+// entry is null, as other unknown words are, and the annotations after it are
+// drawn, as `PyMuPDF` 1.28.2 bake draws them: nothing for the first, whose square is
+// written in the array and has no appearance stream, the red square of object 4
+// for the others. Listing, rendering and baking read them without a panic.
+#[test]
+fn damaged_annots_arrays_are_read_as_bake_reads_them() {
+    let square = b"<< /Type /Annot /Subtype /Square /Rect [20 20 100 100] /IC [1 0 0] >>";
+    for (annots, drawn) in [
+        (
+            "[<< /Subtype /Square /Rect [20 20 100 100] /IC [1 0 0] >> stream ]",
+            None,
+        ),
+        ("[/#GG 4 0 R]", Some(1)),
+        ("[<< /F 0 >> stream 4 0 R]", Some(2)),
+    ] {
+        let pdf = annotations(
+            &format!("/Resources << >> /Annots {annots}"),
+            vec![square.to_vec()],
+        );
+        let page = &pdf.pages()[0];
+        let appearances =
+            Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+        for selection in [VIEW, AnnotationSelection::Flatten] {
+            let listed: Vec<_> = appearances
+                .page(page, selection, PAGE)
+                .iter()
+                .map(|d| (d.index(), d.subtype() == Some(b"Square".as_slice())))
+                .collect();
+            assert_eq!(listed, Vec::from_iter(drawn.map(|i| (i, true))), "{annots}");
+        }
+        let fills = fills(&draw_objects_with(&pdf));
+        let red = [([21, 21, 100, 100], RED)];
+        assert_eq!(
+            fills,
+            if drawn.is_some() { &red[..] } else { &[] },
+            "{annots}"
+        );
+    }
+}
+
+/// What the first page of `pdf` draws, its annotations as viewed.
+fn draw_objects_with(pdf: &Pdf) -> Vec<Ev> {
+    let settings = InterpreterSettings {
+        annotations: VIEW,
+        ..Default::default()
+    };
+    let mut rec = Rec::default();
+    common::interpret_first_page(pdf, settings, &mut rec);
+    rec.0
+}

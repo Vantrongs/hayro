@@ -9,6 +9,7 @@
 use hayro_interpret::annotation::{Appearances, Drawn, Look, Unsupported, work_done};
 use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::hayro_syntax::page::Page;
+use hayro_interpret::hayro_syntax::work;
 use hayro_interpret::{AnnotationSelection, InterpreterSettings};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -1151,23 +1152,36 @@ struct Drew {
 }
 
 /// What reading a page's annotations and looking at them costs: bytes allocated,
-/// units of work, and seconds.
+/// units of work, bytes the file's readers looked at, and seconds.
 #[derive(Debug, Clone, Copy)]
 struct Listed {
     bytes: usize,
     work: u64,
+    examined: usize,
     secs: f64,
     drew: Drew,
 }
 
+/// The bytes the readers of this thread have looked at so far
+/// ([`hayro_interpret::hayro_syntax::work::EXAMINED`]).
+fn examined() -> usize {
+    work::EXAMINED.get()
+}
+
 /// The cost of `f`, given the appearances of `pdf`'s annotations, made inside.
 fn listed<'a>(pdf: &'a Pdf, f: impl FnOnce(&Appearances<'a>) -> Drew) -> Listed {
-    let (bytes, work, start) = (allocated(), work_done(), std::time::Instant::now());
+    let (bytes, work, looked, start) = (
+        allocated(),
+        work_done(),
+        examined(),
+        std::time::Instant::now(),
+    );
     let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
     let drew = f(&appearances);
     Listed {
         bytes: allocated() - bytes,
         work: work_done() - work,
+        examined: examined() - looked,
         secs: start.elapsed().as_secs_f64(),
         drew,
     }
@@ -1177,13 +1191,14 @@ fn listed<'a>(pdf: &'a Pdf, f: impl FnOnce(&Appearances<'a>) -> Drew) -> Listed 
 /// `bytes` and `work` at most for each, and no time that reading what they share
 /// again takes: a few hundredths of a second for 40 reads of a million bytes.
 fn costs_at_most(fewer: Listed, more: Listed, bytes: usize, work: u64, what: &str) {
-    let (b, w, s) = (
+    let (b, w, e, s) = (
         more.bytes.saturating_sub(fewer.bytes),
         more.work.saturating_sub(fewer.work),
+        more.examined.saturating_sub(fewer.examined),
         more.secs - fewer.secs,
     );
     if std::env::var_os("COST_REPORT").is_some() {
-        println!("CASE {what}: +40: {b} bytes, {w} work, {s:.4} s");
+        println!("CASE {what}: +40: {b} bytes, {w} work, {e} examined, {s:.4} s");
     }
     assert!(
         b < 40 * bytes && w < 40 * work && s < 0.25,
@@ -1410,4 +1425,150 @@ fn drew<'a>(appearances: &Appearances<'a>, page: &Page<'a>, visible: kurbo::Rect
         }
     }
     drew
+}
+
+/// The cost of `n` looks at one page whose `/Annots` is written in it: an
+/// annotation written there with a long unused entry, which draws nothing, and a
+/// square of its own; look `i` shows `view(i)`.
+fn inline_annots_cost(n: usize, view: impl Fn(usize) -> kurbo::Rect) -> Listed {
+    let pdf = Pdf::new(common::one_page(
+        200,
+        &format!(
+            "/Annots [<< /Type /Annot /Subtype /Square /C [0] /Rect [10 10 110 40] {} 0 >> 4 0 R]",
+            long_name()
+        ),
+        vec![b"<< /Type /Annot /Subtype /Square /C [0] /Rect [10 10 110 40] >>".to_vec()],
+    ))
+    .expect("valid pdf");
+    let page = &pdf.pages()[0];
+    listed(&pdf, |appearances| {
+        let mut all = Drew::default();
+        for i in 0..n {
+            all.generated += drew(appearances, page, view(i)).generated;
+        }
+        all
+    })
+}
+
+/// A page whose `/Annots` is written in it, looked at again, costs a lookup, and,
+/// shown otherwise, what it draws: the array and what is written in it are not
+/// read again.
+#[test]
+fn a_page_looked_at_again_reads_its_written_annotations_once() {
+    let (fewer, more) = (
+        inline_annots_cost(40, |_| PAGE),
+        inline_annots_cost(80, |_| PAGE),
+    );
+    assert_eq!(more.drew.generated, 80);
+    costs_at_most(fewer, more, 256, 8, "one view");
+    let view = |i: usize| kurbo::Rect::new(0.0, 0.0, 200.0 + i as f64 / 64.0, 200.0);
+    let (fewer, more) = (inline_annots_cost(40, view), inline_annots_cost(80, view));
+    assert_eq!(more.drew.generated, 80);
+    costs_at_most(fewer, more, 16 << 10, 1_000, "views of their own");
+}
+
+/// The cost of a page with `n` annotations, each with an appearance stream of its
+/// own, `5 0 m` of a box `bbox`, whose `/Length` is one shared object: a number of a
+/// million digits.
+fn shared_length_cost(n: usize, bbox: &str) -> Listed {
+    let mut objects = vec![long_number(5).into_bytes()];
+    for i in 0..n {
+        objects.push(
+            format!(
+                "<< /Type /Annot /Subtype /Square /Rect [10 10 110 40] /AP << /N {} 0 R >> >>",
+                5 + n + i
+            )
+            .into_bytes(),
+        );
+    }
+    for _ in 0..n {
+        objects.push(
+            format!("<< /Subtype /Form /BBox {bbox} /Length 4 0 R >>\nstream\n5 0 m\nendstream")
+                .into_bytes(),
+        );
+    }
+    let refs: Vec<String> = (0..n).map(|i| format!("{} 0 R", 5 + i)).collect();
+    let pdf = Pdf::new(common::one_page(
+        200,
+        &format!("/Annots [{}]", refs.join(" ")),
+        objects,
+    ))
+    .expect("valid pdf");
+    let page = &pdf.pages()[0];
+    listed(&pdf, |appearances| drew(appearances, page, PAGE))
+}
+
+/// Appearance streams that share their `/Length`, an object, read it once: each
+/// stream costs what its own dictionary holds, some 12 KiB allocated, from listing
+/// it to placing it, whether it draws or its box draws nothing; reading the shared
+/// million digits again would take a hundredth of a second a stream.
+#[test]
+fn streams_sharing_a_long_length_read_it_once() {
+    for (bbox, streams) in [("[0 0 10 10]", 1), ("[0 0 0 0]", 0)] {
+        let (fewer, more) = (shared_length_cost(40, bbox), shared_length_cost(80, bbox));
+        assert_eq!(more.drew.streams, 80 * streams, "{bbox}");
+        costs_at_most(fewer, more, 16 << 10, 1_000, bbox);
+        assert!(
+            more.examined - fewer.examined < 40 * 1_000,
+            "{bbox}: {fewer:?} {more:?}"
+        );
+    }
+}
+
+/// The cost of a page with `n` annotations that share their state, `/AS 4 0 R`, a
+/// name of `len` bytes, and their appearances, `/AP 5 0 R`, whose `/N` holds that
+/// state as `state`.
+fn shared_state_cost(n: usize, len: usize, state: &str) -> Listed {
+    let name = format!("/{}", "A".repeat(len));
+    let mut objects = vec![
+        name.clone().into_bytes(),
+        format!("<< /N << /Off 6 0 R {name} {state} >> >>").into_bytes(),
+        common::stream("/Subtype /Form /BBox [0 0 0 0]", b"0 0 m 10 10 l S"),
+    ];
+    objects.extend((0..n).map(|_| {
+        b"<< /Type /Annot /Subtype /Square /C [0] /Rect [10 10 110 40] /AS 4 0 R /AP 5 0 R >>"
+            .to_vec()
+    }));
+    let refs: Vec<String> = (0..n).map(|i| format!("{} 0 R", 7 + i)).collect();
+    let pdf = Pdf::new(common::one_page(
+        200,
+        &format!("/Annots [{}]", refs.join(" ")),
+        objects,
+    ))
+    .expect("valid pdf");
+    let page = &pdf.pages()[0];
+    listed(&pdf, |appearances| drew(appearances, page, PAGE))
+}
+
+/// Annotations that share a state, a long name, and the states it names one of,
+/// find what it draws once: each costs a lookup, whatever the name's length, for a
+/// state that is a stream that draws nothing and one that is no stream. No counter
+/// sees hashing and comparing the name, so the time tells: 200 more annotations
+/// that each hashed and compared a name of 8 MB would take a quarter of a second or
+/// more, where 200 lookups take a few milliseconds.
+#[test]
+fn annotations_sharing_a_long_state_find_it_once() {
+    for state in ["6 0 R", "1"] {
+        let len = 8 << 20;
+        let (fewer, more) = (
+            shared_state_cost(200, len, state),
+            shared_state_cost(400, len, state),
+        );
+        assert_eq!(more.drew, Drew::default(), "{state}");
+        let (bytes, work, looked, secs) = (
+            more.bytes - fewer.bytes,
+            more.work - fewer.work,
+            more.examined - fewer.examined,
+            more.secs - fewer.secs,
+        );
+        if std::env::var_os("COST_REPORT").is_some() {
+            println!(
+                "CASE {state}: +200: {bytes} bytes, {work} work, {looked} examined, {secs:.4} s"
+            );
+        }
+        assert!(
+            bytes < 200 * (16 << 10) && work < 200 * 1_000 && looked < 200 * 1_000 && secs < 0.1,
+            "{state}: {fewer:?} {more:?}"
+        );
+    }
 }

@@ -14,7 +14,7 @@
 use super::Unsupported;
 use hayro_syntax::hash;
 use hayro_syntax::object::{Array, Dict, MaybeRef, Name, Number, ObjRef, Object, Stream};
-use hayro_syntax::xref::XRef;
+use hayro_syntax::xref::{ContentKey, XRef};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -155,6 +155,12 @@ pub(crate) struct Source {
 }
 
 impl Source {
+    /// Whether the value is an object of its own, which entries that refer to it
+    /// share.
+    pub(crate) fn is_object(&self) -> bool {
+        matches!(self.held, Held::Object(_))
+    }
+
     /// Entry `key` absent, as [`Entries::source`] gives it.
     pub(crate) fn absent(key: &'static [u8]) -> Self {
         Self {
@@ -206,7 +212,9 @@ pub(crate) struct Objects<'a> {
 }
 
 /// Where a dictionary or array lies: its data, which the document holds while it is
-/// read, and its length.
+/// read, and its length, to tell whether one lies within another ([`Objects::own`]).
+/// What is read from one is keyed by its [`ContentKey`] instead, which also tells
+/// apart the same bytes decrypted for two objects.
 type Place = (usize, usize);
 
 /// Entries read of a dictionary, by key.
@@ -219,10 +227,10 @@ struct Read<'a> {
     xref: &'a XRef,
     objects: RefCell<hash::Map<ObjRef, Found<'a>>>,
     /// The entries read of dictionaries in shared objects.
-    entries: RefCell<hash::Map<Place, Keyed<'a>>>,
+    entries: RefCell<hash::Map<ContentKey<'a>, Keyed<'a>>>,
     /// The first entries read of arrays in shared objects, each with the object it
     /// refers to, and whether they are all.
-    prefixes: RefCell<hash::Map<Place, (Vec<Item<'a>>, bool)>>,
+    prefixes: RefCell<hash::Map<ContentKey<'a>, (Vec<Item<'a>>, bool)>>,
     /// Where the data of each object an annotation's own-ness was told by lies, or
     /// `None` when it is no dictionary, array or stream ([`Objects::own`]).
     places: RefCell<hash::Map<ObjRef, Option<Place>>>,
@@ -329,13 +337,16 @@ impl<'a> Objects<'a> {
     }
 }
 
-/// Which annotation an entry of a page's `/Annots` names, as a key for what a
-/// document makes of it once: the object it refers to, or where a dictionary
-/// written in the array lies. Reading the entry costs as much as finding this.
+/// Which annotation an entry of a page's `/Annots` names, or which `/Annots` array a
+/// page has, as a key for what a document makes of it once: the object it refers
+/// to, or what a dictionary or array written in place is read from
+/// ([`ContentKey`]): one key however many times it is read, as the body that holds
+/// it is parsed once, and another for the same bytes decrypted for another object.
+/// Reading the entry costs as much as finding this.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum Id {
+pub(crate) enum Id<'a> {
     Object(ObjRef),
-    Written(Place),
+    Written(ContentKey<'a>),
 }
 
 /// A page's `/Annots` array: the object it is, read only when its entries are
@@ -349,7 +360,7 @@ pub(crate) enum Annots<'a> {
 /// array, which annotation, and, for a dictionary written there, the dictionary.
 pub(crate) struct Listed<'a> {
     pub(crate) index: usize,
-    pub(crate) id: Id,
+    pub(crate) id: Id<'a>,
     written: Option<Dict<'a>>,
 }
 
@@ -441,11 +452,12 @@ impl<'a> Objects<'a> {
 }
 
 impl<'a> Annots<'a> {
-    /// The object the array is, when it is one.
-    pub(crate) fn object(&self) -> Option<ObjRef> {
+    /// Which array this is: the object it is, or what it is read from where it is
+    /// written in the page, which reading it again does not change.
+    pub(crate) fn id(&self) -> Id<'a> {
         match self {
-            Self::Object(r, _) => Some(*r),
-            Self::Written(_) => None,
+            Self::Object(r, _) => Id::Object(*r),
+            Self::Written(a) => Id::Written(a.content_key()),
         }
     }
 
@@ -472,12 +484,12 @@ impl<'a> Annots<'a> {
                     MaybeRef::Ref(r) => (Id::Object(r), None),
                     MaybeRef::NotRef(Object::Dict(d)) => {
                         super::work(d.data().len());
-                        (Id::Written(place(d.data())), Some(d))
+                        (Id::Written(d.content_key()), Some(d))
                     }
                     MaybeRef::NotRef(Object::Stream(s)) => {
                         let d = s.dict().clone();
                         super::work(d.data().len());
-                        (Id::Written(place(d.data())), Some(d))
+                        (Id::Written(d.content_key()), Some(d))
                     }
                     MaybeRef::NotRef(_) => return None,
                 };
@@ -609,7 +621,7 @@ impl<'a> Items<'a> {
             let refs = self.0.raw_iter().map(|e| e.as_obj_ref());
             return self.iter().zip(refs).take(n).collect();
         };
-        let at = place(self.0.data());
+        let at = self.0.content_key();
         let known = read.prefixes.borrow().get(&at).cloned();
         let found = match known {
             Some((found, all)) if all || found.len() >= n => found,
@@ -745,7 +757,7 @@ impl<'a> Entries<'a> {
         if !self.1.shared {
             return fresh();
         }
-        let at = place(self.0.data());
+        let at = self.0.content_key();
         let known = read
             .entries
             .borrow()
@@ -862,6 +874,12 @@ impl<'a> Entries<'a> {
             Held::In(self.id()?)
         };
         Some(Source { held, key })
+    }
+
+    /// What this dictionary is read from ([`ContentKey`]), the same however often it
+    /// is read.
+    pub(crate) fn content_key(&self) -> ContentKey<'a> {
+        self.0.content_key()
     }
 
     /// Whether this dictionary is an object of its own ([`Objects`]), rather than

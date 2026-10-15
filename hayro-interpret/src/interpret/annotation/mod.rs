@@ -44,7 +44,7 @@ use hayro_syntax::hash;
 use hayro_syntax::object::dict::keys::{AP, AS, BORDER, BS, C, CA, D, F, N, RECT, SUBTYPE, W};
 use hayro_syntax::object::{Name, ObjRef, Stream};
 use hayro_syntax::page::Page;
-use hayro_syntax::xref::XRef;
+use hayro_syntax::xref::{ContentKey, XRef};
 use kurbo::{Affine, Shape};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -243,11 +243,23 @@ enum Plan<'a> {
     /// An appearance generated for each area shown, from `annot`, read as its own
     /// the first time and as a shared object's after.
     Generate {
-        id: Id,
+        id: Id<'a>,
         annot: Entries<'a>,
         subtype: Option<Rc<Name<'a>>>,
         again: Cell<bool>,
     },
+}
+
+/// What the state an annotation's `/AS` names among its normal appearances comes to
+/// ([`Appearances::state`]).
+#[derive(Clone)]
+enum State<'a> {
+    /// A stream, its appearance.
+    Stream(StreamEntries<'a>),
+    /// There but no stream: the annotation draws nothing.
+    Nothing,
+    /// No such state, or no `/AS`: as if there were no appearance.
+    Absent,
 }
 
 /// What an annotation comes to before generating: an appearance stream, nothing,
@@ -309,15 +321,17 @@ struct Known<'a> {
     form: Option<Option<Entries<'a>>>,
     /// What each annotation pages list comes to, by which it is and the selection;
     /// `None` for one that draws nothing on any page.
-    plans: hash::Map<(Id, AnnotationSelection), Option<Rc<Plan<'a>>>>,
+    plans: hash::Map<(Id<'a>, AnnotationSelection), Option<Rc<Plan<'a>>>>,
     /// The appearances generated, by annotation and area shown.
-    generated: hash::Map<(Id, View), Option<Rc<Annotation<'a>>>>,
-    /// Of each `/Annots` array object, by selection, the annotations it lists that
-    /// may draw, each with its place.
-    lists: hash::Map<(ObjRef, AnnotationSelection), Plans<'a>>,
-    /// What a page whose `/Annots` is an array object draws, by the array, the
-    /// selection and the area shown.
-    pages: hash::Map<(ObjRef, AnnotationSelection, View), Rc<[Drawn<'a>]>>,
+    generated: hash::Map<(Id<'a>, View), Option<Rc<Annotation<'a>>>>,
+    /// Of each `/Annots` array, an object or written in a page, by selection, the
+    /// annotations it lists that may draw, each with its place.
+    lists: hash::Map<(Id<'a>, AnnotationSelection), Plans<'a>>,
+    /// What a page draws, by its `/Annots` array, the selection and the area shown.
+    pages: hash::Map<(Id<'a>, AnnotationSelection, View), Rc<[Drawn<'a>]>>,
+    /// The states `/AS` entries held in objects of their own name, by the
+    /// dictionary of states and the entry ([`Appearances::state`]).
+    states: hash::Map<(ContentKey<'a>, Source), State<'a>>,
     fields: hash::Map<ObjRef, Option<Field<'a>>>,
     /// Text set in its fonts, by what it is made of.
     shaped: hash::Map<TextKey, Result<Rc<Shaped>, Unsupported>>,
@@ -419,9 +433,9 @@ impl<'a> Appearances<'a> {
     ///
     /// What an annotation comes to is found once for the document, by the object
     /// it is or where it is written, the selection and the area shown, however many
-    /// times pages list it; and what a page whose `/Annots` is an array object
-    /// draws, by the array, the selection and the area shown. A page listing again
-    /// what was found costs a lookup, whatever it holds and whatever it draws.
+    /// times pages list it; and what a page draws, by its `/Annots` array, an object
+    /// or written in the page, the selection and the area shown. A page listing
+    /// again what was found costs a lookup, whatever it holds and whatever it draws.
     pub fn page(
         &self,
         page: &Page<'a>,
@@ -432,10 +446,7 @@ impl<'a> Appearances<'a> {
             return Rc::from([]);
         };
         let view = view(visible);
-        let Some(array) = annots.object() else {
-            let plans = self.plans(&annots, selection);
-            return self.drawn(&plans, visible, view).into();
-        };
+        let array = annots.id();
         self.once(
             |k| &mut k.pages,
             Some((array, selection, view)),
@@ -566,17 +577,10 @@ impl<'a> Appearances<'a> {
                 // the data of a stream after it in the file.
                 let stream = match ap.get(N) {
                     Value::Stream(stream) => Some(stream),
-                    Value::Dict(states) => match annot.name(AS) {
-                        Some(state) => match states.get(&state) {
-                            Value::Stream(stream) => Some(stream),
-                            // A state that is there but is no stream, a reference to
-                            // no object among them, draws nothing (observed).
-                            _ if states.present(&state) => {
-                                return Prepared::Look(Look::Nothing);
-                            }
-                            _ => None,
-                        },
-                        None => None,
+                    Value::Dict(states) => match self.state(annot, &states) {
+                        State::Stream(stream) => Some(stream),
+                        State::Nothing => return Prepared::Look(Look::Nothing),
+                        State::Absent => None,
                     },
                     _ => None,
                 };
@@ -594,6 +598,30 @@ impl<'a> Appearances<'a> {
             _ => return self.not_a_dictionary(annot),
         }
         self.to_generate(annot)
+    }
+
+    /// The state `annot`'s `/AS` names among `states`, its normal appearances, found
+    /// once for the document for each `/AS` held in an object of its own and each
+    /// dictionary of states: annotations that share both find it by a lookup, which
+    /// neither hashes nor compares the name, however long.
+    fn state(&self, annot: &Entries<'a>, states: &Entries<'a>) -> State<'a> {
+        let find = || {
+            let Some(state) = annot.name(AS) else {
+                return State::Absent;
+            };
+            match states.get(&state) {
+                Value::Stream(stream) => State::Stream(stream),
+                // A state that is there but is no stream, a reference to no object
+                // among them, draws nothing (observed).
+                _ if states.present(&state) => State::Nothing,
+                _ => State::Absent,
+            }
+        };
+        let key = annot
+            .source(AS)
+            .filter(|s| s.is_object())
+            .map(|s| (states.content_key(), s));
+        self.once(|k| &mut k.states, key, find)
     }
 
     /// What `annot`, whose `/AP` is neither a dictionary nor absent, comes to:
