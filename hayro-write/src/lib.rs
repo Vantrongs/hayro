@@ -13,7 +13,6 @@ mod log;
 
 mod primitive;
 
-use crate::primitive::{WriteDirect, WriteIndirect};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use hayro_syntax::hash;
@@ -245,8 +244,11 @@ struct ExtractionContext<'a> {
     chunks: Vec<Chunk>,
     /// What a reference to each body an entry leads to is written as
     /// ([`hayro_syntax::xref::XRef::content_key`]), for every entry leading to it:
-    /// its copy's reference, or `None` for `null`, where it cannot be read.
-    copies: hash::Map<ContentKey<'a>, Option<Ref>>,
+    /// its copy's reference, or [`Self::null`]'s, where it cannot be read.
+    copies: hash::Map<ContentKey<'a>, Ref>,
+    /// The object that is `null`, which references to objects that cannot be read
+    /// refer to, once written.
+    null: Option<Ref>,
     /// The bodies left to copy, each once: an entry leading to it, its copy, and the
     /// index of the page whose copy refers to it first.
     to_copy: Vec<(ObjRef, Ref, usize)>,
@@ -292,6 +294,7 @@ impl<'a> ExtractionContext<'a> {
         Self {
             chunks: vec![],
             copies: hash::Map::default(),
+            null: None,
             to_copy: Vec::new(),
             page: 0,
             shared_streams: hash::Map::default(),
@@ -319,6 +322,19 @@ impl<'a> ExtractionContext<'a> {
         (self.new_ref)()
     }
 
+    /// The object that is `null`, written the first time it is asked for.
+    pub(crate) fn null(&mut self) -> Ref {
+        if let Some(null) = self.null {
+            return null;
+        }
+        let null = self.new_ref();
+        let mut chunk = Chunk::with_settings(self.chunk_settings);
+        chunk.indirect(null).primitive(pdf_writer::Null);
+        self.push(chunk);
+        self.null = Some(null);
+        null
+    }
+
     /// Records that part of the source could not be read whole.
     pub(crate) fn fail(&mut self, error: ExtractionError) {
         self.error.get_or_insert(error);
@@ -331,9 +347,9 @@ fn write_dependencies(pdf: &Pdf, ctx: &mut ExtractionContext<'_>) {
     while let Some((source, copy, page)) = ctx.to_copy.pop() {
         ctx.page = page;
         let (written, lost) = pdf.xref().watch(|| {
-            let object = pdf.xref().get::<Object<'_>>(source.into())?;
+            let object = pdf.xref().written(source.into())?;
             let mut chunk = Chunk::with_settings(ctx.chunk_settings);
-            object.write_indirect(&mut chunk, copy, ctx);
+            primitive::write_indirect(&object, &mut chunk, copy, ctx);
             ctx.push(chunk);
             Some(())
         });
@@ -492,8 +508,8 @@ fn write_page<'a>(
 
     let raw_dict = page.raw();
 
-    if let Some(group) = raw_dict.get_raw::<Object<'_>>(GROUP) {
-        group.write_direct(pdf_page.insert(Name(GROUP)), ctx);
+    if let Some(group) = raw_dict.get_written(GROUP) {
+        primitive::write(&group, pdf_page.insert(Name(GROUP)), ctx);
     }
 
     serialize_resources(page.resources(), ctx, &mut pdf_page);
@@ -579,8 +595,8 @@ fn copy_xobject<'a>(
 
     let raw_dict = page.raw();
 
-    if let Some(group) = raw_dict.get_raw::<Object<'_>>(GROUP) {
-        group.write_direct(x_object.insert(Name(GROUP)), ctx);
+    if let Some(group) = raw_dict.get_written(GROUP) {
+        primitive::write(&group, x_object.insert(Name(GROUP)), ctx);
     }
 
     x_object.finish();
@@ -710,8 +726,8 @@ fn category_copy<'a>(category: &Dict<'a>, ctx: &mut ExtractionContext<'a>) -> Re
     ctx.resource_categories.insert(key, copy);
     let mut chunk = Chunk::with_settings(ctx.chunk_settings);
     let mut output = chunk.indirect(copy).dict();
-    for (name, obj) in category.entries() {
-        obj.write_direct(output.insert(Name(name.deref())), ctx);
+    for (name, obj) in category.written() {
+        primitive::write(&obj, output.insert(Name(name.deref())), ctx);
     }
     output.finish();
     ctx.push(chunk);

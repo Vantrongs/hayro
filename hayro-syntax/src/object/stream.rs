@@ -15,7 +15,7 @@ use crate::object::Name;
 use crate::object::dict::InlineImageDict;
 use crate::object::dict::keys::{DECODE_PARMS, DP, F, FILTER, IDENTITY, LENGTH, NAME, TYPE};
 use crate::object::{Array, MaybeRef, ObjectIdentifier};
-use crate::object::{Object, ObjectLike, ObjectRefLike};
+use crate::object::{Object, ObjectLike, ObjectRefLike, Written};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::sync::Arc;
@@ -51,7 +51,7 @@ pub struct FilterEntries<'a> {
 enum List<'a> {
     None,
     /// A filter given by name, as written.
-    Named(MaybeRef<Object<'a>>),
+    Named(Written<'a>),
     Listed(Array<'a>),
 }
 
@@ -63,10 +63,10 @@ pub struct FilterEntry<'a> {
     /// object, or a name of no filter.
     pub filter: Option<Filter>,
     /// The entry as written.
-    pub written: MaybeRef<Object<'a>>,
+    pub written: Written<'a>,
     /// The entry of the parameters in the same place, as written; `None` where
     /// they have none there.
-    pub params_written: Option<MaybeRef<Object<'a>>>,
+    pub params_written: Option<Written<'a>>,
     /// The parameters, resolved: empty where they are no dictionary.
     pub params: Dict<'a>,
     /// Whether the parameters are reached through a reference: their entry, or
@@ -90,7 +90,7 @@ impl<'a> FilterEntries<'a> {
             Some(_) => DP,
         };
         let (key, list) = if let Some(key) = named(F).or_else(|| named(FILTER)) {
-            let written = dict.get_raw::<Object<'a>>(key);
+            let written = dict.get_written(key);
             (key, written.map_or(List::None, List::Named))
         } else if let Some(key) = listed(F).or_else(|| listed(FILTER)) {
             let array = dict.get::<Array<'a>>(key);
@@ -110,22 +110,24 @@ impl<'a> FilterEntries<'a> {
     pub fn entries(&self) -> impl Iterator<Item = FilterEntry<'a>> + '_ {
         let dict = &self.dict;
         // Each written entry resolved in the context of the object holding it.
-        let entry = |written: MaybeRef<Object<'a>>,
+        let entry = |written: Written<'a>,
                      ctx: &ReaderContext<'a>,
-                     params_written: Option<(MaybeRef<Object<'a>>, &ReaderContext<'a>)>,
+                     params_written: Option<(Written<'a>, &ReaderContext<'a>)>,
                      listed_by_reference: bool| {
-            let filter = written
-                .clone()
-                .resolve(ctx)
-                .and_then(Object::into_name)
-                .and_then(Filter::from_name);
+            let filter = match &written {
+                Written::Ref(r) => ctx.xref().get_with::<Name<'a>>((*r).into(), ctx),
+                Written::Name(name) => Some(name.clone()),
+                _ => None,
+            }
+            .and_then(Filter::from_name);
             let params_by_reference =
-                listed_by_reference || matches!(params_written, Some((MaybeRef::Ref(_), _)));
-            let params = params_written
-                .clone()
-                .and_then(|(p, ctx)| p.resolve(ctx))
-                .and_then(Object::into_dict)
-                .unwrap_or_default();
+                listed_by_reference || matches!(params_written, Some((Written::Ref(_), _)));
+            let params = match &params_written {
+                Some((Written::Ref(r), ctx)) => ctx.xref().get_with::<Dict<'a>>((*r).into(), ctx),
+                Some((Written::Dict(dict), _)) => Some(dict.clone()),
+                _ => None,
+            }
+            .unwrap_or_default();
             FilterEntry {
                 filter,
                 written,
@@ -137,7 +139,7 @@ impl<'a> FilterEntries<'a> {
         let (named, listed) = match &self.list {
             List::None => (None, None),
             List::Named(written) => {
-                let params = dict.get_raw::<Object<'a>>(self.params_key);
+                let params = dict.get_written(self.params_key);
                 let params = params.map(|p| (p, dict.ctx()));
                 (
                     Some(entry(written.clone(), dict.ctx(), params, false)),
@@ -147,8 +149,8 @@ impl<'a> FilterEntries<'a> {
             List::Listed(filters) => {
                 let by_reference = dict.get_ref(self.params_key).is_some();
                 let params = dict.get::<Array<'a>>(self.params_key);
-                let mut params_written = params.as_ref().map(Array::raw_iter);
-                let entries = filters.raw_iter().map(move |written| {
+                let mut params_written = params.as_ref().map(Array::written);
+                let entries = filters.written().map(move |written| {
                     let params_written = params_written
                         .as_mut()
                         .and_then(Iterator::next)

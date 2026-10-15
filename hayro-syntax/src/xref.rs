@@ -14,9 +14,10 @@ use crate::object::dict::keys::{
     OCPROPERTIES, PAGES, PREV, PRODUCER, ROOT, SIZE, SUBJECT, TITLE, TYPE, VERSION, W, XREF_STM,
 };
 use crate::object::indirect::IndirectObject;
+use crate::object::parsed::Top;
 use crate::object::{Array, MaybeRef};
 use crate::object::{DateTime, Dict};
-use crate::object::{Object, ObjectLike};
+use crate::object::{Object, ObjectLike, Written};
 use crate::pdf::PdfVersion;
 use crate::reader::Reader;
 use crate::reader::{Link, Readable, ReaderContext, ReaderExt};
@@ -1091,7 +1092,7 @@ impl XRef {
             Ok((place, data, slot)) => match data.get(place.at..slot.end) {
                 Some(body) => Some(ContentKey::new(body, &entered)),
                 // Past the bytes: nothing can be read there, which the read tells.
-                None => self.read(id, &ctx, Taken::Either).and(None),
+                None => self.read::<Object<'_>>(id, &ctx, Taken::Either).and(None),
             },
             Err(Unread::Rejected) => None,
             Err(Unread::Lost(lost)) => {
@@ -1183,7 +1184,7 @@ impl XRef {
         T: ObjectLike<'a>,
     {
         let taken = if T::STREAM { Taken::Whole } else { Taken::Dict };
-        self.read(id, ctx, taken)?.cast()
+        self.read::<Object<'a>>(id, ctx, taken)?.cast()
     }
 
     /// Object `id`, read from `ctx` as [`Self::get_with`] reads any object, but a
@@ -1194,7 +1195,15 @@ impl XRef {
         id: ObjectIdentifier,
         ctx: &ReaderContext<'a>,
     ) -> Option<Object<'a>> {
-        self.read(id, ctx, Taken::Either)
+        self.read::<Object<'a>>(id, ctx, Taken::Either)
+    }
+
+    /// The object with the given identifier as the file writes it ([`Written`]), for
+    /// a copy: `None` where [`Self::get`] reads no object, a stream whose data cannot
+    /// be read included, which is lost.
+    pub fn written(&self, id: ObjectIdentifier) -> Option<Written<'_>> {
+        let ctx = ReaderContext::new(self, false);
+        self.read::<Written<'_>>(id, &ctx, Taken::Whole)
     }
 
     /// The object entry `id` leads to, read from `ctx`, a stream taken as `taken`
@@ -1202,12 +1211,12 @@ impl XRef {
     /// body or what reading it needs as a cycle ([`Link`]), or where it is lost, which
     /// the computation being watched is told: every read of an object goes through
     /// here.
-    fn read<'a>(
+    fn read<'a, O: Made<'a>>(
         &'a self,
         id: ObjectIdentifier,
         ctx: &ReaderContext<'a>,
         taken: Taken,
-    ) -> Option<Object<'a>> {
+    ) -> Option<O> {
         let (repr, entry, entered) = self.entry(id, ctx)?;
         match self.body(repr, id, entry, ctx, &entered, taken) {
             Ok(object) => Some(object),
@@ -1223,7 +1232,7 @@ impl XRef {
     /// the entry from `ctx` ([`Self::entry`]): the object its body holds, read once
     /// for every entry leading to the same place and every read. A body `ctx`'s chain
     /// is reading already is a cycle, through whichever entry it is reached.
-    fn body<'a>(
+    fn body<'a, O: Made<'a>>(
         &'a self,
         repr: &'a SomeRepr,
         id: ObjectIdentifier,
@@ -1231,7 +1240,7 @@ impl XRef {
         ctx: &ReaderContext<'a>,
         entered: &ReaderContext<'a>,
         taken: Taken,
-    ) -> Result<Object<'a>, Unread> {
+    ) -> Result<O, Unread> {
         let (place, data, slot) = self.place(repr, id, entry, entered)?;
         let link = place.link();
         if ctx.rejects(&link) {
@@ -1249,7 +1258,7 @@ impl XRef {
     /// `ctx` whose chain holds the body: read once for every entry leading there and
     /// every read.
     #[allow(clippy::too_many_arguments)]
-    fn at_place<'a>(
+    fn at_place<'a, O: Made<'a>>(
         &'a self,
         repr: &'a SomeRepr,
         id: ObjectIdentifier,
@@ -1258,7 +1267,7 @@ impl XRef {
         ctx: &ReaderContext<'a>,
         entered: &ReaderContext<'a>,
         taken: Taken,
-    ) -> Result<Object<'a>, Unread> {
+    ) -> Result<O, Unread> {
         let kept = repr.shapes.get().get(&place).cloned();
         let shape = match kept {
             Some(shape) => shape,
@@ -1276,7 +1285,7 @@ impl XRef {
         };
         match shape {
             body::Shape::Unreadable => Err(Unread::Lost(id)),
-            body::Shape::Value(node) => Ok(node.object(data, entered)),
+            body::Shape::Value(top) => Ok(O::value(&top, data, entered)),
             body::Shape::Stream {
                 dict: shape,
                 end,
@@ -1284,7 +1293,7 @@ impl XRef {
             } => {
                 let dict = Dict::parsed(data, shape.clone(), entered);
                 if taken == Taken::Dict {
-                    return Ok(Object::Dict(dict));
+                    return Ok(O::dict(dict));
                 }
                 let found = match kept {
                     Some((found, lost)) => {
@@ -1314,12 +1323,10 @@ impl XRef {
                 };
                 match (found, taken) {
                     (Some((from, _, cut)), Taken::Contained) => {
-                        Ok(Object::Stream(Stream::new(&data[from..cut], dict)))
+                        Ok(O::stream(Stream::new(&data[from..cut], dict)))
                     }
-                    (Some((from, to, _)), _) => {
-                        Ok(Object::Stream(Stream::new(&data[from..to], dict)))
-                    }
-                    (None, Taken::Either) => Ok(Object::Dict(dict)),
+                    (Some((from, to, _)), _) => Ok(O::stream(Stream::new(&data[from..to], dict))),
+                    (None, Taken::Either) => Ok(O::dict(dict)),
                     (None, _) => Err(Unread::Lost(id)),
                 }
             }
@@ -1417,7 +1424,9 @@ impl XRef {
             }
             let mut entered = Self::entered(ctx, stream, repr, entry);
             entered.parent_chain_push(link);
-            let read = |taken| self.at_place(repr, stream, entry, place, ctx, &entered, taken);
+            let read = |taken| {
+                self.at_place::<Object<'_>>(repr, stream, entry, place, ctx, &entered, taken)
+            };
             match read(Taken::Contained) {
                 Ok(Object::Stream(contained)) => {
                     // Cut data end where the stream's go on.
@@ -1716,6 +1725,45 @@ pub(crate) enum XRefInput<'a> {
     /// Note that this won't work if the document is encrypted, as we
     /// can't access the crypto dictionary.
     RootRef(ObjectIdentifier),
+}
+
+/// What a read of an object makes of what its body holds: the object, or the
+/// object as the file writes it ([`Written`]).
+trait Made<'a> {
+    /// An object that is no stream, parsed as `top` in `data`, read in `ctx`.
+    fn value(top: &Top, data: &'a [u8], ctx: &ReaderContext<'a>) -> Self;
+    /// A stream's dictionary, taken without the data.
+    fn dict(dict: Dict<'a>) -> Self;
+    /// A stream.
+    fn stream(stream: Stream<'a>) -> Self;
+}
+
+impl<'a> Made<'a> for Object<'a> {
+    fn value(top: &Top, data: &'a [u8], ctx: &ReaderContext<'a>) -> Self {
+        top.object(data, ctx)
+    }
+
+    fn dict(dict: Dict<'a>) -> Self {
+        Self::Dict(dict)
+    }
+
+    fn stream(stream: Stream<'a>) -> Self {
+        Self::Stream(stream)
+    }
+}
+
+impl<'a> Made<'a> for Written<'a> {
+    fn value(top: &Top, data: &'a [u8], ctx: &ReaderContext<'a>) -> Self {
+        top.written(data, ctx)
+    }
+
+    fn dict(dict: Dict<'a>) -> Self {
+        Self::Dict(dict)
+    }
+
+    fn stream(stream: Stream<'a>) -> Self {
+        Self::Stream(stream)
+    }
 }
 
 pub(crate) fn find_last_xref_pos(data: &[u8]) -> Option<usize> {
@@ -2948,10 +2996,9 @@ mod tests {
         out
     }
 
-    // A page holding a name whose escapes are not hex, which reading a dictionary
-    // skips, is read whether its table is sound or rebuilt, and so is one holding such
-    // a name in a dictionary in it: checking the table and rebuilding it read each
-    // object as reading it does, and a dictionary is read alike wherever it is.
+    // A page holding a name whose `#` is no escape is read as one holding a name
+    // without it, whether its table is sound or rebuilt: the name is a name, as
+    // `MuPDF` reads it (`PyMuPDF` 1.28.2), here a key without a value.
     #[test]
     fn a_page_holding_a_name_that_is_no_key_is_read() {
         let content = stream("", BLUE);
@@ -2960,14 +3007,12 @@ mod tests {
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] /Contents 4 0 R \
              /Resources << /Broken#zz >> >>",
             "<< /Type /Page /Parent 2 0 R /Broken#zz /MediaBox [0 0 600 700] /Contents 4 0 R >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] /Contents 4 0 R /Broken#zz 5 >>",
         ] {
             for broken in [false, true] {
-                let file = file_of(&[CATALOG, TREE, page, &content], broken);
-                assert_eq!(
-                    one_page(file),
-                    (600.0, 700.0, BLUE.as_bytes().to_vec()),
-                    "{page}, rebuilt: {broken}"
-                );
+                let unescaped = page.replace("#zz", "zz");
+                let read = |page: &str| one_page(file_of(&[CATALOG, TREE, page, &content], broken));
+                assert_eq!(read(page), read(&unescaped), "{page}, rebuilt: {broken}");
             }
         }
     }

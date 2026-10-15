@@ -139,3 +139,6 @@ html5ever = { git = "https://github.com/Vantrongs/html5ever", rev = "7c13a4e871b
 # 4,096 lists by a fixed one, so that attribute names chosen to share a list do
 # not make interning them quadratic.
 string_cache = { git = "https://github.com/Vantrongs/string-cache", rev = "0099c3e9efeb7eb9730da33e21f516caeaf8842a" }
+# `NumberToken`, which writes a copied number as its source writes it: an i32 or
+# f32 cannot hold `4294967297`, `5.0` or `--5` as viewers read them.
+pdf-writer = { git = "https://github.com/Vantrongs/pdf-writer", rev = "daf9012abec3d7284d756c48ae9d5e5e01cf18b6" }

@@ -82,11 +82,12 @@ impl<'a> Name<'a> {
         Self(Bytes::Borrowed(data))
     }
 
-    /// Create a new name from bytes that may contain escape sequences.
+    /// Create a new name from bytes that may contain escape sequences
+    /// ([`unescape`]).
     #[inline]
     pub fn new_escaped(data: &'a [u8]) -> Option<Self> {
         let mut result = SmallVec::new();
-        unescape(data, |b| result.push(b))?;
+        unescape(data, |b| result.push(b));
         Some(Self(Bytes::decoded(result)))
     }
 
@@ -145,31 +146,39 @@ impl<'a> Readable<'a> for Name<'a> {
 
 /// Reads a name, after its solidus where `solidus`, or an operator of a content
 /// stream, which is read as a name without one: its bytes, whose `#` escapes are
-/// hex. A token of regular characters with other escapes is none.
+/// decoded where they are read ([`unescape`]).
 pub(crate) fn lex_name_like<'a>(r: &mut Reader<'a>, solidus: bool) -> Option<&'a [u8]> {
     let start = r.offset() + usize::from(solidus);
     skip_name_like(r, solidus)?;
-    let data = r.range(start..r.offset())?;
-    if data.contains(&b'#') {
-        unescape(data, |_| {})?;
-    }
-    Some(data)
+    r.range(start..r.offset())
 }
 
-/// Decodes the `#` escapes of a name's bytes into `out`; `None` where one is not
-/// two hex digits.
+/// Decodes the `#` escapes of a name's bytes into `out`, as `MuPDF` reads them
+/// (`PyMuPDF` 1.28.2): a `#` and two hex digits is the byte they make, but for 0,
+/// which no name holds; any other `#` is itself (`/A#2`, `/A#G1` and `/A#00` are
+/// `A#2`, `A#G1` and `A#00`, and `/A##41` is `A#A`).
 #[inline]
-fn unescape(data: &[u8], mut out: impl FnMut(u8)) -> Option<()> {
-    let mut r = Reader::new(data);
-    while let Some(b) = r.read_byte() {
-        if b == b'#' {
-            let hex = r.read_bytes(2)?;
-            out(decode_hex_digit(hex[0])? << 4 | decode_hex_digit(hex[1])?);
-        } else {
-            out(b);
+fn unescape(data: &[u8], mut out: impl FnMut(u8)) {
+    let mut at = 0;
+    while let Some(&b) = data.get(at) {
+        let byte = (b == b'#')
+            .then(|| {
+                let hex = data.get(at + 1..at + 3)?;
+                let byte = decode_hex_digit(hex[0])? << 4 | decode_hex_digit(hex[1])?;
+                (byte != 0).then_some(byte)
+            })
+            .flatten();
+        match byte {
+            Some(byte) => {
+                out(byte);
+                at += 3;
+            }
+            None => {
+                out(b);
+                at += 1;
+            }
         }
     }
-    Some(())
 }
 
 // This method is shared by `Name` and the parser for content stream operators (which behave like
@@ -225,13 +234,31 @@ mod tests {
         );
     }
 
+    // A `#` that is not an escape is itself, as `MuPDF` reads it (`PyMuPDF` 1.28.2).
     #[test]
     fn name_3() {
-        assert!(
-            Reader::new("/AB#FG".as_bytes())
-                .read_without_context::<Name<'_>>()
-                .is_none()
-        );
+        for (written, read) in [
+            ("/AB#FG", &b"AB#FG"[..]),
+            ("/A#2", b"A#2"),
+            ("/A#", b"A#"),
+            ("/A#G1", b"A#G1"),
+            ("/A#4G", b"A#4G"),
+            ("/A##41", b"A#A"),
+            ("/#", b"#"),
+            ("/A#00", b"A#00"),
+            ("/A#g1", b"A#g1"),
+            ("/A#61", b"Aa"),
+            ("/A#2F", b"A/"),
+        ] {
+            assert_eq!(
+                Reader::new(written.as_bytes())
+                    .read_without_context::<Name<'_>>()
+                    .unwrap()
+                    .deref(),
+                read,
+                "{written}"
+            );
+        }
     }
 
     #[test]

@@ -15,7 +15,7 @@ use crate::object::array::parse_array_with;
 use crate::object::dict::{new_offsets, parse_dict_with};
 use crate::object::{
     Array, Bytes, Dict, MAX_OBJECT_NESTING_DEPTH, MaybeRef, Name, Null, Number, ObjRef, Object,
-    ObjectLike, String, leaf,
+    ObjectLike, String, Written, leaf,
 };
 use crate::reader::{Reader, ReaderContext, ReaderExt};
 use crate::sync::Arc;
@@ -24,6 +24,11 @@ use alloc::vec::Vec;
 
 /// Where bytes are, from and up to, in the bytes of what holds them.
 pub(crate) type Span = (usize, usize);
+
+/// Where a number's bytes are, from and up to, in the bytes of what holds it, in 32
+/// bits each, so that a number's node is no larger than a string's: a dictionary,
+/// an array or an object of 4 GiB or more that holds a number does not parse.
+type Token = (u32, u32);
 
 /// The bytes of a string or name: where they are, or decoded.
 #[derive(Clone)]
@@ -67,7 +72,9 @@ impl Text {
 pub(crate) enum Node {
     Null,
     Boolean(bool),
-    Number(Number),
+    /// A number, and where its bytes are, which a copy writes
+    /// ([`crate::object::Written`]).
+    Number(Number, Token),
     /// A reference, which only an item or a value is.
     Ref(ObjRef),
     String(Text),
@@ -128,17 +135,23 @@ impl<'a> Parse<'_, 'a> {
                 Some(Node::Dict(Arc::new(self.dict(r, start, depth)?)))
             }
             b'[' => Some(Node::Array(Arc::new(self.array(r, start, depth)?))),
-            _ => Some(match leaf(r, false, self.ctx)? {
-                Object::Null(_) => Node::Null,
-                Object::Boolean(value) => Node::Boolean(value),
-                Object::Number(number) => Node::Number(number),
-                Object::String(string) => {
-                    Node::String(Text::of(string.into_bytes(), self.data, start))
-                }
-                Object::Name(name) => Node::Name(Text::of(name.into_bytes(), self.data, start)),
-                // A token is none of these.
-                Object::Array(_) | Object::Dict(_) | Object::Stream(_) => return None,
-            }),
+            _ => {
+                let at = r.offset();
+                Some(match leaf(r, false, self.ctx)? {
+                    Object::Null(_) => Node::Null,
+                    Object::Boolean(value) => Node::Boolean(value),
+                    Object::Number(number) => {
+                        let place = |offset: usize| u32::try_from(offset - start).ok();
+                        Node::Number(number, (place(at)?, place(r.offset())?))
+                    }
+                    Object::String(string) => {
+                        Node::String(Text::of(string.into_bytes(), self.data, start))
+                    }
+                    Object::Name(name) => Node::Name(Text::of(name.into_bytes(), self.data, start)),
+                    // A token is none of these.
+                    Object::Array(_) | Object::Dict(_) | Object::Stream(_) => return None,
+                })
+            }
         }
     }
 
@@ -215,29 +228,74 @@ impl<'a> Parse<'_, 'a> {
     }
 }
 
-impl Node {
+/// An object parsed where a body holds it: its node, and where it starts in the
+/// bytes it is read from, which where its parts are is kept relative to.
+#[derive(Clone)]
+pub(crate) struct Top {
+    at: usize,
+    node: Node,
+}
+
+impl Top {
     /// The object `r` is at in `data`, read in `ctx` as reading an object reads it
-    /// (`Object::read`), a reference being a number: where it is is kept relative to
-    /// the start of `data`.
+    /// (`Object::read`), a reference being a number.
     pub(crate) fn read<'a>(
         r: &mut Reader<'a>,
         data: &'a [u8],
         ctx: &ReaderContext<'a>,
     ) -> Option<Self> {
-        Parse { data, ctx }.object(r, 0, 0)
+        let at = r.offset();
+        let node = Parse { data, ctx }.object(r, at, 0)?;
+        Some(Self { at, node })
     }
 
+    /// The dictionary `dict`, parsed where it is kept relative to the start of the
+    /// bytes it is read from.
+    pub(crate) fn dict(dict: Arc<DictNode>) -> Self {
+        Self {
+            at: 0,
+            node: Node::Dict(dict),
+        }
+    }
+
+    /// The object, read from `data`, which it was parsed in, in `ctx`.
+    pub(crate) fn object<'a>(&self, data: &'a [u8], ctx: &ReaderContext<'a>) -> Object<'a> {
+        self.node.object(&data[self.at..], ctx)
+    }
+
+    /// The object as written ([`Written`]), read from `data`, which it was parsed
+    /// in, in `ctx`.
+    pub(crate) fn written<'a>(&self, data: &'a [u8], ctx: &ReaderContext<'a>) -> Written<'a> {
+        self.node.written(&data[self.at..], ctx)
+    }
+}
+
+impl Node {
     /// The object, held in `data`, read in `ctx`; `null` for a reference, which only
     /// [`Self::item`] reads.
     pub(crate) fn object<'a>(&self, data: &'a [u8], ctx: &ReaderContext<'a>) -> Object<'a> {
         match self {
             Self::Null | Self::Ref(_) => Object::Null(Null),
             Self::Boolean(value) => Object::Boolean(*value),
-            Self::Number(number) => Object::Number(*number),
+            Self::Number(number, _) => Object::Number(*number),
             Self::String(text) => Object::String(String::from_bytes(text.bytes(data))),
             Self::Name(text) => Object::Name(Name::from_bytes(text.bytes(data))),
             Self::Array(array) => Object::Array(Array::parsed(data, array.clone(), ctx)),
             Self::Dict(dict) => Object::Dict(Dict::parsed(data, dict.clone(), ctx)),
+        }
+    }
+
+    /// The item, held in `data`, read in `ctx`, as written ([`Written`]).
+    pub(crate) fn written<'a>(&self, data: &'a [u8], ctx: &ReaderContext<'a>) -> Written<'a> {
+        match self {
+            Self::Ref(reference) => Written::Ref(*reference),
+            Self::Number(_, (from, to)) => Written::Number(&data[*from as usize..*to as usize]),
+            Self::Null => Written::Null,
+            Self::Boolean(value) => Written::Boolean(*value),
+            Self::String(text) => Written::String(String::from_bytes(text.bytes(data))),
+            Self::Name(text) => Written::Name(Name::from_bytes(text.bytes(data))),
+            Self::Array(array) => Written::Array(Array::parsed(data, array.clone(), ctx)),
+            Self::Dict(dict) => Written::Dict(Dict::parsed(data, dict.clone(), ctx)),
         }
     }
 

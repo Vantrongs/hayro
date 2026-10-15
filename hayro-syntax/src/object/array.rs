@@ -3,7 +3,7 @@
 use crate::object::macros::object;
 use crate::object::parsed::{ArrayNode, Items, Node};
 use crate::object::r#ref::MaybeRef;
-use crate::object::{FromBytes, Object, ObjectIdentifier, ObjectLike};
+use crate::object::{FromBytes, Object, ObjectIdentifier, ObjectLike, Written};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::sync::Arc;
@@ -72,6 +72,31 @@ impl<'a> Array<'a> {
             cursor: self.cursor(),
             ctx: self.ctx().clone(),
         }
+    }
+
+    /// Returns an iterator over the items of the array as the file writes them
+    /// ([`Written`]).
+    pub fn written(&self) -> impl Iterator<Item = Written<'a>> + use<'a> {
+        let ctx = self.ctx().clone();
+        let mut cursor = self.cursor();
+        core::iter::from_fn(move || match &mut cursor {
+            Cursor::Bytes(reader) => {
+                let start = reader.offset();
+                reader.skip_white_spaces_and_comments();
+                if reader.at_end() {
+                    return None;
+                }
+                // Objects are already guaranteed to be valid.
+                let item = Written::read(reader, &ctx).unwrap();
+                crate::work::lexed(reader.offset() - start);
+                Some(item)
+            }
+            Cursor::Parsed { data, node, at } => {
+                let item = node.items().get(*at)?.written(data, &ctx);
+                *at += 1;
+                Some(item)
+            }
+        })
     }
 
     /// Returns an iterator over the entries of the array that are objects of type

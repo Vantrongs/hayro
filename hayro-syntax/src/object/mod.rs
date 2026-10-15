@@ -124,6 +124,61 @@ pub(crate) trait ObjectRefLike<'a>: Sized {
     fn cast_ref<'b>(obj: &'b Object<'a>) -> Option<&'b Self>;
 }
 
+/// An object as the file writes it, for a copy that is to be read as its source is
+/// ([`Dict::written`], [`Array::written`], [`crate::xref::XRef::written`]): a number
+/// is the bytes it is written as, which its value does not tell apart where readers
+/// read them otherwise (`MuPDF` reads `4294967297` as 1 and `--5` as -5, hayro the
+/// first as 4294967297 and the second as 0, and `5.0` is a real to both), and an
+/// item of an array or a value of a dictionary that is a reference is the reference.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Written<'a> {
+    /// A reference, which only an item or a value is.
+    Ref(ObjRef),
+    /// The null object.
+    Null,
+    /// A boolean.
+    Boolean(bool),
+    /// A number, as the bytes it is written as: a sign, digits, points and minuses.
+    Number(&'a [u8]),
+    /// A string, decoded and decrypted.
+    String(String<'a>),
+    /// A name, decoded.
+    Name(Name<'a>),
+    /// A dictionary.
+    Dict(Dict<'a>),
+    /// An array.
+    Array(Array<'a>),
+    /// A stream, which only an object of its own is.
+    Stream(Stream<'a>),
+}
+
+impl<'a> Written<'a> {
+    /// The item `r` is at, read in `ctx` as a `MaybeRef<Object>` is read, after
+    /// white space and comments.
+    pub(crate) fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
+        r.skip_white_spaces_and_comments();
+        let at = r.offset();
+        Some(match r.read_with_context::<MaybeRef<Object<'a>>>(ctx)? {
+            MaybeRef::Ref(reference) => Self::Ref(reference),
+            MaybeRef::NotRef(object) => Self::of(object, r.range(at..r.offset())?),
+        })
+    }
+
+    /// `object`, read from `bytes`.
+    pub(crate) fn of(object: Object<'a>, bytes: &'a [u8]) -> Self {
+        match object {
+            Object::Null(_) => Self::Null,
+            Object::Boolean(value) => Self::Boolean(value),
+            Object::Number(_) => Self::Number(bytes),
+            Object::String(string) => Self::String(string),
+            Object::Name(name) => Self::Name(name),
+            Object::Dict(dict) => Self::Dict(dict),
+            Object::Array(array) => Self::Array(array),
+            Object::Stream(stream) => Self::Stream(stream),
+        }
+    }
+}
+
 /// A primitive PDF object.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Object<'a> {
@@ -535,13 +590,55 @@ mod macros {
 #[cfg(test)]
 mod tests {
     use crate::object::indirect::IndirectObject;
-    use crate::object::{Array, Dict, Name, Null, Number, Object, Stream, String};
+    use crate::object::{
+        Array, Dict, Name, Null, Number, ObjRef, Object, ObjectIdentifier, Stream, String, Written,
+    };
     use crate::reader::Reader;
     use crate::reader::{ReaderContext, ReaderExt};
 
     fn object_impl(data: &[u8]) -> Option<Object<'_>> {
         let mut r = Reader::new(data);
         r.read_with_context::<Object<'_>>(&ReaderContext::dummy())
+    }
+
+    // A number is written as its bytes, read from bytes or parsed in a body, in a
+    // dictionary, an array, or as an object of its own.
+    #[test]
+    fn numbers_are_written_as_their_bytes() {
+        let token = |w: Written<'_>| match w {
+            Written::Number(token) => Some(token.to_vec()),
+            _ => None,
+        };
+        let dict = object_impl(b"<< /A 4294967297 /B [--5 % c\n 5.0 1 0 R] >>")
+            .unwrap()
+            .into_dict()
+            .unwrap();
+        let check = |dict: &Dict<'_>| {
+            assert_eq!(
+                token(dict.get_written(b"A").unwrap()),
+                Some(b"4294967297".to_vec())
+            );
+            let Written::Array(array) = dict.get_written(b"B").unwrap() else {
+                panic!("an array");
+            };
+            let items: Vec<_> = array.written().collect();
+            assert_eq!(token(items[0].clone()), Some(b"--5".to_vec()));
+            assert_eq!(token(items[1].clone()), Some(b"5.0".to_vec()));
+            assert_eq!(items[2], Written::Ref(ObjRef::new(1, 0)));
+        };
+        check(&dict);
+        let file = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog /Pages 3 0 R /A 4294967297 \
+            /B [--5 % c\n 5.0 1 0 R] >>\nendobj\n2 0 obj\n  -.50\nendobj\n\
+            3 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n\
+            trailer\n<< /Root 1 0 R >>\n";
+        let pdf = crate::Pdf::new(file.to_vec()).unwrap();
+        check(
+            &pdf.xref()
+                .get::<Dict<'_>>(ObjectIdentifier::new(1, 0))
+                .unwrap(),
+        );
+        let written = pdf.xref().written(ObjectIdentifier::new(2, 0)).unwrap();
+        assert_eq!(token(written), Some(b"-.50".to_vec()));
     }
 
     #[test]
@@ -643,20 +740,24 @@ mod tests {
         assert_eq!(items.len(), 3);
     }
 
-    // A name whose escapes are not hex is `null` wherever it is an object, as skipping
-    // it reads it, and no name.
+    // A name whose `#` is no escape is a name wherever it is an object, the `#`
+    // itself, as `MuPDF` reads it (`PyMuPDF` 1.28.2).
     #[test]
     fn name_with_escapes_that_are_not_hex() {
-        assert!(matches!(object_impl(b"/a#zz").unwrap(), Object::Null(_)));
+        let name = |object: Object<'_>| object.into_name().map(|n| n.to_vec());
+        assert_eq!(name(object_impl(b"/a#zz").unwrap()), Some(b"a#zz".to_vec()));
         let array = object_impl(b"[/a#zz 1]").unwrap();
-        let items: Vec<_> = array.into_array().unwrap().raw_iter().collect();
+        let items: Vec<_> = array.into_array().unwrap().iter::<Object<'_>>().collect();
         assert_eq!(items.len(), 2);
-        let dict = object_impl(b"<< /K /a#zz /L 1 >>").unwrap();
-        assert_eq!(dict.into_dict().unwrap().entries().count(), 2);
-        assert!(
-            Reader::new(b"/a#zz")
-                .read_without_context::<Name<'_>>()
-                .is_none()
+        assert_eq!(name(items[0].clone()), Some(b"a#zz".to_vec()));
+        let dict = object_impl(b"<< /K /a#zz /L 1 >>")
+            .unwrap()
+            .into_dict()
+            .unwrap();
+        assert_eq!(dict.entries().count(), 2);
+        assert_eq!(
+            dict.get::<Name<'_>>(b"K").map(|n| n.to_vec()),
+            Some(b"a#zz".to_vec())
         );
     }
 

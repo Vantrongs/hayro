@@ -746,7 +746,7 @@ mod tests {
     use crate::object::Dict;
     use crate::object::ObjectIdentifier;
     use crate::object::indirect::IndirectObject;
-    use crate::object::parsed::{DictNode, Node};
+    use crate::object::parsed::{DictNode, Top};
     use alloc::string::String;
 
     /// A generator of pseudo-random numbers, the same in every run.
@@ -880,7 +880,7 @@ mod tests {
             Slot::to(slot),
             false,
             |r| DictNode::read(r, data, &ctx),
-            |r| Node::read(r, data, &ctx),
+            |r| Top::read(r, data, &ctx),
         )
         .0?;
         let dict = match &syntax {
@@ -912,7 +912,7 @@ mod tests {
             Slot::to(slot),
             true,
             |r| DictNode::read(r, data, &ctx),
-            |r| Node::read(r, data, &ctx),
+            |r| Top::read(r, data, &ctx),
         )
         .0;
         if slot == data.len() && !matches!(syntax, Some((Read::Stream { .. }, _))) {
@@ -1063,7 +1063,7 @@ mod tests {
                 let mut parse = Reader::new(&data);
                 parse.jump(at);
                 let ctx = ReaderContext::dummy();
-                let node = Node::read(&mut parse, &data, &ctx);
+                let node = Top::read(&mut parse, &data, &ctx);
                 assert_eq!(
                     parse.offset(),
                     end,

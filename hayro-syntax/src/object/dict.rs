@@ -5,7 +5,7 @@ use crate::object::macros::object;
 use crate::object::parsed::{DictNode, Node};
 use crate::object::r#ref::{MaybeRef, ObjRef};
 use crate::object::{Name, ObjectIdentifier};
-use crate::object::{Object, ObjectLike};
+use crate::object::{Object, ObjectLike, Written};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::sync::Arc;
@@ -143,6 +143,31 @@ impl<'a> Dict<'a> {
             let obj = self.get_raw(k.deref()).unwrap();
             (k, obj)
         })
+    }
+
+    /// The entries as the file writes them ([`Written`]), sorted by key.
+    pub fn written(&self) -> impl Iterator<Item = (Name<'a>, Written<'a>)> + '_ {
+        self.keys().map(|k| {
+            let value = self.get_written(k.deref()).unwrap();
+            (k, value)
+        })
+    }
+
+    /// The entry of a key as the file writes it ([`Written`]).
+    pub fn get_written(&self, key: impl AsRef<[u8]>) -> Option<Written<'a>> {
+        match self.offsets()? {
+            Found::Offsets(offsets) => {
+                let offset = *offsets.get(key.as_ref())?;
+                let mut r = Reader::new(&self.data()[offset..]);
+                let value = Written::read(&mut r, self.ctx());
+                crate::work::lexed(r.offset());
+                value
+            }
+            Found::Parsed(node) => Some(
+                node.get(key.as_ref(), self.data())?
+                    .written(self.data(), self.ctx()),
+            ),
+        }
     }
 
     /// Return the object identifier of the dict, if it's an indirect object.

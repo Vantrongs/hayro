@@ -3,7 +3,7 @@
 
 use hayro_write::hayro_syntax::Pdf;
 use hayro_write::hayro_syntax::object::{
-    Array, Dict, Name, ObjRef, Object, Rect, Stream, dict_or_stream,
+    Array, Dict, Name, ObjRef, Object, Rect, Stream, Written, dict_or_stream,
 };
 use hayro_write::hayro_syntax::page::ContentError;
 use hayro_write::pdf_writer::{self, Ref};
@@ -615,9 +615,10 @@ fn a_page_drawn_with_an_object_that_cannot_be_read_is_an_error() {
     }
 }
 
-// A page whose dictionary holds a name with escapes that are not hex, which reading
-// it skips, is read and copied whole, its box and its drawing: the file's table, which
-// is sound, is checked by reading each object as reading it does.
+// A page whose dictionary holds a name with a `#` that is no escape, a name as
+// `MuPDF` reads it (`PyMuPDF` 1.28.2), is read and copied whole, its box and its
+// drawing: the file's table, which is sound, is checked by reading each object as
+// reading it does.
 #[test]
 fn a_page_holding_a_name_that_is_no_key_is_copied_whole() {
     const DRAWING: &[u8] = b"0 0 1 rg 0 0 50 50 re f";
@@ -625,7 +626,7 @@ fn a_page_holding_a_name_that_is_no_key_is_copied_whole() {
         &[
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] /Contents 4 0 R /Broken#zz >>"
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] /Contents 4 0 R /Broken#zz 5 >>"
                 .to_vec(),
             fixtures::stream("", DRAWING),
         ],
@@ -852,4 +853,153 @@ fn a_category_whose_stream_data_cannot_be_read_is_copied_as_its_dictionary() {
             Some(b"Helvetica".as_slice())
         );
     }
+}
+
+/// `value`, read from `pdf`, shown with each reference as what it leads to, `null`
+/// where it leads to nothing: what a reader makes of it.
+fn shown(pdf: &Pdf, value: &Written<'_>) -> String {
+    match value {
+        Written::Ref(r) => match pdf.xref().written((*r).into()) {
+            None | Some(Written::Null) => "R(null)".into(),
+            Some(target) => format!("R({})", shown(pdf, &target)),
+        },
+        Written::Null => "null".into(),
+        Written::Boolean(b) => format!("{b}"),
+        Written::Number(token) => format!("N({})", String::from_utf8_lossy(token)),
+        Written::String(s) => format!("S{:?}", s.as_bytes()),
+        Written::Name(n) => format!("/{:?}", n.as_ref()),
+        Written::Dict(d) => {
+            let entries: Vec<String> = d
+                .written()
+                .map(|(k, v)| format!("{:?}:{}", k.as_ref(), shown(pdf, &v)))
+                .collect();
+            format!("<<{}>>", entries.join(","))
+        }
+        Written::Array(a) => {
+            let items: Vec<String> = a.written().map(|v| shown(pdf, &v)).collect();
+            format!("[{}]", items.join(","))
+        }
+        Written::Stream(_) => "stream".into(),
+    }
+}
+
+/// The values of a resource form's dictionary, as `PyMuPDF` 1.28.2 reads them in
+/// the source (`Document::xref_get_key`): numbers whose tokens it reads otherwise
+/// than their values say (`4294967297` as 1, `--5` as -5, `5.0` as a real,
+/// `4294967297.5` as 1.5), names whose `#` is no escape, strings with octal
+/// escapes beyond a byte and line ends, and references to no object, direct, in
+/// arrays and dictionaries, and as a key's value, which `MuPDF` tells from `null`.
+const WRITTEN: &[&str] = &[
+    "4294967297",
+    "--5",
+    "5.0",
+    "612.0",
+    ".5",
+    "3-",
+    "1.-5",
+    "-0.0",
+    "0000000001.5",
+    "4294967297.5",
+    "99999999999999999999",
+    "2147483648",
+    "/A#2",
+    "/A#G1",
+    "/A##41",
+    "/A#20B",
+    "/A#00",
+    "(\\777)",
+    "(a\r\nb)",
+    "(a\\\n\nb)",
+    "<414>",
+    "true",
+    "foo",
+    "[1 2.5 /N (s) [null true] << /K 99 0 R >> 99 0 R]",
+    "<< /A 99 0 R /B 5 0 R >>",
+    "99 0 R",
+    "5 0 R",
+];
+
+/// Every value a copy writes is read as the source's is: a number as the bytes it
+/// is written as, a name or string as the bytes it is read as, a reference to no
+/// object as a reference to an object that is `null`, never a direct `null`.
+#[test]
+fn values_are_copied_as_the_file_writes_them() {
+    let entries: String = WRITTEN
+        .iter()
+        .enumerate()
+        .map(|(i, v)| format!("/K{i} {v} "))
+        .collect();
+    let source = Pdf::new(fixtures::one_page(
+        200,
+        "/Resources << /XObject << /X 4 0 R >> >> /Contents 6 0 R",
+        vec![
+            fixtures::stream(
+                &format!("/Type /XObject /Subtype /Form /BBox [0 0 9 9] {entries}"),
+                b"",
+            ),
+            b"4294967297".to_vec(),
+            fixtures::stream("", b"/X Do"),
+        ],
+    ))
+    .unwrap();
+    let form = source
+        .xref()
+        .get::<Stream<'_>>(ObjRef::new(4, 0).into())
+        .unwrap();
+    for query in page_queries(0, [200.0, 200.0]) {
+        let result = run(&source, &[query]).unwrap();
+        let copy = reread(&result);
+        let copied = (1..100)
+            .filter_map(|n| copy.xref().get::<Stream<'_>>(ObjRef::new(n, 0).into()))
+            .find(|s| s.dict().contains_key(b"K0"))
+            .expect("the form's copy");
+        for (i, value) in WRITTEN.iter().enumerate() {
+            let key = format!("K{i}");
+            let read = |pdf: &Pdf, stream: &Stream<'_>| {
+                shown(pdf, &stream.dict().get_written(key.as_bytes()).unwrap())
+            };
+            assert_eq!(read(&copy, &copied), read(&source, &form), "{value:?}");
+        }
+        let text = String::from_utf8_lossy(result.chunk.as_bytes()).into_owned();
+        for token in ["/K0 4294967297", "/K1 --5", "/K2 5.0", "/K9 4294967297.5"] {
+            assert!(text.contains(token), "{token} in {text}");
+        }
+        assert!(
+            !text.contains("null>>"),
+            "a reference written as null: {text}"
+        );
+    }
+}
+
+/// A string of an encrypted file is copied as it decrypts.
+#[test]
+fn strings_of_an_encrypted_file_are_copied_decrypted() {
+    let source = Pdf::new(rc4::file(
+        &[
+            rc4::Part::Object("<< /Type /Catalog /Pages 2 0 R >>", b""),
+            rc4::Part::Object("<< /Type /Pages /Kids [3 0 R] /Count 1 >>", b""),
+            rc4::Part::Object(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 9 9] \
+                 /Resources << /ExtGState << /G 4 0 R >> >> >>",
+                b"",
+            ),
+            rc4::Part::Object(
+                "<< /Type /ExtGState /Note STRING /N [STRING] >>",
+                b"a\r\n)b\xff",
+            ),
+        ],
+        &[],
+    ))
+    .unwrap();
+    let result = run(&source, &[ExtractionQuery::new_page(0)]).unwrap();
+    let copy = reread(&result);
+    let state = (1..20)
+        .filter_map(|n| copy.xref().get::<Dict<'_>>(ObjRef::new(n, 0).into()))
+        .find(|d| d.contains_key(b"Note"))
+        .expect("the state's copy");
+    let note = state.get::<hayro_syntax::object::String<'_>>(b"Note");
+    assert_eq!(note.unwrap().as_bytes(), b"a\r\n)b\xff");
+    let listed = state.get::<Array<'_>>(b"N").unwrap();
+    let item = listed.iter::<hayro_syntax::object::String<'_>>().next();
+    assert_eq!(item.unwrap().as_bytes(), b"a\r\n)b\xff");
 }

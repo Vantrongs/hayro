@@ -11,7 +11,7 @@
 #[cfg(test)]
 use crate::hash;
 use crate::lost::Lost;
-use crate::object::parsed::{DictNode, Node};
+use crate::object::parsed::{DictNode, Top};
 use crate::object::{Number, ObjectIdentifier};
 use crate::reader::{Link, Reader, ReaderContext, ReaderExt};
 use crate::sync::Arc;
@@ -123,7 +123,7 @@ pub(super) enum Shape {
     /// parse in its slot.
     Unreadable,
     /// An object that is no stream.
-    Value(Node),
+    Value(Top),
     /// A stream: its dictionary, where the dictionary ends, and where its data are,
     /// with what finding them lost, once found the same way from every chain of
     /// references (the data are found by /Length, which may be an object).
@@ -173,13 +173,13 @@ impl Shape {
             slot,
             place.source == Source::File,
             |r| DictNode::read(r, data, ctx),
-            |r| Node::read(r, data, ctx),
+            |r| Top::read(r, data, ctx),
         );
         crate::work::read_bodies(looked);
         match read.map(|(read, _)| read) {
             None => Self::Unreadable,
             Some(Read::Object(node)) => Self::Value(node),
-            Some(Read::Dict(dict)) => Self::Value(Node::Dict(Arc::new(dict))),
+            Some(Read::Dict(dict)) => Self::Value(Top::dict(Arc::new(dict))),
             Some(Read::Stream { dict, end }) => Self::Stream {
                 dict: Arc::new(dict),
                 end,
@@ -554,7 +554,7 @@ mod tests {
 
     /// What reading a body finds, made comparable: its kind, the object, and where
     /// it ends.
-    fn shown(read: &Read<Node, Arc<DictNode>>, end: usize, data: &[u8]) -> String {
+    fn shown(read: &Read<Top, Arc<DictNode>>, end: usize, data: &[u8]) -> String {
         let ctx = ReaderContext::dummy();
         let dict = |dict: &Arc<DictNode>| {
             let dict = Dict::parsed(data, dict.clone(), &ctx);
@@ -598,7 +598,7 @@ mod tests {
                     Slot::to(slot),
                     header,
                     |r| DictNode::read(r, data, &ctx).map(Arc::new),
-                    |r| Node::read(r, data, &ctx),
+                    |r| Top::read(r, data, &ctx),
                 )
                 .0
             };
@@ -667,7 +667,7 @@ mod tests {
                     slot,
                     false,
                     |r| DictNode::read(r, data, &ctx).map(Arc::new),
-                    |r| Node::read(r, data, &ctx),
+                    |r| Top::read(r, data, &ctx),
                 )
                 .0
                 .map(|(read, end)| shown(&read, end, data))
