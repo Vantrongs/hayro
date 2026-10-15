@@ -13,8 +13,8 @@
 use super::entries::Entries;
 use super::markup::{Quad, quads};
 use super::out::{Color, Out};
-use super::text::{self, Family, Fonts, Typeface};
-use super::{Unsupported, c_color, color_of, rect};
+use super::text::{self, Align, Family, Fonts, Setting, Shaped, Typeface};
+use super::{Appearances, Unsupported, c_color, color_of, rect};
 use hayro_syntax::object::dict::keys::C;
 use kurbo::{Affine, BezPath, Circle, Point, Shape};
 
@@ -354,7 +354,7 @@ pub(super) fn redact(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
 }
 
 /// The text of each standard stamp name, its lines and size.
-fn stamp_text(name: &[u8]) -> Option<(&'static [&'static str], f32)> {
+fn standard(name: &[u8]) -> Option<(&'static [&'static str], f32)> {
     Some(match name {
         b"Approved" => (&["APPROVED"], 30.0),
         b"Experimental" => (&["EXPERIMENTAL"], 20.0),
@@ -374,26 +374,50 @@ fn stamp_text(name: &[u8]) -> Option<(&'static [&'static str], f32)> {
     })
 }
 
-/// `Stamp`: the text of its `/Name` (`Draft` without one, Table 181), a standard
-/// name in its own words and size, another name as it is, in 20 pt; in /C (black
-/// without it) in a box of the same colour, clipped to `/Rect`.
-pub(super) fn stamp(annot: &Entries<'_>, fonts: &Fonts, out: &mut Out) -> Drawn {
-    let name = annot
-        .name(b"Name")
-        .map_or_else(|| b"Draft".to_vec(), |n| n.as_ref().to_vec());
-    let custom = [String::from_utf8_lossy(&name).into_owned()];
-    let custom: Vec<&str> = custom.iter().map(String::as_str).collect();
-    let (lines, size): (&[&str], f32) = match stamp_text(&name) {
+/// The text a stamp draws: its lines, set in Times Bold, and the size they are
+/// drawn at.
+pub(super) struct StampText {
+    lines: Vec<Shaped>,
+    size: f32,
+}
+
+/// The text of stamp `annot`'s `/Name` (`Draft` without one, Table 181): a standard
+/// name in its own words and size, another name as it is, in 20 pt.
+pub(super) fn stamp_text(annot: &Entries<'_>, fonts: &Fonts) -> Result<StampText, Unsupported> {
+    let name = annot.name(b"Name");
+    let name = name.as_deref().map_or(&b"Draft"[..], |n| n.as_ref());
+    let custom;
+    let (lines, size): (&[&str], f32) = match standard(name) {
         Some((lines, size)) => (lines, size),
-        None => (&custom, 20.0),
+        None => {
+            custom = [String::from_utf8_lossy(name)];
+            (&[&*custom[0]], 20.0)
+        }
     };
+    let lines = lines
+        .iter()
+        .map(|line| fonts.shape_plain(Typeface::SERIF_BOLD, line))
+        .collect::<Result<_, _>>()?;
+    Ok(StampText { lines, size })
+}
+
+/// `Stamp`: the text of its `/Name` ([`stamp_text`], set once for the document by
+/// the entry that holds it), in /C (black without it) in a box of the same colour,
+/// clipped to `/Rect`: what of it the page shows, in `visible`.
+pub(super) fn stamp<'a>(
+    annot: &Entries<'a>,
+    doc: &Appearances<'a>,
+    visible: kurbo::Rect,
+    out: &mut Out,
+) -> Drawn {
     // Without a box, viewers draw over coordinates of ±2^32.
     let r = rect(annot).ok_or(Unsupported::Coordinates)?;
-    let color = c_color(annot, Color::BLACK);
     let scale = (r.width() / 190.0).min(r.height() / 50.0);
     if scale <= 0.0 {
         return Ok(None);
     }
+    let color = c_color(annot, Color::BLACK);
+    let text = doc.stamp_text(annot)?;
     let at = Affine::translate(r.center().to_vec2())
         * Affine::rotate(0.6_f64.to_radians())
         * Affine::scale(scale);
@@ -409,17 +433,30 @@ pub(super) fn stamp(annot: &Entries<'_>, fonts: &Fonts, out: &mut Out) -> Drawn 
     }
     out.op("s");
     fail(out.fill_color(&color))?;
+    let size = text.size;
     // Baselines from the box's middle.
-    let baselines: &[f32] = match (lines.len(), size as u32) {
+    let baselines: &[f64] = match (text.lines.len(), size as u32) {
         (2, _) => &[2.0, -15.5],
         (_, 30) => &[-11.0],
         (_, 26) => &[-10.0],
         _ => &[-7.0],
     };
-    for (line, y) in lines.iter().zip(baselines) {
-        let glyphs = fonts.shape(Typeface::SERIF_BOLD, line)?;
-        let x = -text::width(&glyphs, size) / 2.0;
-        fail(text::draw(&glyphs, size, (x, *y), at, out))?;
+    let set = Setting {
+        base: size,
+        color,
+        align: Align::Left,
+    };
+    for (line, y) in text.lines.iter().zip(baselines) {
+        let x = -line.width(0..line.len(), size) / 2.0;
+        text::draw_line(
+            &doc.fonts,
+            line,
+            &set,
+            (x, *y),
+            at,
+            r.intersect(visible),
+            out,
+        )?;
     }
     out.op("Q");
     Ok(Some(()))

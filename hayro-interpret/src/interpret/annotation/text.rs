@@ -266,7 +266,7 @@ pub(super) fn draw(
         return Some(());
     }
     let (mut x, y) = (f64::from(origin.0), f64::from(origin.1));
-    let mut pen = Pen::new(transform, size, (x, y), EVERYWHERE);
+    let mut pen = Pen::new(transform, size, y, EVERYWHERE);
     let mut brush = Brush::new(None, None);
     for g in glyphs {
         pen.put(out, x, &g.face.outline(g.id), EVERYWHERE, &mut brush)?;
@@ -285,7 +285,7 @@ const EVERYWHERE: Rect = Rect::new(
 );
 
 /// Writes glyphs of one size along a baseline in a frame: the frame, scaled to the
-/// size and moved to the baseline's origin, once, and each glyph that can reach a
+/// size and moved to the first glyph written, once, and each glyph that can reach a
 /// clip as its form, moved along from the glyph before it ([`Out::form`]), so that
 /// a glyph costs a few bytes of content however often it is drawn. The numbers a
 /// viewer computes a glyph's place from are those written, so each must be
@@ -296,21 +296,22 @@ pub(super) struct Pen {
     frame: Affine,
     size: f64,
     scale: f64,
-    origin: (f64, f64),
+    /// The baseline, up the frame.
+    y: f64,
     view: Rect,
     /// Where across the last glyph written lies; `None` before the first.
     at: Option<f64>,
 }
 
 impl Pen {
-    /// A pen for glyphs at `size` (not 0) along the baseline from `origin` in `frame`,
-    /// of which those that can reach `view`, in the frame, are tested further.
-    pub(super) fn new(frame: Affine, size: f32, origin: (f64, f64), view: Rect) -> Self {
+    /// A pen for glyphs at `size` (not 0) along the baseline `y` up `frame`, of
+    /// which those that can reach `view`, in the frame, are tested further.
+    pub(super) fn new(frame: Affine, size: f32, y: f64, view: Rect) -> Self {
         Self {
             frame,
             size: f64::from(size),
             scale: f64::from(size) / 1000.0,
-            origin,
+            y,
             view,
             at: None,
         }
@@ -331,27 +332,28 @@ impl Pen {
         let Some(form) = &outline.form else {
             return Some(());
         };
-        if self.size.is_finite() && !reaches(outline.em, self.size, (x, self.origin.1), self.view) {
+        if self.size.is_finite() && !reaches(outline.em, self.size, (x, self.y), self.view) {
             return Some(());
         }
-        let (s, y) = (self.scale, self.origin.1);
+        let (s, y) = (self.scale, self.y);
         let at = self.frame * Affine::new([s, 0.0, 0.0, s, x, y]);
         if !out.box_reaches(at, outline.ink, clip)? {
             return Some(());
         }
-        let from = match self.at {
-            Some(from) => from,
+        // The first glyph written is placed where it lies, not from the baseline's
+        // origin, which may lie as far before it as the text passed over is long.
+        match self.at {
+            Some(from) => {
+                let dx = (x - from) / s;
+                if dx != 0.0 {
+                    out.nums(&[1.0, 0.0, 0.0, 1.0, dx, 0.0], "cm")?;
+                }
+            }
             None => {
                 brush.ready(out)?;
                 out.op("q");
-                let start = self.frame * Affine::new([s, 0.0, 0.0, s, self.origin.0, y]);
-                out.nums(&start.as_coeffs(), "cm")?;
-                self.origin.0
+                out.nums(&at.as_coeffs(), "cm")?;
             }
-        };
-        let dx = (x - from) / s;
-        if dx != 0.0 {
-            out.nums(&[1.0, 0.0, 0.0, 1.0, dx, 0.0], "cm")?;
         }
         out.form(form);
         self.at = Some(x);
@@ -1164,7 +1166,7 @@ pub(super) fn draw_glyphs(
         };
         if first < last {
             brush.want = Some(style.color.unwrap_or(set.color));
-            let mut pen = Pen::new(frame, size, (pos(i), y), view);
+            let mut pen = Pen::new(frame, size, y, view);
             for k in i + first..i + last {
                 work(1);
                 let g = fonts.glyph(style.face, text.chars[k])?;
@@ -1304,7 +1306,7 @@ pub(super) fn draw_comb(
     let middle = |advance: f32| (cell - advance * size) / 2.0;
     let at = |i: usize| f64::from(start(i) + middle(text.advance(i)));
     let face = text.styles[0].face;
-    let mut pen = Pen::new(Affine::IDENTITY, size, (at(0), y), seen);
+    let mut pen = Pen::new(Affine::IDENTITY, size, y, seen);
     let mut brush = Brush::new(None, None);
     let cells = if skips() {
         cells(text, size, cell, &start, &middle, count, seen)

@@ -341,6 +341,8 @@ struct Known<'a> {
     fields: Kept<ContentKey<'a>, Option<Field<'a>>>,
     /// Text set in its fonts, by what it is made of.
     shaped: Kept<TextKey<'a>, Result<Rc<Shaped>, Unsupported>>,
+    /// The text of stamps, by the entry that holds the name.
+    stamps: Kept<Source<'a>, Result<Rc<icons::StampText>, Unsupported>>,
     /// The styles default styles (`/DS`) set, by the entry that holds each and
     /// whether relative sizes are of a positive base size.
     styles: Kept<(Source<'a>, bool), Result<Style, Unsupported>>,
@@ -763,7 +765,7 @@ impl<'a> Appearances<'a> {
             b"Sound" => icons::icon(annot, icons::Icon::Sound, fonts, &mut out),
             b"Caret" => ok(icons::caret(annot, &mut out)),
             b"Redact" => ok(icons::redact(annot, &mut out)),
-            b"Stamp" => icons::stamp(annot, fonts, &mut out),
+            b"Stamp" => icons::stamp(annot, self, visible, &mut out),
             b"FreeText" => freetext::free_text(annot, self, visible, &mut out),
             b"Line" => lines::line(annot, self, visible, &mut out),
             b"Polygon" => lines::poly(annot, true, &mut out),
@@ -875,6 +877,16 @@ impl<'a> Appearances<'a> {
                 &text.map(|t| text::text_string(&t)).unwrap_or_default(),
             )
         })
+    }
+
+    /// The text of stamp `annot` ([`icons::stamp_text`]), set once for the document
+    /// by the entry that holds its name.
+    fn stamp_text(&self, annot: &Entries<'a>) -> Result<Rc<icons::StampText>, Unsupported> {
+        self.once(
+            |k| &mut k.stamps,
+            Some(annot.source(b"Name")),
+            || icons::stamp_text(annot, &self.fonts).map(Rc::new),
+        )
     }
 
     /// The style the default style (`/DS`) of `annot` sets, relative sizes of a base

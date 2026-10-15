@@ -1774,3 +1774,64 @@ fn an_array_annotations_share_is_walked_once() {
         costs_at_most(fewer, more, 16 << 10, 1_000, annot);
     }
 }
+
+/// Stamps that share a long name read it once for the document, and set it once:
+/// those of no area, which draw nothing; those whose name is spaces, which draw
+/// their frame alone; and those whose name runs far past their box, which draw the
+/// part of it the box shows. Twice as many cost what the added ones draw, and no
+/// more for a name twice as long.
+#[test]
+fn stamps_sharing_a_long_name_read_it_once() {
+    const N: usize = 40;
+    let names = [|n: usize| "#20".repeat(n), |n: usize| "ABCD".repeat(n / 4)];
+    for name in names {
+        for rect in ["[10 10 10 10]", "[10 10 200 60]"] {
+            let annot = |_: usize| format!("/Subtype /Stamp /Name 4 0 R /Rect {rect}");
+            let added = |n: usize| {
+                let shared = [format!("/{}", name(n))];
+                let (one, two) = (
+                    cost_of(N, "", &shared, &annot),
+                    cost_of(2 * N, "", &shared, &annot),
+                );
+                Cost {
+                    bytes: two.bytes - one.bytes,
+                    work: two.work - one.work,
+                }
+            };
+            let (short, long) = (added(20_000), added(40_000));
+            assert!(
+                long.bytes < N * (64 << 10)
+                    && long.work < (N * 4_000) as u64
+                    && long.bytes < short.bytes + N * 256
+                    && long.work < short.work + (N * 4) as u64,
+                "{} {rect}: {short:?} added at 20,000, {long:?} at 40,000",
+                &name(4)
+            );
+        }
+    }
+}
+
+/// A glyph far along its line, past text the box does not show, is placed where it
+/// lies, by numbers as small as its place: the end of a long right-aligned word,
+/// the middle of a long stamp name, is drawn, and only it.
+#[test]
+fn a_glyph_far_along_its_line_is_drawn() {
+    let word = "A".repeat(40_000);
+    for annot in [
+        format!(
+            "/Subtype /FreeText /Q 2 /DA (/Helv 12 Tf) /Contents ({word}) /Rect [10 10 190 190]"
+        ),
+        format!("/Subtype /Stamp /Name /{word} /Rect [10 10 200 60]"),
+    ] {
+        let pdf = one_annotation(&annot);
+        let Look::Generated(g) = first_look(&pdf) else {
+            panic!("not generated: {}", &annot[..20]);
+        };
+        let drawn = g.content.matches(" Do\n").count();
+        assert!(
+            (1..100).contains(&drawn),
+            "{drawn} glyphs: {}",
+            &annot[..20]
+        );
+    }
+}
