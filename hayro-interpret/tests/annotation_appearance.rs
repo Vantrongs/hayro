@@ -2837,3 +2837,104 @@ fn draw_objects_with(pdf: &Pdf) -> Vec<Ev> {
     common::interpret_first_page(pdf, settings, &mut rec);
     rec.0
 }
+
+/// A file of two pages, 3 and 4, with `pages` entries, objects 5 on `objects`, and
+/// as object 9 one the file lists but that cannot be read; the catalog has
+/// `catalog` entries.
+fn two_pages_and_a_lost_object(catalog: &str, pages: [&str; 2], objects: &[&str]) -> Pdf {
+    let mut all = vec![
+        format!("<< /Type /Catalog /Pages 2 0 R {catalog} >>").into_bytes(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+    ];
+    for page in pages {
+        all.push(
+            format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] {page} >>").into_bytes(),
+        );
+    }
+    all.extend(objects.iter().map(|o| o.as_bytes().to_vec()));
+    all.resize(8, b"null".to_vec());
+    all.push(b"<< /Broken >".to_vec());
+    Pdf::new(common::file(&all, "")).expect("valid pdf")
+}
+
+// An object the file lists but that cannot be read, which reading a page's
+// annotations meets, is told to every computation that looks at that page, and to
+// those of other pages that list what it is read for, however often and in whatever
+// order: what is found once for the document tells each later use what finding it
+// lost, as the reader's own caches do. A page whose annotations do not reach it is
+// not told. The interactive form is read where a widget needs it, not when the
+// appearances are made, outside any computation.
+#[test]
+fn what_reading_annotations_lost_is_told_each_time() {
+    let square = "<< /Type /Annot /Subtype /Square /Rect [10 10 110 40]";
+    let widget = "<< /Type /Annot /Subtype /Widget /FT /Tx /V (x) /Rect [10 10 110 40]";
+    let clean = format!("{square} /C [1 0 0] >>");
+    let both = |page: &'static str| [page, page];
+    for (catalog, pages, objects, lose) in [
+        ("", both("/Annots 9 0 R"), vec![], [true, true]),
+        (
+            "",
+            both("/Annots 5 0 R"),
+            vec!["[6 0 R 9 0 R]", &format!("{square} >>")],
+            [true, true],
+        ),
+        (
+            "",
+            both("/Annots [6 0 R 9 0 R]"),
+            vec!["null", &format!("{square} >>")],
+            [true, true],
+        ),
+        (
+            "",
+            ["/Annots [6 0 R]", "/Annots [7 0 R]"],
+            vec!["null", &format!("{square} /C 9 0 R >>"), &clean],
+            [true, false],
+        ),
+        (
+            "",
+            ["/Annots [6 0 R]", "/Annots [6 0 R 7 0 R]"],
+            vec!["null", &format!("{square} /AP 9 0 R >>"), &clean],
+            [true, true],
+        ),
+        (
+            "",
+            both("/Annots [6 0 R]"),
+            vec![
+                "<< /N << /On 9 0 R >> >>",
+                &format!("{square} /AS /On /AP 5 0 R >>"),
+            ],
+            [true, true],
+        ),
+        (
+            "",
+            ["/Annots [6 0 R]", "/Annots [7 0 R]"],
+            vec!["null", &format!("{widget} /Parent 9 0 R >>"), &clean],
+            [true, false],
+        ),
+        (
+            "/AcroForm 9 0 R",
+            ["/Annots [6 0 R]", "/Annots [7 0 R]"],
+            vec!["null", &format!("{widget} >>"), &clean],
+            [true, false],
+        ),
+    ] {
+        let pdf = two_pages_and_a_lost_object(catalog, pages, &objects);
+        let all = pdf.pages();
+        let appearances =
+            Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+        for order in [[0, 1], [1, 0]] {
+            for i in order {
+                for view in [PAGE, kurbo::Rect::new(0.0, 0.0, 150.0, 150.0), PAGE] {
+                    let (_, lost) = pdf
+                        .xref()
+                        .watch(|| appearances.page(&all[i], AnnotationSelection::Flatten, view));
+                    assert_eq!(
+                        lost.map(|id| id.obj_number),
+                        lose[i].then_some(9),
+                        "{catalog} {pages:?} {objects:?}: page {i} of {order:?}, {view:?}"
+                    );
+                }
+            }
+        }
+    }
+}

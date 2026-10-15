@@ -41,6 +41,7 @@ use super::AnnotationSelection;
 use crate::BlendMode;
 use crate::x_object::box_and_matrix;
 use hayro_syntax::hash;
+use hayro_syntax::lost::Lost;
 use hayro_syntax::object::dict::keys::{AP, AS, BORDER, BS, C, CA, D, F, N, RECT, SUBTYPE, W};
 use hayro_syntax::object::{Name, ObjRef, Stream};
 use hayro_syntax::page::Page;
@@ -296,10 +297,9 @@ fn selected(annot: &Entries<'_>, selection: AnnotationSelection) -> bool {
 /// interactive form. Make one per document: fonts are loaded once, and each field
 /// above widgets is read once, however many pages its widgets are on.
 pub struct Appearances<'a> {
+    xref: &'a XRef,
     objects: Objects<'a>,
     fonts: Fonts,
-    /// The interactive form dictionary (`/AcroForm`).
-    form: Option<Entries<'a>>,
     fields: Fields<'a>,
 }
 
@@ -310,6 +310,11 @@ pub struct Appearances<'a> {
 /// what many annotations share is read and set once. Shared by every
 /// [`Appearances`] of the document a renderer makes, one per page, through its
 /// document's cache.
+///
+/// Each value is kept with what reading it lost ([`Lost`]), which every later use
+/// is told as the first was ([`XRef::note`]), as the reader's own caches do
+/// ([`hayro_syntax::lost::Memo`]): a page drawn with what another page's
+/// annotations read without an object is told so.
 #[derive(Clone, Default)]
 pub(crate) struct Fields<'a>(Rc<RefCell<Known<'a>>>);
 
@@ -318,32 +323,35 @@ struct Known<'a> {
     /// The document's objects, each read once.
     objects: Option<Objects<'a>>,
     /// The interactive form dictionary, once read.
-    form: Option<Option<Entries<'a>>>,
+    form: Option<(Option<Entries<'a>>, Lost)>,
     /// What each annotation pages list comes to, by which it is and the selection;
     /// `None` for one that draws nothing on any page.
-    plans: hash::Map<(Id<'a>, AnnotationSelection), Option<Rc<Plan<'a>>>>,
+    plans: Kept<(Id<'a>, AnnotationSelection), Option<Rc<Plan<'a>>>>,
     /// The appearances generated, by annotation and area shown.
-    generated: hash::Map<(Id<'a>, View), Option<Rc<Annotation<'a>>>>,
+    generated: Kept<(Id<'a>, View), Option<Rc<Annotation<'a>>>>,
     /// Of each `/Annots` array, an object or written in a page, by selection, the
     /// annotations it lists that may draw, each with its place.
-    lists: hash::Map<(Id<'a>, AnnotationSelection), Plans<'a>>,
+    lists: Kept<(Id<'a>, AnnotationSelection), Plans<'a>>,
     /// What a page draws, by its `/Annots` array, the selection and the area shown.
-    pages: hash::Map<(Id<'a>, AnnotationSelection, View), Rc<[Drawn<'a>]>>,
+    pages: Kept<(Id<'a>, AnnotationSelection, View), Rc<[Drawn<'a>]>>,
     /// The states `/AS` entries held in objects of their own name, by the
     /// dictionary of states and the entry ([`Appearances::state`]).
-    states: hash::Map<(ContentKey<'a>, Source), State<'a>>,
-    fields: hash::Map<ObjRef, Option<Field<'a>>>,
+    states: Kept<(ContentKey<'a>, Source), State<'a>>,
+    fields: Kept<ObjRef, Option<Field<'a>>>,
     /// Text set in its fonts, by what it is made of.
-    shaped: hash::Map<TextKey, Result<Rc<Shaped>, Unsupported>>,
+    shaped: Kept<TextKey, Result<Rc<Shaped>, Unsupported>>,
     /// The options of lists, by the entry that holds them.
-    labels: hash::Map<Source, Rc<Vec<Label<'a>>>>,
+    labels: Kept<Source, Rc<Vec<Label<'a>>>>,
     /// Default appearances read, by the entry that holds each, and the form's; with
     /// whether reading each met a number whose reading is not established.
-    appearances: hash::Map<Source, (DefaultAppearance, bool)>,
-    form_appearance: Option<(DefaultAppearance, bool)>,
+    appearances: Kept<Source, (DefaultAppearance, bool)>,
+    form_appearance: Option<((DefaultAppearance, bool), Lost)>,
     /// What text and choice fields show, by what it is made of.
-    field_text: hash::Map<TextKey, Result<widget::FieldText, Unsupported>>,
+    field_text: Kept<TextKey, Result<widget::FieldText, Unsupported>>,
 }
+
+/// Values found once for the document, each with what finding it lost.
+type Kept<K, V> = hash::Map<K, (V, Lost)>;
 
 /// A default appearance as [`text::default_appearance`] reads it.
 type DefaultAppearance = (Family, Option<f32>, Option<Color>);
@@ -402,18 +410,30 @@ impl<'a> Appearances<'a> {
             .objects
             .get_or_insert_with(|| Objects::new(xref))
             .clone();
-        let known = fields.0.borrow().form.clone();
-        let form = known.unwrap_or_else(|| {
-            let form = objects.catalog().and_then(|root| root.dict(b"AcroForm"));
-            fields.0.borrow_mut().form = Some(form.clone());
-            form
-        });
         Self {
+            xref,
             objects,
             fonts: Fonts::new(font_resolver),
-            form,
             fields,
         }
+    }
+
+    /// The interactive form dictionary (`/AcroForm`), read once for the document,
+    /// where a widget needs it: what reading it lost is told to each computation
+    /// that uses it.
+    fn form(&self) -> Option<Entries<'a>> {
+        let known = self.fields.0.borrow().form.clone();
+        let (form, lost) = known.unwrap_or_else(|| {
+            let made = self.xref.watch(|| {
+                self.objects
+                    .catalog()
+                    .and_then(|root| root.dict(b"AcroForm"))
+            });
+            self.fields.0.borrow_mut().form = Some(made.clone());
+            made
+        });
+        self.xref.note(lost);
+        form
     }
 
     /// The annotations of `page` that `selection` draws and that draw something or
@@ -770,22 +790,25 @@ impl<'a> Appearances<'a> {
     }
 
     /// `make()`, made once for the document under `key` in the map `map` gives;
-    /// made each time without a key.
+    /// made each time without a key. What making it lost is told to the
+    /// computation asking, now and each time it is asked for again.
     fn once<K: Eq + std::hash::Hash, V: Clone>(
         &self,
-        map: for<'k> fn(&'k mut Known<'a>) -> &'k mut hash::Map<K, V>,
+        map: for<'k> fn(&'k mut Known<'a>) -> &'k mut Kept<K, V>,
         key: Option<K>,
         make: impl FnOnce() -> V,
     ) -> V {
         let Some(key) = key else {
             return make();
         };
-        if let Some(made) = map(&mut self.fields.0.borrow_mut()).get(&key) {
-            return made.clone();
+        let known = map(&mut self.fields.0.borrow_mut()).get(&key).cloned();
+        if let Some((made, lost)) = known {
+            self.xref.note(lost);
+            return made;
         }
         // Made without the map borrowed: making may look other things up.
-        let made = make();
-        map(&mut self.fields.0.borrow_mut()).insert(key, made.clone());
+        let (made, lost) = self.xref.watch(make);
+        map(&mut self.fields.0.borrow_mut()).insert(key, (made.clone(), lost));
         made
     }
 
@@ -855,11 +878,13 @@ impl<'a> Appearances<'a> {
         let make = || entries::noting(|| text::default_appearance(&read().unwrap_or_default()));
         let (da, unreadable) = if form {
             let known = self.fields.0.borrow().form_appearance;
-            known.unwrap_or_else(|| {
-                let made = make();
+            let (made, lost) = known.unwrap_or_else(|| {
+                let made = self.xref.watch(make);
                 self.fields.0.borrow_mut().form_appearance = Some(made);
                 made
-            })
+            });
+            self.xref.note(lost);
+            made
         } else {
             self.once(|k| &mut k.appearances, source, make)
         };
@@ -871,34 +896,46 @@ impl<'a> Appearances<'a> {
 
     /// The field entries widget `annot` is drawn with, however deep its `/Parent`
     /// chain; `None` when the chain loops, which viewers read as a broken field and
-    /// draw nothing for. Each field above widgets is read once.
+    /// draw nothing for. Each field above widgets is read once, and kept with what
+    /// reading it and the fields above it lost.
     fn field(&self, annot: &Entries<'a>) -> Option<Field<'a>> {
-        let known = &mut self.fields.0.borrow_mut().fields;
         let mut on_walk = hash::Set::default();
         on_walk.extend(annot.id());
-        // From the widget up to the first field read before, or to the top.
+        // From the widget up to the first field read before, or to the top; what
+        // reading the walk lost is lost to each field on it.
         let mut walk: Vec<(Option<ObjRef>, Entries<'a>)> = vec![(None, annot.clone())];
-        let mut field = loop {
-            let node = &walk[walk.len() - 1].1;
-            let Some((id, parent)) = node.parent() else {
-                break Some(Field::default());
-            };
-            // A direct parent dictionary cannot lead back to itself.
-            if let Some(id) = id {
-                if let Some(field) = known.get(&id) {
-                    break field.clone();
+        let (mut field, lost) = self.xref.watch(|| {
+            loop {
+                let node = &walk[walk.len() - 1].1;
+                let Some((id, parent)) = node.parent() else {
+                    break Some(Field::default());
+                };
+                // A direct parent dictionary cannot lead back to itself.
+                if let Some(id) = id {
+                    let known = self.fields.0.borrow().fields.get(&id).cloned();
+                    if let Some((field, lost)) = known {
+                        self.xref.note(lost);
+                        break field;
+                    }
+                    if !on_walk.insert(id) {
+                        break None;
+                    }
                 }
-                if !on_walk.insert(id) {
-                    break None;
-                }
+                walk.push((id, parent));
             }
-            walk.push((id, parent));
-        };
-        for (id, node) in walk.into_iter().rev() {
-            field = field.map(|above| above.below(&node));
-            if let Some(id) = id {
-                known.insert(id, field.clone());
+        });
+        let (fields, lost) = self.xref.watch(|| {
+            self.xref.note(lost);
+            let mut fields = Vec::new();
+            for (id, node) in walk.into_iter().rev() {
+                field = field.clone().map(|above| above.below(&node));
+                fields.extend(id.map(|id| (id, field.clone())));
             }
+            fields
+        });
+        let known = &mut self.fields.0.borrow_mut().fields;
+        for (id, field) in fields {
+            known.insert(id, (field, lost));
         }
         field
     }

@@ -155,7 +155,8 @@ fn draw<'a>(
     out: &mut Out,
 ) -> Drawn {
     let fail = |o: Option<()>| o.ok_or(Unsupported::Kind);
-    let (fonts, form) = (&doc.fonts, doc.form.as_ref());
+    let (fonts, form) = (&doc.fonts, doc.form());
+    let form = form.as_ref();
     let (fw, fh) = (bbox.width(), bbox.height());
     if kind == Kind::Sig {
         return signature(bbox, fonts, out);

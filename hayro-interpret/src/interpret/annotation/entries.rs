@@ -13,6 +13,7 @@
 
 use super::Unsupported;
 use hayro_syntax::hash;
+use hayro_syntax::lost::Lost;
 use hayro_syntax::object::{Array, Dict, MaybeRef, Name, Number, ObjRef, Object, Stream};
 use hayro_syntax::xref::{ContentKey, XRef};
 use std::cell::{Cell, RefCell};
@@ -217,23 +218,46 @@ pub(crate) struct Objects<'a> {
 /// apart the same bytes decrypted for two objects.
 type Place = (usize, usize);
 
-/// Entries read of a dictionary, by key.
-type Keyed<'a> = hash::Map<Box<[u8]>, Entry<'a>>;
+/// Entries read of a dictionary, by key, each with what reading it lost.
+type Keyed<'a> = hash::Map<Box<[u8]>, (Entry<'a>, Lost)>;
 
 /// An entry read of an array, and the object it refers to.
 type Item<'a> = (Found<'a>, Option<ObjRef>);
 
+/// The first entries read of an array, whether they are all, and what reading them
+/// lost.
+type Prefix<'a> = (Vec<Item<'a>>, bool, Lost);
+
+/// What is kept of the objects read, each with what reading it lost ([`Lost`]),
+/// which every later use is told as the first was ([`XRef::note`]), as the reader's
+/// own caches do.
 struct Read<'a> {
     xref: &'a XRef,
-    objects: RefCell<hash::Map<ObjRef, Found<'a>>>,
+    objects: RefCell<hash::Map<ObjRef, (Found<'a>, Lost)>>,
     /// The entries read of dictionaries in shared objects.
     entries: RefCell<hash::Map<ContentKey<'a>, Keyed<'a>>>,
     /// The first entries read of arrays in shared objects, each with the object it
     /// refers to, and whether they are all.
-    prefixes: RefCell<hash::Map<ContentKey<'a>, (Vec<Item<'a>>, bool)>>,
+    prefixes: RefCell<hash::Map<ContentKey<'a>, Prefix<'a>>>,
     /// Where the data of each object an annotation's own-ness was told by lies, or
     /// `None` when it is no dictionary, array or stream ([`Objects::own`]).
-    places: RefCell<hash::Map<ObjRef, Option<Place>>>,
+    places: RefCell<hash::Map<ObjRef, (Option<Place>, Lost)>>,
+}
+
+impl<'a> Read<'a> {
+    /// What was kept of `r`, its loss told to the computation asking, if anything.
+    fn object(&self, r: ObjRef) -> Option<Found<'a>> {
+        let (found, lost) = self.objects.borrow().get(&r).cloned()?;
+        self.xref.note(lost);
+        Some(found)
+    }
+
+    /// Object `r` read, and what reading it lost, which the computation asking is
+    /// told too.
+    fn read(&self, r: ObjRef) -> (Found<'a>, Lost) {
+        self.xref
+            .watch(|| Found::read(self.xref.get::<Object<'a>>(r.into())))
+    }
 }
 
 /// An object as it was read: a string's bytes and a name's shared, as they may
@@ -319,11 +343,10 @@ impl<'a> Objects<'a> {
     fn found(&self, read: &Read<'a>, entry: Option<MaybeRef<Object<'a>>>) -> (Found<'a>, Self) {
         match entry {
             Some(MaybeRef::Ref(r)) => {
-                let known = read.objects.borrow().get(&r).cloned();
-                let found = known.unwrap_or_else(|| {
-                    let found = Found::read(read.xref.get::<Object<'a>>(r.into()));
-                    read.objects.borrow_mut().insert(r, found.clone());
-                    found
+                let found = read.object(r).unwrap_or_else(|| {
+                    let read_now = read.read(r);
+                    read.objects.borrow_mut().insert(r, read_now.clone());
+                    read_now.0
                 });
                 let shared = Self {
                     read: self.read.clone(),
@@ -421,26 +444,40 @@ impl<'a> Objects<'a> {
         let r = ObjRef::from(id);
         let at = place(dict.data());
         let known = read.places.borrow().get(&r).copied();
-        let outer = known.unwrap_or_else(|| {
-            let known = read.objects.borrow().get(&r).cloned();
-            let found = known.unwrap_or_else(|| {
-                let found = Found::read(read.xref.get::<Object<'a>>(id));
-                // An object that holds annotations is kept for the others it holds;
-                // an annotation's own object, which no other reads, is not.
-                if !matches!(&found, Found::Object(Object::Dict(d)) if place(d.data()) == at) {
-                    read.objects.borrow_mut().insert(r, found.clone());
-                }
-                found
-            });
-            let outer = match &found {
-                Found::Object(Object::Dict(d)) => Some(place(d.data())),
-                Found::Object(Object::Array(a)) => Some(place(a.data())),
-                Found::Object(Object::Stream(s)) => Some(place(s.dict().data())),
-                _ => None,
-            };
-            read.places.borrow_mut().insert(r, outer);
-            outer
-        });
+        let outer = match known {
+            Some((outer, lost)) => {
+                read.xref.note(lost);
+                outer
+            }
+            None => {
+                let kept = read.objects.borrow().get(&r).cloned();
+                let (found, lost) = match kept {
+                    Some((found, lost)) => {
+                        read.xref.note(lost);
+                        (found, lost)
+                    }
+                    None => {
+                        let read_now = read.read(r);
+                        // An object that holds annotations is kept for the others it
+                        // holds; an annotation's own object, which no other reads, is
+                        // not.
+                        if !matches!(&read_now.0, Found::Object(Object::Dict(d)) if place(d.data()) == at)
+                        {
+                            read.objects.borrow_mut().insert(r, read_now.clone());
+                        }
+                        read_now
+                    }
+                };
+                let outer = match &found {
+                    Found::Object(Object::Dict(d)) => Some(place(d.data())),
+                    Found::Object(Object::Array(a)) => Some(place(a.data())),
+                    Found::Object(Object::Stream(s)) => Some(place(s.dict().data())),
+                    _ => None,
+                };
+                read.places.borrow_mut().insert(r, (outer, lost));
+                outer
+            }
+        };
         let (start, len) = outer?;
         if (start, len) == at {
             Some(true)
@@ -624,17 +661,25 @@ impl<'a> Items<'a> {
         let at = self.0.content_key();
         let known = read.prefixes.borrow().get(&at).cloned();
         let found = match known {
-            Some((found, all)) if all || found.len() >= n => found,
+            Some((found, all, lost)) if all || found.len() >= n => {
+                read.xref.note(lost);
+                found
+            }
             _ => {
-                let mut entries = self.0.raw_iter();
-                let found: Vec<Item<'a>> = entries
-                    .by_ref()
-                    .take(n)
-                    .map(|e| (e.as_obj_ref(), e))
-                    .map(|(r, e)| (self.1.found(read, Some(e)).0, r))
-                    .collect();
-                let all = found.len() < n || entries.next().is_none();
-                read.prefixes.borrow_mut().insert(at, (found.clone(), all));
+                let ((found, all), lost) = read.xref.watch(|| {
+                    let mut entries = self.0.raw_iter();
+                    let found: Vec<Item<'a>> = entries
+                        .by_ref()
+                        .take(n)
+                        .map(|e| (e.as_obj_ref(), e))
+                        .map(|(r, e)| (self.1.found(read, Some(e)).0, r))
+                        .collect();
+                    let all = found.len() < n || entries.next().is_none();
+                    (found, all)
+                });
+                read.prefixes
+                    .borrow_mut()
+                    .insert(at, (found.clone(), all, lost));
                 found
             }
         };
@@ -763,15 +808,21 @@ impl<'a> Entries<'a> {
             .borrow()
             .get(&at)
             .and_then(|entries| entries.get(key).cloned());
-        let entry = known.unwrap_or_else(|| {
-            let (entry, _) = fresh();
-            read.entries
-                .borrow_mut()
-                .entry(at)
-                .or_default()
-                .insert(key.into(), entry.clone());
-            entry
-        });
+        let entry = match known {
+            Some((entry, lost)) => {
+                read.xref.note(lost);
+                entry
+            }
+            None => {
+                let ((entry, _), lost) = read.xref.watch(fresh);
+                read.entries
+                    .borrow_mut()
+                    .entry(at)
+                    .or_default()
+                    .insert(key.into(), (entry.clone(), lost));
+                entry
+            }
+        };
         // Every entry of a shared object is read with the objects of shared ones.
         (entry, self.1.clone())
     }
