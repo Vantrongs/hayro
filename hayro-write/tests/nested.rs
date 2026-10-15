@@ -25,7 +25,14 @@ fn nested_flate_page(len: usize) -> Vec<u8> {
         .cycle()
         .take(len)
         .collect();
-    let data = zlib(&zlib(&content));
+    page(
+        "/Filter [/FlateDecode /FlateDecode]",
+        &zlib(&zlib(&content)),
+    )
+}
+
+/// One page whose content stream has dictionary entries `entries` and holds `data`.
+fn page(entries: &str, data: &[u8]) -> Vec<u8> {
     let objects: [&[u8]; 3] = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
@@ -40,14 +47,8 @@ fn nested_flate_page(len: usize) -> Vec<u8> {
         out.extend(b"\nendobj\n");
     }
     offsets.push(out.len());
-    out.extend(
-        format!(
-            "4 0 obj\n<< /Filter [/FlateDecode /FlateDecode] /Length {} >>\nstream\n",
-            data.len()
-        )
-        .bytes(),
-    );
-    out.extend_from_slice(&data);
+    out.extend(format!("4 0 obj\n<< {entries} /Length {} >>\nstream\n", data.len()).bytes());
+    out.extend_from_slice(data);
     out.extend(b"\nendstream\nendobj\n");
     let table = out.len();
     out.extend(b"xref\n0 5\n0000000000 65535 f \n");
@@ -97,6 +98,72 @@ fn nested_filters_are_copied_in_memory_bounded_whatever_they_decode_to() {
         assert!(
             (2 * len..16 * len).contains(&work),
             "{len} bytes decoded twice with {work} bytes of work"
+        );
+    }
+}
+
+/// The page copied as a page and as a form, and the work counted.
+fn copied(file: Vec<u8>) -> (hayro_write::ExtractionResult, usize) {
+    let pdf = Pdf::new(file).unwrap();
+    let queries = [
+        ExtractionQuery::new_page(0),
+        ExtractionQuery::new_xobject(0),
+    ];
+    EXAMINED.set(0);
+    TOLD.set(0);
+    BODIES_READ.set(0);
+    let mut next = Ref::new(1);
+    let copy = extract(
+        &pdf,
+        Box::new(|| next.bump()),
+        ChunkSettings::default(),
+        &queries,
+    )
+    .unwrap();
+    for root in &copy.root_refs {
+        assert!(root.is_ok(), "{root:?}");
+    }
+    (copy, EXAMINED.get() + TOLD.get() + BODIES_READ.get())
+}
+
+/// A content of 100,000 filters over empty data is copied on a stack of 512 KiB, on
+/// which a debug build copies a content of one filter.
+#[test]
+fn a_content_of_many_filters_is_copied_on_a_small_stack() {
+    for filter in ["/AHx", "/Fl"] {
+        let entries = format!("/Filter [{}]", [filter].repeat(100_000).join(" "));
+        std::thread::Builder::new()
+            .stack_size(512 << 10)
+            .spawn(move || copied(page(&entries, b"")))
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
+
+/// Content in Flate filters nested `n` deep, each with a checksum zlib rejects at its
+/// end, is copied with work proportional to what the filters make.
+#[test]
+fn nested_bad_checksums_are_copied_with_work_linear_in_their_number() {
+    let data = b"0 0 1 rg 20 20 160 160 re f\n".repeat(40);
+    for n in [16, 32, 64, 128] {
+        let mut encoded = data.clone();
+        let mut made = 0;
+        for _ in 0..n {
+            made += encoded.len();
+            encoded = zlib(&encoded);
+            let last = encoded.len() - 1;
+            encoded[last] ^= 1;
+        }
+        let entries = format!("/Filter [{}]", ["/FlateDecode"].repeat(n).join(" "));
+        let (_, work) = copied(page(&entries, &encoded));
+        eprintln!("{n} filters: work {work} for {made} bytes made");
+        // Each filter takes its data and makes its output with zlib, then with the
+        // permissive decoder, for the page and for the form, each content read twice:
+        // once until the last filter restarts, then again.
+        assert!(
+            work < 24 * made + 64 * encoded.len() + 100_000,
+            "{n} filters: work {work} for {made} bytes made"
         );
     }
 }

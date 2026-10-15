@@ -433,7 +433,7 @@ fn nested_flate_is_read_in_memory_bounded_whatever_it_decodes_to() {
             let (peak, read, work) = peak_of_reading(&pdf);
             assert_eq!(read, size, "{name}");
             assert!(
-                peak < 1 << 20,
+                peak < 2 << 20,
                 "{name}: {size} bytes read with a peak of {peak}"
             );
             assert!(
@@ -449,6 +449,52 @@ fn nested_flate_is_read_in_memory_bounded_whatever_it_decodes_to() {
             "{name}: peaks {peaks:?} grow with the data"
         );
     }
+}
+
+/// Flate inside Flate whose outer data have a checksum zlib rejects, found once the
+/// inner data were read, is read in memory that does not grow with what the outer
+/// filter makes: here a few bytes of content followed by 8 or 32 MiB the inner filter
+/// does not read.
+#[test]
+fn a_damaged_outer_flate_is_read_in_memory_bounded_whatever_it_decodes_to() {
+    let inner = zlib(b"q Q", 9);
+    let peaks = [8 << 20, 32 << 20].map(|tail| {
+        let mut data = inner.clone();
+        data.resize(inner.len() + tail, 0);
+        let pdf = stream_file("/Filter [/FlateDecode /FlateDecode]", &bad_checksum(&data));
+        assert_eq!(object_3(&pdf).decoded_strict().unwrap().as_ref(), b"q Q");
+        let (peak, read, work) = peak_of_reading(&pdf);
+        assert_eq!(read, 3);
+        assert!(
+            work < 8 * tail,
+            "{tail} bytes after the content read with {work} bytes of work"
+        );
+        println!("{tail} bytes after the content: peak {peak}, work {work}");
+        peak
+    });
+    assert!(
+        peaks[1] < (2 << 20).min(peaks[0] + 128 * 1024),
+        "peaks {peaks:?} grow with the data"
+    );
+}
+
+/// A predictor over rows of one byte is read many rows at a time: a read fills the
+/// buffer it is given, so that short rows do not cost a read each.
+#[test]
+fn short_predictor_rows_are_read_many_at_a_time() {
+    let data: Vec<u8> = (0..65_536_u32).map(|i| (i * 7) as u8).collect();
+    let parms = "/Predictor 2 /Colors 1 /BitsPerComponent 8 /Columns 1";
+    let pdf = stream_file(
+        &format!("/Filter /FlateDecode /DecodeParms << {parms} >>"),
+        &zlib(&data, 6),
+    );
+    let stream = object_3(&pdf);
+    assert_eq!(stream.decoded_strict().unwrap().as_ref(), &data[..]);
+    let meter = Meter::default();
+    let mut reader = stream.decoded_strict_reader(&meter).unwrap().unwrap();
+    let mut buf = vec![0; 4096];
+    assert_eq!(reader.read(&mut buf, &meter), Ok(4096));
+    assert_eq!(buf, data[..4096]);
 }
 
 /// A hook that asks to stop ends the reading within a bounded amount of work, and
@@ -542,5 +588,214 @@ fn an_end_does_not_hide_a_failure_before_it() {
             .unwrap();
         let (read, _) = read_all(&mut reader, &mut Rng(5), &Meter::default());
         assert_eq!(read, Err(ReadError::Failed), "{dict}");
+    }
+}
+
+/// Runs `f` on a thread whose stack is `stack` bytes.
+fn on_stack<T: Send>(stack: usize, f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(stack)
+            .spawn_scoped(scope, f)
+            .unwrap()
+            .join()
+            .unwrap()
+    })
+}
+
+/// Chains of 10,000 and 100,000 filters, `ASCIIHex` or `Flate`, over empty data are read,
+/// read again and dropped on a 256 KiB stack, as `decoded_strict` reads them, in
+/// memory that grows with the number of filters by a few dozen bytes each, as their
+/// names in the file do, not by the buffers and window of a filter's decoder.
+#[test]
+fn deep_chains_are_read_on_a_small_stack_in_memory_of_their_filters() {
+    for filter in ["/AHx", "/Fl"] {
+        let peaks = [10_000, 100_000].map(|n| {
+            let dict = format!("/Filter [{}]", [filter].repeat(n).join(" "));
+            on_stack(256 << 10, move || {
+                let pdf = stream_file(&dict, b"");
+                let stream = object_3(&pdf);
+                assert_eq!(stream.decoded_strict().unwrap().len(), 0);
+                let (reads, allocations) = measure(|| {
+                    let meter = Meter::default();
+                    let mut reader = stream.decoded_strict_reader(&meter).unwrap().unwrap();
+                    let first = read_all(&mut reader, &mut Rng(3), &meter);
+                    reader.rewind();
+                    (first, read_all(&mut reader, &mut Rng(4), &meter))
+                });
+                assert_eq!(reads.0, (Ok(Vec::new()), 0), "{n} {filter}");
+                assert_eq!(reads.1, (Ok(Vec::new()), 0), "{n} {filter}: read again");
+                println!("{n} {filter}: peak {}", allocations.peak);
+                allocations.peak
+            })
+        });
+        assert!(
+            peaks[1] < peaks[0] + 64 * 90_000,
+            "{filter}: peaks {peaks:?} for 10,000 and 100,000 filters"
+        );
+    }
+}
+
+/// Flate filters nested `n` deep, each with a checksum zlib rejects at its end, are
+/// read as `decoded_strict` reads them, with work proportional to what the filters
+/// make: a filter that goes on with the next decoder decodes its own data again, not
+/// those of every filter before it.
+#[test]
+#[cfg(debug_assertions)]
+fn nested_bad_checksums_are_read_with_work_linear_in_their_number() {
+    use hayro_syntax::work::TOLD;
+    let data = b"0 0 1 rg 20 20 160 160 re f\n".repeat(40);
+    for n in [16, 32, 64, 128] {
+        let mut encoded = data.clone();
+        // What all the filters make.
+        let mut made = 0;
+        for _ in 0..n {
+            made += encoded.len();
+            encoded = bad_checksum(&encoded);
+        }
+        let pdf = stream_file(
+            &format!("/Filter [{}]", ["/Fl"].repeat(n).join(" ")),
+            &encoded,
+        );
+        let stream = object_3(&pdf);
+        assert_eq!(stream.decoded_strict().unwrap().as_ref(), data, "{n}");
+        TOLD.set(0);
+        let mut reader = stream
+            .decoded_strict_reader(&Meter::default())
+            .unwrap()
+            .unwrap();
+        let (read, _) = read_all(&mut reader, &mut Rng(5), &Meter::default());
+        let work = TOLD.get();
+        assert_eq!(read, Ok(data.clone()), "{n}");
+        println!("{n} filters: work {work} for {made} bytes made");
+        // Each filter takes its data and makes its output with zlib, then with the
+        // permissive decoder.
+        assert!(
+            work < 6 * made,
+            "{n} filters: work {work} for {made} bytes made"
+        );
+    }
+}
+
+/// [`read_all`], comparing the bytes with `expected` as they come rather than keeping
+/// them: `Ok(None)` where they differ.
+fn read_compared(
+    reader: &mut StrictReader<'_>,
+    expected: &[u8],
+    rng: &mut Rng,
+    meter: &Meter<'_>,
+) -> (Result<Option<usize>, ReadError>, usize) {
+    let mut buf = vec![0; 70_000];
+    let (mut at, mut same, mut restarts) = (0, true, 0);
+    loop {
+        let len = 1 + rng.below(70_000);
+        match reader.read(&mut buf[..len], meter) {
+            Ok(0) => return (Ok(same.then_some(at)), restarts),
+            Ok(n) => {
+                same &= expected.get(at..at + n) == Some(&buf[..n]);
+                at += n;
+            }
+            Err(ReadError::Restarted) => {
+                restarts += 1;
+                (at, same) = (0, true);
+            }
+            Err(error) => return (Err(error), restarts),
+        }
+    }
+}
+
+/// Chains of Flate filters, each making more than a megabyte, some with a checksum
+/// zlib rejects, are read as `decoded_strict` reads them, with work proportional to
+/// what each filter makes, a pass more for each damaged filter, and restart at most
+/// twice for each damaged filter and twice for the last one; rewound, they read the
+/// same again with no restart. They are read in less memory than decoding them whole
+/// holds: with at most 17 filters, a megabyte held at most and the state and buffers
+/// of each filter's decoder, none held whole; past that, one in 17 held whole.
+#[test]
+fn deep_expanding_chains_read_what_strict_decoding_returns() {
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let mut cases: Vec<(usize, Vec<usize>)> = vec![
+        (12, vec![]),
+        (12, vec![5]),
+        (12, vec![11]),
+        (12, vec![0]),
+        (12, (0..12).collect()),
+        (40, vec![]),
+        (40, vec![3, 20]),
+    ];
+    for _ in 0..6 {
+        let n = 2 + rng.below(11);
+        let damaged = (0..n).filter(|_| rng.chance(25)).collect();
+        cases.push((n, damaged));
+    }
+    for (case, (n, damaged)) in cases.into_iter().enumerate() {
+        // Noise, which no filter makes smaller: each makes about as much.
+        let content = common::noise(if n > 17 { 1_200_000 } else { 3_000_000 }, case as u32);
+        let mut encoded = content.clone();
+        // The innermost filter, the last one read, is layer 0.
+        for layer in 0..n {
+            encoded = match rng.below(3) {
+                0 => zlib(&encoded, 1),
+                _ => common::stored_zlib(&encoded, 65_535),
+            };
+            if damaged.contains(&layer) {
+                let last = encoded.len() - 1;
+                encoded[last] ^= 1;
+            }
+        }
+        let dict = format!("/Filter [{}]", ["/Fl"].repeat(n).join(" "));
+        let pdf = stream_file(&dict, &encoded);
+        let stream = object_3(&pdf);
+        let (whole, decoding) = measure(|| stream.decoded_strict().map(|d| d.into_owned()));
+        let expected = whole.as_deref().unwrap_or(&[]);
+        let ((read, restarts, again, work), allocations) = measure(|| {
+            #[cfg(debug_assertions)]
+            hayro_syntax::work::TOLD.set(0);
+            let meter = Meter::default();
+            let mut reader = stream.decoded_strict_reader(&meter).unwrap().unwrap();
+            let (read, restarts) = read_compared(&mut reader, expected, &mut rng, &meter);
+            #[cfg(debug_assertions)]
+            let work = hayro_syntax::work::TOLD.get();
+            #[cfg(not(debug_assertions))]
+            let work = 0;
+            reader.rewind();
+            let again = read_compared(&mut reader, expected, &mut rng, &meter);
+            (read, restarts, again, work)
+        });
+        let name = format!("case {case}: {n} filters, damaged {damaged:?}");
+        match (&whole, &read) {
+            (Ok(whole), Ok(read)) => assert_eq!(*read, Some(whole.len()), "{name}"),
+            (Err(DecodeFailure::StreamDecode), Err(ReadError::Failed)) => {}
+            _ => panic!("{name}: {:?} vs {read:?}", whole.as_ref().map(Vec::len)),
+        }
+        assert_eq!(again, (read, 0), "{name}: read again");
+        assert!(
+            restarts <= 2 * damaged.len() + 2,
+            "{name}: {restarts} restarts"
+        );
+        // Each pass takes a filter's data and makes its output: the first pass, a
+        // second where a filter streamed restarts, the last filter's two more
+        // decoders, and the permissive decoder of each damaged filter.
+        // Each pass takes a filter's data and makes its output: the first pass, the
+        // last filter's two more decoders, and for each damaged filter a pass to its
+        // end, its raw decoder's and its permissive decoder's.
+        assert!(
+            work < (3 * damaged.len() + 6) * n * content.len(),
+            "{name}: {work} bytes of work"
+        );
+        let most = match n {
+            ..=17 => decoding.peak.min((1 << 20) + n * (256 << 10)),
+            _ => decoding.peak,
+        };
+        assert!(
+            allocations.peak < most,
+            "{name}: a peak of {}, {} decoding whole",
+            allocations.peak,
+            decoding.peak
+        );
+        println!(
+            "{name}: {restarts} restarts, peak {} ({} decoding whole), work {work}",
+            allocations.peak, decoding.peak
+        );
     }
 }

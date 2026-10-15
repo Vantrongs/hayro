@@ -95,6 +95,7 @@ impl Filter {
         meter: &Meter<'_>,
         strict: bool,
     ) -> Result<FilterResult<'static>, DecodeFailure> {
+        let predictor = || lzw_flate::PredictorParams::from_params(params);
         let res =
             match self {
                 Self::AsciiHexDecode => ascii_hex::decode(data, meter)
@@ -106,10 +107,10 @@ impl Filter {
                 Self::RunLengthDecode => run_length::decode(data, meter)
                     .map(FilterResult::from_data)
                     .ok_or(DecodeFailure::StreamDecode),
-                Self::LzwDecode => lzw_flate::lzw::decode(data, params, meter)
+                Self::LzwDecode => lzw_flate::lzw::decode(data, &predictor(), meter)
                     .map(FilterResult::from_data)
                     .ok_or(DecodeFailure::StreamDecode),
-                Self::FlateDecode => lzw_flate::flate::decode(data, params, meter, strict)
+                Self::FlateDecode => lzw_flate::flate::decode(data, &predictor(), meter, strict)
                     .map(FilterResult::from_data)
                     .ok_or(DecodeFailure::StreamDecode),
                 #[cfg(feature = "images")]

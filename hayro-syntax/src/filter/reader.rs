@@ -679,7 +679,6 @@ mod tests {
     mod compressed {
         use super::super::fixtures::stored_deflate;
         use super::*;
-        use crate::object::Dict;
         use std::io::Write;
 
         pub(crate) fn zlib(data: &[u8]) -> Vec<u8> {
@@ -711,7 +710,12 @@ mod tests {
             encoded[2] = 0;
             let end = encoded.len() - 4;
             encoded.insert(end, 0b111);
-            let expected = flate::decode(&encoded, &Dict::default(), &Meter::default(), false);
+            let expected = flate::decode(
+                &encoded,
+                &PredictorParams::default(),
+                &Meter::default(),
+                false,
+            );
             let mut reader = DecodedReader::flate(
                 DecryptedReader::raw(Cow::Borrowed(&encoded)),
                 &params(1, 1, 8, 1),
@@ -750,8 +754,13 @@ mod tests {
         /// and by the permissive decoder) each stay under three polls' work. Rewound,
         /// the reader then yields what whole decoding does, as does a fresh reader.
         fn cancelled_within_bounded_work(encoded: &[u8], p: &PredictorParams) {
-            let whole = flate::decode(encoded, &Dict::default(), &Meter::default(), false)
-                .and_then(|d| apply_predictor(d, p, &Meter::default()));
+            let whole = flate::decode(
+                encoded,
+                &PredictorParams::default(),
+                &Meter::default(),
+                false,
+            )
+            .and_then(|d| apply_predictor(d, p, &Meter::default()));
             let hook = second_poll();
             let meter = Meter::new(Some(&hook));
             let mut reader =

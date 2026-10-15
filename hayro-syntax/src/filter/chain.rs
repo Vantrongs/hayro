@@ -1,7 +1,16 @@
 //! A stream's data decoded through all its filters a piece at a time, as
 //! [`Stream::decoded_strict`](crate::object::Stream::decoded_strict) decodes them
 //! whole, in memory bounded by the decoders' state, windows and buffers, however
-//! much the filters make of the data and however they nest.
+//! much the filters make of the data and however many there are.
+//!
+//! The filters are a flat list of [`Layer`]s. Each but the last is decoded in turn
+//! into a buffer while what it makes is at most [`HELD`] bytes, as whole decoding
+//! decodes it; one that makes more is streamed instead: the layers above read it as
+//! it decodes. At most [`LIVE`] layers below the last are streamed at once; past
+//! that a layer is held whatever it makes. So the stages alive at once, the stack a
+//! read goes down and the memory of their windows do not grow with the number of
+//! filters, and a layer whose output is held decides its decoder before the layers
+//! above read any of it.
 //!
 //! Each filter is a [`Stage`] that reads the one before it. A Flate stage that finds
 //! its data corrupt for the decoder it uses goes on with the next one whole decoding
@@ -12,27 +21,142 @@
 //! A stage that ends, fails or restarts reads the stages before it to their end
 //! first, as whole decoding decodes them whole first: one of them may yet fail or
 //! restart, which voids what the stage made of their data.
+//!
+//! A restart costs at most one more decoding of the layers streamed below the one
+//! restarting and of those above it. A stage restarts only once the stages before it
+//! read to their end with no restart, so their decoders are final, and its own new
+//! decoder is too: a layer streamed restarts at most twice, and a run of at most
+//! [`LIVE`] streamed layers and the one over them restarts at most `2 * LIVE + 2`
+//! times, however its layers are damaged.
 
 use crate::filter::lzw_flate::flate::fallback::{FlateStream, Input};
-use crate::filter::lzw_flate::{PredictorParams, Unpredictor, lzw};
+use crate::filter::lzw_flate::{PredictorParams, Unpredictor, flate, lzw};
 use crate::filter::reader::ReadError;
+use crate::filter::{ascii_85, ascii_hex, run_length};
 use crate::trivia::is_white_space_character;
 use crate::work::{Meter, POLL_BYTES};
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
+use alloc::rc::Rc;
 use alloc::vec::Vec;
+
+/// The most bytes a layer below the last one makes and still has them held, as the
+/// writer holds a stream it reads to its end: past that, streaming the layer, its
+/// state, window and buffers about a tenth of that, saves memory.
+const HELD: usize = 1 << 20;
+
+/// The most layers below the last one streamed at once: their decoders' state and
+/// buffers, about a tenth of [`HELD`] each, take about twice as much as holding one,
+/// and each restart of one decodes them all again.
+const LIVE: usize = 16;
+
+/// The bytes the permissive Flate decoder makes at a time in a stage, which it holds
+/// besides its window.
+const PERMISSIVE_STEP: usize = 16 * 1024;
+
+/// A filter of the chain, its predictor reversed after it where it has one, by an
+/// [`Unpredictor`] where a stage reverses it (boxed: a long chain holds many layers
+/// with none).
+pub(crate) enum Layer {
+    Flate(PredictorParams, Option<Box<Unpredictor>>),
+    Lzw(PredictorParams, Option<Box<Unpredictor>>),
+    AsciiHex,
+    Ascii85,
+    RunLength,
+}
+
+impl Layer {
+    /// `data` decoded whole, as [`Stream::decoded_strict`] decodes the layer, where it
+    /// makes at most `limit` bytes; else `Err` with the decoders that found the data
+    /// corrupt before the one that made more.
+    ///
+    /// [`Stream::decoded_strict`]: crate::object::Stream::decoded_strict
+    fn decode(
+        &self,
+        data: &[u8],
+        meter: &Meter<'_>,
+        limit: usize,
+    ) -> Result<Result<Vec<u8>, ReadError>, usize> {
+        let decoded = match self {
+            Self::Flate(params, _) => {
+                flate::decode_within(data, params, meter, true, limit).map_err(|l| l.tried)?
+            }
+            Self::Lzw(params, _) => {
+                lzw::decode_within(data, params, meter, limit).map_err(|()| 0_usize)?
+            }
+            // Each makes at most as many bytes as half, four times and 64 times the data.
+            Self::AsciiHex => ascii_hex::decode(data, meter),
+            Self::Ascii85 if data.len().saturating_mul(4) <= limit => ascii_85::decode(data, meter),
+            Self::RunLength if data.len().saturating_mul(64) <= limit => {
+                run_length::decode(data, meter)
+            }
+            Self::Ascii85 | Self::RunLength => return Err(0),
+        };
+        Ok(match (decoded, meter.cancelled()) {
+            (_, true) => Err(ReadError::Cancelled),
+            (Some(decoded), false) => Ok(decoded),
+            (None, false) => Err(ReadError::Failed),
+        })
+    }
+
+    /// The layer's stage, reading `from`, its decoder past the first `tried` whole
+    /// decoding would try, which found the data corrupt.
+    fn stage<'a>(&self, from: Box<dyn Stage + 'a>, tried: usize) -> Box<dyn Stage + 'a> {
+        let predicted = |stage: Box<dyn Stage + 'a>, unpredictor: &Option<Box<Unpredictor>>| {
+            match unpredictor {
+                None => stage,
+                Some(unpredictor) => Box::new(Predict {
+                    from: stage,
+                    unpredictor: Unpredictor::clone(unpredictor),
+                    input: Vec::new(),
+                    chunk: Vec::new(),
+                    taken: 0,
+                }) as Box<dyn Stage + 'a>,
+            }
+        };
+        match self {
+            Self::Flate(_, unpredictor) => {
+                predicted(Box::new(Flate::new(from, Which::after(tried))), unpredictor)
+            }
+            Self::Lzw(params, unpredictor) => predicted(
+                Box::new(Bytewise::lzw(from, params.early_change)),
+                unpredictor,
+            ),
+            Self::AsciiHex => Box::new(Bytewise::ascii_hex(from)),
+            Self::Ascii85 => Box::new(Bytewise::ascii_85(from)),
+            Self::RunLength => Box::new(Bytewise::run_length(from)),
+        }
+    }
+}
 
 /// The decoded data of a stream, read from its start in pieces (see
 /// [`Stream::decoded_strict_reader`](crate::object::Stream::decoded_strict_reader)).
 pub struct StrictReader<'a> {
-    last: Box<dyn Stage + 'a>,
+    /// The stored data, decrypted.
+    stored: Data<'a>,
+    layers: Vec<Layer>,
+    /// The last layer's stage, over the layers below it held or streamed, built at the
+    /// first read.
+    chain: Option<Box<dyn Stage + 'a>>,
+    /// Whether bytes were read since the start or the last restart.
+    handed: bool,
     /// The error that ended the reads, until a rewind.
     ended: Option<ReadError>,
 }
 
 impl<'a> StrictReader<'a> {
-    pub(crate) fn new(last: Box<dyn Stage + 'a>) -> Self {
-        Self { last, ended: None }
+    pub(crate) fn new(stored: Cow<'a, [u8]>, layers: Vec<Layer>) -> Self {
+        let stored = match stored {
+            Cow::Borrowed(data) => Data::Borrowed(data),
+            Cow::Owned(data) => Data::Shared(Rc::new(data)),
+        };
+        Self {
+            stored,
+            layers,
+            chain: None,
+            handed: false,
+            ended: None,
+        }
     }
 
     /// Fills `buf` with the next decoded bytes and returns how many: at most
@@ -52,7 +176,7 @@ impl<'a> StrictReader<'a> {
             return Ok(0);
         }
         let result = match meter.cancelled() {
-            false => self.last.read(&mut buf[..len], meter),
+            false => self.read_chain(&mut buf[..len], meter),
             true => Err(ReadError::Cancelled),
         };
         // A decoder may end early on a stop as on data cut short.
@@ -60,19 +184,96 @@ impl<'a> StrictReader<'a> {
             false => result,
             true => Err(ReadError::Cancelled),
         };
-        if let Err(error) = result
-            && error != ReadError::Restarted
-        {
-            self.ended = Some(error);
+        match result {
+            Ok(n) => self.handed |= n > 0,
+            Err(ReadError::Restarted) => self.handed = false,
+            Err(error) => self.ended = Some(error),
         }
         result
+    }
+
+    /// [`Self::read`] from the stages, built first if they are not; a restart before
+    /// any byte was read is read past.
+    fn read_chain(&mut self, buf: &mut [u8], meter: &Meter<'_>) -> Result<usize, ReadError> {
+        loop {
+            let chain = match &mut self.chain {
+                Some(chain) => chain,
+                None => {
+                    let chain = self.build(meter)?;
+                    self.chain.insert(chain)
+                }
+            };
+            match chain.read(buf, meter) {
+                Err(ReadError::Restarted) if !self.handed => {}
+                result => return result,
+            }
+        }
+    }
+
+    /// The stages: each layer but the last decoded whole into a buffer where it reads
+    /// one and makes at most [`HELD`] bytes, else streamed, up to [`LIVE`] at once,
+    /// the next one then read whole into a buffer; and the last one over them.
+    fn build(&self, meter: &Meter<'_>) -> Result<Box<dyn Stage + 'a>, ReadError> {
+        let mut from = Source::Held(self.stored.clone());
+        let Some((last, layers)) = self.layers.split_last() else {
+            return Ok(from.stage());
+        };
+        let mut live = 0;
+        for layer in layers {
+            from = match from {
+                Source::Held(data) => match layer.decode(data.as_slice(), meter, HELD) {
+                    Ok(decoded) => Source::Held(Data::Held(decoded?)),
+                    Err(tried) => {
+                        live = 1;
+                        Source::Live(layer.stage(Source::Held(data).stage(), tried))
+                    }
+                },
+                Source::Live(stage) if live < LIVE => {
+                    live += 1;
+                    Source::Live(layer.stage(stage, 0))
+                }
+                Source::Live(stage) => {
+                    let mut stage = layer.stage(stage, 0);
+                    let mut out = Vec::new();
+                    let mut filled = 0;
+                    loop {
+                        // Grown by half, so that a large output is held with at most
+                        // half as much room to spare, and cleared a piece at a time as
+                        // reads fill it, each byte once however few a read gives.
+                        if filled == out.len() {
+                            if out.capacity() - filled < POLL_BYTES {
+                                out.reserve_exact((filled / 2).max(POLL_BYTES));
+                            }
+                            out.resize(filled + POLL_BYTES, 0);
+                        }
+                        let read = stage.read(&mut out[filled..], meter);
+                        match read {
+                            Ok(0) => break,
+                            Ok(n) => filled += n,
+                            // A streamed layer's restart, or this one's on what they
+                            // made: the stages start over themselves.
+                            Err(ReadError::Restarted) => filled = 0,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    out.truncate(filled);
+                    live = 0;
+                    // Drops the stages below, which made all they will.
+                    Source::Held(Data::Held(out))
+                }
+            };
+        }
+        Ok(last.stage(from.stage(), 0))
     }
 
     /// Back to the start of the data, each decoder kept as restarts chose it, so that
     /// data read to their end once are read again with no restart.
     pub fn rewind(&mut self) {
         self.ended = None;
-        self.last.rewind();
+        self.handed = false;
+        if let Some(chain) = &mut self.chain {
+            chain.rewind();
+        }
     }
 }
 
@@ -86,14 +287,48 @@ pub(crate) trait Stage {
     fn rewind(&mut self);
 }
 
-/// The stored data, decrypted.
-pub(crate) struct Stored<'a> {
-    data: Cow<'a, [u8]>,
+/// Bytes a stage reads from their start: the stored data or a layer's held output.
+#[derive(Clone)]
+enum Data<'a> {
+    Borrowed(&'a [u8]),
+    /// Decrypted, kept for a reader that starts over.
+    Shared(Rc<Vec<u8>>),
+    Held(Vec<u8>),
+}
+
+impl Data<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(data) => data,
+            Self::Shared(data) => data,
+            Self::Held(data) => data,
+        }
+    }
+}
+
+/// What a layer reads: bytes held, or the stage of a layer streamed.
+enum Source<'a> {
+    Held(Data<'a>),
+    Live(Box<dyn Stage + 'a>),
+}
+
+impl<'a> Source<'a> {
+    fn stage(self) -> Box<dyn Stage + 'a> {
+        match self {
+            Self::Held(data) => Box::new(Stored::new(data)),
+            Self::Live(stage) => stage,
+        }
+    }
+}
+
+/// The stored data, decrypted, or a layer's held output.
+struct Stored<'a> {
+    data: Data<'a>,
     at: usize,
 }
 
 impl<'a> Stored<'a> {
-    pub(crate) fn new(data: Cow<'a, [u8]>) -> Self {
+    fn new(data: Data<'a>) -> Self {
         Self { data, at: 0 }
     }
 }
@@ -104,7 +339,7 @@ impl Stage for Stored<'_> {
         if meter.cancelled() {
             return Err(ReadError::Cancelled);
         }
-        let rest = &self.data[self.at..];
+        let rest = &self.data.as_slice()[self.at..];
         let n = rest.len().min(buf.len());
         buf[..n].copy_from_slice(&rest[..n]);
         self.at += n;
@@ -122,9 +357,11 @@ const PULLED: usize = 8192;
 
 /// The bytes of the stage before, for a decoder that takes them a few at a time;
 /// the first error reading them ends them, kept for the stage to handle.
-pub(crate) struct Pulled<'a> {
+struct Pulled<'a> {
     from: Box<dyn Stage + 'a>,
     buf: Vec<u8>,
+    /// The bytes the last read of the stage before gave.
+    got: usize,
     at: usize,
     taken: usize,
     end: bool,
@@ -136,6 +373,7 @@ impl<'a> Pulled<'a> {
         Self {
             from,
             buf: Vec::new(),
+            got: 0,
             at: 0,
             taken: 0,
             end: false,
@@ -151,10 +389,13 @@ impl<'a> Pulled<'a> {
             }
             self.buf.drain(..self.at);
             self.at = 0;
+            // Room for twice what the last read gave, so that data that are few do
+            // not cost a large buffer cleared each time.
             let len = self.buf.len();
-            self.buf.resize(len + PULLED, 0);
+            self.buf.resize(len + (2 * self.got).clamp(256, PULLED), 0);
             let read = self.from.read(&mut self.buf[len..], meter);
-            self.buf.truncate(len + *read.as_ref().unwrap_or(&0));
+            self.got = *read.as_ref().unwrap_or(&0);
+            self.buf.truncate(len + self.got);
             match read {
                 Ok(0) => self.end = true,
                 Ok(_) => {}
@@ -215,8 +456,9 @@ impl<'a> Pulled<'a> {
 }
 
 impl Input for Pulled<'_> {
+    #[inline]
     fn next(&mut self, meter: &Meter<'_>) -> Option<u8> {
-        if !self.fill(0, meter) {
+        if self.at == self.buf.len() && !self.fill(0, meter) {
             return None;
         }
         let byte = self.buf[self.at];
@@ -224,12 +466,23 @@ impl Input for Pulled<'_> {
         Some(byte)
     }
 
+    #[inline]
     fn peek(&mut self, ahead: usize, meter: &Meter<'_>) -> Option<u8> {
+        if let Some(&byte) = self.buf.get(self.at + ahead) {
+            return Some(byte);
+        }
         self.fill(ahead, meter).then(|| self.buf[self.at + ahead])
     }
 
     fn taken(&self) -> usize {
         self.taken
+    }
+
+    fn take(&mut self, max: usize, meter: &Meter<'_>) -> &[u8] {
+        self.fill(0, meter);
+        let n = max.min(self.buf.len() - self.at);
+        self.consume(n);
+        &self.buf[self.at - n..self.at]
     }
 }
 
@@ -292,19 +545,34 @@ enum Which {
 
 impl Which {
     fn first() -> Self {
+        Self::after(0)
+    }
+
+    /// The decoder after the first `tried`.
+    fn after(tried: usize) -> Self {
         #[cfg(feature = "unsafe")]
-        return Self::Zlib;
+        return match tried {
+            0 => Self::Zlib,
+            1 => Self::Raw,
+            _ => Self::Permissive,
+        };
         #[cfg(not(feature = "unsafe"))]
-        return Self::Permissive;
+        return {
+            let _ = tried;
+            Self::Permissive
+        };
     }
 }
 
 /// A Flate stage.
-pub(crate) struct Flate<'a> {
+struct Flate<'a> {
     mode: Mode<'a>,
     which: Which,
     state: State,
     made: Made,
+    /// The bytes zlib-rs made at its last call.
+    #[cfg(feature = "unsafe")]
+    made_last: usize,
 }
 
 enum Mode<'a> {
@@ -356,13 +624,14 @@ impl<'a> Mode<'a> {
 }
 
 impl<'a> Flate<'a> {
-    pub(crate) fn new(from: Box<dyn Stage + 'a>) -> Self {
-        let which = Which::first();
+    fn new(from: Box<dyn Stage + 'a>, which: Which) -> Self {
         Self {
             mode: Mode::new(Pulled::new(from), which),
             which,
             state: State::Going,
             made: Made::default(),
+            #[cfg(feature = "unsafe")]
+            made_last: 0,
         }
     }
 
@@ -394,12 +663,16 @@ impl<'a> Flate<'a> {
                     } else {
                         zlib_rs::InflateFlush::NoFlush
                     };
-                    made.resize(POLL_BYTES.min(meter.until_poll().max(1)), 0);
+                    // Room for twice what the last call made, at least what zlib's
+                    // fast loop needs.
+                    let room = (2 * self.made_last).clamp(1024, POLL_BYTES);
+                    made.resize(room.min(meter.until_poll().max(1)), 0);
                     let (out_before, in_before) = (decoder.total_out(), decoder.total_in());
                     let status = decoder.decompress(available, made, flush);
                     let written = (decoder.total_out() - out_before) as usize;
                     let took = (decoder.total_in() - in_before) as usize;
                     made.truncate(written);
+                    self.made_last = written;
                     input.consume(took);
                     meter.work(took + written)?;
                     return Ok(match status {
@@ -412,7 +685,7 @@ impl<'a> Flate<'a> {
                 }
             }
             Mode::Permissive(stream) => {
-                stream.step(meter, POLL_BYTES)?;
+                stream.step(meter, PERMISSIVE_STEP)?;
                 let pending = stream.pending();
                 self.made.buf.extend_from_slice(pending);
                 let n = pending.len();
@@ -478,11 +751,13 @@ impl Stage for Flate<'_> {
 
 /// A predictor reversed row by row, as `apply_predictor` reverses it, which never
 /// fails where [`Unpredictor`] takes its parameters.
-pub(crate) struct Predict<'a> {
+struct Predict<'a> {
     from: Box<dyn Stage + 'a>,
     unpredictor: Unpredictor,
     /// The encoded row being read, reversed as far as its bytes allow.
     input: Vec<u8>,
+    /// Room for the bytes read from the stage before, cleared once.
+    chunk: Vec<u8>,
     /// The bytes of the last row decoded that were handed out.
     taken: usize,
 }
@@ -497,14 +772,16 @@ impl Predict<'_> {
     /// Reads the next row: false where the data end first (a last row cut short is
     /// dropped, as `apply_predictor` drops it).
     fn fill(&mut self, meter: &Meter<'_>) -> Result<bool, ReadError> {
-        let mut chunk = [0; 8192];
         let len = self.unpredictor.input_len();
+        if self.chunk.is_empty() {
+            self.chunk.resize(len.clamp(1, 8192), 0);
+        }
         while self.input.len() < len {
-            let wanted = (len - self.input.len()).min(chunk.len());
-            match self.from.read(&mut chunk[..wanted], meter) {
+            let wanted = (len - self.input.len()).min(self.chunk.len());
+            match self.from.read(&mut self.chunk[..wanted], meter) {
                 Ok(0) => return Ok(false),
                 Ok(n) => {
-                    self.input.extend_from_slice(&chunk[..n]);
+                    self.input.extend_from_slice(&self.chunk[..n]);
                     self.unpredictor.advance(&mut self.input, POLL_BYTES);
                 }
                 Err(e) => {
@@ -520,17 +797,23 @@ impl Predict<'_> {
 }
 
 impl Stage for Predict<'_> {
+    /// As many rows as `buf` holds, so that short rows do not cost a read each.
     fn read(&mut self, buf: &mut [u8], meter: &Meter<'_>) -> Result<usize, ReadError> {
-        while self.taken == self.unpredictor.row().len() {
-            if !self.fill(meter)? {
-                return Ok(0);
+        let mut n = 0;
+        while n < buf.len() {
+            if self.taken == self.unpredictor.row().len() {
+                if !self.fill(meter)? {
+                    break;
+                }
+                continue;
             }
+            let row = &self.unpredictor.row()[self.taken..];
+            let k = (buf.len() - n).min(row.len());
+            meter.work(k)?;
+            buf[n..n + k].copy_from_slice(&row[..k]);
+            self.taken += k;
+            n += k;
         }
-        let row = &self.unpredictor.row()[self.taken..];
-        let n = buf.len().min(row.len());
-        meter.work(n)?;
-        buf[..n].copy_from_slice(&row[..n]);
-        self.taken += n;
         Ok(n)
     }
 
@@ -564,7 +847,7 @@ impl Decoder {
 }
 
 /// A stage of a decoder that takes a byte or a few at a time.
-pub(crate) struct Bytewise<'a> {
+struct Bytewise<'a> {
     input: Pulled<'a>,
     decoder: Decoder,
     state: State,
@@ -581,20 +864,20 @@ impl<'a> Bytewise<'a> {
         }
     }
 
-    pub(crate) fn lzw(from: Box<dyn Stage + 'a>, early_change: bool) -> Self {
+    fn lzw(from: Box<dyn Stage + 'a>, early_change: bool) -> Self {
         let decoder = Decoder::Lzw(lzw::Decoder::new(early_change), early_change);
         Self::new(from, decoder)
     }
 
-    pub(crate) fn ascii_hex(from: Box<dyn Stage + 'a>) -> Self {
+    fn ascii_hex(from: Box<dyn Stage + 'a>) -> Self {
         Self::new(from, Decoder::AsciiHex(None))
     }
 
-    pub(crate) fn ascii_85(from: Box<dyn Stage + 'a>) -> Self {
+    fn ascii_85(from: Box<dyn Stage + 'a>) -> Self {
         Self::new(from, Decoder::Ascii85(Vec::new()))
     }
 
-    pub(crate) fn run_length(from: Box<dyn Stage + 'a>) -> Self {
+    fn run_length(from: Box<dyn Stage + 'a>) -> Self {
         Self::new(from, Decoder::RunLength)
     }
 
@@ -680,7 +963,7 @@ fn ascii_hex(
             if is_white_space_character(byte) {
                 continue;
             }
-            let Some(digit) = crate::filter::ascii_hex::decode_hex_digit(byte) else {
+            let Some(digit) = ascii_hex::decode_hex_digit(byte) else {
                 return State::Failed;
             };
             match high.take() {
@@ -797,21 +1080,4 @@ fn run_length(input: &mut Pulled<'_>, out: &mut Vec<u8>, meter: &Meter<'_>) -> S
         }
     }
     State::Going
-}
-
-/// `stage` with the predictor of `params` reversed after it; `None` where only the
-/// whole-data decoder reverses it.
-pub(crate) fn predicted<'a>(
-    stage: Box<dyn Stage + 'a>,
-    params: &PredictorParams,
-) -> Option<Box<dyn Stage + 'a>> {
-    if params.predictor == 1 {
-        return Some(stage);
-    }
-    Some(Box::new(Predict {
-        from: stage,
-        unpredictor: Unpredictor::new(params)?,
-        input: Vec::new(),
-        taken: 0,
-    }))
 }
