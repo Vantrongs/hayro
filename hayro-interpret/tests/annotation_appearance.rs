@@ -809,25 +809,41 @@ fn annotations(page_entries: &str, objects: Vec<Vec<u8>>) -> Pdf {
     Pdf::new(common::one_page(200, page_entries, objects)).expect("valid pdf")
 }
 
-/// The annotations of the first page.
-fn annots<'a>(pdf: &'a Pdf) -> Vec<Dict<'a>> {
-    pdf.pages()[0]
-        .raw()
+const PAGE: kurbo::Rect = kurbo::Rect::new(0.0, 0.0, 200.0, 200.0);
+
+/// What each annotation of the first page looks like as viewed on a 200 pt page
+/// ([`Appearances::page`]): one look for each entry of its `/Annots` that names a
+/// dictionary, [`Look::Nothing`] for one the page does not draw.
+fn looks_of(pdf: &Pdf) -> Vec<Look<'_>> {
+    let page = &pdf.pages()[0];
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    let drawn = appearances.page(page, AnnotationSelection::View, PAGE);
+    page.raw()
         .get::<Array<'_>>(b"Annots")
         .unwrap()
-        .iter::<Dict<'_>>()
+        .items::<Dict<'_>>()
+        .enumerate()
+        .filter(|(_, d)| d.is_some())
+        .map(|(i, _)| {
+            drawn
+                .iter()
+                .find(|d| d.index() == i)
+                .map_or(Look::Nothing, |d| d.look().clone())
+        })
         .collect()
 }
 
-const PAGE: kurbo::Rect = kurbo::Rect::new(0.0, 0.0, 200.0, 200.0);
+/// What the first annotation of the first page looks like ([`looks_of`]).
+fn first_look(pdf: &Pdf) -> Look<'_> {
+    looks_of(pdf).swap_remove(0)
+}
 
-/// What [`Appearances::look`] says for each annotation of the first page, in short:
+/// What each annotation of the first page looks like ([`looks_of`]), in short:
 /// the stream's data, `generated`, `nothing`, or `unsupported`.
 fn looks(pdf: &Pdf) -> Vec<String> {
-    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-    annots(pdf)
-        .iter()
-        .map(|a| match appearances.look(a, PAGE) {
+    looks_of(pdf)
+        .into_iter()
+        .map(|look| match look {
             Look::Stream { stream, .. } => {
                 String::from_utf8(stream.decoded().unwrap().into_owned()).unwrap()
             }
@@ -981,8 +997,7 @@ fn a_generated_appearance_has_its_opacity_and_blend() {
         "/Annots [4 0 R]",
         vec![b"<< /Subtype /Highlight /CA 0.5 /Rect [10 10 90 40] /QuadPoints [10 40 90 40 10 30 90 30] >>".to_vec()],
     );
-    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-    let Look::Generated(highlight) = appearances.look(&annots(&pdf)[0], PAGE) else {
+    let Look::Generated(highlight) = first_look(&pdf) else {
         panic!("a highlight is generated");
     };
     assert_eq!(
@@ -1087,8 +1102,7 @@ fn generated(annot: &str) -> String {
         "/Annots [4 0 R]",
         vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
     );
-    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-    match appearances.look(&annots(&pdf)[0], PAGE) {
+    match first_look(&pdf) {
         Look::Generated(a) => expanded(&a),
         _ => panic!("{annot}: not generated"),
     }
@@ -1691,8 +1705,7 @@ fn a_damaged_box_or_matrix_places_the_appearance_as_viewers_do() {
             common::stream("/BBox [0 /x 10 10] /Matrix [1 0 0 -1]", b"0 g 0 0 4 3 re f"),
         ],
     );
-    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-    let Look::Stream { placement, .. } = appearances.look(&annots(&pdf)[0], PAGE) else {
+    let Look::Stream { placement, .. } = first_look(&pdf) else {
         panic!("an appearance stream");
     };
     assert_eq!(placement.bbox(), [0.0, 0.0, 10.0, 10.0]);
@@ -2253,10 +2266,8 @@ fn a_text_field_draws_a_value_stream() {
             ]
             .concat(),
         );
-        let appearances =
-            Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-        match appearances.look(&annots(&pdf)[0], PAGE) {
-            Look::Generated(a) => a.content,
+        match first_look(&pdf) {
+            Look::Generated(a) => a.content.clone(),
             _ => panic!("{value}: not generated"),
         }
     };
@@ -2309,8 +2320,7 @@ fn content(annot: &str, others: Vec<Vec<u8>>) -> String {
     let mut objects = vec![format!("<< /Type /Annot {annot} >>").into_bytes()];
     objects.extend(others);
     let pdf = annotations("/Annots [4 0 R]", objects);
-    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-    match appearances.look(&annots(&pdf)[0], PAGE) {
+    match first_look(&pdf) {
         Look::Generated(a) => expanded(&a),
         Look::Nothing => "nothing".into(),
         Look::Unsupported(why) => format!("{why:?}"),
@@ -2332,8 +2342,14 @@ fn real_flags_are_read_as_viewers_read_them() {
                     .into_bytes(),
             ],
         );
-        let annot = &annots(&pdf)[0];
-        hayro_interpret::annotation::flattened(annot)
+        let appearances =
+            Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+        let drawn = appearances.page(&pdf.pages()[0], AnnotationSelection::Flatten, PAGE);
+        match drawn.first().map(|d| d.look()) {
+            None => Ok(false),
+            Some(Look::Unsupported(why)) => Err(*why),
+            Some(_) => Ok(true),
+        }
     };
     for (flags, kept) in [
         ("16777217.0", Ok(true)),
@@ -2587,9 +2603,7 @@ fn a_real_is_read_from_its_digits() {
                     .into_bytes(),
             ],
         );
-        let appearances =
-            Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-        let Look::Generated(square) = appearances.look(&annots(&pdf)[0], PAGE) else {
+        let Look::Generated(square) = first_look(&pdf) else {
             panic!("/CA {ca}: a square is generated");
         };
         assert_eq!(square.opacity, opacity, "/CA {ca}");
@@ -2660,10 +2674,8 @@ fn the_last_lines_of_a_tall_text_are_drawn() {
                 vec!["A"; words].join(" ")
             );
             let pdf = annotations("/Annots [4 0 R]", vec![annot.into_bytes()]);
-            let appearances =
-                Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-            match appearances.look(&annots(&pdf)[0], PAGE) {
-                Look::Generated(a) => a.content,
+            match first_look(&pdf) {
+                Look::Generated(a) => a.content.clone(),
                 Look::Nothing => "nothing".into(),
                 Look::Unsupported(why) => format!("{why:?}"),
                 Look::Stream { .. } => "stream".into(),
@@ -2672,5 +2684,103 @@ fn the_last_lines_of_a_tall_text_are_drawn() {
         let (drawn, control) = (raw(""), raw(&"\\n".repeat(10)));
         assert!(drawn.contains(" Do"), "{rect}: {drawn}");
         assert_eq!(drawn, control, "{rect}");
+    }
+}
+
+/// An annotation `/Annots` names twice is drawn twice, as `PyMuPDF` 1.28.2 bake
+/// draws it (a square at /CA 0.5 named twice is twice as dark), though what it
+/// looks like is found once.
+#[test]
+fn an_annotation_named_twice_is_drawn_twice() {
+    let once = red_square_after("[4 0 R]");
+    assert!(!once.is_empty());
+    let mut twice = red_square_after("[4 0 R]");
+    twice.extend(once);
+    assert_eq!(red_square_after("[4 0 R 4 0 R]"), twice);
+}
+
+/// An entry of `/Annots` that refers to the page itself, or to the page tree above
+/// it, names an annotation as any other does: `PyMuPDF` 1.28.2 bake draws a page
+/// dictionary that is a square as a square.
+#[test]
+fn an_annotation_that_is_the_page_or_its_tree_is_drawn() {
+    let square = "/Subtype /Square /IC [1 0 0] /Rect [20 20 100 100]";
+    for (pages, page) in [
+        (String::new(), format!("/Annots [3 0 R] {square}")),
+        (square.to_owned(), "/Annots [2 0 R]".to_owned()),
+    ] {
+        let file = common::file(
+            &[
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+                format!("<< /Type /Pages /Kids [3 0 R] /Count 1 {pages} >>").into_bytes(),
+                format!(
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << >> {page} >>"
+                )
+                .into_bytes(),
+            ],
+            "",
+        );
+        let pdf = Pdf::new(file).expect("valid pdf");
+        let mut rec = Rec::default();
+        common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut rec);
+        assert!(
+            rec.0
+                .iter()
+                .any(|e| matches!(e, Ev::Fill { rgba: RED, .. })),
+            "{page}: {:?}",
+            rec.0
+        );
+    }
+}
+
+/// Whether an entry is there, as viewers look an entry up: one written null, or
+/// as a word read as null, is not, and one that refers to an object is, even to
+/// null or to a word (observed in `PyMuPDF` 1.28.2 bake): a square whose `/AP` is
+/// so written is generated, and one whose `/AP` so refers draws nothing; a widget
+/// whose `/V` is so written shows its field's value, and one whose `/V` so refers
+/// shows none.
+#[test]
+fn an_entry_written_null_is_absent_and_one_referred_to_is_there() {
+    let square = "/Subtype /Square /IC [1 0 0] /Rect [20 20 100 100]";
+    let generated = content(square, vec![]);
+    assert_ne!(generated, "nothing");
+    for (ap, object) in [
+        ("/AP null", "null"),
+        ("/AP foo", "null"),
+        ("/AP 1e3", "null"),
+        ("/AP 5 0 R", "null"),
+        ("/AP 5 0 R", "foo"),
+        ("/AP 99 0 R", "null"),
+    ] {
+        let look = content(&format!("{square} {ap}"), vec![object.as_bytes().to_vec()]);
+        let expected = if ap.ends_with(" R") {
+            "nothing"
+        } else {
+            &generated
+        };
+        assert_eq!(look, expected, "{ap} ({object})");
+    }
+    let field = b"<< /FT /Tx /V (HELLO) /DA (/Helv 12 Tf 0 g) >>".to_vec();
+    let widget = |v: &str, object: &str| {
+        content(
+            &format!("/Subtype /Widget /Parent 5 0 R /Rect [20 80 180 120] {v}"),
+            vec![field.clone(), object.as_bytes().to_vec()],
+        )
+    };
+    let inherited = widget("", "null");
+    assert_ne!(inherited, "nothing");
+    for (v, object) in [
+        ("/V null", "null"),
+        ("/V foo", "null"),
+        ("/V 6 0 R", "null"),
+        ("/V 6 0 R", "foo"),
+        ("/V 99 0 R", "null"),
+    ] {
+        let expected = if v.ends_with(" R") {
+            "nothing"
+        } else {
+            &inherited
+        };
+        assert_eq!(widget(v, object), expected, "{v} ({object})");
     }
 }

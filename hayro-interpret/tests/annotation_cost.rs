@@ -6,10 +6,10 @@
 //! memory. Work that allocates as it goes is measured by the bytes each thread has
 //! allocated in all ([`allocated`]).
 
-use hayro_interpret::InterpreterSettings;
-use hayro_interpret::annotation::{Appearances, Look, Unsupported, work_done};
+use hayro_interpret::annotation::{Appearances, Drawn, Look, Unsupported, work_done};
 use hayro_interpret::hayro_syntax::Pdf;
-use hayro_interpret::hayro_syntax::object::{Array, Dict};
+use hayro_interpret::hayro_syntax::page::Page;
+use hayro_interpret::{AnnotationSelection, InterpreterSettings};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -59,23 +59,35 @@ static ALLOCATOR: Limited = Limited;
 /// A page 200 pt square.
 const PAGE: kurbo::Rect = kurbo::Rect::new(0.0, 0.0, 200.0, 200.0);
 
-/// The generated content of the annotation `annot` on a 200 pt page.
-fn generated(annot: &str) -> String {
-    let pdf = Pdf::new(common::one_page(
+/// The annotations the first page of `pdf` draws as viewed on a 200 pt page.
+fn drawn<'a>(appearances: &Appearances<'a>, pdf: &'a Pdf) -> std::rc::Rc<[Drawn<'a>]> {
+    appearances.page(&pdf.pages()[0], AnnotationSelection::View, PAGE)
+}
+
+/// What the first annotation of the first page of `pdf` looks like as viewed on a
+/// 200 pt page, [`Look::Nothing`] when it draws nothing.
+fn first_look(pdf: &Pdf) -> Look<'_> {
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    drawn(&appearances, pdf)
+        .iter()
+        .find(|d| d.index() == 0)
+        .map_or(Look::Nothing, |d| d.look().clone())
+}
+
+/// A file with one 200 pt page whose only annotation is `annot`.
+fn one_annotation(annot: &str) -> Pdf {
+    Pdf::new(common::one_page(
         200,
         "/Annots [4 0 R]",
         vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
     ))
-    .expect("valid pdf");
-    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-    let annots: Vec<Dict<'_>> = pdf.pages()[0]
-        .raw()
-        .get::<Array<'_>>(b"Annots")
-        .unwrap()
-        .iter::<Dict<'_>>()
-        .collect();
-    match appearances.look(&annots[0], PAGE) {
-        Look::Generated(a) => a.content,
+    .expect("valid pdf")
+}
+
+/// The generated content of the annotation `annot` on a 200 pt page.
+fn generated(annot: &str) -> String {
+    match first_look(&one_annotation(annot)) {
+        Look::Generated(a) => a.content.clone(),
         _ => panic!("{annot}: not generated"),
     }
 }
@@ -210,16 +222,12 @@ fn widgets_below_one_chain_of_fields_read_each_field_once() {
         objects,
     ))
     .expect("valid pdf");
-    let annots: Vec<Dict<'_>> = pdf.pages()[0]
-        .raw()
-        .get::<Array<'_>>(b"Annots")
-        .unwrap()
-        .iter::<Dict<'_>>()
-        .collect();
     let before = allocated();
     let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-    for annot in &annots {
-        assert!(matches!(appearances.look(annot, PAGE), Look::Generated(_)));
+    let drawn = drawn(&appearances, &pdf);
+    assert_eq!(drawn.len(), N);
+    for d in drawn.iter() {
+        assert!(matches!(d.look(), Look::Generated(_)));
     }
     let bytes = allocated() - before;
     // About 4 KiB a widget; reading the whole chain for each takes gigabytes.
@@ -304,16 +312,12 @@ fn shared_value_cost(n: usize, len: usize, field: &str, rect: &str) -> usize {
         objects,
     ))
     .expect("valid pdf");
-    let annots: Vec<Dict<'_>> = pdf.pages()[0]
-        .raw()
-        .get::<Array<'_>>(b"Annots")
-        .unwrap()
-        .iter::<Dict<'_>>()
-        .collect();
     let before = allocated();
     let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-    for annot in &annots {
-        let Look::Generated(a) = appearances.look(annot, PAGE) else {
+    let drawn = drawn(&appearances, &pdf);
+    assert_eq!(drawn.len(), n);
+    for d in drawn.iter() {
+        let Look::Generated(a) = d.look() else {
             panic!("{field}: not generated");
         };
         assert!(
@@ -363,16 +367,12 @@ fn shared_object_cost(n: usize, shared: &str, annot: &str) -> usize {
         objects,
     ))
     .expect("valid pdf");
-    let annots: Vec<Dict<'_>> = pdf.pages()[0]
-        .raw()
-        .get::<Array<'_>>(b"Annots")
-        .unwrap()
-        .iter::<Dict<'_>>()
-        .collect();
     let before = allocated();
     let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-    for a in &annots {
-        let Look::Generated(a) = appearances.look(a, PAGE) else {
+    let drawn = drawn(&appearances, &pdf);
+    assert_eq!(drawn.len(), n);
+    for d in drawn.iter() {
+        let Look::Generated(a) = d.look() else {
             panic!("{annot}: not generated");
         };
         assert!(
@@ -439,16 +439,8 @@ fn a_squiggly_fanning_out_of_a_point_is_unsupported() {
         ],
     ))
     .expect("valid pdf");
-    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-    let annot = pdf.pages()[0]
-        .raw()
-        .get::<Array<'_>>(b"Annots")
-        .unwrap()
-        .iter::<Dict<'_>>()
-        .next()
-        .unwrap();
     assert!(matches!(
-        appearances.look(&annot, PAGE),
+        first_look(&pdf),
         Look::Unsupported(Unsupported::Coordinates)
     ));
 }
@@ -458,22 +450,9 @@ fn a_squiggly_fanning_out_of_a_point_is_unsupported() {
 fn look_within(secs: u64, annot: String) -> Result<String, Unsupported> {
     let (sent, done) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let pdf = Pdf::new(common::one_page(
-            200,
-            "/Annots [4 0 R]",
-            vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
-        ))
-        .expect("valid pdf");
-        let appearances =
-            Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-        let annots: Vec<Dict<'_>> = pdf.pages()[0]
-            .raw()
-            .get::<Array<'_>>(b"Annots")
-            .unwrap()
-            .iter::<Dict<'_>>()
-            .collect();
-        let look = match appearances.look(&annots[0], PAGE) {
-            Look::Generated(a) => Ok(a.content),
+        let pdf = one_annotation(&annot);
+        let look = match first_look(&pdf) {
+            Look::Generated(a) => Ok(a.content.clone()),
             Look::Unsupported(why) => Err(why),
             _ => panic!("neither generated nor unsupported"),
         };
@@ -571,24 +550,20 @@ fn a_stream_read_for_no_text_is_not_decoded() {
             ],
         ))
         .expect("valid pdf");
-        let annot = pdf.pages()[0]
-            .raw()
-            .get::<Array<'_>>(b"Annots")
-            .unwrap()
-            .iter::<Dict<'_>>()
-            .next()
-            .unwrap();
         let appearances =
             Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+        let page = &pdf.pages()[0];
         let before = allocated();
-        let _ = hayro_interpret::annotation::flattened(&annot);
-        let _ = hayro_interpret::annotation::flags(&annot);
-        assert!(
-            matches!(appearances.look(&annot, PAGE), Look::Generated(_)),
-            "{annot:?}"
-        );
+        let flattened = appearances.page(page, AnnotationSelection::Flatten, PAGE);
+        let viewed = appearances.page(page, AnnotationSelection::View, PAGE);
+        for drawn in [flattened, viewed] {
+            assert!(
+                matches!(drawn.first().map(Drawn::look), Some(Look::Generated(_))),
+                "{annot}"
+            );
+        }
         let bytes = allocated() - before;
-        assert!(bytes < 1 << 20, "{bytes} bytes: {annot:?}");
+        assert!(bytes < 1 << 20, "{bytes} bytes: {annot}");
     }
 }
 
@@ -618,16 +593,10 @@ fn cost_of(n: usize, catalog: &str, shared: &[String], annot: &dyn Fn(usize) -> 
     objects.extend(shared.iter().map(|s| s.clone().into_bytes()));
     objects.extend((0..n).map(|i| format!("<< /Type /Annot {} >>", annot(i)).into_bytes()));
     let pdf = Pdf::new(common::file(&objects, "")).expect("valid pdf");
-    let annots: Vec<Dict<'_>> = pdf.pages()[0]
-        .raw()
-        .get::<Array<'_>>(b"Annots")
-        .unwrap()
-        .iter::<Dict<'_>>()
-        .collect();
     let (bytes, work) = (allocated(), work_done());
     let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-    for a in &annots {
-        match appearances.look(a, PAGE) {
+    for d in drawn(&appearances, &pdf).iter() {
+        match d.look() {
             Look::Generated(g) => assert!(g.content.len() < 64 << 10, "{}", annot(0)),
             Look::Unsupported(why) => panic!("{why:?}: {}", annot(0)),
             _ => {}
@@ -851,22 +820,8 @@ fn text_in_a_negative_size_is_laid_out_as_far_as_it_shows() {
          /RC (<p>{}<span style=\"font-size:12pt\">A</span></p>)",
         long_text()
     );
-    let pdf = Pdf::new(common::one_page(
-        200,
-        "/Annots [4 0 R]",
-        vec![format!("<< /Type /Annot {mixed} >>").into_bytes()],
-    ))
-    .expect("valid pdf");
-    let annot = pdf.pages()[0]
-        .raw()
-        .get::<Array<'_>>(b"Annots")
-        .unwrap()
-        .iter::<Dict<'_>>()
-        .next()
-        .unwrap();
-    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
     assert!(matches!(
-        appearances.look(&annot, PAGE),
+        first_look(&one_annotation(&mixed)),
         Look::Unsupported(Unsupported::RichText)
     ));
 }
@@ -892,22 +847,8 @@ fn a_drawn_glyph_costs_a_few_bytes() {
             long_text()
         ),
     ] {
-        let pdf = Pdf::new(common::one_page(
-            200,
-            "/Annots [4 0 R]",
-            vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
-        ))
-        .expect("valid pdf");
-        let a = pdf.pages()[0]
-            .raw()
-            .get::<Array<'_>>(b"Annots")
-            .unwrap()
-            .iter::<Dict<'_>>()
-            .next()
-            .unwrap();
-        let appearances =
-            Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-        let Look::Generated(g) = appearances.look(&a, PAGE) else {
+        let pdf = one_annotation(&annot);
+        let Look::Generated(g) = first_look(&pdf) else {
             panic!("{annot}: not generated")
         };
         let drawn = g.content.matches(" Do\n").count();
@@ -1003,104 +944,6 @@ fn text_that_cannot_reach_the_page_is_not_laid_out() {
     });
 }
 
-/// The cost of looking `n` times at one annotation, `annot`, which a page's
-/// `/Annots` names `n` times, each look generating its appearance.
-fn repeated_cost(n: usize, annot: &str) -> Cost {
-    repeated_look_cost(n, annot, |look| matches!(look, Look::Generated(_)))
-}
-
-/// The cost of looking `n` times at one annotation, `annot`, which a page's
-/// `/Annots` names `n` times, each look as `expected` tells.
-fn repeated_look_cost(n: usize, annot: &str, expected: fn(&Look<'_>) -> bool) -> Cost {
-    let pdf = Pdf::new(common::one_page(
-        200,
-        &format!("/Annots [{}]", vec!["4 0 R"; n].join(" ")),
-        vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
-    ))
-    .expect("valid pdf");
-    let annots: Vec<Dict<'_>> = pdf.pages()[0]
-        .raw()
-        .get::<Array<'_>>(b"Annots")
-        .unwrap()
-        .iter::<Dict<'_>>()
-        .collect();
-    let (bytes, work) = (allocated(), work_done());
-    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-    for a in &annots {
-        assert!(expected(&appearances.look(a, PAGE)));
-    }
-    Cost {
-        bytes: allocated() - bytes,
-        work: work_done() - work,
-    }
-}
-
-/// Whether an annotation is an object of its own is found once for the document: an
-/// annotation `/Annots` names many times, with a long entry it does not draw, is not
-/// read again for each time.
-#[test]
-fn an_annotation_named_again_is_not_read_again() {
-    let annot = format!(
-        "/Subtype /Square /C [0] /Rect [10 10 110 40] /Unused [{}]",
-        "0 ".repeat(20_000)
-    );
-    let (one, two) = (repeated_cost(40, &annot), repeated_cost(80, &annot));
-    let (bytes, work) = (two.bytes - one.bytes, two.work - one.work);
-    assert!(
-        bytes < 40 * (16 << 10) && work < 40 * 1_000,
-        "{one:?} for 40, {two:?} for 80"
-    );
-}
-
-/// An annotation `/Annots` names many times reads the text it holds itself once,
-/// not once each time: a `FreeText` with rich text and a rich text field with a
-/// rich value, each written in the annotation, one word of 20,000 characters whose
-/// start alone its box shows, cost for each time named again what drawing that
-/// start does.
-#[test]
-fn a_text_held_in_an_annotation_named_again_is_not_read_again() {
-    let word = "ABCD\\)efg".repeat(2_222);
-    for annot in [
-        format!(
-            "/Subtype /FreeText /BS << /W 0 >> /RC (<p>{word}</p>) /Rect [10 10 110 40] \
-             /DA (/Helv 12 Tf 0 g)"
-        ),
-        format!(
-            "/Subtype /Widget /FT /Tx /Ff 33554432 /RV (<p>{word}</p>) /Rect [10 10 110 40] \
-             /DA (/Helv 12 Tf 0 g)"
-        ),
-    ] {
-        let (one, two) = (repeated_cost(40, &annot), repeated_cost(80, &annot));
-        let (bytes, work) = (two.bytes - one.bytes, two.work - one.work);
-        assert!(
-            bytes < 40 * (16 << 10) && work < 40 * 1_000,
-            "{one:?} for 40, {two:?} for 80: {}",
-            &annot[..30]
-        );
-    }
-}
-
-/// An annotation `/Annots` names many times is read once whatever its look comes
-/// to: one whose appearance is a long string, no dictionary, draws nothing before
-/// any generator runs, and is not read again for each time.
-#[test]
-fn an_annotation_that_draws_nothing_named_again_is_not_read_again() {
-    let annot = format!(
-        "/Subtype /Square /Rect [10 10 110 40] /C [1 0 0] /AP ({})",
-        "ABCD\\)efg".repeat(2_222)
-    );
-    let nothing = |look: &Look<'_>| matches!(look, Look::Nothing);
-    let (one, two) = (
-        repeated_look_cost(40, &annot, nothing),
-        repeated_look_cost(80, &annot, nothing),
-    );
-    let (bytes, work) = (two.bytes - one.bytes, two.work - one.work);
-    assert!(
-        bytes < 40 * (16 << 10) && work < 40 * 1_000,
-        "{one:?} for 40, {two:?} for 80"
-    );
-}
-
 /// A list whose options are drawn 0 high, as with a default appearance size of 0
 /// and a default style that sets no size, draws none and looks at none: lists
 /// sharing 20,000 options cost what one without options does. The labels a list
@@ -1118,6 +961,9 @@ fn a_list_drawn_0_high_looks_at_no_option() {
     });
 }
 
+/// A kind of annotation measured, by name, and the entries of each.
+type Kind = (&'static str, Box<dyn Fn(usize) -> String>);
+
 /// Not a check but a measure, of what is left open: text whose box starts far
 /// above the page and reaches it is laid out from its first line for each
 /// annotation, down to the lines the page shows, as greedy line breaking at one
@@ -1132,7 +978,7 @@ fn a_list_drawn_0_high_looks_at_no_option() {
 fn hidden_prefix_cost() {
     let text = vec![format!("({})", long_text())];
     let thousandths = |i: usize| format!("{}.{:03}", 100 + i / 1000, i % 1000);
-    let kinds: [(&str, Box<dyn Fn(usize) -> String>); 6] = [
+    let kinds: [Kind; 6] = [
         (
             "FreeText, widths of their own, top 15000",
             Box::new(move |i| {
@@ -1218,4 +1064,275 @@ fn hidden_prefix_cost() {
             (costs[2].bytes - costs[1].bytes) / 80,
         );
     }
+}
+
+/// What a page draws, counted: appearance streams, generated appearances, and
+/// annotations that cannot be drawn.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Drew {
+    streams: usize,
+    generated: usize,
+    unsupported: usize,
+}
+
+/// What reading a page's annotations and looking at them costs: bytes allocated,
+/// units of work, and seconds.
+#[derive(Debug, Clone, Copy)]
+struct Listed {
+    bytes: usize,
+    work: u64,
+    secs: f64,
+    drew: Drew,
+}
+
+/// The cost of `f`, given the appearances of `pdf`'s annotations, made inside.
+fn listed<'a>(pdf: &'a Pdf, f: impl FnOnce(&Appearances<'a>) -> Drew) -> Listed {
+    let (bytes, work, start) = (allocated(), work_done(), std::time::Instant::now());
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    let drew = f(&appearances);
+    Listed {
+        bytes: allocated() - bytes,
+        work: work_done() - work,
+        secs: start.elapsed().as_secs_f64(),
+        drew,
+    }
+}
+
+/// Asserts that `more`, 40 more references than `fewer` to what it shares, cost
+/// `bytes` and `work` at most for each, and no time that reading what they share
+/// again takes: a few hundredths of a second for 40 reads of a million bytes.
+fn costs_at_most(fewer: Listed, more: Listed, bytes: usize, work: u64, what: &str) {
+    let (b, w, s) = (
+        more.bytes.saturating_sub(fewer.bytes),
+        more.work.saturating_sub(fewer.work),
+        more.secs - fewer.secs,
+    );
+    if std::env::var_os("COST_REPORT").is_some() {
+        println!("CASE {what}: +40: {b} bytes, {w} work, {s:.4} s");
+    }
+    assert!(
+        b < 40 * bytes && w < 40 * work && s < 0.25,
+        "{what}: {fewer:?} for 40, {more:?} for 80"
+    );
+}
+
+/// A long escaped name, 60,000 bytes as written and 20,000 read.
+fn long_name() -> String {
+    format!("/{}", "#41".repeat(20_000))
+}
+
+/// A number of a million digits, `n` after leading zeros.
+fn long_number(n: u32) -> String {
+    format!("{}{n}", "0".repeat(1_000_000))
+}
+
+/// The cost of a page whose `/Annots` names one annotation, `annot`, `n` times,
+/// from reading its `/Annots` to each look, as viewed.
+fn named_cost(n: usize, annot: &str) -> Listed {
+    let pdf = Pdf::new(common::one_page(
+        200,
+        &format!("/Annots [{}]", vec!["4 0 R"; n].join(" ")),
+        vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
+    ))
+    .expect("valid pdf");
+    let page = &pdf.pages()[0];
+    listed(&pdf, |appearances| drew(appearances, page, PAGE))
+}
+
+/// An annotation a page names again costs a lookup each time, from its entry in
+/// `/Annots` on: it is not read, selected or looked at again, whatever it holds
+/// and whatever its look comes to: drawn with a long entry it does not use, hidden
+/// by long flags, drawn with long contents that are no text, of a long unknown
+/// subtype, with an appearance that is a long name or string, drawn from long rich
+/// text it holds.
+#[test]
+fn an_annotation_named_again_costs_a_lookup() {
+    let unused = format!(
+        "/Subtype /Square /C [0] /Rect [10 10 110 40] {} [{}]",
+        long_name(),
+        "0 ".repeat(20_000)
+    );
+    let hidden = format!(
+        "/Subtype /Square /C [0] /Rect [10 10 110 40] /F {}",
+        long_number(2)
+    );
+    let contents = format!(
+        "/Subtype /FreeText /Rect [10 10 110 40] /DA (/Helv 12 Tf 0 g) /Contents {}",
+        long_number(5)
+    );
+    let subtype = format!("/Subtype {} /Rect [10 10 110 40]", long_name());
+    let ap = format!(
+        "/Subtype /Square /C [0] /Rect [10 10 110 40] /AP {}",
+        long_name()
+    );
+    let ap_string = format!(
+        "/Subtype /Square /Rect [10 10 110 40] /C [1 0 0] /AP ({})",
+        "ABCD\\)efg".repeat(2_222)
+    );
+    // Rich text written in the annotation, one word whose start alone its box shows.
+    let word = "ABCD\\)efg".repeat(2_222);
+    let rc = format!(
+        "/Subtype /FreeText /BS << /W 0 >> /RC (<p>{word}</p>) /Rect [10 10 110 40] \
+         /DA (/Helv 12 Tf 0 g)"
+    );
+    let rv = format!(
+        "/Subtype /Widget /FT /Tx /Ff 33554432 /RV (<p>{word}</p>) /Rect [10 10 110 40] \
+         /DA (/Helv 12 Tf 0 g)"
+    );
+    for (annot, generated) in [
+        (unused, 1),
+        (hidden, 0),
+        (contents, 1),
+        (subtype, 0),
+        (ap, 0),
+        (ap_string, 0),
+        (rc, 1),
+        (rv, 1),
+    ] {
+        let (fewer, more) = (named_cost(40, &annot), named_cost(80, &annot));
+        let what = &annot[..40];
+        assert_eq!(fewer.drew.generated, 40 * generated, "{what}");
+        assert_eq!(more.drew.generated, 80 * generated, "{what}");
+        costs_at_most(fewer, more, 256, 8, what);
+    }
+}
+
+/// The cost of a page whose `/Annots` names `n` annotations `annot`, each an object
+/// of its own after `shared`, numbered from 4.
+fn sharing_cost(n: usize, shared: &[String], annot: &str) -> Listed {
+    let first = 4 + shared.len();
+    let refs: Vec<String> = (0..n).map(|i| format!("{} 0 R", first + i)).collect();
+    let mut objects: Vec<Vec<u8>> = shared.iter().map(|s| s.clone().into_bytes()).collect();
+    objects.extend((0..n).map(|_| format!("<< /Type /Annot {annot} >>").into_bytes()));
+    let pdf = Pdf::new(common::one_page(
+        200,
+        &format!("/Annots [{}]", refs.join(" ")),
+        objects,
+    ))
+    .expect("valid pdf");
+    let page = &pdf.pages()[0];
+    listed(&pdf, |appearances| drew(appearances, page, PAGE))
+}
+
+/// Annotations that share an object read it once, however they reach it: an
+/// appearance stream whose `/BBox` is a long array of its own, read once for all
+/// (its first entry a long name, read as 0), and a long subtype name, copied for
+/// none.
+#[test]
+fn what_annotations_share_is_read_once_however_reached() {
+    let bbox = vec![
+        String::from_utf8(common::stream(
+            "/Subtype /Form /BBox 5 0 R",
+            b"0 0 m 10 10 l S",
+        ))
+        .unwrap(),
+        format!("[{} 0 100 100 {}]", long_name(), "0 ".repeat(200_000)),
+    ];
+    let stream = "/Subtype /Square /Rect [10 10 110 40] /AP << /N 4 0 R >>";
+    let (fewer, more) = (
+        sharing_cost(40, &bbox, stream),
+        sharing_cost(80, &bbox, stream),
+    );
+    assert_eq!(more.drew.streams, 80);
+    costs_at_most(fewer, more, 8 << 10, 1_000, "a shared /BBox");
+    let name = vec![long_name()];
+    let subtype = "/Subtype 4 0 R /Rect [10 10 110 40]";
+    let (fewer, more) = (
+        sharing_cost(40, &name, subtype),
+        sharing_cost(80, &name, subtype),
+    );
+    costs_at_most(fewer, more, 8 << 10, 1_000, "a shared subtype");
+}
+
+/// A `FreeText` whose contents are a long number, no text, looked at on pages that
+/// show it differently, reads its contents once: each look costs what it draws.
+#[test]
+fn an_annotation_shown_differently_reads_its_entries_once() {
+    let annot = format!(
+        "/Subtype /FreeText /Rect [10 10 110 40] /DA (/Helv 12 Tf 0 g) /Contents {}",
+        long_number(5)
+    );
+    let pdf = Pdf::new(common::one_page(
+        200,
+        "/Annots [4 0 R]",
+        vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
+    ))
+    .expect("valid pdf");
+    let page = &pdf.pages()[0];
+    let views = |n: usize| {
+        listed(&pdf, |appearances| {
+            let mut all = Drew::default();
+            for i in 0..n {
+                let view = kurbo::Rect::new(0.0, 0.0, 200.0 + i as f64 / 64.0, 200.0);
+                all.generated += drew(appearances, page, view).generated;
+            }
+            all
+        })
+    };
+    let (fewer, more) = (views(40), views(80));
+    assert_eq!(more.drew.generated, 80);
+    costs_at_most(fewer, more, 16 << 10, 1_000, "seen differently");
+}
+
+/// The cost of `n` pages whose `/Annots` is one array object, `4 0 R`: an
+/// annotation written in it with a long unused entry, which draws nothing, and a
+/// square of its own; each page shown as `view(i)` tells.
+fn shared_annots_cost(n: usize, view: impl Fn(usize) -> kurbo::Rect) -> Listed {
+    let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", 6 + i)).collect();
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!("<< /Type /Pages /Kids [{}] /Count {n} >>", kids.join(" ")).into_bytes(),
+        b"<< >>".to_vec(),
+        format!(
+            "[<< /Type /Annot /Subtype /Square /C [0] /Rect [10 10 110 40] {} 0 >> 5 0 R]",
+            long_name()
+        )
+        .into_bytes(),
+        b"<< /Type /Annot /Subtype /Square /C [0] /Rect [10 10 110 40] >>".to_vec(),
+    ];
+    objects.extend((0..n).map(|_| {
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots 4 0 R >>".to_vec()
+    }));
+    let pdf = Pdf::new(common::file(&objects, "")).expect("valid pdf");
+    let pages = pdf.pages();
+    listed(&pdf, |appearances| {
+        let mut all = Drew::default();
+        for (i, page) in pages.iter().enumerate() {
+            all.generated += drew(appearances, page, view(i)).generated;
+        }
+        all
+    })
+}
+
+/// Pages that share their `/Annots` array read it once: each page shown as the
+/// others costs a lookup, and each shown otherwise what it draws.
+#[test]
+fn pages_sharing_their_annotations_read_them_once() {
+    let (fewer, more) = (
+        shared_annots_cost(40, |_| PAGE),
+        shared_annots_cost(80, |_| PAGE),
+    );
+    assert_eq!(more.drew.generated, 80);
+    costs_at_most(fewer, more, 256, 8, "one view");
+    let view = |i: usize| kurbo::Rect::new(0.0, 0.0, 200.0 + i as f64 / 64.0, 200.0);
+    let (fewer, more) = (shared_annots_cost(40, view), shared_annots_cost(80, view));
+    assert_eq!(more.drew.generated, 80);
+    costs_at_most(fewer, more, 16 << 10, 1_000, "views of their own");
+}
+
+/// What `appearances` draws of `page` as viewed where `visible` shows, counted.
+fn drew<'a>(appearances: &Appearances<'a>, page: &Page<'a>, visible: kurbo::Rect) -> Drew {
+    let mut drew = Drew::default();
+    for d in appearances
+        .page(page, AnnotationSelection::View, visible)
+        .iter()
+    {
+        match d.look() {
+            Look::Stream { .. } => drew.streams += 1,
+            Look::Generated(_) => drew.generated += 1,
+            Look::Nothing => panic!("a page lists no annotation that draws nothing"),
+            Look::Unsupported(_) => drew.unsupported += 1,
+        }
+    }
+    drew
 }

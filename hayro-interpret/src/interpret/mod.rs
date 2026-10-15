@@ -16,7 +16,7 @@ use crate::x_object::{FormXObject, ImageXObject, XObject};
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
 use hayro_syntax::object::dict::keys::{ANNOTS, MCID, OC};
-use hayro_syntax::object::{Array, Dict, Name, Object, dict_or_stream};
+use hayro_syntax::object::{Dict, Name, Object, dict_or_stream};
 use hayro_syntax::page::{Page, Resources};
 use kurbo::{Affine, Point, Shape};
 use rustc_hash::FxHashMap;
@@ -106,16 +106,16 @@ pub struct InterpreterSettings {
 }
 
 /// Which annotations a page is drawn with (PDF 32000-1 12.5.3).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum AnnotationSelection {
     /// As for viewing: all but those flagged Hidden or `NoView`.
     #[default]
     View,
     /// As for printing: those flagged Print, but not Hidden.
     Print,
-    /// As when annotations are flattened into page content
-    /// ([`annotation::flattened`]): all but links and those flagged Hidden or
-    /// Invisible.
+    /// As when annotations are flattened into page content for printing what the
+    /// reader sees: all but links and those flagged Hidden or Invisible, whatever
+    /// their Print and `NoView` flags.
     Flatten,
 }
 
@@ -161,9 +161,7 @@ pub fn interpret_page<'a>(
     let resources = page.resources();
     interpret(page.typed_operations(), resources, context, device);
 
-    if context.settings.render_annotations
-        && let Some(annot_arr) = page.raw().get::<Array<'_>>(ANNOTS)
-    {
+    if context.settings.render_annotations && page.raw().contains_key(ANNOTS) {
         // The fields of the document's forms are read once for all its pages.
         let appearances = annotation::Appearances::with_fields(
             page.xref(),
@@ -171,29 +169,14 @@ pub fn interpret_page<'a>(
             context.interpreter_cache.annotation_fields.clone(),
         );
         let visible = page.intersected_crop_box().to_kurbo();
-        for annot in annot_arr.iter::<Dict<'_>>() {
-            let shown = annotation::flags(&annot).and_then(|flags| {
-                Ok(match context.settings.annotations {
-                    AnnotationSelection::View => flags & (2 | 32) == 0,
-                    AnnotationSelection::Print => flags & 2 == 0 && flags & 4 != 0,
-                    AnnotationSelection::Flatten => annotation::flattened(&annot)?,
-                })
-            });
-            match shown {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(_) => {
-                    (context.settings.warning_sink)(InterpreterWarning::UnsupportedAnnotation);
-                    continue;
-                }
-            }
-
-            match appearances.look(&annot, visible) {
+        let drawn = appearances.page(page, context.settings.annotations, visible);
+        for annot in drawn.iter() {
+            match annot.look() {
                 annotation::Look::Stream { stream, placement } => {
                     // The box and matrix as the placement reads them, as a writer
                     // that copies the stream draws it.
                     let Some(apx) = FormXObject::placed(
-                        &stream,
+                        stream,
                         Affine::new(placement.matrix().map(f64::from)),
                         placement.bbox(),
                     ) else {
@@ -209,7 +192,7 @@ pub fn interpret_page<'a>(
                     context.restore_state(device);
                 }
                 annotation::Look::Generated(appearance) => {
-                    draw_generated(&appearance, resources, context, device);
+                    draw_generated(appearance, resources, context, device);
                 }
                 annotation::Look::Nothing => {}
                 annotation::Look::Unsupported(_) => {

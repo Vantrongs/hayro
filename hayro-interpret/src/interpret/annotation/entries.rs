@@ -12,9 +12,9 @@
 //! reading is not established makes [`read`] fail with [`Unsupported::Number`].
 
 use super::Unsupported;
-use hayro_syntax::object::{Array, Dict, MaybeRef, Name, Null, Number, ObjRef, Object, Stream};
+use hayro_syntax::object::{Array, Dict, MaybeRef, Name, Number, ObjRef, Object, Stream};
 use hayro_syntax::xref::XRef;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -93,12 +93,6 @@ fn int(n: Number) -> i32 {
     } else {
         i32::MIN
     }
-}
-
-/// A flags entry (`/F`, `/Ff`) read as a number: the bits of its integer, none
-/// when it is not a number.
-pub(crate) fn flags(n: Option<Number>) -> u32 {
-    n.map_or(0, |n| int(n) as u32)
 }
 
 /// A dictionary an annotation is drawn from: the annotation, one it refers to (its
@@ -198,10 +192,12 @@ impl Held {
 /// annotations that share it must not each pay. So each object a reference names is
 /// read once, and so is each entry read of a dictionary that lies in one, and the
 /// first entries read of an array there; an annotation's own entries, which no
-/// other annotation reads, are read as they are wanted, but those of one a page
-/// names again, which are kept as a shared object's ([`Objects::annotation`]). Read
-/// without them ([`Objects::default`]), as boxes and matrices outside annotations
-/// are, each reference is followed afresh.
+/// other annotation reads, are read as they are wanted the first time it is looked
+/// at, and as a shared object's after ([`Entries::shared`]). Generators read only
+/// through these: they are given [`Entries`], [`Items`] and [`StreamEntries`], which
+/// carry the objects of their document, and hold no dictionary, array or stream of
+/// it otherwise. Read without them ([`Entries::detached`]), as boxes and matrices
+/// of content outside annotations are, each reference is followed afresh.
 #[derive(Clone, Default)]
 pub(crate) struct Objects<'a> {
     read: Option<Rc<Read<'a>>>,
@@ -214,7 +210,7 @@ pub(crate) struct Objects<'a> {
 type Place = (usize, usize);
 
 /// Entries read of a dictionary, by key.
-type Keyed<'a> = FxHashMap<Box<[u8]>, Found<'a>>;
+type Keyed<'a> = FxHashMap<Box<[u8]>, Entry<'a>>;
 
 /// An entry read of an array, and the object it refers to.
 type Item<'a> = (Found<'a>, Option<ObjRef>);
@@ -230,35 +226,63 @@ struct Read<'a> {
     /// Where the data of each object an annotation's own-ness was told by lies, or
     /// `None` when it is no dictionary, array or stream ([`Objects::own`]).
     places: RefCell<FxHashMap<ObjRef, Option<Place>>>,
-    /// Where each annotation looked at lies ([`Objects::annotation`]).
-    looked: RefCell<FxHashSet<Place>>,
 }
 
-/// An object as it was read: a string's bytes shared, as they may have been
-/// decoded; `None` for a reference to no object or no entry.
+/// An object as it was read: a string's bytes and a name's shared, as they may
+/// have been decoded, so that a copy costs the same however long they are; `None`
+/// for a reference to no object or no entry.
 #[derive(Clone)]
 enum Found<'a> {
+    /// Any object but a string or a name.
     Object(Object<'a>),
     String(Rc<hayro_syntax::object::String<'a>>),
+    Name(Rc<Name<'a>>),
     None,
 }
 
 impl<'a> Found<'a> {
-    /// `object`, with the work of reading it: as much as it is long.
-    fn read(object: Option<Object<'a>>) -> Self {
-        let found = match object {
+    /// `object`, read.
+    fn of(object: Option<Object<'a>>) -> Self {
+        match object {
             Some(Object::String(s)) => Self::String(Rc::new(s)),
+            Some(Object::Name(n)) => Self::Name(Rc::new(n)),
             Some(object) => Self::Object(object),
             None => Self::None,
-        };
+        }
+    }
+
+    /// `object`, with the work of reading it for an annotation: as much as it is
+    /// long.
+    fn read(object: Option<Object<'a>>) -> Self {
+        let found = Self::of(object);
         super::work(match &found {
             Self::Object(Object::Dict(d)) => d.data().len(),
             Self::Object(Object::Array(a)) => a.data().len(),
             Self::Object(Object::Stream(s)) => s.dict().data().len(),
             Self::String(s) => s.as_bytes().len(),
+            Self::Name(n) => n.len(),
             _ => 1,
         });
         found
+    }
+}
+
+/// A dictionary's entry as it was read: what it holds, the object it refers to, and
+/// whether the dictionary has the key.
+#[derive(Clone)]
+struct Entry<'a> {
+    found: Found<'a>,
+    r: Option<ObjRef>,
+    written: bool,
+}
+
+impl Entry<'_> {
+    /// Whether the entry is there as viewers look an entry up: a null value is no
+    /// entry, nor is a word read as null (`foo`, `1e3`), but a reference is one,
+    /// even to null or to no object (observed in `PyMuPDF` 1.28.2 bake: `/AP` and an
+    /// inherited `/V` so written are absent, and so referred to, present).
+    fn present(&self) -> bool {
+        self.written && (self.r.is_some() || !matches!(self.found, Found::Object(Object::Null(_))))
     }
 }
 
@@ -276,7 +300,6 @@ impl<'a> Objects<'a> {
                 entries: RefCell::default(),
                 prefixes: RefCell::default(),
                 places: RefCell::default(),
-                looked: RefCell::default(),
             })),
             shared: false,
         }
@@ -306,21 +329,72 @@ impl<'a> Objects<'a> {
     }
 }
 
+/// Which annotation an entry of a page's `/Annots` names, as a key for what a
+/// document makes of it once: the object it refers to, or where a dictionary
+/// written in the array lies. Reading the entry costs as much as finding this.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Id {
+    Object(ObjRef),
+    Written(Place),
+}
+
+/// A page's `/Annots` array: the object it is, read only when its entries are
+/// ([`Annots::entries`]), or the array written in the page.
+pub(crate) enum Annots<'a> {
+    Object(ObjRef, Objects<'a>),
+    Written(Array<'a>),
+}
+
+/// An entry of a page's `/Annots` that may name an annotation: its place in the
+/// array, which annotation, and, for a dictionary written there, the dictionary.
+pub(crate) struct Listed<'a> {
+    pub(crate) index: usize,
+    pub(crate) id: Id,
+    written: Option<Dict<'a>>,
+}
+
 impl<'a> Objects<'a> {
-    /// The entries of annotation `dict`: read as they are wanted the first time it
-    /// is looked at, and from the second on as a shared object's are, each read
-    /// once and kept, so that an annotation a page's `/Annots` names many times
-    /// reads none of its entries again however long, whatever its look comes to.
-    pub(crate) fn annotation(&self, dict: Dict<'a>) -> Entries<'a> {
-        let seen = self
-            .read
-            .as_ref()
-            .is_some_and(|read| !read.looked.borrow_mut().insert(place(dict.data())));
+    /// The `/Annots` of page dictionary `page`; `None` when it has none, or these
+    /// are no document's objects. An array object it refers to is read only when
+    /// its entries are.
+    pub(crate) fn annots(&self, page: &Dict<'a>) -> Option<Annots<'a>> {
+        self.read.as_ref()?;
+        match page.get_raw::<Object<'a>>(b"Annots")? {
+            MaybeRef::Ref(r) => Some(Annots::Object(r, self.clone())),
+            MaybeRef::NotRef(Object::Array(a)) => Some(Annots::Written(a)),
+            MaybeRef::NotRef(_) => None,
+        }
+    }
+
+    /// The entries of the document's catalog, read afresh.
+    pub(crate) fn catalog(&self) -> Option<Entries<'a>> {
+        let read = self.read.as_ref()?;
+        let root = read.xref.get::<Dict<'a>>(read.xref.root_id())?;
         let objects = Self {
             read: self.read.clone(),
-            shared: self.shared || seen,
+            shared: true,
         };
-        Entries(dict, objects)
+        Some(Entries(root, objects))
+    }
+
+    /// The entries of the annotation `listed` names, read as its own are the first
+    /// time it is looked at ([`Entries::shared`] for later); `None` when it names
+    /// no dictionary. An annotation object is read as a dictionary, as one that is
+    /// a stream's is, and afresh: from the page's `/Annots` too, whatever objects
+    /// the page was read through (observed in `PyMuPDF` 1.28.2 bake, which draws an
+    /// annotation that is the page itself).
+    pub(crate) fn annotation(&self, listed: &Listed<'a>) -> Option<Entries<'a>> {
+        let dict = match (&listed.written, listed.id) {
+            (Some(dict), _) => dict.clone(),
+            (None, Id::Object(r)) => {
+                let read = self.read.as_ref()?;
+                let dict = read.xref.get::<Dict<'a>>(r.into())?;
+                super::work(dict.data().len());
+                dict
+            }
+            (None, Id::Written(_)) => return None,
+        };
+        Some(Entries(dict, self.clone()))
     }
 
     /// Whether `dict` is an object of its own, rather than held directly in another,
@@ -366,17 +440,63 @@ impl<'a> Objects<'a> {
     }
 }
 
+impl<'a> Annots<'a> {
+    /// The object the array is, when it is one.
+    pub(crate) fn object(&self) -> Option<ObjRef> {
+        match self {
+            Self::Object(r, _) => Some(*r),
+            Self::Written(_) => None,
+        }
+    }
+
+    /// The entries that may name an annotation, in order: references, and
+    /// dictionaries written in the array. The array is read here, and of a
+    /// reference no more than it.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = Listed<'a>> + use<'a> {
+        let array = match self {
+            Self::Written(a) => Some(a.clone()),
+            Self::Object(r, objects) => objects.read.as_ref().and_then(|read| {
+                match objects.found(read, Some(MaybeRef::Ref(*r))).0 {
+                    Found::Object(Object::Array(a)) => Some(a),
+                    _ => None,
+                }
+            }),
+        };
+        array
+            .into_iter()
+            .flat_map(|a| a.raw_iter())
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                super::work(1);
+                let (id, written) = match entry {
+                    MaybeRef::Ref(r) => (Id::Object(r), None),
+                    MaybeRef::NotRef(Object::Dict(d)) => {
+                        super::work(d.data().len());
+                        (Id::Written(place(d.data())), Some(d))
+                    }
+                    MaybeRef::NotRef(Object::Stream(s)) => {
+                        let d = s.dict().clone();
+                        super::work(d.data().len());
+                        (Id::Written(place(d.data())), Some(d))
+                    }
+                    MaybeRef::NotRef(_) => return None,
+                };
+                Some(Listed { index, id, written })
+            })
+    }
+}
+
 /// The value of an entry or of an array's entry.
 #[derive(Clone)]
 pub(crate) enum Value<'a> {
     Number(Number),
     Bool(bool),
-    Name(Name<'a>),
+    Name(Rc<Name<'a>>),
     String(Rc<hayro_syntax::object::String<'a>>),
     Array(Items<'a>),
     Dict(Entries<'a>),
     /// A stream, decoded only where its text is read ([`Value::text`]).
-    Stream(Stream<'a>),
+    Stream(StreamEntries<'a>),
     /// Null, a reference to no object, or no entry.
     Null,
 }
@@ -386,26 +506,25 @@ impl<'a> Value<'a> {
         let object = match found {
             Found::Object(o) => o,
             Found::String(s) => return Self::String(s),
+            Found::Name(n) => return Self::Name(n),
             Found::None => return Self::Null,
         };
         match object {
             Object::Number(n) => Self::Number(n),
             Object::Boolean(b) => Self::Bool(b),
-            Object::Name(n) => Self::Name(n),
+            // Read into `Found::Name` and `Found::String`.
+            Object::Name(n) => Self::Name(Rc::new(n)),
             Object::String(s) => Self::String(Rc::new(s)),
             Object::Array(a) => Self::Array(Items(a, objects.clone())),
             Object::Dict(d) => Self::Dict(Entries(d, objects.clone())),
-            Object::Stream(s) => Self::Stream(s),
+            Object::Stream(s) => Self::Stream(StreamEntries(s, objects.clone())),
             Object::Null(_) => Self::Null,
         }
     }
 
     /// `object`, read without [`Objects`].
     fn read(object: Option<Object<'a>>) -> Self {
-        Self::of(
-            object.map_or(Found::None, Found::Object),
-            &Objects::default(),
-        )
+        Self::of(Found::of(object), &Objects::default())
     }
 
     /// A number, read as a real (see the module).
@@ -432,7 +551,7 @@ impl<'a> Value<'a> {
 
     pub(crate) fn name(&self) -> Option<&[u8]> {
         match self {
-            Self::Name(n) => Some(n.as_ref()),
+            Self::Name(n) => Some(n),
             _ => None,
         }
     }
@@ -441,7 +560,7 @@ impl<'a> Value<'a> {
     pub(crate) fn is_text(&self, entry: Text) -> bool {
         match self {
             Self::String(_) => true,
-            Self::Stream(s) => entry.stream() && s.decoded().is_ok(),
+            Self::Stream(s) => entry.stream() && s.0.decoded().is_ok(),
             _ => false,
         }
     }
@@ -451,7 +570,9 @@ impl<'a> Value<'a> {
     pub(crate) fn text(&self, entry: Text) -> Option<Vec<u8>> {
         match self {
             Self::String(s) => Some(s.as_bytes().to_vec()),
-            Self::Stream(s) if entry.stream() => s.decoded().ok().map(std::borrow::Cow::into_owned),
+            Self::Stream(s) if entry.stream() => {
+                s.0.decoded().ok().map(std::borrow::Cow::into_owned)
+            }
             _ => None,
         }
     }
@@ -586,25 +707,43 @@ pub(crate) struct Label<'a> {
 }
 
 impl<'a> Entries<'a> {
-    /// The entries of `dict`, its references followed afresh ([`Objects`]).
-    pub(crate) fn new(dict: Dict<'a>) -> Self {
+    /// The entries of `dict`, of content outside annotations, its references
+    /// followed afresh ([`Objects`]). Annotations are read with their document's
+    /// objects ([`Objects::annotation`]), and hold no dictionary to read so.
+    pub(crate) fn detached(dict: Dict<'a>) -> Self {
         Self(dict, Objects::default())
     }
 
-    /// The entries of `dict`, of a document whose objects are `objects`.
-    pub(crate) fn of(dict: Dict<'a>, objects: &Objects<'a>) -> Self {
-        Self(dict, objects.clone())
+    /// These entries, read from now on as a shared object's are: each once, and
+    /// kept. An annotation looked at again is read so.
+    pub(crate) fn shared(&self) -> Self {
+        let objects = Objects {
+            read: self.1.read.clone(),
+            shared: true,
+        };
+        Self(self.0.clone(), objects)
     }
 
-    /// Entry `key`; [`Value::Null`] when there is none. In a shared object, it is
-    /// read once.
-    pub(crate) fn get(&self, key: &[u8]) -> Value<'a> {
+    /// Entry `key` as read, and the objects to read in it with. In a shared object,
+    /// it is read once.
+    fn entry(&self, key: &[u8]) -> (Entry<'a>, Objects<'a>) {
         let Some(read) = &self.1.read else {
-            return Value::read(self.0.get::<Object<'a>>(key));
+            let entry = Entry {
+                found: Found::of(self.0.get::<Object<'a>>(key)),
+                r: self.0.get_ref(key),
+                written: self.0.contains_key(key),
+            };
+            return (entry, Objects::default());
+        };
+        let fresh = || {
+            let raw = self.0.get_raw::<Object<'a>>(key);
+            let r = raw.as_ref().and_then(MaybeRef::as_obj_ref);
+            let (found, objects) = self.1.found(read, raw);
+            let written = self.0.contains_key(key);
+            (Entry { found, r, written }, objects)
         };
         if !self.1.shared {
-            let (found, objects) = self.1.found(read, self.0.get_raw::<Object<'a>>(key));
-            return Value::of(found, &objects);
+            return fresh();
         }
         let at = place(self.0.data());
         let known = read
@@ -612,23 +751,28 @@ impl<'a> Entries<'a> {
             .borrow()
             .get(&at)
             .and_then(|entries| entries.get(key).cloned());
-        let found = known.unwrap_or_else(|| {
-            let (found, _) = self.1.found(read, self.0.get_raw::<Object<'a>>(key));
+        let entry = known.unwrap_or_else(|| {
+            let (entry, _) = fresh();
             read.entries
                 .borrow_mut()
                 .entry(at)
                 .or_default()
-                .insert(key.into(), found.clone());
-            found
+                .insert(key.into(), entry.clone());
+            entry
         });
-        Value::of(found, &self.1)
+        // Every entry of a shared object is read with the objects of shared ones.
+        (entry, self.1.clone())
     }
 
-    /// Whether entry `key` is there as viewers look an entry up: a null value is no
-    /// entry, but a reference is one, even to no object (it then reads as null).
-    /// The value is not read but to tell whether it is null.
+    /// Entry `key`; [`Value::Null`] when there is none.
+    pub(crate) fn get(&self, key: &[u8]) -> Value<'a> {
+        let (entry, objects) = self.entry(key);
+        Value::of(entry.found, &objects)
+    }
+
+    /// Whether entry `key` is there as viewers look an entry up ([`Entry::present`]).
     pub(crate) fn present(&self, key: &[u8]) -> bool {
-        self.0.contains_key(key) && self.0.get::<Null>(key).is_none()
+        self.entry(key).0.present()
     }
 
     pub(crate) fn number(&self, key: &[u8]) -> Option<f64> {
@@ -646,7 +790,7 @@ impl<'a> Entries<'a> {
         }
     }
 
-    pub(crate) fn name(&self, key: &[u8]) -> Option<Name<'a>> {
+    pub(crate) fn name(&self, key: &[u8]) -> Option<Rc<Name<'a>>> {
         match self.get(key) {
             Value::Name(n) => Some(n),
             _ => None,
@@ -655,7 +799,7 @@ impl<'a> Entries<'a> {
 
     /// Whether entry `key` is the name `name`.
     pub(crate) fn is(&self, key: &[u8], name: &[u8]) -> bool {
-        self.name(key).is_some_and(|n| n.as_ref() == name)
+        self.name(key).is_some_and(|n| **n == *name)
     }
 
     /// The bytes of text entry `entry` ([`Value::text`]).
@@ -705,13 +849,14 @@ impl<'a> Entries<'a> {
     }
 
     /// Where entry `key`'s value is held ([`Source`]); `None` for a value in a direct
-    /// dictionary, which no key names. The value is not read: a text many
+    /// dictionary, which no key names. Told from the entry as read: a text many
     /// annotations share is so known by the object that holds it, and one an
     /// annotation holds itself by that annotation, however long.
     pub(crate) fn source(&self, key: &'static [u8]) -> Option<Source> {
-        let held = if let Some(r) = self.0.get_ref(key) {
+        let entry = self.entry(key).0;
+        let held = if let Some(r) = entry.r {
             Held::Object(r)
-        } else if !self.present(key) {
+        } else if !entry.present() {
             Held::Absent
         } else {
             Held::In(self.id()?)
@@ -733,7 +878,29 @@ impl<'a> Entries<'a> {
     /// The dictionary `/Parent` names, and the reference to it when it is an object of
     /// its own.
     pub(crate) fn parent(&self) -> Option<(Option<ObjRef>, Self)> {
-        let parent = self.dict(b"Parent")?;
-        Some((self.0.get_ref(b"Parent"), parent))
+        let (entry, objects) = self.entry(b"Parent");
+        let r = entry.r;
+        match Value::of(entry.found, &objects) {
+            Value::Dict(parent) => Some((r, parent)),
+            _ => None,
+        }
+    }
+}
+
+/// A stream an entry holds, with the objects of its document: its dictionary is read
+/// as [`Entries`], and the stream itself is given out only as what an annotation
+/// draws ([`StreamEntries::into_stream`]).
+#[derive(Clone)]
+pub(crate) struct StreamEntries<'a>(Stream<'a>, Objects<'a>);
+
+impl<'a> StreamEntries<'a> {
+    /// The entries of the stream's dictionary.
+    pub(crate) fn dict(&self) -> Entries<'a> {
+        Entries(self.0.dict().clone(), self.1.clone())
+    }
+
+    /// The stream, for a renderer or writer to draw.
+    pub(crate) fn into_stream(self) -> Stream<'a> {
+        self.0
     }
 }

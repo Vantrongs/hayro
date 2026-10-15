@@ -2,8 +2,9 @@
 //! on the page, or, for an annotation without a usable one, an appearance generated
 //! from its entries (PDF 32000-1 12.5).
 //!
-//! The renderer draws annotations with [`Appearances::look`], and a writer that flattens
-//! annotations into page content can use the same to draw what the renderer shows.
+//! The renderer draws a page's annotations as [`Appearances::page`] lists them, and a
+//! writer that flattens annotations into page content can use the same to draw what
+//! the renderer shows.
 //!
 //! What a generated appearance shows follows the PDF specification. The markup
 //! shapes (`markup.rs`) are adapted from `PDFium` (`core/fpdfdoc/cpdf_generateap.cpp`,
@@ -32,14 +33,16 @@ mod rich;
 mod text;
 mod widget;
 
-use entries::{Entries, Items, Label, Objects, Source, Value};
+use entries::{Annots, Entries, Id, Items, Label, Listed, Objects, Source, StreamEntries, Value};
 use out::{Color, Out, written_all};
 use text::{Family, Fonts, Shaped, Typeface};
 
+use super::AnnotationSelection;
 use crate::BlendMode;
 use crate::x_object::box_and_matrix;
 use hayro_syntax::object::dict::keys::{AP, AS, BORDER, BS, C, CA, D, F, N, RECT, SUBTYPE, W};
-use hayro_syntax::object::{Dict, Name, Number, ObjRef, Stream};
+use hayro_syntax::object::{Name, ObjRef, Stream};
+use hayro_syntax::page::Page;
 use hayro_syntax::xref::XRef;
 use kurbo::{Affine, Shape};
 use rustc_hash::FxHashMap;
@@ -65,6 +68,7 @@ pub fn work_done() -> u64 {
 }
 
 /// What an annotation draws.
+#[derive(Clone)]
 pub enum Look<'a> {
     /// Its normal appearance stream, drawn as [`Placement`] says.
     Stream {
@@ -74,7 +78,7 @@ pub enum Look<'a> {
         placement: Placement,
     },
     /// An appearance generated from its entries.
-    Generated(Appearance),
+    Generated(Rc<Appearance>),
     /// Nothing.
     Nothing,
     /// Something this crate cannot draw: the annotation has no usable appearance
@@ -202,25 +206,79 @@ impl Glyph {
     }
 }
 
-/// Whether `annot` is kept when annotations are flattened into page content for
-/// printing what the reader sees: every annotation but links and those flagged
-/// Invisible or Hidden (PDF 32000-1 12.5.3), whatever their Print and `NoView` flags.
-/// [`Unsupported::Number`] when its flags cannot be read as viewers read them.
-pub fn flattened(annot: &Dict<'_>) -> Result<bool, Unsupported> {
-    let link = annot
-        .get::<Name<'_>>(SUBTYPE)
-        .is_some_and(|n| n.as_ref() == b"Link");
-    Ok(!link && flags(annot)? & 3 == 0)
+/// An annotation a page draws, or one it cannot draw ([`Appearances::page`]).
+#[derive(Clone)]
+pub struct Drawn<'a> {
+    index: usize,
+    annotation: Rc<Annotation<'a>>,
 }
 
-/// The annotation flags of `annot` (`/F`, PDF 32000-1 12.5.3);
-/// [`Unsupported::Number`] when they cannot be read as viewers read them.
-pub fn flags(annot: &Dict<'_>) -> Result<u32, Unsupported> {
-    // Read as a number, so that an object of another kind is not read whole.
-    entries::read(|| entries::flags(annot.get::<Number>(F)))
+impl<'a> Drawn<'a> {
+    /// Its place among the entries of the page's `/Annots`.
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// What it draws: never [`Look::Nothing`].
+    pub fn look(&self) -> &Look<'a> {
+        &self.annotation.look
+    }
+
+    /// Its `/Subtype`, to tell which annotation it is.
+    pub fn subtype(&self) -> Option<&[u8]> {
+        self.annotation.subtype.as_deref().map(|n| &**n)
+    }
 }
 
-/// What the annotations of one document look like: [`Appearances::look`], with
+/// What an annotation looks like on a page, and its subtype.
+struct Annotation<'a> {
+    look: Look<'a>,
+    subtype: Option<Rc<Name<'a>>>,
+}
+
+/// What an annotation a page lists comes to before the area the page shows is known.
+enum Plan<'a> {
+    /// The same on every page: an appearance stream, or why it cannot be drawn.
+    Fixed(Rc<Annotation<'a>>),
+    /// An appearance generated for each area shown, from `annot`, read as its own
+    /// the first time and as a shared object's after.
+    Generate {
+        id: Id,
+        annot: Entries<'a>,
+        subtype: Option<Rc<Name<'a>>>,
+        again: Cell<bool>,
+    },
+}
+
+/// What an annotation comes to before generating: an appearance stream, nothing,
+/// why it cannot be drawn, or an appearance to generate.
+enum Prepared<'a> {
+    Look(Look<'a>),
+    Generate,
+}
+
+/// The annotations a page lists that may draw, each with its place in `/Annots`.
+type Plans<'a> = Rc<[(usize, Rc<Plan<'a>>)]>;
+
+/// The area a page shows, as a key: its coordinates' bits.
+type View = [u64; 4];
+
+fn view(visible: kurbo::Rect) -> View {
+    [visible.x0, visible.y0, visible.x1, visible.y1].map(f64::to_bits)
+}
+
+/// Whether `annot` is drawn as `selection` says (PDF 32000-1 12.5.3), by its flags
+/// (`/F`), read as a number.
+fn selected(annot: &Entries<'_>, selection: AnnotationSelection) -> bool {
+    let flags = annot.get(F).flags();
+    match selection {
+        AnnotationSelection::View => flags & (2 | 32) == 0,
+        AnnotationSelection::Print => flags & 2 == 0 && flags & 4 != 0,
+        AnnotationSelection::Flatten => flags & 3 == 0 && !annot.is(SUBTYPE, b"Link"),
+    }
+}
+
+/// What the annotations of one document look like: [`Appearances::page`], with
 /// generated text in the standard fonts a font resolver gives (Helvetica for
 /// characters a family's font lacks) and widget defaults from the document's
 /// interactive form. Make one per document: fonts are loaded once, and each field
@@ -247,6 +305,19 @@ pub(crate) struct Fields<'a>(Rc<RefCell<Known<'a>>>);
 struct Known<'a> {
     /// The document's objects, each read once.
     objects: Option<Objects<'a>>,
+    /// The interactive form dictionary, once read.
+    form: Option<Option<Entries<'a>>>,
+    /// What each annotation pages list comes to, by which it is and the selection;
+    /// `None` for one that draws nothing on any page.
+    plans: FxHashMap<(Id, AnnotationSelection), Option<Rc<Plan<'a>>>>,
+    /// The appearances generated, by annotation and area shown.
+    generated: FxHashMap<(Id, View), Option<Rc<Annotation<'a>>>>,
+    /// Of each `/Annots` array object, by selection, the annotations it lists that
+    /// may draw, each with its place.
+    lists: FxHashMap<(ObjRef, AnnotationSelection), Plans<'a>>,
+    /// What a page whose `/Annots` is an array object draws, by the array, the
+    /// selection and the area shown.
+    pages: FxHashMap<(ObjRef, AnnotationSelection, View), Rc<[Drawn<'a>]>>,
     fields: FxHashMap<ObjRef, Option<Field<'a>>>,
     /// Text set in its fonts, by what it is made of.
     shaped: FxHashMap<TextKey, Result<Rc<Shaped>, Unsupported>>,
@@ -317,10 +388,12 @@ impl<'a> Appearances<'a> {
             .objects
             .get_or_insert_with(|| Objects::new(xref))
             .clone();
-        let form = xref
-            .get::<Dict<'a>>(xref.root_id())
-            .map(|root| Entries::of(root, &objects))
-            .and_then(|root| root.dict(b"AcroForm"));
+        let known = fields.0.borrow().form.clone();
+        let form = known.unwrap_or_else(|| {
+            let form = objects.catalog().and_then(|root| root.dict(b"AcroForm"));
+            fields.0.borrow_mut().form = Some(form.clone());
+            form
+        });
         Self {
             objects,
             fonts: Fonts::new(font_resolver),
@@ -329,8 +402,12 @@ impl<'a> Appearances<'a> {
         }
     }
 
-    /// What `annot` draws on a page that shows `visible` (in default user space) of it,
-    /// with text in `fonts`.
+    /// The annotations of `page` that `selection` draws and that draw something or
+    /// cannot be drawn, in the order of its `/Annots`, as they look on a page that
+    /// shows `visible` (in default user space) of them, with text in the fonts of
+    /// these appearances. An entry of `/Annots` that names no dictionary names no
+    /// annotation; one whose flags cannot be read as viewers read them cannot be
+    /// drawn ([`Unsupported::Number`]).
     ///
     /// The normal appearance is `/AP /N`, or, when that is a dictionary of states, the
     /// state `/AS` names. A stream there draws when it has a `/BBox` that, after its
@@ -339,27 +416,164 @@ impl<'a> Appearances<'a> {
     /// button widget, which viewers draw anew. Without an appearance there
     /// (no `/AP`, no `/N`, no stream for the state), one is generated from the
     /// annotation's entries.
-    pub fn look(&self, annot: &Dict<'a>, visible: kurbo::Rect) -> Look<'a> {
-        entries::read(|| self.look_read(annot, visible)).unwrap_or_else(Look::Unsupported)
+    ///
+    /// What an annotation comes to is found once for the document, by the object
+    /// it is or where it is written, the selection and the area shown, however many
+    /// times pages list it; and what a page whose `/Annots` is an array object
+    /// draws, by the array, the selection and the area shown. A page listing again
+    /// what was found costs a lookup, whatever it holds and whatever it draws.
+    pub fn page(
+        &self,
+        page: &Page<'a>,
+        selection: AnnotationSelection,
+        visible: kurbo::Rect,
+    ) -> Rc<[Drawn<'a>]> {
+        let Some(annots) = self.objects.annots(page.raw()) else {
+            return Rc::from([]);
+        };
+        let view = view(visible);
+        let Some(array) = annots.object() else {
+            let plans = self.plans(&annots, selection);
+            return self.drawn(&plans, visible, view).into();
+        };
+        self.once(
+            |k| &mut k.pages,
+            Some((array, selection, view)),
+            || {
+                let plans = self.once(
+                    |k| &mut k.lists,
+                    Some((array, selection)),
+                    || self.plans(&annots, selection).into(),
+                );
+                self.drawn(&plans, visible, view).into()
+            },
+        )
     }
 
-    fn look_read(&self, annot: &Dict<'a>, visible: kurbo::Rect) -> Look<'a> {
-        let entries = self.objects.annotation(annot.clone());
-        match entries.get(AP) {
-            // A reference to no object.
-            Value::Null if entries.present(AP) => return self.not_a_dictionary(annot, visible),
+    /// The annotations `annots` lists that `selection` draws and that may draw
+    /// something, each with its place, each found once for the document.
+    fn plans(
+        &self,
+        annots: &Annots<'a>,
+        selection: AnnotationSelection,
+    ) -> Vec<(usize, Rc<Plan<'a>>)> {
+        annots
+            .entries()
+            .filter_map(|listed| {
+                let plan = self.once(
+                    |k| &mut k.plans,
+                    Some((listed.id, selection)),
+                    || self.plan(&listed, selection),
+                )?;
+                Some((listed.index, plan))
+            })
+            .collect()
+    }
+
+    /// What the annotation `listed` names comes to as `selection` draws it, before
+    /// the area shown is known; `None` when it draws nothing on any page.
+    fn plan(&self, listed: &Listed<'a>, selection: AnnotationSelection) -> Option<Rc<Plan<'a>>> {
+        let annot = self.objects.annotation(listed)?;
+        let subtype = annot.name(SUBTYPE);
+        let fixed = |look| {
+            let annotation = Annotation {
+                look,
+                subtype: subtype.clone(),
+            };
+            Some(Rc::new(Plan::Fixed(Rc::new(annotation))))
+        };
+        match entries::read(|| selected(&annot, selection)) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(why) => return fixed(Look::Unsupported(why)),
+        }
+        match entries::read(|| self.prepare(&annot)) {
+            Ok(Prepared::Look(Look::Nothing)) => None,
+            Ok(Prepared::Look(look)) => fixed(look),
+            Ok(Prepared::Generate) => Some(Rc::new(Plan::Generate {
+                id: listed.id,
+                annot,
+                subtype,
+                again: Cell::new(false),
+            })),
+            Err(why) => fixed(Look::Unsupported(why)),
+        }
+    }
+
+    /// The annotations of `plans` as drawn on a page that shows `visible`, whose
+    /// key is `view`: those generated, once for the document for each area shown.
+    fn drawn(
+        &self,
+        plans: &[(usize, Rc<Plan<'a>>)],
+        visible: kurbo::Rect,
+        view: View,
+    ) -> Vec<Drawn<'a>> {
+        plans
+            .iter()
+            .filter_map(|(index, plan)| {
+                let annotation = match &**plan {
+                    Plan::Fixed(annotation) => annotation.clone(),
+                    Plan::Generate { id, .. } => self.once(
+                        |k| &mut k.generated,
+                        Some((*id, view)),
+                        || self.generated(plan, visible),
+                    )?,
+                };
+                Some(Drawn {
+                    index: *index,
+                    annotation,
+                })
+            })
+            .collect()
+    }
+
+    /// The appearance `plan`, [`Plan::Generate`], generates for a page that shows
+    /// `visible`; `None` when it paints nothing.
+    fn generated(&self, plan: &Plan<'a>, visible: kurbo::Rect) -> Option<Rc<Annotation<'a>>> {
+        let Plan::Generate {
+            annot,
+            subtype,
+            again,
+            ..
+        } = plan
+        else {
+            return None;
+        };
+        let annot = if again.replace(true) {
+            annot.shared()
+        } else {
+            annot.clone()
+        };
+        let look = match entries::read(|| self.generate(&annot, visible)) {
+            Ok(Ok(Some(appearance))) => Look::Generated(Rc::new(appearance)),
+            Ok(Ok(None)) => return None,
+            Ok(Err(why)) | Err(why) => Look::Unsupported(why),
+        };
+        Some(Rc::new(Annotation {
+            look,
+            subtype: subtype.clone(),
+        }))
+    }
+
+    /// What `annot` comes to before generating (see [`Appearances::page`]).
+    fn prepare(&self, annot: &Entries<'a>) -> Prepared<'a> {
+        match annot.get(AP) {
+            // A reference to null or to no object.
+            Value::Null if annot.present(AP) => return self.not_a_dictionary(annot),
             Value::Null => {}
             Value::Dict(ap) => {
                 // Each read as any object: a dictionary read as a stream may pick up
                 // the data of a stream after it in the file.
                 let stream = match ap.get(N) {
                     Value::Stream(stream) => Some(stream),
-                    Value::Dict(states) => match entries.name(AS) {
-                        Some(state) => match states.get(state.as_ref()) {
+                    Value::Dict(states) => match annot.name(AS) {
+                        Some(state) => match states.get(&state) {
                             Value::Stream(stream) => Some(stream),
                             // A state that is there but is no stream, a reference to
                             // no object among them, draws nothing (observed).
-                            _ if states.present(state.as_ref()) => return Look::Nothing,
+                            _ if states.present(&state) => {
+                                return Prepared::Look(Look::Nothing);
+                            }
                             _ => None,
                         },
                         None => None,
@@ -367,46 +581,43 @@ impl<'a> Appearances<'a> {
                     _ => None,
                 };
                 if let Some(stream) = stream {
-                    return match placement(&stream, &entries) {
-                        Ok(Some(placement)) => Look::Stream { stream, placement },
+                    return Prepared::Look(match placement(&stream, annot) {
+                        Ok(Some(placement)) => Look::Stream {
+                            stream: stream.into_stream(),
+                            placement,
+                        },
                         Ok(None) => Look::Nothing,
                         Err(why) => Look::Unsupported(why),
-                    };
+                    });
                 }
             }
-            _ => return self.not_a_dictionary(annot, visible),
+            _ => return self.not_a_dictionary(annot),
         }
-        self.generated(&entries, visible)
+        self.to_generate(annot)
     }
 
-    /// What `annot`, whose `/AP` is neither a dictionary nor null, looks like:
+    /// What `annot`, whose `/AP` is neither a dictionary nor absent, comes to:
     /// nothing, but a button, whose appearance viewers make anew.
-    fn not_a_dictionary(&self, annot: &Dict<'a>, visible: kurbo::Rect) -> Look<'a> {
-        let annot = self.objects.annotation(annot.clone());
+    fn not_a_dictionary(&self, annot: &Entries<'a>) -> Prepared<'a> {
         let button = annot.is(SUBTYPE, b"Widget")
             && self
-                .field(&annot)
+                .field(annot)
                 .is_some_and(|f| f.get(Inherited::Type).name() == Some(b"Btn"));
         if button {
-            self.generated(&annot, visible)
+            self.to_generate(annot)
         } else {
-            Look::Nothing
+            Prepared::Look(Look::Nothing)
         }
     }
 
-    /// The appearance generated for `annot`: none for one held directly in a page's
-    /// `/Annots` rather than an object of its own, which viewers draw only by its
-    /// appearance stream (observed in `PyMuPDF` bake).
-    fn generated(&self, annot: &Entries<'a>, visible: kurbo::Rect) -> Look<'a> {
+    /// An appearance to generate for `annot`: none for one held directly in a
+    /// page's `/Annots` rather than an object of its own, which viewers draw only by
+    /// its appearance stream (observed in `PyMuPDF` bake).
+    fn to_generate(&self, annot: &Entries<'a>) -> Prepared<'a> {
         match annot.own() {
-            Some(true) => {}
-            Some(false) => return Look::Nothing,
-            None => return Look::Unsupported(Unsupported::Kind),
-        }
-        match self.generate(annot, visible) {
-            Ok(Some(appearance)) => Look::Generated(appearance),
-            Ok(None) => Look::Nothing,
-            Err(why) => Look::Unsupported(why),
+            Some(true) => Prepared::Generate,
+            Some(false) => Prepared::Look(Look::Nothing),
+            None => Prepared::Look(Look::Unsupported(Unsupported::Kind)),
         }
     }
 }
@@ -414,8 +625,11 @@ impl<'a> Appearances<'a> {
 /// Where appearance `stream` is drawn on `annot`: `None` when the annotation has no
 /// `/Rect`, or the stream has no `/BBox` that, after its `/Matrix`, encloses some
 /// area; [`Unsupported::Coordinates`] when one of its numbers cannot be written.
-fn placement(stream: &Stream<'_>, annot: &Entries<'_>) -> Result<Option<Placement>, Unsupported> {
-    let Some((bbox, matrix)) = box_and_matrix(stream.dict()) else {
+fn placement(
+    stream: &StreamEntries<'_>,
+    annot: &Entries<'_>,
+) -> Result<Option<Placement>, Unsupported> {
+    let Some((bbox, matrix)) = box_and_matrix(&stream.dict()) else {
         return Ok(None);
     };
     let Some(rect) = rect(annot) else {
@@ -471,7 +685,7 @@ impl<'a> Appearances<'a> {
         let mut out = Out::default();
         let fonts = &self.fonts;
         let ok = |drew: Option<()>| Ok(drew);
-        let drew = match subtype.as_ref() {
+        let drew = match &**subtype {
             b"Square" => ok(markup::shape(annot, false, &mut out)),
             b"Circle" => ok(markup::shape(annot, true, &mut out)),
             b"Highlight" => ok(markup::highlight(annot, &mut out)),
@@ -514,7 +728,7 @@ impl<'a> Appearances<'a> {
         if drew.is_none() || !paints {
             return Ok(None);
         }
-        let blend = if subtype.as_ref() == b"Highlight" {
+        let blend = if **subtype == *b"Highlight" {
             BlendMode::Multiply
         } else {
             BlendMode::Normal

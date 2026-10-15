@@ -148,7 +148,7 @@ impl Shading {
         let shading_type = match shading_num {
             1 => {
                 let domain = dict.get::<[f32; 4]>(DOMAIN).unwrap_or([0.0, 1.0, 0.0, 1.0]);
-                let matrix = Affine::new(Entries::new(dict.clone()).matrix(MATRIX));
+                let matrix = Affine::new(Entries::detached(dict.clone()).matrix(MATRIX));
                 let function = read_function(dict, &color_space)?;
 
                 ShadingType::FunctionBased {
@@ -294,7 +294,7 @@ impl Shading {
         };
 
         // Read as viewers read a damaged one, as a form's is.
-        let bbox = Entries::new(dict.clone()).rect(BBOX);
+        let bbox = Entries::detached(dict.clone()).rect(BBOX);
         let background = dict
             .get::<Array<'_>>(BACKGROUND)
             .map(|a| a.items::<f32>().map_while(|n| n).collect::<SmallVec<_>>());

@@ -161,7 +161,7 @@ fn draw<'a>(
         return signature(bbox, fonts, out);
     }
     if matches!(kind, Kind::Check | Kind::Radio) {
-        let on = annot.name(AS).is_some_and(|state| state.as_ref() != b"Off");
+        let on = annot.name(AS).is_some_and(|state| **state != *b"Off");
         let s = fw.min(fh);
         // The square at the bottom left of the box.
         let sq = kurbo::Rect::new(0.0, 0.0, s, s);

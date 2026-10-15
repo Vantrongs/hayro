@@ -104,7 +104,7 @@ impl ShadingPattern {
 
             Shading::new(dict, stream, cache)
         })?;
-        let matrix = Affine::new(Entries::new(dict.clone()).matrix(MATRIX));
+        let matrix = Affine::new(Entries::detached(dict.clone()).matrix(MATRIX));
 
         if dict.contains_key(EXT_G_STATE) {
             warn!("shading patterns with ext_g_state are not supported yet");
@@ -168,7 +168,7 @@ impl<'a> TilingPattern<'a> {
         let dict = stream.dict();
 
         // Read as viewers read damaged ones, as forms are.
-        let entries = Entries::new(dict.clone());
+        let entries = Entries::detached(dict.clone());
         let bbox = entries.rect(BBOX)?;
         let x_step = entries.number(X_STEP).unwrap_or(0.0) as f32;
         let y_step = entries.number(Y_STEP).unwrap_or(0.0) as f32;

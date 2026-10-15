@@ -385,7 +385,7 @@ mod tests {
         let annot = format!("<< /Subtype /Squiggly /Rect [0 0 1 1] /QuadPoints [{quads}] >>");
         let dict = Dict::from_bytes(annot.as_bytes()).expect("valid dict");
         let mut out = Out::default();
-        squiggly(&Entries::new(dict), visible, &mut out)
+        squiggly(&Entries::detached(dict), visible, &mut out)
             .expect("drawable")
             .expect("an appearance");
         out.finish().expect("written").0
@@ -444,7 +444,7 @@ mod tests {
             /QuadPoints [33554432 24 33554440 24 33554432 10 33554440 10] >>";
         let dict = Dict::from_bytes(annot.as_bytes()).expect("valid dict");
         let mut out = Out::default();
-        let got = squiggly(&Entries::new(dict), PAGE, &mut out);
+        let got = squiggly(&Entries::detached(dict), PAGE, &mut out);
         assert!(matches!(got, Err(super::Unsupported::Coordinates)));
     }
 

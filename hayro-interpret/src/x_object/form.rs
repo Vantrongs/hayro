@@ -15,8 +15,7 @@ use std::borrow::Cow;
 /// keeps its place, one that is not a number reads as 0, and missing ones are 0.
 /// A form whose `/BBox` is not an array has no box and is not drawn; one whose
 /// `/Matrix` is not an array is drawn with the identity.
-pub(crate) fn box_and_matrix(dict: &Dict<'_>) -> Option<([f64; 4], [f64; 6])> {
-    let dict = Entries::new(dict.clone());
+pub(crate) fn box_and_matrix(dict: &Entries<'_>) -> Option<([f64; 4], [f64; 6])> {
     let b = dict.numbers(BBOX, 4)?;
     Some(([b[0], b[1], b[2], b[3]], dict.matrix(MATRIX)))
 }
@@ -32,7 +31,7 @@ pub(crate) struct FormXObject<'a> {
 
 impl<'a> FormXObject<'a> {
     pub(crate) fn new(stream: &Stream<'a>) -> Option<Self> {
-        let (bbox, matrix) = box_and_matrix(stream.dict())?;
+        let (bbox, matrix) = box_and_matrix(&Entries::detached(stream.dict().clone()))?;
         Self::placed(stream, Affine::new(matrix), bbox.map(|v| v as f32))
     }
 
