@@ -44,10 +44,11 @@ impl<'a> Array<'a> {
         ResolvedArrayIter::new(self.data, &self.ctx)
     }
 
-    /// The items of the array that are of a specific type, resolved; `Err` with the
-    /// object an item refers to where the file lists it but it cannot be read
-    /// ([`crate::xref::XRef::get_checked`]). Unlike [`Self::iter`], an item of
-    /// another type, or a reference to nothing, is passed over, not the end.
+    /// The items of the array that are of a specific type, resolved; `Err` with an
+    /// object reading an item lost ([`crate::lost`]), the one it refers to where the
+    /// file lists it but it cannot be read, which the computation being watched is
+    /// told too. Unlike [`Self::iter`], an item of another type, or a reference to
+    /// nothing, is passed over, not the end.
     #[allow(
         private_bounds,
         reason = "users shouldn't be able to implement `ObjectLike` for custom objects."

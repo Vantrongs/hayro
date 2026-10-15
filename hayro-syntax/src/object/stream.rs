@@ -608,7 +608,9 @@ impl<'a> TryFrom<Object<'a>> for Stream<'a> {
     }
 }
 
-impl<'a> ObjectLike<'a> for Stream<'a> {}
+impl<'a> ObjectLike<'a> for Stream<'a> {
+    const STREAM: bool = true;
+}
 impl<'a> ObjectRefLike<'a> for Stream<'a> {
     fn cast_ref<'b>(obj: &'b Object<'a>) -> Option<&'b Self> {
         match obj {

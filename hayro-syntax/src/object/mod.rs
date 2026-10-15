@@ -77,6 +77,11 @@ impl AsRef<[u8]> for Bytes<'_> {
 
 /// A trait for PDF objects.
 pub(crate) trait ObjectLike<'a>: TryFrom<Object<'a>> + Readable<'a> + Debug + Clone {
+    /// Whether a stream is read as one, its data and all: a stream whose data cannot
+    /// be read is lost to such a read, where any other reads its dictionary or is
+    /// of another kind.
+    const STREAM: bool = false;
+
     /// Reads the object an indirect object holds, after its header.
     fn read_indirect(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         r.read_with_context::<Self>(ctx)
@@ -236,6 +241,8 @@ impl<'a> Object<'a> {
 }
 
 impl<'a> ObjectLike<'a> for Object<'a> {
+    const STREAM: bool = true;
+
     // Only an indirect object is a stream: a dictionary followed by `stream`, as
     // `Syntax::read_from` in the `xref` module reads one. In an array or dictionary,
     // which reading and skipping read alike, it is a dictionary.
@@ -417,18 +424,31 @@ impl ObjectIdentifier {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// The bytes object headers were read from on this thread, which the tests
+    /// bound to show that no header is read again for every entry leading to it.
+    pub(crate) static HEADER_BYTES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
 impl Readable<'_> for ObjectIdentifier {
     fn read(r: &mut Reader<'_>, _: &ReaderContext<'_>) -> Option<Self> {
-        let obj_number = r.read_without_context::<i32>()?;
-        r.skip_white_spaces_and_comments();
-        let gen_number = r.read_without_context::<i32>()?;
-        r.skip_white_spaces_and_comments();
-        r.forward_tag(b"obj")?;
-
-        Some(Self {
-            obj_number,
-            gen_number,
-        })
+        #[cfg(test)]
+        let start = r.offset();
+        let id = (|| {
+            let obj_number = r.read_without_context::<i32>()?;
+            r.skip_white_spaces_and_comments();
+            let gen_number = r.read_without_context::<i32>()?;
+            r.skip_white_spaces_and_comments();
+            r.forward_tag(b"obj")?;
+            Some(Self {
+                obj_number,
+                gen_number,
+            })
+        })();
+        #[cfg(test)]
+        HEADER_BYTES.set(HEADER_BYTES.get() + (r.offset() - start));
+        id
     }
 }
 

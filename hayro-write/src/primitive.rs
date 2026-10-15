@@ -55,19 +55,13 @@ impl WriteDirect for object::ObjRef {
 /// What a reference to `source` is written as, queuing the object for copying.
 ///
 /// A reference to an object that does not exist is `null`, as it reads: writing it
-/// would leave a reference to nothing. One the file lists but that cannot be parsed
-/// fails the extraction. A stream whose dictionary refers to no other object is
-/// copied once for all streams with the same copied dictionary and data.
+/// would leave a reference to nothing. One the file lists but that cannot be read
+/// is lost, which fails the extraction ([`crate::extract`]). A stream whose
+/// dictionary refers to no other object is copied once for all streams with the same
+/// copied dictionary and data.
 fn target(source: object::ObjRef, ctx: &mut ExtractionContext<'_>) -> Option<Ref> {
     let id = ObjectIdentifier::new(source.obj_number, source.gen_number);
-    let object = match ctx.pdf.xref().get_checked::<Object<'_>>(id) {
-        Ok(Some(object)) => object,
-        Ok(None) => return None,
-        Err(_) => {
-            ctx.fail(ExtractionError::Unreadable(source));
-            return None;
-        }
-    };
+    let object = ctx.pdf.xref().get::<Object<'_>>(id)?;
     if let Object::Stream(stream) = &object
         && !refers(stream.dict())
     {
@@ -106,10 +100,10 @@ fn target(source: object::ObjRef, ctx: &mut ExtractionContext<'_>) -> Option<Ref
             .entry(key)
             .or_default()
             .push((source, copy));
-        ctx.to_visit_refs.push(source);
+        ctx.to_visit_refs.push((source, ctx.page));
         return Some(copy);
     }
-    ctx.to_visit_refs.push(source);
+    ctx.to_visit_refs.push((source, ctx.page));
     Some(ctx.map_ref(source))
 }
 

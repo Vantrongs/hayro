@@ -70,6 +70,19 @@ pub(crate) fn file(objects: &[Part<'_>], aliases: &[(u32, u32)]) -> Vec<u8> {
 
 /// [`file`], or where not `encrypted`, the same file with nothing encrypted.
 pub(crate) fn file_with(objects: &[Part<'_>], aliases: &[(u32, u32)], encrypted: bool) -> Vec<u8> {
+    file_headed(objects, aliases, encrypted, &|number| {
+        format!("{number} 0 obj")
+    })
+}
+
+/// [`file_with`], each object headed by what `header` makes of its number.
+#[allow(dead_code)]
+pub(crate) fn file_headed(
+    objects: &[Part<'_>],
+    aliases: &[(u32, u32)],
+    encrypted: bool,
+    header: &dyn Fn(u32) -> String,
+) -> Vec<u8> {
     let crypt = |number: u32, data: &[u8]| {
         if encrypted {
             crypt(number, data)
@@ -83,7 +96,7 @@ pub(crate) fn file_with(objects: &[Part<'_>], aliases: &[(u32, u32)], encrypted:
     for (i, part) in objects.iter().enumerate() {
         let number = i as u32 + 1;
         offsets.push(out.len());
-        out.extend(format!("{number} 0 obj\n").bytes());
+        out.extend(format!("{}\n", header(number)).bytes());
         match part {
             Part::Object(object, string) => out.extend(
                 object

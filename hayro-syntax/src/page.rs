@@ -1,6 +1,7 @@
 //! Reading the pages of a PDF document.
 
 use crate::content::{TypedIter, UntypedIter};
+use crate::lost::{Lost, Memo};
 use crate::object::Array;
 use crate::object::Dict;
 use crate::object::Name;
@@ -30,6 +31,8 @@ use node::{Node, Objects, dict_of};
 pub struct Pages<'a> {
     pages: Vec<Page<'a>>,
     xref: &'a XRef,
+    /// What reading the page tree lost.
+    lost: Lost,
 }
 
 impl<'a> Pages<'a> {
@@ -40,18 +43,36 @@ impl<'a> Pages<'a> {
     // `pdf-page.c`) and, where the tree is odd, finds each page by the nodes' /Count
     // (`pdf_lookup_page_loc_imp`), so a damaged /Count hides pages or refuses the
     // file. The walk ignores /Count: it hides no page the /Kids hold.
+    //
+    // What reading the tree loses — a node, a /Kids array or a node's /Type that
+    // cannot be read, or, where no tree lists a page, any object — may have held
+    // pages: it is kept for the document ([`Self::unreadable`]). What reading a
+    // page's entries loses is kept for the page ([`Page::unreadable`]). Neither is
+    // told to a computation being watched while the pages are read.
     pub(crate) fn new(ctx: &ReaderContext<'a>, xref: &'a XRef) -> Option<Self> {
-        let mut objects = Objects::new(ctx.clone());
-        let tree = objects.tree().filter(Node::is_dict);
-        let (mut pages, listings) = tree
-            .map(|tree| walk(tree, &mut objects))
-            .unwrap_or_default();
-        if pages.is_empty() {
-            pages = brute_force(xref);
-        }
+        let ((pages, listings, objects), lost) = xref.apart(|| {
+            let mut objects = Objects::new(ctx.clone());
+            let tree = objects.tree().filter(Node::is_dict);
+            let (mut pages, listings) = tree
+                .map(|tree| walk(tree, &mut objects))
+                .unwrap_or_default();
+            if pages.is_empty() {
+                pages = brute_force(xref);
+            }
+            (pages, listings, objects)
+        });
         let pages = with_inherited(pages, Arc::new(listings), objects, ctx);
 
-        Some(Self { pages, xref })
+        Some(Self { pages, xref, lost })
+    }
+
+    /// An object the page tree refers to that the file lists but that cannot be read,
+    /// if there is one: a node, a /Kids array, or a node's /Type, which may have held
+    /// pages, or, where no page tree lists a page and every page object of the file
+    /// is a page, any object. The pages are those that can be read, as viewers list
+    /// them, and a copy of all of them may lose some.
+    pub fn unreadable(&self) -> Option<ObjectIdentifier> {
+        self.lost
     }
 
     /// Return the xref table (of the document the pages belong to).   
@@ -221,8 +242,10 @@ fn walk<'a>(tree: Node<'a>, objects: &mut Objects<'a>) -> (Vec<Listed<'a>>, List
 
 // Every dictionary of the file that has /Contents and, if typed, is a /Page. Better
 // than nothing where the page tree is lost, though the order is the objects', which
-// may not be the document's.
+// may not be the document's. An object that cannot be read may be a page: it is
+// lost.
 fn brute_force<'a>(xref: &'a XRef) -> Vec<Listed<'a>> {
+    xref.note(xref.unreadable_object());
     let mut pages = vec![];
     for object in xref.objects() {
         if let Some(dict) = object.into_dict()
@@ -237,8 +260,9 @@ fn brute_force<'a>(xref: &'a XRef) -> Vec<Listed<'a>> {
     pages
 }
 
-/// The entries a page inherits, in the order of [`Inheritable::ALL`].
-type Inherited<'a> = [Result<Option<Object<'a>>, InheritanceError>; 4];
+/// The entries a page inherits, in the order of [`Inheritable::ALL`], and what
+/// looking them up lost.
+type Inherited<'a> = ([Result<Option<Object<'a>>, InheritanceError>; 4], Lost);
 
 // Each of `entries` as a page with the entries it inherits, found as MuPDF finds
 // them once it has loaded every page, which reads these entries: by then a /Parent
@@ -247,23 +271,23 @@ type Inherited<'a> = [Result<Option<Object<'a>>, InheritanceError>; 4];
 //
 // What pages share is read once for all: the categories of resources that are one
 // dictionary, which they share through a node or which is one object, and the
-// rectangle of a box array.
-//
-// A page whose own dictionary, an entry it inherits, or a category of its resources
-// is an object the file lists but that cannot be read lost what it is drawn with:
-// it keeps the object ([`Page::unreadable`]).
+// rectangle of a box array. What reading it lost is kept with it, for each page
+// that uses it ([`Page::unreadable`]).
 fn with_inherited<'a>(
     entries: Vec<Listed<'a>>,
     listings: Arc<Listings<'a>>,
     objects: Objects<'a>,
     ctx: &ReaderContext<'a>,
 ) -> Vec<Page<'a>> {
+    let xref = ctx.xref();
     let mut tree = Inheritance::with(objects);
     let look_up = |tree: &mut Inheritance<'a>| -> Vec<Inherited<'a>> {
         entries
             .iter()
             .map(|(page, lister)| {
-                Inheritable::ALL.map(|key| tree.lookup(page, &listings, *lister, key))
+                xref.apart(|| {
+                    Inheritable::ALL.map(|key| tree.lookup(page, &listings, *lister, key))
+                })
             })
             .collect()
     };
@@ -273,56 +297,50 @@ fn with_inherited<'a>(
     }
     let mut objects = tree.into_objects();
     // By what the dictionary is read from, which pages share where they share it.
-    let mut read =
-        FxHashMap::<ContentKey<'a>, (Resources<'a>, Option<ObjectIdentifier>)>::default();
-    let mut rects = FxHashMap::<ContentKey<'a>, Option<Rect>>::default();
-    let mut rect = |entry: &Option<Object<'a>>| match entry {
-        Some(Object::Array(array)) => *rects
-            .entry(array.content_key())
-            .or_insert_with(|| Rect::try_from(Object::Array(array.clone())).ok()),
-        _ => None,
-    };
+    let mut categories = Memo::<ContentKey<'a>, Resources<'a>>::default();
+    let mut rects = Memo::<ContentKey<'a>, Option<Rect>>::default();
     entries
         .into_iter()
         .zip(inherited)
-        .map(|((page, lister), inherited)| {
-            let mut unreadable = page.lost();
-            let [media_box, crop_box, rotate, resources] = inherited.map(|entry| match entry {
-                Ok(value) => value,
-                Err(InheritanceError::Unreadable(id)) => {
-                    unreadable.get_or_insert(id);
-                    None
-                }
-                Err(InheritanceError::ParentLoop) => None,
+        .map(|((page, lister), (inherited, looked_up))| {
+            let ((boxes, resources), read) = xref.apart(|| {
+                let [media_box, crop_box, rotate, resources] =
+                    inherited.map(|entry| entry.ok().flatten());
+                let resources = resources.and_then(Object::into_dict).unwrap_or_default();
+                let resources = categories
+                    .get(xref, resources.content_key(), || {
+                        Resources::read(|key| objects.get(&resources, key).and_then(dict_of))
+                    })
+                    .clone();
+                let mut rect = |entry: Option<Object<'a>>| match entry {
+                    Some(Object::Array(array)) => {
+                        *rects.get(xref, array.content_key(), || rect_of(&array, &mut objects))
+                    }
+                    _ => None,
+                };
+                ((rect(media_box), rect(crop_box), rotate), resources)
             });
-            let resources = resources.and_then(Object::into_dict).unwrap_or_default();
-            let (resources, lost) = read
-                .entry(resources.content_key())
-                .or_insert_with(|| {
-                    let mut lost = None;
-                    let resources =
-                        Resources::read(|key| match objects.get_checked(&resources, key) {
-                            Ok(category) => category.and_then(dict_of),
-                            Err(id) => {
-                                lost.get_or_insert(id);
-                                None
-                            }
-                        });
-                    (resources, lost)
-                })
-                .clone();
-            let boxes = (rect(&media_box), rect(&crop_box), rotate);
             Page::new(
                 page,
                 listings.clone(),
                 lister,
                 boxes,
                 resources,
-                unreadable.or(lost),
+                looked_up.or(read),
                 ctx,
             )
         })
         .collect()
+}
+
+/// The rectangle of box `array`, as [`Rect`] reads one: four numbers, each written
+/// in the array or an object it refers to, read once for all the boxes that refer
+/// to it ([`Objects`]).
+fn rect_of<'a>(array: &Array<'a>, objects: &mut Objects<'a>) -> Option<Rect> {
+    let mut items = array.raw_iter();
+    let mut number = || objects.resolve(items.next()?)?.into_f32().map(f64::from);
+    let [x0, y0, x1, y1] = [number()?, number()?, number()?, number()?];
+    Some(Rect::new(x0.min(x1), y0.min(y1), x1.max(x0), y1.max(y0)))
 }
 
 /// A part of a page's /Contents that cannot be read; the object is `None` for a part
@@ -355,9 +373,10 @@ pub struct Page<'a> {
     media_box: Rect,
     crop_box: Rect,
     rotation: Rotation,
-    page_streams: OnceLock<Option<Vec<u8>>>,
+    /// The content, and what reading it lost.
+    page_streams: OnceLock<(Option<Vec<u8>>, Lost)>,
     resources: Resources<'a>,
-    unreadable: Option<ObjectIdentifier>,
+    unreadable: Lost,
     /// The nodes the page tree lists pages under, and the index of the one listing
     /// this page.
     listings: Arc<Listings<'a>>,
@@ -372,7 +391,7 @@ impl<'a> Page<'a> {
         lister: Option<usize>,
         (media_box, crop_box, rotate): (Option<Rect>, Option<Rect>, Option<Object<'a>>),
         resources: Resources<'a>,
-        unreadable: Option<ObjectIdentifier>,
+        unreadable: Lost,
         reader_ctx: &ReaderContext<'a>,
     ) -> Self {
         let media_box = media_box.unwrap_or(A4);
@@ -418,15 +437,16 @@ impl<'a> Page<'a> {
         Some(iter)
     }
 
-    /// Return the decoded content stream of the page.
+    /// Return the decoded content stream of the page; what reading it lost is told
+    /// to the computation being watched each time ([`crate::lost`]).
     pub fn page_stream(&self) -> Option<&[u8]> {
         let convert_single = |s: Stream<'_>| {
             let data = s.decoded().ok()?;
             Some(data.into_owned())
         };
 
-        self.page_streams
-            .get_or_init(|| {
+        let (data, lost) = self.page_streams.get_or_init(|| {
+            self.xref().watch(|| {
                 if let Some(stream) = self.inner.get::<Stream<'_>>(CONTENTS) {
                     convert_single(stream)
                 } else if let Some(array) = self.inner.get::<Array<'_>>(CONTENTS) {
@@ -447,8 +467,9 @@ impl<'a> Page<'a> {
                     None
                 }
             })
-            .as_ref()
-            .map(|d| d.as_slice())
+        });
+        self.xref().note(*lost);
+        data.as_deref()
     }
 
     /// The decoded content of the page, as [`Self::page_stream`] joins it, or the
@@ -500,13 +521,15 @@ impl<'a> Page<'a> {
         }
     }
 
-    /// An object the page is drawn with that the file lists but that cannot be read,
-    /// if there is one: the page's own dictionary, an entry it inherits (its boxes,
-    /// rotation or resources, [`Inheritable`]) or a category of its resources. Such a page
-    /// reads as if the object were missing, as viewers draw it, so a copy of it would
-    /// lose what the source draws; [`Self::try_page_stream`] tells the same of its
-    /// content, and what the page's dictionary and resources refer to tells it
-    /// itself ([`crate::xref::XRef::get_checked`]).
+    /// An object the page's boxes, rotation or resources were read with that the
+    /// file lists but that cannot be read, if there is one ([`crate::lost`]): an entry
+    /// it inherits ([`Inheritable`]) or an object on the way to it, a number of a box,
+    /// or a category of its resources. Such a page reads as if the object were
+    /// `null`, as viewers draw it, so a copy of it would lose what the source draws.
+    /// What else is read of the page tells the computation reading it itself, its
+    /// content ([`Self::try_page_stream`]) and what its dictionary and resources
+    /// refer to; what reading the page tree lost is the document's
+    /// ([`Pages::unreadable`]).
     pub fn unreadable(&self) -> Option<ObjectIdentifier> {
         self.unreadable
     }
@@ -2282,5 +2305,146 @@ mod tests {
             pages(&[catalog, "null", PAGE]),
             Some(vec![(3, Some(1600.0))])
         );
+    }
+
+    /// Each page's object number and width, what the document lost, and each page.
+    type Losses = (Vec<(i32, f64)>, Option<i32>, Vec<Option<i32>>);
+
+    /// The [`Losses`] of a file of `objects`.
+    fn lost(objects: &[&str]) -> Losses {
+        let pdf = Pdf::new(pdf(objects)).unwrap();
+        let number = |id: Option<ObjectIdentifier>| id.map(|id| id.obj_number);
+        let pages = pdf.pages();
+        (
+            pages
+                .iter()
+                .map(|page| (number(page.obj_id()).unwrap_or(0), page.media_box().x1))
+                .collect(),
+            number(pages.unreadable()),
+            pages.iter().map(|page| number(page.unreadable())).collect(),
+        )
+    }
+
+    // A /Kids array, a node or a node's /Type that the file lists but that cannot be
+    // read may have held pages: the document tells it, and lists the pages that can be
+    // read, as MuPDF lists them (a node that cannot be read is an empty page there).
+    // A /Kids array the file does not hold loses nothing.
+    #[test]
+    fn a_page_tree_object_that_cannot_be_read_is_lost_to_the_document() {
+        let tree = pages_node("2", "3 0 R 4 0 R");
+        let node = |entries: &str| format!("<< /Type /Pages /Parent 2 0 R {entries} >>");
+        let typed = "<< /Type 5 0 R /Parent 2 0 R /Kids [6 0 R] >>";
+        let wide = "<< /Type /Page /MediaBox [0 0 600 500] >>";
+        let a4 = A4.x1;
+        for (third, fifth, pages, document) in [
+            (node("/Kids 5 0 R"), "[6 0 R", vec![(4, 200.0)], Some(5)),
+            (
+                node("/Kids 5 0 R"),
+                "[6 0 R]",
+                vec![(6, 600.0), (4, 200.0)],
+                None,
+            ),
+            (node("/Kids 9 0 R"), "null", vec![(4, 200.0)], None),
+            (
+                "<< /Type /Pages /Kids [6 0 R] /Broken >".to_owned(),
+                "null",
+                vec![(3, a4), (4, 200.0)],
+                Some(3),
+            ),
+            (
+                typed.to_owned(),
+                "<< /Broken >",
+                vec![(3, a4), (4, 200.0)],
+                Some(5),
+            ),
+            (
+                typed.to_owned(),
+                "/Pages",
+                vec![(6, 600.0), (4, 200.0)],
+                None,
+            ),
+        ] {
+            let (listed, lost, each) = lost(&[CATALOG, &tree, &third, SMALL, fifth, wide]);
+            assert_eq!(
+                (listed, lost),
+                (pages, document),
+                "{third}, object 5: {fifth}"
+            );
+            assert!(each.iter().all(Option::is_none), "{third}: {each:?}");
+        }
+    }
+
+    // A box pages inherit whose number is an object the file lists but that cannot be
+    // read is lost to each of them, though it is read once for all; one the file does
+    // not hold makes no box, and loses nothing. A number pages share is resolved once
+    // however many boxes hold it.
+    #[test]
+    fn a_box_whose_number_cannot_be_read_is_lost_to_every_page_drawn_with_it() {
+        let tree = |number: &str| {
+            pages_node("2", "3 0 R 4 0 R")
+                .replace(" >>", &format!(" /MediaBox [0 0 {number} 700] >>"))
+        };
+        let page = "<< /Type /Page /Parent 2 0 R >>";
+        let a4 = A4.x1;
+        for (number, fifth, width, page_lost) in [
+            ("5 0 R", "<< /Broken >", a4, Some(5)),
+            ("5 0 R", "[1 2", a4, Some(5)),
+            ("5 0 R", "600", 600.0, None),
+            ("9 0 R", "null", a4, None),
+        ] {
+            let (listed, document, each) = lost(&[CATALOG, &tree(number), page, page, fifth]);
+            assert_eq!(listed, vec![(3, width), (4, width)], "{number}: {fifth}");
+            assert_eq!(document, None);
+            assert_eq!(each, vec![page_lost; 2], "{number}: {fifth}");
+        }
+        // Each page's own box, all holding one number.
+        let n = 50;
+        let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", 4 + i)).collect();
+        let mut objects = vec![
+            CATALOG.to_owned(),
+            pages_node(&n.to_string(), &kids.join(" ")),
+            "600".to_owned(),
+        ];
+        objects.extend(
+            (0..n).map(|_| "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 3 0 R 700] >>".to_owned()),
+        );
+        let objects: Vec<&str> = objects.iter().map(String::as_str).collect();
+        let file = pdf(&objects);
+        let mut widths = vec![];
+        assert_eq!(
+            resolved_again(|| {
+                let pdf = Pdf::new(file).unwrap();
+                widths = pdf.pages().iter().map(|p| p.media_box().x1).collect();
+            }),
+            []
+        );
+        assert_eq!(widths, vec![600.0; n]);
+    }
+
+    // A category of resources whose object is a dictionary followed by stream data
+    // that cannot be read is read as the dictionary, as MuPDF reads it: its fonts
+    // are there, and nothing is lost. Read as a stream, it is lost.
+    #[test]
+    fn a_category_with_stream_data_that_cannot_be_read_is_its_dictionary() {
+        let page =
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] /Resources << /Font 4 0 R >> >>";
+        let category = "<< /F1 5 0 R /Length 9999 >>\nstream\nBT /F1 12 Tf ET";
+        let font = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";
+        let file = pdf(&[CATALOG, &pages_node("1", "3 0 R"), page, category, font]);
+        let pdf = Pdf::new(file).unwrap();
+        let page = &pdf.pages()[0];
+        assert_eq!(page.unreadable(), None);
+        assert!(page.resources().fonts.contains_key(b"F1"));
+        let (stream, lost) = pdf.xref().watch(|| {
+            pdf.xref()
+                .get::<crate::object::Stream<'_>>(ObjectIdentifier::new(4, 0))
+        });
+        assert!(stream.is_none());
+        assert_eq!(lost, Some(ObjectIdentifier::new(4, 0)));
+        let (dict, lost) = pdf
+            .xref()
+            .watch(|| pdf.xref().get::<Dict<'_>>(ObjectIdentifier::new(4, 0)));
+        assert!(dict.is_some_and(|dict| dict.contains_key(b"F1")));
+        assert_eq!(lost, None);
     }
 }

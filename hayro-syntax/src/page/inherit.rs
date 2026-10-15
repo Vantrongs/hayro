@@ -1,6 +1,7 @@
 //! The entries a page inherits from the page tree, found as `MuPDF` finds them.
 
 use super::{KidsStates, Node, Objects, Page};
+use crate::lost::Lost;
 use crate::object::dict::keys::{CROP_BOX, MEDIA_BOX, PARENT, RESOURCES, ROTATE};
 use crate::object::{MaybeRef, Null, Object, ObjectIdentifier};
 use crate::pdf::Pdf;
@@ -16,9 +17,6 @@ pub enum InheritanceError {
     /// The page's /Parent chain loops even after the page tree's /Parent entries
     /// are repaired.
     ParentLoop,
-    /// The entry the page inherits refers to this object, which the file lists but
-    /// which cannot be read: the value is lost.
-    Unreadable(ObjectIdentifier),
 }
 
 /// An entry a page inherits from the page tree (the PDF specification's table 31).
@@ -73,21 +71,28 @@ impl Inheritable {
 /// Where each node's /Parent chain leads is kept for each entry until the /Parent
 /// entries are repaired, so the lookups for all pages take time linear in the
 /// nodes the chains pass and the pages.
+///
+/// A lookup that reads an object the file lists but that cannot be read, the value
+/// or a /Parent on the way, finds it as `null`, as viewers do, and the computation
+/// being watched is told ([`crate::lost`]), by every lookup that finds what that one
+/// found, from what is kept.
 pub struct Inheritance<'a> {
     objects: Objects<'a>,
-    repaired: Option<FxHashMap<Key<'a>, Node<'a>>>,
-    chains: FxHashMap<Key<'a>, [Option<Chain<'a>>; 4]>,
+    /// The repaired /Parent entries, and what reading the page tree for them lost.
+    repaired: Option<(FxHashMap<Key<'a>, Node<'a>>, Lost)>,
+    /// Where each node's chain leads, and what following it lost.
+    chains: FxHashMap<Key<'a>, [Option<(Chain<'a>, Lost)>; 4]>,
 }
 
-/// A value of an entry a node has: `null` for a reference to nothing, `Err` with the
-/// object a reference leads to where the file lists it but it cannot be read.
-pub(super) type Held<'a> = Result<Object<'a>, ObjectIdentifier>;
+/// A value of an entry a node has, `null` for a reference to nothing or to an object
+/// that cannot be read, and what reading it lost.
+pub(super) type Held<'a> = (Object<'a>, Lost);
 
 /// Where a node's /Parent chain leads for one entry.
 #[derive(Clone)]
 enum Chain<'a> {
     /// To a node with the entry: its value.
-    Found(Held<'a>),
+    Found(Object<'a>),
     /// To this node, which has no /Parent, or one that is no dictionary.
     End(Key<'a>),
     /// Round in a loop.
@@ -130,8 +135,8 @@ impl<'a> Inheritance<'a> {
     }
 
     /// The value of `key` for `page`: `None` if neither it nor a /Parent has the key,
-    /// `null` for a reference to nothing, [`InheritanceError::Unreadable`] for one to
-    /// an object the file lists but that cannot be read.
+    /// `null` for a reference to nothing or to an object the file lists but that
+    /// cannot be read, which is lost ([`crate::lost`]).
     pub fn get(
         &mut self,
         page: &Page<'a>,
@@ -150,20 +155,32 @@ impl<'a> Inheritance<'a> {
         lister: Option<usize>,
         key: Inheritable,
     ) -> Result<Option<Object<'a>>, InheritanceError> {
+        let xref = self.objects.xref();
         let chain = match self.chain(page, key) {
             Chain::Loop if self.repaired.is_none() => {
-                self.repaired = Some(tree_parents(&mut self.objects));
+                let repaired = xref.watch(|| tree_parents(&mut self.objects));
+                self.repaired = Some(repaired);
                 self.chains.clear();
                 self.chain(page, key)
             }
             chain => chain,
         };
-        let held = match chain {
-            Chain::Found(value) => Some(value),
-            Chain::End(end) => listings.held(end, page.key(), lister, key).cloned(),
-            Chain::Loop | Chain::Followed => return Err(InheritanceError::ParentLoop),
-        };
-        held.transpose().map_err(InheritanceError::Unreadable)
+        // Every chain followed since is followed through the repaired entries.
+        if let Some((_, lost)) = &self.repaired {
+            xref.note(*lost);
+        }
+        match chain {
+            Chain::Found(value) => Ok(Some(value)),
+            Chain::End(end) => {
+                Ok(listings
+                    .held(end, page.key(), lister, key)
+                    .map(|(value, lost)| {
+                        xref.note(*lost);
+                        value.clone()
+                    }))
+            }
+            Chain::Loop | Chain::Followed => Err(InheritanceError::ParentLoop),
+        }
     }
 
     /// The objects the lookups have resolved.
@@ -177,34 +194,43 @@ impl<'a> Inheritance<'a> {
     }
 
     /// Where the /Parent chain from `start` leads for `key`, kept for each node it
-    /// passes, so that no chain is followed past a node twice.
+    /// passes, so that no chain is followed past a node twice. What following it
+    /// lost is kept with it: every node it passes leads where its last node does,
+    /// the only one whose entries can be lost, as a chain ends at a /Parent that is
+    /// lost.
     fn chain(&mut self, start: &Node<'a>, key: Inheritable) -> Chain<'a> {
         let slot = key.index();
+        let xref = self.objects.xref();
         let mut passed = vec![];
         let mut node = start.clone();
-        let chain = loop {
-            let at = node.key();
-            match self
-                .chains
-                .get(&at)
-                .and_then(|chains| chains[slot].as_ref())
-            {
-                Some(Chain::Followed) => break Chain::Loop,
-                Some(chain) => break chain.clone(),
-                None => {}
+        let (chain, lost) = xref.watch(|| {
+            loop {
+                let at = node.key();
+                match self
+                    .chains
+                    .get(&at)
+                    .and_then(|chains| chains[slot].as_ref())
+                {
+                    Some((Chain::Followed, _)) => break Chain::Loop,
+                    Some((chain, lost)) => {
+                        xref.note(*lost);
+                        break chain.clone();
+                    }
+                    None => {}
+                }
+                passed.push(at);
+                if let Some(value) = value(&node, key, &mut self.objects) {
+                    break Chain::Found(value);
+                }
+                let Some(parent) = self.parent(&node) else {
+                    break Chain::End(at);
+                };
+                self.chains.entry(at).or_default()[slot] = Some((Chain::Followed, None));
+                node = parent;
             }
-            passed.push(at);
-            if let Some(value) = value(&node, key, &mut self.objects) {
-                break Chain::Found(value);
-            }
-            let Some(parent) = self.parent(&node) else {
-                break Chain::End(at);
-            };
-            self.chains.entry(at).or_default()[slot] = Some(Chain::Followed);
-            node = parent;
-        };
+        });
         for at in passed {
-            self.chains.entry(at).or_default()[slot] = Some(chain.clone());
+            self.chains.entry(at).or_default()[slot] = Some((chain.clone(), lost));
         }
         chain
     }
@@ -212,7 +238,11 @@ impl<'a> Inheritance<'a> {
     /// The node's /Parent as the lookups see it: repaired, or one that is a
     /// dictionary.
     fn parent(&mut self, node: &Node<'a>) -> Option<Node<'a>> {
-        match self.repaired.as_ref().and_then(|map| map.get(&node.key())) {
+        match self
+            .repaired
+            .as_ref()
+            .and_then(|(map, _)| map.get(&node.key()))
+        {
             Some(parent) => Some(parent.clone()),
             None => self
                 .objects
@@ -236,7 +266,8 @@ struct Listing<'a> {
     end: usize,
     /// For each of [`Inheritable::ALL`], the value of the nearest of this node and
     /// the nodes listing it that has the entry, read once for all the pages that
-    /// inherit it.
+    /// inherit it, with what reading it lost, which the pages that inherit it are
+    /// told, not the walk reading it.
     held: [Option<Held<'a>>; 4],
 }
 
@@ -255,9 +286,10 @@ impl<'a> Listings<'a> {
             return None;
         }
         self.at.insert(node.key(), at);
-        let held = Inheritable::ALL.map(|key| match value(node, key, objects) {
-            Some(value) => Some(value),
-            None => lister.and_then(|lister| self.nodes[lister].held[key.index()].clone()),
+        let xref = objects.xref();
+        let held = Inheritable::ALL.map(|key| match xref.apart(|| value(node, key, objects)) {
+            (Some(value), lost) => Some((value, lost)),
+            (None, _) => lister.and_then(|lister| self.nodes[lister].held[key.index()].clone()),
         });
         self.nodes.push(Listing { end: at + 1, held });
         Some(at)
@@ -293,11 +325,11 @@ impl<'a> Listings<'a> {
 }
 
 // The value `node` has for `key`, if it has the key.
-fn value<'a>(node: &Node<'a>, key: Inheritable, objects: &mut Objects<'a>) -> Option<Held<'a>> {
+fn value<'a>(node: &Node<'a>, key: Inheritable, objects: &mut Objects<'a>) -> Option<Object<'a>> {
     objects.has(node, key.name()).then(|| {
         objects
-            .get_checked(node.dict(), key.name())
-            .map(|value| value.unwrap_or(Object::Null(Null)))
+            .get(node.dict(), key.name())
+            .unwrap_or(Object::Null(Null))
     })
 }
 

@@ -435,10 +435,11 @@ fn drawn_with(node: &str, page: &str, fifth: &str, appearance: &str) -> Pdf {
 }
 
 // A page drawn with an object the file lists but that cannot be read, its resources,
-// a category of them, resources or a box it inherits, or its own dictionary, is an
-// error for each query that copies it, rather than a copy without what it lost. So is
-// an appearance whose own resources cannot be read. An object the file does not hold,
-// or one the page is not drawn with, as /Thumb, loses nothing.
+// a category of them, resources or a box it inherits, fails the extraction rather
+// than giving a copy without what it lost; one the page tree cannot read, as its own
+// dictionary, may have held pages, and fails it too. So does an appearance whose own
+// resources cannot be read. An object the file does not hold, or one the page is not
+// drawn with, as /Thumb, loses nothing.
 #[test]
 fn a_page_drawn_with_an_object_that_cannot_be_read_is_an_error() {
     let fonts = "<< /Font << /F1 6 0 R >> /Broken >";
@@ -453,26 +454,31 @@ fn a_page_drawn_with_an_object_that_cannot_be_read_is_an_error() {
         ),
         ("/Resources 5 0 R", "", fonts, 5),
         ("/CropBox 5 0 R", "", "[0 0 200 200", 5),
-        ("", "/Broken >", "null", 3),
     ] {
         let source = drawn_with(node, page, fifth, "");
         for query in page_queries(0, [200.0, 200.0]) {
-            let result = run(&source, &[query]).unwrap();
+            let result = run(&source, &[query]);
             assert!(
-                matches!(result.root_refs[0], Err(ExtractionError::UnreadablePage(0, id)) if id == lost(object)),
+                matches!(result, Err(ExtractionError::UnreadablePage(0, id)) if id == lost(object)),
                 "{node} {page} {fifth}: {:?}",
-                result.root_refs[0]
+                result.map(|r| r.root_refs)
             );
         }
         // An appearance drawn with the page's resources, as it has none.
-        let result = run(&source, &[ExtractionQuery::new_form(lost(7), 0)]).unwrap();
+        let result = run(&source, &[ExtractionQuery::new_form(lost(7), 0)]);
         assert!(
-            matches!(
-                result.root_refs[0],
-                Err(ExtractionError::UnreadablePage(0, _))
-            ),
+            matches!(result, Err(ExtractionError::UnreadablePage(0, id)) if id == lost(object)),
             "{node} {page} {fifth}: {:?}",
-            result.root_refs[0]
+            result.map(|r| r.root_refs)
+        );
+    }
+    let source = drawn_with("", "/Broken >", "null", "");
+    for query in page_queries(0, [200.0, 200.0]) {
+        let result = run(&source, &[query]);
+        assert!(
+            matches!(result, Err(ExtractionError::UnreadablePageTree(id)) if id == lost(3)),
+            "{:?}",
+            result.map(|r| r.root_refs)
         );
     }
     let source = drawn_with(
@@ -481,11 +487,11 @@ fn a_page_drawn_with_an_object_that_cannot_be_read_is_an_error() {
         fonts,
         "/Resources 5 0 R",
     );
-    let result = run(&source, &[ExtractionQuery::new_form(lost(7), 0)]).unwrap();
+    let result = run(&source, &[ExtractionQuery::new_form(lost(7), 0)]);
     assert!(
-        matches!(result.root_refs[0], Err(ExtractionError::Unreadable(id)) if id == lost(5)),
+        matches!(result, Err(ExtractionError::UnreadablePage(0, id)) if id == lost(5)),
         "{:?}",
-        result.root_refs[0]
+        result.map(|r| r.root_refs)
     );
     for (node, page) in [
         ("", "/Resources 9 0 R"),
@@ -551,5 +557,194 @@ fn a_page_holding_a_name_that_is_no_key_is_copied_whole() {
             "query {kind}"
         );
         assert_eq!(drawing, DRAWING, "query {kind}");
+    }
+}
+
+/// Whether copying page `page` of `source` with each kind of query gives a whole
+/// copy (`true`) or an error (`false`); the one error the queries meet is returned.
+fn copied_whole(source: &Pdf, page: usize) -> Result<(), ExtractionError> {
+    for query in page_queries(page, [200.0, 200.0]) {
+        let result = run(source, &[query])?;
+        if let Some(Err(error)) = result.root_refs.into_iter().next() {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// The objects of a file of one page drawn with each kind of object a copy reads: a
+/// node it inherits a box from, a box holding a referred number, a rotation, two
+/// content streams, resources, a category of fonts, a font, an image with a color
+/// space; and with objects no copy is drawn with: an image's and the catalog's
+/// metadata, a thumbnail and private data. Object `n` is at index `n - 1`.
+const GRAPH: [&str; 17] = [
+    "<< /Type /Catalog /Pages 2 0 R /Metadata 17 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox 8 0 R >>",
+    "<< /Type /Page /Parent 2 0 R /Contents [4 0 R 5 0 R] /Resources 6 0 R \
+     /CropBox [0 0 9 0 R 200] /Rotate 10 0 R /Thumb 15 0 R /PieceInfo 16 0 R >>",
+    "STREAM BT /F1 12 Tf 10 10 Td (HI) Tj ET",
+    "STREAM q 20 0 0 20 50 50 cm /Im Do Q",
+    "<< /Font 7 0 R /XObject << /Im 11 0 R >> >>",
+    "<< /F1 12 0 R >>",
+    "[0 0 200 200]",
+    "200",
+    "0",
+    "STREAM /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace 13 0 R \
+     /BitsPerComponent 8 /Metadata 14 0 R|x",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    "/DeviceGray",
+    "STREAM /Type /Metadata /Subtype /XML|<x/>",
+    "STREAM /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8|x",
+    "<< /App << /Private 1 >> >>",
+    "STREAM /Type /Metadata /Subtype /XML|<x/>",
+];
+
+/// The objects of [`GRAPH`] that no copy of its page is drawn with.
+const NOT_DRAWN_WITH: [u32; 4] = [14, 15, 16, 17];
+
+/// [`GRAPH`] with object `broken` replaced by what `broken_as` makes of it.
+fn graph(broken: u32, broken_as: impl Fn(&str) -> Vec<u8>) -> Pdf {
+    let objects: Vec<Vec<u8>> = GRAPH
+        .iter()
+        .zip(1..)
+        .map(|(object, number)| {
+            if number == broken {
+                return broken_as(object);
+            }
+            match object.strip_prefix("STREAM ") {
+                Some(stream) => match stream.split_once('|') {
+                    Some((dict, data)) => fixtures::stream(dict, data.as_bytes()),
+                    None => fixtures::stream("", stream.as_bytes()),
+                },
+                None => object.as_bytes().to_vec(),
+            }
+        })
+        .collect();
+    Pdf::new(fixtures::file(&objects, "")).unwrap()
+}
+
+// One object a page's copy is drawn with that the file lists but that cannot be read,
+// wherever it is in what the copy reads, fails the copy; one it is not drawn with,
+// metadata, a thumbnail, private data, does not. So does a stream whose dictionary
+// can be read but whose data cannot.
+#[test]
+fn an_object_that_cannot_be_read_fails_a_copy_exactly_where_it_is_drawn_with() {
+    let whole = graph(0, |_| unreachable!());
+    copied_whole(&whole, 0).expect("the whole file is copied");
+    for broken in 2..=GRAPH.len() as u32 {
+        let drawn_with = !NOT_DRAWN_WITH.contains(&broken);
+        let source = graph(broken, |_| b"<< /Broken >".to_vec());
+        let copied = copied_whole(&source, 0);
+        assert_eq!(copied.is_ok(), !drawn_with, "object {broken}: {copied:?}");
+        if GRAPH[broken as usize - 1].starts_with("STREAM ") {
+            // Data in another file, which a reader cannot read.
+            let source = graph(broken, |_| fixtures::stream("/F (elsewhere)", b"x"));
+            let copied = copied_whole(&source, 0);
+            assert_eq!(
+                copied.is_ok(),
+                !drawn_with,
+                "data of object {broken}: {copied:?}"
+            );
+        }
+    }
+}
+
+// What reading one page lost, read once for the pages that share it, is lost to each
+// of them however often it is read: a box they share whose number cannot be read, a
+// category of resources whose font cannot be, content whose stream cannot be.
+#[test]
+fn a_page_sharing_what_another_read_without_an_object_is_not_copied() {
+    for (shared, fifth) in [
+        ("/MediaBox 5 0 R", "[0 0 6 0 R 200]"),
+        ("/MediaBox [0 0 6 0 R 200]", "null"),
+        ("/Resources << /Font 5 0 R >>", "<< /F1 6 0 R >>"),
+        ("/Contents [5 0 R 6 0 R]", "null"),
+    ] {
+        let source = Pdf::new(fixtures::file(
+            &[
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+                b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 200 200] >>".to_vec(),
+                format!("<< /Type /Page /Parent 2 0 R {shared} >>").into_bytes(),
+                format!("<< /Type /Page /Parent 2 0 R {shared} >>").into_bytes(),
+                fifth.as_bytes().to_vec(),
+                b"<< /Broken >".to_vec(),
+            ],
+            "",
+        ))
+        .unwrap();
+        for order in [[0, 1], [1, 0]] {
+            for page in order {
+                for _ in 0..2 {
+                    let copied = copied_whole(&source, page);
+                    assert!(copied.is_err(), "{shared}, page {page} of {order:?}");
+                }
+            }
+        }
+    }
+}
+
+// A page tree whose /Kids cannot be read may have held pages: copying any page fails,
+// rather than a copy of the file without them. /Kids the file does not hold lose
+// nothing.
+#[test]
+fn a_page_tree_whose_kids_cannot_be_read_fails_every_copy() {
+    for (kids, whole) in [("[6 0 R", false), ("[6 0 R]", true), ("null", true)] {
+        let source = Pdf::new(fixtures::file(
+            &[
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+                b"<< /Type /Pages /Kids [3 0 R 4 0 R] /MediaBox [0 0 200 200] >>".to_vec(),
+                b"<< /Type /Pages /Parent 2 0 R /Kids 5 0 R >>".to_vec(),
+                b"<< /Type /Page /Parent 2 0 R >>".to_vec(),
+                kids.as_bytes().to_vec(),
+                b"<< /Type /Page /Parent 3 0 R >>".to_vec(),
+            ],
+            "",
+        ))
+        .unwrap();
+        let pages = source.pages().len();
+        let copied = copied_whole(&source, 0);
+        if whole {
+            assert_eq!(pages, if kids == "null" { 1 } else { 2 }, "{kids}");
+            copied.expect(kids);
+        } else {
+            assert!(
+                matches!(copied, Err(ExtractionError::UnreadablePageTree(id)) if id == ObjRef::new(5, 0)),
+                "{kids}: {copied:?}"
+            );
+        }
+    }
+}
+
+// A category of resources whose dictionary can be read, written as a stream whose data
+// cannot be, is the dictionary: its font is copied, and the page is drawn with it.
+#[test]
+fn a_category_whose_stream_data_cannot_be_read_is_copied_as_its_dictionary() {
+    // Last, so that no stream's end after it is taken for its own.
+    let source = Pdf::new(fixtures::file(
+        &[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+              /Resources << /Font 6 0 R >> >>"
+                .to_vec(),
+            fixtures::stream("", b"BT /F1 12 Tf 10 10 Td (HELLO) Tj ET"),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            b"<< /F1 5 0 R /Length 9999 >>\nstream\nshort of its length".to_vec(),
+        ],
+        "",
+    ))
+    .unwrap();
+    for query in page_queries(0, [200.0, 200.0]) {
+        let result = run(&source, &[query]).unwrap();
+        let copy = reread(&result);
+        let font = copied_dict(&copy, result.root_refs[0].unwrap())
+            .get::<Dict<'_>>(b"Resources")
+            .and_then(|r| r.get::<Dict<'_>>(b"Font"))
+            .and_then(|f| f.get::<Dict<'_>>(b"F1"))
+            .expect("the font is copied");
+        assert_eq!(
+            font.get::<Name<'_>>(b"BaseFont").as_deref(),
+            Some(b"Helvetica".as_slice())
+        );
     }
 }

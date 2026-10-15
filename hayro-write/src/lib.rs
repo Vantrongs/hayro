@@ -38,12 +38,14 @@ pub use pdf_writer::Settings as ChunkSettings;
 /// Apply the extraction queries to the given PDF and return the results.
 ///
 /// The copy never leaves out what the source draws: a page whose content cannot be
-/// read whole, or that is drawn with an object the file lists but that cannot be
-/// parsed ([`Page::unreadable`]), is an error for its query, and a stream it copies
-/// that cannot be decrypted whole, or an object it copies that the file lists but
-/// that cannot be parsed, fails the extraction. Streams whose dictionaries refer to no other object are written
-/// once for all that copy to the same dictionary and data, as fonts embedded in
-/// each of several pages are.
+/// read whole is an error for its query, and the extraction fails where anything a
+/// query or what it copies reads — the page's boxes and resources
+/// ([`Page::unreadable`]), its content, every object copied — refers to an object the
+/// file lists but that cannot be read ([`hayro_syntax::lost`]), however it is read,
+/// as it does where the page tree lost one ([`hayro_syntax::page::Pages::unreadable`])
+/// or a stream it copies cannot be decrypted whole. Streams whose dictionaries refer
+/// to no other object are written once for all that copy to the same dictionary and
+/// data, as fonts embedded in each of several pages are.
 pub fn extract<'a>(
     pdf: &Pdf,
     new_ref: Box<dyn FnMut() -> Ref + 'a>,
@@ -51,6 +53,10 @@ pub fn extract<'a>(
     queries: &[ExtractionQuery],
 ) -> Result<ExtractionResult, ExtractionError> {
     let pages = pdf.pages();
+    if let Some(id) = pages.unreadable() {
+        return Err(ExtractionError::UnreadablePageTree(id.into()));
+    }
+    let xref = pdf.xref();
     let mut ctx = ExtractionContext::new(new_ref, pdf, chunk_settings);
 
     for query in queries {
@@ -60,7 +66,8 @@ pub fn extract<'a>(
                 .ok_or(ExtractionError::InvalidPageIndex(query.page_index))
         };
 
-        let res = match query.query_type {
+        ctx.page = query.page_index;
+        let (res, lost) = xref.watch(|| match query.query_type {
             ExtractionQueryType::XObject => {
                 let root_ref = ctx.new_ref();
                 write_xobject(page()?, query.page_index, None, root_ref, &mut ctx).map(|_| root_ref)
@@ -75,7 +82,13 @@ pub fn extract<'a>(
                 write_page(page()?, root_ref, query.page_index, &mut ctx).map(|_| root_ref)
             }
             ExtractionQueryType::Form(obj) => write_form(obj, page()?, query.page_index, &mut ctx),
-        };
+        });
+        if let Some(id) = lost {
+            ctx.fail(match res {
+                Err(error) => error,
+                Ok(_) => ExtractionError::UnreadablePage(query.page_index, id.into()),
+            });
+        }
 
         ctx.root_refs.push(res);
     }
@@ -175,10 +188,13 @@ pub enum ExtractionError {
     NotAStream(ObjRef),
     /// The content of the page with this index cannot be read whole.
     Content(usize, ContentError),
-    /// The page with this index is drawn with an object the file lists but that
-    /// cannot be parsed: its dictionary, an entry it inherits, or a category of its
-    /// resources ([`Page::unreadable`]).
+    /// What copying the page with this index read refers to this object, which the
+    /// file lists but which cannot be read ([`hayro_syntax::lost`]).
     UnreadablePage(usize, ObjRef),
+    /// The page tree refers to this object, which the file lists but which cannot be
+    /// read, and which may have held pages
+    /// ([`hayro_syntax::page::Pages::unreadable`]).
+    UnreadablePageTree(ObjRef),
     /// A stream the copy needs cannot be decrypted whole.
     StreamData(ObjRef, DecodeFailure),
     /// An object the copy needs is listed in the file but cannot be parsed.
@@ -199,10 +215,19 @@ pub struct ExtractionResult {
 /// A stream's copied dictionary, and its data's length and hash.
 type StreamKey = (Vec<u8>, usize, u64);
 
+/// What an extraction copies, and what it keeps of what it copied for the queries
+/// after: these copies are of what a query read before, and do not read it again,
+/// but whatever a query or a copy loses fails the whole extraction
+/// ([`ExtractionContext::fail`]), so no query uses a copy that lost anything.
 struct ExtractionContext<'a> {
     chunks: Vec<Chunk>,
     visited_objects: HashSet<ObjRef>,
-    to_visit_refs: Vec<ObjRef>,
+    /// The objects left to copy, each with the index of the page whose copy refers
+    /// to it first.
+    to_visit_refs: Vec<(ObjRef, usize)>,
+    /// The index of the page being copied, or whose copy refers to the object being
+    /// copied first.
+    page: usize,
     /// What each reference to a source object is written as: the copy's reference,
     /// or `None` for `null`, where the object does not exist.
     ref_targets: FxHashMap<ObjRef, Option<Ref>>,
@@ -237,6 +262,7 @@ impl<'a> ExtractionContext<'a> {
             chunks: vec![],
             visited_objects: HashSet::new(),
             to_visit_refs: Vec::new(),
+            page: 0,
             ref_targets: FxHashMap::default(),
             shared_streams: FxHashMap::default(),
             forms: FxHashMap::default(),
@@ -274,18 +300,25 @@ impl<'a> ExtractionContext<'a> {
 }
 
 fn write_dependencies(pdf: &Pdf, ctx: &mut ExtractionContext<'_>) {
-    while let Some(ref_) = ctx.to_visit_refs.pop() {
+    while let Some((ref_, page)) = ctx.to_visit_refs.pop() {
         // Don't visit objects twice!
         if ctx.visited_objects.contains(&ref_) {
             continue;
         }
 
-        let mut chunk = Chunk::with_settings(ctx.chunk_settings);
-        if let Some(object) = pdf.xref().get::<Object<'_>>(ref_.into()) {
+        ctx.page = page;
+        let (written, lost) = pdf.xref().watch(|| {
+            let object = pdf.xref().get::<Object<'_>>(ref_.into())?;
+            let mut chunk = Chunk::with_settings(ctx.chunk_settings);
             let new_ref = ctx.map_ref(ref_);
             object.write_indirect(&mut chunk, new_ref, ctx);
             ctx.chunks.push(chunk);
-
+            Some(())
+        });
+        if let Some(id) = lost {
+            ctx.fail(ExtractionError::UnreadablePage(page, id.into()));
+        }
+        if written.is_some() {
             ctx.visited_objects.insert(ref_);
         } else {
             // It was read when it was first referred to.
@@ -405,7 +438,7 @@ fn write_page<'a>(
     page_idx: usize,
     ctx: &mut ExtractionContext<'a>,
 ) -> Result<(), ExtractionError> {
-    readable(page, page_idx)?;
+    drawn_with(page, ctx);
     let mut chunk = Chunk::with_settings(ctx.chunk_settings);
     // Note: We can cache content stream references, but _not_ the page references themselves.
     // Acrobat for some reason doesn't like duplicate page references in the page tree.
@@ -463,7 +496,7 @@ fn write_xobject<'a>(
     xobj_ref: Ref,
     ctx: &mut ExtractionContext<'a>,
 ) -> Result<(), ExtractionError> {
-    readable(page, page_idx)?;
+    drawn_with(page, ctx);
     let content = page
         .try_page_stream()
         .map_err(|e| ExtractionError::Content(page_idx, e))?;
@@ -522,14 +555,10 @@ fn write_form<'a>(
         return Err(ExtractionError::NotAStream(obj));
     };
     // What a renderer draws the stream with: its own resources if they are a
-    // dictionary, the page's otherwise; resources that cannot be read are neither.
-    let own_resources = stream
-        .dict()
-        .get_checked::<Dict<'_>>(RESOURCES)
-        .map_err(|id| ExtractionError::Unreadable(id.into()))?
-        .is_some();
+    // dictionary, the page's otherwise.
+    let own_resources = stream.dict().get::<Dict<'_>>(RESOURCES).is_some();
     if !own_resources {
-        readable(page, page_idx)?;
+        drawn_with(page, ctx);
     }
     let key = (obj, (!own_resources).then_some(page_idx));
     if let Some(form_ref) = ctx.forms.get(&key) {
@@ -557,12 +586,10 @@ fn write_form<'a>(
     Ok(form_ref)
 }
 
-/// An error for a page drawn with an object that cannot be read.
-fn readable(page: &Page<'_>, page_idx: usize) -> Result<(), ExtractionError> {
-    match page.unreadable() {
-        Some(id) => Err(ExtractionError::UnreadablePage(page_idx, id.into())),
-        None => Ok(()),
-    }
+/// Tells the query being copied what reading the boxes and resources of `page` it
+/// copies lost.
+fn drawn_with(page: &Page<'_>, ctx: &ExtractionContext<'_>) {
+    ctx.pdf.xref().note(page.unreadable());
 }
 
 /// Writes `/Resources` into `writer`, each category a reference to the copy of its

@@ -3,6 +3,7 @@
 use crate::crypto::reader::DecryptedReader;
 use crate::crypto::{DecryptionError, DecryptionTarget, Decryptor, get};
 use crate::data::Data;
+use crate::lost::Lost;
 use crate::metadata::Metadata;
 use crate::object::Name;
 use crate::object::ObjectIdentifier;
@@ -18,7 +19,7 @@ use crate::object::{Object, ObjectLike};
 use crate::pdf::PdfVersion;
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt};
-use crate::sync::{Arc, FxHashMap, OnceLock};
+use crate::sync::{Arc, FxHashMap, Mutex, MutexExt, OnceLock};
 use crate::trivia::{is_eol_character, is_white_space_character};
 use crate::util::findr_needle;
 use crate::{PdfData, object};
@@ -154,7 +155,7 @@ pub(crate) fn open(data: PdfData, password: &[u8]) -> Result<XRef, XRefError> {
         Ok(()) => match XRef::new(
             data.clone(),
             xref_map,
-            BTreeSet::new(),
+            Rebuilt::default(),
             XRefInput::TrailerDictData(trailer),
             password,
         ) {
@@ -315,12 +316,12 @@ fn read_object<'a, D>(
 // its header's number, the scan takes the definition before it.
 fn fallback(data: PdfData, password: &[u8], old: Old) -> Option<XRef> {
     warn!("xref table was invalid, trying to manually build xref table");
-    let (xref_map, unreadable, xref_input) = fallback_xref_map(&data, password, old);
+    let (xref_map, rebuilt, xref_input) = fallback_xref_map(&data, password, old);
 
     if let Some(xref_input) = xref_input {
         warn!("rebuild xref table with {} entries", xref_map.len());
 
-        XRef::new(data.clone(), xref_map, unreadable, xref_input, password).ok()
+        XRef::new(data.clone(), xref_map, rebuilt, xref_input, password).ok()
     } else {
         warn!("couldn't find trailer dictionary, failed to rebuild xref table");
 
@@ -334,11 +335,24 @@ fn fallback(data: PdfData, password: &[u8], old: Old) -> Option<XRef> {
 /// reference to an object the file does not hold is: what refers to it lost it.
 type Unreadable = BTreeSet<ObjectIdentifier>;
 
+/// The identifier the header of each object of a rebuilt table names, where that is
+/// not the entry's own: an entry of the old table kept for an object headed as
+/// another. Found once, where the table is rebuilt, for every entry leading there.
+type Headers = FxHashMap<ObjectIdentifier, ObjectIdentifier>;
+
+/// What a rebuild finds besides the table: the objects it lists that cannot be
+/// read, and the entries whose objects are headed as others.
+#[derive(Debug, Default, Clone)]
+struct Rebuilt {
+    unreadable: Unreadable,
+    headers: Headers,
+}
+
 fn fallback_xref_map<'a>(
     data: &'a PdfData,
     password: &[u8],
     old: Old,
-) -> (XrefMap, Unreadable, Option<XRefInput<'a>>) {
+) -> (XrefMap, Rebuilt, Option<XRefInput<'a>>) {
     let mut scan = Scan::new(data.as_ref());
     let mut listed = old.listed;
     let (read, unreadable) = read_unread(data.as_ref(), &mut scan, &old.unread);
@@ -382,7 +396,7 @@ fn read_unread(
                     rest[..at]
                         .iter()
                         .map(|&(offset, id)| Listed { id, offset, header }),
-                )
+                );
             }
             Some((_, false)) => unreadable.extend(rest[..at].iter().map(|&(_, id)| id)),
             None => {}
@@ -400,7 +414,7 @@ fn fallback_xref_map_inner<'a>(
     password: &[u8],
     listed: &[Listed],
     unread: &[ObjectIdentifier],
-) -> (XrefMap, Unreadable, Option<XRefInput<'a>>) {
+) -> (XrefMap, Rebuilt, Option<XRefInput<'a>>) {
     let mut xref_map = FxHashMap::default();
     // Each object found, in the order of the file.
     let mut found = vec![];
@@ -503,13 +517,17 @@ fn fallback_xref_map_inner<'a>(
         }
     }
 
-    keep_listed(&mut xref_map, &found, listed);
-    let mut unreadable: Unreadable = unread
+    let headers = keep_listed(&mut xref_map, &found, listed);
+    let unreadable: Unreadable = unread
         .iter()
         .chain(&broken)
         .filter(|id| !xref_map.contains_key(id))
         .copied()
         .collect();
+    let mut rebuilt = Rebuilt {
+        unreadable,
+        headers,
+    };
 
     // Try to choose the right trailer dict by doing basic validation: the last whose
     // /Root is a dictionary with /Pages. Each catalog the trailers name is read once,
@@ -583,15 +601,15 @@ fn fallback_xref_map_inner<'a>(
         if let Ok(xref) = XRef::new(
             data.clone(),
             xref_map.clone(),
-            unreadable.clone(),
+            rebuilt.clone(),
             XRefInput::TrailerDictData(trailer_dict.as_ref().map(|d| d.data()).unwrap()),
             password,
         ) {
             let ctx = ReaderContext::new(&xref, false);
-            let (patched_map, patched_unreadable, _) =
+            let (patched_map, patched, _) =
                 fallback_xref_map_inner(data, scan, ctx, false, password, listed, unread);
             xref_map = patched_map;
-            unreadable = patched_unreadable;
+            rebuilt = patched;
         }
     }
 
@@ -600,7 +618,7 @@ fn fallback_xref_map_inner<'a>(
     } else {
         root_ref.map(XRefInput::RootRef)
     };
-    (xref_map, unreadable, input)
+    (xref_map, rebuilt, input)
 }
 
 /// What a rebuild finds at `r`: `None` where no header can start, as no number can;
@@ -648,11 +666,16 @@ fn scan_header(r: &mut Reader<'_>) -> Option<ObjectIdentifier> {
 }
 
 /// Adds to the rebuilt table `xref_map` the entries of the old table, `listed`, whose
-/// number the scan did not find. The object such an entry leads to is the entry's:
+/// number the scan did not find, and returns those whose header names another
+/// object, with that object. The object such an entry leads to is the entry's:
 /// where its header names another number, the scan takes for that number the last
 /// definition no such entry leads to, unless the old table, too, lists that number
 /// at the entry's offset.
-fn keep_listed(xref_map: &mut XrefMap, found: &[(ObjectIdentifier, usize)], listed: &[Listed]) {
+fn keep_listed(
+    xref_map: &mut XrefMap,
+    found: &[(ObjectIdentifier, usize)],
+    listed: &[Listed],
+) -> Headers {
     let kept: Vec<Listed> = listed
         .iter()
         .filter(|entry| !xref_map.contains_key(&entry.id))
@@ -681,9 +704,14 @@ fn keep_listed(xref_map: &mut XrefMap, found: &[(ObjectIdentifier, usize)], list
             xref_map.insert(*id, EntryType::Normal(*offset));
         }
     }
+    let mut headers = Headers::default();
     for entry in kept {
         xref_map.insert(entry.id, EntryType::Normal(entry.offset));
+        if entry.header != entry.id {
+            headers.insert(entry.id, entry.header);
+        }
     }
+    headers
 }
 
 const DUMMY_XREF: XRef = XRef(Inner::Dummy);
@@ -698,6 +726,9 @@ std::thread_local! {
     /// the tests bound to show that the page tree resolves each object once.
     pub(crate) static RESOLVED: core::cell::RefCell<Option<FxHashMap<ObjectIdentifier, usize>>> =
         const { core::cell::RefCell::new(None) };
+    /// How often an object was read to find out whether it is lost, which the tests
+    /// bound to show that each is read once.
+    pub(crate) static VERDICTS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 /// An xref table.
@@ -708,7 +739,7 @@ impl XRef {
     fn new(
         data: PdfData,
         xref_map: XrefMap,
-        unreadable: Unreadable,
+        rebuilt: Rebuilt,
         input: XRefInput<'_>,
         password: &[u8],
     ) -> Result<Self, XRefError> {
@@ -721,7 +752,9 @@ impl XRef {
             document: DocumentId::new(),
             data: Arc::new(Data::new(data)),
             map: Arc::new(xref_map),
-            unreadable: Arc::new(unreadable),
+            unreadable: Arc::new(rebuilt.unreadable),
+            headers: Arc::new(rebuilt.headers),
+            verdicts: Arc::default(),
             decryptor: Arc::new(Decryptor::None),
             has_ocgs: false,
             metadata: Arc::new(Metadata::default()),
@@ -803,6 +836,8 @@ impl XRef {
                 mutable.decryptor = Arc::new(decryptor);
                 mutable.has_ocgs = has_ocgs;
                 mutable.metadata = Arc::new(metadata);
+                // What was read before the decryptor was known is not kept.
+                mutable.verdicts = Arc::default();
             }
         }
 
@@ -982,7 +1017,16 @@ impl XRef {
         }
     }
 
-    /// Return the object with the given identifier.
+    /// An object the table lists that cannot be read, if there is one.
+    pub(crate) fn unreadable_object(&self) -> Lost {
+        match &self.0 {
+            Inner::Dummy => None,
+            Inner::Some(r) => r.unreadable.first().copied(),
+        }
+    }
+
+    /// Return the object with the given identifier; `None` too for one the table
+    /// lists but that cannot be read, which is lost ([`Self::watch`]).
     #[allow(private_bounds)]
     pub fn get<'a, T>(&'a self, id: ObjectIdentifier) -> Option<T>
     where
@@ -992,19 +1036,37 @@ impl XRef {
         self.get_with(id, &ctx)
     }
 
-    /// Object `id` as a `T`: `Ok(None)` where the table does not list it, or it is
-    /// another kind of object; `Err(id)` where the table lists it but it cannot be read
-    /// ([`Self::has_entry`]), so that what refers to it is not taken for whole.
-    #[allow(private_bounds)]
-    pub fn get_checked<'a, T>(&'a self, id: ObjectIdentifier) -> Result<Option<T>, ObjectIdentifier>
-    where
-        T: ObjectLike<'a>,
-    {
-        self.get_checked_with(id, &ReaderContext::new(self, false))
+    /// Runs `f`, and returns with its result what its reads of this document lost
+    /// ([`crate::lost`]): the first object they met that the table lists but that
+    /// cannot be read, however they read it, and whatever a value computed before
+    /// and kept tells ([`Self::note`]). The computation `f` runs within, if any, is
+    /// told too.
+    pub fn watch<T>(&self, f: impl FnOnce() -> T) -> (T, Lost) {
+        match &self.0 {
+            Inner::Some(repr) => repr.data.watched.watch(true, f),
+            Inner::Dummy => (f(), None),
+        }
     }
 
-    /// [`Self::get_checked`] from `ctx`, where a reference the cycle check rejects is
-    /// `null`, as reading it is.
+    /// Tells the computation being watched that it lost `lost`, as a value it uses
+    /// that was computed before, and lost it then, does ([`crate::lost::Memo`]).
+    pub fn note(&self, lost: Lost) {
+        if let Inner::Some(repr) = &self.0 {
+            repr.data.watched.note(lost);
+        }
+    }
+
+    /// [`Self::watch`], but the computation `f` runs within is not told: for a value
+    /// kept for others, which tell what it lost where they use it.
+    pub(crate) fn apart<T>(&self, f: impl FnOnce() -> T) -> (T, Lost) {
+        match &self.0 {
+            Inner::Some(repr) => repr.data.watched.watch(false, f),
+            Inner::Dummy => (f(), None),
+        }
+    }
+
+    /// Object `id` read from `ctx` as a `T`, or `Err` with what reading it lost
+    /// ([`Self::watch`]), which the computation around is told too.
     pub(crate) fn get_checked_with<'a, T>(
         &'a self,
         id: ObjectIdentifier,
@@ -1013,24 +1075,17 @@ impl XRef {
     where
         T: ObjectLike<'a>,
     {
-        if let Some(object) = self.get_with::<T>(id, ctx) {
-            return Ok(Some(object));
+        match self.watch(|| self.get_with::<T>(id, ctx)) {
+            (_, Some(lost)) => Err(lost),
+            (object, None) => Ok(object),
         }
-        if self.is_lost(id, ctx) && self.get_with::<Object<'a>>(id, ctx).is_none() {
-            return Err(id);
-        }
-        Ok(None)
     }
 
-    /// Whether object `id`, which reading from `ctx` found nothing for, is lost: the
-    /// table lists it, and it is no reference back into the chain being resolved,
-    /// which reads as `null`. Every read that tells a lost object from a missing one
-    /// asks this.
-    pub(crate) fn is_lost(&self, id: ObjectIdentifier, ctx: &ReaderContext<'_>) -> bool {
-        self.has_entry(id) && !ctx.rejects(&id)
-    }
-
-    /// Return the object with the given identifier.
+    /// Object `id` as a `T`, read from `ctx`: `None` where the table does not list
+    /// it, where `ctx`'s chain rejects it as a cycle, or where it is another kind of
+    /// object. Where the table lists it but it cannot be read (as a `T` that is read
+    /// with a stream's data, a stream whose data cannot be read cannot), it is `None`
+    /// too, and lost: the computation being watched is told ([`Self::watch`]).
     #[allow(private_bounds)]
     pub(crate) fn get_with<'a, T>(
         &'a self,
@@ -1041,7 +1096,7 @@ impl XRef {
         T: ObjectLike<'a>,
     {
         let (repr, entry, ctx) = self.entry(id, ctx)?;
-        match entry {
+        let object = match entry {
             // An object is at the offset, as `check` or the scan that rebuilt the
             // table found it; one that is not of the type the caller expects is no
             // such object.
@@ -1053,11 +1108,84 @@ impl XRef {
                     .map(IndirectObject::get)
             }
             EntryType::ObjStream(stream, index) => self.compressed(id, stream, index, &ctx),
+        };
+        if object.is_none() {
+            self.read_lost(repr, id, entry, &ctx, T::STREAM);
+        }
+        object
+    }
+
+    /// Tells the computation being watched that object `id`, at `entry`, which a read
+    /// found nothing of the type it asked for at, is lost, if it is: if it cannot be
+    /// read as an object, or, for a read of a stream with its data, if it is a
+    /// stream whose data cannot be read. What is found at each place is kept: a
+    /// place read again, under any entry, is not read whole again.
+    fn read_lost<'a>(
+        &'a self,
+        repr: &'a SomeRepr,
+        id: ObjectIdentifier,
+        entry: EntryType,
+        ctx: &ReaderContext<'a>,
+        stream: bool,
+    ) {
+        let kept = repr.verdicts.get().get(&entry).copied();
+        let verdict = kept.unwrap_or_else(|| {
+            // What a stream's /Length refers to may be read otherwise in another
+            // chain; what is lost while finding out is the read's own concern.
+            let (verdict, shared) = ctx.shared(|ctx| self.apart(|| self.verdict(id, entry, ctx)).0);
+            if shared {
+                repr.verdicts.get().insert(entry, verdict);
+            }
+            verdict
+        });
+        if verdict == Verdict::Unreadable || (stream && verdict == Verdict::StreamLost) {
+            self.note(Some(id));
+        }
+    }
+
+    /// Whether object `id`, at `entry`, can be read as an object, read from `ctx`.
+    fn verdict<'a>(
+        &'a self,
+        id: ObjectIdentifier,
+        entry: EntryType,
+        ctx: &ReaderContext<'a>,
+    ) -> Verdict {
+        #[cfg(test)]
+        VERDICTS.set(VERDICTS.get() + 1);
+        let Inner::Some(repr) = &self.0 else {
+            return Verdict::Readable;
+        };
+        match entry {
+            EntryType::Normal(offset) => {
+                let data = repr.data.get().as_ref();
+                match Syntax::read(data, offset, true, ctx) {
+                    None => Verdict::Unreadable,
+                    Some(Syntax::Stream { dict, end }) => {
+                        let mut r = Reader::new(data);
+                        r.jump(end);
+                        match Stream::after_dict(&mut r, dict) {
+                            Some(_) => Verdict::Readable,
+                            None => Verdict::StreamLost,
+                        }
+                    }
+                    Some(Syntax::Object(_)) => Verdict::Readable,
+                }
+            }
+            EntryType::ObjStream(stream, index) => match self.object_stream(id, stream, ctx) {
+                // Lost with the stream, which reading it told, or a cycle.
+                None => Verdict::Readable,
+                Some(objects) => match objects.get::<Object<'a>>(id, index, ctx) {
+                    Some(_) => Verdict::Readable,
+                    None => Verdict::Unreadable,
+                },
+            },
         }
     }
 
     /// Object `id`, as [`Self::get_with`] reads it, from what `parsed` holds of an
-    /// object read before at the same offset of the file under another entry.
+    /// object read before at the same offset of the file under another entry; a
+    /// stream whose data cannot be read is its dictionary, as each place this is
+    /// used reads it as a dictionary, if not as another kind of object.
     ///
     /// Entries of a damaged table that lead to one object are each that object, read
     /// in its own context, but the object's bytes are parsed once: what they hold does
@@ -1073,28 +1201,39 @@ impl XRef {
         let (data, at, header) = match entry {
             EntryType::Normal(offset) => (repr.data.get().as_ref(), offset, true),
             EntryType::ObjStream(stream, index) => {
+                // Lost with the stream, which reading it told, or a cycle.
                 let stream = self.object_stream(id, stream, &ctx)?;
-                (stream.data.as_slice(), stream.offset(id, index)?, false)
+                let Some(at) = stream.offset(id, index) else {
+                    self.note(Some(id));
+                    return None;
+                };
+                (stream.data.as_slice(), at, false)
             }
         };
-        parsed
+        let object = parsed
             .0
             .entry(ContentKey::new(data.get(at..)?, &ctx))
             .or_insert_with(|| Syntax::read(data, at, header, &ctx))
-            .as_ref()?
-            .in_context(data, &ctx)
+            .as_ref()
+            .map(|syntax| syntax.in_context(data, &ctx));
+        if object.is_none() {
+            self.note(Some(id));
+        }
+        object
     }
 
     /// The entry of object `id`, and the context to read it in, reached from `ctx`:
     /// what is read from it is cached and checked for cycles as `id`, the entry it is
     /// reached through, whatever its header says. This is the only place that names the
-    /// object a context reads.
+    /// object a context reads. An object the table lists but that cannot be read has
+    /// no entry, and is lost ([`Self::watch`]).
     ///
     /// What is read is decrypted as the object its header names, as it was encrypted:
     /// where entries of a damaged table lead to one object, each reads what the bytes
     /// hold, not bytes decrypted with a key they were not encrypted with, and the
     /// bytes alone say how they decrypt, so what is cached by them is what every entry
-    /// reads ([`ContentKey`]).
+    /// reads ([`ContentKey`]). The header each entry leads to is found once, where the
+    /// table is read: no entry reads it again.
     fn entry<'a>(
         &'a self,
         id: ObjectIdentifier,
@@ -1112,7 +1251,12 @@ impl XRef {
         };
 
         // References to undefined objects are treated as null.
-        let entry = *repr.map.get(&id)?;
+        let Some(&entry) = repr.map.get(&id) else {
+            if repr.unreadable.contains(&id) {
+                self.note(Some(id));
+            }
+            return None;
+        };
 
         if ctx.rejects(&id) {
             warn!("cycle detected in indirect object: {id:?}");
@@ -1122,16 +1266,8 @@ impl XRef {
 
         let mut ctx = ctx.clone();
         ctx.set_obj_number(id);
-        if let EntryType::Normal(offset) = entry
-            && self.is_encrypted()
-            && let Some(header) = repr
-                .data
-                .get()
-                .as_ref()
-                .get(offset..)
-                .and_then(|data| Reader::new(data).read_without_context::<ObjectIdentifier>())
-        {
-            ctx.set_decryption(header);
+        if let Some(header) = repr.headers.get(&id) {
+            ctx.set_decryption(*header);
         }
         ctx.parent_chain_push(id);
         ctx.set_in_content_stream(false);
@@ -1173,6 +1309,15 @@ impl XRef {
 
         repr.data.get_with(stream, ctx)
     }
+}
+
+/// Whether the object at a place an entry leads to can be read as an object.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum Verdict {
+    Readable,
+    /// A stream whose dictionary can be read, but not its data.
+    StreamLost,
+    Unreadable,
 }
 
 /// What reading the object at each place of the file or of an object stream's data
@@ -1220,15 +1365,20 @@ impl<'a> Syntax<'a> {
         }
     }
 
-    /// The object read in `ctx`.
-    fn in_context(&self, data: &'a [u8], ctx: &ReaderContext<'a>) -> Option<Object<'a>> {
+    /// The object read in `ctx`; a stream whose data cannot be read is its
+    /// dictionary ([`XRef::get_parsed`]).
+    fn in_context(&self, data: &'a [u8], ctx: &ReaderContext<'a>) -> Object<'a> {
         match self {
             Self::Stream { dict, end } => {
                 let mut r = Reader::new(data);
                 r.jump(*end);
-                Stream::after_dict(&mut r, dict.in_context(ctx)).map(Object::Stream)
+                let dict = dict.in_context(ctx);
+                match Stream::after_dict(&mut r, dict.clone()) {
+                    Some(stream) => Object::Stream(stream),
+                    None => Object::Dict(dict),
+                }
             }
-            Self::Object(object) => Some(object.in_context(ctx)),
+            Self::Object(object) => object.in_context(ctx),
         }
     }
 }
@@ -1261,7 +1411,7 @@ pub(crate) fn find_last_xref_pos(data: &[u8]) -> Option<usize> {
 }
 
 /// A type of xref entry.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Copy)]
 enum EntryType {
     /// An indirect object that is at a specific offset in the original data.
     Normal(usize),
@@ -1296,6 +1446,11 @@ struct SomeRepr {
     map: Arc<XrefMap>,
     /// The objects a rebuilt table lists that cannot be read.
     unreadable: Arc<Unreadable>,
+    /// The entries of a rebuilt table whose objects are headed as others.
+    headers: Arc<Headers>,
+    /// Whether the object at each place an entry leads to, which a read of the type
+    /// it asked for did not find, can be read as an object ([`XRef::get_with`]).
+    verdicts: Arc<Mutex<FxHashMap<EntryType, Verdict>>>,
     metadata: Arc<Metadata>,
     decryptor: Arc<Decryptor>,
     has_ocgs: bool,
@@ -1764,6 +1919,11 @@ fn parse_metadata(info_dict: &Dict<'_>) -> Metadata {
             .map(|t| t.to_vec()),
     }
 }
+
+#[cfg(test)]
+#[allow(dead_code, reason = "the tests here use some of the files")]
+#[path = "../tests/common/rc4.rs"]
+mod rc4;
 
 #[cfg(test)]
 mod tests {
@@ -2315,10 +2475,11 @@ mod tests {
         }
     }
 
-    // What a page is drawn with that the file lists but that cannot be read, its own
-    // dictionary, an entry it inherits or a category of its resources, stays lost: the
-    // page reads as viewers draw it, but tells what it lost, whether the table is
-    // sound or rebuilt. A reference to an object the file does not hold is still
+    // What a page is drawn with that the file lists but that cannot be read, an entry
+    // it inherits or a category of its resources, stays lost: the page reads as
+    // viewers draw it, but tells what it lost, whether the table is sound or rebuilt.
+    // A page tree entry that cannot be read may have been a node that held pages:
+    // the document tells it. A reference to an object the file does not hold is still
     // `null`, and an entry the page is not drawn with, such as /Thumb, loses nothing.
     #[test]
     fn what_a_page_is_drawn_with_that_cannot_be_read_is_not_taken_for_missing() {
@@ -2355,12 +2516,12 @@ mod tests {
             ),
             // A box it inherits.
             (tree("/CropBox 5 0 R"), page(""), "[0 0 600 700", lost),
-            // The page itself.
+            // The page itself, which the tree loses.
             (
                 tree(""),
                 "<< /Type /Page /MediaBox [0 0 600 700] /Contents 4 0 R /Broken >".to_owned(),
                 "null",
-                Some(ObjectIdentifier::new(3, 0)),
+                None,
             ),
             // Resources the file does not hold, and a thumbnail that cannot be read.
             (tree(""), page("/Resources 9 0 R"), "null", None),
@@ -2378,6 +2539,14 @@ mod tests {
                     *unreadable,
                     "{tree} {page} {fifth}, rebuilt: {broken}"
                 );
+                let tree_lost = page
+                    .ends_with("/Broken >")
+                    .then(|| ObjectIdentifier::new(3, 0));
+                assert_eq!(
+                    pages.unreadable(),
+                    tree_lost,
+                    "{tree} {page} {fifth}, rebuilt: {broken}"
+                );
             }
         }
         // A page the file does not hold is an empty page that lost nothing.
@@ -2388,6 +2557,7 @@ mod tests {
         let pdf = crate::Pdf::new(file).unwrap();
         assert_eq!(pdf.pages().len(), 1);
         assert_eq!(pdf.pages()[0].unreadable(), None);
+        assert_eq!(pdf.pages().unreadable(), None);
         assert!(pdf.pages()[0].raw().is_empty());
     }
 
@@ -2402,5 +2572,85 @@ mod tests {
         let data = b"xref\n0 999999999999999999999\ntrailer\n<<>>";
         let mut reader = Reader::new(data);
         assert!(read_xref_table_trailer(&mut reader, &ReaderContext::dummy()).is_none());
+    }
+
+    /// A file whose root lists node 3 and `n` entries the table puts at it, a node of
+    /// one 600 × 700 page whose header is padded to `64 * n` bytes where `padded`.
+    fn aliased_padded(n: u32, padded: bool, encrypted: bool) -> Vec<u8> {
+        use super::rc4::{self, Part};
+        let kids: Vec<String> = (0..=n)
+            .map(|i| format!("{} 0 R", if i == 0 { 3 } else { 4 + i }))
+            .collect();
+        let root = format!("<< /Type /Pages /Kids [{}] >>", kids.join(" "));
+        let aliases: Vec<(u32, u32)> = (1..=n).map(|i| (4 + i, 3)).collect();
+        let pad = if padded { 64 * n as usize } else { 1 };
+        rc4::file_headed(
+            &[
+                Part::Object("<< /Type /Catalog /Pages 2 0 R >>", b""),
+                Part::Object(&root, b""),
+                Part::Object("<< /Type /Pages /Kids [4 0 R] /Rotate 0 >>", b""),
+                Part::Object(
+                    "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 600 700] >>",
+                    b"",
+                ),
+            ],
+            &aliases,
+            encrypted,
+            &|number| {
+                let pad = if number == 3 { pad } else { 1 };
+                format!("{number}{}0 obj", " ".repeat(pad))
+            },
+        )
+    }
+
+    /// The bytes of object headers read to open `file` and find its pages' sizes,
+    /// once it is checked that each of the `pages` pages is 600 × 700 pt.
+    fn header_bytes(file: Vec<u8>, pages: usize) -> usize {
+        object::HEADER_BYTES.set(0);
+        let pdf = crate::Pdf::new(file).unwrap();
+        assert_eq!(pdf.pages().len(), pages);
+        for page in pdf.pages().iter() {
+            assert_eq!(page.render_dimensions(), (600.0, 700.0));
+        }
+        object::HEADER_BYTES.get()
+    }
+
+    // The header of an object that entries of an encrypted file's table lead to,
+    // which names the key its bytes decrypt with, is read once for them all, not once
+    // for each: reading the file is linear in its size, however long the header.
+    #[test]
+    fn a_header_entries_lead_to_is_read_once_for_them_all() {
+        for (padded, encrypted) in [(true, true), (true, false), (false, true)] {
+            let [small, large] = [256, 512]
+                .map(|n| header_bytes(aliased_padded(n, padded, encrypted), n as usize + 1));
+            assert!(
+                large <= small * 25 / 10,
+                "padded: {padded}, encrypted: {encrypted}: header bytes read for 256 \
+                 entries {small}, for 512 {large}"
+            );
+        }
+    }
+
+    // An object of another kind than a read asks for is read once to find out it is
+    // not lost, however many references lead to it.
+    #[test]
+    fn an_object_of_another_kind_is_read_once_to_find_it_is_not_lost() {
+        let n = 512;
+        let items = vec!["5 0 R"; n].join(" ");
+        let annots = format!("<< /List [{items}] >>");
+        let string = format!("({})", "\\101".repeat(64 * n));
+        let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>";
+        let file = file_of(&[CATALOG, TREE, page, &annots, &string], false);
+        let pdf = crate::Pdf::new(file).unwrap();
+        let list = pdf
+            .xref()
+            .get::<Dict<'_>>(ObjectIdentifier::new(4, 0))
+            .unwrap()
+            .get::<Array<'_>>(b"List".as_slice())
+            .unwrap();
+        VERDICTS.set(0);
+        let read: Vec<_> = list.iter_checked::<Dict<'_>>().collect();
+        assert!(read.is_empty(), "{read:?}");
+        assert_eq!(VERDICTS.get(), 1);
     }
 }

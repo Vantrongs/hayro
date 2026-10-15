@@ -1,3 +1,4 @@
+use crate::lost::{Lost, Watched};
 use crate::object::ObjectIdentifier;
 use crate::object::Stream;
 use crate::reader::ReaderContext;
@@ -65,9 +66,12 @@ impl From<Vec<u8>> for PdfData {
 pub(crate) struct Data {
     data: PdfData,
     // 32 segments are more than enough as we can't have more objects than this.
-    // `None` for a stream that is no object stream, which is not read again.
-    decoded: SegmentList<Option<ObjectStream>, 32>,
+    // `None` for a stream that is no object stream, which is not read again; with
+    // what reading it lost.
+    decoded: SegmentList<(Option<ObjectStream>, Lost), 32>,
     map: Mutex<FxHashMap<ObjectIdentifier, usize>>,
+    /// The computations being watched ([`crate::xref::XRef::watch`]).
+    pub(crate) watched: Watched,
 }
 
 impl Debug for Data {
@@ -83,6 +87,7 @@ impl Data {
             data,
             decoded: SegmentList::new(),
             map: Mutex::new(FxHashMap::default()),
+            watched: Watched::default(),
         }
     }
 
@@ -91,24 +96,39 @@ impl Data {
         &self.data
     }
 
-    /// The object stream `id`, read once.
+    /// The object stream `id`, read once; what reading it lost is told to every
+    /// computation that asks for it ([`crate::lost`]). Where it cannot be read as an
+    /// object stream, the objects the table puts in it are lost, and so is it.
     pub(crate) fn get_with(
         &self,
         id: ObjectIdentifier,
         ctx: &ReaderContext<'_>,
     ) -> Option<&ObjectStream> {
+        let kept = |idx: usize| {
+            let (stream, lost) = self.decoded.get(idx)?;
+            self.watched.note(*lost);
+            stream.as_ref()
+        };
         if let Some(&idx) = self.map.get().get(&id) {
-            return self.decoded.get(idx)?.as_ref();
+            return kept(idx);
         }
 
         // Decoding may resolve other objects, so do it without holding the cache lock.
         // A stream that is read differently from another resolution chain, such as
         // one rejected while it is being read already, is not kept, nor returned:
         // what is read from it borrows from what is kept.
-        let (stream, shared) = ctx.shared(|ctx| {
-            ctx.xref()
-                .get_with::<Stream<'_>>(id, ctx)
-                .and_then(|stream| ObjectStream::new(&stream))
+        let ((stream, lost), shared) = ctx.shared(|ctx| {
+            self.watched.watch(true, || {
+                let objects = ctx
+                    .xref()
+                    .get_with::<Stream<'_>>(id, ctx)
+                    .and_then(|stream| ObjectStream::new(&stream));
+                // Unless the chain being read rejects it, as a cycle.
+                if objects.is_none() && !ctx.rejects(&id) {
+                    self.watched.note(Some(id));
+                }
+                objects
+            })
         });
         if !shared {
             return None;
@@ -116,11 +136,11 @@ impl Data {
 
         let mut locked = self.map.get();
         if let Some(&idx) = locked.get(&id) {
-            return self.decoded.get(idx)?.as_ref();
+            return kept(idx);
         }
 
         let idx = locked.len();
-        let stream = self.decoded.get_or_init(idx, || stream);
+        let (stream, _) = self.decoded.get_or_init(idx, || (stream, lost));
         locked.insert(id, idx);
 
         stream.as_ref()

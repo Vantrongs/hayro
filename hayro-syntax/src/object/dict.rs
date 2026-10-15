@@ -84,8 +84,9 @@ impl<'a> Dict<'a> {
 
     /// The entry of a key as a specific object, resolved: `Ok(None)` without the key,
     /// or where it is another kind of object or a reference to an object the file
-    /// does not list; `Err` with the object a reference leads to where the file lists
-    /// it but it cannot be read ([`crate::xref::XRef::get_checked`]).
+    /// does not list; `Err` with an object reading it lost ([`crate::lost`]), the one
+    /// a reference leads to where the file lists it but it cannot be read, which the
+    /// computation being watched is told too, as [`Self::get`] tells it.
     #[allow(
         private_bounds,
         reason = "users shouldn't be able to implement `ObjectLike` for custom objects."
