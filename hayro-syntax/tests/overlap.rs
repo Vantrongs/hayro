@@ -7,7 +7,7 @@
 
 use hayro_syntax::Pdf;
 use hayro_syntax::object::{Array, Dict, Name, Number, ObjectIdentifier, Rect};
-use hayro_syntax::work::{BODIES_READ, LEXED};
+use hayro_syntax::work::{BODIES_READ, LEXED, OBJECT_STREAM_ENTRIES};
 
 mod common;
 use common::allocations::measure;
@@ -531,4 +531,281 @@ fn typed_reads_of_composite_values_lex_nothing() {
             "case {case}"
         );
     }
+}
+
+/// The catalog, the page tree and page 3, `size` points square, whose `/UserUnit`
+/// is `unit`.
+fn one_page(size: u32, unit: &str) -> Vec<(u32, Vec<u8>)> {
+    vec![
+        (1, CATALOG.to_vec()),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+        (
+            3,
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {size} {size}] /UserUnit {unit} >>"
+            )
+            .into_bytes(),
+        ),
+    ]
+}
+
+/// Page 3's `/UserUnit`, and what reading it lost.
+fn unit(file: Vec<u8>) -> (Option<f32>, Option<ObjectIdentifier>) {
+    let pdf = Pdf::new(file).unwrap();
+    let page = &pdf.pages()[0];
+    pdf.xref().watch(|| page.raw().get::<f32>(b"UserUnit"))
+}
+
+fn id(number: i32) -> ObjectIdentifier {
+    ObjectIdentifier::new(number, 0)
+}
+
+/// Page 3, whose `/UserUnit` is object 5 of object stream 4, whose `data` put objects 5
+/// and 6 after /First 8.
+fn cut_in_an_object_stream(data: &str) -> Vec<u8> {
+    let mut objects = one_page(50, "5 0 R");
+    objects.push((
+        4,
+        format!(
+            "<< /Type /ObjStm /N 2 /First 8 /Length {} >>\nstream\n{data}\nendstream",
+            data.len()
+        )
+        .into_bytes(),
+    ));
+    stream_table(&objects, &[(5, 4, 0), (6, 4, 1)], false)
+}
+
+/// Page 3, whose `/UserUnit` is object 4, `4 0 obj\n2`, then `between`, then `5 0 obj`,
+/// with an entry for each header.
+fn cut_in_the_file(between: &str) -> Vec<u8> {
+    let extra = format!("4 0 obj\n2{between}5 0 obj\n0\nendobj");
+    let five = extra.find("5 0 obj").unwrap();
+    table_file(
+        &one_page(10, "4 0 R"),
+        extra.as_bytes(),
+        &[(4, 0), (5, five)],
+        false,
+    )
+}
+
+// The next place cuts a token where no delimiter ends it: the body would go on past
+// its slot, so it is lost, not read as the token's start. MuPDF reads `1` for the
+// `12` of an object stream, and fails object 4 of the file, `2` where the bytes say
+// `25`, reading /UserUnit as missing.
+#[test]
+fn a_token_the_next_place_cuts_is_lost_not_read_as_its_start() {
+    // Object 5 at `1` of `12`, object 6 at its `2`.
+    let file = cut_in_an_object_stream("5 0 6 1 12");
+    assert_eq!(unit(file.clone()), (None, Some(id(5))));
+    let pdf = Pdf::new(file).unwrap();
+    assert_eq!(pdf.xref().get::<i32>(id(6)), Some(2));
+    // A name, `/Ab`, cut after `/A`.
+    let file = cut_in_an_object_stream("5 0 6 2 /Ab");
+    assert_eq!(unit(file), (None, Some(id(5))));
+    // Where white space ends the token, it is read.
+    assert_eq!(
+        unit(cut_in_an_object_stream("5 0 6 2 1 2")),
+        (Some(1.0), None)
+    );
+    assert_eq!(
+        unit(cut_in_an_object_stream("5 0 6 2 12")),
+        (Some(12.0), None)
+    );
+    // In the file, entry 5 at the `5` of `25 0 obj`: the table is rebuilt, and
+    // object 4, empty in its slot, lost.
+    assert_eq!(unit(cut_in_the_file("")), (None, Some(id(4))));
+    assert_eq!(unit(cut_in_the_file(" ")), (Some(2.0), None));
+}
+
+/// What loading `file`, whose page 3 is 600 pt square, and reading its `/UserUnit`
+/// finds, with what reading it lost; and the bytes lexed and decoded, the object
+/// streams' entries read, and the most bytes held at once doing so.
+fn loaded_one(file: Vec<u8>) -> ((Option<f32>, Option<ObjectIdentifier>), [usize; 3]) {
+    BODIES_READ.set(0);
+    LEXED.set(0);
+    OBJECT_STREAM_ENTRIES.set(0);
+    let (found, used) = measure(move || {
+        let pdf = Pdf::new(file).unwrap();
+        let page = &pdf.pages()[0];
+        assert_eq!((page.media_box().x1, page.media_box().y1), (600.0, 600.0));
+        pdf.xref().watch(|| page.raw().get::<f32>(b"UserUnit"))
+    });
+    let work = [
+        BODIES_READ.get() + LEXED.get(),
+        OBJECT_STREAM_ENTRIES.get(),
+        used.peak,
+    ];
+    (found, work)
+}
+
+/// Asserts that each of the costs of 2 `n` is at most about twice that of `n`.
+fn linear_each(family: &str, cost: impl Fn(u32) -> [usize; 3]) {
+    let [small, large] = [128, 256].map(&cost);
+    assert!(
+        small
+            .iter()
+            .zip(&large)
+            .all(|(s, l)| *l <= s * 21 / 10 + 4096),
+        "{family}: (bytes lexed and decoded, entries, peak bytes held) {small:?} for 128, \
+         {large:?} for 256"
+    );
+}
+
+/// `n` object streams that one header, `10 0 obj`, heads each, one after another, the
+/// data of each, `5 0 7`, reaching over those after it to one pad of `512 n` spaces
+/// and the one `endstream`; `startxref` leads to no table, which is rebuilt.
+fn object_streams_of_one_number(n: u32) -> Vec<u8> {
+    let mut extra =
+        b"10 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length 0 >>\nstream\n5 0 7 ".repeat(n as usize);
+    extra.extend(b" ".repeat(512 * n as usize));
+    extra.extend(b"\nendstream\nendobj");
+    table_file(&one_page(600, "5 0 R"), &extra, &[], true)
+}
+
+/// One header, `4 0 obj`, then `n` object stream dictionaries, each with its data,
+/// `5 0 1`, all reaching over those after it to one tail of `512 n` bytes and the
+/// one `endstream`, as each /Length says; the table is rebuilt.
+fn object_streams_under_one_header(n: u32) -> Vec<u8> {
+    let mut extra = b"4 0 obj\n".to_vec();
+    let mut lengths = vec![];
+    for _ in 0..n {
+        extra.extend(b"<< /Type /ObjStm /N 1 /First 4 /Length LLLLLLLLLL >>\nstream\n");
+        lengths.push(extra.len());
+        extra.extend(b"5 0 1\n");
+    }
+    extra.extend(b"A".repeat(512 * n as usize));
+    let end = extra.len();
+    extra.extend(b"\nendstream\nendobj");
+    for data in lengths {
+        let at = data - b" >>\nstream\n".len() - 10;
+        extra[at..at + 10].copy_from_slice(format!("{:10}", end - data).as_bytes());
+    }
+    table_file(&one_page(600, "5 0 R"), &extra, &[], true)
+}
+
+// A rebuilt table reads the object streams it finds by their places, through the
+// body layer: each is the body of its header, its data cut at the next place that
+// holds a stream, decoded once, whichever definition of its number the table keeps
+// and however many dictionaries follow the header; so what is decoded and kept, and
+// the entries read, are linear in the file. The object is the last stream's.
+#[test]
+fn object_streams_a_rebuilt_table_finds_are_read_in_linear_work_and_memory() {
+    assert_eq!(
+        loaded_one(object_streams_of_one_number(64)).0,
+        (Some(7.0), None)
+    );
+    linear_each("object streams of one number", |n| {
+        loaded_one(object_streams_of_one_number(n)).1
+    });
+    assert_eq!(
+        loaded_one(object_streams_under_one_header(64)).0,
+        (Some(1.0), None)
+    );
+    linear_each("object streams under one header", |n| {
+        loaded_one(object_streams_under_one_header(n)).1
+    });
+}
+
+/// Page 3, 600 by 700 pt, and `n` catalogs, objects 100 on, in one Flate object
+/// stream with a tail of `4096 n` spaces, and a trailer naming each; the table is
+/// rebuilt.
+fn catalogs_in_one_object_stream(n: u32) -> Vec<u8> {
+    use std::io::Write;
+    let mut header = String::new();
+    let mut body = String::new();
+    for k in 0..n {
+        header += &format!("{} {} ", 100 + k, body.len());
+        body += std::str::from_utf8(CATALOG).unwrap();
+        body += " ";
+    }
+    let mut data = (header.clone() + &body).into_bytes();
+    data.extend(b" ".repeat(4096 * n as usize));
+    let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    z.write_all(&data).unwrap();
+    let z = z.finish().unwrap();
+    let mut file = b"%PDF-1.7\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+        3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] >>\nendobj\n"
+        .to_vec();
+    file.extend(
+        format!(
+            "4 0 obj\n<< /Type /ObjStm /N {n} /First {} /Filter /FlateDecode /Length {} >>\nstream\n",
+            header.len(),
+            z.len()
+        )
+        .bytes(),
+    );
+    file.extend(z);
+    file.extend(b"\nendstream\nendobj\n");
+    for k in 0..n {
+        file.extend(format!("trailer\n<< /Size 200 /Root {} 0 R >>\n", 100 + k).bytes());
+    }
+    file.extend(b"startxref\n9\n%%EOF\n");
+    file
+}
+
+// Every trailer a rebuild finds names a catalog in one object stream: the catalogs
+// are read as the rebuilt table reads them, the stream decoded once and each catalog
+// read once, so checking them takes work and memory linear in the file. The last
+// trailer is taken.
+#[test]
+fn catalogs_in_one_object_stream_are_checked_in_linear_work_and_memory() {
+    let cost = |n: u32| {
+        BODIES_READ.set(0);
+        LEXED.set(0);
+        OBJECT_STREAM_ENTRIES.set(0);
+        let file = catalogs_in_one_object_stream(n);
+        let (root, used) = measure(move || {
+            let pdf = Pdf::new(file).unwrap();
+            let page = &pdf.pages()[0];
+            assert_eq!((page.media_box().x1, page.media_box().y1), (600.0, 700.0));
+            pdf.xref().root_id()
+        });
+        assert_eq!(root, id(100 + n as i32 - 1));
+        [
+            BODIES_READ.get() + LEXED.get(),
+            OBJECT_STREAM_ENTRIES.get(),
+            used.peak,
+        ]
+    };
+    linear_each("catalogs in one object stream", cost);
+}
+
+/// Page 3, whose `/UserUnit` is object 5, the one object of object stream 10, whose
+/// data, `5 0 12` and `after`, reach over stream 9 after them, as its /Length says.
+fn cut_at_another_stream(after: &str) -> Vec<u8> {
+    let inner = "9 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n";
+    let data = format!("5 0 12{after}{inner}");
+    let mut objects = one_page(50, "5 0 R");
+    objects.push((
+        10,
+        format!(
+            "<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n{data}\nendstream",
+            data.len()
+        )
+        .into_bytes(),
+    ));
+    let mut file = stream_table(&objects, &[(5, 10, 0)], false);
+    // The table, object 11, puts stream 9 at its header, in stream 10's data.
+    let at = file.windows(7).position(|w| w == b"9 0 obj").unwrap() as u32;
+    let table = file.windows(11).position(|w| w == b"/Type /XRef").unwrap();
+    let rows = table
+        + file[table..]
+            .windows(7)
+            .position(|w| w == b"stream\n")
+            .unwrap()
+        + 7;
+    let row = rows + 9 * 7;
+    assert_eq!(file[row], 0, "no entry 9 yet");
+    file[row] = 1;
+    file[row + 1..row + 5].copy_from_slice(&at.to_be_bytes());
+    file
+}
+
+// An object stream's data cut at the place of a stream they reach end where the
+// stream's go on: the last object, reaching that end, may go on past it, so it is
+// lost, not read as its start (`12` of the `129` the stream's data hold).
+#[test]
+fn an_object_that_reaches_the_cut_of_its_stream_is_lost() {
+    assert_eq!(unit(cut_at_another_stream("")), (None, Some(id(5))));
+    assert_eq!(unit(cut_at_another_stream(" ")), (Some(12.0), None));
 }

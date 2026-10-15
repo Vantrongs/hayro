@@ -1696,13 +1696,13 @@ mod tests {
             );
             let tree = format!("<< /Type /Pages /Count {n} /Kids [{}] >>", kids.join(" "));
             let file = recovered(&[(1, 0, CATALOG), (2, 0, &tree), (n as i32 + 3, 0, &stream)]);
-            crate::xref::OBJECT_STREAM_ENTRIES.set(0);
+            crate::work::OBJECT_STREAM_ENTRIES.set(0);
             crate::object::stream::SEARCHED.set(0);
             let pdf = Pdf::new(file).unwrap();
             assert_eq!(pdf.pages().len(), n);
             assert!(pdf.pages().iter().all(|page| page.media_box().x1 == 200.0));
             (
-                crate::xref::OBJECT_STREAM_ENTRIES.get(),
+                crate::work::OBJECT_STREAM_ENTRIES.get(),
                 crate::object::stream::SEARCHED.get(),
             )
         };

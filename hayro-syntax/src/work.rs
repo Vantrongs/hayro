@@ -28,8 +28,8 @@ std::thread_local! {
 std::thread_local! {
     /// The bytes of objects' bodies read on this thread, in the file, headers and
     /// all, or in object streams, and around streams' data found, with the file
-    /// once where `endstream` is looked for in it: what tests bound the work of
-    /// reading objects by. Debug builds only.
+    /// once where `endstream` is looked for in it, and the decoded data of object
+    /// streams: what tests bound the work of reading objects by. Debug builds only.
     #[doc(hidden)]
     pub static BODIES_READ: Cell<usize> = const { Cell::new(0) };
 }
@@ -42,6 +42,22 @@ std::thread_local! {
     /// hold by, with [`BODIES_READ`]. Debug builds only.
     #[doc(hidden)]
     pub static LEXED: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(all(debug_assertions, feature = "std"))]
+std::thread_local! {
+    /// The entries of object streams' headers read on this thread: what tests bound
+    /// the work of reading object streams by, with [`BODIES_READ`], which counts
+    /// their decoded data. Debug builds only.
+    #[doc(hidden)]
+    pub static OBJECT_STREAM_ENTRIES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Counts `entries` of an object stream's header read ([`OBJECT_STREAM_ENTRIES`]).
+#[inline]
+pub(crate) fn object_stream_entries(_entries: usize) {
+    #[cfg(all(debug_assertions, feature = "std"))]
+    OBJECT_STREAM_ENTRIES.set(OBJECT_STREAM_ENTRIES.get() + _entries);
 }
 
 /// Counts `bytes` of arrays' items or dictionaries' values read ([`LEXED`]).

@@ -272,7 +272,7 @@ impl<'a> ObjectLike<'a> for Object<'a> {
     const STREAM: bool = true;
 
     // Only an indirect object is a stream: a dictionary followed by `stream`, as
-    // `body::Read::from` in the `xref` module reads one. In an array or dictionary,
+    // `body::Read::in_slot` in the `xref` module reads one. In an array or dictionary,
     // which reading and skipping read alike, it is a dictionary.
     fn read_indirect(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         match r.read_with_context::<Self>(ctx)? {

@@ -740,8 +740,8 @@ impl<'a> Scan<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::body::Read;
-    use super::super::{object_in, read_object, rebuilt_header};
+    use super::super::body::{Read, Slot};
+    use super::super::{object_in, rebuilt_header};
     use super::*;
     use crate::object::Dict;
     use crate::object::ObjectIdentifier;
@@ -870,18 +870,19 @@ mod tests {
     }
 
     /// What reading the object at `at` of `data` finds, as an entry's object is read
-    /// (`body::Read::from`): where it ends, and for a dictionary whether it has a
-    /// /Root and a /Type key.
-    fn entry_read(data: &[u8], at: usize) -> Option<Found> {
-        let mut r = Reader::new(data);
-        r.jump(at);
+    /// in a slot that ends at `slot` (`body::Read::in_slot`): where it ends, and for
+    /// a dictionary whether it has a /Root and a /Type key.
+    fn entry_read(data: &[u8], at: usize, slot: usize) -> Option<Found> {
         let ctx = ReaderContext::dummy();
-        let syntax = Read::from(
-            &mut r,
+        let (syntax, end) = Read::in_slot(
+            data,
+            at,
+            Slot::to(slot),
             false,
             |r| DictNode::read(r, data, &ctx),
             |r| Node::read(r, data, &ctx),
-        )?;
+        )
+        .0?;
         let dict = match &syntax {
             Read::Dict(dict) | Read::Stream { dict, .. } => Some(dict),
             Read::Object(_) => None,
@@ -893,35 +894,35 @@ mod tests {
             })
         };
         Some(Found {
-            end: r.offset(),
+            end,
             root: has(ROOT),
             kind: has(TYPE),
         })
     }
 
     /// What reading the object at `at` of `data` after its header finds, as an
-    /// entry's object is read (`body::Read::from`) and as `XRef::get_with` reads
-    /// one that is not a stream (`IndirectObject`), which agree: where the object
-    /// ends.
-    fn headed_read(data: &[u8], at: usize) -> Option<usize> {
-        let mut r = Reader::new(data);
-        r.jump(at);
+    /// entry's object is read in a slot that ends at `slot` (`body::Read::in_slot`),
+    /// and, on all of `data`, as `XRef::get_with` reads one that is not a stream
+    /// (`IndirectObject`), which agree: where the object ends.
+    fn headed_read(data: &[u8], at: usize, slot: usize) -> Option<usize> {
         let ctx = ReaderContext::dummy();
-        let syntax = Read::from(
-            &mut r,
+        let syntax = Read::in_slot(
+            data,
+            at,
+            Slot::to(slot),
             true,
             |r| DictNode::read(r, data, &ctx),
             |r| Node::read(r, data, &ctx),
-        );
-        let end = r.offset();
-        if !matches!(syntax, Some(Read::Stream { .. })) {
+        )
+        .0;
+        if slot == data.len() && !matches!(syntax, Some((Read::Stream { .. }, _))) {
             let mut indirect = Reader::new(data);
             indirect.jump(at);
             let read =
                 indirect.read_with_context::<IndirectObject<Object<'_>>>(&ReaderContext::dummy());
             assert_eq!(read.is_some(), syntax.is_some(), "at {at}");
         }
-        syntax.map(|_| end)
+        syntax.map(|(_, end)| end)
     }
 
     /// The header at `at` of `data` and whether its object is read, as rebuilding a
@@ -930,7 +931,7 @@ mod tests {
         let mut r = Reader::new(data);
         r.jump(at);
         let (header, object) = rebuilt_header(&mut r, scan).flatten()?;
-        object.then_some(header)
+        object.map(|_| header)
     }
 
     /// Reads every item of `object`, an array or dictionary, and of those in it.
@@ -950,18 +951,19 @@ mod tests {
         }
     }
 
-    /// Where the object at `at` of `data` ends as checking a table reads it, which
-    /// skips a dictionary.
-    fn checked(data: &[u8], at: usize) -> Option<usize> {
-        let mut r = Reader::new(data);
-        r.jump(at);
-        read_object(
-            &mut r,
+    /// Where the object at `at` of `data` ends as checking a table reads it, in a slot
+    /// that ends at `slot`, which skips a dictionary.
+    fn checked(data: &[u8], at: usize, slot: usize) -> Option<usize> {
+        Read::in_slot(
+            data,
+            at,
+            Slot::to(slot),
             false,
             |r| r.skip::<Dict<'_>>(false),
             |r| r.read_with_context::<Object<'_>>(&ReaderContext::dummy()),
         )
-        .map(|_| r.offset())
+        .0
+        .map(|(_, end)| end)
     }
 
     // What the rebuild of a table finds of an object, through a scan, and what its
@@ -995,7 +997,7 @@ mod tests {
             positions.swap(i, random.below(i + 1));
         }
         for at in positions {
-            let read = entry_read(&data, at);
+            let read = entry_read(&data, at, data.len());
             // The scan, asked twice, as the scan that rebuilds a table asks about a
             // header's object and then about a dictionary there.
             for _ in 0..2 {
@@ -1008,9 +1010,9 @@ mod tests {
                     shown()
                 );
             }
-            // The check on the whole rest of the file, and up to an offset where
-            // the next object may start.
-            let whole = checked(&data, at);
+            // The check on the whole rest of the file, and in a slot up to an offset
+            // where the next object may start.
+            let whole = checked(&data, at, data.len());
             assert_eq!(
                 whole,
                 read.map(|read| read.end),
@@ -1018,18 +1020,38 @@ mod tests {
                 shown()
             );
             let next = at + random.below(data.len() - at + 1);
-            let checked = checked(&data[..next], at);
+            let checked = checked(&data, at, next);
             assert_eq!(
                 checked,
-                entry_read(&data[..next], at).map(|read| read.end),
+                entry_read(&data, at, next).map(|read| read.end),
                 "case {case}, check at {at} to {next} of {:?}",
                 shown()
             );
-            // What reads to its end before that offset is read there.
+            // What reads to its end before that offset is read there, but a
+            // dictionary after which a comment runs past the offset, or starts after
+            // white space up to it and past it, as whether it is a stream's depends on
+            // what follows the comment.
             if let Some(read) = read
                 && read.end <= next
             {
-                assert_eq!(checked, Some(read.end), "case {case}");
+                let dict = matches!(
+                    Read::in_slot(
+                        &data,
+                        at,
+                        Slot::to(data.len()),
+                        false,
+                        |r| r.skip::<Dict<'_>>(false),
+                        |r| r.skip::<Object<'_>>(false),
+                    )
+                    .0,
+                    Some((Read::Dict(_) | Read::Stream { .. }, _))
+                );
+                let depends = dict
+                    && super::super::body::stream_follows(&data, read.end, Slot::to(next))
+                        .is_none();
+                if !depends {
+                    assert_eq!(checked, Some(read.end), "case {case}");
+                }
             }
             // The items of an array and the entries of a dictionary read, at any
             // depth, as skipping the array or dictionary read them.
@@ -1060,17 +1082,18 @@ mod tests {
             // An object after a header: its header and object are read alike by
             // checking the table, on the whole rest of the file and up to an offset,
             // by rebuilding it, and by reading the object.
-            let read = headed_read(&data, at);
+            let read = headed_read(&data, at, data.len());
             let header = Reader::new(&data[at..]).read_without_context::<ObjectIdentifier>();
             assert_eq!(
-                object_in(&data[at..]),
+                object_in(&data, at, data.len()),
                 read.and(header),
                 "case {case}, header check at {at} of {:?}",
                 shown()
             );
+            let in_slot = Reader::new(&data[at..next]).read_without_context::<ObjectIdentifier>();
             assert_eq!(
-                object_in(&data[at..next]),
-                headed_read(&data[..next], at).and(header),
+                object_in(&data, at, next),
+                headed_read(&data, at, next).and(in_slot),
                 "case {case}, header check at {at} to {next} of {:?}",
                 shown()
             );

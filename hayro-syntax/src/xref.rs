@@ -34,7 +34,8 @@ use core::ops::Deref;
 mod body;
 mod scan;
 
-use body::{Place, Source, Taken, Unread};
+pub(crate) use body::Place;
+use body::{Slot, Source, Taken, Unread};
 use scan::Scan;
 
 pub(crate) const XREF_ENTRY_LEN: usize = 20;
@@ -156,8 +157,8 @@ pub(crate) fn open(data: PdfData, password: &[u8]) -> Result<XRef, XRefError> {
     match check(&mut xref_map, data.as_ref()) {
         Ok(()) => match XRef::new(
             data.clone(),
+            Rebuilt::sound(&xref_map),
             xref_map,
-            Rebuilt::default(),
             XRefInput::TrailerDictData(trailer),
             password,
         ) {
@@ -235,7 +236,7 @@ fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Old> {
     while let Some(&(offset, _)) = rest.first() {
         let at = rest.partition_point(|(other, _)| *other == offset);
         let end = rest.get(at).map_or(data.len(), |(next, _)| *next);
-        let header = data.get(offset..end).and_then(object_in);
+        let header = object_in(data, offset, end);
         for (_, id) in &rest[..at] {
             match header {
                 Some(header) => {
@@ -269,24 +270,22 @@ fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Old> {
     }
 }
 
-/// The identifier in the header of the object `data` starts with, if the object ends
-/// in `data`: if reading it as an entry's object is read ([`read_object`]) reads it
-/// there. A dictionary is skipped, which reads it as reading it does.
-fn object_in(data: &[u8]) -> Option<ObjectIdentifier> {
-    let header = Reader::new(data).read_without_context::<ObjectIdentifier>()?;
-    let mut r = Reader::new(data);
-    let object = read_object(
-        &mut r,
+/// The identifier in the header of the object at `at` of `data`, if the object ends
+/// in its slot, which ends at `slot`: if reading it as an entry's object is read
+/// ([`body::Read::in_slot`]) reads it there. A dictionary is skipped, which reads it
+/// as reading it does.
+fn object_in(data: &[u8], at: usize, slot: usize) -> Option<ObjectIdentifier> {
+    let header = Reader::new_with(data, at).read_without_context::<ObjectIdentifier>()?;
+    let (object, _looked) = body::Read::in_slot(
+        data,
+        at,
+        Slot::to(slot),
         true,
         |r| r.skip::<Dict<'_>>(false),
         |r| r.read_with_context::<Object<'_>>(&ReaderContext::dummy()),
     );
     #[cfg(test)]
-    opened(if object.is_some() {
-        r.offset()
-    } else {
-        data.len()
-    });
+    opened(if object.is_some() { _looked } else { slot - at });
     object.map(|_| header)
 }
 
@@ -327,7 +326,7 @@ fn fallback(data: PdfData, password: &[u8], old: Old) -> Option<XRef> {
     if let Some(xref_input) = xref_input {
         warn!("rebuild xref table with {} entries", xref_map.len());
 
-        XRef::new(data.clone(), xref_map, rebuilt, xref_input, password).ok()
+        XRef::new(data.clone(), rebuilt, xref_map, xref_input, password).ok()
     } else {
         warn!("couldn't find trailer dictionary, failed to rebuild xref table");
 
@@ -346,12 +345,25 @@ type Unreadable = BTreeSet<ObjectIdentifier>;
 /// another. Found once, where the table is rebuilt, for every entry leading there.
 type Headers = FxHashMap<ObjectIdentifier, ObjectIdentifier>;
 
-/// What a rebuild finds besides the table: the objects it lists that cannot be
-/// read, and the entries whose objects are headed as others.
-#[derive(Debug, Default, Clone)]
+/// What reading a table finds besides its entries: where the objects of the file
+/// are, which their slots end at, and, for a rebuilt table, the objects it lists
+/// that cannot be read and the entries whose objects are headed as others.
+#[derive(Debug, Clone)]
 struct Rebuilt {
+    layout: Layout,
     unreadable: Unreadable,
     headers: Headers,
+}
+
+impl Rebuilt {
+    /// What a table read from the file finds: its objects are at its entries.
+    fn sound(map: &XrefMap) -> Self {
+        Self {
+            layout: Layout::new(map),
+            unreadable: Unreadable::default(),
+            headers: Headers::default(),
+        }
+    }
 }
 
 fn fallback_xref_map<'a>(
@@ -367,7 +379,7 @@ fn fallback_xref_map<'a>(
         data,
         &mut scan,
         ReaderContext::dummy(),
-        true,
+        None,
         password,
         &listed,
         &unreadable,
@@ -412,11 +424,25 @@ fn read_unread(
     (listed, unreadable)
 }
 
+/// The table a scan of the file rebuilds, where objects in object streams are
+/// decrypted by `decryptor`, `None` until the trailer is known: a document whose
+/// trailer has /Encrypt is scanned again with its decryptor.
+///
+/// Every object the rebuild reads, an object stream it finds or a catalog a trailer
+/// names, is read as the table it rebuilds reads it, through a table of what it has
+/// found, by place ([`XRef::object_stream_at`], [`XRef::get_with`]): each body once,
+/// in its slot, and each object stream's data decoded once, cut at the next place
+/// holding a stream, however many objects the scan finds in it, entries name it or
+/// trailers name a catalog in it. The places are every header the scan finds with an
+/// object after it, and every one the old table leads to, the same for the rebuild's
+/// reads and for the rebuilt table's ([`Layout`]): so the bodies read, and the data
+/// of object streams decoded, are disjoint, whichever definitions of one number the
+/// table keeps.
 fn fallback_xref_map_inner<'a>(
     data: &'a PdfData,
     scan: &mut Scan<'_>,
     mut dummy_ctx: ReaderContext<'a>,
-    recurse: bool,
+    decryptor: Option<Arc<Decryptor>>,
     password: &[u8],
     listed: &[Listed],
     unread: &[ObjectIdentifier],
@@ -432,9 +458,10 @@ fn fallback_xref_map_inner<'a>(
     let mut r = Reader::new(data.as_ref());
 
     let mut last_obj_num = None;
-    // The object streams found: the object, where its header is, and where its
-    // dictionary is.
+    // The object streams found: the object, and where its header is.
     let mut object_streams = vec![];
+    // The last header found with an object after it, where it is, and where its
+    // object starts.
     let mut last_header = None;
 
     loop {
@@ -443,14 +470,14 @@ fn fallback_xref_map_inner<'a>(
         // First try to check if we have an object identifier.
         if let Some(header) = rebuilt_header(&mut r, scan) {
             match header {
-                Some((obj_id, true)) => {
+                Some((obj_id, Some(body))) => {
                     xref_map.insert(obj_id, EntryType::Normal(cur_pos));
                     found.push((obj_id, cur_pos));
                     last_obj_num = Some(obj_id);
-                    last_header = Some((obj_id, cur_pos));
+                    last_header = Some((obj_id, cur_pos, body));
                     dummy_ctx.set_obj_number(obj_id);
                 }
-                Some((obj_id, false)) => broken.push(obj_id),
+                Some((obj_id, None)) => broken.push(obj_id),
                 // There must be a white space before the next object number.
                 None => r.forward_while(|b| !is_white_space_character(b)),
             }
@@ -477,13 +504,14 @@ fn fallback_xref_map_inner<'a>(
                             root_ref = last_obj_num;
                         }
 
-                        // Only an object stream is read as a stream, once the scan has
-                        // found every place, which its data may not reach past
-                        // ([`object_stream_at`]).
+                        // An object stream is the body of its header's object, read
+                        // once the scan has found every place, which its data may
+                        // not reach past ([`XRef::object_stream_at`]).
                         if dict.get::<Name<'_>>(TYPE).as_deref() == Some(b"ObjStm")
-                            && let Some((id, at)) = last_header
+                            && let Some((id, at, body)) = last_header
+                            && body == cur_pos
                         {
-                            object_streams.push((id, at, cur_pos));
+                            object_streams.push((id, at));
                         }
                     }
                 }
@@ -507,15 +535,44 @@ fn fallback_xref_map_inner<'a>(
         }
     }
 
-    let layout = Layout::new(&xref_map);
-    for (stream, at, dict_at) in object_streams {
-        let mut ctx = dummy_ctx.clone();
-        ctx.set_obj_number(stream);
-        let Some(obj_stream) = object_stream_at(data.as_ref(), &layout, &ctx, at, dict_at) else {
-            continue;
-        };
-        for (idx, (obj_num, _)) in obj_stream.offsets.iter().enumerate() {
-            let id = ObjectIdentifier::new(*obj_num as i32, 0);
+    let layout = Layout::over(
+        found
+            .iter()
+            .map(|(_, at)| *at)
+            .chain(listed.iter().map(|entry| entry.offset))
+            .collect(),
+    );
+    let decrypted = decryptor
+        .clone()
+        .unwrap_or_else(|| Arc::new(Decryptor::None));
+    if !object_streams.is_empty() {
+        // The objects each object stream holds, read through a table of the objects
+        // found, which a stream's /Length may be.
+        let probe = XRef::table(
+            data.clone(),
+            Rebuilt {
+                layout: layout.clone(),
+                unreadable: Unreadable::default(),
+                headers: Headers::default(),
+            },
+            Arc::new(xref_map),
+            decrypted.clone(),
+        );
+        let mut held = vec![];
+        for (stream, at) in object_streams {
+            if let Some(objects) = probe.object_stream_at(at, stream) {
+                held.extend(
+                    objects
+                        .offsets
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, (obj_num, _))| (*obj_num, stream, idx)),
+                );
+            }
+        }
+        xref_map = probe.into_map();
+        for (obj_num, stream, idx) in held {
+            let id = ObjectIdentifier::new(obj_num as i32, 0);
             // If we already found an entry for that object number that was not
             // inside an object stream. Somewhat arbitrary and maybe
             // we can do better, but that seems to work for the current
@@ -533,10 +590,6 @@ fn fallback_xref_map_inner<'a>(
     }
 
     let headers = keep_listed(&mut xref_map, &found, listed);
-    let layout = Layout {
-        starts: Layout::new(&xref_map).starts,
-        ends: layout.ends,
-    };
     let unreadable: Unreadable = unread
         .iter()
         .chain(&broken)
@@ -544,69 +597,21 @@ fn fallback_xref_map_inner<'a>(
         .copied()
         .collect();
     let mut rebuilt = Rebuilt {
+        layout,
         unreadable,
         headers,
     };
 
     // Try to choose the right trailer dict by doing basic validation: the last whose
-    // /Root is a dictionary with /Pages. Each catalog the trailers name is read once,
-    // however many name it or entries lead to it.
+    // /Root is a dictionary with /Pages, read as the rebuilt table reads it.
     let has_pages = |dict: &Dict<'_>| -> bool { dict.contains_key(PAGES) };
-    let catalog_has_pages = |id: ObjectIdentifier| -> bool {
-        match xref_map.get(&id) {
-            Some(EntryType::Normal(offset)) => {
-                let mut reader = Reader::new(data.as_ref());
-                reader.jump(*offset);
-                let mut ctx = dummy_ctx.clone();
-                ctx.set_obj_number(id);
-                let catalog = reader.read_with_context::<IndirectObject<Dict<'_>>>(&ctx);
-                opened(reader.offset() - offset);
-                catalog.is_some_and(|catalog| has_pages(&catalog.get()))
-            }
-            Some(EntryType::ObjStream(obj_num, idx)) => {
-                let stream_id = ObjectIdentifier::new(*obj_num as i32, 0);
-                let Some(EntryType::Normal(offset)) = xref_map.get(&stream_id) else {
-                    return false;
-                };
-                let mut reader = Reader::new(data.as_ref());
-                reader.jump(*offset);
-                let mut ctx = dummy_ctx.clone();
-                ctx.set_obj_number(stream_id);
-                if reader.skip::<ObjectIdentifier>(false).is_none() {
-                    return false;
-                }
-                reader.skip_white_spaces_and_comments();
-                opened(reader.offset() - offset);
-                object_stream_at(data.as_ref(), &layout, &ctx, *offset, reader.offset())
-                    .is_some_and(|objects| {
-                        let Some(at) = objects.offset(id, *idx) else {
-                            return false;
-                        };
-                        let mut r = Reader::new(objects.data());
-                        r.jump(at);
-                        r.skip_white_spaces_and_comments();
-                        r.read_with_context::<Dict<'_>>(&dummy_ctx)
-                            .is_some_and(|catalog| has_pages(&catalog))
-                    })
-            }
-            None => false,
-        }
-    };
-    let mut catalogs = FxHashMap::default();
+    let table = XRef::table(data.clone(), rebuilt.clone(), Arc::new(xref_map), decrypted);
     let mut trailer_dict = None;
     for dict in trailer_dicts {
         let valid = match dict.get_raw::<Dict<'_>>(ROOT) {
-            Some(MaybeRef::Ref(r)) => {
-                let id = ObjectIdentifier::from(r);
-                // An object at an offset is the same dictionary under any entry.
-                let read = match xref_map.get(&id) {
-                    Some(EntryType::Normal(offset)) => (Some(*offset), None),
-                    _ => (None, Some(id)),
-                };
-                *catalogs
-                    .entry(read)
-                    .or_insert_with(|| catalog_has_pages(id))
-            }
+            Some(MaybeRef::Ref(r)) => table
+                .get::<Dict<'_>>(r.into())
+                .is_some_and(|catalog| has_pages(&catalog)),
             Some(MaybeRef::NotRef(d)) => has_pages(&d),
             None => false,
         };
@@ -614,26 +619,28 @@ fn fallback_xref_map_inner<'a>(
             trailer_dict = Some(dict);
         }
     }
+    let mut xref_map = table.into_map();
 
     let has_encryption = trailer_dict
         .as_ref()
         .is_some_and(|t| t.contains_key(ENCRYPT));
 
-    if has_encryption && recurse {
+    if has_encryption && decryptor.is_none() {
         // The problem is that in this case, we have used a dummy reader context which does not have
         // a decryptor. Therefore, we were unable to decrypt any of the object streams and missed
         // all objects that are inside of such a stream. Therefore, we need to redo the process
         // using a `ReaderContext` that does have the ability to decrypt.
         if let Ok(xref) = XRef::new(
             data.clone(),
-            xref_map.clone(),
             rebuilt.clone(),
+            xref_map.clone(),
             XRefInput::TrailerDictData(trailer_dict.as_ref().map(|d| d.data()).unwrap()),
             password,
         ) {
             let ctx = ReaderContext::new(&xref, false);
+            let decryptor = xref.decryptor();
             let (patched_map, patched, _) =
-                fallback_xref_map_inner(data, scan, ctx, false, password, listed, unread);
+                fallback_xref_map_inner(data, scan, ctx, Some(decryptor), password, listed, unread);
             xref_map = patched_map;
             rebuilt = patched;
         }
@@ -647,33 +654,15 @@ fn fallback_xref_map_inner<'a>(
     (xref_map, rebuilt, input)
 }
 
-/// The object stream whose dictionary is at `dict_at` of the file, `data`, after
-/// its header at `at`, read in `ctx` as reading it for an entry reads it: its data
-/// cut at the place of another stream they reach ([`body::Taken::Contained`]).
-fn object_stream_at(
-    data: &[u8],
-    layout: &Layout,
-    ctx: &ReaderContext<'_>,
-    at: usize,
-    dict_at: usize,
-) -> Option<ObjectStream> {
-    let mut r = Reader::new(data);
-    r.jump(dict_at);
-    let dict = r.read_with_context::<Dict<'_>>(ctx)?;
-    let end = r.offset();
-    opened(end - dict_at);
-    let (from, _, cut) = layout.stream_data(data, at, end, &dict)?;
-    ObjectStream::new(&Stream::new(&data[from..cut], dict))
-}
-
 /// What a rebuild finds at `r`: `None` where no header can start, as no number can;
-/// else the header there, if any, and whether an object follows it, read to its end
-/// however far that is, as reading it does; `r` after the header. The scan reads each
-/// part of the file a bounded number of times however many objects it holds.
+/// else the header there, if any, and where the object after it starts if one does,
+/// read to its end however far that is, as reading it does; `r` after the header.
+/// The scan reads each part of the file a bounded number of times however many
+/// objects it holds.
 fn rebuilt_header(
     r: &mut Reader<'_>,
     scan: &mut Scan<'_>,
-) -> Option<Option<(ObjectIdentifier, bool)>> {
+) -> Option<Option<(ObjectIdentifier, Option<usize>)>> {
     if !r.peek_byte().is_some_and(object::starts_number) {
         return None;
     }
@@ -683,7 +672,8 @@ fn rebuilt_header(
     let mut body = r.clone();
     body.skip_white_spaces_and_comments();
     opened(body.offset() - r.offset());
-    Some(Some((id, scan.object(body.offset()).is_some())))
+    let at = body.offset();
+    Some(Some((id, scan.object(at).map(|_| at))))
 }
 
 /// The header `r` starts with, `N G obj`, and `r` after it.
@@ -763,10 +753,6 @@ const DUMMY_XREF: XRef = XRef(Inner::Dummy);
 
 #[cfg(test)]
 std::thread_local! {
-    /// The entries of object streams read on this thread, which the tests bound to
-    /// show that each object stream is read once.
-    pub(crate) static OBJECT_STREAM_ENTRIES: core::cell::Cell<usize> =
-        const { core::cell::Cell::new(0) };
     /// While `Some`, how often the body of each object has been read on this thread,
     /// by the entry a read of it was made for, which the tests bound to show that
     /// loading the pages reads each object once.
@@ -779,32 +765,56 @@ std::thread_local! {
 pub struct XRef(Inner);
 
 impl XRef {
+    /// The table `map` of the file `data`, with what reading it found besides,
+    /// `rebuilt`, decrypted by `decryptor`, its trailer not read yet.
+    fn table(
+        data: PdfData,
+        rebuilt: Rebuilt,
+        map: Arc<XrefMap>,
+        decryptor: Arc<Decryptor>,
+    ) -> Self {
+        Self(Inner::Some(Arc::new(SomeRepr {
+            document: DocumentId::new(),
+            data: Arc::new(Data::new(data)),
+            layout: rebuilt.layout,
+            map,
+            unreadable: Arc::new(rebuilt.unreadable),
+            headers: Arc::new(rebuilt.headers),
+            shapes: Arc::default(),
+            decryptor,
+            has_ocgs: false,
+            metadata: Arc::new(Metadata::default()),
+            trailer_data: TrailerData::dummy(),
+        })))
+    }
+
+    /// The table's entries, which no other copy of it holds.
+    fn into_map(self) -> XrefMap {
+        let Inner::Some(repr) = self.0 else {
+            unreachable!()
+        };
+        Arc::unwrap_or_clone(Arc::unwrap_or_clone(repr).map)
+    }
+
+    /// What decrypts the document.
+    fn decryptor(&self) -> Arc<Decryptor> {
+        match &self.0 {
+            Inner::Some(repr) => repr.decryptor.clone(),
+            Inner::Dummy => Arc::new(Decryptor::None),
+        }
+    }
+
     fn new(
         data: PdfData,
-        xref_map: XrefMap,
         rebuilt: Rebuilt,
+        xref_map: XrefMap,
         input: XRefInput<'_>,
         password: &[u8],
     ) -> Result<Self, XRefError> {
         // This is a bit hacky, but the problem is we can't read the resolved trailer dictionary
         // before we actually created the xref struct. So we first create it using dummy data
         // and then populate the data.
-        let trailer_data = TrailerData::dummy();
-
-        let layout = Layout::new(&xref_map);
-        let mut xref = Self(Inner::Some(Arc::new(SomeRepr {
-            document: DocumentId::new(),
-            data: Arc::new(Data::new(data)),
-            layout,
-            map: Arc::new(xref_map),
-            unreadable: Arc::new(rebuilt.unreadable),
-            headers: Arc::new(rebuilt.headers),
-            shapes: Arc::default(),
-            decryptor: Arc::new(Decryptor::None),
-            has_ocgs: false,
-            metadata: Arc::new(Metadata::default()),
-            trailer_data,
-        })));
+        let mut xref = Self::table(data, rebuilt, Arc::new(xref_map), Arc::new(Decryptor::None));
 
         // We read the trailer twice, once to determine the encryption used and then a second
         // time to resolve the catalog dictionary, etc. This allows us to support catalog dictionaries
@@ -1145,16 +1155,6 @@ impl XRef {
         self.read(id, ctx, taken)?.cast()
     }
 
-    /// Object stream `id`, read from `ctx` as [`Self::get_with`] reads a stream, its
-    /// data cut at the place of another stream they reach ([`Taken::Contained`]).
-    pub(crate) fn object_stream_with<'a>(
-        &'a self,
-        id: ObjectIdentifier,
-        ctx: &ReaderContext<'a>,
-    ) -> Option<Stream<'a>> {
-        self.read(id, ctx, Taken::Contained)?.cast()
-    }
-
     /// Object `id`, read from `ctx` as [`Self::get_with`] reads any object, but a
     /// stream whose data cannot be read is its dictionary, as each place this is
     /// used reads it as a dictionary, if not as another kind of object.
@@ -1200,6 +1200,23 @@ impl XRef {
         taken: Taken,
     ) -> Result<Object<'a>, Unread> {
         let (place, data, slot) = self.place(repr, id, entry, entered)?;
+        self.at_place(repr, id, entry, (place, data, slot), ctx, entered, taken)
+    }
+
+    /// The object the body at `place`, in `data`, whose slot ends at `slot`, holds,
+    /// read for entry `id`, at `entry`, in `entered`, the context of the entry from
+    /// `ctx`: read once for every entry leading there and every read.
+    #[allow(clippy::too_many_arguments)]
+    fn at_place<'a>(
+        &'a self,
+        repr: &'a SomeRepr,
+        id: ObjectIdentifier,
+        entry: EntryType,
+        (place, data, slot): (Place, &'a [u8], Slot),
+        ctx: &ReaderContext<'a>,
+        entered: &ReaderContext<'a>,
+        taken: Taken,
+    ) -> Result<Object<'a>, Unread> {
         let kept = repr.shapes.get().get(&place).cloned();
         let shape = match kept {
             Some(shape) => shape,
@@ -1211,7 +1228,7 @@ impl XRef {
                     }
                 });
                 // Reading a body resolves nothing: no lock is held while it reads.
-                let shape = body::Shape::read(&data[..slot], place, entered);
+                let shape = body::Shape::read(data, slot, place, entered);
                 repr.shapes.get().entry(place).or_insert(shape).clone()
             }
         };
@@ -1267,16 +1284,17 @@ impl XRef {
     }
 
     /// Where entry `id`, at `entry`, leads, read in `entered`, the bytes the place is
-    /// in, and where in them its slot ends: at the next place an entry of the table,
-    /// or the object stream's header, names in them ([`Place`]). This reads nothing
-    /// of the file: the body is read at the place ([`body::Shape::read`]).
+    /// in, and where in them its slot ends: at the next place in them ([`Place`],
+    /// [`Layout`], [`ObjectStream::slot`]). This reads nothing of the file but,
+    /// for an object in an object stream, the stream, once ([`Self::object_stream`]):
+    /// the body is read at the place ([`body::Shape::read`]).
     fn place<'a>(
         &'a self,
         repr: &'a SomeRepr,
         id: ObjectIdentifier,
         entry: EntryType,
         entered: &ReaderContext<'a>,
-    ) -> Result<(Place, &'a [u8], usize), Unread> {
+    ) -> Result<(Place, &'a [u8], Slot), Unread> {
         let decryption = entered.decryption();
         match entry {
             EntryType::Normal(at) => {
@@ -1286,7 +1304,7 @@ impl XRef {
                     at,
                     decryption,
                 };
-                Ok((place, data, repr.layout.slot_end(data, at)))
+                Ok((place, data, Slot::to(repr.layout.slot_end(data, at))))
             }
             EntryType::ObjStream(stream, index) => {
                 // Generation number is implicitly 0.
@@ -1296,20 +1314,98 @@ impl XRef {
 
                     return Err(Unread::Lost(id));
                 }
-                let (kept, objects) = match repr.data.get_with(stream, entered) {
-                    Decoded::Stream(kept, objects) => (kept, objects),
-                    Decoded::Lost(lost) => return Err(Unread::Lost(lost)),
-                    Decoded::Rejected => return Err(Unread::Rejected),
-                };
+                let (kept, objects) = self.object_stream(repr, stream, entered)?;
                 let at = objects.offset(id, index).ok_or(Unread::Lost(id))?;
                 let place = Place {
                     source: Source::Stream(kept),
                     at,
                     decryption,
                 };
-                Ok((place, objects.data(), objects.slot_end(at)))
+                Ok((place, objects.data(), objects.slot(at)))
             }
         }
+    }
+
+    /// Object stream `stream`, read from `ctx`, decoded once for every entry leading
+    /// to its place ([`Self::decoded`]), and where it is kept. A stream the table does
+    /// not list, or cannot read, is lost, with the objects in it.
+    fn object_stream<'a>(
+        &'a self,
+        repr: &'a SomeRepr,
+        stream: ObjectIdentifier,
+        ctx: &ReaderContext<'a>,
+    ) -> Result<(usize, &'a ObjectStream), Unread> {
+        let Some(&entry) = repr.map.get(&stream) else {
+            return Err(Unread::Lost(stream));
+        };
+        // A stream in another is found by reading that one, which the chain stops
+        // where it is read already.
+        if matches!(entry, EntryType::ObjStream(..)) && ctx.rejects(&stream) {
+            return Err(Unread::Rejected);
+        }
+        let entered = Self::entered(ctx, stream, repr, entry);
+        let place = self.place(repr, stream, entry, &entered)?;
+        self.decoded(repr, stream, entry, place, ctx)
+    }
+
+    /// The object stream entry `stream`, at `entry`, leads to, at `place`, read from
+    /// `ctx` as [`Self::get_with`] reads a stream, its data cut at the place of
+    /// another stream they reach ([`Taken::Contained`]), decoded, and where it is
+    /// kept: once for every entry and every read leading to the place, and for the
+    /// rebuild of a table, which reads its object streams by their places
+    /// ([`Self::object_stream_at`]). What reading it lost is told to every read of it
+    /// ([`crate::data::Data::object_stream`]).
+    fn decoded<'a>(
+        &'a self,
+        repr: &'a SomeRepr,
+        stream: ObjectIdentifier,
+        entry: EntryType,
+        place: (Place, &'a [u8], Slot),
+        ctx: &ReaderContext<'a>,
+    ) -> Result<(usize, &'a ObjectStream), Unread> {
+        let decoded = repr.data.object_stream(place.0, stream, ctx, |ctx| {
+            if ctx.rejects(&stream) {
+                return None;
+            }
+            let entered = Self::entered(ctx, stream, repr, entry);
+            let read = |taken| self.at_place(repr, stream, entry, place, ctx, &entered, taken);
+            match read(Taken::Contained) {
+                Ok(Object::Stream(contained)) => {
+                    // Cut data end where the stream's go on.
+                    let cut = matches!(
+                        read(Taken::Whole),
+                        Ok(Object::Stream(whole))
+                            if whole.stored().len() > contained.stored().len()
+                    );
+                    ObjectStream::new(&contained, cut)
+                }
+                Ok(_) | Err(Unread::Rejected) => None,
+                Err(Unread::Lost(lost)) => {
+                    self.note(Some(lost));
+                    None
+                }
+            }
+        });
+        match decoded {
+            Decoded::Stream(kept, objects) => Ok((kept, objects)),
+            Decoded::Lost(lost) => Err(Unread::Lost(lost)),
+            Decoded::Rejected => Err(Unread::Rejected),
+        }
+    }
+
+    /// The object stream at `at` of the file, under header `header`, read as an entry
+    /// leading there reads it ([`Self::decoded`]): how the rebuild of a table reads the
+    /// object streams it finds, whatever entries the table ends with.
+    fn object_stream_at(&self, at: usize, header: ObjectIdentifier) -> Option<&ObjectStream> {
+        let Inner::Some(repr) = &self.0 else {
+            return None;
+        };
+        let ctx = ReaderContext::new(self, false);
+        let entry = EntryType::Normal(at);
+        let entered = Self::entered(&ctx, header, repr, entry);
+        let place = self.place(repr, header, entry, &entered).ok()?;
+        let (_, objects) = self.decoded(repr, header, entry, place, &ctx).ok()?;
+        Some(objects)
     }
 
     /// The entry of object `id`, and the context to read it in, reached from `ctx`:
@@ -1384,13 +1480,18 @@ struct Layout {
 impl Layout {
     /// The layout of the file whose objects `map` puts at its offsets.
     fn new(map: &XrefMap) -> Self {
-        let mut starts: Vec<usize> = map
-            .values()
-            .filter_map(|entry| match entry {
-                EntryType::Normal(at) => Some(*at),
-                EntryType::ObjStream(..) => None,
-            })
-            .collect();
+        Self::over(
+            map.values()
+                .filter_map(|entry| match entry {
+                    EntryType::Normal(at) => Some(*at),
+                    EntryType::ObjStream(..) => None,
+                })
+                .collect(),
+        )
+    }
+
+    /// The layout of the file whose objects are at `starts`.
+    fn over(mut starts: Vec<usize>) -> Self {
         starts.sort_unstable();
         starts.dedup();
         Self {
@@ -1409,18 +1510,18 @@ impl Layout {
     }
 
     /// Whether the object at `at` of the file, `data`, read in its slot, is a
-    /// stream, as reading it finds ([`body::Read::from`]).
+    /// stream, as reading it finds ([`body::Read::in_slot`]).
     fn holds_stream(&self, data: &[u8], at: usize) -> bool {
-        let mut r = Reader::new(&data[..self.slot_end(data, at)]);
-        r.jump(at);
-        let read = body::Read::from(
-            &mut r,
+        let (read, looked) = body::Read::in_slot(
+            data,
+            at,
+            Slot::to(self.slot_end(data, at)),
             true,
             |r| r.skip::<Dict<'_>>(false),
             |r| r.skip::<Object<'_>>(false),
         );
-        crate::work::read_bodies(r.offset().saturating_sub(at));
-        matches!(read, Some(body::Read::Stream { .. }))
+        crate::work::read_bodies(looked);
+        matches!(read, Some((body::Read::Stream { .. }, _)))
     }
 
     /// The data of the stream at `at` of the file, `data`, whose dictionary, `dict`,
@@ -1532,7 +1633,7 @@ impl SomeRepr {
         &self,
         data: &[u8],
         place: Place,
-        slot: usize,
+        slot: Slot,
         end: usize,
         dict: &Dict<'_>,
     ) -> Option<body::DataAt> {
@@ -1541,7 +1642,7 @@ impl SomeRepr {
         if place.source == Source::File {
             return self.layout.stream_data(data, place.at, end, dict);
         }
-        let mut r = Reader::new(&data[..slot]);
+        let mut r = Reader::new(&data[..slot.end]);
         r.jump(end);
         let stream = match Stream::by_length(&mut r, dict)? {
             Some(stream) => stream,
@@ -1997,6 +2098,9 @@ fn get_decryptor(trailer_dict: &Dict<'_>, password: &[u8]) -> Result<Decryptor, 
 /// however many of its objects are read.
 pub(crate) struct ObjectStream {
     data: Vec<u8>,
+    /// Whether the data are cut where the stream's go on ([`Taken::Contained`]),
+    /// so that their end is no end of an object.
+    cut: bool,
     /// Each object's number and offset in `data`.
     offsets: Vec<(u32, usize)>,
     /// The offsets, each once, in order: where the slot of each object ends
@@ -2008,45 +2112,56 @@ pub(crate) struct ObjectStream {
 }
 
 impl ObjectStream {
-    pub(crate) fn new(inner: &Stream<'_>) -> Option<Self> {
+    /// The object stream `inner`, whose data are `cut` where the stream's go on: a
+    /// number of its header that reaches the end of cut data may go on past it, so
+    /// the header cannot be read.
+    pub(crate) fn new(inner: &Stream<'_>, cut: bool) -> Option<Self> {
         let num_objects = inner.dict().get::<usize>(N)?;
         let first_offset = inner.dict().get::<usize>(FIRST)?;
         let data = inner.decoded().ok()?.into_owned();
 
         let mut r = Reader::new(&data);
+        let number = |r: &mut Reader<'_>| {
+            r.skip_white_spaces_and_comments();
+            let number = r.read_without_context::<usize>()?;
+            (!cut || r.offset() < data.len()).then_some(number)
+        };
 
         let mut offsets = vec![];
 
         for _ in 0..num_objects {
-            r.skip_white_spaces_and_comments();
-            // Skip object number
-            let obj_num = r.read_without_context::<u32>()?;
-            r.skip_white_spaces_and_comments();
-            let relative_offset = r.read_without_context::<usize>()?;
+            let obj_num = u32::try_from(number(&mut r)?).ok()?;
+            let relative_offset = number(&mut r)?;
             offsets.push((obj_num, first_offset.checked_add(relative_offset)?));
         }
-        #[cfg(test)]
-        OBJECT_STREAM_ENTRIES.set(OBJECT_STREAM_ENTRIES.get() + offsets.len());
+        crate::work::read_bodies(data.len());
+        crate::work::object_stream_entries(offsets.len());
         let mut starts: Vec<usize> = offsets.iter().map(|(_, at)| *at).collect();
         starts.sort_unstable();
         starts.dedup();
 
         Some(Self {
             data,
+            cut,
             offsets,
             starts,
             by_number: OnceLock::new(),
         })
     }
 
-    /// Where the slot of the object at `at` ends: at the next offset the header
-    /// lists, or the end of the data.
-    fn slot_end(&self, at: usize) -> usize {
+    /// The slot of the object at `at`: up to the next offset the header lists, or the
+    /// end of the data, which goes on unknown where they are cut.
+    fn slot(&self, at: usize) -> Slot {
         let next = self.starts.partition_point(|start| *start <= at);
-        self.starts
+        let end = self
+            .starts
             .get(next)
             .map_or(self.data.len(), |next| *next)
-            .min(self.data.len())
+            .min(self.data.len());
+        Slot {
+            end,
+            open: self.cut && end == self.data.len(),
+        }
     }
 
     /// The decoded data.
