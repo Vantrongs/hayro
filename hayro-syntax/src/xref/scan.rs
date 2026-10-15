@@ -10,8 +10,8 @@
 //! - An object reads as the reader reads it: a token that is no array or dictionary
 //!   is read by the reader itself, and an array or dictionary, at any depth, reads
 //!   its items and keys as the one reading of them that reading and skipping share
-//!   (`parse_dict_with` in `object::dict`): a name whose `#` escapes are not hex is
-//!   no key, and is skipped as an object.
+//!   (`parse_dict_with` in `object::dict`): a token in a key's place that is no
+//!   name is skipped as an object.
 //! - A literal string ends where the depth of its unescaped parentheses first falls
 //!   below the depth after its `(`. One pass over the file finds that depth after
 //!   each byte, kept as its least value in each block of the file in a tree of
@@ -422,7 +422,7 @@ impl<'a> Scan<'a> {
             Some(b'<') if self.data[at..].starts_with(b"<<") => self.container(at, at + 2, true),
             _ => {
                 // A name, string, number, keyword, `null` or boolean: read by the
-                // reader, which reads a name with escapes that are not hex as none.
+                // reader.
                 let mut r = Reader::new(self.data);
                 r.jump(at);
                 let read = r.read_with_context::<Object<'_>>(&ReaderContext::dummy());
@@ -551,8 +551,8 @@ impl<'a> Scan<'a> {
                     self.close(&mut stack, &mut at, end, false, &mut outcome);
                     continue;
                 }
-                // As reading a dictionary reads it, a name whose escapes are not hex
-                // is no key, and is skipped as an object.
+                // As reading a dictionary reads it, a token in a key's place that is
+                // no name is skipped as an object.
                 State::Key if let Some((key, end)) = self.key(at) => {
                     let frame = stack.back_mut().unwrap();
                     frame.read_keys(Keys {
@@ -763,7 +763,7 @@ mod tests {
 
     /// A file of `len` pieces of tokens, strings, escapes, comments and headers that
     /// open, close and nest in every way, and the tokens reading reads leniently:
-    /// names whose escapes are not hex, which are no keys, bad numbers, keywords,
+    /// names whose escapes are not hex, bad numbers, keywords,
     /// brackets that do not match.
     fn file(random: &mut Random, len: usize) -> Vec<u8> {
         const PIECES: &[&str] = &[

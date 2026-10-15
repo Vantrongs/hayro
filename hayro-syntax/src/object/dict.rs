@@ -381,9 +381,8 @@ std::thread_local! {
 
 /// Reads a dictionary, calling `on_entry` with each key and where its value starts,
 /// which reads the value, as an object `depth` deep: the one way a dictionary is
-/// read, whether it is kept, skipped or parsed. A key is a name whose `#` escapes
-/// are hex; another token in its place, such as a name with other escapes, is
-/// skipped as an object.
+/// read, whether it is kept, skipped or parsed. A key is a name; another token in
+/// its place is skipped as an object.
 pub(crate) fn parse_dict_with<'a, F>(
     r: &mut Reader<'a>,
     in_content_stream: bool,

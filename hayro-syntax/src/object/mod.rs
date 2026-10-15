@@ -436,8 +436,8 @@ impl<'a> Leaf<'a> for &ReaderContext<'a> {
 /// the scan that rebuilds a table read it; `make` says whether into an object or
 /// into nothing.
 ///
-/// A token that starts like a number or a name but is none, such as `1e3` or a name
-/// with an escape that is not hex, is `null` up to the next white space or delimiter.
+/// A token that starts like a number but is none, such as `1e3`, is `null` up to the
+/// next white space or delimiter.
 /// `MuPDF` reads such a number as a keyword, which is `null` as a value in an array or
 /// dictionary (`lex_number` in `MuPDF`'s `pdf-lex.c`, `pdf_parse_array` and
 /// `pdf_parse_dict` in `pdf-parse.c`), so one bad token does not lose the object
