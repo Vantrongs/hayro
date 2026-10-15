@@ -74,14 +74,6 @@ impl<'a> StrictReader<'a> {
         self.ended = None;
         self.last.rewind();
     }
-
-    /// The decoder each Flate filter reads with, in the order of the filters: a
-    /// reader made with them reads as this one does after a rewind.
-    pub(crate) fn choices(&self) -> Vec<Which> {
-        let mut choices = Vec::new();
-        self.last.choices(&mut choices);
-        choices
-    }
 }
 
 /// A filter's decoder over the data the stage before it yields.
@@ -92,9 +84,6 @@ pub(crate) trait Stage {
     fn read(&mut self, buf: &mut [u8], meter: &Meter<'_>) -> Result<usize, ReadError>;
     /// Back to the start, the stages before it too, each keeping its decoder.
     fn rewind(&mut self);
-    /// Adds the decoder of each Flate stage up to this one to `choices`, the first
-    /// stage's first.
-    fn choices(&self, choices: &mut Vec<Which>);
 }
 
 /// The stored data, decrypted.
@@ -125,8 +114,6 @@ impl Stage for Stored<'_> {
     fn rewind(&mut self) {
         self.at = 0;
     }
-
-    fn choices(&self, _: &mut Vec<Which>) {}
 }
 
 /// How many bytes a decoder that takes them a few at a time is given from the stage
@@ -294,7 +281,7 @@ enum Found {
 
 /// A Flate decoder, in the order whole decoding tries them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Which {
+enum Which {
     #[cfg(feature = "unsafe")]
     Zlib,
     #[cfg(feature = "unsafe")]
@@ -369,9 +356,8 @@ impl<'a> Mode<'a> {
 }
 
 impl<'a> Flate<'a> {
-    /// A stage reading with decoder `which`, by default the first.
-    pub(crate) fn new(from: Box<dyn Stage + 'a>, which: Option<Which>) -> Self {
-        let which = which.unwrap_or_else(Which::first);
+    pub(crate) fn new(from: Box<dyn Stage + 'a>) -> Self {
+        let which = Which::first();
         Self {
             mode: Mode::new(Pulled::new(from), which),
             which,
@@ -488,17 +474,6 @@ impl Stage for Flate<'_> {
     fn rewind(&mut self) {
         self.start(self.which, true);
     }
-
-    fn choices(&self, choices: &mut Vec<Which>) {
-        let from = match &self.mode {
-            #[cfg(feature = "unsafe")]
-            Mode::Inflating { input, .. } => &input.from,
-            Mode::Permissive(stream) => &stream.input.from,
-            Mode::Switching => unreachable!("a stage between decoders is not read"),
-        };
-        from.choices(choices);
-        choices.push(self.which);
-    }
 }
 
 /// A predictor reversed row by row, as `apply_predictor` reverses it, which never
@@ -562,10 +537,6 @@ impl Stage for Predict<'_> {
     fn rewind(&mut self) {
         self.from.rewind();
         self.start_over();
-    }
-
-    fn choices(&self, choices: &mut Vec<Which>) {
-        self.from.choices(choices);
     }
 }
 
@@ -684,10 +655,6 @@ impl Stage for Bytewise<'_> {
     fn rewind(&mut self) {
         self.input.rewind();
         self.start_over();
-    }
-
-    fn choices(&self, choices: &mut Vec<Which>) {
-        self.input.from.choices(choices);
     }
 }
 

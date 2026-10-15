@@ -354,18 +354,6 @@ impl<'a> Stream<'a> {
         &self,
         meter: &Meter<'_>,
     ) -> Result<Option<StrictReader<'a>>, DecodeFailure> {
-        self.decoded_strict_reader_chosen(meter, &[])
-    }
-
-    /// [`Self::decoded_strict_reader`], each Flate filter read with the decoder
-    /// `chosen` names for it ([`StrictReader::choices`]), the first where it names
-    /// none.
-    pub(crate) fn decoded_strict_reader_chosen(
-        &self,
-        meter: &Meter<'_>,
-        chosen: &[chain::Which],
-    ) -> Result<Option<StrictReader<'a>>, DecodeFailure> {
-        let mut chosen = chosen.iter().copied();
         let FiltersAndParams { filters, params } = self.filters_and_params();
         let predictors = || {
             filters
@@ -397,10 +385,9 @@ impl<'a> Stream<'a> {
                 // Decrypted with the stored data.
                 Filter::Crypt => stage,
                 Filter::FlateDecode => {
-                    let Some(stage) = chain::predicted(
-                        Box::new(chain::Flate::new(stage, chosen.next())),
-                        &predictor,
-                    ) else {
+                    let Some(stage) =
+                        chain::predicted(Box::new(chain::Flate::new(stage)), &predictor)
+                    else {
                         return Ok(None);
                     };
                     stage

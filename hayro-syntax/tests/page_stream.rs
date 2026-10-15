@@ -118,16 +118,49 @@ fn content_written_as_it_is_decoded_restarts_where_a_stream_does() {
             )
             .unwrap();
         assert!(written == expected, "{contents}: {} bytes", written.len());
-        // zlib rejects the data after it was written, raw deflate before any is; the
-        // permissive decoder reads it.
-        let (least, most) = if cfg!(feature = "unsafe") {
-            (1, 4)
-        } else {
-            (0, 0)
-        };
-        assert!(
-            (least..=most).contains(&restarts),
-            "{contents}: {restarts} restarts"
-        );
+        // zlib rejects the data after it was written; the permissive decoder reads it.
+        let expected = usize::from(cfg!(feature = "unsafe"));
+        assert_eq!(restarts, expected, "{contents}");
     }
+}
+
+/// Content of many streams that each turn out corrupt for zlib after their data
+/// restarts once: what is written and decoded doubles with the streams.
+#[test]
+#[cfg(debug_assertions)]
+fn content_of_many_restarting_streams_restarts_once() {
+    use hayro_syntax::page::ContentPiece;
+    use hayro_syntax::work::{Meter, TOLD};
+
+    let [small, large] = [64, 128].map(|n| {
+        let objects: Vec<_> = (0..n)
+            .map(|i| {
+                let text: Vec<u8> = common::noise(4096, i)
+                    .iter()
+                    .map(|b| b'a' + b % 26)
+                    .collect();
+                common::stream("/Filter /FlateDecode", &bad_checksum(&text))
+            })
+            .collect();
+        let parts: String = (0..n).map(|i| format!("{} 0 R ", 4 + i)).collect();
+        let entries = format!("/Contents [{parts}]");
+        let pdf = Pdf::new(common::one_page(100, &entries, objects)).unwrap();
+        let (mut written, mut restarts) = (0, 0);
+        TOLD.set(0);
+        pdf.pages()[0]
+            .try_page_stream_to(
+                &mut |piece| match piece {
+                    ContentPiece::Data(data) => written += data.len(),
+                    ContentPiece::Restart => restarts += 1,
+                },
+                &Meter::default(),
+            )
+            .unwrap();
+        assert!(restarts <= 1, "{n} streams: {restarts} restarts");
+        (written, TOLD.get())
+    });
+    assert!(
+        large.0 <= small.0 * 25 / 10 && large.1 <= small.1 * 25 / 10,
+        "64 streams: {small:?}, 128: {large:?} (written, work)"
+    );
 }

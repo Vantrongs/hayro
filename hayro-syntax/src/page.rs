@@ -10,7 +10,7 @@ use crate::object::Rect;
 use crate::object::Stream;
 use crate::object::array::ArrayIter;
 use crate::object::dict::keys::*;
-use crate::object::stream::{DecodeFailure, ReadError};
+use crate::object::stream::{DecodeFailure, ReadError, StrictReader};
 use crate::object::{MaybeRef, Null, Object, ObjectIdentifier};
 use crate::reader::ReaderContext;
 use crate::sync::{Arc, OnceLock};
@@ -395,6 +395,40 @@ impl<'a> Decoded<'a> {
 /// again; those of streams that decode to more are decoded each time they are named.
 const CONTENT_KEPT: usize = 1 << 20;
 
+/// The most decoded bytes of a stream [`Page::try_page_stream_to`] holds before it
+/// writes them, once the content restarted; a stream that decodes to more is read
+/// to its end, then again as it is written.
+const CONTENT_HELD: usize = 1 << 20;
+
+/// The data `reader` reads, where they are at most [`CONTENT_HELD`] bytes; `None`
+/// once it read more to their end, so that, rewound, it reads them with no restart.
+fn held(
+    reader: &mut StrictReader<'_>,
+    buf: &mut [u8],
+    meter: &Meter<'_>,
+) -> Result<Option<Vec<u8>>, DecodeFailure> {
+    let mut data = Some(Vec::new());
+    loop {
+        match reader.read(buf, meter) {
+            Ok(0) => return Ok(data),
+            Ok(n) => match &mut data {
+                Some(d) if d.len() + n <= CONTENT_HELD => d.extend_from_slice(&buf[..n]),
+                _ => data = None,
+            },
+            Err(ReadError::Restarted) => data = Some(Vec::new()),
+            Err(error) => return Err(failure(error)),
+        }
+    }
+}
+
+/// Why decoding stopped, where reading it did for `error`.
+fn failure(error: ReadError) -> DecodeFailure {
+    match error {
+        ReadError::Cancelled => DecodeFailure::Cancelled,
+        ReadError::Restarted | ReadError::Failed => DecodeFailure::StreamDecode,
+    }
+}
+
 /// A piece of a page's content, written as it is decoded
 /// ([`Page::try_page_stream_to`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -403,7 +437,7 @@ pub enum ContentPiece<'d> {
     Data(&'d [u8]),
     /// Every piece written before is void, and the content is written again from its
     /// start: a stream turned out corrupt for the decoder that read it, and is read
-    /// with the next one decoding whole would try.
+    /// with the next one decoding whole would try. At most once for a content.
     Restart,
 }
 
@@ -581,8 +615,9 @@ impl<'a> Page<'a> {
     /// and buffers of [`POLL_BYTES`], however much the content's filters make of its
     /// data and however they nest, and up to 1 MiB of the streams an array of
     /// contents names more than once, each decoded once if it fits. The pieces after
-    /// the last [`ContentPiece::Restart`] are the content; on an error, `out` was
-    /// given part of it.
+    /// the [`ContentPiece::Restart`], if there is one, are the content: once it
+    /// restarted, each stream is held, up to 1 MiB, or read twice, before it is
+    /// written. On an error, `out` was given part of the content.
     pub fn try_page_stream_to(
         &self,
         out: &mut dyn FnMut(ContentPiece<'_>),
@@ -621,12 +656,12 @@ impl<'a> Page<'a> {
         // The data of parts named more than once, `None` for a `null` one.
         let mut kept = hash::Map::<ContentKey<'a>, Option<Vec<u8>>>::default();
         let mut kept_bytes = 0;
-        // The decoders each part's filters read with, once a restart chose them.
-        let mut chosen = vec![Vec::new(); parts.len()];
         let mut buf = vec![0; POLL_BYTES];
+        // Whether the content restarted.
+        let mut careful = false;
         'content: loop {
             let mut written = false;
-            for (i, (part, key)) in parts.iter().zip(&keys).enumerate() {
+            for (part, key) in parts.iter().zip(&keys) {
                 let (id, object) = resolved(part)?;
                 if let Some(data) = key.and_then(|key| kept.get(&key)) {
                     if let Some(data) = data {
@@ -658,15 +693,35 @@ impl<'a> Page<'a> {
                     Some(c) if c.len() + data.len() <= room => c.extend_from_slice(data),
                     _ => *copy = None,
                 };
-                match stream
-                    .decoded_strict_reader_chosen(meter, &chosen[i])
-                    .map_err(failed)?
-                {
+                match stream.decoded_strict_reader(meter).map_err(failed)? {
                     None => {
                         let data = stream.decoded_strict_metered(meter).map_err(failed)?;
                         out(ContentPiece::Data(&data));
                         written = true;
                         keep(&mut copy, &data);
+                    }
+                    // After a restart, each part is read to its end before it is
+                    // written, so that the content restarts once: written again
+                    // each time, the parts before would make it quadratic.
+                    Some(mut reader) if careful => {
+                        let held = held(&mut reader, &mut buf, meter).map_err(failed)?;
+                        if let Some(data) = held {
+                            out(ContentPiece::Data(&data));
+                            keep(&mut copy, &data);
+                        } else {
+                            reader.rewind();
+                            loop {
+                                match reader.read(&mut buf, meter) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        out(ContentPiece::Data(&buf[..n]));
+                                        keep(&mut copy, &buf[..n]);
+                                    }
+                                    // A reading to the end is read again with no restart.
+                                    Err(error) => return Err(failed(failure(error))),
+                                }
+                            }
+                        }
                     }
                     Some(mut reader) => loop {
                         match reader.read(&mut buf, meter) {
@@ -676,22 +731,17 @@ impl<'a> Page<'a> {
                                 written = true;
                                 keep(&mut copy, &buf[..n]);
                             }
+                            Err(ReadError::Restarted) if written => {
+                                out(ContentPiece::Restart);
+                                careful = true;
+                                continue 'content;
+                            }
                             Err(ReadError::Restarted) => {
-                                chosen[i] = reader.choices();
-                                if written {
-                                    out(ContentPiece::Restart);
-                                    continue 'content;
-                                }
                                 if let Some(c) = &mut copy {
                                     c.clear();
                                 }
                             }
-                            Err(ReadError::Failed) => {
-                                return Err(failed(DecodeFailure::StreamDecode));
-                            }
-                            Err(ReadError::Cancelled) => {
-                                return Err(failed(DecodeFailure::Cancelled));
-                            }
+                            Err(error) => return Err(failed(failure(error))),
                         }
                     },
                 }
