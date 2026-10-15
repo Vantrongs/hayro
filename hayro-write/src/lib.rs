@@ -653,7 +653,7 @@ fn write_form<'a>(
     } else {
         &[TYPE, SUBTYPE, BBOX, MATRIX, RESOURCES]
     };
-    primitive::write_stream_dict(stream.dict(), form.deref_mut(), ctx, skip);
+    primitive::write_stream_dict(&stream, form.deref_mut(), ctx, skip);
     let [x0, y0, x1, y1] = placement.bbox;
     form.bbox(Rect::new(x0, y0, x1, y1));
     form.matrix(placement.matrix);

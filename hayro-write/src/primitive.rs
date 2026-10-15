@@ -1,8 +1,9 @@
 use crate::{ExtractionContext, ExtractionError};
+use hayro_syntax::Filter;
 use hayro_syntax::hash;
 use hayro_syntax::object;
 use hayro_syntax::object::dict::keys::{
-    AF, CRYPT, DECODE_PARMS, FILTER, LAST_MODIFIED, LENGTH, METADATA, OC, OPI, PIECE_INFO, PT_DATA,
+    AF, DECODE_PARMS, DP, FILTER, LAST_MODIFIED, LENGTH, METADATA, OC, OPI, PIECE_INFO, PT_DATA,
     REF, STRUCT_PARENT, STRUCT_PARENTS,
 };
 use hayro_syntax::object::{MaybeRef, Null, Number, ObjectIdentifier, Stream};
@@ -81,7 +82,7 @@ fn first_target(source: object::ObjRef, ctx: &mut ExtractionContext<'_>) -> Opti
         };
         let mut scratch = Chunk::new();
         let mut dict = scratch.indirect(Ref::new(1)).dict();
-        write_stream_dict(stream.dict(), &mut dict, ctx, &[]);
+        write_stream_dict(stream, &mut dict, ctx, &[]);
         dict.finish();
         let _ = ctx.meter.work(scratch.len() + data.len());
         // Hashed with the map's random keys, as the key it is part of is.
@@ -258,60 +259,52 @@ impl WriteIndirect for Stream<'_> {
             }
         };
         let mut obj = chunk.stream(id, &data);
-        write_stream_dict(self.dict(), obj.deref_mut(), ctx, &[]);
+        write_stream_dict(self, obj.deref_mut(), ctx, &[]);
     }
 }
 
-/// Copies the dictionary of a stream whose data is copied decrypted, leaving out
+/// Copies the dictionary of `stream`, whose data is copied decrypted, leaving out
 /// `skip`, the length and any /Crypt filter with its parameters: the copy is not
-/// encrypted.
+/// encrypted. Where a /Crypt filter is left out, the filters kept are written as
+/// /Filter and their parameters, each in its filter's place, as `/DecodeParms`, as the
+/// stream's own filters are read with theirs ([`Stream::filter_entries`]).
 pub(crate) fn write_stream_dict(
-    hayro_dict: &dict::Dict<'_>,
+    stream: &Stream<'_>,
     pdf_dict: &mut Dict<'_>,
     ctx: &mut ExtractionContext<'_>,
     skip: &[&[u8]],
 ) {
-    let is_crypt = |name: &object::Name<'_>| name.deref() == CRYPT;
-    let filters = hayro_dict.get::<Object<'_>>(FILTER);
-    let crypt = match &filters {
-        Some(Object::Name(name)) => is_crypt(name),
-        Some(Object::Array(filters)) => filters.iter::<object::Name<'_>>().any(|n| is_crypt(&n)),
-        _ => false,
-    };
+    let hayro_dict = stream.dict();
+    let filters = stream.filter_entries();
     let mut skipped = STREAM_KEYS.to_vec();
     skipped.extend_from_slice(skip);
-    if !crypt {
+    if !filters.applied().any(|(f, _)| f == Filter::Crypt) {
         write_dict(hayro_dict, pdf_dict, ctx, &skipped);
         return;
     }
-    skipped.extend_from_slice(&[FILTER, DECODE_PARMS]);
+    skipped.extend_from_slice(&[filters.key, FILTER, DECODE_PARMS, DP]);
     write_dict(hayro_dict, pdf_dict, ctx, &skipped);
-    // Only an array of filters keeps some; the parameters keep their places.
-    let Some(Object::Array(filters)) = filters else {
-        return;
+    let kept = || {
+        filters
+            .entries()
+            .filter(|e| e.filter != Some(Filter::Crypt))
     };
-    let params = hayro_dict.get::<array::Array<'_>>(DECODE_PARMS);
-    // Whether each entry, in its place, is kept.
-    let kept: Vec<bool> = filters
-        .items::<Object<'_>>()
-        .map(|f| !matches!(f, Some(Object::Name(n)) if is_crypt(&n)))
-        .collect();
-    if !kept.contains(&true) {
+    if kept().next().is_none() {
         return;
     }
-    let kept = |i: usize| kept.get(i) == Some(&true);
     let mut out = pdf_dict.insert(pdf_writer::Name(FILTER)).array();
-    for (i, filter) in filters.raw_iter().enumerate() {
-        if kept(i) {
-            filter.write_direct(out.push(), ctx);
-        }
+    for entry in kept() {
+        entry.written.write_direct(out.push(), ctx);
     }
     out.finish();
-    if let Some(params) = params {
+    if kept().any(|e| e.params_written.is_some()) {
         let mut out = pdf_dict.insert(pdf_writer::Name(DECODE_PARMS)).array();
-        for (i, param) in params.raw_iter().enumerate() {
-            if kept(i) {
-                param.write_direct(out.push(), ctx);
+        for entry in kept() {
+            match &entry.params_written {
+                Some(params) => params.write_direct(out.push(), ctx),
+                None => {
+                    out.push().primitive(pdf_writer::Null);
+                }
             }
         }
     }

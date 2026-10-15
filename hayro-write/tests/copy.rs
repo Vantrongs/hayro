@@ -263,6 +263,73 @@ fn crypt_filters_are_left_out_of_the_copy() {
     );
 }
 
+/// A /Crypt filter left out of a copy takes its parameters with it, however the
+/// filters and their parameters are written: each filter kept is read with the
+/// parameters it was read with in the source, as `PyMuPDF` 1.28.2 reads them (an
+/// entry of the filters that names none keeps its place; `/DP` is read before
+/// `/DecodeParms`).
+#[test]
+fn crypt_filters_are_left_out_with_the_parameters_in_their_places() {
+    const CONTENT: &[u8] = b"0 0 10 10 re f";
+    // Two rows of 7 bytes under PNG filter 0.
+    let rows = [b"\0".as_slice(), &CONTENT[..7], b"\0", &CONTENT[7..]].concat();
+    let data = fixtures::stored_zlib(&rows, 64);
+    let predictor = "<< /Predictor 12 /Columns 7 >>";
+    let forms = [
+        format!("/Filter [null /Crypt /FlateDecode] /DP [null null {predictor}]"),
+        format!("/Filter [null /Crypt /FlateDecode] /DecodeParms [null null {predictor}]"),
+        format!(
+            "/Filter [/Crypt null /FlateDecode] /DP [<< /Name /Identity >> null {predictor}] \
+             /DecodeParms [<< /Predictor 1 >>]"
+        ),
+        "/Filter [/Crypt /FlateDecode] /DecodeParms 9 0 R".to_string(),
+        "/Filter [/Crypt 1 /FlateDecode] /DP [null 10 0 R 10 0 R]".to_string(),
+    ];
+    let mut objects: Vec<Vec<u8>> = forms
+        .iter()
+        .map(|entries| {
+            fixtures::stream(
+                &format!("/Type /XObject /Subtype /Form /BBox [0 0 9 9] {entries}"),
+                &data,
+            )
+        })
+        .collect();
+    objects.push(format!("[null {predictor}]").into_bytes());
+    objects.push(predictor.as_bytes().to_vec());
+    let names: String = (0..forms.len())
+        .map(|i| format!("/X{i} {} 0 R ", i + 4))
+        .collect();
+    let source = Pdf::new(fixtures::one_page(
+        200,
+        &format!("/Resources << /XObject << {names}>> >>"),
+        objects,
+    ))
+    .unwrap();
+    for number in 4..4 + forms.len() as i32 {
+        let stream: Stream<'_> = source.xref().get(ObjRef::new(number, 0).into()).unwrap();
+        assert_eq!(
+            stream.decoded().unwrap().as_ref(),
+            CONTENT,
+            "source {number}"
+        );
+    }
+    let result = run(&source, &[ExtractionQuery::new_page(0)]).unwrap();
+    let copy = reread(&result);
+    let text = String::from_utf8_lossy(result.chunk.as_bytes()).into_owned();
+    assert!(!text.contains("Crypt"), "{text}");
+    assert!(!text.contains("/DP"), "{text}");
+    let x_objects = copied_dict(&copy, result.root_refs[0].unwrap())
+        .get::<Dict<'_>>(b"Resources")
+        .and_then(|r| r.get::<Dict<'_>>(b"XObject"))
+        .expect("the copy draws the forms");
+    for (i, entries) in forms.iter().enumerate() {
+        let form = x_objects
+            .get::<Stream<'_>>(format!("X{i}").as_bytes())
+            .expect("a copied form");
+        assert_eq!(form.decoded().unwrap().as_ref(), CONTENT, "{entries}");
+    }
+}
+
 #[test]
 fn a_page_whose_content_cannot_be_read_is_an_error() {
     let source = Pdf::new(fixtures::one_page(
@@ -435,7 +502,7 @@ fn pages_drawn_with_entries_leading_to_one_object_are_copied_with_its_colors() {
                         .and_then(|r| r.get::<Dict<'_>>(b"ColorSpace"))
                         .and_then(|c| c.get::<Array<'_>>(b"CS"))
                         .expect("the copy is drawn with /CS");
-                    let palette = match space.iter::<Object<'_>>().nth(3) {
+                    let palette = match space.items::<Object<'_>>().nth(3).flatten() {
                         Some(Object::String(palette)) => palette.to_vec(),
                         other => panic!("no palette: {other:?}"),
                     };
