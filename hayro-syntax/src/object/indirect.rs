@@ -22,7 +22,7 @@ where
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         r.skip::<ObjectIdentifier>(false)?;
         r.skip_white_spaces_and_comments();
-        let inner = r.read_with_context::<T>(ctx)?;
+        let inner = T::read_indirect(r, ctx)?;
         r.skip_white_spaces_and_comments();
         // We are lenient and don't require it.
         r.forward_tag(b"endobj");

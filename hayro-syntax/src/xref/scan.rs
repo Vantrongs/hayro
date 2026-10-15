@@ -43,9 +43,8 @@
 //! (`scan_ends_objects_as_reading_them_does`).
 
 use crate::object::dict::keys::{ROOT, TYPE};
-use crate::object::name::skip_name_like;
-use crate::object::{MAX_OBJECT_NESTING_DEPTH, Name, Null, Number, ObjRef, Object};
-use crate::reader::{Reader, ReaderContext, ReaderExt, Skippable};
+use crate::object::{MAX_OBJECT_NESTING_DEPTH, Name, ObjRef, Object, Skip, leaf};
+use crate::reader::{Reader, ReaderContext, ReaderExt};
 use crate::sync::FxHashMap;
 use crate::trivia::{is_eol_character, is_white_space_character};
 use alloc::collections::VecDeque;
@@ -295,16 +294,6 @@ impl Frame {
     }
 }
 
-/// A token of regular characters that is no other object, which reading an object
-/// skips (`skip_name_like` without a solidus).
-struct Keyword;
-
-impl Skippable for Keyword {
-    fn skip(r: &mut Reader<'_>, _: bool) -> Option<()> {
-        skip_name_like(r, false)
-    }
-}
-
 /// What a token at an offset is.
 enum Token {
     /// A token that ends at the offset.
@@ -458,40 +447,47 @@ impl<'a> Scan<'a> {
     }
 
     /// The token at `at`, read as an item of an array or a dictionary's value where
-    /// `reference`, which may be a reference, or as an object.
+    /// `reference`, which may be a reference, or as an object: as skipping it reads
+    /// it, but for a literal string, whose end is looked up.
     fn token(&self, at: usize, reference: bool) -> Token {
-        if reference && let Some(end) = self.skipped::<ObjRef>(at) {
+        if reference && let Some(end) = self.skipped(at, |r| r.skip::<ObjRef>(false)) {
             return Token::Ends(end);
         }
-        let skipped = match self.data.get(at) {
-            None => None,
-            Some(b'n') => self.skipped::<Null>(at),
-            Some(b't' | b'f') => self.skipped::<bool>(at),
-            Some(b'/') => self.skipped::<Name<'_>>(at),
-            Some(b'<') if self.data[at..].starts_with(b"<<") => return Token::Opens(at + 2, true),
-            Some(b'<') => self.skipped::<crate::object::String<'_>>(at),
-            Some(b'(') => {
-                return self
-                    .strings
-                    .end(self.data, at)
-                    .map_or(Token::Fails, Token::String);
-            }
-            Some(b'[') => return Token::Opens(at + 1, false),
-            Some(b'.' | b'+' | b'-' | b'0'..=b'9') => self
-                .skipped::<Number>(at)
-                .or_else(|| self.skipped::<Keyword>(at)),
-            Some(_) => self.skipped::<Keyword>(at),
-        };
-        skipped.map_or(Token::Fails, Token::Ends)
+        match self.data.get(at) {
+            None => Token::Fails,
+            Some(b'<') if self.data[at..].starts_with(b"<<") => Token::Opens(at + 2, true),
+            Some(b'[') => Token::Opens(at + 1, false),
+            Some(b'(') => self
+                .strings
+                .end(self.data, at)
+                .map_or(Token::Fails, Token::String),
+            Some(_) => self
+                .skipped(at, |r| leaf(r, false, Skip))
+                .map_or(Token::Fails, Token::Ends),
+        }
     }
 
-    /// Where a `T` at `at` ends, if one is there, counting the bytes skipping it reads.
-    fn skipped<T: Skippable>(&self, at: usize) -> Option<usize> {
+    /// The name at `at`, read as reading a dictionary reads a key, and where it ends.
+    fn key(&self, at: usize) -> Option<(Name<'a>, usize)> {
         let mut r = Reader::new(self.data);
         r.jump(at);
-        let skipped = T::skip(&mut r, false);
+        let key = r.read_without_context::<Name<'a>>();
         step(r.offset() - at + 1);
-        skipped.map(|()| r.offset())
+        key.map(|key| (key, r.offset()))
+    }
+
+    /// Where what `skip` reads at `at` ends, if it reads one, counting the bytes it
+    /// reads.
+    fn skipped<T>(
+        &self,
+        at: usize,
+        skip: impl FnOnce(&mut Reader<'a>) -> Option<T>,
+    ) -> Option<usize> {
+        let mut r = Reader::new(self.data);
+        r.jump(at);
+        let skipped = skip(&mut r);
+        step(r.offset() - at + 1);
+        skipped.map(|_| r.offset())
     }
 
     /// The outcome known for the `[` or `<<` at `at`.
@@ -555,25 +551,16 @@ impl<'a> Scan<'a> {
                     self.close(&mut stack, &mut at, end, false, &mut outcome);
                     continue;
                 }
-                State::Key if self.data.get(at) == Some(&b'/') => {
-                    let mut r = Reader::new(self.data);
-                    r.jump(at);
-                    let name = r.skip::<Name<'_>>(false).unwrap_or_default();
-                    step(name.len());
+                // As reading a dictionary reads it, a name whose escapes are not hex
+                // is no key, and is skipped as an object.
+                State::Key if let Some((key, end)) = self.key(at) => {
                     let frame = stack.back_mut().unwrap();
-                    // As reading a dictionary reads it, a name whose escapes are not
-                    // hex is no key, and is skipped as an object.
-                    match Name::new(&name[1..]) {
-                        Some(key) => {
-                            frame.read_keys(Keys {
-                                root: key.as_ref() == ROOT,
-                                kind: key.as_ref() == TYPE,
-                            });
-                            frame.value = true;
-                        }
-                        None => frame.value = false,
-                    }
-                    at = r.offset();
+                    frame.read_keys(Keys {
+                        root: key.as_ref() == ROOT,
+                        kind: key.as_ref() == TYPE,
+                    });
+                    frame.value = true;
+                    at = end;
                     continue;
                 }
                 State::Key => self.token(at, false),
@@ -753,9 +740,11 @@ impl<'a> Scan<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Syntax, read_object};
+    use super::super::{Syntax, object_in, read_object, scan_header};
     use super::*;
     use crate::object::Dict;
+    use crate::object::ObjectIdentifier;
+    use crate::object::indirect::IndirectObject;
     use alloc::string::String;
 
     /// A generator of pseudo-random numbers, the same in every run.
@@ -811,6 +800,8 @@ mod tests {
             "obj",
             "endobj",
             "stream",
+            "endstream",
+            "<< /Length 1 >> stream\n",
             "null",
             "true",
             "fals",
@@ -837,6 +828,31 @@ mod tests {
             "<< /B#zz >>",
             "<< /B#zz /Root 1 0 R >>",
             "<< /A ( /Root \\( ) /Root 1 0 R >>",
+            // Numbers and headers with signs where a number ends, and other tokens
+            // that start like numbers or names.
+            "3-",
+            "0-",
+            "3- 0 obj",
+            "3 0- obj",
+            "+3 -0 obj",
+            "3.0 0 obj",
+            "-1 0 obj",
+            "99999999999 0 obj",
+            "4- 0 R",
+            "4 0- R",
+            "1.0 0 R",
+            "-x",
+            "+ ",
+            "-(",
+            "+<",
+            "1.5-",
+            "1-.5",
+            "--",
+            ".-",
+            "/a#zz",
+            "/a#4",
+            "/",
+            "#zz",
         ];
         let mut out = String::new();
         for _ in 0..len {
@@ -871,6 +887,51 @@ mod tests {
             root: dict.is_some_and(|dict| dict.contains_key(ROOT)),
             kind: dict.is_some_and(|dict| dict.contains_key(TYPE)),
         })
+    }
+
+    /// What reading the object at `at` of `data` after its header finds, as an
+    /// entry's object is read (`Syntax::read_from`) and as `XRef::get_with` reads
+    /// one that is not a stream (`IndirectObject`), which agree: where the object
+    /// ends.
+    fn headed_read(data: &[u8], at: usize) -> Option<usize> {
+        let mut r = Reader::new(data);
+        r.jump(at);
+        let syntax = Syntax::read_from(&mut r, true, &ReaderContext::dummy());
+        let end = r.offset();
+        if !matches!(syntax, Some(Syntax::Stream { .. })) {
+            let mut indirect = Reader::new(data);
+            indirect.jump(at);
+            let read =
+                indirect.read_with_context::<IndirectObject<Object<'_>>>(&ReaderContext::dummy());
+            assert_eq!(read.is_some(), syntax.is_some(), "at {at}");
+        }
+        syntax.map(|_| end)
+    }
+
+    /// The header at `at` of `data` and whether its object is read, as rebuilding a
+    /// table finds them (`scan_header`, then the scan).
+    fn headed_rebuilt(data: &[u8], scan: &mut Scan<'_>, at: usize) -> Option<ObjectIdentifier> {
+        let mut r = Reader::new(data);
+        r.jump(at);
+        let header = scan_header(&mut r)?;
+        scan.object(r.offset()).map(|_| header)
+    }
+
+    /// Reads every item of `object`, an array or dictionary, and of those in it.
+    fn read_items(object: Object<'_>) {
+        match object {
+            Object::Array(array) => array.raw_iter().for_each(|item| {
+                if let crate::object::MaybeRef::NotRef(item) = item {
+                    read_items(item);
+                }
+            }),
+            Object::Dict(dict) => dict.entries().for_each(|(_, item)| {
+                if let crate::object::MaybeRef::NotRef(item) = item {
+                    read_items(item);
+                }
+            }),
+            _ => {}
+        }
     }
 
     /// Where the object at `at` of `data` ends as checking a table reads it, which
@@ -951,6 +1012,36 @@ mod tests {
             {
                 assert_eq!(checked, Some(read.end), "case {case}");
             }
+            // The items of an array and the entries of a dictionary read, at any
+            // depth, as skipping the array or dictionary read them.
+            let mut r = Reader::new(&data);
+            r.jump(at);
+            if let Some(object) = r.read_with_context::<Object<'_>>(&ReaderContext::dummy()) {
+                read_items(object);
+            }
+            // An object after a header: its header and object are read alike by
+            // checking the table, on the whole rest of the file and up to an offset,
+            // by rebuilding it, and by reading the object.
+            let read = headed_read(&data, at);
+            let header = Reader::new(&data[at..]).read_without_context::<ObjectIdentifier>();
+            assert_eq!(
+                object_in(&data[at..]),
+                read.and(header),
+                "case {case}, header check at {at} of {:?}",
+                shown()
+            );
+            assert_eq!(
+                object_in(&data[at..next]),
+                headed_read(&data[..next], at).and(header),
+                "case {case}, header check at {at} to {next} of {:?}",
+                shown()
+            );
+            assert_eq!(
+                headed_rebuilt(&data, &mut scan, at),
+                read.and(header),
+                "case {case}, header scan at {at} of {:?}",
+                shown()
+            );
         }
     }
 }

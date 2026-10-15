@@ -90,11 +90,18 @@ fn kids_stored(entries: usize) {
 }
 
 /// A state for each /Kids array a walk of the page tree reads: the nodes whose
-/// /Kids is the same object share one, so that the walk reads the array once
-/// however many nodes list it. The walks read /Kids only through this.
+/// /Kids is read from the same bytes share one, whether it is one object or written
+/// into one node's dictionary, under any of the entries of a damaged table that lead
+/// to it, so that the walk reads the array once however many nodes list it. The walks
+/// read /Kids only through this.
+///
+/// The state's kids are read in the context of the first node that reads them: a
+/// page written into the array is read in each listing node's ([`Self::own`]), but a
+/// node written into it is one node, walked once, though another entry leading to the
+/// array would decrypt its strings with another key.
 struct KidsStates<T> {
     states: Vec<T>,
-    shared: FxHashMap<ObjectIdentifier, usize>,
+    shared: FxHashMap<(usize, usize), usize>,
 }
 
 impl<T> Default for KidsStates<T> {
@@ -108,24 +115,40 @@ impl<T> Default for KidsStates<T> {
 
 impl<T> KidsStates<T> {
     /// The index of the state of `node`'s /Kids, made by `new` from its entries if
-    /// there is none.
-    fn of<'a>(&mut self, node: &Node<'a>, new: impl FnOnce(ArrayIter<'a>) -> T) -> usize {
-        // The object of the /Kids array, which other nodes may list too; `None` for
-        // an array written into the node, which only it lists.
-        let id = match node.dict().get_raw::<Object<'a>>(KIDS) {
-            Some(MaybeRef::Ref(kids)) => Some(ObjectIdentifier::from(kids)),
-            _ => None,
+    /// there is none, and the array, read in the node's context.
+    fn of<'a>(
+        &mut self,
+        node: &Node<'a>,
+        objects: &mut Objects<'a>,
+        new: impl FnOnce(ArrayIter<'a>, &mut Objects<'a>) -> T,
+    ) -> (usize, Array<'a>) {
+        let kids = objects
+            .get(node.dict(), KIDS)
+            .and_then(Object::into_array)
+            .unwrap_or_default();
+        let bytes = kids.data();
+        let at = match self.shared.get(&(bytes.as_ptr() as usize, bytes.len())) {
+            Some(at) => *at,
+            None => {
+                let at = self.states.len();
+                self.states.push(new(kids.raw_iter(), objects));
+                // An empty array is no object's bytes.
+                if !bytes.is_empty() {
+                    self.shared
+                        .insert((bytes.as_ptr() as usize, bytes.len()), at);
+                }
+                at
+            }
         };
-        if let Some(at) = id.and_then(|id| self.shared.get(&id)) {
-            return *at;
+        (at, kids)
+    }
+
+    /// `kid`, read from the array of a state as the node listing `kids` reads it.
+    fn own<'a>(kid: &Node<'a>, kids: &Array<'a>) -> Node<'a> {
+        match kid.id() {
+            None if kid.is_dict() => Node::page(None, &kid.dict().in_context(kids.ctx())),
+            _ => kid.clone(),
         }
-        let at = self.states.len();
-        let kids = node.dict().get::<Array<'a>>(KIDS).unwrap_or_default();
-        self.states.push(new(kids.raw_iter()));
-        if let Some(id) = id {
-            self.shared.insert(id, at);
-        }
-        at
     }
 }
 
@@ -137,11 +160,12 @@ type Listed<'a> = (Node<'a>, Option<usize>);
 // in a cycle or in a /Kids array that two nodes share, adds nothing, which keeps the
 // walk linear in the file. A page listed again is a page again, as in MuPDF.
 //
-// The nodes listing one /Kids array object share the entries read from it: a node
-// read from it was read then, and adds nothing when another node lists it, so each
-// node listing the array lists the pages read from it and goes on reading where the
-// others stopped. Each array is thus read once, and its pages listed again for each
-// node that lists it, which is the walk's output.
+// The nodes listing one /Kids array, by its bytes, share the entries read from it
+// (see `KidsStates`): a node read from it was read then, and adds nothing when
+// another node lists it, so each node listing the array lists the pages read from
+// it and goes on reading where the others stopped. Each array is thus read once,
+// and its pages listed again for each node that lists it, which is the walk's
+// output.
 fn walk<'a>(tree: Node<'a>, objects: &mut Objects<'a>) -> (Vec<Listed<'a>>, Listings<'a>) {
     /// A /Kids array: the entries not read yet, and the pages among those read.
     struct Kids<'a> {
@@ -151,37 +175,38 @@ fn walk<'a>(tree: Node<'a>, objects: &mut Objects<'a>) -> (Vec<Listed<'a>>, List
 
     let mut pages = vec![];
     let mut listings = Listings::default();
-    if !tree.is_tree() {
+    if !objects.is_tree(&tree) {
         pages.push((tree, None));
         return (pages, listings);
     }
     let mut kids = KidsStates::default();
     // Each node whose kids are being read: its index in `listings`, the index of
-    // its /Kids in `kids`, and how many of the pages read from them it has listed.
-    let mut stack: Vec<(usize, usize, usize)> = vec![];
+    // its /Kids in `kids`, the array as it reads it, and how many of the pages read
+    // from them it has listed.
+    let mut stack: Vec<(usize, usize, Array<'a>, usize)> = vec![];
     let mut next = Some((tree, None));
     loop {
         if let Some((node, lister)) = next.take()
             && let Some(at) = listings.read(&node, lister, objects)
         {
-            let array = kids.of(&node, |unread| Kids {
+            let (array, own) = kids.of(&node, objects, |unread, _| Kids {
                 unread,
                 pages: vec![],
             });
-            stack.push((at, array, 0));
+            stack.push((at, array, own, 0));
         }
-        let Some((at, array, listed)) = stack.last_mut() else {
+        let Some((at, array, own, listed)) = stack.last_mut() else {
             return (pages, listings);
         };
         let array = &mut kids.states[*array];
         if let Some(page) = array.pages.get(*listed) {
-            pages.push((page.clone(), Some(*at)));
+            pages.push((KidsStates::<Kids<'a>>::own(page, own), Some(*at)));
             *listed += 1;
         } else if let Some(kid) = array.unread.next() {
             #[cfg(test)]
             kids_read();
             let kid = objects.node(kid);
-            if kid.is_tree() {
+            if objects.is_tree(&kid) {
                 next = Some((kid, Some(*at)));
             } else {
                 #[cfg(test)]
@@ -588,7 +613,7 @@ impl<'a> Resources<'a> {
     }
 
     /// The resources whose category for each key is `category`'s.
-    fn read(mut category: impl FnMut(&[u8]) -> Option<Dict<'a>>) -> Self {
+    fn read(mut category: impl FnMut(&'static [u8]) -> Option<Dict<'a>>) -> Self {
         let mut category = |key| category(key).unwrap_or_default();
         Self {
             ext_g_states: category(EXT_G_STATE),
@@ -1198,6 +1223,105 @@ mod tests {
                 large.0 < small.0 * 21 / 10 && large.1 < small.1 * 21 / 10,
                 "parent loop: {parent_loop}: (read, stored) {small:?} for 500, {large:?} for 1000"
             );
+        }
+    }
+
+    /// A file of `objects`, numbered from 1, the first being the catalog, whose table
+    /// also lists each number of `aliases` at the object of the number paired with it:
+    /// the headers there name another number, so the table is rebuilt, keeping them.
+    fn aliased(objects: &[String], aliases: &[(usize, usize)]) -> Vec<u8> {
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut offsets = vec![0];
+        for (i, object) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend(format!("{} 0 obj\n{object}\nendobj\n", i + 1).bytes());
+        }
+        let size = aliases
+            .iter()
+            .map(|(n, _)| n + 1)
+            .fold(offsets.len(), usize::max);
+        let mut entries = vec![0; size];
+        entries[..offsets.len()].copy_from_slice(&offsets);
+        for &(number, target) in aliases {
+            entries[number] = offsets[target];
+        }
+        let xref = out.len();
+        out.extend(format!("xref\n0 {size}\n").bytes());
+        for offset in entries {
+            let kind = if offset == 0 { "65535 f" } else { "00000 n" };
+            out.extend(format!("{offset:010} {kind} \n").bytes());
+        }
+        out.extend(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").bytes(),
+        );
+        out
+    }
+
+    // A page, 3, and a node, 5, that `n` entries of the table lead to: with `direct`,
+    // its /Kids array, written into it, lists itself under all of them, and its
+    // /Rotate, which the pages could inherit, is an array as large; otherwise each of
+    // `n` nodes lists a /Kids array object, 4, under one of `n` entries leading to
+    // it, which lists them all. With `parent_loop`, the page's /Parent is itself,
+    // which makes the lookups repair the tree. The file grows with `n`, and is one
+    // page.
+    fn aliased_kids(n: usize, direct: bool, parent_loop: bool) -> Vec<u8> {
+        let parent = if parent_loop { "/Parent 3 0 R" } else { "" };
+        let mut objects = vec![
+            CATALOG.to_owned(),
+            pages_node("1", "3 0 R 5 0 R"),
+            format!("<< /Type /Page /MediaBox [0 0 200 100] {parent} >>"),
+        ];
+        let refs = |numbers: core::ops::Range<usize>| {
+            numbers
+                .map(|k| format!("{k} 0 R"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let aliases: Vec<(usize, usize)> = if direct {
+            objects.push("null".to_owned());
+            objects.push(format!(
+                "<< /Type /Pages /Kids [{}] /Rotate [{}] >>",
+                refs(5..n + 5),
+                " 0".repeat(n)
+            ));
+            (6..n + 5).map(|alias| (alias, 5)).collect()
+        } else {
+            objects.push(format!("[{}]", refs(5..n + 5)));
+            objects.extend((0..n).map(|k| format!("<< /Type /Pages /Kids {} 0 R >>", n + 5 + k)));
+            (n + 5..2 * n + 5).map(|alias| (alias, 4)).collect()
+        };
+        aliased(&objects, &aliases)
+    }
+
+    // Each /Kids array is read once, however many entries of the table lead to it or
+    // to the node holding it, and so is each entry of the node: the /Kids entries
+    // read, the node entries looked up, and the bytes of dictionaries and arrays
+    // parsed for such a file grow with it, not with its square, with and without the
+    // repair.
+    #[test]
+    fn a_kids_array_entries_lead_to_is_read_once() {
+        use crate::object::dict::PARSED;
+        for direct in [true, false] {
+            for parent_loop in [false, true] {
+                let counts = |n: usize| {
+                    let file = aliased_kids(n, direct, parent_loop);
+                    super::KIDS_READ.set(0);
+                    super::LOOKUPS.set(0);
+                    PARSED.set((0, 0));
+                    let pdf = Pdf::new(file).unwrap();
+                    let pages = pdf.pages();
+                    assert_eq!(pages.len(), 1);
+                    assert_eq!(pages[0].obj_id(), Some(ObjectIdentifier::new(3, 0)));
+                    assert_eq!(pages[0].media_box().x1, 200.0);
+                    [super::KIDS_READ.get(), super::LOOKUPS.get(), PARSED.get().1]
+                };
+                let [small, large] = [500, 1000].map(counts);
+                assert!(
+                    (0..3).all(|i| large[i] < small[i] * 21 / 10),
+                    "direct: {direct}, parent loop: {parent_loop}: [kids read, lookups, \
+                     bytes parsed] {small:?} for 500, {large:?} for 1000"
+                );
+            }
         }
     }
 

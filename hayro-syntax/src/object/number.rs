@@ -5,7 +5,7 @@ use crate::object::macros::object;
 use crate::object::{Object, ObjectLike};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
-use crate::trivia::{is_regular_character, is_white_space_character};
+use crate::trivia::is_regular_character;
 use core::fmt::{Debug, Display, Formatter};
 
 #[rustfmt::skip]
@@ -81,36 +81,12 @@ impl Display for Number {
     }
 }
 
+// Reading and skipping a number are one reading: what one accepts, and where it ends,
+// the other does too, so that checking a table, rebuilding it and reading an object
+// find the same numbers, headers and references.
 impl Skippable for Number {
     fn skip(r: &mut Reader<'_>, _: bool) -> Option<()> {
-        let has_sign = r.forward_if(|b| b == b'+' || b == b'-').is_some();
-
-        // Some PDFs have weird trailing minuses, so try to accept those as well.
-        match r.peek_byte()? {
-            b'.' => {
-                r.read_byte()?;
-                // See PDFJS-9252 - treat a single . as 0.
-                r.forward_while(is_digit_or_minus);
-            }
-            b'0'..=b'9' | b'-' => {
-                r.forward_while_1(is_digit_or_minus)?;
-                if let Some(()) = r.forward_tag(b".") {
-                    r.forward_while(is_digit_or_minus);
-                }
-            }
-            // See PDFJS-bug1753983 - accept just + or - as a zero.
-            // ALso see PDFJS-bug1953099, where the sign is followed by a show
-            // text string operand, requiring us to allow '<' and '(' as well.
-            b if has_sign && (is_white_space_character(b) || matches!(b, b'(' | b'<')) => {}
-            _ => return None,
-        }
-
-        // See issue 994. Don't accept numbers that are followed by a regular character.
-        if r.peek_byte().is_some_and(is_regular_character) {
-            return None;
-        }
-
-        Some(())
+        lex::<false>(r).map(|_| ())
     }
 }
 
@@ -118,75 +94,82 @@ impl Readable<'_> for Number {
     #[inline]
     fn read(r: &mut Reader<'_>, _: &ReaderContext<'_>) -> Option<Self> {
         let old_offset = r.offset();
-        read_inner(r).or_else(|| {
-            r.jump(old_offset);
-            None
-        })
+        match lex::<true>(r) {
+            Some(lexed) => Some(lexed.value(r)),
+            None => {
+                r.jump(old_offset);
+                None
+            }
+        }
     }
 }
 
+/// What reading a number found, before its value is made.
+struct Lexed {
+    start: usize,
+    negative: bool,
+    mantissa: u64,
+    overflowed: bool,
+    has_dot: bool,
+    decimal_shift: u32,
+    has_digits: bool,
+    /// Where the digits and `.` that make the value end: at the first minus after the
+    /// sign, if any.
+    end: Option<usize>,
+}
+
+/// Reads a number: an optional sign, then a run of digits and minuses with at most
+/// one `.` in or before it, not followed by a regular character. A sign alone is
+/// zero where no regular character follows it (PDFJS-bug1753983; PDFJS-bug1953099
+/// has one before a string). Its value is that of the digits and `.` before the first
+/// minus after the sign: some PDFs have weird trailing minuses (`3-` is 3); with no
+/// digits there, it is zero. `VALUE` says whether to gather what makes the value;
+/// what is accepted and where it ends do not depend on it.
 #[inline(always)]
-fn read_inner(r: &mut Reader<'_>) -> Option<Number> {
-    let start_offset = r.offset();
-    let negative = match r.peek_byte()? {
+fn lex<const VALUE: bool>(r: &mut Reader<'_>) -> Option<Lexed> {
+    let mut lexed = Lexed {
+        start: r.offset(),
+        negative: false,
+        mantissa: 0,
+        overflowed: false,
+        has_dot: false,
+        decimal_shift: 0,
+        has_digits: false,
+        end: None,
+    };
+    let signed = match r.peek_byte()? {
         b'-' => {
+            lexed.negative = true;
             r.forward();
             true
         }
         b'+' => {
             r.forward();
-            false
+            true
         }
         _ => false,
     };
-
-    let mut mantissa: u64 = 0;
-    let mut has_dot = false;
-    let mut decimal_shift: u32 = 0;
-    let mut has_digits = false;
-    let mut overflowed = false;
-    let mut number_end = None;
-
-    loop {
-        match r.peek_byte() {
-            Some(b'0'..=b'9') => {
-                let d = r.read_byte().unwrap();
-                if !overflowed {
-                    if let Some(value) = mantissa
-                        .checked_mul(10)
-                        .and_then(|v| v.checked_add((d - b'0') as u64))
-                    {
-                        mantissa = value;
-                    } else {
-                        overflowed = true;
-                    }
-                }
-                has_digits = true;
-                if has_dot {
-                    decimal_shift += 1;
-                }
+    match r.peek_byte() {
+        Some(b'0'..=b'9' | b'-' | b'.') => {}
+        Some(b) if signed && !is_regular_character(b) => return Some(lexed),
+        None if signed => return Some(lexed),
+        _ => return None,
+    }
+    let mut dot = false;
+    while let Some(b) = r.peek_byte() {
+        match b {
+            b'0'..=b'9' if VALUE && lexed.end.is_none() => lexed.digit(b - b'0'),
+            b'0'..=b'9' => {}
+            b'-' => {
+                lexed.end.get_or_insert(r.offset());
             }
-            Some(b'.') if !has_dot => {
-                r.forward();
-                has_dot = true;
-            }
-            // Some weird PDFs have trailing minus in the fraction of number.
-            Some(b'-') if has_digits => {
-                number_end = Some(r.offset());
-                r.forward();
-                r.forward_while(is_digit_or_minus);
-                break;
+            b'.' if !dot => {
+                dot = true;
+                lexed.has_dot = VALUE && lexed.end.is_none();
             }
             _ => break,
         }
-    }
-
-    if !has_digits {
-        if negative || has_dot {
-            // Treat numbers like just `-`, `+` or `-.` as zero.
-            return Some(Number(InternalNumber::Integer(0)));
-        }
-        return None;
+        r.forward();
     }
 
     // See issue 994. Don't accept numbers that are followed by a regular character
@@ -195,43 +178,78 @@ fn read_inner(r: &mut Reader<'_>) -> Option<Number> {
         return None;
     }
 
-    let integer_overflow = !has_dot && mantissa > i64::MAX as u64;
-
-    if overflowed || integer_overflow {
-        let end_offset = number_end.unwrap_or_else(|| r.offset());
-        let number = core::str::from_utf8(r.range(start_offset..end_offset)?).ok()?;
-
-        if !has_dot && let Ok(value) = number.parse::<i64>() {
-            return Some(Number(InternalNumber::Integer(value)));
+    Some(lexed)
+}
+impl Lexed {
+    #[inline(always)]
+    fn digit(&mut self, digit: u8) {
+        self.has_digits = true;
+        if self.has_dot {
+            self.decimal_shift += 1;
         }
-
-        let value = number.parse::<f64>().ok()?;
-        return Some(Number(InternalNumber::Real(value)));
-    }
-
-    if !has_dot {
-        let value = if negative {
-            (mantissa as i64).wrapping_neg()
-        } else {
-            mantissa as i64
-        };
-        Some(Number(InternalNumber::Integer(value)))
-    } else {
-        let mut value = mantissa as f64;
-
-        if decimal_shift > 0 {
-            if decimal_shift < POWERS_OF_10.len() as u32 {
-                value /= POWERS_OF_10[decimal_shift as usize];
-            } else {
-                value /= powi_f64(10.0, decimal_shift);
+        if !self.overflowed {
+            match self
+                .mantissa
+                .checked_mul(10)
+                .and_then(|v| v.checked_add(digit as u64))
+            {
+                Some(value) => self.mantissa = value,
+                None => self.overflowed = true,
             }
         }
+    }
 
-        if negative {
-            value = -value;
+    /// The number's value; `r` is where it was read from.
+    #[inline(always)]
+    fn value(&self, r: &Reader<'_>) -> Number {
+        if !self.has_digits {
+            return Number(InternalNumber::Integer(0));
         }
 
-        Some(Number(InternalNumber::Real(value)))
+        let integer_overflow = !self.has_dot && self.mantissa > i64::MAX as u64;
+
+        if self.overflowed || integer_overflow {
+            // The sign, digits and `.` before the first minus after the sign.
+            let number = r
+                .range(self.start..self.end.unwrap_or_else(|| r.offset()))
+                .and_then(|number| core::str::from_utf8(number).ok())
+                .unwrap_or_default();
+
+            if !self.has_dot
+                && let Ok(value) = number.parse::<i64>()
+            {
+                return Number(InternalNumber::Integer(value));
+            }
+
+            // Digits around at most one `.`, after an optional sign, always parse.
+            let value = number.parse::<f64>().unwrap_or(f64::NAN);
+            return Number(InternalNumber::Real(value));
+        }
+
+        if !self.has_dot {
+            let value = if self.negative {
+                (self.mantissa as i64).wrapping_neg()
+            } else {
+                self.mantissa as i64
+            };
+            Number(InternalNumber::Integer(value))
+        } else {
+            let mut value = self.mantissa as f64;
+
+            if self.decimal_shift > 0 {
+                if self.decimal_shift < POWERS_OF_10.len() as u32 {
+                    value /= POWERS_OF_10[self.decimal_shift as usize];
+                } else {
+                    value /= powi_f64(10.0, self.decimal_shift);
+                }
+            }
+
+            if self.negative {
+                value = -value;
+            }
+
+            Number(InternalNumber::Real(value))
+        }
     }
 }
 
@@ -245,23 +263,10 @@ pub(crate) enum InternalNumber {
 
 macro_rules! int_num {
     ($i:ident) => {
+        // As reading one reads it.
         impl Skippable for $i {
             fn skip(r: &mut Reader<'_>, _: bool) -> Option<()> {
-                r.forward_if(|b| b == b'+' || b == b'-');
-                r.forward_while_1(is_digit)?;
-
-                // We have a float instead of an integer.
-                if r.peek_byte() == Some(b'.') {
-                    return None;
-                }
-
-                // See issue 994. Don't accept numbers that are followed by a regular character
-                // without any white space in-between.
-                if r.peek_byte().is_some_and(is_regular_character) {
-                    return None;
-                }
-
-                Some(())
+                r.read_without_context::<$i>().map(|_| ())
             }
         }
 
@@ -345,14 +350,6 @@ impl TryFrom<Object<'_>> for f64 {
 }
 
 impl ObjectLike<'_> for f64 {}
-
-pub(crate) fn is_digit(byte: u8) -> bool {
-    byte.is_ascii_digit()
-}
-
-pub(crate) fn is_digit_or_minus(byte: u8) -> bool {
-    is_digit(byte) || byte == b'-'
-}
 
 #[cfg(test)]
 mod tests {
@@ -630,6 +627,88 @@ mod tests {
             .read_without_context::<f32>()
             .unwrap();
         assert_eq!(got, f32::MAX);
+    }
+
+    // Skipping a number, or an integer, reads what reading it does, to the same end.
+    #[test]
+    fn skipping_a_number_reads_it_as_reading_does() {
+        for token in [
+            "3",
+            "3-",
+            "0-",
+            "3--",
+            "3-1",
+            "1.5-",
+            "1-.5",
+            "--5",
+            "-",
+            "+",
+            "-.",
+            ".",
+            ".-",
+            "+ ",
+            "- ",
+            "-(",
+            "+<",
+            "-]",
+            "-/",
+            "-x",
+            "+abc",
+            "1.2.3",
+            "1e3",
+            "3.0",
+            "3.7",
+            "-1-2",
+            "99999999999",
+            "12345678901234567890123.",
+            "-.5",
+            "+.5",
+            "0",
+            "-0",
+        ] {
+            let read = |skip: bool| {
+                let mut r = Reader::new(token.as_bytes());
+                let found = if skip {
+                    r.skip::<Number>(false).is_some()
+                } else {
+                    r.read_without_context::<Number>().is_some()
+                };
+                (found, r.offset())
+            };
+            assert_eq!(read(true), read(false), "{token:?}");
+            let read = |skip: bool| {
+                let mut r = Reader::new(token.as_bytes());
+                let found = if skip {
+                    r.skip::<i32>(false).is_some()
+                } else {
+                    r.read_without_context::<i32>().is_some()
+                };
+                (found, r.offset())
+            };
+            assert_eq!(read(true), read(false), "{token:?} as i32");
+        }
+    }
+
+    // A number's value is that of the digits before the first minus after its sign;
+    // a sign alone is zero.
+    #[test]
+    fn values_of_numbers_with_odd_minuses_and_signs() {
+        for (token, value) in [
+            ("3-", 3.0),
+            ("3--", 3.0),
+            ("1-.5", 1.0),
+            ("1.5-", 1.5),
+            ("--5", 0.0),
+            ("+", 0.0),
+            ("- ", 0.0),
+            ("-(", 0.0),
+            (".", 0.0),
+        ] {
+            let number = Reader::new(token.as_bytes())
+                .read_without_context::<Number>()
+                .unwrap();
+            assert_eq!(number.as_f64(), value, "{token:?}");
+        }
     }
 
     #[test]

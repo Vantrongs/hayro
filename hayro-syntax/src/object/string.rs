@@ -2,35 +2,19 @@
 
 use crate::crypto::DecryptionTarget;
 use crate::filter::ascii_hex;
-use crate::object::Object;
 use crate::object::macros::object;
+use crate::object::{Bytes, Object};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::trivia::is_white_space_character;
-use alloc::vec::Vec;
 use core::borrow::Borrow;
 use core::hash::{Hash, Hasher};
 use core::ops::Deref;
 use smallvec::SmallVec;
 
-#[derive(Clone)]
-enum StringInner<'a> {
-    Borrowed(&'a [u8]),
-    Owned(SmallVec<[u8; 23]>),
-}
-
-impl AsRef<[u8]> for StringInner<'_> {
-    fn as_ref(&self) -> &[u8] {
-        match self {
-            Self::Borrowed(data) => data,
-            Self::Owned(data) => data,
-        }
-    }
-}
-
 /// A PDF string object.
 #[derive(Clone)]
-pub struct String<'a>(StringInner<'a>);
+pub struct String<'a>(Bytes<'a>);
 
 impl<'a> String<'a> {
     /// Returns the string data as a byte slice.
@@ -49,10 +33,7 @@ impl Deref for String<'_> {
 
 impl AsRef<[u8]> for String<'_> {
     fn as_ref(&self) -> &[u8] {
-        match &self.0 {
-            StringInner::Borrowed(data) => data,
-            StringInner::Owned(data) => data,
-        }
+        self.0.as_ref()
     }
 }
 
@@ -106,7 +87,7 @@ impl Skippable for String<'_> {
 impl<'a> Readable<'a> for String<'a> {
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         let decoded = match r.peek_byte()? {
-            b'<' => StringInner::Owned(read_hex(r)?),
+            b'<' => Bytes::decoded(read_hex(r)?),
             b'(' => read_literal(r)?,
             _ => return None,
         };
@@ -116,18 +97,12 @@ impl<'a> Readable<'a> for String<'a> {
             Some(id) => ctx
                 .xref()
                 .decrypt(id, decoded.as_ref(), DecryptionTarget::String)
-                .map(StringInner::from)
+                .map(Bytes::from)
                 .unwrap_or(decoded),
             None => decoded,
         };
 
         Some(Self(final_data))
-    }
-}
-
-impl From<Vec<u8>> for StringInner<'_> {
-    fn from(value: Vec<u8>) -> Self {
-        Self::Owned(SmallVec::from_vec(value))
     }
 }
 
@@ -180,7 +155,7 @@ fn skip_literal(r: &mut Reader<'_>) -> Option<()> {
     Some(())
 }
 
-fn read_literal<'a>(r: &mut Reader<'a>) -> Option<StringInner<'a>> {
+fn read_literal<'a>(r: &mut Reader<'a>) -> Option<Bytes<'a>> {
     let start = r.offset();
     skip_literal(r)?;
     let end = r.offset();
@@ -189,7 +164,7 @@ fn read_literal<'a>(r: &mut Reader<'a>) -> Option<StringInner<'a>> {
     let data = r.range(start + 1..end - 1)?;
 
     if !data.iter().any(|b| matches!(b, b'\\' | b'\n' | b'\r')) {
-        return Some(StringInner::Borrowed(data));
+        return Some(Bytes::Borrowed(data));
     }
 
     let mut r = Reader::new(data);
@@ -269,7 +244,7 @@ fn read_literal<'a>(r: &mut Reader<'a>) -> Option<StringInner<'a>> {
         }
     }
 
-    Some(StringInner::Owned(result))
+    Some(Bytes::decoded(result))
 }
 
 fn is_octal_digit(byte: u8) -> bool {

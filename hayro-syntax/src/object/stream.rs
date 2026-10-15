@@ -445,6 +445,14 @@ impl<'a> Readable<'a> for Stream<'a> {
 }
 
 impl<'a> Stream<'a> {
+    /// The stream of the same bytes, read in `ctx`, which its data is decrypted in.
+    pub(crate) fn in_context(&self, ctx: &ReaderContext<'a>) -> Self {
+        Self {
+            dict: self.dict.in_context(ctx),
+            data: self.data,
+        }
+    }
+
     /// The stream of `dict`, read from `r` after the dictionary.
     pub(crate) fn after_dict(r: &mut Reader<'a>, dict: Dict<'a>) -> Option<Self> {
         if dict.contains_key(F) {

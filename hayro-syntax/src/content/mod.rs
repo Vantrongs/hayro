@@ -36,7 +36,7 @@ pub mod ops;
 use crate::content::ops::TypedInstruction;
 use crate::object;
 use crate::object::dict::InlineImageDict;
-use crate::object::name::{Name, skip_name_like};
+use crate::object::name::{Name, lex_name_like};
 use crate::object::{Array, Null, Number, Object, Stream};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
@@ -76,24 +76,16 @@ impl Deref for Operator<'_> {
     }
 }
 
+// Skipping an operator reads it as reading does.
 impl Skippable for Operator<'_> {
     fn skip(r: &mut Reader<'_>, _: bool) -> Option<()> {
-        skip_name_like(r, false).map(|_| ())
+        lex_name_like(r, false).map(|_| ())
     }
 }
 
 impl<'a> Readable<'a> for Operator<'a> {
     fn read(r: &mut Reader<'a>, _: &ReaderContext<'a>) -> Option<Self> {
-        let start = r.offset();
-        skip_name_like(r, false)?;
-        let end = r.offset();
-        let data = r.range(start..end)?;
-
-        if data.is_empty() {
-            return None;
-        }
-
-        Some(Self(Name::new(data)?))
+        Some(Self(Name::new(lex_name_like(r, false)?)?))
     }
 }
 

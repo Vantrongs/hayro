@@ -111,6 +111,11 @@ impl<'a> Dict<'a> {
         self.ctx().obj_number()
     }
 
+    /// The bytes from where the value of `key` starts to the dictionary's end.
+    pub(crate) fn value_data(&self, key: &[u8]) -> Option<&'a [u8]> {
+        self.data().get(*self.offsets()?.get(key)?..)
+    }
+
     /// Return the raw entry for a specific key.
     #[allow(private_bounds)]
     pub fn get_raw<T>(&self, key: impl AsRef<[u8]>) -> Option<MaybeRef<T>>
@@ -271,8 +276,9 @@ fn read_inner<'a>(
 
 #[cfg(test)]
 std::thread_local! {
-    /// The entries and bytes of the dictionaries parsed on this thread, which the
-    /// tests bound to show that a dictionary many objects share is parsed once.
+    /// The entries and bytes of the dictionaries parsed on this thread, and the
+    /// bytes of the arrays, which the tests bound to show that a dictionary or array
+    /// many objects share is parsed once.
     pub(crate) static PARSED: core::cell::Cell<(usize, usize)> =
         const { core::cell::Cell::new((0, 0)) };
 }

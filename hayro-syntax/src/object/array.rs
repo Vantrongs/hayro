@@ -60,6 +60,11 @@ impl<'a> Array<'a> {
         ContentKey::new(self.data, &self.ctx)
     }
 
+    /// The context the array's items are read in.
+    pub(crate) fn ctx(&self) -> &ReaderContext<'a> {
+        &self.ctx
+    }
+
     /// The array of the same bytes, read in `ctx`.
     pub(crate) fn in_context(&self, ctx: &ReaderContext<'a>) -> Self {
         Self {
@@ -131,6 +136,12 @@ impl Default for Array<'_> {
 impl<'a> Readable<'a> for Array<'a> {
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         let bytes = r.skip::<Array<'_>>(ctx.in_content_stream())?;
+
+        #[cfg(test)]
+        super::dict::PARSED.with(|parsed| {
+            let (entries, read) = parsed.get();
+            parsed.set((entries, read + bytes.len()));
+        });
 
         Some(Self {
             data: &bytes[1..bytes.len() - 1],

@@ -205,9 +205,9 @@ impl<'a> Inheritance<'a> {
     fn parent(&mut self, node: &Node<'a>) -> Option<Node<'a>> {
         match self.repaired.as_ref().and_then(|map| map.get(&node.key())) {
             Some(parent) => Some(parent.clone()),
-            None => node
-                .dict()
-                .get_raw::<Object<'a>>(PARENT)
+            None => self
+                .objects
+                .entry(node.dict(), PARENT)
                 .map(|parent| self.objects.node(parent))
                 .filter(Node::is_dict),
         }
@@ -285,7 +285,7 @@ impl<'a> Listings<'a> {
 
 // The value `node` has for `key`, `null` for a reference to nothing.
 fn value<'a>(node: &Node<'a>, key: Inheritable, objects: &mut Objects<'a>) -> Option<Object<'a>> {
-    node.has(key.name()).then(|| {
+    objects.has(node, key.name()).then(|| {
         objects
             .get(node.dict(), key.name())
             .unwrap_or(Object::Null(Null))
@@ -304,9 +304,10 @@ fn value<'a>(node: &Node<'a>, key: Inheritable, objects: &mut Objects<'a>) -> Op
 // 257 nodes above it, and which may set other parents where a /Kids cycle is
 // entered through a shared node. A kid that is no dictionary is passed over here.
 //
-// The nodes listing one /Kids array object share the kids left in it: those that
-// one of them took were met then, so every other would pass over them. Each array
-// is thus read and stored once, however many nodes list it.
+// The nodes listing one /Kids array, by its bytes (see `KidsStates`), share the
+// kids left in it: those that one of them took were met then, so every other would
+// pass over them. Each array is thus read and stored once, however many nodes list
+// it.
 fn tree_parents<'a>(objects: &mut Objects<'a>) -> FxHashMap<Key<'a>, Node<'a>> {
     let mut parents = FxHashMap::default();
     let Some(root) = objects.tree() else {
@@ -316,7 +317,7 @@ fn tree_parents<'a>(objects: &mut Objects<'a>) -> FxHashMap<Key<'a>, Node<'a>> {
     // `None` for a direct `null`, which `MuPDF` skips.
     let mut kids = KidsStates::<Vec<Option<Node<'a>>>>::default();
     let mut read = |kids: &mut KidsStates<_>, node: &Node<'a>| {
-        kids.of(node, |kids| {
+        let (at, _) = kids.of(node, objects, |kids, objects| {
             let kids: Vec<_> = kids
                 .map(|kid| {
                     #[cfg(test)]
@@ -330,7 +331,8 @@ fn tree_parents<'a>(objects: &mut Objects<'a>) -> FxHashMap<Key<'a>, Node<'a>> {
             #[cfg(test)]
             super::kids_stored(kids.len());
             kids
-        })
+        });
+        at
     };
     let mut met = FxHashSet::default();
     met.insert(root.key());

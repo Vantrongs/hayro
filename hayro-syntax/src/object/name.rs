@@ -1,8 +1,8 @@
 //! Names.
 
 use crate::filter::ascii_hex::decode_hex_digit;
-use crate::object::Object;
 use crate::object::macros::object;
+use crate::object::{Bytes, Object};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, Skippable};
 use crate::trivia::is_regular_character;
@@ -12,15 +12,9 @@ use core::hash::{Hash, Hasher};
 use core::ops::Deref;
 use smallvec::SmallVec;
 
-#[derive(Clone)]
-enum NameInner<'a> {
-    Borrowed(&'a [u8]),
-    Owned(SmallVec<[u8; 23]>),
-}
-
 /// A PDF name object.
 #[derive(Clone)]
-pub struct Name<'a>(NameInner<'a>);
+pub struct Name<'a>(Bytes<'a>);
 
 impl<'a> Deref for Name<'a> {
     type Target = [u8];
@@ -32,10 +26,7 @@ impl<'a> Deref for Name<'a> {
 
 impl AsRef<[u8]> for Name<'_> {
     fn as_ref(&self) -> &[u8] {
-        match &self.0 {
-            NameInner::Borrowed(data) => data,
-            NameInner::Owned(data) => data,
-        }
+        self.0.as_ref()
     }
 }
 
@@ -85,25 +76,15 @@ impl<'a> Name<'a> {
     /// Create a new name from an unescaped byte sequence.
     #[inline]
     pub fn new_unescaped(data: &'a [u8]) -> Self {
-        Self(NameInner::Borrowed(data))
+        Self(Bytes::Borrowed(data))
     }
 
     /// Create a new name from bytes that may contain escape sequences.
     #[inline]
     pub fn new_escaped(data: &'a [u8]) -> Option<Self> {
         let mut result = SmallVec::new();
-        let mut r = Reader::new(data);
-
-        while let Some(b) = r.read_byte() {
-            if b == b'#' {
-                let hex = r.read_bytes(2)?;
-                result.push(decode_hex_digit(hex[0])? << 4 | decode_hex_digit(hex[1])?);
-            } else {
-                result.push(b);
-            }
-        }
-
-        Some(Self(NameInner::Owned(result)))
+        unescape(data, |b| result.push(b))?;
+        Some(Self(Bytes::decoded(result)))
     }
 
     /// Return a string representation of the name.
@@ -131,22 +112,46 @@ impl Display for Name<'_> {
 
 object!(Name<'a>, Name);
 
+// Skipping a name reads it as reading does, escapes included, without decoding them.
 impl Skippable for Name<'_> {
     fn skip(r: &mut Reader<'_>, _: bool) -> Option<()> {
-        skip_name_like(r, true).map(|_| ())
+        lex_name_like(r, true).map(|_| ())
     }
 }
 
 impl<'a> Readable<'a> for Name<'a> {
     fn read(r: &mut Reader<'a>, _: &ReaderContext<'a>) -> Option<Self> {
-        let start = r.offset();
-        skip_name_like(r, true)?;
-        let end = r.offset();
-
-        // Exclude leading solidus.
-        let data = r.range(start + 1..end)?;
-        Self::new(data)
+        Self::new(lex_name_like(r, true)?)
     }
+}
+
+/// Reads a name, after its solidus where `solidus`, or an operator of a content
+/// stream, which is read as a name without one: its bytes, whose `#` escapes are
+/// hex. A token of regular characters with other escapes is none.
+pub(crate) fn lex_name_like<'a>(r: &mut Reader<'a>, solidus: bool) -> Option<&'a [u8]> {
+    let start = r.offset() + usize::from(solidus);
+    skip_name_like(r, solidus)?;
+    let data = r.range(start..r.offset())?;
+    if data.contains(&b'#') {
+        unescape(data, |_| {})?;
+    }
+    Some(data)
+}
+
+/// Decodes the `#` escapes of a name's bytes into `out`; `None` where one is not
+/// two hex digits.
+#[inline]
+fn unescape(data: &[u8], mut out: impl FnMut(u8)) -> Option<()> {
+    let mut r = Reader::new(data);
+    while let Some(b) = r.read_byte() {
+        if b == b'#' {
+            let hex = r.read_bytes(2)?;
+            out(decode_hex_digit(hex[0])? << 4 | decode_hex_digit(hex[1])?);
+        } else {
+            out(b);
+        }
+    }
+    Some(())
 }
 
 // This method is shared by `Name` and the parser for content stream operators (which behave like

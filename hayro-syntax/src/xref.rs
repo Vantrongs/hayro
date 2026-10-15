@@ -163,6 +163,7 @@ pub(crate) fn open(data: PdfData, password: &[u8]) -> Result<XRef, XRefError> {
         Ok(()) => match XRef::new(
             data.clone(),
             xref_map,
+            BTreeSet::new(),
             XRefInput::TrailerDictData(trailer),
             password,
         ) {
@@ -323,12 +324,12 @@ fn read_object<'a, D>(
 // its header's number, the scan takes the definition before it.
 fn fallback(data: PdfData, password: &[u8], old: Old) -> Option<XRef> {
     warn!("xref table was invalid, trying to manually build xref table");
-    let (xref_map, xref_input) = fallback_xref_map(&data, password, old);
+    let (xref_map, unreadable, xref_input) = fallback_xref_map(&data, password, old);
 
     if let Some(xref_input) = xref_input {
         warn!("rebuild xref table with {} entries", xref_map.len());
 
-        XRef::new(data.clone(), xref_map, xref_input, password).ok()
+        XRef::new(data.clone(), xref_map, unreadable, xref_input, password).ok()
     } else {
         warn!("couldn't find trailer dictionary, failed to rebuild xref table");
 
@@ -336,14 +337,21 @@ fn fallback(data: PdfData, password: &[u8], old: Old) -> Option<XRef> {
     }
 }
 
+/// The objects of a rebuilt table that cannot be read: a header names them, or an
+/// entry of the old table leads to a header, but no object can be read after it, and
+/// the rebuilt table has none of their number. A reference to one is no `null`, as a
+/// reference to an object the file does not hold is: what refers to it lost it.
+type Unreadable = BTreeSet<ObjectIdentifier>;
+
 fn fallback_xref_map<'a>(
     data: &'a PdfData,
     password: &[u8],
     old: Old,
-) -> (XrefMap, Option<XRefInput<'a>>) {
+) -> (XrefMap, Unreadable, Option<XRefInput<'a>>) {
     let mut scan = Scan::new(data.as_ref());
     let mut listed = old.listed;
-    listed.extend(read_unread(data.as_ref(), &mut scan, &old.unread));
+    let (read, unreadable) = read_unread(data.as_ref(), &mut scan, &old.unread);
+    listed.extend(read);
     fallback_xref_map_inner(
         data,
         &mut scan,
@@ -351,18 +359,21 @@ fn fallback_xref_map<'a>(
         true,
         password,
         &listed,
+        &unreadable,
     )
 }
 
 /// The entries of `unread`, sorted by offset, that lead to an object read to its end,
-/// as reading the entry's object does. Checking the table reads an object only up to
-/// the next offset an entry names, which another's header may be at, in a string.
+/// as reading the entry's object does, and those that lead to a header with no object
+/// that can be read after it. Checking the table reads an object only up to the next
+/// offset an entry names, which another's header may be at, in a string.
 fn read_unread(
     data: &[u8],
     scan: &mut Scan<'_>,
     unread: &[(usize, ObjectIdentifier)],
-) -> Vec<Listed> {
+) -> (Vec<Listed>, Vec<ObjectIdentifier>) {
     let mut listed = vec![];
+    let mut unreadable = vec![];
     let mut rest = unread;
     while let Some(&(offset, _)) = rest.first() {
         let at = rest.partition_point(|(other, _)| *other == offset);
@@ -372,18 +383,22 @@ fn read_unread(
             let header = r.read_without_context::<ObjectIdentifier>()?;
             r.skip_white_spaces_and_comments();
             opened(r.offset() - offset);
-            scan.object(r.offset()).map(|_| header)
+            Some((header, scan.object(r.offset()).is_some()))
         });
-        if let Some(header) = header {
-            listed.extend(
-                rest[..at]
-                    .iter()
-                    .map(|&(offset, id)| Listed { id, offset, header }),
-            );
+        match header {
+            Some((header, true)) => {
+                listed.extend(
+                    rest[..at]
+                        .iter()
+                        .map(|&(offset, id)| Listed { id, offset, header }),
+                )
+            }
+            Some((_, false)) => unreadable.extend(rest[..at].iter().map(|&(_, id)| id)),
+            None => {}
         }
         rest = &rest[at..];
     }
-    listed
+    (listed, unreadable)
 }
 
 fn fallback_xref_map_inner<'a>(
@@ -393,10 +408,13 @@ fn fallback_xref_map_inner<'a>(
     recurse: bool,
     password: &[u8],
     listed: &[Listed],
-) -> (XrefMap, Option<XRefInput<'a>>) {
+    unread: &[ObjectIdentifier],
+) -> (XrefMap, Unreadable, Option<XRefInput<'a>>) {
     let mut xref_map = FxHashMap::default();
     // Each object found, in the order of the file.
     let mut found = vec![];
+    // Each header found with no object that can be read after it.
+    let mut broken = vec![];
     let mut trailer_dicts = vec![];
     let mut root_ref = None;
 
@@ -423,6 +441,8 @@ fn fallback_xref_map_inner<'a>(
                     found.push((obj_id, cur_pos));
                     last_obj_num = Some(obj_id);
                     dummy_ctx.set_obj_number(obj_id);
+                } else {
+                    broken.push(obj_id);
                 }
             } else {
                 // There must be a white space before the next object number.
@@ -501,6 +521,12 @@ fn fallback_xref_map_inner<'a>(
     }
 
     keep_listed(&mut xref_map, &found, listed);
+    let mut unreadable: Unreadable = unread
+        .iter()
+        .chain(&broken)
+        .filter(|id| !xref_map.contains_key(id))
+        .copied()
+        .collect();
 
     // Try to choose the right trailer dict by doing basic validation: the last whose
     // /Root is a dictionary with /Pages. Each catalog the trailers name is read once,
@@ -574,26 +600,24 @@ fn fallback_xref_map_inner<'a>(
         if let Ok(xref) = XRef::new(
             data.clone(),
             xref_map.clone(),
+            unreadable.clone(),
             XRefInput::TrailerDictData(trailer_dict.as_ref().map(|d| d.data()).unwrap()),
             password,
         ) {
             let ctx = ReaderContext::new(&xref, false);
-            let (patched_map, _) =
-                fallback_xref_map_inner(data, scan, ctx, false, password, listed);
+            let (patched_map, patched_unreadable, _) =
+                fallback_xref_map_inner(data, scan, ctx, false, password, listed, unread);
             xref_map = patched_map;
+            unreadable = patched_unreadable;
         }
     }
 
-    if let Some(trailer_dict_data) = trailer_dict.map(|d| d.data()) {
-        (
-            xref_map,
-            Some(XRefInput::TrailerDictData(trailer_dict_data)),
-        )
-    } else if let Some(root_ref) = root_ref {
-        (xref_map, Some(XRefInput::RootRef(root_ref)))
+    let input = if let Some(trailer_dict_data) = trailer_dict.map(|d| d.data()) {
+        Some(XRefInput::TrailerDictData(trailer_dict_data))
     } else {
-        (xref_map, None)
-    }
+        root_ref.map(XRefInput::RootRef)
+    };
+    (xref_map, unreadable, input)
 }
 
 /// The header `r` starts with, `N G obj`, and `r` after it.
@@ -681,6 +705,7 @@ impl XRef {
     fn new(
         data: PdfData,
         xref_map: XrefMap,
+        unreadable: Unreadable,
         input: XRefInput<'_>,
         password: &[u8],
     ) -> Result<Self, XRefError> {
@@ -693,6 +718,7 @@ impl XRef {
             document: DocumentId::new(),
             data: Arc::new(Data::new(data)),
             map: Arc::new(xref_map),
+            unreadable: Arc::new(unreadable),
             decryptor: Arc::new(Decryptor::None),
             has_ocgs: false,
             metadata: Arc::new(Metadata::default()),
@@ -942,12 +968,14 @@ impl XRef {
         }
     }
 
-    /// Whether the table lists object `id`; a reference to an object it does not list
-    /// is `null`.
+    /// Whether the table lists object `id`, whether or not it can be read; a reference
+    /// to an object it does not list is `null`. A table rebuilt from a damaged file
+    /// lists an object whose header is in the file, or that the damaged table lists at
+    /// a header, though no object can be read after it.
     pub fn has_entry(&self, id: ObjectIdentifier) -> bool {
         match &self.0 {
             Inner::Dummy => false,
-            Inner::Some(r) => r.map.contains_key(&id),
+            Inner::Some(r) => r.map.contains_key(&id) || r.unreadable.contains(&id),
         }
     }
 
@@ -1146,22 +1174,8 @@ impl<'a> Syntax<'a> {
                 r.jump(*end);
                 Stream::after_dict(&mut r, dict.in_context(ctx)).map(Object::Stream)
             }
-            Self::Object { object, at } => Some(match object {
-                Object::Dict(dict) => Object::Dict(dict.in_context(ctx)),
-                Object::Array(array) => Object::Array(array.in_context(ctx)),
-                // A string is decrypted as the object it is read for.
-                Object::String(_) if ctx.xref().needs_decryption(ctx) => {
-                    let mut r = Reader::new(data);
-                    r.jump(*at);
-                    r.read_with_context::<Object<'a>>(ctx)?
-                }
-                Object::Null(_)
-                | Object::Boolean(_)
-                | Object::Number(_)
-                | Object::String(_)
-                | Object::Name(_) => object.clone(),
-                Object::Stream(_) => unreachable!("a stream is read as `Self::Stream`"),
-            }),
+            // A string is decrypted as the object it is read for.
+            Self::Object { object, at } => object.in_context(data.get(*at..)?, ctx),
         }
     }
 }
@@ -1227,6 +1241,8 @@ struct SomeRepr {
     data: Arc<Data>,
     /// Never changed once read: what is read through it is read from one table.
     map: Arc<XrefMap>,
+    /// The objects a rebuilt table lists that cannot be read.
+    unreadable: Arc<Unreadable>,
     metadata: Arc<Metadata>,
     decryptor: Arc<Decryptor>,
     has_ocgs: bool,
@@ -2074,11 +2090,21 @@ mod tests {
     /// listing them, or, where `broken`, a `startxref` that leads to none, which
     /// rebuilds it.
     fn file_of(objects: &[&str], broken: bool) -> Vec<u8> {
+        let headed: Vec<(String, &str)> = objects
+            .iter()
+            .enumerate()
+            .map(|(i, object)| (format!("{} 0 obj", i + 1), *object))
+            .collect();
+        file_headed(&headed, broken)
+    }
+
+    /// As [`file_of`], each object after its header.
+    fn file_headed(objects: &[(String, &str)], broken: bool) -> Vec<u8> {
         let mut out = b"%PDF-1.7\n".to_vec();
         let mut offsets = vec![];
-        for (i, object) in objects.iter().enumerate() {
+        for (header, object) in objects {
             offsets.push(out.len());
-            out.extend(format!("{} 0 obj\n{object}\nendobj\n", i + 1).bytes());
+            out.extend(format!("{header}\n{object}\nendobj\n").bytes());
         }
         let xref = out.len();
         out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).bytes());
@@ -2115,6 +2141,87 @@ mod tests {
                     one_page(file),
                     (600.0, 700.0, BLUE.as_bytes().to_vec()),
                     "{page}, rebuilt: {broken}"
+                );
+            }
+        }
+    }
+
+    // A header whose numbers end in a minus, which reading a number reads, leads to
+    // its object whether the table is sound or rebuilt: checking the table, rebuilding
+    // it and reading an object read a header by one rule.
+    #[test]
+    fn a_page_whose_header_numbers_end_in_a_minus_is_read() {
+        let content = stream("", BLUE);
+        let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] /Contents 4 0 R >>";
+        for header in ["3- 0 obj", "3 0- obj", "3-- 0-- obj"] {
+            for broken in [false, true] {
+                let objects = [
+                    ("1 0 obj".to_owned(), CATALOG),
+                    ("2 0 obj".to_owned(), TREE),
+                    (header.to_owned(), page),
+                    ("4 0 obj".to_owned(), content.as_str()),
+                ];
+                let file = file_headed(&objects, broken);
+                assert_eq!(
+                    one_page(file.clone()),
+                    (600.0, 700.0, BLUE.as_bytes().to_vec()),
+                    "{header}, rebuilt: {broken}"
+                );
+                let pdf = crate::Pdf::new(file).unwrap();
+                let page = &pdf.pages()[0];
+                assert_eq!(page.obj_id(), Some(ObjectIdentifier::new(3, 0)));
+                assert_eq!(page.try_page_stream().unwrap(), BLUE.as_bytes());
+            }
+        }
+    }
+
+    /// What reading the content of the one page `file` opens to finds.
+    fn content_of(file: Vec<u8>) -> Result<Vec<u8>, crate::page::ContentError> {
+        let pdf = crate::Pdf::new(file).unwrap();
+        let pages = pdf.pages();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].media_box().x1, 600.0);
+        pages[0].try_page_stream()
+    }
+
+    // An object whose header is in the file but which cannot be read stays one that
+    // cannot be read when the table is rebuilt, whether the old table lists it or
+    // only the scan finds it: a page whose content it is, alone or as one part, is no
+    // empty page. A reference to an object the file does not hold is still `null`.
+    #[test]
+    fn content_that_cannot_be_read_is_not_taken_for_missing_content() {
+        use crate::page::ContentError;
+        let blue = stream("", BLUE);
+        let page = |contents: &str| {
+            format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] /Contents {contents} >>")
+        };
+        for broken_object in [
+            format!("[ 1 2\n{blue}"),
+            format!("<< /Length >\nstream\n{BLUE}\nendstream"),
+        ] {
+            for contents in ["4 0 R", "[5 0 R 4 0 R]"] {
+                for broken in [false, true] {
+                    let page = page(contents);
+                    let file = file_of(&[CATALOG, TREE, &page, &broken_object, &blue], broken);
+                    let read = content_of(file);
+                    assert!(
+                        matches!(read, Err(ContentError::Unreadable(Some(id))) if id == ObjectIdentifier::new(4, 0)),
+                        "{broken_object:?} in {contents}, rebuilt: {broken}: {read:?}"
+                    );
+                }
+            }
+        }
+        for (contents, content) in [
+            ("9 0 R", vec![]),
+            ("[5 0 R 9 0 R]", format!("{BLUE} ").into_bytes()),
+        ] {
+            for broken in [false, true] {
+                let page = page(contents);
+                let file = file_of(&[CATALOG, TREE, &page, "null", &blue], broken);
+                assert_eq!(
+                    content_of(file).unwrap(),
+                    content,
+                    "{contents}, rebuilt: {broken}"
                 );
             }
         }
