@@ -8,7 +8,8 @@ mod fixtures;
 pub(crate) mod rc4;
 
 pub(crate) use fixtures::{
-    file, file_with_aliases, noise, one_page, one_page_objects, stored_zlib, stream,
+    CUT_ROW_CONTENT, cut_row_content_stream, file, file_with_aliases, noise, one_page,
+    one_page_objects, stored_zlib, stream,
 };
 
 use aes::cipher::block_padding::{NoPadding, Pkcs7};

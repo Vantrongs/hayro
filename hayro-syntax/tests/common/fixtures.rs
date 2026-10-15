@@ -123,3 +123,23 @@ pub(crate) fn noise(n: usize, seed: u32) -> Vec<u8> {
         })
         .collect()
 }
+
+/// A page content of 26 bytes that fills a blue square, `0 0 1 rg 10 10 50 50 re  f`.
+pub(crate) const CUT_ROW_CONTENT: &[u8] = b"0 0 1 rg 10 10 50 50 re  f";
+
+/// The content stream of [`CUT_ROW_CONTENT`] in Flate under the PNG Up predictor in
+/// rows of 5, its last row the `f` alone, which `MuPDF` keeps and draws (`PyMuPDF`
+/// 1.28.2).
+pub(crate) fn cut_row_content_stream() -> Vec<u8> {
+    let mut rows = Vec::new();
+    let mut above = [0_u8; 5];
+    for row in CUT_ROW_CONTENT.chunks(5) {
+        rows.push(2);
+        rows.extend(row.iter().zip(above).map(|(b, a)| b.wrapping_sub(a)));
+        above[..row.len()].copy_from_slice(row);
+    }
+    stream(
+        "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 5 >>",
+        &stored_zlib(&rows, 64),
+    )
+}

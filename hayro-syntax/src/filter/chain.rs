@@ -769,8 +769,8 @@ impl Predict<'_> {
         self.taken = 0;
     }
 
-    /// Reads the next row: false where the data end first (a last row cut short is
-    /// dropped, as `apply_predictor` drops it).
+    /// Reads the next row: false where the data end before it (a last row cut short
+    /// is kept, as `apply_predictor` keeps it).
     fn fill(&mut self, meter: &Meter<'_>) -> Result<bool, ReadError> {
         let len = self.unpredictor.input_len();
         if self.chunk.is_empty() {
@@ -779,7 +779,13 @@ impl Predict<'_> {
         while self.input.len() < len {
             let wanted = (len - self.input.len()).min(self.chunk.len());
             match self.from.read(&mut self.chunk[..wanted], meter) {
-                Ok(0) => return Ok(false),
+                Ok(0) => {
+                    let cut = self.unpredictor.finish_cut_row(&mut self.input);
+                    if cut {
+                        self.taken = 0;
+                    }
+                    return Ok(cut);
+                }
                 Ok(n) => {
                     self.input.extend_from_slice(&self.chunk[..n]);
                     self.unpredictor.advance(&mut self.input, POLL_BYTES);

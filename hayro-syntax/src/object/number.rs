@@ -95,6 +95,25 @@ impl Number {
         }
     }
 
+    /// The number as `MuPDF` reads an integer from it (observed in `PyMuPDF` 1.28.2,
+    /// through the predictor parameters of a stream): an integer's low 32 bits, a
+    /// real's [`Number::viewer_f32`] plus one half, truncated toward zero, and
+    /// `i32::MIN` where that lies outside 32 bits. `None` where `viewer_f32` is.
+    pub fn viewer_i32(&self) -> Option<i32> {
+        match self.0 {
+            InternalNumber::Integer(i) => Some(i as i32),
+            InternalNumber::Real(..) => {
+                let v = self.viewer_f32()? + 0.5;
+                // -2^31 and 2^31 are 32-bit floats.
+                Some(if (-2_147_483_648.0..2_147_483_648.0).contains(&v) {
+                    v as i32
+                } else {
+                    i32::MIN
+                })
+            }
+        }
+    }
+
     /// Create a new `Number` from an f32 number.
     pub const fn from_f32(num: f32) -> Self {
         Self(InternalNumber::Real(num as f64, num))

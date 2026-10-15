@@ -18,11 +18,8 @@ pub(crate) enum BytesPerPixel {
 
 // Note: This impl is not from the png crate.
 impl BytesPerPixel {
-    pub(crate) fn from_row_len(row_len: usize, bpp: usize) -> Option<Self> {
-        if !row_len.is_multiple_of(bpp) {
-            return None;
-        }
-
+    /// The pixel size the unrolled code handles, where it is one.
+    pub(crate) fn of(bpp: usize) -> Option<Self> {
         match bpp {
             1 => Some(Self::One),
             2 => Some(Self::Two),
@@ -59,21 +56,24 @@ impl RowFilter {
 }
 
 // Note: This function is not from the png crate.
-/// Unfilters pixels `part` of `current` (a range of whole pixels), whose pixels before
-/// it are unfiltered, as `unfilter` does for the whole row: a row is unfiltered in
-/// parts as its bytes arrive.
+/// Unfilters bytes `part` of `current`, whose bytes before it are unfiltered, as
+/// [`unfilter`] does for the whole row: a row is unfiltered in parts as its bytes
+/// arrive. `part` starts at a pixel; it may end inside one only where the row does.
 pub(crate) fn unfilter_part(
     filter: RowFilter,
-    tbpp: BytesPerPixel,
+    bpp: usize,
     previous: &[u8],
     current: &mut [u8],
     part: Range<usize>,
 ) {
-    let bpp = tbpp as usize;
+    let Some(tbpp) = BytesPerPixel::of(bpp) else {
+        unfilter_bytes(filter, bpp, previous, current, part);
+        return;
+    };
     let from = part.start.saturating_sub(bpp);
     let above = previous.get(from..part.end).unwrap_or(&[]);
     if part.start == 0 || filter == RowFilter::NoFilter {
-        unfilter(filter, tbpp, above, &mut current[part]);
+        unfilter(filter, bpp, above, &mut current[part]);
         return;
     }
     // `unfilter` takes the pixels left and above-left of its first as zero. The pixel
@@ -89,16 +89,59 @@ pub(crate) fn unfilter_part(
             RowFilter::NoFilter | RowFilter::Sub => 0,
         });
     }
-    unfilter(filter, tbpp, above, &mut current[from..part.end]);
+    unfilter_pixels(filter, tbpp, above, &mut current[from..part.end]);
     debug_assert_eq!(current[from..part.start], left[..bpp]);
 }
 
-pub(crate) fn unfilter(
-    mut filter: RowFilter,
-    tbpp: BytesPerPixel,
+// Note: This function is not from the png crate.
+/// Unfilters `current`, a row of pixels of `bpp` bytes, or its start, under the row
+/// `previous` (empty for the first row). The last pixel may be cut short, in a row
+/// whose length is no whole number of pixels or in a last row cut short: each of its
+/// bytes is unfiltered from the bytes left of and above it, as those of a whole one.
+pub(crate) fn unfilter(filter: RowFilter, bpp: usize, previous: &[u8], current: &mut [u8]) {
+    match BytesPerPixel::of(bpp) {
+        Some(tbpp) => unfilter_pixels(filter, tbpp, previous, current),
+        None => unfilter_bytes(filter, bpp, previous, current, 0..current.len()),
+    }
+}
+
+/// [`unfilter`] for the pixel sizes the unrolled code handles.
+fn unfilter_pixels(filter: RowFilter, tbpp: BytesPerPixel, previous: &[u8], current: &mut [u8]) {
+    let bpp = tbpp as usize;
+    let whole = current.len() / bpp * bpp;
+    unfilter_whole(filter, tbpp, previous, &mut current[..whole]);
+    unfilter_bytes(filter, bpp, previous, current, whole..current.len());
+}
+
+// Note: This function is not from the png crate.
+/// Unfilters bytes `range` of `current` one at a time, the bytes before them
+/// unfiltered; a byte of `previous` past its end is zero.
+fn unfilter_bytes(
+    filter: RowFilter,
+    bpp: usize,
     previous: &[u8],
     current: &mut [u8],
+    range: Range<usize>,
 ) {
+    if filter == RowFilter::NoFilter {
+        return;
+    }
+    for i in range {
+        let left = i.checked_sub(bpp);
+        let a = left.map_or(0, |j| current[j]);
+        let b = previous.get(i).copied().unwrap_or(0);
+        let c = left.and_then(|j| previous.get(j)).copied().unwrap_or(0);
+        current[i] = current[i].wrapping_add(match filter {
+            RowFilter::NoFilter => 0,
+            RowFilter::Sub => a,
+            RowFilter::Up => b,
+            RowFilter::Avg => ((u16::from(a) + u16::from(b)) / 2) as u8,
+            RowFilter::Paeth => paeth::filter_paeth(a, b, c),
+        });
+    }
+}
+
+fn unfilter_whole(mut filter: RowFilter, tbpp: BytesPerPixel, previous: &[u8], current: &mut [u8]) {
     use self::RowFilter::*;
 
     // If the previous row is empty, then treat it as if it were filled with zeros.
@@ -358,8 +401,9 @@ mod tests {
     use alloc::vec::Vec;
 
     /// A row unfiltered in parts, split at every pixel boundary and at several at
-    /// once, comes out as unfiltering it whole does: for every filter and pixel size,
-    /// with a previous row and without.
+    /// once, comes out as unfiltering it whole does, and as unfiltering it a byte at a
+    /// time does: for every filter and pixel size, with a previous row and without,
+    /// and with a last pixel cut short.
     #[test]
     fn a_row_unfiltered_in_parts_matches_it_whole() {
         let bytes = |n: usize, seed: u32| -> Vec<u8> {
@@ -373,27 +417,30 @@ mod tests {
                 })
                 .collect()
         };
-        for bpp in [1, 2, 3, 4, 6, 8] {
-            let tbpp = BytesPerPixel::from_row_len(bpp, bpp).unwrap();
-            let len = 9 * bpp;
-            for filter in 0..5 {
-                let filter = RowFilter::from_u8(filter).unwrap();
-                for previous in [Vec::new(), bytes(len, 7)] {
-                    let encoded = bytes(len, bpp as u32 + 11);
-                    let mut whole = encoded.clone();
-                    unfilter(filter, tbpp, &previous, &mut whole);
-                    let splits = (1..9).map(|k| alloc::vec![k * bpp]).chain([
-                        alloc::vec![bpp, 2 * bpp, 5 * bpp],
-                        (1..9).map(|k| k * bpp).collect(),
-                    ]);
-                    for split in splits {
-                        let mut parts = encoded.clone();
-                        let mut start = 0;
-                        for end in split.into_iter().chain([len]) {
-                            unfilter_part(filter, tbpp, &previous, &mut parts, start..end);
-                            start = end;
+        for bpp in [1, 2, 3, 4, 5, 6, 7, 8, 12, 64] {
+            for len in [9 * bpp, 9 * bpp - 1, 8 * bpp + 1] {
+                for filter in 0..5 {
+                    let filter = RowFilter::from_u8(filter).unwrap();
+                    for previous in [Vec::new(), bytes(9 * bpp, 7)] {
+                        let encoded = bytes(len, bpp as u32 + 11);
+                        let mut whole = encoded.clone();
+                        unfilter(filter, bpp, &previous, &mut whole);
+                        let mut bytewise = encoded.clone();
+                        unfilter_bytes(filter, bpp, &previous, &mut bytewise, 0..len);
+                        assert_eq!(whole, bytewise, "{filter:?} bpp {bpp} len {len}");
+                        let splits = (1..9).map(|k| alloc::vec![k * bpp]).chain([
+                            alloc::vec![bpp, 2 * bpp, 5 * bpp],
+                            (1..9).map(|k| k * bpp).collect(),
+                        ]);
+                        for split in splits {
+                            let mut parts = encoded.clone();
+                            let mut start = 0;
+                            for end in split.into_iter().filter(|&e| e < len).chain([len]) {
+                                unfilter_part(filter, bpp, &previous, &mut parts, start..end);
+                                start = end;
+                            }
+                            assert_eq!(parts, whole, "{filter:?} bpp {bpp} len {len}");
                         }
-                        assert_eq!(parts, whole, "{filter:?} bpp {bpp}");
                     }
                 }
             }

@@ -193,6 +193,36 @@ fn a_user_space_form_has_the_callers_box_and_no_matrix() {
     assert_eq!(form.decoded().unwrap().as_ref(), b"0 0 200 200 re f");
 }
 
+/// A page content under a predictor whose last row is cut short is copied with that
+/// row, as a page and as forms, as `MuPDF` draws it.
+#[test]
+fn a_content_row_cut_short_is_copied() {
+    let source = Pdf::new(fixtures::one_page(
+        100,
+        "/Contents 4 0 R",
+        vec![fixtures::cut_row_content_stream()],
+    ))
+    .unwrap();
+    let result = run(&source, &page_queries(0, [100.0, 100.0])).unwrap();
+    let copy = reread(&result);
+    for root in &result.root_refs {
+        let root = root.unwrap();
+        let content = match copy
+            .xref()
+            .get::<Stream<'_>>(ObjRef::new(root.get(), 0).into())
+        {
+            Some(form) => form,
+            None => copied_dict(&copy, root)
+                .get::<Stream<'_>>(b"Contents")
+                .unwrap(),
+        };
+        assert_eq!(
+            content.decoded().unwrap().as_ref(),
+            fixtures::CUT_ROW_CONTENT
+        );
+    }
+}
+
 #[test]
 fn crypt_filters_are_left_out_of_the_copy() {
     // An unencrypted file, where a reader passes /Crypt data through.

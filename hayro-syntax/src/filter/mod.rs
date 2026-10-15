@@ -95,7 +95,9 @@ impl Filter {
         meter: &Meter<'_>,
         strict: bool,
     ) -> Result<FilterResult<'static>, DecodeFailure> {
-        let predictor = || lzw_flate::PredictorParams::from_params(params);
+        // `MuPDF` refuses a stream whose predictor parameters it refuses.
+        let predictor =
+            || lzw_flate::PredictorParams::from_params(params).ok_or(DecodeFailure::StreamDecode);
         let res =
             match self {
                 Self::AsciiHexDecode => ascii_hex::decode(data, meter)
@@ -107,12 +109,16 @@ impl Filter {
                 Self::RunLengthDecode => run_length::decode(data, meter)
                     .map(FilterResult::from_data)
                     .ok_or(DecodeFailure::StreamDecode),
-                Self::LzwDecode => lzw_flate::lzw::decode(data, &predictor(), meter)
-                    .map(FilterResult::from_data)
-                    .ok_or(DecodeFailure::StreamDecode),
-                Self::FlateDecode => lzw_flate::flate::decode(data, &predictor(), meter, strict)
-                    .map(FilterResult::from_data)
-                    .ok_or(DecodeFailure::StreamDecode),
+                Self::LzwDecode => predictor().and_then(|p| {
+                    lzw_flate::lzw::decode(data, &p, meter)
+                        .map(FilterResult::from_data)
+                        .ok_or(DecodeFailure::StreamDecode)
+                }),
+                Self::FlateDecode => predictor().and_then(|p| {
+                    lzw_flate::flate::decode(data, &p, meter, strict)
+                        .map(FilterResult::from_data)
+                        .ok_or(DecodeFailure::StreamDecode)
+                }),
                 #[cfg(feature = "images")]
                 Self::DctDecode => {
                     dct::decode(data, params, image_params, meter).ok_or(DecodeFailure::ImageDecode)

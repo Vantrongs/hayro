@@ -254,11 +254,14 @@ fn layer(data: &[u8], rng: &mut Rng) -> (String, String, Vec<u8>) {
         if rng.chance(60) {
             return ("null".into(), data.to_vec());
         }
-        // Rows of any bytes: each predictor decodes them to something.
+        // Rows of any bytes: each predictor decodes them to something. Pixels of any
+        // size up to 12 bytes; TIFF prediction of other than 8-bit components only
+        // the whole decoder reverses.
+        let bits = [1, 2, 4, 8, 16];
         let (predictor, colors, bpc) = match rng.below(8) {
-            0 => (2, 1 + rng.below(4), 8),
-            1 => (2, 1, 4), // only the whole decoder reverses it
-            _ => (10 + rng.below(6), 1 + rng.below(4), [8, 16][rng.below(2)]),
+            0 => (2, 1 + rng.below(6), 8),
+            1 => (2, 1 + rng.below(3), bits[rng.below(5)]),
+            _ => (10 + rng.below(6), 1 + rng.below(6), bits[rng.below(5)]),
         };
         let columns = 1 + rng.below(60);
         let params = format!(
@@ -266,8 +269,9 @@ fn layer(data: &[u8], rng: &mut Rng) -> (String, String, Vec<u8>) {
         );
         let mut rows = data.to_vec();
         if predictor >= 10 {
+            let row = (columns * colors * bpc).div_ceil(8) + 1;
             for (i, b) in rows.iter_mut().enumerate() {
-                if i % (columns * colors * bpc / 8 + 1) == 0 {
+                if i % row == 0 {
                     *b %= 6;
                 }
             }
@@ -333,7 +337,8 @@ fn the_reader_reads_what_strict_decoding_returns() {
             assert!(
                 params
                     .iter()
-                    .any(|p| p.contains("/Predictor 2 /Colors 1 /BitsPerComponent 4")),
+                    .any(|p| p.starts_with("<< /Predictor 2 ")
+                        && !p.contains("/BitsPerComponent 8 ")),
                 "case {case}: {dict}: no reader"
             );
             *outcomes.entry("whole").or_insert(0) += 1;
@@ -371,6 +376,90 @@ fn the_reader_reads_what_strict_decoding_returns() {
     // Every outcome is reached, restarts where zlib-rs decodes first.
     let expected = if cfg!(feature = "unsafe") { 5 } else { 3 };
     assert_eq!(outcomes.len(), expected, "{outcomes:?}");
+}
+
+/// Predicted rows whose last row is cut short at every length, under PNG and TIFF
+/// prediction and pixels of every kind, and LZW data whose last code is cut short,
+/// each in an outer filter or not: the reader reads what strict decoding returns, and
+/// that keeps the row cut short, past its PNG filter byte.
+#[test]
+fn rows_and_codes_cut_short_read_what_strict_decoding_returns() {
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let mut pieces = Rng(0x9e37_79b9_7f4a_7c15);
+    let hex = |data: &[u8]| -> Vec<u8> {
+        data.iter()
+            .flat_map(|b| format!("{b:02X}").into_bytes())
+            .chain(*b">")
+            .collect()
+    };
+    let mut check = |filter: &str, parms: &str, encoded: &[u8]| {
+        let mut decoded = Vec::new();
+        for outer in [false, true] {
+            let (dict, data) = if outer {
+                let dict = format!("/Filter [/AHx {filter}] /DecodeParms [null {parms}]");
+                (dict, hex(encoded))
+            } else {
+                (
+                    format!("/Filter {filter} /DecodeParms {parms}"),
+                    encoded.to_vec(),
+                )
+            };
+            let pdf = stream_file(&dict, &data);
+            let stream = object_3(&pdf);
+            let whole = stream.decoded_strict().unwrap().into_owned();
+            match stream.decoded_strict_reader(&Meter::default()).unwrap() {
+                Some(mut reader) => {
+                    let (read, _) = read_all(&mut reader, &mut pieces, &Meter::default());
+                    assert_eq!(read.as_ref(), Ok(&whole), "{dict}");
+                }
+                None => assert!(parms.starts_with("<< /Predictor 2 ") && !parms.contains(" 8 ")),
+            }
+            decoded.push(whole);
+        }
+        assert_eq!(decoded[0], decoded[1], "{filter} {parms}");
+        decoded.swap_remove(0)
+    };
+    for (predictor, colors, bpc, columns) in [
+        (12_usize, 1_usize, 8_usize, 5_usize),
+        (12, 3, 8, 2),
+        (12, 5, 8, 2),
+        (12, 3, 4, 3),
+        (12, 3, 16, 1),
+        (2, 3, 8, 2),
+        (2, 5, 8, 2),
+        (2, 1, 16, 3),
+        (2, 1, 4, 11),
+    ] {
+        let row = (colors * bpc * columns).div_ceil(8);
+        let png = usize::from(predictor >= 10);
+        let parms = format!(
+            "<< /Predictor {predictor} /Colors {colors} /BitsPerComponent {bpc} /Columns {columns} >>"
+        );
+        for len in 2 * (row + png)..=3 * (row + png) {
+            let mut rows = common::noise(len, len as u32);
+            if png == 1 {
+                for b in rows.iter_mut().step_by(row + 1) {
+                    *b %= 5;
+                }
+            }
+            let cut = len % (row + png);
+            let expected = len / (row + png) * row + cut.saturating_sub(png);
+            let lzw = lzw(&rows, true, &mut rng);
+            for (filter, encoded) in [("/FlateDecode", zlib(&rows, 6)), ("/LZWDecode", lzw)] {
+                let decoded = check(filter, &parms, &encoded);
+                assert_eq!(decoded.len(), expected, "{filter} {parms}: {len} bytes");
+            }
+        }
+    }
+    // LZW cut inside its last code or its end-of-data code, with a predictor or not.
+    let data = common::noise(3000, 5);
+    let encoded = lzw(&data, true, &mut rng);
+    for cut in 1..=4 {
+        let encoded = &encoded[..encoded.len() - cut];
+        for parms in ["null", "<< /Predictor 12 /Colors 3 /Columns 7 >>"] {
+            check("/LZWDecode", parms, encoded);
+        }
+    }
 }
 
 /// Data with a bad checksum, which zlib rejects and the permissive decoder reads in

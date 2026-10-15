@@ -314,8 +314,8 @@ impl Predicted {
     }
 
     /// Reads the rest of the next row, reversing the predictor as its bytes arrive;
-    /// false if the data ends first (a last row cut short is dropped, as
-    /// `apply_predictor` drops it). The row grows with the bytes read, so a declared
+    /// false if the data end before it (a last row cut short is kept, as
+    /// `apply_predictor` keeps it). The row grows with the bytes read, so a declared
     /// width alone allocates nothing.
     fn fill(
         &mut self,
@@ -328,7 +328,13 @@ impl Predicted {
         while self.input.len() < len {
             let wanted = (len - self.input.len()).min(chunk.len());
             match source.read(&mut chunk[..wanted], inflated, meter) {
-                Ok(0) => return Ok(false),
+                Ok(0) => {
+                    let cut = self.unpredictor.finish_cut_row(&mut self.input);
+                    if cut {
+                        self.taken = 0;
+                    }
+                    return Ok(cut);
+                }
                 Ok(n) => {
                     self.input.extend_from_slice(&chunk[..n]);
                     self.unpredictor.advance(&mut self.input, POLL_BYTES);
@@ -568,8 +574,12 @@ mod tests {
 
     #[test]
     fn predicted_rows_match_the_whole_data_decoder() {
-        // Every PNG row filter, the TIFF predictor, 1 to 4 colours, packed PNG rows.
+        // Every PNG row filter, the TIFF predictor, 1 to 5 colours, packed PNG rows,
+        // PNG rows of no whole number of pixels.
         for (predictor, colors, bpc, columns) in [
+            (12, 5, 8, 3),
+            (13, 3, 4, 3),
+            (2, 5, 8, 2),
             (10, 1, 8, 7),
             (11, 3, 8, 5),
             (12, 1, 8, 9),
@@ -593,7 +603,7 @@ mod tests {
                         r[0] = (i % 6) as u8;
                     }
                 }
-                // Whole rows, then a row cut short, which is dropped.
+                // Whole rows, then a row cut short, which is kept.
                 for cut in [0, row / 2] {
                     let mut data = data.clone();
                     data.extend(noise(cut, 99));
@@ -613,20 +623,15 @@ mod tests {
         same_as_whole(&encoded[..50_000], &params(1, 1, 8, 1));
     }
 
-    /// Predictors and layouts only the whole-data decoder handles are not read
-    /// incrementally.
+    /// TIFF prediction of components of other than 8 bits, which only the
+    /// whole-data decoder reverses, is not read incrementally.
     #[test]
     fn other_predictors_are_left_to_the_whole_data_decoder() {
         for p in [
             params(2, 1, 4, 3),
             params(2, 3, 16, 3),
-            params(3, 1, 8, 3),
-            params(15, 3, 8, 0),
-            params(15, 5, 8, 3),
-            params(11, 1, 3, 3),
-            params(15, 1, 8, usize::MAX),
-            params(15, 3, 16, usize::MAX),
-            params(2, 1, 8, 0),
+            params(2, 2, 1, 7),
+            params(2, 1, 2, 5),
         ] {
             assert!(DecodedReader::flate(DecryptedReader::raw(Cow::Borrowed(&[])), &p).is_none());
         }

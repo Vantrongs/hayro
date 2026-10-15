@@ -72,10 +72,13 @@ fn zlib(data: &[u8]) -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
+/// A row declared far longer than the data allocates nothing for its length: the
+/// data are a first row cut short, which is kept (its filter byte, then `1 2 3`).
 #[test]
 fn a_declared_predictor_row_is_not_allocated_before_data_arrives() {
-    for columns in [1 << 20, usize::MAX / 32] {
-        for row in [&[][..], &[0, 1, 2, 3][..]] {
+    // 268,435,454 columns of one byte are the most `MuPDF` takes.
+    for columns in [1 << 20, 268_435_454] {
+        for (row, expected) in [(&[][..], &[][..]), (&[0, 1, 2, 3][..], &[1, 2, 3][..])] {
             let pdf = stream_file(
                 &format!(
                     "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Colors 1 \
@@ -89,9 +92,11 @@ fn a_declared_predictor_row_is_not_allocated_before_data_arrives() {
             assert!(probe.largest < 4096, "the probe allocated {probe:?}");
             let ((), read) = measure(|| {
                 let mut reader = stream.decoded_reader().unwrap();
-                assert_eq!(reader.read(&mut [0; 4], &Meter::default()), Ok(0));
+                let (data, _) = read_up_to(&mut reader, 8, 4);
+                assert_eq!(data, expected);
                 reader.rewind();
-                assert_eq!(reader.read(&mut [0; 4], &Meter::default()), Ok(0));
+                let (data, _) = read_up_to(&mut reader, 8, 4);
+                assert_eq!(data, expected);
             });
             assert!(read.largest < 128 * 1024, "reading allocated {read:?}");
         }

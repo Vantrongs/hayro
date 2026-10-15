@@ -1,9 +1,7 @@
-use crate::bit_reader::{BitChunk, BitChunks, BitReader, BitWriter, bit_mask};
-use crate::filter::png::{self, BytesPerPixel, RowFilter};
-use crate::object::Dict;
+use crate::filter::png::{self, RowFilter};
 use crate::object::dict::keys::{BITS_PER_COMPONENT, COLORS, COLUMNS, EARLY_CHANGE, PREDICTOR};
+use crate::object::{Dict, Object};
 use crate::work::{Meter, POLL_BYTES};
-use alloc::vec;
 use alloc::vec::Vec;
 
 pub(crate) mod flate {
@@ -1107,24 +1105,15 @@ pub(crate) mod lzw {
 
 #[derive(Clone)]
 pub(crate) struct PredictorParams {
+    /// 1 for none, 2 for TIFF prediction, 10 to 15 for PNG prediction.
     pub(crate) predictor: u8,
+    /// 1 to 32.
     pub(crate) colors: u8,
+    /// 1, 2, 4, 8 or 16.
     pub(crate) bits_per_component: u8,
+    /// At least 1, and few enough that a row's bits fit 32 bits.
     pub(crate) columns: usize,
     pub(crate) early_change: bool,
-}
-
-impl PredictorParams {
-    fn bits_per_pixel(&self) -> usize {
-        usize::from(self.bits_per_component) * usize::from(self.colors)
-    }
-
-    fn row_length_in_bytes(&self) -> Option<usize> {
-        let bits = self.bits_per_pixel();
-        (self.columns / 8)
-            .checked_mul(bits)?
-            .checked_add(((self.columns % 8) * bits).div_ceil(8))
-    }
 }
 
 impl Default for PredictorParams {
@@ -1140,167 +1129,244 @@ impl Default for PredictorParams {
 }
 
 impl PredictorParams {
-    pub(crate) fn from_params(dict: &Dict<'_>) -> Self {
-        Self {
-            predictor: dict.get(PREDICTOR).unwrap_or(1),
-            colors: dict.get(COLORS).unwrap_or(1),
-            bits_per_component: dict.get(BITS_PER_COMPONENT).unwrap_or(8),
-            columns: dict.get(COLUMNS).unwrap_or(1),
-            early_change: dict.get::<u8>(EARLY_CHANGE).map(|e| e != 0).unwrap_or(true),
+    /// The parameters of `dict` as `MuPDF` reads them (observed in `PyMuPDF` 1.28.2):
+    /// each number as [`Number::viewer_i32`] gives it, a value that is no number as
+    /// absent. A predictor it does not know is none; under a predictor, colors,
+    /// bits per component or columns below one are their defaults. `None` where it
+    /// refuses the stream: more than 32 colors, bits per component other than 1, 2,
+    /// 4, 8 or 16, or so many columns that a row's bits come near 2^31; also where
+    /// the reading of a number is not established.
+    pub(crate) fn from_params(dict: &Dict<'_>) -> Option<Self> {
+        let read = |key: &[u8], default: i32| match dict.get::<Object<'_>>(key) {
+            Some(Object::Number(n)) => n.viewer_i32(),
+            _ => Some(default),
+        };
+        let mut params = Self {
+            // Read by LZW alone, so a reading not established leaves it the default.
+            early_change: read(EARLY_CHANGE, 1).is_none_or(|e| e != 0),
+            ..Self::default()
+        };
+        params.predictor = match read(PREDICTOR, 1)? {
+            p @ (2 | 10..=15) => p as u8,
+            _ => return Some(params),
+        };
+        let at_least_one = |v: i32, default: i32| if v < 1 { default } else { v };
+        let colors = at_least_one(read(COLORS, 1)?, 1);
+        let bpc = at_least_one(read(BITS_PER_COMPONENT, 8)?, 8);
+        let columns = at_least_one(read(COLUMNS, 1)?, 1);
+        if colors > 32 || !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
+            return None;
         }
+        let bits = colors * bpc;
+        if i64::from(columns) * i64::from(bits) > i64::from(i32::MAX - 7)
+            || columns >= i32::MAX / bits
+        {
+            return None;
+        }
+        params.colors = colors as u8;
+        params.bits_per_component = bpc as u8;
+        params.columns = columns as usize;
+        Some(params)
+    }
+}
+
+/// How the rows of a predictor are laid out and reversed.
+#[derive(Clone, Copy)]
+struct Rows {
+    /// The bytes of a decoded row.
+    len: usize,
+    kind: Kind,
+}
+
+#[derive(Clone, Copy)]
+enum Kind {
+    /// A row filter byte before each row, which is unfiltered a byte at a time with
+    /// pixels of `bpp` bytes.
+    Png { bpp: usize },
+    /// TIFF prediction of 8-bit components: each byte adds the one `colors` before.
+    Tiff8 { colors: usize },
+    /// TIFF prediction of components of 1, 2, 4 or 16 bits.
+    Tiff { colors: usize, bpc: u8 },
+}
+
+impl Rows {
+    /// `None` without a predictor.
+    fn of(params: &PredictorParams) -> Option<Self> {
+        let colors = usize::from(params.colors);
+        let bpc = params.bits_per_component;
+        let bits = colors * usize::from(bpc);
+        let len = (bits * params.columns).div_ceil(8);
+        let kind = match params.predictor {
+            1 => return None,
+            2 if bpc == 8 => Kind::Tiff8 { colors },
+            2 => Kind::Tiff { colors, bpc },
+            _ => Kind::Png {
+                bpp: bits.div_ceil(8),
+            },
+        };
+        Some(Self { len, kind })
     }
 }
 
 /// The data with its predictor reversed, in pieces whose work counts on `meter`;
-/// `None` once its hook asks to stop.
+/// `None` once its hook asks to stop. A last row cut short is reversed as far as it
+/// goes and kept, as `MuPDF` keeps it: a PNG row needs a byte after its filter byte.
 pub(crate) fn apply_predictor(
     data: Vec<u8>,
     params: &PredictorParams,
     meter: &Meter<'_>,
 ) -> Option<Vec<u8>> {
-    match params.predictor {
-        1 => Some(data),
-        i => {
-            let is_png_predictor = i >= 10;
-
-            let row_len = params.row_length_in_bytes()?;
-
-            let total_row_len = if is_png_predictor {
-                // + 1 Because each row must start with the predictor that is used for PNG predictors.
-                row_len.checked_add(1)?
-            } else {
-                row_len
-            };
-
-            let num_rows = data.len().checked_div(total_row_len)?;
-
-            if !matches!(params.bits_per_component, 1 | 2 | 4 | 8 | 16) {
-                warn!("invalid bits per component {}", params.bits_per_component);
-
-                return None;
-            }
-
-            let (bit_size, chunk_len) = if is_png_predictor {
-                (8, params.bits_per_pixel().div_ceil(8))
-            } else {
-                (params.bits_per_component, params.colors as usize)
-            };
-
-            if bit_size == 8
-                && let Some(tbpp) = BytesPerPixel::from_row_len(row_len, chunk_len)
-            {
-                return apply_predictor_8bit_png(
-                    data,
-                    i,
-                    is_png_predictor,
-                    row_len,
-                    total_row_len,
-                    num_rows,
-                    tbpp,
-                    meter,
-                );
-            }
-
-            let zero_row = vec![0; row_len];
-            let mut prev_row = BitChunks::new(&zero_row, bit_size, chunk_len)?;
-            let zero_col = BitChunk::new(0, chunk_len);
-            let mut out = vec![0; num_rows * row_len];
-            let mut writer = BitWriter::new(&mut out, bit_size)?;
-
-            for in_row in data.chunks_exact(total_row_len) {
-                if is_png_predictor {
-                    let predictor = in_row[0];
-                    let in_data = &in_row[1..];
-                    let in_data_chunks = BitChunks::new(in_data, bit_size, chunk_len)?;
-
-                    match predictor {
-                        1 => apply::<Sub>(
-                            prev_row,
-                            zero_col.clone(),
-                            zero_col.clone(),
-                            in_data_chunks,
-                            &mut writer,
-                            chunk_len,
-                            bit_size,
-                            meter,
-                        )?,
-                        2 => apply::<Up>(
-                            prev_row,
-                            zero_col.clone(),
-                            zero_col.clone(),
-                            in_data_chunks,
-                            &mut writer,
-                            chunk_len,
-                            bit_size,
-                            meter,
-                        )?,
-                        3 => apply::<Avg>(
-                            prev_row,
-                            zero_col.clone(),
-                            zero_col.clone(),
-                            in_data_chunks,
-                            &mut writer,
-                            chunk_len,
-                            bit_size,
-                            meter,
-                        )?,
-                        4 => apply::<Paeth>(
-                            prev_row,
-                            zero_col.clone(),
-                            zero_col.clone(),
-                            in_data_chunks,
-                            &mut writer,
-                            chunk_len,
-                            bit_size,
-                            meter,
-                        )?,
-                        _ => {
-                            // Just copy the data.
-                            let mut reader = BitReader::new(in_data);
-
-                            while let Some(data) = reader.read(bit_size) {
-                                meter.work(1).ok()?;
-                                writer.write(data);
-                            }
-                        }
-                    }
-                } else if i == 2 {
-                    apply::<Sub>(
-                        prev_row,
-                        zero_col.clone(),
-                        zero_col.clone(),
-                        BitChunks::new(in_row, bit_size, chunk_len)?,
-                        &mut writer,
-                        chunk_len,
-                        bit_size,
-                        meter,
-                    )?;
-                } else {
-                    warn!("unknown predictor {i}");
-
-                    return None;
-                }
-
-                let (data, new_writer) = writer.split_off();
-                writer = new_writer;
-                prev_row = BitChunks::new(data, bit_size, chunk_len)?;
-            }
-
-            Some(out)
+    let Some(rows) = Rows::of(params) else {
+        return Some(data);
+    };
+    match rows.kind {
+        Kind::Png { bpp } => unpredict_png(data, rows.len, bpp, meter),
+        Kind::Tiff8 { colors } => unpredict_tiff8(data, rows.len, colors, meter),
+        Kind::Tiff { colors, bpc } => {
+            let components = colors * params.columns;
+            unpredict_tiff(data, rows.len, colors, bpc, components, meter)
         }
     }
 }
 
+/// The bytes of a part of a row reversed between two polls: whole pixels of `bpp`.
+fn part_len(bpp: usize) -> usize {
+    (POLL_BYTES / bpp).max(1) * bpp
+}
+
+fn unpredict_png(mut data: Vec<u8>, len: usize, bpp: usize, meter: &Meter<'_>) -> Option<Vec<u8>> {
+    let part_len = part_len(bpp);
+    let (mut src, mut dst) = (0, 0);
+    while src < data.len() {
+        let filter = RowFilter::from_u8(data[src]);
+        // The row's bytes after its filter byte, fewer in a last row cut short.
+        let k = (data.len() - src - 1).min(len);
+        for start in (0..k).step_by(part_len) {
+            let end = (start + part_len).min(k);
+            // The row moves left, so the bytes a part overwrites were moved before.
+            data.copy_within(src + 1 + start..src + 1 + end, dst + start);
+            let (done, rest) = data.split_at_mut(dst);
+            let previous = done.len().checked_sub(len).map_or(&[][..], |p| &done[p..]);
+            if let Some(filter) = filter {
+                png::unfilter_part(filter, bpp, previous, &mut rest[..k], start..end);
+            }
+            meter.work(end - start).ok()?;
+        }
+        src += len + 1;
+        dst += k;
+    }
+    data.truncate(dst);
+    Some(data)
+}
+
+fn unpredict_tiff8(
+    mut data: Vec<u8>,
+    len: usize,
+    colors: usize,
+    meter: &Meter<'_>,
+) -> Option<Vec<u8>> {
+    let part_len = part_len(colors);
+    for row in data.chunks_mut(len) {
+        for start in (0..row.len()).step_by(part_len) {
+            let end = (start + part_len).min(row.len());
+            png::unfilter_part(RowFilter::Sub, colors, &[], row, start..end);
+            meter.work(end - start).ok()?;
+        }
+    }
+    Some(data)
+}
+
+fn unpredict_tiff(
+    mut data: Vec<u8>,
+    len: usize,
+    colors: usize,
+    bpc: u8,
+    components: usize,
+    meter: &Meter<'_>,
+) -> Option<Vec<u8>> {
+    // In a last row cut short inside a 16-bit component, `MuPDF` takes the missing low
+    // byte from where the row before held it, as stored (observed in `PyMuPDF`
+    // 1.28.2; in a first row it reads a byte not established, taken as zero here).
+    let (full, cut) = (data.len() / len, data.len() % len);
+    let missing = match full.checked_sub(1) {
+        Some(before) if bpc == 16 && cut % 2 == 1 => data[before * len + cut],
+        _ => 0,
+    };
+    for row in data.chunks_mut(len) {
+        if bpc == 16 {
+            unpredict_tiff16(row, colors, missing, meter)?;
+        } else {
+            unpredict_tiff_bits(row, colors, bpc, components, meter)?;
+        }
+    }
+    Some(data)
+}
+
+/// A row of 16-bit components, each the sum of itself and the one `colors` before;
+/// a last component cut short takes `missing` as its low byte, and keeps its high one.
+fn unpredict_tiff16(row: &mut [u8], colors: usize, missing: u8, meter: &Meter<'_>) -> Option<()> {
+    let n = row.len().div_ceil(2);
+    let part = part_len(2) / 2;
+    for start in (colors..n).step_by(part) {
+        let end = (start + part).min(n);
+        for s in start..end {
+            let at = |row: &[u8], s: usize| {
+                u16::from_be_bytes([row[2 * s], row.get(2 * s + 1).copied().unwrap_or(missing)])
+            };
+            let [high, low] = at(row, s).wrapping_add(at(row, s - colors)).to_be_bytes();
+            row[2 * s] = high;
+            if let Some(byte) = row.get_mut(2 * s + 1) {
+                *byte = low;
+            }
+        }
+        meter.work(2 * (end - start)).ok()?;
+    }
+    Some(())
+}
+
+/// A row of components of `bpc` (1, 2 or 4) bits, most significant first, each the
+/// sum of itself and the one `colors` before modulo 2^bpc; a row holds `components`,
+/// a last row cut short as many as its bytes do. Bits after the last component of a
+/// row are cleared, as `MuPDF` clears them.
+fn unpredict_tiff_bits(
+    row: &mut [u8],
+    colors: usize,
+    bpc: u8,
+    components: usize,
+    meter: &Meter<'_>,
+) -> Option<()> {
+    let bpc = usize::from(bpc);
+    let n = components.min(row.len() * 8 / bpc);
+    let mask = (1_u8 << bpc) - 1;
+    let shift = |s: usize| 8 - bpc - s * bpc % 8;
+    let part = part_len(1) * 8 / bpc;
+    for start in (colors..n).step_by(part) {
+        let end = (start + part).min(n);
+        for s in start..end {
+            let left = (row[(s - colors) * bpc / 8] >> shift(s - colors)) & mask;
+            let byte = &mut row[s * bpc / 8];
+            let v = ((*byte >> shift(s)) & mask).wrapping_add(left) & mask;
+            *byte = (*byte & !(mask << shift(s))) | (v << shift(s));
+        }
+        meter.work((end - start) * bpc / 8 + 1).ok()?;
+    }
+    let used = n * bpc % 8;
+    if used != 0 {
+        row[n * bpc / 8] &= !(0xFF >> used);
+    }
+    Some(())
+}
+
 /// Reverses a predictor row by row, as `apply_predictor` does for the whole data at
-/// once: for the predictors and row layouts `apply_predictor_8bit_png` handles
-/// (whole bytes per pixel), the only ones it accepts. A row is reversed in parts, as
-/// its bytes arrive.
+/// once: for PNG prediction and TIFF prediction of 8-bit components, the predictors
+/// that unfilter a byte at a time. A row is reversed in parts, as its bytes arrive.
 #[derive(Clone)]
 pub(crate) struct Unpredictor {
     is_png_predictor: bool,
-    tbpp: BytesPerPixel,
+    /// The bytes of a pixel for PNG prediction, of the components of one for TIFF.
+    bpp: usize,
     /// The previous row, decoded after its predictor byte for PNG predictors; empty
-    /// before the first, as `apply_predictor_8bit_png` passes it.
+    /// before the first, as `apply_predictor` passes it.
     prev: Vec<u8>,
     row_len: usize,
     /// The bytes of the row being read that are reversed.
@@ -1308,33 +1374,20 @@ pub(crate) struct Unpredictor {
 }
 
 impl Unpredictor {
-    /// `None` for predictor 1 (no prediction) and for the predictors and layouts
-    /// `apply_predictor` handles otherwise (or rejects).
+    /// `None` for predictor 1 (no prediction) and for the TIFF prediction of
+    /// components of other than 8 bits, which only `apply_predictor` reverses.
     pub(crate) fn new(params: &PredictorParams) -> Option<Self> {
-        let is_png_predictor = params.predictor >= 10;
-        if !(is_png_predictor || params.predictor == 2)
-            || !matches!(params.bits_per_component, 1 | 2 | 4 | 8 | 16)
-        {
-            return None;
-        }
-        let row_len = params.row_length_in_bytes()?;
-        let chunk_len = if is_png_predictor {
-            params.bits_per_pixel().div_ceil(8)
-        } else if params.bits_per_component == 8 {
-            params.colors as usize
-        } else {
-            return None;
+        let rows = Rows::of(params)?;
+        let (is_png_predictor, bpp) = match rows.kind {
+            Kind::Png { bpp } => (true, bpp),
+            Kind::Tiff8 { colors } => (false, colors),
+            Kind::Tiff { .. } => return None,
         };
-        if row_len == 0 {
-            return None;
-        }
-        row_len.checked_add(usize::from(is_png_predictor))?;
-        let tbpp = BytesPerPixel::from_row_len(row_len, chunk_len)?;
         Some(Self {
             is_png_predictor,
-            tbpp,
+            bpp,
             prev: Vec::new(),
-            row_len,
+            row_len: rows.len,
             done: 0,
         })
     }
@@ -1344,35 +1397,58 @@ impl Unpredictor {
         self.row_len + usize::from(self.is_png_predictor)
     }
 
+    /// The filter of the encoded row read so far, and its bytes after the filter byte.
+    fn split<'b>(&self, input: &'b mut [u8]) -> Option<(Option<RowFilter>, &'b mut [u8])> {
+        if self.is_png_predictor {
+            let (&mut filter, row) = input.split_first_mut()?;
+            Some((RowFilter::from_u8(filter), row))
+        } else {
+            Some((Some(RowFilter::Sub), input))
+        }
+    }
+
     /// Reverses the predictor over the bytes of `input`, the encoded row read so far,
     /// that make whole pixels and were not reversed before, once there are at least
     /// `min` of them.
     pub(crate) fn advance(&mut self, input: &mut [u8], min: usize) {
-        let (filter, row) = if self.is_png_predictor {
-            let Some((&mut filter, row)) = input.split_first_mut() else {
-                return;
-            };
-            (RowFilter::from_u8(filter), row)
-        } else {
-            (Some(RowFilter::Sub), input)
+        let (bpp, done) = (self.bpp, self.done);
+        let Some((filter, row)) = self.split(input) else {
+            return;
         };
-        let end = row.len() / self.tbpp as usize * self.tbpp as usize;
-        if end <= self.done || end - self.done < min {
+        let end = row.len() / bpp * bpp;
+        if end <= done || end - done < min {
             return;
         }
         if let Some(filter) = filter {
-            png::unfilter_part(filter, self.tbpp, self.row(), row, self.done..end);
+            png::unfilter_part(filter, bpp, self.row(), row, done..end);
         }
         self.done = end;
     }
 
-    /// Decodes the rest of `input`, which holds the whole encoded row, and takes it
-    /// as the previous row ([`Self::row`]), leaving `input` empty.
+    /// Decodes the rest of `input`, which holds the encoded row, whole or the last
+    /// one cut short, and takes it as the previous row ([`Self::row`]), leaving
+    /// `input` empty.
     pub(crate) fn finish_row(&mut self, input: &mut Vec<u8>) {
-        self.advance(input, 0);
+        let (bpp, done) = (self.bpp, self.done);
+        if let Some((Some(filter), row)) = self.split(input) {
+            let end = row.len();
+            png::unfilter_part(filter, bpp, self.row(), row, done.min(end)..end);
+        }
         core::mem::swap(&mut self.prev, input);
         input.clear();
         self.done = 0;
+    }
+
+    /// At the end of the data, decodes the last row cut short that `input` holds, as
+    /// `apply_predictor` keeps it: true where it holds a byte of data.
+    pub(crate) fn finish_cut_row(&mut self, input: &mut Vec<u8>) -> bool {
+        if input.len() <= usize::from(self.is_png_predictor) {
+            input.clear();
+            self.done = 0;
+            return false;
+        }
+        self.finish_row(input);
+        true
     }
 
     /// The last row decoded; empty before the first.
@@ -1395,165 +1471,11 @@ impl Unpredictor {
     }
 }
 
-#[expect(clippy::too_many_arguments)]
-fn apply_predictor_8bit_png(
-    mut data: Vec<u8>,
-    predictor: u8,
-    is_png_predictor: bool,
-    row_len: usize,
-    total_row_len: usize,
-    num_rows: usize,
-    tbpp: BytesPerPixel,
-    meter: &Meter<'_>,
-) -> Option<Vec<u8>> {
-    if row_len == 0 || total_row_len == 0 {
-        return None;
-    }
-
-    let out_len = num_rows * row_len;
-    let part_len = POLL_BYTES / tbpp as usize * tbpp as usize;
-
-    for row_idx in 0..num_rows {
-        let src_start = row_idx * total_row_len;
-        let dst_start = row_idx * row_len;
-
-        let filter = if is_png_predictor {
-            RowFilter::from_u8(data[src_start])
-        } else if predictor == 2 {
-            Some(RowFilter::Sub)
-        } else {
-            warn!("unknown predictor {predictor}");
-
-            return None;
-        };
-
-        for start in (0..row_len).step_by(part_len) {
-            let end = (start + part_len).min(row_len);
-            if is_png_predictor {
-                // The row moves left, so the bytes a part overwrites were moved before.
-                data.copy_within(
-                    src_start + 1 + start..src_start + 1 + end,
-                    dst_start + start,
-                );
-            }
-
-            let (done, rest) = data.split_at_mut(dst_start);
-            let prev_row = if let Some(prev_start) = done.len().checked_sub(row_len) {
-                &done[prev_start..]
-            } else {
-                &[]
-            };
-            let row = &mut rest[..row_len];
-
-            if let Some(filter) = filter {
-                png::unfilter_part(filter, tbpp, prev_row, row, start..end);
-            }
-            meter.work(end - start).ok()?;
-        }
-    }
-
-    data.truncate(out_len);
-
-    Some(data)
-}
-
-#[expect(clippy::too_many_arguments)]
-fn apply<'a, T: Predictor>(
-    prev_row: BitChunks<'a>,
-    mut prev_col: BitChunk,
-    mut top_left: BitChunk,
-    cur_row: BitChunks<'a>,
-    writer: &mut BitWriter<'a>,
-    chunk_len: usize,
-    bit_size: u8,
-    meter: &Meter<'_>,
-) -> Option<()> {
-    for (cur_row, prev_row) in cur_row.zip(prev_row) {
-        meter.work(chunk_len).ok()?;
-        let old_pos = writer.cur_pos();
-
-        for (((cur_row, prev_row), prev_col), top_left) in cur_row
-            .iter()
-            .zip(prev_row.iter())
-            .zip(prev_col.iter())
-            .zip(top_left.iter())
-        {
-            // Note that the wrapping behavior when adding inside the predictors is dependent on the
-            // bit size, so it wouldn't be triggered for bits per component < 16. So we mask out
-            // the bytes manually, which is equivalent to a wrapping add.
-            writer.write(
-                T::predict(cur_row, prev_row, prev_col, top_left) as u32 & bit_mask(bit_size),
-            );
-        }
-
-        prev_col = {
-            let out_data = writer.get_data();
-            let mut reader = BitReader::new_with(out_data, old_pos);
-            BitChunk::from_reader(&mut reader, bit_size, chunk_len).unwrap()
-        };
-
-        top_left = prev_row;
-    }
-
-    Some(())
-}
-
-trait Predictor {
-    fn predict(cur_row: u16, prev_row: u16, prev_col: u16, top_left: u16) -> u16;
-}
-
-struct Sub;
-impl Predictor for Sub {
-    fn predict(cur_row: u16, _: u16, prev_col: u16, _: u16) -> u16 {
-        cur_row.wrapping_add(prev_col)
-    }
-}
-
-struct Up;
-impl Predictor for Up {
-    fn predict(cur_row: u16, prev_row: u16, _: u16, _: u16) -> u16 {
-        cur_row.wrapping_add(prev_row)
-    }
-}
-
-struct Avg;
-impl Predictor for Avg {
-    fn predict(cur_row: u16, prev_row: u16, prev_col: u16, _: u16) -> u16 {
-        cur_row.wrapping_add(((prev_col as u32 + prev_row as u32) / 2) as u16)
-    }
-}
-
-struct Paeth;
-impl Predictor for Paeth {
-    fn predict(cur_row: u16, prev_row: u16, prev_col: u16, top_left: u16) -> u16 {
-        fn paeth(a: u16, b: u16, c: u16) -> u16 {
-            let a = a as i32;
-            let b = b as i32;
-            let c = c as i32;
-
-            let p = a + b - c;
-            let pa = (p - a).abs();
-            let pb = (p - b).abs();
-            let pc = (p - c).abs();
-
-            if pa <= pb && pa <= pc {
-                a as u16
-            } else if pb <= pc {
-                b as u16
-            } else {
-                c as u16
-            }
-        }
-
-        cur_row.wrapping_add(paeth(prev_col, prev_row, top_left))
-    }
-}
-
 #[cfg(test)]
 #[rustfmt::skip]
 mod tests {
     use crate::filter::lzw_flate::{PredictorParams, apply_predictor, flate, lzw};
-    use crate::filter::png::{self, BytesPerPixel, RowFilter};
+    use crate::filter::png::{self, RowFilter};
     use crate::work::{Meter, POLL_BYTES};
 
     #[test]
@@ -1710,7 +1632,7 @@ mod tests {
         for row in input.chunks(row_len + 1) {
             let mut current = row[1..].to_vec();
             let previous = &expected[expected.len().saturating_sub(row_len)..];
-            png::unfilter(RowFilter::from_u8(row[0]).unwrap(), BytesPerPixel::Three, previous, &mut current);
+            png::unfilter(RowFilter::from_u8(row[0]).unwrap(), 3, previous, &mut current);
             expected.extend(current);
         }
         let params = PredictorParams {

@@ -18,6 +18,17 @@ fn decoded_content_is_not_copied() {
     assert!(used.peak < data.len() * 3 / 2, "{used:?}");
 }
 
+/// A content under a predictor whose last row is cut short keeps that row, by the
+/// strict and the lenient reading alike, as `MuPDF` draws it.
+#[test]
+fn a_content_row_cut_short_is_kept() {
+    let content = common::cut_row_content_stream();
+    let pdf = Pdf::new(common::one_page(100, "/Contents 4 0 R", vec![content])).unwrap();
+    let page = &pdf.pages()[0];
+    assert_eq!(page.try_page_stream().unwrap(), common::CUT_ROW_CONTENT);
+    assert_eq!(page.page_stream().unwrap(), common::CUT_ROW_CONTENT);
+}
+
 /// A stream an array of contents names many times is decoded once, by the strict
 /// and the lenient reading alike, though the content holds it each time.
 #[test]

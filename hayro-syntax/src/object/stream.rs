@@ -357,7 +357,8 @@ impl<'a> Stream<'a> {
     /// `Err` where `decoded_strict` fails before decoding: where the data cannot be
     /// decrypted whole, or the hook asks to stop. `Ok(None)` where a filter has no
     /// decoder that reads a piece at a time, an image filter or a predictor only the
-    /// whole decoder reverses: the caller decodes whole then.
+    /// whole decoder reverses, or where whole decoding refuses a predictor's
+    /// parameters: the caller decodes whole then.
     pub fn decoded_strict_reader(
         &self,
         meter: &Meter<'_>,
@@ -365,23 +366,27 @@ impl<'a> Stream<'a> {
         let FiltersAndParams { filters, params } = self.filters_and_params();
         let mut layers = Vec::with_capacity(filters.len());
         for (filter, params) in filters.iter().zip(&params) {
-            let predictor = PredictorParams::from_params(params);
-            // `None` where only the whole decoder reverses the predictor.
-            let unpredictor = || match predictor.predictor {
-                1 => Some(None),
-                _ => Unpredictor::new(&predictor).map(|u| Some(Box::new(u))),
+            // The parameters and the reversal of the predictor; `None` where whole
+            // decoding refuses the parameters or only it reverses the predictor.
+            let predicted = || {
+                let predictor = PredictorParams::from_params(params)?;
+                let unpredictor = match predictor.predictor {
+                    1 => None,
+                    _ => Some(Box::new(Unpredictor::new(&predictor)?)),
+                };
+                Some((predictor, unpredictor))
             };
             layers.push(match filter {
                 // Decrypted with the stored data.
                 Filter::Crypt => continue,
                 Filter::FlateDecode => {
-                    let Some(unpredictor) = unpredictor() else {
+                    let Some((predictor, unpredictor)) = predicted() else {
                         return Ok(None);
                     };
                     Layer::Flate(predictor, unpredictor)
                 }
                 Filter::LzwDecode => {
-                    let Some(unpredictor) = unpredictor() else {
+                    let Some((predictor, unpredictor)) = predicted() else {
                         return Ok(None);
                     };
                     Layer::Lzw(predictor, unpredictor)
@@ -400,9 +405,9 @@ impl<'a> Stream<'a> {
     }
 
     /// The decoded data, read incrementally, when the stream's filters allow it: no
-    /// filter, or Flate with no predictor or a byte-aligned one. It yields the bytes
-    /// [`Stream::decoded`] returns, without holding them all. `None` for other
-    /// filters, or where decryption would fail.
+    /// filter, or Flate with no predictor, a PNG predictor, or the TIFF predictor of
+    /// 8-bit components. It yields the bytes [`Stream::decoded`] returns, without
+    /// holding them all. `None` for other filters, or where decryption would fail.
     pub fn decoded_reader(&self) -> Option<DecodedReader<'a>> {
         let filter = self.reader_filter()?;
         let data = match self.decryption().ok()? {
@@ -433,7 +438,7 @@ impl<'a> Stream<'a> {
         match filters.as_slice() {
             [] => Some(None),
             [Filter::FlateDecode] => {
-                let params = PredictorParams::from_params(&params[0]);
+                let params = PredictorParams::from_params(&params[0])?;
                 if params.predictor != 1 {
                     Unpredictor::new(&params)?;
                 }
