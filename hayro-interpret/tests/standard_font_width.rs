@@ -33,16 +33,19 @@ impl<'a> Device<'a> for Rec {
     fn knock_out(&mut self, _: &BezPath, _: kurbo::Affine, _: &DrawMode) {}
 }
 
-#[test]
-fn a_glyph_the_metrics_lack_advances_by_the_fonts_width() {
+/// Where `text` places its glyphs in 10-point Helvetica, drawn by Liberation Sans,
+/// with `differences`.
+fn placed(text: &str, differences: &str) -> Vec<f64> {
     let file = common::one_page(
         100,
         "/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >>",
         vec![
-            common::stream("", b"BT /F1 10 Tf 0 50 Td <808141> Tj ET"),
-            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << \
-              /Differences [128 /afii10017 /afii10018] >> >>"
-                .to_vec(),
+            common::stream("", format!("BT /F1 10 Tf 0 50 Td {text} Tj ET").as_bytes()),
+            format!(
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << \
+                 /Differences {differences} >> >>"
+            )
+            .into_bytes(),
         ],
     );
     let pdf = Pdf::new(file).expect("valid pdf");
@@ -57,7 +60,30 @@ fn a_glyph_the_metrics_lack_advances_by_the_fonts_width() {
     };
     let mut rec = Rec::default();
     common::interpret_first_page(&pdf, settings, &mut rec);
+    rec.0.iter().map(|x| (x * 100.0).round() / 100.0).collect()
+}
+
+#[test]
+fn a_glyph_the_metrics_lack_advances_by_the_fonts_width() {
     // А is 667 thousandths of an em wide in Liberation Sans, Б 656.
-    let x: Vec<f64> = rec.0.iter().map(|x| (x * 100.0).round() / 100.0).collect();
-    assert_eq!(x, [0.0, 6.67, 13.23]);
+    assert_eq!(
+        placed("<808141>", "[128 /afii10017 /afii10018]"),
+        [0.0, 6.67, 13.23]
+    );
+}
+
+/// An entry of /Differences that is neither a number nor a name, a reference to no
+/// object among them, is passed over without taking a code, as `MuPDF` reads it
+/// (`PyMuPDF` 1.28.2: `[65 /x 8 0 R /y null /z]` gives codes 65 to 67 x, y, z).
+#[test]
+fn an_entry_of_the_differences_that_is_no_name_takes_no_code() {
+    // B is Б, 656 thousandths of an em, where the dangling reference takes no code;
+    // it would be Helvetica's B, 667, if it ended the list.
+    let expected = [0.0, 6.67, 13.23];
+    for differences in [
+        "[65 /afii10017 8 0 R /afii10018 null /A]",
+        "[65 /afii10017 (B) /afii10018 /A]",
+    ] {
+        assert_eq!(placed("(ABC)", differences), expected, "{differences}");
+    }
 }

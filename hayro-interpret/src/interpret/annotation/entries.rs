@@ -15,7 +15,6 @@ use super::Unsupported;
 use hayro_syntax::Filter;
 use hayro_syntax::hash;
 use hayro_syntax::lost::Lost;
-use hayro_syntax::object::dict::keys::{DECODE_PARMS, DP};
 use hayro_syntax::object::{Array, Dict, MaybeRef, Name, Number, ObjRef, Object, Stream};
 use hayro_syntax::xref::{ContentKey, XRef};
 use std::any::{Any, TypeId};
@@ -691,17 +690,14 @@ impl<'a> Value<'a> {
         };
         // Parameters given by reference may lead back to an object being read, which
         // the cycle check rejects where viewers read it (issue 59): refused too.
-        let dict = stream.dict();
-        let by_reference = |key: &[u8]| {
-            dict.get_ref(key).is_some()
-                || dict
-                    .get::<Array<'_>>(key)
-                    .is_some_and(|a| a.raw_iter().any(|e| matches!(e, MaybeRef::Ref(_))))
+        let filters = stream.filter_entries();
+        let mut applied = filters.applied();
+        let shown = match (applied.next(), applied.next()) {
+            (None, _) => true,
+            (Some((Filter::FlateDecode, flate)), None) => !flate.params_by_reference,
+            _ => false,
         };
-        if !matches!(stream.filters().as_slice(), [] | [Filter::FlateDecode])
-            || by_reference(DECODE_PARMS)
-            || by_reference(DP)
-        {
+        if !shown {
             return Err(Unsupported::ValueStream);
         }
         stream

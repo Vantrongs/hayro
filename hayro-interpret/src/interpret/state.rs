@@ -383,6 +383,9 @@ pub(crate) fn handle_gs_single<'a>(
                     return Some(());
                 }
             } else if let Some(arr) = dict.get::<Array<'_>>(key) {
+                // The first mode recognized, as the PDF specification says; `MuPDF`
+                // (`PyMuPDF` 1.28.2) reads the first entry alone, so that
+                // `[null /Difference]` draws Normal there.
                 for name in arr.iter::<Name<'_>>() {
                     if let Some(bm) = convert_blend_mode(name.as_str()) {
                         context.get_mut().graphics_state.blend_mode = bm;

@@ -622,6 +622,8 @@ pub fn interpret<'a>(
                 }
 
                 text::begin_glyph_run(context);
+                // An entry that is neither a number nor a string is passed over;
+                // `MuPDF` (`PyMuPDF` 1.28.2) draws nothing of such an array.
                 for obj in s.0.iter::<Object<'_>>() {
                     match obj {
                         Object::Number(num) => {

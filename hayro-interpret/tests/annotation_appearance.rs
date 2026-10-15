@@ -2439,7 +2439,7 @@ fn a_field_value_stream_is_its_text_where_it_decodes_and_unsupported_where_not()
     let tiff = [
         120, 156, 243, 248, 203, 206, 192, 172, 96, 254, 131, 249, 151, 11, 0, 21, 77, 3, 224,
     ];
-    let shown: [(&str, &str, &[u8]); 9] = [
+    let shown: [(&str, &str, &[u8]); 12] = [
         ("(HELLO WORLD)", "", b"HELLO WORLD"),
         ("(HELLO WORLD)", "/Filter /FlateDecode", HELLO_WORLD),
         ("(HELLO WORLD)", "/Filter /FlateDecode", &bad_sum),
@@ -2465,17 +2465,31 @@ fn a_field_value_stream_is_its_text_where_it_decodes_and_unsupported_where_not()
             "/Filter /FlateDecode /DecodeParms << /Predictor 3 /Columns 5 >>",
             HELLO_WORLD,
         ),
+        // An entry of the filters that names none is passed over in its place.
+        ("(HELLO WORLD)", "/Filter [null /FlateDecode]", HELLO_WORLD),
+        // An array of parameters for a filter given by name is not read.
+        (
+            "(HELLO WORLD)",
+            "/Filter /FlateDecode /DP [6 0 R]",
+            HELLO_WORLD,
+        ),
+        (
+            "(HELLO WORLD)",
+            "/Filter [null /FlateDecode] /DecodeParms [null << /Predictor 12 /Columns 5 >>]",
+            &up,
+        ),
     ];
     // LZW of `HELLO WORLD`, valid: refused with the filter, which `MuPDF` reads
     // otherwise where its last code is cut short.
     let lzw = [
         128, 18, 8, 164, 194, 97, 60, 64, 87, 39, 148, 137, 132, 72, 8,
     ];
-    let refused: [(&str, &[u8]); 13] = [
+    let refused: [(&str, &[u8]); 14] = [
         ("/Filter /AHx", b"48454C4C4F20574F524C44>"),
         ("/Filter /LZW", &lzw),
         ("/Filter /FlateDecode /DecodeParms 6 0 R", HELLO_WORLD),
-        ("/Filter /FlateDecode /DP [6 0 R]", HELLO_WORLD),
+        ("/Filter [/FlateDecode] /DP [6 0 R]", HELLO_WORLD),
+        ("/Filter [null /FlateDecode] /DP [null 6 0 R]", HELLO_WORLD),
         (
             "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Colors 33 /Columns 5 >>",
             &up,
