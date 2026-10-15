@@ -674,23 +674,33 @@ impl<'a> Value<'a> {
     /// The bytes of a text or choice field's value, `/V`, whose value this is: a
     /// string's, or a stream's data. Viewers (`PyMuPDF` bake, observed) show the data
     /// as decoding them whole makes them ([`Stream::decoded_strict`]) where they are
-    /// stored as they are or by Flate alone, damaged or cut short. Elsewhere,
+    /// stored as they are or by Flate alone, damaged or cut short, with or without a
+    /// predictor, whose reading matches theirs byte for byte, a last row cut short
+    /// included, its parameters written in the stream's dictionary. Elsewhere,
     /// [`Unsupported::ValueStream`]: where the data do not decode, viewers show what
-    /// their decoder made before it failed, in pieces of their own buffering; and data
-    /// cut short in another filter or a predictor's row are read otherwise by them (a
-    /// half byte of hexadecimal, a group of base-85 without its end, a cut run, a
-    /// partial row), which a value in such a stream, which writers do not make, is not
-    /// told apart from.
+    /// their decoder made before it failed, in pieces of their own buffering; data cut
+    /// short in another filter are read otherwise by them (a half byte of hexadecimal,
+    /// a group of base-85 without its end, a cut run, a byte for an LZW code cut
+    /// short); and parameters given by reference may be ones the cycle check rejects.
+    /// Writers make no such value, and it is not told apart from a valid one.
     pub(crate) fn field_text(&self) -> Result<Option<Vec<u8>>, Unsupported> {
         let stream = match self {
             Self::String(s) => return Ok(Some(s.as_bytes().to_vec())),
             Self::Stream(s) => &s.0,
             _ => return Ok(None),
         };
+        // Parameters given by reference may lead back to an object being read, which
+        // the cycle check rejects where viewers read it (issue 59): refused too.
         let dict = stream.dict();
+        let by_reference = |key: &[u8]| {
+            dict.get_ref(key).is_some()
+                || dict
+                    .get::<Array<'_>>(key)
+                    .is_some_and(|a| a.raw_iter().any(|e| matches!(e, MaybeRef::Ref(_))))
+        };
         if !matches!(stream.filters().as_slice(), [] | [Filter::FlateDecode])
-            || dict.contains_key(DECODE_PARMS)
-            || dict.contains_key(DP)
+            || by_reference(DECODE_PARMS)
+            || by_reference(DP)
         {
             return Err(Unsupported::ValueStream);
         }

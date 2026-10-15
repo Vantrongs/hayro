@@ -2409,14 +2409,16 @@ const HELLO_WORLD: &[u8] = &[
 /// A text or choice field's value may be a stream, whose data, stored as they are or
 /// by Flate alone, are the text as decoding them whole makes them, which is what
 /// `PyMuPDF` 1.28.2 bake draws for each value here: a damaged checksum is ignored, data
-/// cut short end the text, and an unknown filter passes the data on. Where they do
-/// not decode, bake draws what its decoder made before it failed, in pieces of 256
-/// bytes (none of these short ones, but a prefix of a long value), or, for a damaged
-/// Flate, what a lenient decoder makes of the rest; and it reads data cut short in
-/// other filters or a predictor's row otherwise (a cut run of `RunLength` here, which
-/// it shows none of): a value in a stream that does not decode or is encoded
-/// otherwise is unsupported, and the split refuses the page, for every way the value
-/// is drawn.
+/// cut short end the text, an unknown filter passes the data on, and a predictor,
+/// given as `/DecodeParms` or `/DP`, keeps a last row cut short (`D` of rows of five)
+/// and passes the data on where it is unknown. Where they do not decode, bake draws what
+/// its decoder made before it failed, in pieces of 256 bytes (none of these short
+/// ones, but a prefix of a long value), or, for a damaged Flate, what a lenient
+/// decoder makes of the rest, or nothing where it refuses the predictor's parameters;
+/// and it reads data cut short in other filters otherwise (a cut run of `RunLength`
+/// here, which it shows none of): a value in a stream that does not decode or is
+/// encoded otherwise, or whose parameters are given by reference, is unsupported, and
+/// the split refuses the page, for every way the value is drawn.
 #[test]
 fn a_field_value_stream_is_its_text_where_it_decodes_and_unsupported_where_not() {
     let mut bad_sum = HELLO_WORLD.to_vec();
@@ -2428,22 +2430,54 @@ fn a_field_value_stream_is_its_text_where_it_decodes_and_unsupported_where_not()
         .collect();
     let mut hex_then_bad = b"48454C4C4F20574F524C44".to_vec();
     hex_then_bad.extend(b"GG>");
-    let shown: [(&str, &str, &[u8]); 5] = [
+    // zlib of `HELLO WORLD` under the PNG Up predictor, rows of 5, and under the TIFF
+    // predictor, rows of 5: the last row holds `D` alone.
+    let up = [
+        120, 156, 99, 242, 112, 245, 241, 241, 103, 186, 33, 196, 204, 246, 151, 73, 5, 0, 25, 187,
+        3, 143,
+    ];
+    let tiff = [
+        120, 156, 243, 248, 203, 206, 192, 172, 96, 254, 131, 249, 151, 11, 0, 21, 77, 3, 224,
+    ];
+    let shown: [(&str, &str, &[u8]); 9] = [
         ("(HELLO WORLD)", "", b"HELLO WORLD"),
         ("(HELLO WORLD)", "/Filter /FlateDecode", HELLO_WORLD),
         ("(HELLO WORLD)", "/Filter /FlateDecode", &bad_sum),
         ("(HELLO)", "/Filter /FlateDecode", &HELLO_WORLD[..8]),
         ("(HELLO WORLD)", "/Filter /Foo", b"HELLO WORLD"),
-    ];
-    // zlib of `HELLO WORLD` under the PNG Up predictor, rows of 5.
-    let up = [
-        120, 156, 99, 242, 112, 245, 241, 241, 103, 186, 33, 196, 204, 246, 151, 73, 5, 0, 25, 187,
-        3, 143,
-    ];
-    let refused: [(&str, &[u8]); 10] = [
-        ("/Filter /AHx", b"48454C4C4F20574F524C44>"),
         (
+            "(HELLO WORLD)",
             "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 5 >>",
+            &up,
+        ),
+        (
+            "(HELLO WORLD)",
+            "/Filter /FlateDecode /DP << /Predictor 12 /Columns 5 >>",
+            &up,
+        ),
+        (
+            "(HELLO WORLD)",
+            "/Filter /FlateDecode /DecodeParms << /Predictor 2 /Columns 5 >>",
+            &tiff,
+        ),
+        (
+            "(HELLO WORLD)",
+            "/Filter /FlateDecode /DecodeParms << /Predictor 3 /Columns 5 >>",
+            HELLO_WORLD,
+        ),
+    ];
+    // LZW of `HELLO WORLD`, valid: refused with the filter, which `MuPDF` reads
+    // otherwise where its last code is cut short.
+    let lzw = [
+        128, 18, 8, 164, 194, 97, 60, 64, 87, 39, 148, 137, 132, 72, 8,
+    ];
+    let refused: [(&str, &[u8]); 13] = [
+        ("/Filter /AHx", b"48454C4C4F20574F524C44>"),
+        ("/Filter /LZW", &lzw),
+        ("/Filter /FlateDecode /DecodeParms 6 0 R", HELLO_WORLD),
+        ("/Filter /FlateDecode /DP [6 0 R]", HELLO_WORLD),
+        (
+            "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Colors 33 /Columns 5 >>",
             &up,
         ),
         ("/Filter /RL", b"\x04HELLO\x04HE"),
@@ -3217,10 +3251,10 @@ fn what_reading_annotations_lost_is_told_each_time() {
 /// Two widgets drawn by one appearance stream through two entries of the table that
 /// lead to it, the stream's `/DecodeParms` naming the second entry, draw what it holds
 /// alike, `A!`, in either order, and two fields valued by it are both unsupported, a
-/// value with decode parameters being one: a reference from the stream back to
-/// itself is a cycle by either entry, so the predictor its own dictionary sets, which
-/// would read `Ab`, is not applied (`MuPDF`, `PyMuPDF` 1.28.2, reads `A!` through the
-/// first entry).
+/// value whose decode parameters are given by reference being one: a reference from
+/// the stream back to itself is a cycle by either entry, so the predictor its own
+/// dictionary sets, which would read `Ab`, is not applied (`MuPDF`, `PyMuPDF` 1.28.2,
+/// reads `A!` through the first entry).
 #[test]
 fn widgets_drawn_by_one_stream_through_two_entries_draw_it_alike() {
     // zlib of `A!`.
