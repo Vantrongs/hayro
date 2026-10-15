@@ -121,6 +121,35 @@ impl Text {
     }
 }
 
+/// Entry `key` as a key for what a document makes of its value once: where the
+/// value is held (the object it refers to, the object of the dictionary it lies
+/// in, or nowhere, when the entry is absent), or its text, and the entry's key, so
+/// that two entries with the same source have the same value and are read alike.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct Source {
+    held: Held,
+    key: &'static [u8],
+}
+
+impl Source {
+    /// Entry `key` absent, as [`Entries::source`] gives it.
+    pub(crate) fn absent(key: &'static [u8]) -> Self {
+        Self {
+            held: Held::Absent,
+            key,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+enum Held {
+    Object(ObjRef),
+    In(ObjRef),
+    Absent,
+    Text(Option<Vec<u8>>),
+    Name(Vec<u8>),
+}
+
 /// The value of an entry or of an array's entry.
 pub(crate) enum Value<'a> {
     Number(Number),
@@ -306,13 +335,35 @@ impl<'a> Entries<'a> {
         Some(kurbo::Rect::new(n[0], n[1], n[2], n[3]).abs())
     }
 
-    /// The object this dictionary is, when it is one of its own.
-    /// The object that holds entry `key`: the one it refers to, or this dictionary;
-    /// `None` for a direct dictionary.
-    pub(crate) fn source(&self, key: &[u8]) -> Option<ObjRef> {
-        self.0.get_ref(key).or_else(|| self.id())
+    /// Where entry `key`'s value is held ([`Source`]); `None` for a value in a direct
+    /// dictionary, which no key names. The value is not read.
+    pub(crate) fn source(&self, key: &'static [u8]) -> Option<Source> {
+        let held = if let Some(r) = self.0.get_ref(key) {
+            Held::Object(r)
+        } else if !self.present(key) {
+            Held::Absent
+        } else {
+            Held::In(self.id()?)
+        };
+        Some(Source { held, key })
     }
 
+    /// Text entry `entry` as a source: the object it refers to, read once for the
+    /// document, or, in the dictionary itself, its text or name, which annotations
+    /// sharing it then share however they are held.
+    pub(crate) fn text_source(&self, entry: Text) -> Source {
+        let key = entry.key();
+        let held = match self.0.get_ref(key) {
+            Some(r) => Held::Object(r),
+            None => match self.get(key) {
+                Value::Name(n) => Held::Name(n.as_ref().to_vec()),
+                value => Held::Text(value.text(entry)),
+            },
+        };
+        Source { held, key }
+    }
+
+    /// The object this dictionary is, when it is one of its own.
     pub(crate) fn id(&self) -> Option<ObjRef> {
         self.0.obj_id().map(ObjRef::from)
     }

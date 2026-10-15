@@ -13,11 +13,12 @@
 //! chain loops is a broken field and draws nothing, as in common viewers.
 
 use super::entries::{Entries, Text, Value};
-use super::freetext::{self, TextBox};
+use super::freetext;
 use super::out::{Color, Out};
-use super::text::{self, Family, Fonts};
+use super::text::{self, Family, Fonts, TextBox};
 use super::{
-    Appearances, FINEST, Field, Inherited, Unsupported, border_width, circle, color_of, rect,
+    Appearances, FINEST, Field, Inherited, Spans, TextKey, Unsupported, border_width, circle,
+    color_of, rect,
 };
 use hayro_syntax::object::dict::keys::AS;
 use kurbo::{Affine, Shape};
@@ -186,6 +187,9 @@ fn draw(
     let (fw, fh) = (fw as f32, fh as f32);
 
     if kind == Kind::Push {
+        // Viewers lay the bevel and the caption out from the box inside the border,
+        // which must be writable even where nothing is drawn at it.
+        fail(out.within(bbox.inset(-(w + 2.0))))?;
         // Viewers draw a push button's colours, and shade its bevel, in RGB.
         let (background, border) = (background.map(Color::rgb), border.map(Color::rgb));
         fail(frame(bbox, w, background, border, out))?;
@@ -199,13 +203,17 @@ fn draw(
             return Ok(Some(()));
         }
         let source = mk.and_then(|mk| mk.source(Text::Caption.key()));
-        let run = doc.run(source, family.into(), || text::text_string(&caption))?;
+        let run = doc.run(source.as_ref(), family.into(), || {
+            text::text_string(&caption)
+        })?;
         let inset = 2.0 * (w as f32 + 2.0);
         let em = run.width(0..run.len()) as f32;
         let size = size.unwrap_or_else(|| {
+            // Four points more of padding on each side, across as well as up
+            // (observed).
             let by_height = fh - inset - 8.0;
             let by_width = if em > 0.0 {
-                (fw - inset) / em
+                (fw - inset - 8.0) / em
             } else {
                 by_height
             };
@@ -232,15 +240,57 @@ fn draw(
     let pad = 2.0 * w as f32;
     let multiline = kind == Kind::Text && flags & (1 << 12) != 0;
     // Rich text: the widget's own /RV or /DS, whatever its RichText flag says;
-    // viewers do not take them from the fields above it.
-    let rich = annot.text(Text::RichValue);
-    let style = annot.text(Text::DefaultStyle);
-    if kind == Kind::Text && (rich.is_some() || style.is_some()) {
-        // A size fit to the field is none: such rich text is drawn 0 high.
-        let size = size.unwrap_or(0.0);
-        let spans = freetext::rich_spans(rich.as_deref(), style.as_deref(), size, || {
-            value_text(field)
-        })?;
+    // viewers do not take them from the fields above it. Of a text field or a
+    // choice field, as the text of a text field: a list's on several lines, its
+    // text without /RV its options from /TI on, one a line (observed). A size fit to
+    // the field is none: such rich text is drawn 0 high.
+    let rich_size = size.unwrap_or(0.0);
+    let top_index = annot
+        .int(b"TI")
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0);
+    let key = TextKey::new(
+        [
+            Some(annot.text_source(Text::RichValue)),
+            Some(annot.text_source(Text::DefaultStyle)),
+            field.text_source(Inherited::Value, Text::FieldValue, annot),
+            annot.source(b"Opt"),
+        ],
+        Family::Text.into(),
+        vec![
+            u64::from(rich_size.to_bits()),
+            kind as u64,
+            top_index as u64,
+        ],
+    );
+    let spans = if matches!(kind, Kind::Text | Kind::List | Kind::Combo) {
+        Some(doc.spans(key.as_ref(), || {
+            let rich = annot.text(Text::RichValue);
+            let style = annot.text(Text::DefaultStyle);
+            if rich.is_none() && style.is_none() {
+                return Ok(Spans {
+                    spans: Vec::new(),
+                    rich: false,
+                });
+            }
+            let spans =
+                freetext::rich_spans(
+                    rich.as_deref(),
+                    style.as_deref(),
+                    rich_size,
+                    || match kind {
+                        Kind::List => list_text(annot, top_index),
+                        _ => value_text(field),
+                    },
+                )?;
+            Ok(Spans { spans, rich: true })
+        })?)
+    } else {
+        None
+    };
+    if let Some(spans) = spans.filter(|s| s.rich) {
+        let size = rich_size;
+        let multiline = multiline || kind == Kind::List;
         // As viewers lay rich text out: from the top less twice the border width
         // on several lines; on one line, in a band twice the size high whose top
         // lies 1.3 sizes and four border widths above the field's middle, of which
@@ -261,16 +311,16 @@ fn draw(
             f64::from(top),
         );
         let area = TextBox {
-            width: fw,
             pad,
-            right: 2.0 * pad,
             top,
             room,
             frame: Affine::IDENTITY,
             clip: clip.intersect(band),
         };
+        let avail = (fw - 3.0 * pad).max(0.0);
+        let laid = doc.laid(key.as_ref(), &spans, avail, freetext::RICH_ASCENT)?;
         out.op("q");
-        freetext::draw_text(&spans, freetext::RICH_ASCENT, &area, fonts, out)?;
+        laid.draw(&area, shown, fonts, out)?;
         out.op("Q");
         return Ok(Some(()));
     }
@@ -290,42 +340,49 @@ fn draw(
     // that, and the value, which widgets of one field share, is set once.
     let seen = clip.intersect(shown);
     let source = field.source(Inherited::Value);
-    let value = || doc.run(source, family.into(), || value_text(field));
+    let value = || doc.run(source.as_ref(), family.into(), || value_text(field));
     match kind {
         Kind::List => {
             let size = size.unwrap_or(12.0);
-            let opts = annot.items(b"Opt");
-            let top_index = annot
-                .int(b"TI")
-                .and_then(|n| u32::try_from(n).ok())
-                .unwrap_or(0);
-            let mut y = fh - pad - 1.116 * size;
-            for opt in opts.iter().flat_map(|o| o.iter()).skip(top_index as usize) {
-                // An option that is not text keeps its line.
-                let label = match opt {
-                    // An export value and the text shown.
-                    Value::Array(pair) => pair.get(1).text(Text::Option),
-                    opt => opt.text(Text::Option),
-                };
-                if let Some(label) = label {
-                    let glyphs = fonts.shape(family, &text::text_string(&label))?;
-                    fail(text::draw_clipped(
-                        &glyphs,
-                        size,
-                        (pad, y),
-                        0.0,
-                        id,
-                        clip,
-                        out,
-                    ))?;
+            let options = doc.options(annot.source(b"Opt"), family.into(), || annot.items(b"Opt"));
+            // From `/TI` on, each option a line down from the top less the padding;
+            // one that is not text keeps its line.
+            let labels = options.labels.get(top_index..).unwrap_or_default();
+            let (top, step) = (f64::from(fh - pad), f64::from(1.116 * size));
+            let line = |i: usize| (f64::from(pad), top - (i as f64 + 1.0) * step);
+            if let Some(last) = labels.len().checked_sub(1) {
+                // Where every label lies, drawn or not, must be writable.
+                let (first, end) = (line(0), line(last));
+                fail(text::reach_all(
+                    options.ink,
+                    options.widest,
+                    size,
+                    first,
+                    end,
+                    out,
+                ))?;
+                if let Some(e) = options.error_from(top_index) {
+                    return Err(e);
                 }
-                y -= 1.116 * size;
+                for i in text::rows_of(options.ink, size, top, step, last, seen) {
+                    if let Some(run) = &labels[i] {
+                        fail(text::draw_run(
+                            fonts,
+                            run,
+                            0..run.len(),
+                            size,
+                            line(i),
+                            seen,
+                            out,
+                        ))?;
+                    }
+                }
             }
         }
         _ if multiline => {
             let size = size.unwrap_or(12.0);
             let run = value()?;
-            let lines = doc.lines(source, &run, size, avail);
+            let lines = doc.lines(source.as_ref(), &run, size, avail);
             // The first line's baseline is at least a fifth of the size above the
             // padding, however low the field (observed).
             let top = (fh - pad).max(pad + 1.316 * size);
@@ -628,6 +685,26 @@ fn signature(r: kurbo::Rect, fonts: &Fonts, out: &mut Out) -> Drawn {
         out,
     ))?;
     Ok(Some(()))
+}
+
+/// The options of list `annot` from option `from` on, one a line: of each, the text
+/// shown, after its export value or alone, or nothing when it is not text.
+fn list_text(annot: &Entries<'_>, from: usize) -> String {
+    let Some(opts) = annot.items(b"Opt") else {
+        return String::new();
+    };
+    let labels: Vec<String> = opts
+        .iter()
+        .skip(from)
+        .map(|opt| {
+            let label = match opt {
+                Value::Array(pair) => pair.get(1).text(Text::Option),
+                opt => opt.text(Text::Option),
+            };
+            label.map(|l| text::text_string(&l)).unwrap_or_default()
+        })
+        .collect();
+    labels.join("\n")
 }
 
 /// The value of the field `field` as text: a text string, or a text stream, or a

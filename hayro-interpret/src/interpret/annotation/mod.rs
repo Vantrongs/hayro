@@ -30,9 +30,9 @@ mod rich;
 mod text;
 mod widget;
 
-use entries::{Entries, Items, Value};
+use entries::{Entries, Items, Source, Value};
 use out::{Color, Out, written_all};
-use text::{Fonts, Lines, Run, Typeface};
+use text::{Fonts, Laid, Lines, Run, Span, Typeface};
 
 use crate::BlendMode;
 use crate::x_object::box_and_matrix;
@@ -172,11 +172,66 @@ pub(crate) struct Fields<'a>(Rc<RefCell<Known<'a>>>);
 #[derive(Default)]
 struct Known<'a> {
     fields: FxHashMap<ObjRef, Option<Field<'a>>>,
-    /// By the object that holds the text and the typeface.
-    runs: FxHashMap<(ObjRef, Typeface), Result<Rc<Run>, Unsupported>>,
-    /// By the object that holds the text, the typeface, and the bits of the size
+    /// By the entry that holds the text and the typeface.
+    runs: FxHashMap<(Source, Typeface), Result<Rc<Run>, Unsupported>>,
+    /// By the entry that holds the text, the typeface, and the bits of the size
     /// and width the lines are broken at.
-    lines: FxHashMap<(ObjRef, Typeface, u32, u32), Rc<Lines>>,
+    lines: FxHashMap<(Source, Typeface, u32, u32), Rc<Lines>>,
+    /// Text in its styles, and laid out to the bits of a width, by what it is made of.
+    spans: FxHashMap<TextKey, Result<Rc<Spans>, Unsupported>>,
+    laid: FxHashMap<(TextKey, u32), Result<Rc<Laid>, Unsupported>>,
+    /// The options of lists, by the entry that holds them and the typeface.
+    options: FxHashMap<(Source, Typeface), Rc<Options>>,
+}
+
+/// The labels of a list's options, each set as a [`Run`] (`None` for one that is
+/// not text or cannot be set), and why each that cannot be set cannot, in order.
+struct Options {
+    labels: Vec<Option<Rc<Run>>>,
+    errors: Vec<(usize, Unsupported)>,
+    /// The box around a glyph's origin the points of every label's glyphs lie in,
+    /// and the widest label's advance, in em.
+    ink: Option<kurbo::Rect>,
+    widest: f64,
+}
+
+impl Options {
+    /// Why the first label from option `from` on cannot be set, if one cannot.
+    fn error_from(&self, from: usize) -> Option<Unsupported> {
+        let i = self.errors.partition_point(|(i, _)| *i < from);
+        self.errors.get(i).map(|(_, e)| *e)
+    }
+}
+
+/// What text in styles is made of, as a key for making it once per document: the
+/// entries it is read from, and the numbers of the styles it is set in.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TextKey {
+    sources: Vec<Source>,
+    face: Typeface,
+    numbers: Vec<u64>,
+}
+
+impl TextKey {
+    /// The key of text read from entries `sources`, none of them in a direct
+    /// dictionary, in `face` and the styles `numbers` tell apart.
+    fn new(
+        sources: impl IntoIterator<Item = Option<Source>>,
+        face: Typeface,
+        numbers: Vec<u64>,
+    ) -> Option<Self> {
+        Some(Self {
+            sources: sources.into_iter().collect::<Option<_>>()?,
+            face,
+            numbers,
+        })
+    }
+}
+
+/// Text in its styles, and whether it is rich text (`/RC`, `/RV` or `/DS`).
+struct Spans {
+    spans: Vec<Span>,
+    rich: bool,
 }
 
 impl<'a> Appearances<'a> {
@@ -227,9 +282,18 @@ impl<'a> Appearances<'a> {
                 // data of a stream after it in the file.
                 let stream = match ap.get::<Object<'_>>(N) {
                     Some(Object::Stream(stream)) => Some(stream),
-                    Some(Object::Dict(states)) => annot
-                        .get::<Name<'_>>(AS)
-                        .and_then(|state| states.get::<Stream<'_>>(state)),
+                    Some(Object::Dict(states)) => match annot.get::<Name<'_>>(AS) {
+                        Some(state) => match states.get::<Object<'_>>(state.as_ref()) {
+                            Some(Object::Stream(stream)) => Some(stream),
+                            // A state that is there but is no stream, a reference to
+                            // no object among them, draws nothing (observed).
+                            _ if Entries::new(states).present(state.as_ref()) => {
+                                return Look::Nothing;
+                            }
+                            _ => None,
+                        },
+                        None => None,
+                    },
                     _ => None,
                 };
                 if let Some(stream) = stream {
@@ -347,7 +411,7 @@ impl<'a> Appearances<'a> {
             b"Caret" => ok(icons::caret(annot, &mut out)),
             b"Redact" => ok(icons::redact(annot, &mut out)),
             b"Stamp" => icons::stamp(annot, fonts, &mut out),
-            b"FreeText" => freetext::free_text(annot, fonts, &mut out),
+            b"FreeText" => freetext::free_text(annot, self, visible, &mut out),
             b"Line" => lines::line(annot, fonts, &mut out),
             b"Polygon" => lines::poly(annot, true, &mut out),
             b"PolyLine" => lines::poly(annot, false, &mut out),
@@ -387,41 +451,119 @@ impl<'a> Appearances<'a> {
         }))
     }
 
-    /// `text()` set in `typeface`, made once for the document when it is held by
-    /// object `source`.
+    /// `make()`, made once for the document under `key` in the map `map` gives;
+    /// made each time without a key.
+    fn once<K: Eq + std::hash::Hash, V: Clone>(
+        &self,
+        map: for<'k> fn(&'k mut Known<'a>) -> &'k mut FxHashMap<K, V>,
+        key: Option<K>,
+        make: impl FnOnce() -> V,
+    ) -> V {
+        let Some(key) = key else {
+            return make();
+        };
+        if let Some(made) = map(&mut self.fields.0.borrow_mut()).get(&key) {
+            return made.clone();
+        }
+        // Made without the map borrowed: making may look other things up.
+        let made = make();
+        map(&mut self.fields.0.borrow_mut()).insert(key, made.clone());
+        made
+    }
+
+    /// `text()` set in `typeface`, made once for the document when its entry has a
+    /// source.
     fn run(
         &self,
-        source: Option<ObjRef>,
+        source: Option<&Source>,
         typeface: Typeface,
         text: impl FnOnce() -> String,
     ) -> Result<Rc<Run>, Unsupported> {
-        let make = || self.fonts.run(typeface, &text()).map(Rc::new);
-        let Some(source) = source else {
-            return make();
-        };
-        if let Some(run) = self.fields.0.borrow().runs.get(&(source, typeface)) {
-            return run.clone();
-        }
-        let run = make();
-        let mut known = self.fields.0.borrow_mut();
-        known.runs.insert((source, typeface), run.clone());
-        run
+        self.once(
+            |k| &mut k.runs,
+            source.map(|s| (s.clone(), typeface)),
+            || self.fonts.run(typeface, &text()).map(Rc::new),
+        )
     }
 
-    /// The lines of `run`, held by object `source`, at `size` broken to fit
-    /// `width` ([`text::wrap`]), made once for the document.
-    fn lines(&self, source: Option<ObjRef>, run: &Run, size: f32, width: f32) -> Rc<Lines> {
-        let make = || Rc::new(text::wrap(run, size, width));
-        let Some(source) = source else {
-            return make();
-        };
-        let key = (source, run.typeface(), size.to_bits(), width.to_bits());
-        if let Some(lines) = self.fields.0.borrow().lines.get(&key) {
-            return lines.clone();
-        }
-        let lines = make();
-        self.fields.0.borrow_mut().lines.insert(key, lines.clone());
-        lines
+    /// The lines of `run`, of the entry `source`, at `size` broken to fit `width`
+    /// ([`text::wrap`]), made once for the document.
+    fn lines(&self, source: Option<&Source>, run: &Run, size: f32, width: f32) -> Rc<Lines> {
+        self.once(
+            |k| &mut k.lines,
+            source.map(|s| (s.clone(), run.typeface(), size.to_bits(), width.to_bits())),
+            || Rc::new(text::wrap(run, size, width)),
+        )
+    }
+
+    /// The spans `make` reads, made once for the document under `key`.
+    fn spans(
+        &self,
+        key: Option<&TextKey>,
+        make: impl FnOnce() -> Result<Spans, Unsupported>,
+    ) -> Result<Rc<Spans>, Unsupported> {
+        self.once(|k| &mut k.spans, key.cloned(), || make().map(Rc::new))
+    }
+
+    /// `spans`, made under `key`, laid out in `avail` with each line's first baseline
+    /// `ascent` times its size below its top, once for the document.
+    fn laid(
+        &self,
+        key: Option<&TextKey>,
+        spans: &Spans,
+        avail: f32,
+        ascent: f32,
+    ) -> Result<Rc<Laid>, Unsupported> {
+        // The ascent follows from what the spans are.
+        self.once(
+            |k| &mut k.laid,
+            key.map(|k| (k.clone(), avail.to_bits())),
+            || Laid::new(&self.fonts, &spans.spans, avail, ascent).map(Rc::new),
+        )
+    }
+
+    /// The options of `/Opt`, of entry `source`, in `typeface`, made once for the
+    /// document: of each, the text shown, after its export value or alone.
+    fn options<'b>(
+        &self,
+        source: Option<Source>,
+        typeface: Typeface,
+        items: impl FnOnce() -> Option<Items<'b>>,
+    ) -> Rc<Options> {
+        self.once(
+            |k| &mut k.options,
+            source.map(|s| (s, typeface)),
+            || {
+                let mut options = Options {
+                    labels: Vec::new(),
+                    errors: Vec::new(),
+                    ink: None,
+                    widest: 0.0,
+                };
+                for (i, opt) in items().iter().flat_map(Items::iter).enumerate() {
+                    let label = match opt {
+                        Value::Array(pair) => pair.get(1).text(entries::Text::Option),
+                        opt => opt.text(entries::Text::Option),
+                    };
+                    let run = label.map(|l| self.fonts.run(typeface, &text::text_string(&l)));
+                    options.labels.push(match run {
+                        Some(Ok(run)) => {
+                            if let Some(ink) = run.ink() {
+                                options.ink = Some(options.ink.map_or(ink, |i| i.union(ink)));
+                            }
+                            options.widest = options.widest.max(run.width(0..run.len()));
+                            Some(Rc::new(run))
+                        }
+                        Some(Err(e)) => {
+                            options.errors.push((i, e));
+                            None
+                        }
+                        None => None,
+                    });
+                }
+                Rc::new(options)
+            },
+        )
     }
 
     /// The field entries widget `annot` is drawn with, however deep its `/Parent`
@@ -520,12 +662,28 @@ impl<'a> Field<'a> {
             .map_or(Value::Null, |d| d.get(key.key()))
     }
 
-    /// The object that holds entry `key`: the one it refers to, or the dictionary
-    /// it is in; `None` for a direct dictionary.
-    fn source(&self, key: Inherited) -> Option<ObjRef> {
-        self.0[key as usize]
-            .as_ref()
-            .and_then(|d| d.source(key.key()))
+    /// Where text entry `entry` is held, as [`Field::source`] gives it, but for an
+    /// entry of widget `annot` itself, its text ([`Entries::text_source`]): what many
+    /// widgets share is held above them.
+    fn text_source(
+        &self,
+        key: Inherited,
+        entry: entries::Text,
+        annot: &Entries<'_>,
+    ) -> Option<Source> {
+        match &self.0[key as usize] {
+            Some(d) if d.id().is_some() && d.id() == annot.id() => Some(d.text_source(entry)),
+            _ => self.source(key),
+        }
+    }
+
+    /// Where entry `key` is held ([`Entries::source`]): in the nearest dictionary
+    /// that has it, or absent from all.
+    fn source(&self, key: Inherited) -> Option<Source> {
+        match &self.0[key as usize] {
+            Some(d) => d.source(key.key()),
+            None => Some(Source::absent(key.key())),
+        }
     }
 }
 

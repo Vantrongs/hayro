@@ -349,6 +349,80 @@ fn widgets_sharing_a_long_value_set_it_once() {
     }
 }
 
+/// The bytes allocated to look at each of `n` annotations `annot`, each referring to
+/// object 4, `shared`, as `4 0 R`.
+fn shared_object_cost(n: usize, shared: &str, annot: &str) -> usize {
+    let refs: Vec<String> = (0..n).map(|i| format!("{} 0 R", 5 + i)).collect();
+    let mut objects = vec![shared.as_bytes().to_vec()];
+    for _ in 0..n {
+        objects.push(format!("<< /Type /Annot {annot} >>").into_bytes());
+    }
+    let pdf = Pdf::new(common::one_page(
+        200,
+        &format!("/Annots [{}]", refs.join(" ")),
+        objects,
+    ))
+    .expect("valid pdf");
+    let annots: Vec<Dict<'_>> = pdf.pages()[0]
+        .raw()
+        .get::<Array<'_>>(b"Annots")
+        .unwrap()
+        .iter::<Dict<'_>>()
+        .collect();
+    let before = allocated();
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    for a in &annots {
+        let Look::Generated(a) = appearances.look(a, PAGE) else {
+            panic!("{annot}: not generated");
+        };
+        assert!(
+            a.content.len() < 64 << 10,
+            "{annot}: {} bytes",
+            a.content.len()
+        );
+    }
+    allocated() - before
+}
+
+/// Annotations whose text is one object they all refer to lay it out once and draw
+/// what their boxes show of it: `FreeText` contents and rich text, a rich text
+/// field's value, and a list's options.
+#[test]
+fn annotations_sharing_a_long_text_set_it_once() {
+    const N: usize = 200;
+    const LEN: usize = 20_000;
+    let text: String = "ABCD efgh ".chars().cycle().take(LEN).collect();
+    let options: String = (0..LEN / 10).map(|i| format!("(item{i}) ")).collect();
+    let da = "/Rect [10 10 110 40] /DA (/Helv 12 Tf 0 g)";
+    for (shared, annot) in [
+        (
+            format!("({text})"),
+            format!("/Subtype /FreeText {da} /Contents 4 0 R"),
+        ),
+        (
+            format!("(<p>{text}</p>)"),
+            format!("/Subtype /FreeText {da} /Contents (x) /RC 4 0 R"),
+        ),
+        (
+            format!("(<p>{text}</p>)"),
+            format!("/Subtype /Widget /FT /Tx /Ff 33554432 {da} /V (x) /RV 4 0 R"),
+        ),
+        (
+            format!("[{options}]"),
+            format!("/Subtype /Widget /FT /Ch {da} /Opt 4 0 R"),
+        ),
+    ] {
+        let one = shared_object_cost(1, &shared, &annot);
+        let all = shared_object_cost(N, &shared, &annot);
+        // Laying the text out for each annotation allocates at least 0.6 MB one;
+        // drawing what a box shows, as outlines, up to some 64 KiB.
+        assert!(
+            all < one + N * (128 << 10),
+            "{annot}: {one} bytes for one, {all} for {N}"
+        );
+    }
+}
+
 /// A Squiggly quad whose top line stands still while its bottom edge runs a million
 /// points: its hundred million steps all fan out of one point on the page, more than
 /// the page can tell apart. Such a quad marks no text and is unsupported, not drawn

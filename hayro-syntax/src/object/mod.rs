@@ -186,8 +186,10 @@ impl Skippable for Object<'_> {
 
     fn skip_with_depth(r: &mut Reader<'_>, is_content_stream: bool, depth: usize) -> Option<()> {
         match r.peek_byte()? {
-            b'n' => Null::skip(r, is_content_stream),
-            b't' | b'f' => bool::skip(r, is_content_stream),
+            // Outside content, another word read as `null`, as other unknown words are.
+            b'n' if Null::skip(r, is_content_stream).is_some() => Some(()),
+            b't' | b'f' if bool::skip(r, is_content_stream).is_some() => Some(()),
+            b'n' | b't' | b'f' if is_content_stream => None,
             b'/' => Name::skip(r, is_content_stream),
             b'<' => match r.peek_bytes(2)? {
                 // A stream can never appear in a dict/array, so it should never be skipped.
@@ -215,8 +217,19 @@ impl Skippable for Object<'_> {
 impl<'a> Readable<'a> for Object<'a> {
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         let object = match r.peek_byte()? {
-            b'n' => Self::Null(Null::read(r, ctx)?),
-            b't' | b'f' => Self::Boolean(bool::read(r, ctx)?),
+            b'n' | b't' | b'f' => match r.peek_byte()? {
+                b'n' => Null::read(r, ctx).map(Self::Null),
+                _ => bool::read(r, ctx).map(Self::Boolean),
+            }
+            .or_else(|| {
+                // Outside content, another word starting so is read as `null`, as
+                // other unknown words are (`trust`, not `true`).
+                if ctx.in_content_stream() {
+                    return None;
+                }
+                skip_name_like(r, false)?;
+                Some(Self::Null(Null))
+            })?,
             b'/' => Self::Name(Name::read(r, ctx)?),
             b'<' => match r.peek_bytes(2)? {
                 b"<<" => {
@@ -397,6 +410,27 @@ mod tests {
     #[test]
     fn bool() {
         assert!(matches!(object_impl(b"true").unwrap(), Object::Boolean(_)));
+    }
+
+    /// Outside content, a word that starts as `null`, `true` or `false` do but is
+    /// none of them reads as null, as other unknown words do, so a dictionary with
+    /// one keeps its other entries.
+    #[test]
+    fn unknown_words_read_as_null() {
+        for word in [&b"two"[..], b"t", b"nul", b"fals", b"bar"] {
+            assert!(
+                matches!(object_impl(word), Some(Object::Null(_))),
+                "{word:?}"
+            );
+        }
+        let Some(Object::Dict(d)) = object_impl(b"<< /Q two /A 1 >>") else {
+            panic!("not a dictionary");
+        };
+        assert_eq!(d.get::<i32>(b"A"), Some(1));
+        let Some(Object::Array(a)) = object_impl(b"[fals 2]") else {
+            panic!("not an array");
+        };
+        assert_eq!(a.iter::<Object<'_>>().count(), 2);
     }
 
     #[test]

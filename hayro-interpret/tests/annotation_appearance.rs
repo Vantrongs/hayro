@@ -606,6 +606,113 @@ fn text_without_a_font_size_is_12_pt() {
     assert!(tops("/DA (/Helv 0 Tf 0 g)").iter().all(|&h| h > 20));
 }
 
+/// A push button's caption at an automatic size keeps four points from its bevel on
+/// each side, across as well as up (observed: `UTF16` in a box 40 pt square is set at
+/// 8.508 pt, from 7 to 33 pt across).
+#[test]
+fn a_push_buttons_automatic_caption_keeps_four_points_from_each_side() {
+    let c = generated(
+        "/Subtype /Widget /FT /Btn /Ff 65536 /Rect [20 80 60 120] /DA (/Helv 0 Tf 0 g) /MK << /BG [0.8] /CA (UTF16) >>",
+    );
+    let caption = c.rsplit("\n0 g\n").next().unwrap();
+    let xs: Vec<f64> = caption
+        .lines()
+        .filter(|l| [" m", " l", " c"].iter().any(|op| l.ends_with(op)))
+        .flat_map(|l| {
+            let n: Vec<f64> = l.split(' ').filter_map(|n| n.parse().ok()).collect();
+            n.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|[x, _]| *x)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let (lo, hi) = xs
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &x| {
+            (a.min(x), b.max(x))
+        });
+    assert!(lo >= 7.0 && hi <= 33.0 && hi - lo > 24.0, "{lo} {hi}");
+}
+
+/// A choice field with rich text (`/RV` or `/DS`) draws it as a text field does: a
+/// list on several lines, a combo box on one; a list without `/RV` draws its options
+/// from `/TI` on, one a line, in the style of `/DS` (observed).
+#[test]
+fn a_choice_field_draws_rich_text_as_a_text_field_does() {
+    let w = "/Subtype /Widget /Rect [20 80 180 140] /DA (/Helv 12 Tf 0 g)";
+    let rv = "/RV (<p>Rich value</p>)";
+    let ds = "/DS (font-size: 9pt)";
+    let opt = "/Opt [[(e) (zero)] (one) (two)] /TI 1";
+    for (choice, text) in [
+        (
+            format!("/FT /Ch {rv} {opt}"),
+            format!("/FT /Tx /Ff 4096 {rv}"),
+        ),
+        (
+            format!("/FT /Ch /Ff 131072 /V (v) {rv}"),
+            format!("/FT /Tx {rv}"),
+        ),
+        (
+            format!("/FT /Ch {ds} {opt}"),
+            format!("/FT /Tx /Ff 4096 {ds} /V (one\\ntwo)"),
+        ),
+    ] {
+        assert_eq!(
+            content(&format!("{w} {choice}"), vec![]),
+            content(&format!("{w} {text}"), vec![]),
+            "{choice}"
+        );
+    }
+}
+
+/// An appearance state `/AS` names that `/AP /N` has but that is no stream, a
+/// reference to no object among them, draws nothing, a button's too; a state it
+/// lacks, or that is null, is generated anew (observed).
+#[test]
+fn a_state_that_is_no_stream_draws_nothing() {
+    let square = "/Subtype /Square /Rect [20 20 180 180] /IC [1 0 0] /AS /On";
+    let check = "/Subtype /Widget /FT /Btn /Rect [20 20 60 60] /V /On /AS /On";
+    for annot in [square, check] {
+        for (states, drawn) in [
+            ("<< /On 99 0 R >>", false),
+            ("<< /On 5 >>", false),
+            ("<< /On << >> >>", false),
+            ("<< /On null >>", true),
+            ("<< /Off 99 0 R >>", true),
+        ] {
+            let c = content(&format!("{annot} /AP << /N {states} >>"), vec![]);
+            assert_eq!(c != "nothing", drawn, "{annot} {states}: {c}");
+        }
+    }
+}
+
+/// A `Redact` without quadrilaterals outlines its box a point inside, clipped to the
+/// box: one under two points wide, or of no area, shows only what lies within it
+/// (observed: none of the outline of a box of no width).
+#[test]
+fn a_redact_box_is_clipped_to_itself() {
+    let c = content(
+        "/Subtype /Redact /Rect [20 20 21 180] /QuadPoints << >>",
+        vec![],
+    );
+    assert!(c.starts_with("q\n20 20 1 160 re\nW n\n"), "{c}");
+}
+
+/// A push button whose border is 2^23 or more wide is unsupported, as other fields
+/// are, though it has no border colour: viewers lay its bevel and caption out from
+/// the box inside the border.
+#[test]
+fn a_push_button_inside_a_border_too_wide_to_write_is_unsupported() {
+    let button = "/Subtype /Widget /FT /Btn /Ff 65536 /Rect [20 80 180 120] /MK << /CA (A) >>";
+    let drawn = content(&format!("{button} /BS << /W 2 >>"), vec![]);
+    assert!(drawn.contains("\nf\n"), "{drawn}");
+    assert_eq!(
+        content(&format!("{button} /BS << /W 4294967298 >>"), vec![]),
+        "Coordinates"
+    );
+}
+
 #[test]
 fn flags_and_existing_appearances_decide_what_is_generated() {
     use AnnotationSelection::{Flatten, Print, View};

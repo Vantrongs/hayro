@@ -250,26 +250,12 @@ pub(super) fn draw(
     fill(glyphs, size, origin, 0.0, transform, None, out)
 }
 
-/// Fills `glyphs` as [`draw`] does, each space `spacing` wider than its advance,
-/// under a clip to `clip`: a glyph wholly outside it is not written, so text
-/// running far beyond its box costs no more output than the box shows.
-pub(super) fn draw_clipped(
-    glyphs: &[Glyph<'_>],
-    size: f32,
-    origin: (f32, f32),
-    spacing: f32,
-    transform: Affine,
-    clip: Rect,
-    out: &mut Out,
-) -> Option<()> {
-    let origin = (f64::from(origin.0), f64::from(origin.1));
-    fill(glyphs, size, origin, spacing, transform, Some(clip), out)
-}
-
-/// Fills `glyphs` at `size` from `(x, y)` in `transform`, those that reach `clip`
-/// alone when there is one. A glyph is tested by the box of its outline's points
-/// before its outline is taken: one outside the clip costs no outline, and the box's
-/// corners being written stands for its points being written.
+/// Fills `glyphs` at `size` from `(x, y)` in `transform`, each space `spacing`
+/// wider than its advance, those that reach `clip` alone when there is one: a glyph
+/// wholly outside it is not written, so text running far beyond its box costs no
+/// more output than the box shows. A glyph is tested by the box of its outline's
+/// points before its outline is taken: one outside the clip costs no outline, and
+/// the box's corners being written stands for its points being written.
 fn fill(
     glyphs: &[Glyph<'_>],
     size: f32,
@@ -332,6 +318,12 @@ impl Run {
 
     pub(super) fn len(&self) -> usize {
         self.chars.len()
+    }
+
+    /// The box around a glyph's origin the points of each of its glyphs lie in, in
+    /// em; `None` when no glyph has any.
+    pub(super) fn ink(&self) -> Option<Rect> {
+        self.ink
     }
 
     /// The largest advance, in em.
@@ -404,7 +396,7 @@ impl Fonts {
 }
 
 /// Fills glyphs `range` of `run` at `size` with their baseline from `(x, y)`, as
-/// [`draw_clipped`] does, but only those whose box can reach `clip` are looked at:
+/// [`fill`] does under a clip, but only those whose box can reach `clip` are looked at:
 /// the work grows with the glyphs the clip shows, not with the run. Those not looked
 /// at are written nowhere, but where they lie must be writable, as it must be for a
 /// glyph the clip cuts away.
@@ -465,7 +457,12 @@ pub(super) struct Lines {
 
 /// The ink of `run`'s glyphs, at `size`, across and up from a glyph's origin.
 fn ink(run: &Run, size: f32) -> Option<(f64, f64, f64, f64)> {
-    let ink = run.ink?;
+    scaled(run.ink, size)
+}
+
+/// `ink`, a box in em around a glyph's origin, at `size`, as `(x0, x1, y0, y1)`.
+fn scaled(ink: Option<Rect>, size: f32) -> Option<(f64, f64, f64, f64)> {
+    let ink = ink?;
     let s = f64::from(size);
     let (x0, x1) = (ink.x0 * s, ink.x1 * s);
     let (y0, y1) = (ink.y0 * s, ink.y1 * s);
@@ -497,12 +494,49 @@ pub(super) fn rows(
     last: usize,
     clip: Rect,
 ) -> Range<usize> {
-    let Some((_, _, y0, y1)) = ink(run, size) else {
+    rows_of(run.ink, size, top, step, last, clip)
+}
+
+/// [`rows`] of lines whose glyphs' points lie in `ink`, in em around each glyph's
+/// origin.
+pub(super) fn rows_of(
+    ink: Option<Rect>,
+    size: f32,
+    top: f64,
+    step: f64,
+    last: usize,
+    clip: Rect,
+) -> Range<usize> {
+    let Some((_, _, y0, y1)) = scaled(ink, size) else {
         return 0..0;
     };
     // Line j can reach the clip when j + 1 lies between these.
     let (a, b) = ((top + y1 - clip.y0) / step, (top + y0 - clip.y1) / step);
     within_count(a.min(b) - 1.0, a.max(b) - 1.0, last + 1, clip)
+}
+
+/// `None`, failing the content, when a glyph of lines set at `size` could have a
+/// point that cannot be written: lines whose glyphs' points lie in `ink`, in em
+/// around each glyph's origin, none advancing more than `widest` em, each from an
+/// origin on the segment from `first` to `last`.
+pub(super) fn reach_all(
+    ink: Option<Rect>,
+    widest: f64,
+    size: f32,
+    first: (f64, f64),
+    last: (f64, f64),
+    out: &mut Out,
+) -> Option<()> {
+    let Some((x0, x1, y0, y1)) = scaled(ink, size) else {
+        return Some(());
+    };
+    let w = widest * f64::from(size);
+    out.within(Rect::new(
+        first.0.min(last.0) + x0 + w.min(0.0),
+        first.1.min(last.1) + y0,
+        first.0.max(last.0) + x1 + w.max(0.0),
+        first.1.max(last.1) + y1,
+    ))
 }
 
 /// Of `count` glyphs of `run` at `size` centred in cells `cell` wide from 0, each
@@ -572,6 +606,314 @@ pub(super) fn wrap(run: &Run, size: f32, width: f32) -> Lines {
     Lines {
         ranges: out,
         widest,
+    }
+}
+
+/// Where laid out text is drawn ([`Laid::draw`]): its lines from `pad` across, the
+/// top of the first at `top` and each line 1.2 times its largest size below the one
+/// before, as many as fit together in `room` (lines beyond are not drawn), in a box
+/// that `frame` maps to the content's space, under a clip to `clip`, in that space.
+pub(super) struct TextBox {
+    pub(super) pad: f32,
+    pub(super) top: f32,
+    pub(super) room: f32,
+    pub(super) frame: Affine,
+    pub(super) clip: Rect,
+}
+
+/// Text laid out in lines as [`layout`] lays it out to fit a width, kept without
+/// its fonts, so that a document lays out a text many annotations share once, and
+/// each draws only the part its clip shows ([`Laid::draw`]): the work of drawing
+/// grows with what is shown, not with the text.
+pub(super) struct Laid {
+    styles: Vec<Style>,
+    /// The width the lines are aligned in, and their first baseline below their top,
+    /// in sizes.
+    avail: f32,
+    ascent: f32,
+    /// Each glyph's character and span, line after line.
+    chars: Vec<(char, usize)>,
+    /// Each glyph's origin from its line's start without stretching, and the spaces
+    /// before it on its line.
+    xs: Vec<f64>,
+    spaces: Vec<usize>,
+    lines: Vec<LaidLine>,
+    /// Over the lines, in order: the least bottom of a line's glyphs so far and from
+    /// each line on, and the greatest top, from the top of the text; and the height
+    /// of the lines so far, at its greatest.
+    lowest: Vec<f64>,
+    lowest_after: Vec<f64>,
+    highest: Vec<f64>,
+    highest_after: Vec<f64>,
+    filled: Vec<f32>,
+    /// The box the points of every glyph lie in, from `(pad, top)`; `None` without
+    /// glyphs that have points.
+    extent: Option<Rect>,
+    /// Whether any line has a glyph.
+    any: bool,
+}
+
+struct LaidLine {
+    /// Its glyphs, in [`Laid::chars`].
+    glyphs: Range<usize>,
+    align: Align,
+    width: f32,
+    spaces: usize,
+    /// Its baseline below the top of the text.
+    below: f32,
+    /// The box around a glyph's origin the points of each of its glyphs lie in,
+    /// `(x0, x1, y0, y1)`.
+    ink: Option<(f64, f64, f64, f64)>,
+    /// Whether no advance on it is negative, or none positive.
+    forward: bool,
+    backward: bool,
+}
+
+impl LaidLine {
+    /// Where it starts across from `pad`, and how much wider each space is, as
+    /// lines are aligned in `avail`.
+    fn start(&self, avail: f32) -> (f32, f32) {
+        let width = self.width;
+        match self.align {
+            Align::Left => (0.0, 0.0),
+            Align::Center => ((avail - width) / 2.0, 0.0),
+            Align::Right => (avail - width, 0.0),
+            Align::Justify => match self.spaces {
+                0 => (0.0, 0.0),
+                n => (0.0, ((avail - width) / n as f32).max(0.0)),
+            },
+        }
+    }
+
+    /// How low its glyphs reach, from the top of the text; above everything
+    /// without glyphs that have points.
+    fn lo(&self) -> f64 {
+        self.ink
+            .map_or(f64::INFINITY, |(_, _, y0, _)| y0 - f64::from(self.below))
+    }
+
+    /// How high its glyphs reach, from the top of the text.
+    fn hi(&self) -> f64 {
+        self.ink.map_or(f64::NEG_INFINITY, |(_, _, _, y1)| {
+            y1 - f64::from(self.below)
+        })
+    }
+}
+
+/// The number of indices from 0 below `n` for which `pred`, true for those before
+/// some index and false from it on, holds.
+fn partition(n: usize, pred: impl Fn(usize) -> bool) -> usize {
+    let (mut lo, mut hi) = (0, n);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if pred(mid) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+impl Laid {
+    /// `spans` laid out as [`layout`] lays them out in `avail`, each line's first
+    /// baseline `ascent` times its size below its top.
+    pub(super) fn new(
+        fonts: &Fonts,
+        spans: &[Span],
+        avail: f32,
+        ascent: f32,
+    ) -> Result<Self, Unsupported> {
+        let mut laid = Self {
+            styles: spans.iter().map(|s| s.style.clone()).collect(),
+            avail,
+            ascent,
+            chars: Vec::new(),
+            xs: Vec::new(),
+            spaces: Vec::new(),
+            lines: Vec::new(),
+            lowest: Vec::new(),
+            lowest_after: Vec::new(),
+            highest: Vec::new(),
+            highest_after: Vec::new(),
+            filled: Vec::new(),
+            extent: None,
+            any: false,
+        };
+        let (mut height, mut filled) = (0.0_f32, f32::NEG_INFINITY);
+        let (mut lowest, mut highest) = (f64::INFINITY, f64::NEG_INFINITY);
+        let mut tops = Vec::new();
+        for line in layout(fonts, spans, Some(avail))? {
+            let start = laid.chars.len();
+            let (mut x, mut spaces, mut ink) = (0.0_f64, 0, None::<(f64, f64, f64, f64)>);
+            let (mut forward, mut backward) = (true, true);
+            for set in &line.glyphs {
+                laid.chars.push((set.ch, set.span));
+                laid.xs.push(x);
+                laid.spaces.push(spaces);
+                let advance = f64::from(set.glyph.advance) * f64::from(set.size);
+                forward &= advance >= 0.0;
+                backward &= advance <= 0.0;
+                x += advance;
+                spaces += usize::from(set.glyph.is_space());
+                let outline = set.glyph.face.outline(set.glyph.id);
+                if !outline.path.elements().is_empty() {
+                    let s = f64::from(set.size) / 1000.0;
+                    let r = outline.ink;
+                    let (x0, x1) = ((r.x0 * s).min(r.x1 * s), (r.x0 * s).max(r.x1 * s));
+                    let (y0, y1) = ((r.y0 * s).min(r.y1 * s), (r.y0 * s).max(r.y1 * s));
+                    ink = Some(ink.map_or((x0, x1, y0, y1), |(a, b, c, d)| {
+                        (a.min(x0), b.max(x1), c.min(y0), d.max(y1))
+                    }));
+                }
+            }
+            let below = height + laid.ascent * line.size;
+            height += 1.2 * line.size;
+            filled = filled.max(height);
+            let laid_line = LaidLine {
+                glyphs: start..laid.chars.len(),
+                align: line.align,
+                width: line.width(),
+                spaces,
+                below,
+                ink,
+                forward,
+                backward,
+            };
+            // Its glyphs' points, from `(pad, top)`.
+            let (x0, spacing) = laid_line.start(avail);
+            let stretch = f64::from(spacing) * spaces as f64;
+            let xs = &laid.xs[laid_line.glyphs.clone()];
+            let (lo, hi) = (laid_line.lo(), laid_line.hi());
+            if let (Some((ix0, ix1, _, _)), Some(&first)) = (ink, xs.first()) {
+                let (min, max) = xs
+                    .iter()
+                    .fold((first, first), |(a, b), &v| (a.min(v), b.max(v)));
+                let x0 = f64::from(x0);
+                let r = Rect::new(x0 + min + ix0, lo, x0 + max + stretch + ix1, hi);
+                laid.extent = Some(laid.extent.map_or(r, |e| e.union(r)));
+            }
+            lowest = lowest.min(lo);
+            highest = highest.max(hi);
+            laid.lowest.push(lowest);
+            laid.highest.push(highest);
+            tops.push((lo, hi));
+            laid.filled.push(filled);
+            laid.lines.push(laid_line);
+        }
+        laid.any = !laid.chars.is_empty();
+        let (mut lowest, mut highest) = (f64::INFINITY, f64::NEG_INFINITY);
+        laid.lowest_after = vec![0.0; tops.len()];
+        laid.highest_after = vec![0.0; tops.len()];
+        for (j, (lo, hi)) in tops.into_iter().enumerate().rev() {
+            lowest = lowest.min(lo);
+            highest = highest.max(hi);
+            laid.lowest_after[j] = lowest;
+            laid.highest_after[j] = highest;
+        }
+        Ok(laid)
+    }
+
+    /// Draws the lines in `area`, those glyphs alone that can reach both its clip
+    /// and `seen`, in the content's space, but fails, as [`fill`] fails for a glyph
+    /// it does not write, when a point of any glyph cannot be written.
+    pub(super) fn draw(
+        &self,
+        area: &TextBox,
+        seen: Rect,
+        fonts: &Fonts,
+        out: &mut Out,
+    ) -> Result<(), Unsupported> {
+        let fail = |o: Option<()>| o.ok_or(Unsupported::Kind);
+        if !self.any {
+            return Ok(());
+        }
+        fail(out.clip(area.clip))?;
+        let (pad, top) = (f64::from(area.pad), f64::from(area.top));
+        if let Some(e) = self.extent {
+            let all = e + kurbo::Vec2::new(pad, top);
+            fail(out.within(area.frame.transform_rect_bbox(all)))?;
+        }
+        // What can show, in the box: what the clip and `seen` share.
+        let view = area.clip.intersect(seen);
+        if !(view.width() >= 0.0 && view.height() >= 0.0) {
+            return Ok(());
+        }
+        let view = area.frame.inverse().transform_rect_bbox(view);
+        let (qa, qb) = (view.y0 - top, view.y1 - top);
+        // Lines beyond those that fit in the room are not drawn; of the others, a
+        // line before the first whose glyphs can reach as low as the view's top, or
+        // as high as its bottom, cannot reach the view, nor one after the last.
+        let fit = self.filled.partition_point(|&f| f <= area.room);
+        let first = self
+            .lowest
+            .partition_point(|&v| v > qb)
+            .max(self.highest.partition_point(|&v| v < qa));
+        let last = self
+            .highest_after
+            .partition_point(|&v| v >= qa)
+            .min(self.lowest_after.partition_point(|&v| v <= qb))
+            .min(fit);
+        let mut color = None;
+        for line in self.lines.get(first..last).unwrap_or_default() {
+            if !(line.hi() >= qa && line.lo() <= qb) {
+                continue;
+            }
+            let Some((ix0, ix1, _, _)) = line.ink else {
+                continue;
+            };
+            let xs = &self.xs[line.glyphs.clone()];
+            let spaces = &self.spaces[line.glyphs.clone()];
+            let (x0, spacing) = line.start(self.avail);
+            let x0 = pad + f64::from(x0);
+            let s = f64::from(spacing);
+            let at = |i: usize| x0 + xs[i] + s * spaces[i] as f64;
+            // The glyphs that can reach the view across, when their origins run one
+            // way; else all of them.
+            let (vx0, vx1) = (view.x0, view.x1);
+            let range = if line.forward {
+                partition(xs.len(), |i| at(i) + ix1 < vx0)..partition(xs.len(), |i| {
+                    at(i) + ix0 <= vx1
+                })
+            } else if line.backward && spacing == 0.0 {
+                partition(xs.len(), |i| at(i) + ix0 > vx1)..partition(xs.len(), |i| {
+                    at(i) + ix1 >= vx0
+                })
+            } else {
+                0..xs.len()
+            };
+            let y = f64::from(area.top - line.below);
+            let chars = &self.chars[line.glyphs.clone()];
+            let mut i = range.start;
+            while i < range.end {
+                let span = chars[i].1;
+                let mut j = i + 1;
+                while j < range.end && chars[j].1 == span {
+                    j += 1;
+                }
+                let style = &self.styles[span];
+                if color != Some(&style.color) {
+                    fail(out.fill_color(&style.color))?;
+                    color = Some(&style.color);
+                }
+                let glyphs = chars[i..j]
+                    .iter()
+                    .map(|&(c, _)| fonts.glyph(style.face, c))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let origin = (at(i), y);
+                fail(fill(
+                    &glyphs,
+                    style.size,
+                    origin,
+                    spacing,
+                    area.frame,
+                    Some(area.clip),
+                    out,
+                ))?;
+                i = j;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -804,10 +1146,12 @@ pub(super) struct Span {
     pub(super) style: Style,
 }
 
-/// A glyph at the size of the style of span `span` it was set from.
+/// A glyph, and the character it was set for, at the size of the style of span
+/// `span` it was set from.
 #[derive(Clone)]
 pub(super) struct Set<'f> {
     pub(super) glyph: Glyph<'f>,
+    pub(super) ch: char,
     pub(super) size: f32,
     pub(super) span: usize,
 }
@@ -831,11 +1175,6 @@ pub(super) struct Line<'f> {
 impl Line<'_> {
     pub(super) fn width(&self) -> f32 {
         self.glyphs.iter().map(Set::width).sum()
-    }
-
-    /// The number of spaces a justified line stretches at.
-    pub(super) fn spaces(&self) -> usize {
-        self.glyphs.iter().filter(|g| g.glyph.is_space()).count()
     }
 }
 
@@ -882,6 +1221,7 @@ pub(super) fn layout<'f>(
                 let style = &spans[span].style;
                 Ok(Set {
                     glyph: fonts.glyph(style.face, c)?,
+                    ch: c,
                     size: style.size,
                     span,
                 })

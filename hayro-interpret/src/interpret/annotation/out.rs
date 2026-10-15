@@ -79,6 +79,19 @@ impl Color {
         }
     }
 
+    /// The colour as numbers that tell colours apart: its kind, then its components'
+    /// bits.
+    pub(super) fn bits(&self) -> Vec<u64> {
+        let (kind, c): (u64, &[f64]) = match self {
+            Self::Gray(g) => (1, std::slice::from_ref(g)),
+            Self::Rgb(c) => (3, c),
+            Self::Cmyk(c) => (4, c),
+        };
+        std::iter::once(kind)
+            .chain(c.iter().map(|v| v.to_bits()))
+            .collect()
+    }
+
     /// The components, clamped to 0–1.
     fn components(&self) -> Vec<f64> {
         let clamped = |c: &[f64]| c.iter().map(|c| c.clamp(0.0, 1.0)).collect();

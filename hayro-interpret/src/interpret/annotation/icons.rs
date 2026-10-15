@@ -316,15 +316,21 @@ pub(super) fn caret(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
 
 /// `Redact`: each quadrilateral outlined in red, 1 pt wide, clipped as viewers clip it
 /// to the box of the quadrilaterals a point wider on each side; or `/Rect` less a
-/// point without `/QuadPoints`.
+/// point without `/QuadPoints`, clipped to `/Rect`.
 pub(super) fn redact(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     // Without quadrilaterals, as with an empty `/QuadPoints`, the box.
     let Some(quads) = quads(annot).filter(|q| !q.is_empty()) else {
-        let r = rect(annot)?.inset(-1.0);
+        // Clipped to the box, as viewers clip it, so that a box under two points
+        // wide shows only the part of the outline within it.
+        let r = rect(annot)?;
+        let inner = r.inset(-1.0);
+        out.op("q");
+        out.clip(r)?;
         out.op("1 0 0 RG");
         out.stroke_state(1.0, &[])?;
-        out.nums(&[r.x0, r.y0, r.width(), r.height()], "re")?;
+        out.nums(&[inner.x0, inner.y0, inner.width(), inner.height()], "re")?;
         out.op("S");
+        out.op("Q");
         return Some(());
     };
     let clip = quads

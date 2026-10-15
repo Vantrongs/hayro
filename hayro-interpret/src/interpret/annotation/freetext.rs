@@ -17,14 +17,18 @@ use super::entries::{Entries, Text};
 use super::lines::{Ending, Paint, ending};
 use super::out::{Color, Out};
 use super::rich;
-use super::text::{self, Align, Family, Fonts, Span, Style};
-use super::{Unsupported, border_width, color_of, dash, rect};
+use super::text::{self, Align, Family, Span, Style, TextBox};
+use super::{Appearances, Spans, TextKey, Unsupported, border_width, color_of, dash, rect};
 use hayro_syntax::object::dict::keys::C;
 use kurbo::{Affine, Point, Shape};
 
+/// The appearance of `FreeText` `annot`, of which the page shows `visible`; text the
+/// page does not show is not drawn, and text many annotations share is laid out
+/// once for `doc`'s document.
 pub(super) fn free_text(
     annot: &Entries<'_>,
-    fonts: &Fonts,
+    doc: &Appearances<'_>,
+    visible: kurbo::Rect,
     out: &mut Out,
 ) -> Result<Option<()>, Unsupported> {
     // Without a box, viewers draw over coordinates of ±2^32.
@@ -48,26 +52,37 @@ pub(super) fn free_text(
         },
     };
     let border_color = style.color;
-    let rich = annot.text(Text::Rich);
-    let ds = annot.text(Text::DefaultStyle);
-    // Rich text is laid out in a box of its own, sized by the default appearance's.
-    let rich_size = (rich.is_some() || ds.is_some()).then(|| size.unwrap_or(0.0));
-    let (spans, ascent) = if let Some(rich_size) = rich_size {
+    // The text is made of these entries in the default appearance's style.
+    let mut numbers = vec![
+        size.map_or(u64::MAX, |s| u64::from(s.to_bits())),
+        u64::from(style.align as u8),
+    ];
+    numbers.extend(da_color.map_or(vec![0], |c| c.bits()));
+    let key = TextKey::new(
+        [Text::Contents, Text::Rich, Text::DefaultStyle].map(|t| Some(annot.text_source(t))),
+        style.face,
+        numbers,
+    );
+    let spans = doc.spans(key.as_ref(), || {
+        let rich = annot.text(Text::Rich);
+        let ds = annot.text(Text::DefaultStyle);
+        if rich.is_none() && ds.is_none() {
+            let text = contents(annot);
+            return Ok(Spans {
+                spans: vec![Span { text, style }],
+                rich: false,
+            });
+        }
         // A size fit to the box is none for rich text: it is drawn 0 high, as
         // viewers draw it; plain text takes 12 pt.
-        let spans = rich_spans(rich.as_deref(), ds.as_deref(), rich_size, || {
+        let spans = rich_spans(rich.as_deref(), ds.as_deref(), size.unwrap_or(0.0), || {
             contents(annot)
         })?;
-        (spans, RICH_ASCENT)
-    } else {
-        (
-            vec![Span {
-                text: contents(annot),
-                style,
-            }],
-            0.8,
-        )
-    };
+        Ok(Spans { spans, rich: true })
+    })?;
+    // Rich text is laid out in a box of its own, sized by the default appearance's.
+    let rich_size = spans.rich.then(|| size.unwrap_or(0.0));
+    let ascent = if spans.rich { RICH_ASCENT } else { 0.8 };
     let w = border_width(annot);
 
     // The callout line, from the point it points at to the box.
@@ -169,17 +184,18 @@ pub(super) fn free_text(
         out.op("W n");
         clip = clip.intersect(layout.bounding_box());
     }
+    // Rich text is laid out to twice the padding from the right (observed).
+    let right = if rich_size.is_some() { 2.0 * pad } else { pad };
+    let avail = (fw as f32 - pad - right).max(0.0);
+    let laid = doc.laid(key.as_ref(), &spans, avail, ascent)?;
     let area = TextBox {
-        width: fw as f32,
         pad,
-        // Rich text is laid out to twice the padding from the right (observed).
-        right: if rich_size.is_some() { 2.0 * pad } else { pad },
         top: fh as f32 - pad,
         room: f32::INFINITY,
         frame,
         clip,
     };
-    draw_text(&spans, ascent, &area, fonts, out)?;
+    laid.draw(&area, visible, &doc.fonts, out)?;
     out.op("Q");
     Ok(Some(()))
 }
@@ -222,82 +238,6 @@ pub(super) fn rich_spans(
             style,
         }]),
     }
-}
-
-/// Where text is drawn: in a box `width` wide that `frame` maps from its bottom
-/// left to the page, wrapped to that width less `pad` on the left and `right` on
-/// the right, the top of
-/// its first line at `top` and each line 1.2 times its largest size below the
-/// one before, as many as fit together in `room` (lines beyond are not drawn), under
-/// a clip to `clip`, in the box's space.
-pub(super) struct TextBox {
-    pub(super) width: f32,
-    pub(super) pad: f32,
-    pub(super) right: f32,
-    pub(super) top: f32,
-    pub(super) room: f32,
-    pub(super) frame: Affine,
-    pub(super) clip: kurbo::Rect,
-}
-
-/// Draws `spans` in `area`, each line's first baseline `ascent` times its size
-/// below its top.
-pub(super) fn draw_text(
-    spans: &[Span],
-    ascent: f32,
-    area: &TextBox,
-    fonts: &Fonts,
-    out: &mut Out,
-) -> Result<(), Unsupported> {
-    let (fw, pad) = (area.width, area.pad);
-    let avail = (fw - pad - area.right).max(0.0);
-    let lines = text::layout(fonts, spans, Some(avail))?;
-    if !lines.iter().any(|l| !l.glyphs.is_empty()) {
-        return Ok(());
-    }
-    out.clip(area.clip).ok_or(Unsupported::Kind)?;
-    let (mut top, mut used) = (area.top, 0.0);
-    let mut color = None;
-    for line in &lines {
-        used += 1.2 * line.size;
-        if used > area.room {
-            break;
-        }
-        let width = line.width();
-        let (mut x, spacing) = match line.align {
-            Align::Left => (pad, 0.0),
-            Align::Center => (pad + (avail - width) / 2.0, 0.0),
-            Align::Right => (pad + avail - width, 0.0),
-            Align::Justify => match line.spaces() {
-                0 => (pad, 0.0),
-                n => (pad, ((avail - width) / n as f32).max(0.0)),
-            },
-        };
-        let y = top - ascent * line.size;
-        // Each run of glyphs of one span in its colour and size.
-        for run in line.glyphs.chunk_by(|a, b| a.span == b.span) {
-            let span_color = &spans[run[0].span].style.color;
-            if color != Some(span_color) {
-                out.fill_color(span_color).ok_or(Unsupported::Kind)?;
-                color = Some(span_color);
-            }
-            let glyphs: Vec<text::Glyph<'_>> = run.iter().map(|g| g.glyph.clone()).collect();
-            text::draw_clipped(
-                &glyphs,
-                run[0].size,
-                (x, y),
-                spacing,
-                area.frame,
-                area.clip,
-                out,
-            )
-            .ok_or(Unsupported::Kind)?;
-            let spaces = run.iter().filter(|g| g.glyph.is_space()).count();
-            x += text::width(&glyphs, run[0].size) + spacing * spaces as f32;
-        }
-        top -= 1.2 * line.size;
-    }
-    Ok(())
 }
 
 /// `r` with each side moved in by `d`, as given: a box of negative width or height
