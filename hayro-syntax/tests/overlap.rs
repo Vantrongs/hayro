@@ -809,3 +809,38 @@ fn an_object_that_reaches_the_cut_of_its_stream_is_lost() {
     assert_eq!(unit(cut_at_another_stream("")), (None, Some(id(5))));
     assert_eq!(unit(cut_at_another_stream(" ")), (Some(12.0), None));
 }
+
+/// Page 3, whose `/UserUnit` is object 5, at the start of `extra`, with entry 6 at
+/// `six` in it.
+fn entry_before(extra: &[u8], six: usize) -> Vec<u8> {
+    table_file(&one_page(600, "5 0 R"), extra, &[(5, 0), (6, six)], false)
+}
+
+// A header is read in its slot, as a body is: an entry whose header the next offset
+// cuts, or whose bytes start like a header up to it, is lost, as what it names is not
+// known there, and reading on would read the next place's bytes again for each such
+// entry. Bytes that are no header in the slot are no object. MuPDF reads `7 0 x` as no
+// object, whatever the next offset, and uses the default scale.
+#[test]
+fn an_entry_whose_header_the_next_offset_cuts_is_lost() {
+    // Entry 6 at the `2` of `12 0 obj`.
+    assert_eq!(
+        unit(entry_before(b"12 0 obj\n3\nendobj", 1)),
+        (None, Some(id(5)))
+    );
+    // Entry 6 at the space after `7 0`, which a header may go on after.
+    assert_eq!(
+        unit(entry_before(b"7 0 x 6 0 obj\n2\nendobj", 3)),
+        (None, Some(id(5)))
+    );
+    // Entry 6 at the `x`, which the slot ends at: no header.
+    assert_eq!(
+        unit(entry_before(b"7 0 x 6 0 obj\n2\nendobj", 4)),
+        (None, None)
+    );
+    // No offset in the header: it is read.
+    assert_eq!(
+        unit(entry_before(b"5 0 obj\n3\nendobj\n6 0 obj 1 endobj", 17)),
+        (Some(3.0), None)
+    );
+}

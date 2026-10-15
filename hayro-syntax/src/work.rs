@@ -53,6 +53,25 @@ std::thread_local! {
     pub static OBJECT_STREAM_ENTRIES: Cell<usize> = const { Cell::new(0) };
 }
 
+#[cfg(all(debug_assertions, feature = "std"))]
+std::thread_local! {
+    /// The bytes every [`crate::reader::Reader`] on this thread looked at, one by one,
+    /// a byte as often as it was looked at, by reads that failed too, whatever the
+    /// bytes: the file, an object stream's data, a content stream. Counted by the
+    /// reader itself, so no read is left out: what tests bound the work of lexing by.
+    /// A slice a reader takes whole, unread, as a stream's data, is not counted.
+    /// Debug builds only.
+    #[doc(hidden)]
+    pub static EXAMINED: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Counts a byte a reader looked at ([`EXAMINED`]).
+#[inline(always)]
+pub(crate) fn examined() {
+    #[cfg(all(debug_assertions, feature = "std"))]
+    EXAMINED.set(EXAMINED.get() + 1);
+}
+
 /// Counts `entries` of an object stream's header read ([`OBJECT_STREAM_ENTRIES`]).
 #[inline]
 pub(crate) fn object_stream_entries(_entries: usize) {

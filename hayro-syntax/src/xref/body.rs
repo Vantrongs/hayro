@@ -9,9 +9,9 @@
 //! so that a read of another type than the object's costs nothing to repeat.
 
 use crate::lost::Lost;
-use crate::object::ObjectIdentifier;
 use crate::object::parsed::{DictNode, Node};
-use crate::reader::{Reader, ReaderContext};
+use crate::object::{Number, ObjectIdentifier};
+use crate::reader::{Reader, ReaderContext, ReaderExt};
 use crate::sync::Arc;
 #[cfg(test)]
 use crate::sync::FxHashMap;
@@ -190,23 +190,162 @@ pub(super) enum Read<O, D> {
     Stream { dict: D, end: usize },
 }
 
+/// A reader of the bytes a read that starts at a place looks at: those of the
+/// place's slot and the one after it, which no lexing of it can pass
+/// ([`Read::in_slot`]). It is the only reader made at a place: a header, a body and
+/// whether `stream` follows it are read through one wherever an entry leads, for the
+/// table's check ([`super::check`]), the rebuild's probes and every read of an
+/// object, so that how far a read at a place looks is the slot's, whatever the read
+/// and whether it fails. What may be read past the slot is only the white space
+/// before `stream` ([`stream_follows`]), a stream's data, which are not lexed, and,
+/// for an entry the check could not read, the object after a header it read here,
+/// which the rebuild's scan reads (`read_unread` in the parent module).
+pub(super) struct SlotReader<'a> {
+    /// A reader of the bytes up to the slot's end and one more.
+    r: Reader<'a>,
+    data: &'a [u8],
+    at: usize,
+    slot: Slot,
+}
+
+/// What a slot holds where an object of the file starts ([`SlotReader::header`]).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(super) enum Header {
+    /// A header that ends in the slot, naming this object.
+    Read(ObjectIdentifier),
+    /// The start of a header that the slot's end cuts, or may cut: what it names is
+    /// not known in the slot.
+    Cut,
+    /// No header.
+    Absent,
+}
+
+/// What a read at a place finds, and where it ends; and how many bytes it looked at.
+pub(super) type Looked<T> = (Option<(T, usize)>, usize);
+
+impl<'a> SlotReader<'a> {
+    /// A reader at `at` of `data`, in the slot `slot`; `None` where `at` is past
+    /// what the slot lets it read.
+    pub(super) fn new(data: &'a [u8], at: usize, slot: Slot) -> Option<Self> {
+        let view = &data[..data.len().min(slot.end.saturating_add(1))];
+        if at > view.len() {
+            return None;
+        }
+        let mut r = Reader::new(view);
+        r.jump(at);
+        Some(Self { r, data, at, slot })
+    }
+
+    /// The header the bytes start with, `N G obj`, if it ends in the slot, as
+    /// reading it on the whole of the bytes finds it; the reader then is after it.
+    /// A token the slot's end cuts runs on into the byte after it, so a header that
+    /// does not end in the slot is not read ([`Read::in_slot`]): where one may start
+    /// there, it is cut, else there is none.
+    pub(super) fn header(&mut self) -> Header {
+        let mut r = self.r.clone();
+        match r.read_without_context::<ObjectIdentifier>() {
+            Some(id) if r.offset() <= self.slot.end => {
+                self.r = r;
+                Header::Read(id)
+            }
+            Some(_) => Header::Cut,
+            None if self.cut_header() => Header::Cut,
+            None => Header::Absent,
+        }
+    }
+
+    /// Whether the bytes the reader may look at, from it, are the start of a header
+    /// that goes on past them, as far as they go, where they go on past the slot: a
+    /// number that reaches their end, or two numbers, each with the white space and
+    /// comments after it, of which the last reaches their end, and the start of
+    /// `obj`.
+    fn cut_header(&self) -> bool {
+        if self.r.len() <= self.slot.end {
+            return false;
+        }
+        let mut r = self.r.clone();
+        for _ in 0..2 {
+            let mut number = r.clone();
+            if r.skip::<Number>(false).is_none() {
+                return false;
+            }
+            if r.at_end() {
+                return true;
+            }
+            if number.read_without_context::<i32>().is_none() {
+                return false;
+            }
+            r.skip_white_spaces_and_comments();
+            if r.at_end() {
+                return true;
+            }
+        }
+        let rest = r.tail().unwrap_or_default();
+        rest.len() < b"obj".len() && b"obj".starts_with(rest)
+    }
+
+    /// Where the object starts, after white space and comments, where it starts
+    /// before the slot's end.
+    pub(super) fn object_start(&self) -> Option<usize> {
+        let mut r = self.r.clone();
+        r.skip_white_spaces_and_comments();
+        (r.offset() < self.slot.end).then_some(r.offset())
+    }
+
+    /// The object the reader is at, after white space and comments, a dictionary
+    /// read by `dict`, another object by `object` as `Object::read` reads one, and
+    /// where it ends, where that is in the slot; and how many bytes reading it looked
+    /// at. A dictionary is skipped and parsed by one reading; a dictionary followed
+    /// by `stream` is a stream's ([`stream_follows`]).
+    pub(super) fn object<O, D>(
+        mut self,
+        dict: impl FnOnce(&mut Reader<'a>) -> Option<D>,
+        object: impl FnOnce(&mut Reader<'a>) -> Option<O>,
+    ) -> Looked<Read<O, D>> {
+        let (data, at, slot) = (self.data, self.at, self.slot);
+        let r = &mut self.r;
+        r.skip_white_spaces_and_comments();
+        let read = if r.peek_bytes(2) == Some(b"<<") {
+            dict(r).map(Ok)
+        } else {
+            object(r).map(Err)
+        };
+        let end = r.offset();
+        let looked = end.saturating_sub(at);
+        let ends = end <= slot.end && !(slot.open && end >= data.len());
+        let Some(read) = read.filter(|_| ends) else {
+            return (None, looked);
+        };
+        match read {
+            // As `Object::read_indirect` reads an indirect object; an object stream
+            // holds none, but reads one so too.
+            Ok(dict) => match stream_follows(data, end, slot) {
+                Some((true, past)) => (Some((Read::Stream { dict, end }, end)), past - at),
+                Some((false, past)) => (Some((Read::Dict(dict), end)), past - at),
+                None => (None, slot.end - at),
+            },
+            Err(object) => (Some((Read::Object(object), end)), looked),
+        }
+    }
+}
+
 impl<O, D> Read<O, D> {
     /// The body at `at` of `data`, after its header where `header`, a dictionary read
-    /// by `dict`, another object by `object` ([`super::read_object`]), and where it
+    /// by `dict`, another object by `object` ([`SlotReader::object`]), and where it
     /// ends, where that is in its slot, `slot`; and how many bytes reading it looked
     /// at.
     ///
     /// A body is what reading it on the whole of `data` finds, where that ends in the
     /// slot, or nothing: the slot's end is no end of a token, nor of the white space
     /// before `stream`. The body is read on the bytes up to the slot's end and one
-    /// more, so a token reaching the end goes on past it, as it does on all the bytes,
-    /// and the body is not read, its end being past the slot: a number, a name or a
-    /// keyword cut by the end is not taken for a shorter one; where the bytes go on
-    /// unknown past the slot's end, which is theirs ([`Slot::open`]), a body that
-    /// reaches it is not read. The bytes in the slot and the next decide anything
-    /// else reading the body looks at, but whether a dictionary is a stream's
-    /// ([`stream_follows`]). So reading every body of a buffer looks at each byte a
-    /// bounded number of times.
+    /// more ([`SlotReader`]), so a token reaching the end goes on past it, as it does
+    /// on all the bytes, and the body is not read, its end being past the slot: a
+    /// number, a name or a keyword cut by the end is not taken for a shorter one;
+    /// where the bytes go on unknown past the slot's end, which is theirs
+    /// ([`Slot::open`]), a body that reaches it is not read. The bytes in the slot and
+    /// the next decide anything else reading the body looks at, but whether a
+    /// dictionary is a stream's ([`stream_follows`]). So reading every body of a
+    /// buffer looks at each byte a bounded number of times.
     pub(super) fn in_slot<'a>(
         data: &'a [u8],
         at: usize,
@@ -215,29 +354,13 @@ impl<O, D> Read<O, D> {
         dict: impl FnOnce(&mut Reader<'a>) -> Option<D>,
         object: impl FnOnce(&mut Reader<'a>) -> Option<O>,
     ) -> (Option<(Self, usize)>, usize) {
-        let view = &data[..data.len().min(slot.end.saturating_add(1))];
-        if at > view.len() {
+        let Some(mut r) = SlotReader::new(data, at, slot) else {
+            return (None, 0);
+        };
+        if header && !matches!(r.header(), Header::Read(_)) {
             return (None, 0);
         }
-        let mut r = Reader::new(view);
-        r.jump(at);
-        let read = super::read_object(&mut r, header, dict, object);
-        let end = r.offset();
-        let looked = end.saturating_sub(at);
-        let ends = end <= slot.end && !(slot.open && end >= data.len());
-        let Some((_, read)) = read.filter(|_| ends) else {
-            return (None, looked);
-        };
-        match read {
-            // As `Object::read_indirect` reads an indirect object; an object stream
-            // holds none, but reads one so too.
-            Ok(dict) => match stream_follows(data, end, slot) {
-                Some((true, past)) => (Some((Self::Stream { dict, end }, end)), past - at),
-                Some((false, past)) => (Some((Self::Dict(dict), end)), past - at),
-                None => (None, slot.end - at),
-            },
-            Err(object) => (Some((Self::Object(object), end)), looked),
-        }
+        r.object(dict, object)
     }
 }
 
@@ -255,39 +378,41 @@ impl<O, D> Read<O, D> {
 /// white space past it.
 pub(super) fn stream_follows(data: &[u8], end: usize, slot: Slot) -> Option<(bool, usize)> {
     let (open, slot) = (slot.open, slot.end);
-    let mut at = end;
-    while at < slot {
-        match data[at] {
+    // In the slot, and the byte after it, white space and comments.
+    let mut r = Reader::new(&data[..data.len().min(slot.saturating_add(1))]);
+    r.jump(end);
+    while r.offset() < slot {
+        match r.peek_byte() {
             // A comment ends where its line does, at the slot's end at the latest.
-            b'%' => match data[at..data.len().min(slot + 1)]
-                .iter()
-                .position(|b| is_eol_character(*b))
-            {
-                Some(line) => at += line,
-                None if slot >= data.len() && !open => at = slot,
-                None => return None,
-            },
-            b if is_white_space_character(b) => at += 1,
+            Some(b'%') => {
+                r.forward_while(|b| !is_eol_character(b));
+                if r.at_end() {
+                    if slot >= data.len() && !open {
+                        r.jump(slot);
+                    } else {
+                        return None;
+                    }
+                }
+            }
+            Some(b) if is_white_space_character(b) => r.forward(),
             _ => break,
         }
     }
-    if at >= slot {
-        while data.get(at).is_some_and(|b| is_white_space_character(*b)) {
-            at += 1;
-        }
-        if data.get(at) == Some(&b'%') {
+    // Past the slot, white space only.
+    let mut r = Reader::new_with(data, r.offset());
+    if r.offset() >= slot {
+        r.skip_white_spaces();
+        if r.peek_byte() == Some(b'%') {
             return None;
         }
     }
+    let at = r.offset();
     // Bytes that end where they go on unknown, which may be the keyword's start.
     let rest = data.get(at..).unwrap_or_default();
     if open && rest.len() < b"stream".len() && b"stream".starts_with(rest) {
         return None;
     }
-    let stream = data
-        .get(at..)
-        .is_some_and(|rest| rest.starts_with(b"stream"));
-    Some((stream, at))
+    Some((r.peek_tag(b"stream").is_some(), at))
 }
 
 #[cfg(test)]

@@ -35,7 +35,7 @@ mod body;
 mod scan;
 
 pub(crate) use body::Place;
-use body::{Slot, Source, Taken, Unread};
+use body::{Header, Slot, SlotReader, Source, Taken, Unread};
 use scan::Scan;
 
 pub(crate) const XREF_ENTRY_LEN: usize = 20;
@@ -176,8 +176,21 @@ pub(crate) fn open(data: PdfData, password: &[u8]) -> Result<XRef, XRefError> {
 struct Old {
     /// Those that lead to an object that ends before the next offset any entry names.
     listed: Vec<Listed>,
-    /// The others, each by offset: the scan reads their objects to their ends.
-    unread: Vec<(usize, ObjectIdentifier)>,
+    /// Those that lead to a header, or the start of one that the next offset cuts,
+    /// but to no object that ends before it: the scan reads such an object to its
+    /// end where the header ends before the offset (`read_unread`).
+    unread: Vec<Unfinished>,
+}
+
+/// An entry of a table that is rebuilt that leads to no object read before the next
+/// offset any entry names, its slot.
+#[derive(Debug, Clone, Copy)]
+struct Unfinished {
+    id: ObjectIdentifier,
+    offset: usize,
+    /// The header, where it ends in the slot, and where the object after it starts,
+    /// where that is in the slot.
+    header: Option<(ObjectIdentifier, Option<usize>)>,
 }
 
 /// An entry of a table that is rebuilt, which leads to an object.
@@ -191,10 +204,11 @@ struct Listed {
 
 #[cfg(test)]
 std::thread_local! {
-    /// The work opening files has done on this thread to check their tables and to
-    /// scan the files whose tables are rebuilt: the bytes read, and the blocks, tree
-    /// nodes and outcomes a scan looks at (`scan::Scan`). The tests bound it to show
-    /// that opening a file reads each part of it a bounded number of times.
+    /// The work the scans of files whose tables are rebuilt have done on this thread
+    /// besides lexing, which readers count ([`crate::work::EXAMINED`]): the bytes of
+    /// white space and strings read, and the blocks, tree nodes and outcomes looked at
+    /// (`scan::Scan`). The tests bound both to show that opening a file reads each
+    /// part of it a bounded number of times.
     pub(crate) static OPEN_BYTES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
@@ -212,11 +226,11 @@ fn opened(_bytes: usize) {
 // An entry leads to its object where an object whose header names it is at its offset
 // and reading it as the entry's object is read (`body::Shape::read`) reads it before the
 // next offset any entry names: objects of a table do not overlap.
-// So each object is read once however many entries name it, and no further than the
-// next, which reads each byte of the file once. MuPDF, too, rebuilds a table with an
-// entry past the end of the file or in an object stream the table does not list as an
-// object (`check_xref_entry_offsets` in MuPDF's `pdf-xref.c`); an entry at offset 0 is
-// free.
+// So each header and object is read once however many entries name it, and no further
+// than the next offset, its slot (`body::SlotReader`), which reads each byte of the file
+// once. MuPDF, too, rebuilds a table with an entry past the end of the file or in an
+// object stream the table does not list as an object (`check_xref_entry_offsets` in
+// MuPDF's `pdf-xref.c`); an entry at offset 0 is free.
 fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Old> {
     xref_map.retain(|_, entry| *entry != EntryType::Normal(0));
     let mut entries = vec![];
@@ -236,21 +250,18 @@ fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Old> {
     while let Some(&(offset, _)) = rest.first() {
         let at = rest.partition_point(|(other, _)| *other == offset);
         let end = rest.get(at).map_or(data.len(), |(next, _)| *next);
-        let header = object_in(data, offset, end);
-        for (_, id) in &rest[..at] {
-            match header {
-                Some(header) => {
-                    sound &= header == *id;
-                    old.listed.push(Listed {
-                        id: *id,
-                        offset,
-                        header,
-                    });
+        let checked = object_in(data, offset, end);
+        for &(_, id) in &rest[..at] {
+            match checked {
+                Checked::Object(header) => {
+                    sound &= header == id;
+                    old.listed.push(Listed { id, offset, header });
                 }
-                None => {
+                Checked::Unfinished(header) => {
                     sound = false;
-                    old.unread.push((offset, *id));
+                    old.unread.push(Unfinished { id, offset, header });
                 }
+                Checked::Nothing => sound = false,
             }
         }
         rest = &rest[at..];
@@ -270,46 +281,42 @@ fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Old> {
     }
 }
 
-/// The identifier in the header of the object at `at` of `data`, if the object ends
-/// in its slot, which ends at `slot`: if reading it as an entry's object is read
-/// ([`body::Read::in_slot`]) reads it there. A dictionary is skipped, which reads it
+/// What checking a table finds where an entry leads, in the entry's slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Checked {
+    /// A header, the identifier it names, and an object after it that ends in the
+    /// slot.
+    Object(ObjectIdentifier),
+    /// No object that ends in the slot, after a header that does, if one does, and
+    /// where the object starts, if that is before the slot's end; else, after the
+    /// start of a header that the slot's end cuts, which may be the entry's.
+    Unfinished(Option<(ObjectIdentifier, Option<usize>)>),
+    /// No header: the entry leads to no object.
+    Nothing,
+}
+
+/// What the check of a table finds at `at` of `data`, whose slot ends at `slot`: the
+/// header and the object after it, read as an entry's object is read
+/// ([`body::Read::in_slot`]), all in the slot. A dictionary is skipped, which reads it
 /// as reading it does.
-fn object_in(data: &[u8], at: usize, slot: usize) -> Option<ObjectIdentifier> {
-    let header = Reader::new_with(data, at).read_without_context::<ObjectIdentifier>()?;
-    let (object, _looked) = body::Read::in_slot(
-        data,
-        at,
-        Slot::to(slot),
-        true,
+fn object_in(data: &[u8], at: usize, slot: usize) -> Checked {
+    let Some(mut r) = SlotReader::new(data, at, Slot::to(slot)) else {
+        return Checked::Nothing;
+    };
+    let header = match r.header() {
+        Header::Read(header) => header,
+        Header::Cut => return Checked::Unfinished(None),
+        Header::Absent => return Checked::Nothing,
+    };
+    let start = r.object_start();
+    let (object, _) = r.object(
         |r| r.skip::<Dict<'_>>(false),
         |r| r.read_with_context::<Object<'_>>(&ReaderContext::dummy()),
     );
-    #[cfg(test)]
-    opened(if object.is_some() { _looked } else { slot - at });
-    object.map(|_| header)
-}
-
-/// The object `r` is at, after its header where `header`, and where it starts, as an
-/// entry's object is read: a dictionary, read by `dict`, or another object, read by
-/// `object` as `Object::read` reads one. This is how every read of an entry reads an
-/// object's body (`body::Shape::read`), parsing it, and how the table's check finds
-/// that an entry leads to one, skipping a dictionary: a dictionary is skipped and
-/// parsed by one reading.
-fn read_object<'a, D, O>(
-    r: &mut Reader<'a>,
-    header: bool,
-    dict: impl FnOnce(&mut Reader<'a>) -> Option<D>,
-    object: impl FnOnce(&mut Reader<'a>) -> Option<O>,
-) -> Option<(usize, Result<D, O>)> {
-    if header {
-        r.skip::<ObjectIdentifier>(false)?;
+    match object {
+        Some(_) => Checked::Object(header),
+        None => Checked::Unfinished(Some((header, start))),
     }
-    r.skip_white_spaces_and_comments();
-    let at = r.offset();
-    if r.peek_bytes(2) == Some(b"<<") {
-        return Some((at, Ok(dict(r)?)));
-    }
-    Some((at, Err(object(r)?)))
 }
 
 // Try to manually parse the PDF to build an xref table and trailer dictionary.
@@ -373,7 +380,7 @@ fn fallback_xref_map<'a>(
 ) -> (XrefMap, Rebuilt, Option<XRefInput<'a>>) {
     let mut scan = Scan::new(data.as_ref());
     let mut listed = old.listed;
-    let (read, unreadable) = read_unread(data.as_ref(), &mut scan, &old.unread);
+    let (read, unreadable) = read_unread(&mut scan, &old.unread);
     listed.extend(read);
     fallback_xref_map_inner(
         data,
@@ -389,37 +396,25 @@ fn fallback_xref_map<'a>(
 /// The entries of `unread`, sorted by offset, that lead to an object read to its end,
 /// as reading the entry's object does, and those that lead to a header with no object
 /// that can be read after it. Checking the table reads an object only up to the next
-/// offset an entry names, which another's header may be at, in a string.
-fn read_unread(
-    data: &[u8],
-    scan: &mut Scan<'_>,
-    unread: &[(usize, ObjectIdentifier)],
-) -> (Vec<Listed>, Vec<ObjectIdentifier>) {
+/// offset an entry names, which another's header may be at, in a string: the scan
+/// reads the object on, from where the check found it starts, after a header and
+/// white space read in the slot; one that does not start there, or whose header the
+/// slot cuts, is not read, as reading the entry's object does not read it.
+///
+/// The headers and the white space before the objects read are in disjoint slots, so
+/// the objects start at different places, each after a delimiter the slot holds: no
+/// token the scan reads from one, but a string or a container, which it reads once
+/// for all (`scan::Scan`), holds another's start.
+fn read_unread(scan: &mut Scan<'_>, unread: &[Unfinished]) -> (Vec<Listed>, Vec<ObjectIdentifier>) {
     let mut listed = vec![];
     let mut unreadable = vec![];
-    let mut rest = unread;
-    while let Some(&(offset, _)) = rest.first() {
-        let at = rest.partition_point(|(other, _)| *other == offset);
-        let mut r = Reader::new(data);
-        let header = data.get(offset..).and_then(|_| {
-            r.jump(offset);
-            let header = r.read_without_context::<ObjectIdentifier>()?;
-            r.skip_white_spaces_and_comments();
-            opened(r.offset() - offset);
-            Some((header, scan.object(r.offset()).is_some()))
-        });
+    for &Unfinished { id, offset, header } in unread {
         match header {
-            Some((header, true)) => {
-                listed.extend(
-                    rest[..at]
-                        .iter()
-                        .map(|&(offset, id)| Listed { id, offset, header }),
-                );
+            Some((header, Some(at))) if scan.object(at).is_some() => {
+                listed.push(Listed { id, offset, header });
             }
-            Some((_, false)) => unreadable.extend(rest[..at].iter().map(|&(_, id)| id)),
-            None => {}
+            _ => unreadable.push(id),
         }
-        rest = &rest[at..];
     }
     (listed, unreadable)
 }
@@ -490,7 +485,6 @@ fn fallback_xref_map_inner<'a>(
             {
                 r.jump(found.end);
                 if found.root || found.kind {
-                    opened(found.end - cur_pos);
                     let mut dict_reader = Reader::new(&data.as_ref()[cur_pos..found.end]);
                     if let Some(dict) = dict_reader.read_with_context::<Dict<'_>>(&dummy_ctx) {
                         if found.root && dict.contains_key(ROOT) {
@@ -671,7 +665,6 @@ fn rebuilt_header(
     };
     let mut body = r.clone();
     body.skip_white_spaces_and_comments();
-    opened(body.offset() - r.offset());
     let at = body.offset();
     Some(Some((id, scan.object(at).map(|_| at))))
 }
@@ -680,20 +673,6 @@ fn rebuilt_header(
 fn scan_header(r: &mut Reader<'_>) -> Option<ObjectIdentifier> {
     let mut header = r.clone();
     let id = header.read_without_context::<ObjectIdentifier>();
-    #[cfg(test)]
-    opened(match id {
-        Some(_) => header.offset() - r.offset(),
-        // A header that is not one reads two numbers, the white space and comments
-        // after them, and three bytes.
-        None => {
-            let mut read = r.clone();
-            let _ = read.read_without_context::<i32>();
-            read.skip_white_spaces_and_comments();
-            let _ = read.read_without_context::<i32>();
-            read.skip_white_spaces_and_comments();
-            read.offset() + 3 - r.offset()
-        }
-    });
     if id.is_some() {
         *r = header;
     }
@@ -2318,11 +2297,13 @@ mod tests {
         file_with(format!("4 0 obj\n{body}\nendobj\n").as_bytes(), &[0], true)
     }
 
-    /// The work opening `file` takes, after checking it opens to the 100 × 100 page.
+    /// The work opening `file` takes, the bytes lexed and the scan's other work,
+    /// after checking it opens to the 100 × 100 page.
     fn work(file: &[u8]) -> usize {
         OPEN_BYTES.set(0);
+        crate::work::EXAMINED.set(0);
         let pdf = crate::Pdf::new(file.to_vec()).unwrap();
-        let read = OPEN_BYTES.get();
+        let read = OPEN_BYTES.get() + crate::work::EXAMINED.get();
         let pages = pdf.pages();
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0].media_box().x1, 100.0);
@@ -2337,7 +2318,34 @@ mod tests {
     #[test]
     fn opening_a_file_reads_it_in_linear_time() {
         type Family = (&'static str, fn(usize) -> Vec<u8>);
-        let families: [Family; 19] = [
+        let families: [Family; 22] = [
+            // Entries at each `0` of `0…09 0 obj`: each reads a header in its slot of
+            // one byte, which the next `0` ends, not on to `obj`.
+            ("entries in the zeros of a header", |n| {
+                let entries: Vec<usize> = (0..n).collect();
+                let body = format!("{}9 0 obj\nnull\nendobj\n", "0".repeat(n));
+                file_with(body.as_bytes(), &entries, false)
+            }),
+            // Entries every 8 bytes of one number of `8 n` digits: each reads the
+            // number in its slot, not to the end of the run.
+            ("entries in a long number", |n| {
+                let entries: Vec<usize> = (0..n).map(|i| 8 * i).collect();
+                let body = format!("{}\n9 0 obj\nnull\nendobj\n", "1".repeat(8 * n));
+                file_with(body.as_bytes(), &entries, false)
+            }),
+            // Entries at headers in one comment line, each before a `%`, then `8 n`
+            // spaces and the object: from each header, a comment runs past its slot,
+            // so the rebuild does not look for an object past the line and spaces.
+            ("entries in a comment line before white space", |n| {
+                let body = format!(
+                    "4 0 obj %{}\n{}null\nendobj\n",
+                    " 5 0 obj%".repeat(n),
+                    " ".repeat(8 * n)
+                );
+                let entries: Vec<usize> =
+                    body.match_indices("0 obj").map(|(at, _)| at - 2).collect();
+                file_with(body.as_bytes(), &entries, false)
+            }),
             ("aliases", |n| aliases(n, false)),
             ("nested", |n| nested(n, false, false)),
             ("nested after space", |n| nested(n, true, false)),
@@ -2916,16 +2924,16 @@ mod tests {
         )
     }
 
-    /// The bytes of object headers read to open `file` and find its pages' sizes,
-    /// once it is checked that each of the `pages` pages is 600 × 700 pt.
-    fn header_bytes(file: Vec<u8>, pages: usize) -> usize {
-        object::HEADER_BYTES.set(0);
+    /// The bytes lexed to open `file` and find its pages' sizes, once it is checked
+    /// that each of the `pages` pages is 600 × 700 pt.
+    fn lexed_to_open(file: Vec<u8>, pages: usize) -> usize {
+        crate::work::EXAMINED.set(0);
         let pdf = crate::Pdf::new(file).unwrap();
         assert_eq!(pdf.pages().len(), pages);
         for page in pdf.pages().iter() {
             assert_eq!(page.render_dimensions(), (600.0, 700.0));
         }
-        object::HEADER_BYTES.get()
+        crate::work::EXAMINED.get()
     }
 
     // The header of an object that entries of an encrypted file's table lead to,
@@ -2935,10 +2943,10 @@ mod tests {
     fn a_header_entries_lead_to_is_read_once_for_them_all() {
         for (padded, encrypted) in [(true, true), (true, false), (false, true)] {
             let [small, large] = [256, 512]
-                .map(|n| header_bytes(aliased_padded(n, padded, encrypted), n as usize + 1));
+                .map(|n| lexed_to_open(aliased_padded(n, padded, encrypted), n as usize + 1));
             assert!(
                 large <= small * 25 / 10,
-                "padded: {padded}, encrypted: {encrypted}: header bytes read for 256 \
+                "padded: {padded}, encrypted: {encrypted}: bytes lexed for 256 \
                  entries {small}, for 512 {large}"
             );
         }
@@ -3073,10 +3081,10 @@ mod tests {
         }
     }
 
-    /// The bytes of headers read while every item of a page's /Annots, `n`
+    /// The bytes lexed while every item of a page's /Annots, `n`
     /// references to string 4, whose header is padded with `64 * n` spaces where
     /// `padded`, is read as an annotation, as many times as it is listed.
-    fn annotation_header_bytes(n: usize, padded: bool) -> usize {
+    fn lexed_reading_annotations(n: usize, padded: bool) -> usize {
         let annots = vec!["4 0 R"; n].join(" ");
         let page =
             format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] /Annots [{annots}] >>");
@@ -3093,13 +3101,13 @@ mod tests {
         ];
         let pdf = crate::Pdf::new(file_headed(&objects, false)).unwrap();
         let page = &pdf.pages()[0];
-        object::HEADER_BYTES.set(0);
+        crate::work::EXAMINED.set(0);
         let annots = page.raw().get::<Array<'_>>(b"Annots".as_slice()).unwrap();
         for _ in 0..2 {
             assert_eq!(annots.iter_checked::<Dict<'_>>().count(), 0);
             assert_eq!(annots.iter::<Dict<'_>>().count(), 0);
         }
-        object::HEADER_BYTES.get()
+        crate::work::EXAMINED.get()
     }
 
     // The header of an object that many references lead to, read as another kind
@@ -3108,13 +3116,15 @@ mod tests {
     #[test]
     fn a_header_read_for_another_kind_of_object_is_read_once() {
         for padded in [true, false] {
-            let [small, large] = [128, 256].map(|n| annotation_header_bytes(n, padded));
+            let [small, large] = [128, 256].map(|n| lexed_reading_annotations(n, padded));
             assert!(
                 large <= small * 25 / 10,
-                "padded: {padded}: header bytes {small} for 128 references, {large} for 256"
+                "padded: {padded}: bytes lexed {small} for 128 references, {large} for 256"
             );
         }
-        assert!(annotation_header_bytes(256, true) <= 512 * 256 + 16);
+        // The padded header once, and the rest of the object.
+        let bytes = lexed_reading_annotations(256, true);
+        assert!(bytes <= 512 * 256 + 64, "{bytes} bytes lexed");
     }
 
     /// How often bodies were read, or streams' data found, while `run` ran, the most

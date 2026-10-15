@@ -104,10 +104,15 @@ impl<'a> Reader<'a> {
             .and_then(|end| self.data.get(self.offset..end))
     }
 
-    /// Peeks a single byte.
+    /// Peeks a single byte. Every byte a reader looks at one by one is looked at
+    /// here, and counted ([`crate::work::EXAMINED`]).
     #[inline]
     pub fn peek_byte(&self) -> Option<u8> {
-        self.data.get(self.offset).copied()
+        let byte = self.data.get(self.offset).copied();
+        if byte.is_some() {
+            crate::work::examined();
+        }
+        byte
     }
 
     /// Eat the next byte if it satisfies the condition.

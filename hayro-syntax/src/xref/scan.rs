@@ -58,7 +58,8 @@ const MAX_DEPTH: usize = MAX_OBJECT_NESTING_DEPTH;
 const BLOCK: usize = 64;
 
 // The work of a scan counts toward the work of opening the file, which the tests
-// bound: bytes read, and blocks, tree nodes and outcomes looked at.
+// bound: bytes of white space and strings read, and blocks, tree nodes and outcomes
+// looked at; the bytes its readers lex, they count (`crate::work::EXAMINED`).
 use super::opened as step;
 
 /// A set of offsets in the file.
@@ -403,8 +404,8 @@ impl<'a> Scan<'a> {
     }
 
     /// What the scan finds of the object at `at`, after white space and comments,
-    /// read as reading an object there does (`read_object` in the parent module):
-    /// `None` where that fails.
+    /// read as reading an object there does (`body::SlotReader::object` in the
+    /// parent module): `None` where that fails.
     pub(crate) fn object(&mut self, at: usize) -> Option<Found> {
         let at = self.space(at, &mut false);
         if let Some((last, found)) = self.last
@@ -425,7 +426,7 @@ impl<'a> Scan<'a> {
                 let mut r = Reader::new(self.data);
                 r.jump(at);
                 let read = r.read_with_context::<Object<'_>>(&ReaderContext::dummy());
-                step(r.offset() - at + 1);
+                step(1);
                 read.map(|_| Found::new(r.offset(), Keys::default()))
             }
         };
@@ -472,12 +473,11 @@ impl<'a> Scan<'a> {
         let mut r = Reader::new(self.data);
         r.jump(at);
         let key = r.read_without_context::<Name<'a>>();
-        step(r.offset() - at + 1);
+        step(1);
         key.map(|key| (key, r.offset()))
     }
 
-    /// Where what `skip` reads at `at` ends, if it reads one, counting the bytes it
-    /// reads.
+    /// Where what `skip` reads at `at` ends, if it reads one.
     fn skipped<T>(
         &self,
         at: usize,
@@ -486,7 +486,7 @@ impl<'a> Scan<'a> {
         let mut r = Reader::new(self.data);
         r.jump(at);
         let skipped = skip(&mut r);
-        step(r.offset() - at + 1);
+        step(1);
         skipped.map(|_| r.offset())
     }
 
@@ -741,7 +741,7 @@ impl<'a> Scan<'a> {
 #[cfg(test)]
 mod tests {
     use super::super::body::{Read, Slot};
-    use super::super::{object_in, rebuilt_header};
+    use super::super::{Checked, object_in, rebuilt_header};
     use super::*;
     use crate::object::Dict;
     use crate::object::ObjectIdentifier;
@@ -1083,20 +1083,43 @@ mod tests {
             // checking the table, on the whole rest of the file and up to an offset,
             // by rebuilding it, and by reading the object.
             let read = headed_read(&data, at, data.len());
-            let header = Reader::new(&data[at..]).read_without_context::<ObjectIdentifier>();
+            let mut whole = Reader::new(&data);
+            whole.jump(at);
+            let header = whole.read_without_context::<ObjectIdentifier>();
+            // The header, and whether the object after it is read, or whether the
+            // slot cuts the start of a header.
+            let checked = |next: usize| match object_in(&data, at, next) {
+                Checked::Object(header) => (Some(header), true, false),
+                Checked::Unfinished(Some((header, _))) => (Some(header), false, false),
+                Checked::Unfinished(None) => (None, false, true),
+                Checked::Nothing => (None, false, false),
+            };
             assert_eq!(
-                object_in(&data, at, data.len()),
-                read.and(header),
+                checked(data.len()),
+                (header, read.is_some() && header.is_some(), false),
                 "case {case}, header check at {at} of {:?}",
                 shown()
             );
-            let in_slot = Reader::new(&data[at..next]).read_without_context::<ObjectIdentifier>();
-            assert_eq!(
-                object_in(&data, at, next),
-                headed_read(&data, at, next).and(in_slot),
-                "case {case}, header check at {at} to {next} of {:?}",
-                shown()
-            );
+            // In a slot, the header is the one read on all the bytes, if it ends in
+            // the slot; one that does not is cut. Where there is none, the slot may
+            // cut what starts like one.
+            let (in_slot, object, cut) = checked(next);
+            let what = || {
+                format!(
+                    "case {case}, header check at {at} to {next} of {:?}",
+                    shown()
+                )
+            };
+            match header {
+                Some(header) if whole.offset() <= next => assert_eq!(
+                    (in_slot, object, cut),
+                    (Some(header), headed_read(&data, at, next).is_some(), false),
+                    "{}",
+                    what()
+                ),
+                Some(_) => assert_eq!((in_slot, object, cut), (None, false, true), "{}", what()),
+                None => assert_eq!((in_slot, object), (None, false), "{}", what()),
+            }
             assert_eq!(
                 headed_rebuilt(&data, &mut scan, at),
                 read.and(header),

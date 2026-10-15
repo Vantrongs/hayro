@@ -452,31 +452,17 @@ impl ObjectIdentifier {
     }
 }
 
-#[cfg(test)]
-std::thread_local! {
-    /// The bytes object headers were read from on this thread, which the tests
-    /// bound to show that no header is read again for every entry leading to it.
-    pub(crate) static HEADER_BYTES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
-}
-
 impl Readable<'_> for ObjectIdentifier {
     fn read(r: &mut Reader<'_>, _: &ReaderContext<'_>) -> Option<Self> {
-        #[cfg(test)]
-        let start = r.offset();
-        let id = (|| {
-            let obj_number = r.read_without_context::<i32>()?;
-            r.skip_white_spaces_and_comments();
-            let gen_number = r.read_without_context::<i32>()?;
-            r.skip_white_spaces_and_comments();
-            r.forward_tag(b"obj")?;
-            Some(Self {
-                obj_number,
-                gen_number,
-            })
-        })();
-        #[cfg(test)]
-        HEADER_BYTES.set(HEADER_BYTES.get() + (r.offset() - start));
-        id
+        let obj_number = r.read_without_context::<i32>()?;
+        r.skip_white_spaces_and_comments();
+        let gen_number = r.read_without_context::<i32>()?;
+        r.skip_white_spaces_and_comments();
+        r.forward_tag(b"obj")?;
+        Some(Self {
+            obj_number,
+            gen_number,
+        })
     }
 }
 
