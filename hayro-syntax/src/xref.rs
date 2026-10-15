@@ -1001,6 +1001,7 @@ impl XRef {
         data: &[u8],
         target: DecryptionTarget<'_>,
     ) -> Option<Vec<u8>> {
+        crate::work::told(data.len());
         match &self.0 {
             Inner::Dummy => Some(data.to_vec()),
             Inner::Some(r) => r.decryptor.decrypt(id, data, target),
@@ -1046,6 +1047,31 @@ impl XRef {
         match &self.0 {
             Inner::Dummy => false,
             Inner::Some(r) => r.map.contains_key(&id) || r.unreadable.contains(&id),
+        }
+    }
+
+    /// Identifies the body entry `id` leads to, which every entry leading to its
+    /// place reads ([`Place`]): its bytes, from the place to the end of its slot, the
+    /// document, and the object whose key decrypts it. For a cache of what is copied
+    /// from objects, so that entries leading to one body share one copy, read and
+    /// written once. Nothing of the body is read, only, for an object of an object
+    /// stream, the stream, once for all its objects. `None` where the table does not
+    /// list `id`, and where it lists it but its place is lost, which the computation
+    /// being watched is told ([`Self::watch`]).
+    pub fn content_key(&self, id: ObjectIdentifier) -> Option<ContentKey<'_>> {
+        let ctx = ReaderContext::new(self, false);
+        let (repr, entry, entered) = self.entry(id, &ctx)?;
+        match self.place(repr, id, entry, &entered) {
+            Ok((place, data, slot)) => match data.get(place.at..slot.end) {
+                Some(body) => Some(ContentKey::new(body, &entered)),
+                // Past the bytes: nothing can be read there, which the read tells.
+                None => self.read(id, &ctx, Taken::Either).and(None),
+            },
+            Err(Unread::Rejected) => None,
+            Err(Unread::Lost(lost)) => {
+                self.note(Some(lost));
+                None
+            }
         }
     }
 
@@ -1656,7 +1682,9 @@ pub(crate) enum XRefInput<'a> {
 
 pub(crate) fn find_last_xref_pos(data: &[u8]) -> Option<usize> {
     let needle = b"startxref";
-    let pos = findr_needle(data, needle)?;
+    let found = findr_needle(data, needle);
+    crate::work::told(data.len() - found.unwrap_or(0));
+    let pos = found?;
     let mut finder = Reader::new(data);
     finder.jump(pos);
     finder.forward_tag(needle)?;
@@ -1730,6 +1758,7 @@ struct XRefEntry {
 
 impl XRefEntry {
     pub(crate) fn read(data: &[u8]) -> Option<Self> {
+        crate::work::told(XREF_ENTRY_LEN);
         #[inline(always)]
         fn parse_u32(data: &[u8]) -> Option<u32> {
             let mut accum = 0_u32;
@@ -1759,49 +1788,124 @@ impl XRefEntry {
     }
 }
 
+/// Reads the chain of cross-reference sections `startxref` names, at `pos`, into
+/// `xref_map`, and returns the dictionary of the first: its trailer, or its stream's.
+/// The entries of a section are inserted after those of the section its /Prev names
+/// and then its `/XRefStm`, with theirs, so that an object's entry in a later section
+/// replaces one in an earlier. `None` where a section cannot be read, which rebuilds
+/// the table.
+///
+/// Each section is read on the bytes from its offset up to the first that another
+/// section of the chain was read on ([`Sections`]): so the chain reads disjoint bytes,
+/// each once, and takes time linear in the file, whatever the number of sections and
+/// however they nest in each other's strings or streams. A section named at an offset
+/// another was read on, as a section named again is, cannot be read: the sections of
+/// a sound chain do not overlap.
 fn populate_xref_impl<'a>(data: &'a [u8], pos: usize, xref_map: &mut XrefMap) -> Option<&'a [u8]> {
-    let mut visited = BTreeSet::new();
-    populate_xref_impl_inner(data, pos, xref_map, &mut visited)
+    let mut sections = Sections::default();
+    let first = sections.read(data, pos)?;
+    let trailer = first.dict_data();
+    // The sections read whose entries are not inserted yet, each with the offsets of
+    // the sections to read before them, the next last.
+    let mut open = vec![(first.before(), first)];
+    while let Some((before, _)) = open.last_mut() {
+        if let Some(next) = before.pop() {
+            let section = sections.read(data, next)?;
+            open.push((section.before(), section));
+        } else {
+            let (_, section) = open.pop()?;
+            section.insert(xref_map)?;
+        }
+    }
+    Some(trailer)
 }
 
-/// Maximum number of allowed xref `Prev` pointers before we abort.
-const MAX_XREF_CHAIN_DEPTH: usize = 256;
+/// Where the sections of a chain read so far were read: the start and end of the
+/// bytes each was read on.
+#[derive(Default)]
+struct Sections(alloc::collections::BTreeMap<usize, usize>);
 
-fn populate_xref_impl_inner<'a>(
-    data: &'a [u8],
-    pos: usize,
-    xref_map: &mut XrefMap,
-    visited: &mut BTreeSet<usize>,
-) -> Option<&'a [u8]> {
-    if !visited.insert(pos) {
-        warn!("circular xref PREV chain detected at offset {}", pos);
+impl Sections {
+    /// The section at `pos` of `data`, read on the bytes up to the first that another
+    /// section was read on; `None` where it cannot be read there, or `pos` is in the
+    /// bytes another was read on.
+    fn read<'a>(&mut self, data: &'a [u8], pos: usize) -> Option<Section<'a>> {
+        if self
+            .0
+            .range(..=pos)
+            .next_back()
+            .is_some_and(|(_, end)| *end > pos)
+        {
+            warn!("xref section at offset {pos} is inside another of the chain");
 
-        return None;
+            return None;
+        }
+        let limit = self.0.range(pos..).next().map_or(data.len(), |(at, _)| *at);
+        let mut reader = Reader::new(&data[..limit]);
+        reader.jump(pos);
+        // In case the position points to before the object number of a xref stream.
+        reader.skip_white_spaces_and_comments();
+
+        let (section, end) = if reader
+            .clone()
+            .read_without_context::<ObjectIdentifier>()
+            .is_some()
+        {
+            let stream = reader
+                .read_with_context::<IndirectObject<Stream<'_>>>(&ReaderContext::dummy())?
+                .get();
+            (Section::Stream(stream), reader.offset())
+        } else {
+            let mut after = reader.clone();
+            let trailer = read_xref_table_trailer(&mut after, &ReaderContext::dummy())?;
+            reader.skip_white_spaces();
+            reader.forward_tag(b"xref")?;
+            reader.skip_white_spaces();
+            (Section::Table(reader, trailer), after.offset())
+        };
+        self.0.insert(pos, end);
+        Some(section)
+    }
+}
+
+/// A cross-reference section read, whose entries are still to be inserted.
+enum Section<'a> {
+    /// A table: a reader at its first subsection, and its trailer.
+    Table(Reader<'a>, Dict<'a>),
+    /// A cross-reference stream.
+    Stream(Stream<'a>),
+}
+
+impl<'a> Section<'a> {
+    /// The trailer, or the stream's dictionary.
+    fn dict_data(&self) -> &'a [u8] {
+        match self {
+            Self::Table(_, trailer) => trailer.data(),
+            Self::Stream(stream) => stream.dict().data(),
+        }
     }
 
-    if visited.len() > MAX_XREF_CHAIN_DEPTH {
-        warn!(
-            "xref PREV chain exceeds maximum depth of {}",
-            MAX_XREF_CHAIN_DEPTH
-        );
-
-        return None;
+    /// The offsets of the sections whose entries are inserted before this one's, the
+    /// first last: the one /Prev names, then, for a table of a hybrid file, the
+    /// stream `/XRefStm` names, whose entries take precedence.
+    fn before(&self) -> Vec<usize> {
+        let offsets = match self {
+            Self::Table(_, trailer) => [trailer.get::<i32>(XREF_STM), trailer.get::<i32>(PREV)],
+            Self::Stream(stream) => [None, stream.dict().get::<i32>(PREV)],
+        };
+        offsets
+            .into_iter()
+            .flatten()
+            .map(|at| at as usize)
+            .collect()
     }
 
-    let mut reader = Reader::new(data);
-    reader.jump(pos);
-    // In case the position points to before the object number of a xref stream.
-    reader.skip_white_spaces_and_comments();
-
-    let mut r2 = reader.clone();
-    if reader
-        .clone()
-        .read_without_context::<ObjectIdentifier>()
-        .is_some()
-    {
-        populate_from_xref_stream(data, &mut r2, xref_map, visited)
-    } else {
-        populate_from_xref_table(data, &mut r2, xref_map, visited)
+    /// Inserts the section's entries into `insert_map`.
+    fn insert(self, insert_map: &mut XrefMap) -> Option<()> {
+        match self {
+            Self::Table(reader, _) => populate_from_xref_table(reader, insert_map),
+            Self::Stream(stream) => populate_from_xref_stream(&stream, insert_map),
+        }
     }
 }
 
@@ -1822,34 +1926,9 @@ impl Readable<'_> for SubsectionHeader {
     }
 }
 
-/// Populate the xref table, and return the trailer dict.
-fn populate_from_xref_table<'a>(
-    data: &'a [u8],
-    reader: &mut Reader<'a>,
-    insert_map: &mut XrefMap,
-    visited: &mut BTreeSet<usize>,
-) -> Option<&'a [u8]> {
-    let trailer = {
-        let mut reader = reader.clone();
-        read_xref_table_trailer(&mut reader, &ReaderContext::dummy())?
-    };
-
-    reader.skip_white_spaces();
-    reader.forward_tag(b"xref")?;
-    reader.skip_white_spaces();
-
+/// Inserts the entries of the table whose first subsection `reader` is at.
+fn populate_from_xref_table(mut reader: Reader<'_>, insert_map: &mut XrefMap) -> Option<()> {
     let mut max_obj = 0;
-
-    if let Some(prev) = trailer.get::<i32>(PREV) {
-        // First insert the entries from any previous xref tables.
-        populate_xref_impl_inner(data, prev as usize, insert_map, visited)?;
-    }
-
-    // In hybrid files, entries in `XRefStm` should have higher priority, therefore we insert them
-    // after looking at `PREV`.
-    if let Some(xref_stm) = trailer.get::<i32>(XREF_STM) {
-        populate_xref_impl_inner(data, xref_stm as usize, insert_map, visited)?;
-    }
 
     while let Some(header) = reader.read_without_context::<SubsectionHeader>() {
         reader.skip_white_spaces();
@@ -1873,24 +1952,11 @@ fn populate_from_xref_table<'a>(
         }
     }
 
-    Some(trailer.data())
+    Some(())
 }
 
-fn populate_from_xref_stream<'a>(
-    data: &'a [u8],
-    reader: &mut Reader<'a>,
-    insert_map: &mut XrefMap,
-    visited: &mut BTreeSet<usize>,
-) -> Option<&'a [u8]> {
-    let stream = reader
-        .read_with_context::<IndirectObject<Stream<'_>>>(&ReaderContext::dummy())?
-        .get();
-
-    if let Some(prev) = stream.dict().get::<i32>(PREV) {
-        // First insert the entries from any previous xref tables.
-        let _ = populate_xref_impl_inner(data, prev as usize, insert_map, visited)?;
-    }
-
+/// Inserts the entries of cross-reference stream `stream`.
+fn populate_from_xref_stream(stream: &Stream<'_>, insert_map: &mut XrefMap) -> Option<()> {
     let size = stream.dict().get::<u32>(SIZE)?;
 
     let [f1_len, f2_len, f3_len] = stream.dict().get::<[u8; 3]>(W)?;
@@ -1935,7 +2001,7 @@ fn populate_from_xref_stream<'a>(
         )?;
     }
 
-    Some(stream.dict().data())
+    Some(())
 }
 
 fn xref_stream_num(data: &[u8]) -> Option<u32> {
@@ -1971,7 +2037,15 @@ fn xref_stream_subsection<'a>(
     f3_len: u8,
     insert_map: &mut XrefMap,
 ) -> Option<()> {
+    let width = usize::from(f1_len) + usize::from(f2_len) + usize::from(f3_len);
+    if width == 0 {
+        // Entries of no bytes, as many as the dictionary says, tell nothing.
+        warn!("xref stream entries have no width");
+
+        return None;
+    }
     for i in 0..num_elements {
+        crate::work::told(width);
         let f_type = if f1_len == 0 {
             1
         } else {
@@ -1979,7 +2053,7 @@ fn xref_stream_subsection<'a>(
             xref_reader.read_bytes(1)?[0]
         };
 
-        let obj_number = start + i;
+        let obj_number = start.checked_add(i)?;
 
         match f_type {
             // We don't care about free objects.
@@ -2297,13 +2371,15 @@ mod tests {
         file_with(format!("4 0 obj\n{body}\nendobj\n").as_bytes(), &[0], true)
     }
 
-    /// The work opening `file` takes, the bytes lexed and the scan's other work,
-    /// after checking it opens to the 100 × 100 page.
+    /// The work opening `file` takes, the bytes lexed, those worked on otherwise
+    /// ([`crate::work::TOLD`]) and the scan's other work, after checking it opens to
+    /// the 100 × 100 page.
     fn work(file: &[u8]) -> usize {
         OPEN_BYTES.set(0);
         crate::work::EXAMINED.set(0);
+        crate::work::TOLD.set(0);
         let pdf = crate::Pdf::new(file.to_vec()).unwrap();
-        let read = OPEN_BYTES.get() + crate::work::EXAMINED.get();
+        let read = OPEN_BYTES.get() + crate::work::EXAMINED.get() + crate::work::TOLD.get();
         let pages = pdf.pages();
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0].media_box().x1, 100.0);
@@ -2417,7 +2493,7 @@ mod tests {
                 let file = file(n);
                 let work = work(&file);
                 assert!(
-                    work <= 12 * file.len(),
+                    work <= 13 * file.len(),
                     "{family}: {work} steps to open {} bytes",
                     file.len()
                 );
@@ -2430,6 +2506,170 @@ mod tests {
                 "{family}: {small} steps for 1000, {large} for 2000"
             );
         }
+    }
+
+    /// The objects of a file of a catalog, a page tree and a 100 × 100 page, and the
+    /// entries of a cross-reference section listing them, as a table's rows or as a
+    /// stream's data with /W [1 4 2].
+    fn three_objects() -> (Vec<u8>, String, Vec<u8>) {
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut rows = "0000000000 65535 f \n".to_owned();
+        let mut packed = vec![0, 0, 0, 0, 0, 255, 255];
+        for (i, object) in [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+        ]
+        .iter()
+        .enumerate()
+        {
+            rows.push_str(&format!("{:010} 00000 n \n", out.len()));
+            packed.push(1);
+            packed.extend((out.len() as u32).to_be_bytes());
+            packed.extend([0, 0]);
+            out.extend(format!("{} 0 obj\n{object}\nendobj\n", i + 1).bytes());
+        }
+        (out, rows, packed)
+    }
+
+    /// A file of a catalog, a page tree and a 100 × 100 page, whose `n`
+    /// cross-reference sections each sit in the one before, chained by /Prev, the last
+    /// holding `pad` bytes: tables, each in a string of the trailer before, or, with
+    /// `streams`, streams, each in the data of the one before, whose /Length is wrong,
+    /// so that each reads its data up to the `endstream` after the rest.
+    fn nested_sections(n: usize, pad: usize, streams: bool) -> Vec<u8> {
+        let (mut out, rows, packed) = three_objects();
+        let first = out.len();
+        // Each section's start, of one length: the next's offset written in ten digits.
+        let head = |i: usize, next: Option<usize>| -> Vec<u8> {
+            let prev = match next {
+                Some(at) => format!("/Prev {at:010}"),
+                None => format!("/Last {:010}", 0),
+            };
+            if streams {
+                let mut head = format!(
+                    "{} 0 obj\n<< /Type /XRef /Size 4 /W [1 4 2] /Root 1 0 R {prev} /Length 0 >>\nstream\n",
+                    100 + i
+                )
+                .into_bytes();
+                head.extend(&packed);
+                head
+            } else {
+                format!("xref\n0 4\n{rows}trailer\n<< /Size 4 /Root 1 0 R {prev} /S (").into_bytes()
+            }
+        };
+        let unit = head(0, Some(0)).len();
+        for i in 0..n {
+            out.extend(head(i, (i + 1 < n).then(|| first + (i + 1) * unit)));
+        }
+        out.extend(b"x".repeat(pad));
+        let tail: &[u8] = if streams {
+            b"\nendstream\nendobj\n"
+        } else {
+            b") >>"
+        };
+        for _ in 0..n {
+            out.extend(tail);
+        }
+        out.extend(format!("\nstartxref\n{first}\n%%EOF\n").bytes());
+        out
+    }
+
+    /// [`work`], bounded by the file's length.
+    fn bounded(file: &[u8]) -> usize {
+        let work = work(file);
+        assert!(
+            work <= 13 * file.len(),
+            "{work} steps to open {} bytes",
+            file.len()
+        );
+        work
+    }
+
+    // The sections of a chain are read on disjoint bytes, each once: sections nested
+    // in each other's trailer strings or stream data are read once, whatever their
+    // number and the size of what they hold, and the table is rebuilt, rather than
+    // each read to the end of the nest.
+    #[test]
+    fn nested_cross_reference_sections_are_read_once() {
+        for streams in [false, true] {
+            // The size doubles, the number of sections stays.
+            let [small, large] =
+                [1 << 16, 1 << 17].map(|pad| bounded(&nested_sections(64, pad, streams)));
+            assert!(
+                large <= small * 25 / 10,
+                "streams {streams}: {small} steps for 64 KB, {large} for 128 KB"
+            );
+            // The number of sections doubles, the size barely grows.
+            let [few, many] = [64, 128].map(|n| bounded(&nested_sections(n, 1 << 18, streams)));
+            assert!(
+                many <= few * 12 / 10,
+                "streams {streams}: {few} steps for 64 sections, {many} for 128"
+            );
+        }
+    }
+
+    /// A file of `n` sections chained by /Prev, apart, each listing object 3 at a
+    /// page: the last section, which `startxref` names, at a 100 × 100 page, the
+    /// others at a 200 × 200 page after it in the file, which a rebuilt table takes.
+    fn long_chain(n: usize) -> Vec<u8> {
+        let (mut out, rows, _) = three_objects();
+        // The rows of objects 1 and 2.
+        let rows: String = rows
+            .lines()
+            .skip(1)
+            .take(2)
+            .map(|row| format!("{row}\n"))
+            .collect();
+        let first_page = out.windows(7).position(|w| w == b"3 0 obj").unwrap();
+        let other_page = out.len();
+        out.extend(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>\nendobj\n");
+        let mut prev = None;
+        for i in 0..n {
+            let at = out.len();
+            let page = if i + 1 == n { first_page } else { other_page };
+            out.extend(
+                format!(
+                    "xref\n0 3\n0000000000 65535 f \n{rows}3 1\n{page:010} 00000 n \n\
+                     trailer\n<< /Size 4 /Root 1 0 R"
+                )
+                .bytes(),
+            );
+            if let Some(prev) = prev {
+                out.extend(format!(" /Prev {prev}").bytes());
+            }
+            out.extend(b" >>\n");
+            prev = Some(at);
+        }
+        out.extend(format!("startxref\n{}\n%%EOF\n", prev.unwrap()).bytes());
+        out
+    }
+
+    // A chain of many sections apart is read whole, however long: the number of
+    // sections is bounded by the file's length, as they do not overlap.
+    #[test]
+    fn a_long_chain_of_sections_is_read() {
+        let file = long_chain(1000);
+        let pdf = crate::Pdf::new(file.clone()).unwrap();
+        assert_eq!(pdf.pages()[0].media_box().x1, 100.0);
+        bounded(&file);
+    }
+
+    // A cross-reference stream whose entries take no bytes, as many as it says,
+    // tells nothing: the table is rebuilt, without an entry for each.
+    #[test]
+    fn a_cross_reference_stream_of_entries_of_no_width_is_rebuilt() {
+        let (mut out, _, _) = three_objects();
+        out.extend(format!("%{}\n", "x".repeat(4096)).bytes());
+        let at = out.len();
+        out.extend(
+            format!(
+                "9 0 obj\n<< /Type /XRef /Size 1000000 /W [0 0 0] /Root 1 0 R /Length 0 >>\n\
+                 stream\n\nendstream\nendobj\nstartxref\n{at}\n%%EOF\n"
+            )
+            .bytes(),
+        );
+        bounded(&out);
     }
 
     /// A stream object of `data`, with `dict` written into its dictionary.

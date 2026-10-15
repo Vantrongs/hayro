@@ -23,10 +23,11 @@ use hayro_syntax::object::dict::keys::{
 use hayro_syntax::object::stream::DecodeFailure;
 use hayro_syntax::object::{Dict, ObjRef, Object};
 use hayro_syntax::page::{ContentError, Page, Resources, Rotation};
+use hayro_syntax::work::Meter;
 use hayro_syntax::xref::ContentKey;
 use pdf_writer::{Chunk, Content, Filter, Finish, Name, Rect, Ref};
 use rustc_hash::FxHashMap;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ops::Deref;
 use std::ops::DerefMut;
 
@@ -43,9 +44,14 @@ pub use pdf_writer::Settings as ChunkSettings;
 /// ([`Page::unreadable`]), its content, every object copied — refers to an object the
 /// file lists but that cannot be read ([`hayro_syntax::lost`]), however it is read,
 /// as it does where the page tree lost one ([`hayro_syntax::page::Pages::unreadable`])
-/// or a stream it copies cannot be decrypted whole. Streams whose dictionaries refer
-/// to no other object are written once for all that copy to the same dictionary and
-/// data, as fonts embedded in each of several pages are.
+/// or a stream it copies cannot be decrypted whole.
+///
+/// Each object is copied once, however many entries of the table lead to it and
+/// however many references to them the copy holds: once for all entries that lead to
+/// its body ([`hayro_syntax::xref::XRef::content_key`]), which is read, hashed and
+/// written once. Streams whose dictionaries refer to no other object are written once
+/// for all that copy to the same dictionary and data, as fonts embedded in each of
+/// several pages are.
 pub fn extract<'a>(
     pdf: &Pdf,
     new_ref: Box<dyn FnMut() -> Ref + 'a>,
@@ -106,6 +112,7 @@ pub fn extract<'a>(
     for chunk in &ctx.chunks {
         global_chunk.extend(chunk);
     }
+    let _ = ctx.meter.work(global_chunk.len());
 
     Ok(ExtractionResult {
         chunk: global_chunk,
@@ -213,6 +220,11 @@ pub struct ExtractionResult {
 }
 
 /// A stream's copied dictionary, and its data's length and hash.
+///
+/// A file can make the data of many streams hash alike, and their dictionaries
+/// too where these are hashed as the data are, so the keys are hashed at random
+/// ([`ExtractionContext::shared_streams`]) and a stream is compared with one other
+/// at most ([`primitive`]).
 type StreamKey = (Vec<u8>, usize, u64);
 
 /// What an extraction copies, and what it keeps of what it copied for the queries
@@ -221,22 +233,22 @@ type StreamKey = (Vec<u8>, usize, u64);
 /// ([`ExtractionContext::fail`]), so no query uses a copy that lost anything.
 struct ExtractionContext<'a> {
     chunks: Vec<Chunk>,
-    visited_objects: HashSet<ObjRef>,
-    /// The objects left to copy, each with the index of the page whose copy refers
-    /// to it first.
-    to_visit_refs: Vec<(ObjRef, usize)>,
+    /// What a reference to each body an entry leads to is written as
+    /// ([`hayro_syntax::xref::XRef::content_key`]), for every entry leading to it:
+    /// its copy's reference, or `None` for `null`, where it cannot be read.
+    copies: FxHashMap<ContentKey<'a>, Option<Ref>>,
+    /// The bodies left to copy, each once: an entry leading to it, its copy, and the
+    /// index of the page whose copy refers to it first.
+    to_copy: Vec<(ObjRef, Ref, usize)>,
     /// The index of the page being copied, or whose copy refers to the object being
     /// copied first.
     page: usize,
-    /// What each reference to a source object is written as: the copy's reference,
-    /// or `None` for `null`, where the object does not exist.
-    ref_targets: FxHashMap<ObjRef, Option<Ref>>,
-    /// The copies of streams whose dictionaries refer to no other object: the source
-    /// stream and its copy.
-    shared_streams: FxHashMap<StreamKey, Vec<(ObjRef, Ref)>>,
-    /// The copies of streams form queries asked for, by the stream and, for one
-    /// that takes its page's resources, the page.
-    forms: FxHashMap<(ObjRef, Option<usize>), Ref>,
+    /// The copies of streams whose dictionaries refer to no other object: an entry
+    /// leading to the first stream copied with each key, and its copy.
+    shared_streams: HashMap<StreamKey, (ObjRef, Ref)>,
+    /// The copies of streams form queries asked for, by the stream's body and, for
+    /// one that takes its page's resources, the page.
+    forms: FxHashMap<(ContentKey<'a>, Option<usize>), Ref>,
     /// The copy of each resource category dictionary pages and forms are drawn
     /// with, by what it is read from, which pages that share it share.
     resource_categories: FxHashMap<ContentKey<'a>, Ref>,
@@ -245,10 +257,11 @@ struct ExtractionContext<'a> {
     root_refs: Vec<Result<Ref, ExtractionError>>,
     pdf: &'a Pdf,
     new_ref: Box<dyn FnMut() -> Ref + 'a>,
-    ref_map: FxHashMap<ObjRef, Ref>,
     cached_content_streams: FxHashMap<usize, Ref>,
     page_tree_parent_ref: Ref,
     chunk_settings: ChunkSettings,
+    /// Counts the bytes of data hashed, compared and written.
+    meter: Meter<'a>,
 }
 
 impl<'a> ExtractionContext<'a> {
@@ -260,33 +273,27 @@ impl<'a> ExtractionContext<'a> {
         let page_tree_parent_ref = new_ref();
         Self {
             chunks: vec![],
-            visited_objects: HashSet::new(),
-            to_visit_refs: Vec::new(),
+            copies: FxHashMap::default(),
+            to_copy: Vec::new(),
             page: 0,
-            ref_targets: FxHashMap::default(),
-            shared_streams: FxHashMap::default(),
+            shared_streams: HashMap::new(),
             forms: FxHashMap::default(),
             resource_categories: FxHashMap::default(),
             error: None,
             pdf,
             new_ref,
-            ref_map: FxHashMap::default(),
             cached_content_streams: FxHashMap::default(),
             root_refs: Vec::new(),
             page_tree_parent_ref,
             chunk_settings,
+            meter: Meter::default(),
         }
     }
 
-    pub(crate) fn map_ref(&mut self, ref_: ObjRef) -> Ref {
-        if let Some(ref_) = self.ref_map.get(&ref_) {
-            *ref_
-        } else {
-            let new_ref = self.new_ref();
-            self.ref_map.insert(ref_, new_ref);
-
-            new_ref
-        }
+    /// Adds `chunk` to the copy.
+    pub(crate) fn push(&mut self, chunk: Chunk) {
+        let _ = self.meter.work(chunk.len());
+        self.chunks.push(chunk);
     }
 
     pub(crate) fn new_ref(&mut self) -> Ref {
@@ -299,31 +306,25 @@ impl<'a> ExtractionContext<'a> {
     }
 }
 
+/// Copies each body queued ([`ExtractionContext::to_copy`]), and those its copy
+/// refers to, once each.
 fn write_dependencies(pdf: &Pdf, ctx: &mut ExtractionContext<'_>) {
-    while let Some((ref_, page)) = ctx.to_visit_refs.pop() {
-        // Don't visit objects twice!
-        if ctx.visited_objects.contains(&ref_) {
-            continue;
-        }
-
+    while let Some((source, copy, page)) = ctx.to_copy.pop() {
         ctx.page = page;
         let (written, lost) = pdf.xref().watch(|| {
-            let object = pdf.xref().get::<Object<'_>>(ref_.into())?;
+            let object = pdf.xref().get::<Object<'_>>(source.into())?;
             let mut chunk = Chunk::with_settings(ctx.chunk_settings);
-            let new_ref = ctx.map_ref(ref_);
-            object.write_indirect(&mut chunk, new_ref, ctx);
-            ctx.chunks.push(chunk);
+            object.write_indirect(&mut chunk, copy, ctx);
+            ctx.push(chunk);
             Some(())
         });
         if let Some(id) = lost {
             ctx.fail(ExtractionError::UnreadablePage(page, id.into()));
         }
-        if written.is_some() {
-            ctx.visited_objects.insert(ref_);
-        } else {
+        if written.is_none() {
             // It was read when it was first referred to.
-            warn!("failed to extract object with ref: {ref_:?}");
-            ctx.fail(ExtractionError::Unreadable(ref_));
+            warn!("failed to extract object with ref: {source:?}");
+            ctx.fail(ExtractionError::Unreadable(source));
         }
     }
 }
@@ -482,7 +483,7 @@ fn write_page<'a>(
 
     pdf_page.finish();
 
-    ctx.chunks.push(chunk);
+    ctx.push(chunk);
 
     Ok(())
 }
@@ -538,7 +539,7 @@ fn write_xobject<'a>(
     }
 
     x_object.finish();
-    ctx.chunks.push(chunk);
+    ctx.push(chunk);
 
     Ok(())
 }
@@ -551,16 +552,21 @@ fn write_form<'a>(
 ) -> Result<Ref, ExtractionError> {
     // Read as `Object` first: a dictionary read as a stream may pick up the data of a
     // stream after it in the file.
-    let Some(Object::Stream(stream)) = ctx.pdf.xref().get::<Object<'_>>(obj.into()) else {
+    let xref = ctx.pdf.xref();
+    let Some(Object::Stream(stream)) = xref.get::<Object<'_>>(obj.into()) else {
         return Err(ExtractionError::NotAStream(obj));
     };
+    // Read, so listed where it can be read.
+    let body = xref
+        .content_key(obj.into())
+        .ok_or(ExtractionError::NotAStream(obj))?;
     // What a renderer draws the stream with: its own resources if they are a
     // dictionary, the page's otherwise.
     let own_resources = stream.dict().get::<Dict<'_>>(RESOURCES).is_some();
     if !own_resources {
         drawn_with(page, ctx);
     }
-    let key = (obj, (!own_resources).then_some(page_idx));
+    let key = (body, (!own_resources).then_some(page_idx));
     if let Some(form_ref) = ctx.forms.get(&key) {
         return Ok(*form_ref);
     }
@@ -581,7 +587,7 @@ fn write_form<'a>(
         serialize_resources(page.resources(), ctx, &mut form);
     }
     form.finish();
-    ctx.chunks.push(chunk);
+    ctx.push(chunk);
 
     Ok(form_ref)
 }
@@ -634,7 +640,7 @@ fn category_copy<'a>(category: &Dict<'a>, ctx: &mut ExtractionContext<'a>) -> Re
         obj.write_direct(output.insert(Name(name.deref())), ctx);
     }
     output.finish();
-    ctx.chunks.push(chunk);
+    ctx.push(chunk);
     copy
 }
 
@@ -646,6 +652,7 @@ pub fn deflate_encode(data: &[u8]) -> Vec<u8> {
     use std::io::Write;
 
     const COMPRESSION_LEVEL: u8 = 4;
+    let _ = Meter::default().work(data.len());
     let mut e = ZlibEncoder::new(Vec::new(), Compression::new(COMPRESSION_LEVEL as u32));
     e.write_all(data).unwrap();
     e.finish().unwrap()

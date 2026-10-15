@@ -36,32 +36,39 @@ pub(crate) trait WriteDirect {
 
 impl WriteDirect for object::ObjRef {
     fn write_direct(&self, obj: Obj<'_>, ctx: &mut ExtractionContext<'_>) {
-        let target = match ctx.ref_targets.get(self) {
-            Some(target) => *target,
-            None => {
-                let target = target(*self, ctx);
-                ctx.ref_targets.insert(*self, target);
-                target
-            }
-        };
-
-        match target {
+        match target(*self, ctx) {
             Some(mapped_ref) => obj.primitive(mapped_ref),
             None => obj.primitive(pdf_writer::Null),
         }
     }
 }
 
-/// What a reference to `source` is written as, queuing the object for copying.
+/// What a reference to `source` is written as, queuing the body it leads to for
+/// copying the first time an entry leading there is referred to: one copy for every
+/// entry leading to the body ([`ExtractionContext::copies`]).
 ///
 /// A reference to an object that does not exist is `null`, as it reads: writing it
 /// would leave a reference to nothing. One the file lists but that cannot be read
 /// is lost, which fails the extraction ([`crate::extract`]). A stream whose
 /// dictionary refers to no other object is copied once for all streams with the same
-/// copied dictionary and data.
-fn target(source: object::ObjRef, ctx: &mut ExtractionContext<'_>) -> Option<Ref> {
+/// copied dictionary and data, its data hashed once, with its body.
+fn target<'a>(source: object::ObjRef, ctx: &mut ExtractionContext<'a>) -> Option<Ref> {
+    let pdf = ctx.pdf;
     let id = ObjectIdentifier::new(source.obj_number, source.gen_number);
-    let object = ctx.pdf.xref().get::<Object<'_>>(id)?;
+    let body = pdf.xref().content_key(id)?;
+    if let Some(copy) = ctx.copies.get(&body) {
+        return *copy;
+    }
+    let copy = first_target(source, ctx);
+    ctx.copies.insert(body, copy);
+    copy
+}
+
+/// [`target`] for the first reference to an entry leading to its body.
+fn first_target(source: object::ObjRef, ctx: &mut ExtractionContext<'_>) -> Option<Ref> {
+    let pdf = ctx.pdf;
+    let id = ObjectIdentifier::new(source.obj_number, source.gen_number);
+    let object = pdf.xref().get::<Object<'_>>(id)?;
     if let Object::Stream(stream) = &object
         && !refers(stream.dict())
     {
@@ -76,6 +83,7 @@ fn target(source: object::ObjRef, ctx: &mut ExtractionContext<'_>) -> Option<Ref
         let mut dict = scratch.indirect(Ref::new(1)).dict();
         write_stream_dict(stream.dict(), &mut dict, ctx, &[]);
         dict.finish();
+        let _ = ctx.meter.work(scratch.len() + data.len());
         let mut hasher = rustc_hash::FxHasher::default();
         data.hash(&mut hasher);
         let key = (
@@ -83,28 +91,29 @@ fn target(source: object::ObjRef, ctx: &mut ExtractionContext<'_>) -> Option<Ref
             data.len(),
             Hasher::finish(&hasher),
         );
-        let pdf = ctx.pdf;
-        let same_data = |other: &object::ObjRef| {
-            let other = pdf.xref().get::<Stream<'_>>((*other).into());
-            other.and_then(|o| o.try_raw_data().ok()).as_deref() == Some(&*data)
+        let copy = match ctx.shared_streams.get(&key) {
+            Some((other, copy)) => {
+                // One comparison for each stream, however many a file makes hash
+                // alike: one whose data differ is copied on its own.
+                let _ = ctx.meter.work(data.len());
+                let other = pdf.xref().get::<Stream<'_>>((*other).into());
+                if other.and_then(|o| o.try_raw_data().ok()).as_deref() == Some(&*data) {
+                    return Some(*copy);
+                }
+                ctx.new_ref()
+            }
+            None => {
+                let copy = ctx.new_ref();
+                ctx.shared_streams.insert(key, (source, copy));
+                copy
+            }
         };
-        if let Some((_, copy)) = ctx
-            .shared_streams
-            .get(&key)
-            .and_then(|copies| copies.iter().find(|(other, _)| same_data(other)))
-        {
-            return Some(*copy);
-        }
-        let copy = ctx.map_ref(source);
-        ctx.shared_streams
-            .entry(key)
-            .or_default()
-            .push((source, copy));
-        ctx.to_visit_refs.push((source, ctx.page));
+        ctx.to_copy.push((source, copy, ctx.page));
         return Some(copy);
     }
-    ctx.to_visit_refs.push((source, ctx.page));
-    Some(ctx.map_ref(source))
+    let copy = ctx.new_ref();
+    ctx.to_copy.push((source, copy, ctx.page));
+    Some(copy)
 }
 
 /// Whether the copy of `dict` would refer to another object.

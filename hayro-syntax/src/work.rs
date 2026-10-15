@@ -18,8 +18,12 @@ pub struct Meter<'a> {
 
 #[cfg(all(debug_assertions, feature = "std"))]
 std::thread_local! {
-    /// The work every meter on this thread was told of, after a stop too: what tests
-    /// bound the work of a stopped task by. Debug builds only.
+    /// The work every meter on this thread was told of, after a stop too, and the
+    /// bytes worked on outside a meter and a reader: decrypted, or parsed as entries of
+    /// a cross-reference section ([`told`]). With [`EXAMINED`], which counts what
+    /// readers lex, this is the work done on data, decoding, decrypting, and what a
+    /// writer hashes, compares and writes counted too: what tests bound the work of a
+    /// stopped task by, and the work of reading and copying a file. Debug builds only.
     #[doc(hidden)]
     pub static TOLD: Cell<usize> = const { Cell::new(0) };
 }
@@ -70,6 +74,13 @@ std::thread_local! {
 pub(crate) fn examined() {
     #[cfg(all(debug_assertions, feature = "std"))]
     EXAMINED.set(EXAMINED.get() + 1);
+}
+
+/// Counts `bytes` worked on outside a meter and a reader ([`TOLD`]).
+#[inline]
+pub(crate) fn told(_bytes: usize) {
+    #[cfg(all(debug_assertions, feature = "std"))]
+    TOLD.set(TOLD.get() + _bytes);
 }
 
 /// Counts `entries` of an object stream's header read ([`OBJECT_STREAM_ENTRIES`]).

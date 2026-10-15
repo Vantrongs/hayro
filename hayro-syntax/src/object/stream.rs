@@ -603,6 +603,7 @@ fn parse_fallback<'a>(r: &mut Reader<'a>, dict: &Dict<'a>) -> Option<Stream<'a>>
 
 pub(crate) fn searched(data: &[u8], needle: &[u8]) -> Option<usize> {
     let found = find_needle(data, needle);
+    crate::work::told(found.unwrap_or(data.len()));
     #[cfg(test)]
     SEARCHED.set(SEARCHED.get() + found.unwrap_or(data.len()));
     found
