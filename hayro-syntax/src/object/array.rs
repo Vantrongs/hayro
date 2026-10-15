@@ -506,6 +506,14 @@ mod tests {
     }
 
     #[test]
+    fn array_with_dict_followed_by_stream() {
+        let res = array_impl(b"[<< /A 1 >> stream]").unwrap();
+        assert_eq!(res.len(), 2);
+        assert!(matches!(res[0], Object::Dict(_)));
+        assert!(matches!(res[1], Object::Null(_)));
+    }
+
+    #[test]
     fn array_repr() {
         let array = Array::from_bytes(b"[34]").unwrap();
 
