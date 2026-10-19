@@ -7,7 +7,7 @@
 //! quadrilaterals, a line width wider on each side.
 
 use super::entries::{Derived, Entries, Items, Value};
-use super::out::{Color, Out};
+use super::out::{Color, MITER_LIMIT, Out};
 use super::{MOST_PIECES, Unsupported, border_width, c_color, color_of, dash, rect};
 use hayro_syntax::object::dict::keys::{C, IC, INKLIST, QUADPOINTS};
 use kurbo::{Point, Rect, Vec2};
@@ -270,16 +270,23 @@ pub(super) fn squiggly(
 /// a seventh of the way up each side, stroked `h`/16 wide. A quad of no height
 /// draws nothing.
 ///
-/// Only its steps that can reach `shown`, the part of the page the clip lets show,
-/// are drawn, with one more on each side: the rest is clipped, and the ends cut there,
-/// with their caps and joins, lie outside it. Every step is drawn as it is, however
-/// fine: the content can be scaled and zoomed any amount.
+/// Only the steps whose stroke can reach `shown`, the part of the page the clip lets
+/// show, are drawn: those that come within half the miter limit times the width of
+/// it, which holds the stroke and every join. Where a neighbouring step is left out,
+/// the run drawn ends there with a butt cap; the join it lacks lies outside `shown`,
+/// as the corner they share is further than that from it. Every step is drawn as it
+/// is, however fine: the content can be scaled and zoomed any amount. A quad that
+/// would draw more than [`MOST_PIECES`] is [`Unsupported::Coordinates`]: one whose
+/// part on the page is more than about 37 000 times as long as high, which no text
+/// is.
 ///
-/// The steps that can reach `shown` are those whose corners on the bottom edge lie
-/// within the zigzag's largest height of it: about 7 times as many as the quad's
-/// height goes into the length of it `shown` holds. A quad that would draw more than
-/// [`MOST_PIECES`] is [`Unsupported::Coordinates`]: one whose part on the page is
-/// more than about 37 000 times as long as high, which no text is.
+/// The steps drawn are found by halving the range of steps, from all of them down
+/// to single steps, and leaving out each range whose corners' convex hull, that of
+/// its first and last corner on each line, is further than that from `shown`
+/// ([`near`]). The steps run from one line to the other, so a range near `shown`
+/// holds a step near it, but for those at the ends of the part of the zigzag near
+/// `shown`: at most a few at each depth. The work is within about twice the depth,
+/// the bits of the number of steps, times the steps drawn and those few.
 fn zigzag(q: &Quad, shown: Rect, out: &mut Out) -> Result<(), Unsupported> {
     let wrote = |o: Option<()>| o.ok_or(Unsupported::Coordinates);
     let [_, _, bl, br] = q.0;
@@ -298,56 +305,116 @@ fn zigzag(q: &Quad, shown: Rect, out: &mut Out) -> Result<(), Unsupported> {
     let (top_left, top_right) = q.across(1.0 / 7.0);
     let bottom = |t: f64| bl.lerp(br, t);
     let top = |t: f64| top_left.lerp(top_right, t);
+    let hull = |ta: f64, tb: f64| [bottom(ta), bottom(tb), top(tb), top(ta)];
+    let reach = MITER_LIMIT * width / 2.0;
     // The corners are `delta` apart along the bottom edge, at `t = k delta / len`.
     let steps = (len / delta).ceil();
-    let end = steps * delta / len;
-    let reach = (top(0.0) - bottom(0.0))
-        .hypot()
-        .max((top(end) - bottom(end)).hypot())
-        + width;
-    let Some((t0, t1)) = clip_line(bl, along, end, shown.inset(reach)) else {
-        return Ok(());
-    };
-    let first = ((t0 * len / delta).floor() - 1.0).max(0.0);
-    let last = ((t1 * len / delta).ceil() + 1.0).min(steps);
-    if last - first > MOST_PIECES {
-        return Err(Unsupported::Coordinates);
+    if !steps.is_finite() {
+        // Steps too many to number, which no viewer tells apart: refused where the
+        // quad can show.
+        return if near(&hull(0.0, 1.0), shown, reach) {
+            Err(Unsupported::Coordinates)
+        } else {
+            Ok(())
+        };
     }
+    let t = |k: f64| k * delta / len;
     let corner = |k: f64| {
-        let t = k * delta / len;
-        if k % 2.0 == 0.0 { bottom(t) } else { top(t) }
+        if k % 2.0 == 0.0 {
+            bottom(t(k))
+        } else {
+            top(t(k))
+        }
     };
-    let p = corner(first);
-    wrote(out.nums(&[p.x, p.y], "m"))?;
-    for i in 1..=(last - first) as u64 {
-        let p = corner(first + i as f64);
-        wrote(out.nums(&[p.x, p.y], "l"))?;
+    // The ranges of steps left to look at, the first last; step `k` runs from
+    // corner `k` to corner `k + 1`.
+    let mut ranges = vec![(0.0, steps)];
+    let mut drawn = 0.0;
+    // The corner the last step drawn ends at.
+    let mut until = None;
+    while let Some((a, b)) = ranges.pop() {
+        super::work(1);
+        if b - a > 1.0 {
+            if near(&hull(t(a), t(b)), shown, reach) {
+                let mid = ((a + b) / 2.0).floor();
+                // Past 2^53, neighbouring steps' numbers are no longer apart.
+                if !(a < mid && mid < b) {
+                    return Err(Unsupported::Coordinates);
+                }
+                ranges.push((mid, b));
+                ranges.push((a, mid));
+            }
+            continue;
+        }
+        let (from, to) = (corner(a), corner(b));
+        if !near(&[from, to], shown, reach) {
+            continue;
+        }
+        drawn += 1.0;
+        if drawn > MOST_PIECES {
+            return Err(Unsupported::Coordinates);
+        }
+        if until != Some(a) {
+            wrote(out.nums(&[from.x, from.y], "m"))?;
+        }
+        wrote(out.nums(&[to.x, to.y], "l"))?;
+        until = Some(b);
     }
-    out.op("S");
+    if until.is_some() {
+        out.op("S");
+    }
     Ok(())
 }
 
-/// The range of `t` in `0..=end` for which `from + t along` lies in `r`, when there
-/// is one.
-fn clip_line(from: Point, along: Vec2, end: f64, r: Rect) -> Option<(f64, f64)> {
-    let (mut lo, mut hi) = (0.0_f64, end);
-    for (p, q) in [
-        (-along.x, from.x - r.x0),
-        (along.x, r.x1 - from.x),
-        (-along.y, from.y - r.y0),
-        (along.y, r.y1 - from.y),
-    ] {
-        if p == 0.0 {
-            if q < 0.0 {
-                return None;
-            }
-        } else if p < 0.0 {
-            lo = lo.max(q / p);
-        } else {
-            hi = hi.min(q / p);
-        }
+/// Whether the convex hull of `points` comes within `reach` of `r`; also where a
+/// point is no finite number, which cannot then be written.
+fn near(points: &[Point], r: Rect, reach: f64) -> bool {
+    if !points.iter().all(|p| p.is_finite()) {
+        return true;
     }
-    (lo <= hi).then_some((lo, hi))
+    let r = r.abs();
+    let (c, half) = (r.center(), Vec2::new(r.width() / 2.0, r.height() / 2.0));
+    // Apart along `n`: the projections of the hull and of `r` do not meet.
+    let apart = |n: Vec2| {
+        let extent = n.x.abs() * half.x + n.y.abs() * half.y;
+        let along = points.iter().map(|p| n.dot(*p - c));
+        let (lo, hi) = along.fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+            (lo.min(v), hi.max(v))
+        });
+        lo > extent || hi < -extent
+    };
+    let pairs = || {
+        (0..points.len())
+            .flat_map(move |i| (i + 1..points.len()).map(move |j| (points[i], points[j])))
+    };
+    // Two convex shapes that meet are apart along no side's normal.
+    let axes = [Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)];
+    let sides = pairs().map(|(p, q)| (q - p).turn_90());
+    if !axes.into_iter().chain(sides).any(apart) {
+        return true;
+    }
+    // Apart, they are nearest at a corner of one and a side or corner of the other.
+    let to_rect = |p: Point| {
+        let dx = (r.x0 - p.x).max(p.x - r.x1).max(0.0);
+        let dy = (r.y0 - p.y).max(p.y - r.y1).max(0.0);
+        Vec2::new(dx, dy).hypot()
+    };
+    let to_side = |p: Point, a: Point, b: Point| {
+        let ab = b - a;
+        let f = (p - a).dot(ab) / ab.hypot2();
+        let f = if f.is_nan() { 0.0 } else { f.clamp(0.0, 1.0) };
+        (p - a.lerp(b, f)).hypot()
+    };
+    let corners = [
+        Point::new(r.x0, r.y0),
+        Point::new(r.x1, r.y0),
+        Point::new(r.x1, r.y1),
+        Point::new(r.x0, r.y1),
+    ];
+    points.iter().any(|&p| to_rect(p) <= reach)
+        || corners
+            .iter()
+            .any(|&k| pairs().any(|(a, b)| to_side(k, a, b) <= reach))
 }
 
 /// `Ink`: the `/InkList` paths as polylines of one path, stroked once in /C at the
@@ -486,6 +553,95 @@ mod tests {
         let among = zigzags(&squiggly_content(&quad.repeat(101), page));
         assert_eq!(among.len(), 101);
         assert!(among.iter().all(|z| *z == alone[0]));
+    }
+
+    /// The distance from the segment `a`-`b` to `r`.
+    fn distance(a: (f64, f64), b: (f64, f64), r: Rect) -> f64 {
+        let point = |(x, y): (f64, f64)| {
+            let dx = (r.x0 - x).max(x - r.x1).max(0.0);
+            let dy = (r.y0 - y).max(y - r.y1).max(0.0);
+            dx.hypot(dy)
+        };
+        // Where the segment crosses `r`, if it does: the part of it within each of
+        // the rectangle's bands.
+        let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
+        for (from, d, min, max) in [(a.0, b.0 - a.0, r.x0, r.x1), (a.1, b.1 - a.1, r.y0, r.y1)] {
+            if d == 0.0 {
+                if from < min || from > max {
+                    hi = -1.0;
+                }
+            } else {
+                let (s, t) = ((min - from) / d, (max - from) / d);
+                lo = lo.max(s.min(t));
+                hi = hi.min(s.max(t));
+            }
+        }
+        if lo <= hi {
+            return 0.0;
+        }
+        let to_segment = |(x, y): (f64, f64)| {
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let f = (((x - a.0) * dx + (y - a.1) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+            (x - a.0 - f * dx).hypot(y - a.1 - f * dy)
+        };
+        [(r.x0, r.y0), (r.x1, r.y0), (r.x0, r.y1), (r.x1, r.y1)]
+            .map(to_segment)
+            .into_iter()
+            .chain([point(a), point(b)])
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// A quad whose line a seventh of the way up leans far back over the page, while
+    /// its bottom edge lies beside it: of its thousand steps, those whose stroke can
+    /// reach the page, within half the miter limit times the line width of it, are
+    /// drawn, and no other (the 30 steps from 86 on; before, every step was).
+    #[test]
+    fn a_steep_zigzag_draws_the_steps_that_reach_the_page() {
+        let page = Rect::new(0.0, 0.0, 200.0, 200.0);
+        let c = squiggly_content("300 7 -13700 14000 300 0 1300 0", page);
+        // Height 7: steps of 1 along the bottom edge from x = 300, a line 7/16 wide;
+        // the line a seventh of the way up runs from (300, 1) to (1300 - 15000 / 7,
+        // 2000).
+        let (top_left, top_right) = ((300.0, 1.0), (1300.0 - 15000.0 / 7.0, 2000.0));
+        let corner = |k: usize| {
+            let t = k as f64 / 1000.0;
+            if k.is_multiple_of(2) {
+                (300.0 + 1000.0 * t, 0.0)
+            } else {
+                (
+                    top_left.0 + (top_right.0 - top_left.0) * t,
+                    top_left.1 + (top_right.1 - top_left.1) * t,
+                )
+            }
+        };
+        let reach = 10.0 * (7.0 / 16.0) / 2.0;
+        let near: Vec<usize> = (0..1000)
+            .filter(|&k| distance(corner(k), corner(k + 1), page) <= reach)
+            .collect();
+        // The runs of steps drawn, as the steps of each.
+        let mut drawn = vec![];
+        let mut at = None;
+        for line in c.lines() {
+            let n: Vec<&str> = line.split(' ').collect();
+            let (x, y) = match n[..] {
+                [x, y, "m" | "l"] => (x.parse::<f64>().unwrap(), y.parse::<f64>().unwrap()),
+                _ => continue,
+            };
+            // The corner of the bottom edge a step starts or ends at names it.
+            let k = if line.ends_with(" m") {
+                None
+            } else {
+                let (from_x, from_y) = at.unwrap();
+                Some(if from_y == 0.0 { from_x } else { x } - 300.0)
+            };
+            if let Some(k) = k {
+                let k = if at.unwrap().1 == 0.0 { k } else { k - 1.0 };
+                drawn.push(k.round() as usize);
+            }
+            at = Some((x, y));
+        }
+        assert!(near.len() > 20 && near.len() < 100, "{near:?}");
+        assert_eq!(drawn, near, "{c}");
     }
 
     /// A quad 4·10^6 or 8·10^6 pt wide, starting at its left end or far left of the page,

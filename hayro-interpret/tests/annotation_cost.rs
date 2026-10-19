@@ -210,6 +210,34 @@ fn a_flat_squiggle_is_drawn_at_a_bounded_cost() {
     );
 }
 
+/// A squiggle's steps the page does not show are neither drawn nor counted against
+/// the most it draws, nor looked at one by one: a quad wholly above the page, whose
+/// million steps rise steeply to the right, beside a quad on the page.
+#[test]
+fn a_squiggle_off_the_page_costs_nothing_however_steep() {
+    let shown = "20 114 180 114 20 100 180 100";
+    let steep = "0 1000.007 1000 11000 0 1000 1000 1000";
+    let look = |quads: &str| {
+        let pdf = one_annotation(&format!(
+            "/Subtype /Squiggly /C [0] /QuadPoints [{quads}] /Rect [0 0 200 200]"
+        ));
+        let work = work_done();
+        let steps = match first_look(&pdf) {
+            Look::Generated(a) => Ok(a.content.matches(" l\n").count()),
+            Look::Unsupported(why) => Err(why),
+            Look::Nothing => Ok(0),
+            _ => panic!("{quads}: drawn otherwise"),
+        };
+        (steps, work_done() - work)
+    };
+    let (alone, one) = look(shown);
+    assert_eq!(alone, Ok(80));
+    let (both, two) = look(&format!("{shown} {steep}"));
+    assert_eq!(both, alone);
+    assert!(two < one + 200, "{one} for one quad, {two} for both");
+    assert_eq!(look(steep).0, Ok(0));
+}
+
 /// 4·10^6: twice it is below 2^23, from which numbers are not written.
 fn huge() -> String {
     "4000000".to_owned()

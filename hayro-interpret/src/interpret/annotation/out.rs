@@ -94,6 +94,11 @@ impl Color {
     }
 }
 
+/// The miter limit of every stroke ([`Out::stroke_state`]): a join reaches at most
+/// half of it times the line width from its corner, a bevel where a miter would
+/// reach further.
+pub(super) const MITER_LIMIT: f64 = 10.0;
+
 /// Content stream text. Numbers reach it only through [`written`]; one that cannot
 /// be written fails the whole appearance, whatever the generator does next.
 #[derive(Default)]
@@ -239,9 +244,11 @@ impl Out {
         self.nums(&color.components(), op)
     }
 
-    /// The stroke state every generated appearance starts from.
+    /// The stroke state every generated appearance starts from: butt caps, mitred
+    /// joins up to [`MITER_LIMIT`].
     pub(super) fn stroke_state(&mut self, width: f64, dash: &[f64]) -> Option<()> {
-        self.op("0 J 0 j 10 M");
+        self.content.push_str("0 J 0 j ");
+        self.nums(&[MITER_LIMIT], "M")?;
         self.nums(&[width], "w")?;
         self.content.push('[');
         for d in dash {
