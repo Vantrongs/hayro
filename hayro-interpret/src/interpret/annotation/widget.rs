@@ -104,8 +104,7 @@ pub(super) fn widget<'a>(
     let turn = turned(rotation);
     let place = super::rect_transform(r, [0.0, 0.0, fw as f32, fh as f32], turn) * turn;
     let bbox = kurbo::Rect::new(0.0, 0.0, fw, fh);
-    // What the page shows of the box, in the box's space.
-    let shown = (place.inverse() * visible.to_path(0.1)).bounding_box();
+    let shown = Shown::of(visible, place);
     out.op("q");
     fail(out.nums(&place.as_coeffs(), "cm"))?;
     fail(out.clip(bbox))?;
@@ -120,11 +119,64 @@ pub(super) fn widget<'a>(
         border,
         background,
         bbox,
-        shown,
+        &shown,
         out,
     );
     out.op("Q");
     drawn
+}
+
+/// What the page shows of a widget's box, in the box's space: the visible part of
+/// the page, a parallelogram there where the box is turned, and the rectangle that
+/// holds it.
+struct Shown {
+    corners: [kurbo::Point; 4],
+    rect: kurbo::Rect,
+}
+
+impl Shown {
+    fn of(visible: kurbo::Rect, place: Affine) -> Self {
+        let to_box = place.inverse();
+        let corners = [
+            (visible.x0, visible.y0),
+            (visible.x1, visible.y0),
+            (visible.x1, visible.y1),
+            (visible.x0, visible.y1),
+        ]
+        .map(|(x, y)| to_box * kurbo::Point::new(x, y));
+        let rect = (to_box * visible.to_path(0.1)).bounding_box();
+        Self { corners, rect }
+    }
+
+    /// The span across of what it shows between `y0` and `y1` up (`y0 <= y1`), or
+    /// `None` where it shows nothing there.
+    fn across(&self, y0: f64, y1: f64) -> Option<(f64, f64)> {
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        // The span is that of the corners of its part between the two lines: corners
+        // of the parallelogram there, and where its edges cross the lines.
+        for i in 0..4 {
+            let (a, b) = (self.corners[i], self.corners[(i + 1) % 4]);
+            let dy = b.y - a.y;
+            let (t0, t1) = if dy == 0.0 {
+                if a.y < y0 || a.y > y1 {
+                    continue;
+                }
+                (0.0, 1.0)
+            } else {
+                let (s0, s1) = ((y0 - a.y) / dy, (y1 - a.y) / dy);
+                (s0.min(s1).max(0.0), s0.max(s1).min(1.0))
+            };
+            if t0 > t1 {
+                continue;
+            }
+            for t in [t0, t1] {
+                let x = a.x + (b.x - a.x) * t;
+                lo = lo.min(x);
+                hi = hi.max(x);
+            }
+        }
+        (lo <= hi).then_some((lo, hi))
+    }
 }
 
 /// The turn of `degrees`, exact for the right angles.
@@ -138,7 +190,7 @@ fn turned(degrees: i32) -> Affine {
     }
 }
 
-/// Draws the widget of [`widget`] in its box `bbox`, of which `shown` shows.
+/// Draws the widget of [`widget`] in its box `bbox`, of which `visible` shows.
 #[allow(clippy::too_many_arguments)]
 fn draw<'a>(
     annot: &Entries<'a>,
@@ -151,9 +203,10 @@ fn draw<'a>(
     border: Option<Color>,
     background: Option<Color>,
     bbox: kurbo::Rect,
-    shown: kurbo::Rect,
+    visible: &Shown,
     out: &mut Out,
 ) -> Drawn {
+    let shown = visible.rect;
     let fail = |o: Option<()>| o.ok_or(Unsupported::Kind);
     let (fonts, form) = (&doc.fonts, doc.form());
     let form = form.as_ref();
@@ -490,7 +543,7 @@ fn draw<'a>(
                     f64::from(fw),
                     f64::from(fh),
                     w,
-                    shown,
+                    visible,
                     out,
                 )?;
             }
@@ -544,16 +597,19 @@ fn comb_dividers(
     fw: f64,
     fh: f64,
     w: f64,
-    shown: kurbo::Rect,
+    shown: &Shown,
     out: &mut Out,
 ) -> Result<(), Unsupported> {
     let wrote = |o: Option<()>| o.ok_or(Unsupported::Coordinates);
     let cells = cells as f64;
     let height = (fh - 2.0 * w).abs();
-    // Every line covers `w..fh - w` up, so none shows above or below that.
-    if cells < 2.0 || height == 0.0 || shown.y1 < w.min(fh - w) || shown.y0 > w.max(fh - w) {
+    if cells < 2.0 || height == 0.0 {
         return Ok(());
     }
+    // Every line covers `w..fh - w` up: of those the page shows, those across this.
+    let Some((x0, x1)) = shown.across(w.min(fh - w), w.max(fh - w)) else {
+        return Ok(());
+    };
     let step = (fw - 2.0 * w) / cells;
     if step.abs() <= w {
         // From the outer edge of the first line to that of the last.
@@ -565,8 +621,8 @@ fn comb_dividers(
         return Ok(());
     }
     // The lines within half a width of the visible part of the frame.
-    let first = ((shown.x0 - 1.5 * w) / step).floor().max(1.0);
-    let last = ((shown.x1 - 0.5 * w) / step).ceil().min(cells - 1.0);
+    let first = ((x0 - 1.5 * w) / step).floor().max(1.0);
+    let last = ((x1 - 0.5 * w) / step).ceil().min(cells - 1.0);
     if first > last {
         return Ok(());
     }

@@ -129,6 +129,16 @@ fn comb_dividers_are_drawn_each_unless_they_touch() {
     );
     // A field above the page shows none of its dividers, however many.
     assert_eq!(comb("1000000", "0.000001", "[20 1000 180 1030]"), Ok(0));
+    // Nor does one beside the page, turned so that the rectangle holding the page,
+    // in the field's space, reaches the field.
+    let turned = one_annotation(
+        "/Subtype /Widget /FT /Tx /Ff 16777216 /MK << /R 45 /BC [0] >> /MaxLen 1000000 \
+         /BS << /W .000001 >> /Rect [201 20 361 50]",
+    );
+    match first_look(&turned) {
+        Look::Generated(a) => assert_eq!(lines(&a.content), 0),
+        _ => panic!("turned comb beside the page: drawn otherwise"),
+    }
 }
 
 /// A comb field's `/MaxLen` beyond a 32-bit integer makes no comb, as viewers read
