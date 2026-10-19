@@ -6,7 +6,9 @@
 //! memory. Work that allocates as it goes is measured by the bytes each thread has
 //! allocated in all ([`allocated`]).
 
-use hayro_interpret::annotation::{Appearances, Drawn, Look, Unsupported, work_done};
+use hayro_interpret::annotation::{
+    Appearances, Drawn, Look, Unsupported, set_most_pieces, work_done,
+};
 use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::hayro_syntax::object::ObjectIdentifier;
 use hayro_interpret::hayro_syntax::page::Page;
@@ -126,6 +128,8 @@ fn comb_dividers_are_drawn_each() {
                 Ok(n)
             }
             Look::Unsupported(why) => Err(why),
+            // Nothing of it shows.
+            Look::Nothing => Ok(0),
             _ => panic!("{max_len} {w}: drawn otherwise"),
         }
     };
@@ -164,6 +168,7 @@ fn comb_dividers_are_drawn_each() {
         ));
         match first_look(&turned) {
             Look::Generated(a) => assert_eq!(lines(&a.content), 0, "{rect}"),
+            Look::Nothing => {}
             _ => panic!("turned comb at {rect}: drawn otherwise"),
         }
     }
@@ -308,6 +313,57 @@ fn a_squiggle_whose_joins_stay_off_the_page_costs_nothing() {
     // page's bottom row in bake.
     let (both, _) = look(&format!("{shown} 0 -.0008 200 -.0008 0 -.0001 200 -.0001"));
     assert_eq!(both, Err(Unsupported::Coordinates));
+}
+
+/// A squiggle finer than the 32-bit numbers it is written in, along the edge of
+/// what the page shows: its corners as written lie on that grid so unevenly that
+/// whether its joins' tips reach the page is told only step by step, as no bound
+/// on a range of them tells it. The steps looked at one by one count against the
+/// most an annotation draws, with those it draws, so such a squiggle is refused
+/// within a few times that most of work, whether or not its steps paint: quads
+/// 10^-5 and 10^-4 pt high, their top corners 2 and 5 half widths below what the
+/// page shows grown (their joins reach up to 10), the first's steps 10^-5 · 2/7 pt,
+/// under a hundredth of the grid's 1.5·10^-5 at 200, beside a quad on the page
+/// that widens the clip to it. Looked at one by one, nothing of the first and
+/// third paints; the second's sharpest joins do.
+#[test]
+fn a_squiggle_finer_than_its_numbers_along_the_page_is_refused_at_a_bounded_cost() {
+    let shown = "20 114 21 114 20 100 21 100";
+    let quad = |h: f64, d: f64| {
+        let top = -0.25 - d * h / 32.0;
+        let (low, high) = (top - h / 7.0, top - h / 7.0 + h);
+        format!("0 {high} 200 {high} 0 {low} 200 {low} {shown}")
+    };
+    let look = |quads: &str| {
+        let pdf = one_annotation(&format!(
+            "/Subtype /Squiggly /C [0] /QuadPoints [{quads}] /Rect [0 0 200 200]"
+        ));
+        let work = work_done();
+        let look = match first_look(&pdf) {
+            Look::Unsupported(why) => Err(why),
+            Look::Generated(_) => Ok(()),
+            _ => panic!("{quads}: drawn otherwise"),
+        };
+        (look, work_done() - work)
+    };
+    let fine = [(1e-5, 2.0), (1e-4, 2.0), (1e-4, 5.0)];
+    set_most_pieces(4096);
+    for (h, d) in fine {
+        let (got, work) = look(&quad(h, d));
+        assert_eq!(got, Err(Unsupported::Coordinates), "{h} {d}");
+        assert!(work < 2 * 4096 + 1000, "{h} {d}: {work}");
+    }
+    // A hundred times coarser, the steps are told apart by range: drawn at a cost
+    // that does not grow with the limit.
+    let (got, work) = look(&quad(1e-2, 2.0));
+    assert_eq!(got, Ok(()));
+    assert!(work < 1000, "{work}");
+    // At the default most, as within it: 0.8 s in a release build, 6.4 s in a
+    // debug one, when this was written.
+    set_most_pieces(262_144);
+    let (got, work) = look(&quad(1e-4, 2.0));
+    assert_eq!(got, Err(Unsupported::Coordinates));
+    assert!(work < 2 * 262_144 + 1000, "{work}");
 }
 
 /// 4·10^6: twice it is below 2^23, from which numbers are not written.

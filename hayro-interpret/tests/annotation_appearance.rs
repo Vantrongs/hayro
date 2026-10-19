@@ -1978,13 +1978,18 @@ fn a_damaged_box_or_matrix_places_the_appearance_as_viewers_do() {
 }
 
 /// A number of 2^23 or more, where the 32-bit numbers content streams are read in
-/// are a unit or more apart, fails the whole appearance, in whichever quadrilateral, path or entry it is: none is left out as
-/// if it drew nothing. So does one in where an appearance stream is placed.
+/// are a unit or more apart, fails the whole appearance, in whichever quadrilateral,
+/// path or entry it is, where what it draws can paint on the page: none is left out
+/// as if it drew nothing. So does one in where an appearance stream is placed. (What
+/// cannot paint on the page is not written, so its numbers need not be writable:
+/// `what_cannot_paint_on_the_page_is_not_written`. A squiggle across the page and
+/// far beyond it is drawn as the steps on the page, each writable; `PyMuPDF` 1.28.2
+/// bake does not finish it, and draws those steps where it reaches 10^7 only.)
 #[test]
 fn every_number_too_large_to_write_is_unsupported() {
     const H: &str = "100000000";
     let quad = format!("/Rect [0 0 200 200] /QuadPoints [10 80 {H} 80 10 50 {H} 50]");
-    let mut cases: Vec<String> = ["Highlight", "Underline", "StrikeOut", "Squiggly", "Redact"]
+    let mut cases: Vec<String> = ["Highlight", "Underline", "StrikeOut", "Redact"]
         .iter()
         .map(|s| format!("/Subtype /{s} /C [1 0 0] {quad}"))
         .collect();
@@ -2049,6 +2054,84 @@ fn every_number_too_large_to_write_is_unsupported() {
             "Coordinates"
         };
         assert_eq!(looks(&pdf), [expected], "{rect} {matrix}");
+    }
+}
+
+/// What cannot paint on the page is not written: a shape, quad or path of an
+/// annotation that lies wholly off the page, up to 10^7 away where its numbers
+/// cannot be written, draws nothing and refuses nothing; among others, the others
+/// draw as they do alone. Nor is an appearance stream whose /Rect lies off it. `PyMuPDF` 1.28.2 bakes no ink for such a square, and an
+/// underline with a quad off the page as it bakes the underline without it.
+#[test]
+fn what_cannot_paint_on_the_page_is_not_written() {
+    let paints = |e: &Ev| matches!(e, Ev::Fill { .. } | Ev::Stroke { .. });
+    for far in ["10000000", "-10000000", "5000000"] {
+        let f = |d: i32| format!("{}", far.parse::<f64>().unwrap() + f64::from(d));
+        let (a, b) = (f(0), f(60));
+        let quad = format!("{a} 80 {b} 80 {a} 50 {b} 50");
+        let off = format!("/Rect [{a} {a} {b} {b}]");
+        for annot in [
+            format!("/Subtype /Square /C [0] /IC [1 0 0] {off}"),
+            format!("/Subtype /Circle /C [0] /IC [1 0 0] {off}"),
+            format!("/Subtype /Line /C [0] {off} /L [{a} {a} {b} {b}] /LE [/OpenArrow /Circle]"),
+            format!("/Subtype /Ink /C [0] {off} /InkList [[{a} {a} {b} {b} {a} {b}]]"),
+            format!(
+                "/Subtype /Polygon /C [0] /IC [0 0 1] {off} /Vertices [{a} {a} {b} {a} {b} {b}]"
+            ),
+            format!("/Subtype /PolyLine /C [0] {off} /Vertices [{a} {a} {b} {a} {b} {b}]"),
+            format!("/Subtype /FreeText {off} /Contents (A) /DA (/Helv 12 Tf)"),
+            format!(
+                "/Subtype /Widget /FT /Tx /V (A) /DA (/Helv 12 Tf) /MK << /BG [1 0 0] /BC [0] >> {off}"
+            ),
+            format!("/Subtype /Widget /FT /Btn /Ff 65536 /MK << /CA (Go) /BG [1 0 0] >> {off}"),
+            format!("/Subtype /Text {off}"),
+            format!("/Subtype /Caret /C [0] {off}"),
+            format!("/Subtype /Stamp {off}"),
+            format!("/Subtype /Redact /C [1 0 0] {off}"),
+            format!("/Subtype /Highlight /Rect [0 0 200 200] /QuadPoints [{quad}]"),
+            format!("/Subtype /Underline /C [0] /Rect [0 0 200 200] /QuadPoints [{quad}]"),
+            format!("/Subtype /StrikeOut /C [0] /Rect [0 0 200 200] /QuadPoints [{quad}]"),
+            format!("/Subtype /Squiggly /C [0] /Rect [0 0 200 200] /QuadPoints [{quad}]"),
+        ] {
+            let drawn = content(&annot, vec![]);
+            assert!(drawn != "Coordinates", "{annot}");
+            let events = draw(&[&annot], VIEW);
+            assert!(!events.iter().any(paints), "{annot}: {events:?}");
+        }
+        // An appearance stream is placed on its /Rect and clipped to it.
+        let pdf = annotations(
+            "/Annots [4 0 R]",
+            vec![
+                format!("<< /Type /Annot /Subtype /Square {off} /AP << /N 5 0 R >> >>")
+                    .into_bytes(),
+                common::stream("/BBox [0 0 10 10]", b"0 g 0 0 4 3 re f"),
+            ],
+        );
+        assert_eq!(looks(&pdf), ["nothing"], "{off}");
+        let shown = "10 80 190 80 10 50 190 50";
+        for (with, alone) in [
+            ("Highlight", ""),
+            ("Underline", "/C [0]"),
+            ("StrikeOut", "/C [0]"),
+            ("Squiggly", "/C [0]"),
+        ]
+        .map(|(s, c)| {
+            (
+                format!("/Subtype /{s} {c} /Rect [0 0 200 200] /QuadPoints [{shown} {quad}]"),
+                format!("/Subtype /{s} {c} /Rect [0 0 200 200] /QuadPoints [{shown}]"),
+            )
+        })
+        .into_iter()
+        .chain([
+            (
+                format!("/Subtype /Ink /C [0] /Rect [0 0 200 200] /InkList [[10 10 100 100] [{a} {a} {b} {b}]]"),
+                "/Subtype /Ink /C [0] /Rect [0 0 200 200] /InkList [[10 10 100 100]]".to_owned(),
+            ),
+        ]) {
+            let events = draw(&[&with], VIEW);
+            assert!(events.iter().any(paints), "{with}");
+            assert_eq!(events, draw(&[&alone], VIEW), "{with}");
+        }
     }
 }
 

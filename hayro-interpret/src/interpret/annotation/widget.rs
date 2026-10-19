@@ -14,7 +14,7 @@
 
 use super::entries::{Entries, Text, Value};
 use super::freetext;
-use super::out::{Color, Out};
+use super::out::{Color, Out, as_written};
 use super::text::{self, Align, Family, Fonts, Setting, Shaped, Style, TextBox};
 use super::{
     Appearances, FIELD, Field, Inherited, TEXT, TextKey, Unsupported, border_width, circle,
@@ -49,7 +49,6 @@ pub(super) fn widget<'a>(
     field: &Field<'a>,
     doc: &Appearances<'a>,
     visible: kurbo::Rect,
-    beyond: f64,
     out: &mut Out,
 ) -> Drawn {
     let field_type = field.get(Inherited::Type);
@@ -105,7 +104,9 @@ pub(super) fn widget<'a>(
     let turn = turned(rotation);
     let place = super::rect_transform(r, [0.0, 0.0, fw as f32, fh as f32], turn) * turn;
     let bbox = kurbo::Rect::new(0.0, 0.0, fw, fh);
-    let shown = Shown::of(visible, place, beyond);
+    // What the page shows of the box: the rectangle holding it, in the box's space,
+    // for finding the text that can show.
+    let shown = (place.inverse() * visible.to_path(0.1)).bounding_box();
     out.op("q");
     fail(out.nums(&place.as_coeffs(), "cm"))?;
     fail(out.clip(bbox))?;
@@ -120,112 +121,11 @@ pub(super) fn widget<'a>(
         border,
         background,
         bbox,
-        &shown,
+        shown,
         out,
     );
     out.op("Q");
     drawn
-}
-
-/// What the page shows of a widget's box, in the box's space: the visible part of
-/// the page, a parallelogram there where the box is turned, and the rectangle that
-/// holds it; and how far beyond its outline a stroke paints there.
-struct Shown {
-    corners: [kurbo::Point; 4],
-    rect: kurbo::Rect,
-    /// Half the sides of the square a stroke paints beyond its outline on the page
-    /// (`beyond` across and up), in the box's space: a parallelogram there.
-    beyond: [kurbo::Vec2; 2],
-}
-
-impl Shown {
-    fn of(visible: kurbo::Rect, place: Affine, beyond: f64) -> Self {
-        let to_box = place.inverse();
-        let corners = [
-            (visible.x0, visible.y0),
-            (visible.x1, visible.y0),
-            (visible.x1, visible.y1),
-            (visible.x0, visible.y1),
-        ]
-        .map(|(x, y)| to_box * kurbo::Point::new(x, y));
-        let rect = (to_box * visible.to_path(0.1)).bounding_box();
-        let [a, b, c, d, _, _] = to_box.as_coeffs();
-        let beyond = [
-            kurbo::Vec2::new(a * beyond, b * beyond),
-            kurbo::Vec2::new(c * beyond, d * beyond),
-        ];
-        Self {
-            corners,
-            rect,
-            beyond,
-        }
-    }
-
-    /// The span of `u` for which the rectangle `u ± half` across and `y0..y1` up
-    /// meets what it shows inside `clip`, grown on the page by how far a stroke
-    /// paints beyond its outline; `None` for none. Both are convex: they meet unless
-    /// the side of one or the other is a line that parts them, and along each such
-    /// line the rectangle's extent moves with `u`.
-    fn strips(&self, clip: kurbo::Rect, half: f64, (y0, y1): (f64, f64)) -> Option<(f64, f64)> {
-        use kurbo::{Point, Vec2};
-        // What it shows inside the clip: the parallelogram cut by each of its sides.
-        let mut region: Vec<Point> = self.corners.to_vec();
-        let sides: [(Vec2, f64); 4] = [
-            (Vec2::new(1.0, 0.0), clip.x0),
-            (Vec2::new(-1.0, 0.0), -clip.x1),
-            (Vec2::new(0.0, 1.0), clip.y0),
-            (Vec2::new(0.0, -1.0), -clip.y1),
-        ];
-        for (n, at) in sides {
-            let inside = |p: Point| n.dot(p.to_vec2()) - at;
-            let mut kept = Vec::with_capacity(region.len() + 1);
-            for (i, &p) in region.iter().enumerate() {
-                let q = region[(i + 1) % region.len()];
-                let (dp, dq) = (inside(p), inside(q));
-                if dp >= 0.0 {
-                    kept.push(p);
-                }
-                if (dp >= 0.0) != (dq >= 0.0) {
-                    kept.push(p.lerp(q, dp / (dp - dq)));
-                }
-            }
-            region = kept;
-            if region.is_empty() {
-                return None;
-            }
-        }
-        let [e1, e2] = self.beyond;
-        let edges = (0..region.len()).map(|i| region[(i + 1) % region.len()] - region[i]);
-        let axes = [e1, e2]
-            .into_iter()
-            .chain(edges)
-            .map(Vec2::turn_90)
-            .chain([Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)]);
-        let (ylo, yhi) = (y0.min(y1), y0.max(y1));
-        let (mut lo, mut hi) = (f64::NEG_INFINITY, f64::INFINITY);
-        for n in axes {
-            // The grown region along `n`, and the rectangle's extent but for `u`.
-            let grow = n.dot(e1).abs() + n.dot(e2).abs();
-            let along = region.iter().map(|p| n.dot(p.to_vec2()));
-            let g0 = along.clone().fold(f64::INFINITY, f64::min) - grow;
-            let g1 = along.fold(f64::NEG_INFINITY, f64::max) + grow;
-            let (r0, r1) = (
-                (n.y * ylo).min(n.y * yhi) - n.x.abs() * half,
-                (n.y * ylo).max(n.y * yhi) + n.x.abs() * half,
-            );
-            // They meet along `n` where `n.x u + r1 >= g0` and `n.x u + r0 <= g1`.
-            if n.x == 0.0 {
-                if r1 < g0 || r0 > g1 {
-                    return None;
-                }
-            } else {
-                let (a, b) = ((g0 - r1) / n.x, (g1 - r0) / n.x);
-                lo = lo.max(a.min(b));
-                hi = hi.min(a.max(b));
-            }
-        }
-        (lo <= hi).then_some((lo, hi))
-    }
 }
 
 /// The turn of `degrees`, exact for the right angles.
@@ -252,10 +152,9 @@ fn draw<'a>(
     border: Option<Color>,
     background: Option<Color>,
     bbox: kurbo::Rect,
-    visible: &Shown,
+    shown: kurbo::Rect,
     out: &mut Out,
 ) -> Drawn {
-    let shown = visible.rect;
     let fail = |o: Option<()>| o.ok_or(Unsupported::Kind);
     let (fonts, form) = (&doc.fonts, doc.form());
     let form = form.as_ref();
@@ -587,14 +486,7 @@ fn draw<'a>(
             // The dividers before the text, which a border wider than a cell covers.
             if let Some(border) = &border {
                 fail(out.stroke_color(border))?;
-                comb_dividers(
-                    i64::from(max_len),
-                    f64::from(fw),
-                    f64::from(fh),
-                    w,
-                    visible,
-                    out,
-                )?;
+                comb_dividers(i64::from(max_len), f64::from(fw), f64::from(fh), w, out)?;
             }
             // Each glyph centred in its cell: those whose cells the clip can show
             // are drawn.
@@ -631,70 +523,89 @@ fn draw<'a>(
 }
 
 /// The lines between the `cells` cells of a comb field `fw` × `fh`, inside its
-/// border of width `w` (> 0), stroked `w` wide with butt caps (line `i` covers
-/// `w + step i ± w/2` across and `w..fh - w` up, `step` = `(fw - 2w) / cells`),
-/// those whose outline meets what `shown` shows of the box under the clips they are
-/// drawn in (the box, and the box inside the border), grown on the page by how far
-/// a stroke paints beyond its outline.
+/// border of width `w` (> 0), stroked `w` wide with butt caps (line `i` at
+/// `u = w + step i` across, `step` = `(fw - 2w) / cells`, from `w` to `fh - w` up),
+/// those that paint where the page shows them under the clips they are drawn in
+/// (the box, and the box inside the border), as [`Out::region`] says: each line as
+/// it is written, its numbers as a viewer reads them, whose outline meets that.
 ///
 /// Each line is its own stroke, however close or overlapping the lines: the
 /// content can be scaled and zoomed any amount, and viewers draw lines within a
 /// pixel solid when they are one path or one band, where lines stroked each are
 /// grey, as in bake (observed). More lines that paint than
-/// [`super::set_most_pieces`] allows are [`Unsupported::Coordinates`]. Lines of no height draw nothing.
-fn comb_dividers(
-    cells: i64,
-    fw: f64,
-    fh: f64,
-    w: f64,
-    shown: &Shown,
-    out: &mut Out,
-) -> Result<(), Unsupported> {
-    let wrote = |o: Option<()>| o.ok_or(Unsupported::Coordinates);
+/// [`super::set_most_pieces`] allows are [`Unsupported::Coordinates`]. Lines of no
+/// length as written draw nothing; nor do lines under a clip of no area.
+///
+/// The lines that paint are found without looking at the others: those whose
+/// outline meets what shows are those whose `u`, as written, lies in one span
+/// ([`super::out::Region::span`]), and `u` as written runs one way with `i`, so
+/// they are a run of lines, whose ends are found by halving.
+fn comb_dividers(cells: i64, fw: f64, fh: f64, w: f64, out: &mut Out) -> Result<(), Unsupported> {
     let cells = cells as f64;
-    if cells < 2.0 || fh - 2.0 * w == 0.0 {
+    if cells < 2.0 {
         return Ok(());
     }
-    // Where the lines can paint: under the box's clip and the clip to the box
-    // inside the border (`re` of negative size covers the same rectangle as its
-    // absolute).
-    let clip = |size: f64| {
-        let (lo, hi) = (w.min(size - w), w.max(size - w));
-        (lo.max(0.0), hi.min(size))
-    };
-    let ((cx0, cx1), (cy0, cy1)) = (clip(fw), clip(fh));
-    if cx0 > cx1 || cy0 > cy1 {
+    let region = out.region();
+    if region.is_empty() {
         return Ok(());
     }
-    let clip = kurbo::Rect::new(cx0, cy0, cx1, cy1);
-    let Some((u0, u1)) = shown.strips(clip, w / 2.0, (w, fh - w)) else {
+    // A line as written: from `w` to `fh - w` up, half the width to each side.
+    let (y0, y1, half) = (as_written(w), as_written(fh - w), as_written(w) / 2.0);
+    if y0 == y1 {
+        return Ok(());
+    }
+    let base =
+        [(-half, y0), (half, y0), (half, y1), (-half, y1)].map(|(x, y)| kurbo::Point::new(x, y));
+    let Some((u0, u1)) = region.span(&base, kurbo::Vec2::new(1.0, 0.0)) else {
         return Ok(());
     };
-    // The lines whose `u` is in `u0..u1`.
     let step = (fw - 2.0 * w) / cells;
-    let (first, last) = if step == 0.0 {
-        if w < u0 || w > u1 {
-            return Ok(());
-        }
-        (1.0, cells - 1.0)
+    let u = |i: f64| w + step * i;
+    let at = |i: f64| as_written(u(i));
+    // The lines 1 to `cells - 1` whose `u` as written lies in `u0..=u1`: before
+    // the first, it lies on one side of the span, past the last, on the other.
+    let (lo, hi) = (1.0, cells - 1.0);
+    let (first, end) = if step >= 0.0 {
+        (
+            first_where(lo, hi, |i| at(i) >= u0),
+            first_where(lo, hi, |i| at(i) > u1),
+        )
     } else {
-        let (a, b) = ((u0 - w) / step, (u1 - w) / step);
-        (a.min(b).ceil().max(1.0), a.max(b).floor().min(cells - 1.0))
+        (
+            first_where(lo, hi, |i| at(i) <= u1),
+            first_where(lo, hi, |i| at(i) < u0),
+        )
     };
-    if first > last {
+    if first >= end {
         return Ok(());
     }
-    if last - first >= most_pieces() {
+    if end - first > most_pieces() {
         return Err(Unsupported::Coordinates);
     }
+    let wrote = |o: Option<()>| o.ok_or(Unsupported::Coordinates);
     wrote(out.stroke_state(w, &[]))?;
-    for i in 0..=(last - first) as u64 {
-        let u = w + step * (first + i as f64);
+    for k in 0..(end - first) as u64 {
+        let u = u(first + k as f64);
         wrote(out.nums(&[u, w], "m"))?;
         wrote(out.nums(&[u, fh - w], "l"))?;
         out.op("S");
     }
     Ok(())
+}
+
+/// The first whole number from `lo` to `hi` for which `holds`, which holds from
+/// some number on; `hi + 1` for none.
+fn first_where(lo: f64, hi: f64, holds: impl Fn(f64) -> bool) -> f64 {
+    let (mut lo, mut hi) = (lo, hi + 1.0);
+    while lo < hi {
+        let mid = ((lo + hi) / 2.0).floor();
+        if holds(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1.0;
+        }
+    }
+    lo
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

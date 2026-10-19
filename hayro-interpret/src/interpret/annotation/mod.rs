@@ -69,16 +69,19 @@ pub fn work_done() -> u64 {
     WORK.with(Cell::get)
 }
 
-/// Sets the most pieces one shape of repeated pieces draws where the page shows it
-/// (the steps of a squiggle, the dividers of a comb field), for appearances
-/// generated on this thread from then on: 262 144 unless set, 5 to 10 MB of
-/// content. A shape that would draw more is [`Unsupported::Coordinates`]; tests
-/// set a few to reach that with few pieces.
+/// Sets the most pieces one annotation of repeated pieces draws where the page
+/// shows it (the steps of its squiggles, the dividers of a comb field), for
+/// appearances generated on this thread from then on: 262 144 unless set, 5 to 10
+/// MB of content. An annotation that would draw more is
+/// [`Unsupported::Coordinates`]; tests set a few to reach that with few pieces. The
+/// steps of a squiggle that are looked at one by one and turn out to paint nothing
+/// count too, which only one with more steps than the most near what the page
+/// shows can reach.
 pub fn set_most_pieces(n: u32) {
     MOST_PIECES.with(|m| m.set(n));
 }
 
-/// The most pieces one shape draws ([`set_most_pieces`]).
+/// The most pieces one annotation draws ([`set_most_pieces`]).
 fn most_pieces() -> f64 {
     f64::from(MOST_PIECES.with(Cell::get))
 }
@@ -260,8 +263,13 @@ struct Annotation<'a> {
 
 /// What an annotation a page lists comes to before the area the page shows is known.
 enum Plan<'a> {
-    /// The same on every page: an appearance stream, or why it cannot be drawn.
-    Fixed(Rc<Annotation<'a>>),
+    /// The same on every page: an appearance stream, or why it cannot be drawn;
+    /// nothing on a page where the box `within`, on the page, cannot paint, if the
+    /// look has one: a stream's `/Rect`, which its box is placed on and clipped to.
+    Fixed {
+        annotation: Rc<Annotation<'a>>,
+        within: Option<kurbo::Rect>,
+    },
     /// An appearance generated for each area shown, from `annot`, read as its own
     /// the first time and as a shared object's after.
     Generate {
@@ -285,9 +293,11 @@ enum State<'a> {
 }
 
 /// What an annotation comes to before generating: an appearance stream, nothing,
-/// why it cannot be drawn, or an appearance to generate.
+/// why it cannot be drawn, or an appearance to generate. For a stream, or why it
+/// cannot be placed, also its `/Rect`, where it has one: what it paints lies in it.
 enum Prepared<'a> {
     Look(Look<'a>),
+    Placed(Look<'a>, Option<kurbo::Rect>),
     Generate,
 }
 
@@ -556,28 +566,29 @@ impl<'a> Appearances<'a> {
     fn plan(&self, listed: &Listed<'a>, selection: AnnotationSelection) -> Option<Rc<Plan<'a>>> {
         let annot = self.objects.annotation(listed)?;
         let subtype = annot.name(SUBTYPE);
-        let fixed = |look| {
-            let annotation = Annotation {
+        let fixed = |look, within| {
+            let annotation = Rc::new(Annotation {
                 look,
                 subtype: subtype.clone(),
-            };
-            Some(Rc::new(Plan::Fixed(Rc::new(annotation))))
+            });
+            Some(Rc::new(Plan::Fixed { annotation, within }))
         };
         match entries::read(|| selected(&annot, selection)) {
             Ok(true) => {}
             Ok(false) => return None,
-            Err(why) => return fixed(Look::Unsupported(why)),
+            Err(why) => return fixed(Look::Unsupported(why), None),
         }
         match entries::read(|| self.prepare(&annot)) {
-            Ok(Prepared::Look(Look::Nothing)) => None,
-            Ok(Prepared::Look(look)) => fixed(look),
+            Ok(Prepared::Look(Look::Nothing) | Prepared::Placed(Look::Nothing, _)) => None,
+            Ok(Prepared::Look(look)) => fixed(look, None),
+            Ok(Prepared::Placed(look, within)) => fixed(look, within),
             Ok(Prepared::Generate) => Some(Rc::new(Plan::Generate {
                 id: listed.id,
                 annot,
                 subtype,
                 again: Cell::new(false),
             })),
-            Err(why) => fixed(Look::Unsupported(why)),
+            Err(why) => fixed(Look::Unsupported(why), None),
         }
     }
 
@@ -591,11 +602,18 @@ impl<'a> Appearances<'a> {
         beyond: f64,
         view: View,
     ) -> Vec<Drawn<'a>> {
+        // What the page shows, grown by how far a stroke paints beyond it.
+        let region = Out::new(visible, beyond).region();
         plans
             .iter()
             .filter_map(|(index, plan)| {
                 let annotation = match &**plan {
-                    Plan::Fixed(annotation) => annotation.clone(),
+                    Plan::Fixed { annotation, within } => {
+                        if within.is_some_and(|r| !region.meets(&corners(r))) {
+                            return None;
+                        }
+                        annotation.clone()
+                    }
                     Plan::Generate { id, .. } => self.once(
                         |k| &mut k.generated,
                         Some((*id, view)),
@@ -663,14 +681,15 @@ impl<'a> Appearances<'a> {
                     _ => None,
                 };
                 if let Some(stream) = stream {
-                    return Prepared::Look(match placement(&stream, annot) {
+                    let look = match placement(&stream, annot) {
                         Ok(Some(placement)) => Look::Stream {
                             stream: stream.into_stream(),
                             placement,
                         },
                         Ok(None) => Look::Nothing,
                         Err(why) => Look::Unsupported(why),
-                    });
+                    };
+                    return Prepared::Placed(look, rect(annot));
                 }
             }
             _ => return self.not_a_dictionary(annot),
@@ -788,7 +807,8 @@ impl<'a> Appearances<'a> {
         let Some(subtype) = annot.name(SUBTYPE) else {
             return Ok(None);
         };
-        let mut out = Out::default();
+        // What cannot paint where the page shows it is not written ([`Out`]).
+        let mut out = Out::new(visible, beyond);
         let fonts = &self.fonts;
         let ok = |drew: Option<()>| Ok(drew);
         let drew = match &**subtype {
@@ -797,7 +817,7 @@ impl<'a> Appearances<'a> {
             b"Highlight" => ok(markup::highlight(annot, &mut out)),
             b"Underline" => ok(markup::text_lines(annot, markup::Line::Under, &mut out)),
             b"StrikeOut" => ok(markup::text_lines(annot, markup::Line::Through, &mut out)),
-            b"Squiggly" => markup::squiggly(annot, visible, beyond, &mut out),
+            b"Squiggly" => markup::squiggly(annot, &mut out),
             b"Ink" => ok(markup::ink(annot, &mut out)),
             b"Text" => icons::icon(annot, icons::Icon::Note, fonts, &mut out),
             b"FileAttachment" => icons::icon(annot, icons::Icon::FileAttachment, fonts, &mut out),
@@ -810,7 +830,7 @@ impl<'a> Appearances<'a> {
             b"Polygon" => lines::poly(annot, true, &mut out),
             b"PolyLine" => lines::poly(annot, false, &mut out),
             b"Widget" => match self.field(annot) {
-                Some(field) => widget::widget(annot, &field, self, visible, beyond, &mut out),
+                Some(field) => widget::widget(annot, &field, self, visible, &mut out),
                 // A widget whose /Parent chain loops is a broken field: nothing.
                 None => Ok(None),
             },
@@ -1175,4 +1195,9 @@ fn dash(annot: &Entries<'_>) -> Vec<f64> {
 fn rect(annot: &Entries<'_>) -> Option<kurbo::Rect> {
     let n = annot.numbers(RECT, 4)?;
     Some(kurbo::Rect::new(n[0], n[1], n[2], n[3]).abs())
+}
+
+/// The corners of `r`.
+fn corners(r: kurbo::Rect) -> [kurbo::Point; 4] {
+    [(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1)].map(kurbo::Point::from)
 }

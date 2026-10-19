@@ -269,7 +269,7 @@ pub(super) fn draw(
     let mut pen = Pen::new(transform, size, y, EVERYWHERE);
     let mut brush = Brush::new(None, None);
     for g in glyphs {
-        pen.put(out, x, &g.face.outline(g.id), EVERYWHERE, &mut brush)?;
+        pen.put(out, x, &g.face.outline(g.id), &mut brush)?;
         x += f64::from(g.advance) * f64::from(size);
     }
     pen.end(out);
@@ -285,13 +285,14 @@ const EVERYWHERE: Rect = Rect::new(
 );
 
 /// Writes glyphs of one size along a baseline in a frame: the frame, scaled to the
-/// size and moved to the first glyph written, once, and each glyph that can reach a
-/// clip as its form, moved along from the glyph before it ([`Out::form`]), so that
-/// a glyph costs a few bytes of content however often it is drawn. The numbers a
-/// viewer computes a glyph's place from are those written, so each must be
-/// writable; a glyph is tested by the box of its outline's points, first in the
-/// frame against a box there that holds what the clip shows ([`reaches`]), then
-/// where it lies, whose corners must be writable, as its points then are.
+/// size and moved to the first glyph written, once, and each glyph that can paint
+/// where the page shows it as its form, moved along from the glyph before it
+/// ([`Out::form`]), so that a glyph costs a few bytes of content however often it
+/// is drawn. The numbers a viewer computes a glyph's place from are those written,
+/// so each must be writable; a glyph is tested by the box of its outline's points,
+/// first in the frame against a box there that holds what the clip shows
+/// ([`reaches`]), then where it lies, against what the page shows of it under the
+/// clips written ([`Out::meets`]).
 pub(super) struct Pen {
     frame: Affine,
     size: f64,
@@ -317,18 +318,11 @@ impl Pen {
         }
     }
 
-    /// Writes the glyph of `outline` with its origin `x` across, when it can reach
-    /// `clip`, in the content's space; what `brush` holds back is set before the
-    /// first glyph written. At a size that is no number, the box's corners cannot
-    /// be written, which fails the content, wherever the glyph lies.
-    fn put(
-        &mut self,
-        out: &mut Out,
-        x: f64,
-        outline: &Outline,
-        clip: Rect,
-        brush: &mut Brush,
-    ) -> Option<()> {
+    /// Writes the glyph of `outline` with its origin `x` across, when its box can
+    /// paint where the page shows it; what `brush` holds back is set before. At a
+    /// size that is no number, the box's place cannot be told, and the glyph's
+    /// numbers cannot be written, which fails the content, wherever it lies.
+    fn put(&mut self, out: &mut Out, x: f64, outline: &Outline, brush: &mut Brush) -> Option<()> {
         let Some(form) = &outline.form else {
             return Some(());
         };
@@ -337,7 +331,20 @@ impl Pen {
         }
         let (s, y) = (self.scale, self.y);
         let at = self.frame * Affine::new([s, 0.0, 0.0, s, x, y]);
-        if !out.box_reaches(at, outline.ink, clip)? {
+        // What the brush sets is held back until a glyph is drawn ([`Out`]); the
+        // glyph is drawn where its box can paint under it.
+        if self.at.is_none() {
+            brush.ready(out)?;
+        }
+        let ink = outline.ink;
+        let corners = [
+            (ink.x0, ink.y0),
+            (ink.x1, ink.y0),
+            (ink.x1, ink.y1),
+            (ink.x0, ink.y1),
+        ]
+        .map(|(x, y)| at * kurbo::Point::new(x, y));
+        if !out.meets(&corners) {
             return Some(());
         }
         // The first glyph written is placed where it lies, not from the baseline's
@@ -350,7 +357,6 @@ impl Pen {
                 }
             }
             None => {
-                brush.ready(out)?;
                 out.op("q");
                 out.nums(&at.as_coeffs(), "cm")?;
             }
@@ -1106,8 +1112,8 @@ fn partition(n: usize, pred: impl Fn(usize) -> bool) -> usize {
 /// Draws glyphs `range` of `text` laid out at `set`, along the baseline from
 /// `(x, y)` in `frame`, each space a justified line stretches `spacing` wider: of
 /// those, only the spans and glyphs whose boxes can reach `view` across, a box in
-/// the frame, are looked at, by searches, and those drawn that reach `clip`, in the
-/// content's space. The work grows with the glyphs drawn, not with the text.
+/// the frame, are looked at, by searches, and those drawn that can paint where the
+/// page shows them ([`Pen`]). The work grows with the glyphs drawn, not with the text.
 /// `color` is the fill colour set so far.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_glyphs(
@@ -1119,7 +1125,6 @@ pub(super) fn draw_glyphs(
     spacing: f64,
     frame: Affine,
     view: Rect,
-    clip: Rect,
     out: &mut Out,
     brush: &mut Brush,
 ) -> Result<(), Unsupported> {
@@ -1170,7 +1175,7 @@ pub(super) fn draw_glyphs(
             for k in i + first..i + last {
                 work(1);
                 let g = fonts.glyph(style.face, text.chars[k])?;
-                fail(pen.put(out, pos(k), &g.face.outline(g.id), clip, brush))?;
+                fail(pen.put(out, pos(k), &g.face.outline(g.id), brush))?;
             }
             pen.end(out);
         }
@@ -1211,7 +1216,6 @@ pub(super) fn draw_line(
         0.0,
         frame,
         view,
-        seen,
         out,
         &mut Brush::new(None, Some(set.color)),
     )
@@ -1269,7 +1273,6 @@ pub(super) fn draw_rows(
                 0.0,
                 Affine::IDENTITY,
                 seen,
-                seen,
                 out,
                 &mut brush,
             )?;
@@ -1316,7 +1319,7 @@ pub(super) fn draw_comb(
     for i in cells {
         work(1);
         let g = fonts.glyph(face, text.chars[i])?;
-        fail(pen.put(out, at(i), &g.face.outline(g.id), seen, &mut brush))?;
+        fail(pen.put(out, at(i), &g.face.outline(g.id), &mut brush))?;
     }
     pen.end(out);
     Ok(())
@@ -1517,7 +1520,6 @@ pub(super) fn draw_box(
                     f64::from(spacing),
                     area.frame,
                     view,
-                    shown,
                     out,
                     &mut brush,
                 )?;
@@ -2047,8 +2049,11 @@ mod tests {
     }
 
     /// What `draw` writes: its content and the glyphs it names, or why it fails.
-    fn written(draw: impl FnOnce(&mut Out) -> Result<(), super::Unsupported>) -> String {
-        let mut out = Out::default();
+    fn written(
+        seen: Rect,
+        draw: impl FnOnce(&mut Out) -> Result<(), super::Unsupported>,
+    ) -> String {
+        let mut out = Out::new(seen, 0.0);
         let drew = draw(&mut out);
         match (drew, out.finish()) {
             (Ok(()), Ok((content, glyphs))) => {
@@ -2064,14 +2069,15 @@ mod tests {
     /// fails. Returns whether passing over took less work.
     fn same(
         case: &str,
+        seen: Rect,
         draw: impl Fn(&mut Out) -> Result<(), super::Unsupported>,
     ) -> (bool, String) {
         let before = work_done();
-        let fast = written(&draw);
+        let fast = written(seen, &draw);
         let quick = work_done() - before;
         super::EXHAUSTIVE.with(|e| e.set(true));
         let before = work_done();
-        let all = written(&draw);
+        let all = written(seen, &draw);
         let slow = work_done() - before;
         super::EXHAUSTIVE.with(|e| e.set(false));
         assert!(
@@ -2183,7 +2189,7 @@ mod tests {
         area: &TextBox,
         seen: Rect,
     ) -> (bool, String) {
-        same(case, |out| {
+        same(case, seen, |out| {
             draw_box(
                 fonts,
                 std::iter::once(Ok(text.clone())),
@@ -2246,7 +2252,7 @@ mod tests {
             };
             let seen = seen(&mut rng);
             let ascent = rng.pick(&[0.8, 0.9]);
-            let (quick, drawn) = same(&format!("case {case}"), |out| {
+            let (quick, drawn) = same(&format!("case {case}"), seen, |out| {
                 draw_box(
                     &fonts,
                     pieces.iter().cloned().map(Ok),
@@ -2412,7 +2418,7 @@ mod tests {
             let step = f64::from(1.116 * size);
             let avail = rng.pick(&[0.0, 8.0, 60.0, 190.0]);
             let pad = rng.pick(&[0.0, 2.0]);
-            let rows = same(&format!("rows {case}"), |out| {
+            let rows = same(&format!("rows {case}"), seen, |out| {
                 draw_rows(
                     &fonts,
                     &text,
@@ -2430,13 +2436,13 @@ mod tests {
                 rng.pick(&[-10.0, 20.0, 190.0]),
             );
             let frame = frame(&mut rng);
-            let line = same(&format!("line {case}"), |out| {
+            let line = same(&format!("line {case}"), seen, |out| {
                 draw_line(&fonts, &text, &set, origin, frame, seen, out)
             });
             let cell = rng.pick(&[0.0, 0.01, 7.5, 40.0, 1e5]);
             let count = text.len().min(rng.pick(&[1, 5, 30, 1000]));
             let y = rng.pick(&[-30.0, 10.0, 100.0, 195.0]);
-            let comb = same(&format!("comb {case}"), |out| {
+            let comb = same(&format!("comb {case}"), seen, |out| {
                 draw_comb(&fonts, &text, &set, count, cell, y, seen, out)
             });
             let labels: Vec<Rc<Shaped>> = (0..rng.pick(&[1, 3, 40, 300]))
@@ -2446,7 +2452,7 @@ mod tests {
                     Rc::new(fonts.shape_plain(Family::Sans, &label).unwrap())
                 })
                 .collect();
-            let options = same(&format!("options {case}"), |out| {
+            let options = same(&format!("options {case}"), seen, |out| {
                 draw_options(
                     &fonts,
                     |i| Ok(labels[i].clone()),
@@ -2485,10 +2491,10 @@ mod tests {
         let mut drew = 0;
         for shift in [-20.0, -0.5, 0.0, 7.0, 100.0, 199.0, 200.5, 230.0] {
             let top = n as f64 * step + shift;
-            let rows = same(&format!("rows {shift}"), |out| {
+            let rows = same(&format!("rows {shift}"), PAGE, |out| {
                 draw_rows(&fonts, &text, &set, 9.0, top, step, |_| 0.0, PAGE, out)
             });
-            let options = same(&format!("options {shift}"), |out| {
+            let options = same(&format!("options {shift}"), PAGE, |out| {
                 draw_options(
                     &fonts,
                     |_| Ok(label.clone()),
@@ -2511,7 +2517,7 @@ mod tests {
             let last = f64::from(cell) * word.len() as f64;
             for at in [last - 150.0, last - 0.5 * f64::from(cell), last + 3.0] {
                 let seen = Rect::new(at, 0.0, at + 200.0, 200.0);
-                let comb = same(&format!("comb {cell} at {at}"), |out| {
+                let comb = same(&format!("comb {cell} at {at}"), seen, |out| {
                     draw_comb(&fonts, &word, &set, word.len(), cell, 100.0, seen, out)
                 });
                 drew += usize::from(comb.1.contains(" Do"));
