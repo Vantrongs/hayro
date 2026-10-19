@@ -107,13 +107,13 @@ fn lines(content: &str) -> usize {
     content.lines().filter(|l| l.ends_with(" m")).count()
 }
 
-/// Comb dividers that touch are drawn as the band they cover, at a cost that does
-/// not grow with `/MaxLen`; dividers apart are drawn each, however close, each its
-/// own stroke (`MuPDF` draws lines closer than a pixel solid when they are one path,
-/// grey as in bake when stroked each), those the page shows, and a comb that would
-/// draw more than 262 144 is refused.
+/// Comb dividers are drawn each, however close, touching or overlapping, each its
+/// own stroke (`MuPDF` draws lines closer than a pixel solid when they are one path
+/// or one band, grey as in bake when stroked each), those that paint where the page
+/// shows the field under the clips they are drawn in, and a comb that would draw
+/// more than 262 144 is refused.
 #[test]
-fn comb_dividers_are_drawn_each_unless_they_touch() {
+fn comb_dividers_are_drawn_each() {
     let comb = |max_len: &str, w: &str, rect: &str| {
         let pdf = one_annotation(&format!(
             "/Subtype /Widget /FT /Tx /Ff 16777216 /MK << /BC [0] >> /MaxLen {max_len} \
@@ -130,19 +130,31 @@ fn comb_dividers_are_drawn_each_unless_they_touch() {
         }
     };
     let field = "[20 100 180 130]";
-    // The band (the border is a rectangle).
-    assert_eq!(comb("2147483647", "1", field), Ok(1));
+    // Dividers that touch (a step of the width) or overlap, each.
+    assert_eq!(comb("158", "1", field), Ok(157));
+    assert_eq!(comb("1000", "1", field), Ok(999));
+    // As many overlapping as /MaxLen less one: more than 262 144 are refused.
+    assert_eq!(
+        comb("2147483647", "1", field),
+        Err(Unsupported::Coordinates)
+    );
     // Dividers 0.001 pt wide, 0.005 pt apart, each shown: as many as /MaxLen less one.
     assert_eq!(comb("32000", "0.001", field), Ok(31_999));
     // Of a field 160 times as wide as the page, with dividers about 1 pt apart, the
-    // 199 on the page and the next.
-    assert_eq!(comb("32000", "0.001", "[0 100 32000 130]"), Ok(200));
+    // 199 on the page, the one at its edge and the next.
+    assert_eq!(comb("32000", "0.001", "[0 100 32000 130]"), Ok(201));
     assert_eq!(
         comb("100000000", "0.000001", field),
         Err(Unsupported::Coordinates)
     );
     // A field above the page shows none of its dividers, however many.
     assert_eq!(comb("1000000", "0.000001", "[20 1000 180 1030]"), Ok(0));
+    // Nor does one below it whose border is wider than it is high: the lines reach
+    // past the field up and down, onto the page, but the field's box clips them.
+    assert_eq!(
+        comb("1000000", ".00001", "[20 -.000002 180 -.000001]"),
+        Ok(0)
+    );
     // Nor does one above or beside the page, turned so that the rectangle holding
     // the page, in the field's space, reaches the field.
     for rect in ["[201 20 361 50]", "[20 201 180 231]"] {

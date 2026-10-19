@@ -17,8 +17,8 @@ use super::freetext;
 use super::out::{Color, Out};
 use super::text::{self, Align, Family, Fonts, Setting, Shaped, Style, TextBox};
 use super::{
-    Appearances, FIELD, Field, Inherited, MOST_PIECES, TEXT, TextKey, Unsupported, border_width,
-    circle, color_of, rect,
+    Appearances, FIELD, Field, Inherited, MOST_PIECES, PAINTS_BEYOND, TEXT, TextKey, Unsupported,
+    border_width, circle, color_of, rect,
 };
 use hayro_syntax::object::dict::keys::AS;
 use kurbo::{Affine, Shape};
@@ -132,11 +132,14 @@ pub(super) fn widget<'a>(
 struct Shown {
     corners: [kurbo::Point; 4],
     rect: kurbo::Rect,
+    /// [`PAINTS_BEYOND`] in the box's space, as far as it stretches there.
+    beyond: f64,
 }
 
 impl Shown {
     fn of(visible: kurbo::Rect, place: Affine) -> Self {
         let to_box = place.inverse();
+        let [a, b, c, d, _, _] = to_box.as_coeffs();
         let corners = [
             (visible.x0, visible.y0),
             (visible.x1, visible.y0),
@@ -145,7 +148,13 @@ impl Shown {
         ]
         .map(|(x, y)| to_box * kurbo::Point::new(x, y));
         let rect = (to_box * visible.to_path(0.1)).bounding_box();
-        Self { corners, rect }
+        // No direction stretches more than the matrix's Frobenius norm.
+        let beyond = PAINTS_BEYOND * (a * a + b * b + c * c + d * d).sqrt();
+        Self {
+            corners,
+            rect,
+            beyond,
+        }
     }
 
     /// The span across of what it shows between `y0` and `y1` up (`y0 <= y1`), or
@@ -582,17 +591,17 @@ fn draw<'a>(
 }
 
 /// The lines between the `cells` cells of a comb field `fw` × `fh`, inside its
-/// border of width `w`, stroked `w` wide with butt caps (line `i` covers
+/// border of width `w` (> 0), stroked `w` wide with butt caps (line `i` covers
 /// `w + step i ± w/2` across and `w..fh - w` up, `step` = `(fw - 2w) / cells`),
-/// those `shown` shows.
+/// those that paint where `shown` shows the box under the clips they are drawn in
+/// (the box, and the box inside the border), or come as close to it as a stroke
+/// paints beyond its outline.
 ///
-/// Lines that touch or overlap cover one band, drawn as one stroke as wide. Lines
-/// apart are drawn each, however close, each stroked on its own: the content can be
-/// scaled and zoomed any amount, and viewers draw several lines within a pixel solid
-/// when they are one path, or one stroke dashed `[w, step - w]` (which covers the
-/// same rectangles), where separate strokes are grey, as in bake (observed). More
-/// than [`MOST_PIECES`] lines shown are [`Unsupported::Coordinates`]. Lines of no
-/// height draw nothing.
+/// Each line is its own stroke, however close or overlapping the lines: the
+/// content can be scaled and zoomed any amount, and viewers draw lines within a
+/// pixel solid when they are one path or one band, where lines stroked each are
+/// grey, as in bake (observed). More than [`MOST_PIECES`] lines that paint are
+/// [`Unsupported::Coordinates`]. Lines of no height draw nothing.
 fn comb_dividers(
     cells: i64,
     fw: f64,
@@ -603,27 +612,42 @@ fn comb_dividers(
 ) -> Result<(), Unsupported> {
     let wrote = |o: Option<()>| o.ok_or(Unsupported::Coordinates);
     let cells = cells as f64;
-    let height = (fh - 2.0 * w).abs();
-    if cells < 2.0 || height == 0.0 {
+    if cells < 2.0 || fh - 2.0 * w == 0.0 {
         return Ok(());
     }
-    // Every line covers `w..fh - w` up: of those the page shows, those across this.
-    let Some((x0, x1)) = shown.across(w.min(fh - w), w.max(fh - w)) else {
+    // Where the lines can paint: under the box's clip and the clip to the box
+    // inside the border (`re` of negative size covers the same rectangle as its
+    // absolute), across the lines' height. Of that, what the page shows across.
+    let clip = |size: f64| {
+        let (lo, hi) = (w.min(size - w), w.max(size - w));
+        (lo.max(0.0), hi.min(size))
+    };
+    let ((cx0, cx1), (cy0, cy1)) = (clip(fw), clip(fh));
+    if cx0 > cx1 || cy0 > cy1 {
+        return Ok(());
+    }
+    let Some((x0, x1)) = shown.across(cy0, cy1) else {
         return Ok(());
     };
-    let step = (fw - 2.0 * w) / cells;
-    if step.abs() <= w {
-        // From the outer edge of the first line to that of the last.
-        let (a, b) = (w + step, w + step * (cells - 1.0));
-        wrote(out.stroke_state(height, &[]))?;
-        wrote(out.nums(&[a.min(b) - w / 2.0, fh / 2.0], "m"))?;
-        wrote(out.nums(&[a.max(b) + w / 2.0, fh / 2.0], "l"))?;
-        out.op("S");
+    let (x0, x1) = (x0.max(cx0), x1.min(cx1));
+    if x0 > x1 {
         return Ok(());
     }
-    // The lines within half a width of the visible part of the frame.
-    let first = ((x0 - 1.5 * w) / step).floor().max(1.0);
-    let last = ((x1 - 0.5 * w) / step).ceil().min(cells - 1.0);
+    // A line paints a little beyond its outline ([`PAINTS_BEYOND`]), but not beyond
+    // the clips: it paints in what they let show if it comes that close to it, and
+    // it covers their whole height.
+    let (x0, x1) = (x0 - shown.beyond, x1 + shown.beyond);
+    // The lines whose `u ± w/2` meets `x0..x1`, and one more on each side.
+    let step = (fw - 2.0 * w) / cells;
+    let (first, last) = if step == 0.0 {
+        if x0 - w / 2.0 > w || w > x1 + w / 2.0 {
+            return Ok(());
+        }
+        (1.0, cells - 1.0)
+    } else {
+        let (a, b) = ((x0 - 1.5 * w) / step, (x1 - 0.5 * w) / step);
+        (a.min(b).floor().max(1.0), a.max(b).ceil().min(cells - 1.0))
+    };
     if first > last {
         return Ok(());
     }

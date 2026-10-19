@@ -1405,7 +1405,7 @@ fn fields_inherit_through_deep_parents_and_loops_end() {
 
 /// A comb field's `/MaxLen` of no cells makes no comb, as viewers read it: the value
 /// is drawn as in a plain text field (larger ones are in `annotation_cost.rs`).
-/// Dividers that touch are drawn as the band they cover.
+/// Dividers that overlap are drawn each, as bake draws them.
 #[test]
 fn comb_cells_follow_max_len() {
     let comb = |max_len: &str| {
@@ -1426,15 +1426,24 @@ fn comb_cells_follow_max_len() {
     assert_eq!(strokes(&comb("2")), [frame, [100, 101, 100, 129]]);
     // The text over the dividers, which a border wider than a cell covers (observed).
     assert!(matches!(comb("2").last(), Some(Ev::Fill { .. })));
-    // The dividers of 1000 cells 0.158 pt apart, 1 pt wide, cover the inside; they
-    // are drawn before the text.
-    let band = comb("1000");
-    let Some(Ev::Stroke { bbox, width, .. }) =
-        band.iter().rfind(|e| matches!(e, Ev::Stroke { .. }))
-    else {
-        panic!("{band:?}");
-    };
-    assert_eq!((*bbox, *width), ([21, 115, 179, 115], 28.0), "{band:?}");
+    // The dividers of 1000 cells 0.158 pt apart, 1 pt wide, overlap: each is its
+    // own stroke, from the bottom to the top of the inside, before the text.
+    let dense = comb("1000");
+    let dividers: Vec<_> = dense
+        .iter()
+        .filter_map(|e| match e {
+            Ev::Stroke { bbox, width, .. } if *bbox != frame => Some((*bbox, *width)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dividers.len(), 999, "{dense:?}");
+    assert!(
+        dividers
+            .iter()
+            .all(|(b, w)| b[1] == 101 && b[3] == 129 && b[0] == b[2] && *w == 1.0),
+        "{dividers:?}"
+    );
+    assert!(matches!(dense.last(), Some(Ev::Fill { .. })));
 }
 
 /// A text markup quad of no height marks no text and draws nothing, as viewers draw it.
