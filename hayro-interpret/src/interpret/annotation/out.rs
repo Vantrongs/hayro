@@ -845,6 +845,8 @@ pub(super) struct Out {
     /// The glyphs drawn, each once, and their names.
     glyphs: Vec<Rc<Glyph>>,
     named: hash::Set<Rc<str>>,
+    /// How many glyph forms were drawn.
+    forms: usize,
     state: State,
     frames: Vec<Frame>,
     /// The state set since the last thing painted, held back.
@@ -898,6 +900,7 @@ impl Out {
             failed: false,
             glyphs: Vec::new(),
             named: hash::Set::default(),
+            forms: 0,
             state: State {
                 region: Region {
                     shown,
@@ -918,6 +921,11 @@ impl Out {
     }
 
     /// What the page shows of the current space, under the clips written so far.
+    /// How many glyph forms have been drawn.
+    pub(super) fn forms(&self) -> usize {
+        self.forms
+    }
+
     pub(super) fn region(&self) -> Region {
         self.state.region.clone()
     }
@@ -975,6 +983,7 @@ impl Out {
         self.content.push('/');
         self.content.push_str(&glyph.name);
         self.content.push_str(" Do\n");
+        self.forms += 1;
         if self.named.insert(glyph.name.clone()) {
             self.glyphs.push(glyph.clone());
         }

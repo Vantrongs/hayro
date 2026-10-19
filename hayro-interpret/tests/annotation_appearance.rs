@@ -3772,3 +3772,243 @@ fn words_after_long_runs_of_spaces_are_drawn_where_a_viewer_adds_them_up_or_refu
         "of 500 spaces or more, {drawn_long} drawn, {refused_long} refused"
     );
 }
+
+/// The origin of each glyph the content `c` draws, in the order drawn.
+fn glyph_places(c: &str) -> Vec<kurbo::Point> {
+    let (mut ctm, mut saved, mut out) = (Affine::IDENTITY, vec![], vec![]);
+    for line in c.lines() {
+        if line == "q" {
+            saved.push(ctm);
+        } else if line == "Q" {
+            ctm = saved.pop().unwrap();
+        } else if let Some(m) = line.strip_suffix(" cm") {
+            let m: Vec<f64> = m.split(' ').map(|n| n.parse().unwrap()).collect();
+            ctm *= Affine::new([m[0], m[1], m[2], m[3], m[4], m[5]]);
+        } else if line.ends_with(" Do") {
+            out.push(ctm * kurbo::Point::ZERO);
+        }
+    }
+    out
+}
+
+/// Asserts that `annot`, on a 400 pt page, draws its glyphs where `PyMuPDF` 1.28.2
+/// bake draws those that show: `lines`, each a baseline and the origins on it,
+/// within 1e-3, but for lines below `bottom`, which the field clips away.
+fn draws_lines_as_bake(annot: &str, lines: &[(f64, &[f64])], bottom: f64) {
+    let pdf = Pdf::new(common::one_page(
+        400,
+        "/Annots [4 0 R]",
+        vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
+    ))
+    .unwrap();
+    let page = &pdf.pages()[0];
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    let full = kurbo::Rect::new(0.0, 0.0, 400.0, 400.0);
+    let drawn = appearances.page(page, AnnotationSelection::View, &View::new(full, 1.0));
+    let Look::Generated(a) = drawn[0].look() else {
+        panic!("{annot}: not generated");
+    };
+    let got = glyph_places(&a.content);
+    let want: Vec<kurbo::Point> = lines
+        .iter()
+        .filter(|(y, _)| *y >= bottom)
+        .flat_map(|(y, xs)| xs.iter().map(|x| kurbo::Point::new(*x, *y)))
+        .collect();
+    assert_eq!(got.len(), want.len(), "{annot}: {got:?}");
+    for (g, w) in got.iter().zip(&want) {
+        assert!((*g - *w).hypot() < 1e-3, "{annot}: {g:?}, bake {w:?}");
+    }
+}
+
+/// The text of merge review 13: two words of five Courier letters at 12 pt in a
+/// box 79.2 wide, as wide as the words and the space. Viewers measure a line in
+/// 32-bit numbers and keep both words on it, as `PyMuPDF` 1.28.2 bake does; one
+/// float narrower, the second word wraps. Laying it out in 64 bits wrapped and
+/// clipped it. A field and `FreeText`, low and tall, at 89.2 and the floats next
+/// to it; the glyph origins are bake's.
+#[test]
+fn a_line_as_wide_as_its_box_stays_on_it() {
+    const ONE: &[f64] = &[10.0, 17.2, 24.4, 31.6, 38.8, 53.2, 60.4, 67.6, 74.8, 82.0];
+    const HALF: &[f64] = &[10.0, 17.2, 24.4, 31.6, 38.8];
+    for (kind, low, tall) in [
+        (
+            "/Subtype /Widget /FT /Tx /Ff 4096 /T (a) /V (AAAAA AAAAA)",
+            [22.4, 9.008],
+            [121.608, 108.216],
+        ),
+        (
+            "/Subtype /FreeText /Contents (AAAAA AAAAA)",
+            [25.4, 11.0],
+            [125.4, 111.0],
+        ),
+    ] {
+        for (top, ys) in [(35, low), (135, tall)] {
+            for (x1, wraps) in [("89.2", false), ("89.20001", false), ("89.19999", true)] {
+                let annot =
+                    format!("{kind} /Rect [10 20 {x1} {top}] /BS << /W 0 >> /DA (/Cour 12 Tf 0 g)");
+                let lines: &[(f64, &[f64])] = if wraps {
+                    &[(ys[0], HALF), (ys[1], HALF)]
+                } else {
+                    &[(ys[0], ONE)]
+                };
+                draws_lines_as_bake(&annot, lines, 20.0);
+            }
+        }
+    }
+}
+
+/// A run of spaces breaks as `PyMuPDF` 1.28.2 bake breaks it: a line takes a word
+/// and the space after it, and each space after that is a token of its own, which
+/// starts the next line when the line does not fit; spaces at a line's start are
+/// laid out on it. Left, centred and right, in fields 50 and 40 wide; the glyph
+/// origins are bake's.
+#[test]
+fn spaces_break_lines_as_viewers_break_them() {
+    let field = |rect: &str, q: i32, v: &str| {
+        format!(
+            "/Subtype /Widget /FT /Tx /Ff 4096 /T (a) /Rect [{rect}] /Q {q} /BS << /W 0 >> \
+             /DA (/Cour 12 Tf 0 g) /V ({v})"
+        )
+    };
+    let five = |x: f64| [x, x + 7.2, x + 14.4, x + 21.6, x + 28.8];
+    let two = |x: f64| [x, x + 7.2];
+    let (y0, y1, y2, y3) = (286.608, 273.216, 259.824, 246.432);
+    for (q, wide, narrow, lead) in [
+        (0, [0.0, 7.2, 0.0], [0.0, 0.0, 0.0], 0.0),
+        (1, [3.4, 10.6, 17.8], [2.0, 2.0, 12.8], 2.0),
+        (2, [6.8, 14.0, 35.6], [4.0, 4.0, 25.6], 4.0),
+    ] {
+        let annot = field("0 20 50 300", q, "AAAAA   BBBBB CC");
+        let lines: [(f64, &[f64]); 3] = [
+            (y0, &five(wide[0])),
+            (y1, &five(wide[1])),
+            (y2, &two(wide[2])),
+        ];
+        draws_lines_as_bake(&annot, &lines, 20.0);
+        // At 40, the second line holds two spaces alone.
+        let annot = field("0 20 40 300", q, "AAAAA   BBBBB CC");
+        let lines: [(f64, &[f64]); 3] = [
+            (y0, &five(narrow[0])),
+            (y2, &five(narrow[1])),
+            (y3, &two(narrow[2])),
+        ];
+        draws_lines_as_bake(&annot, &lines, 20.0);
+        // Spaces before a word that does not fit with them are a line of their own.
+        let annot = field("0 20 40 300", q, "   AAAAA BBBBB");
+        let lines: [(f64, &[f64]); 2] = [(y1, &five(lead)), (y2, &five(lead))];
+        draws_lines_as_bake(&annot, &lines, 20.0);
+    }
+}
+
+/// A field narrower than its padding centres or right-aligns its text in a room
+/// less than 0, as `PyMuPDF` 1.28.2 bake does: a field 10 wide at border width 3
+/// has a room of 10 - 12 = -2, and starts `AB` at 6 + (-2 - 14.4) / 2 = -2.2,
+/// centred, and 10 - 6 - 14.4 = -10.4, right-aligned (bake's origins); on one line
+/// and on several. Holding the room at 0 put them 1 and 2 points to the right.
+#[test]
+fn a_room_less_than_0_is_kept() {
+    for ff in ["", "/Ff 4096"] {
+        for (q, x) in [(0, 6.0), (1, -2.2), (2, -10.4)] {
+            let pdf = annotations(
+                "/Annots [4 0 R]",
+                vec![
+                    format!(
+                        "<< /Type /Annot /Subtype /Widget /FT /Tx {ff} /T (a) /Rect [0 20 10 150] \
+                         /Q {q} /BS << /W 3 >> /DA (/Cour 12 Tf 0 g) /V (AB) >>"
+                    )
+                    .into_bytes(),
+                ],
+            );
+            let Look::Generated(a) = first_look(&pdf) else {
+                panic!("{ff} {q}: {:?}", looks(&pdf));
+            };
+            let points = glyph_places(&a.content);
+            assert!(!points.is_empty(), "{ff} {q}: nothing drawn");
+            // The glyphs the clip shows lie where bake's do.
+            for p in &points {
+                let k = ((p.x - x) / 7.2).round();
+                assert!(
+                    (0.0..2.0).contains(&k) && (p.x - x - 7.2 * k).abs() < 1e-3,
+                    "{ff} {q}: {points:?}, bake from {x}"
+                );
+            }
+        }
+    }
+}
+
+/// A long line of tiny glyphs, all on the page: 13,980, 13,983 and 14,000 Courier
+/// `A`s at 0.25 pt in a field 2,400 wide on a page as wide, 0.15 pt apart. Each
+/// glyph's place is written from its run's first, and a run starts anew well
+/// before what is written for it nears 2^23, so all are drawn, as bake draws
+/// them, however long the line.
+#[test]
+fn a_long_line_of_tiny_glyphs_is_drawn_whole() {
+    for n in [13_980, 13_983, 14_000] {
+        let objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 2400 200] /Annots [4 0 R] >>".to_vec(),
+            format!(
+                "<< /Type /Annot /Subtype /Widget /FT /Tx /T (a) /Rect [0 20 2400 100] \
+                 /DA (/Cour .25 Tf 0 g) /V ({}) >>",
+                "A".repeat(n)
+            )
+            .into_bytes(),
+        ];
+        let pdf = Pdf::new(common::file(&objects, "")).unwrap();
+        let page = &pdf.pages()[0];
+        let appearances =
+            Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+        let full = kurbo::Rect::new(0.0, 0.0, 2400.0, 200.0);
+        let drawn = appearances.page(page, AnnotationSelection::View, &View::new(full, 1.0));
+        let Look::Generated(a) = drawn[0].look() else {
+            panic!("{n}: not generated");
+        };
+        let points = glyph_places(&a.content);
+        assert_eq!(points.len(), n);
+        // Bake's first origin is the padding's 2; a viewer's sum of 14,000
+        // advances lies within a few thousandths of exact.
+        for (i, p) in points.iter().enumerate() {
+            assert!(
+                (p.x - (2.0 + 0.15 * i as f64)).abs() < 0.01,
+                "{n}: glyph {i} at {}",
+                p.x
+            );
+        }
+    }
+}
+
+/// `FreeText`'s room is its box's side, each end moved in by its `/RD` entry, less
+/// four border widths, in 32-bit numbers in that order, as `PyMuPDF` 1.28.2 bake
+/// computes it: at these two boxes the room as the inner width less the padding
+/// twice differs by a float, and bake keeps `AbcW il Wq` on one line in the first
+/// and wraps it in the second.
+#[test]
+fn free_text_measures_its_room_as_viewers_do() {
+    for (x0, x1, w, rd0, rd2, lines) in [
+        ("-45.17", "27.943996", "1.1", "4.74", "1.97", 1),
+        ("0.74", "66.063995", "0.3", "1.83", "0.29", 2),
+    ] {
+        let annot = format!(
+            "/Subtype /FreeText /Rect [{x0} 20 {x1} 300] /RD [{rd0} 0 {rd2} 0] \
+             /BS << /W {w} >> /DA (/Helv 12 Tf 0 g) /Contents (AbcW il Wq)"
+        );
+        let pdf = Pdf::new(common::one_page(
+            400,
+            "/Annots [4 0 R]",
+            vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
+        ))
+        .unwrap();
+        let page = &pdf.pages()[0];
+        let appearances =
+            Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+        let full = kurbo::Rect::new(-100.0, 0.0, 400.0, 400.0);
+        let drawn = appearances.page(page, AnnotationSelection::View, &View::new(full, 1.0));
+        let Look::Generated(a) = drawn[0].look() else {
+            panic!("{annot}: not generated");
+        };
+        let mut ys: Vec<f64> = glyph_places(&a.content).iter().map(|p| p.y).collect();
+        ys.dedup();
+        assert_eq!(ys.len(), lines, "{annot}");
+    }
+}

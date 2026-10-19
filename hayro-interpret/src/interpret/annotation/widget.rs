@@ -93,10 +93,16 @@ pub(super) fn widget<'a>(
         Kind::Sig => 0,
         _ => mk.as_ref().and_then(|mk| mk.int(b"R")).unwrap_or(0),
     };
+    // The sides as viewers compute them, in 32-bit numbers: the field's room for
+    // text is measured against them to the bit ([`text::Shaped::lines`]).
+    let (width, height) = (
+        f64::from(r.x1 as f32 - r.x0 as f32),
+        f64::from(r.y1 as f32 - r.y0 as f32),
+    );
     let (fw, fh) = if matches!(rotation % 360, 90 | 270) {
-        (r.height(), r.width())
+        (height, width)
     } else {
-        (r.width(), r.height())
+        (width, height)
     };
     if !(fw > 0.0 && fh > 0.0) {
         return Ok(None);
@@ -229,8 +235,9 @@ fn draw<'a>(
             // Four points more of padding on each side, across as well as up
             // (observed).
             let by_height = fh - inset - 8.0;
-            let by_width = if em > 0.0 {
-                (fw - inset - 8.0) / em
+            let measured = caption.em();
+            let by_width = if measured > 0.0 {
+                (fw - inset - 8.0) / measured
             } else {
                 by_height
             };
@@ -340,6 +347,7 @@ fn draw<'a>(
             f64::from(top),
         );
         let area = TextBox {
+            rich: true,
             pad,
             top,
             room,
@@ -402,7 +410,10 @@ fn draw<'a>(
         out.op("Q");
         return Ok(Some(()));
     }
-    let avail = (fw - 2.0 * pad).max(0.0);
+    // The room for the text, as viewers compute it: not held at 0 where the
+    // padding is wider than the field (observed: a field 10 wide at border width
+    // 3 centres its text at 6 + (-2 - width) / 2).
+    let avail = fw - 2.0 * pad;
     let q = annot.int(b"Q").unwrap_or(0);
     let align = |width: f32| match q {
         1 => pad + (avail - width) / 2.0,
@@ -478,7 +489,7 @@ fn draw<'a>(
             let max_len = field.get(Inherited::MaxLen).int().filter(|n| *n >= 1);
             // Automatic: the field's height, or less for the text to fit across.
             let size = size.unwrap_or_else(|| {
-                let em = value.width(all.clone(), 1.0) as f32;
+                let em = value.em();
                 if em > 0.0 { fh.min(fw / em) } else { fh }
             });
             let Some(max_len) = max_len else {
@@ -528,7 +539,12 @@ fn draw<'a>(
             let em = value.width(0..value.len(), 1.0) as f32;
             let size = size.unwrap_or_else(|| {
                 let by_height = fh - 2.0 * pad;
-                let by_width = if em > 0.0 { avail / em } else { by_height };
+                let measured = value.em();
+                let by_width = if measured > 0.0 {
+                    avail / measured
+                } else {
+                    by_height
+                };
                 by_height.min(by_width).max(1.0)
             });
             let origin = (

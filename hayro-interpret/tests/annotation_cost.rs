@@ -2063,3 +2063,51 @@ fn a_glyph_far_along_its_line_is_drawn() {
         }
     }
 }
+
+/// Annotations that share a text whose lines each hold one token wider than any
+/// box, and whose paragraphs are long runs of spaces, lay out only the lines they
+/// show, each measured as viewers measure it up to the glyph that passes the room:
+/// a token is passed whole by a search, and a space after a space is a token of
+/// its own, each looked at once. `FreeText` contents and a multiline field's
+/// value, each in its own width and size.
+#[test]
+fn lines_of_huge_tokens_and_runs_of_spaces_cost_what_they_show() {
+    let huge = "W".repeat(2_000);
+    let text = format!(
+        "({} {}\\n{}\\n{} {})",
+        huge,
+        huge,
+        " ".repeat(6_000),
+        huge,
+        " ".repeat(6_000)
+    );
+    let shared = vec![text];
+    let thousandths = |i: usize| format!("{}.{:03}", 100 + i / 1000, i % 1000);
+    shared_once("", &shared, |i| {
+        format!(
+            "/Subtype /FreeText /BS << /W 0 >> /Contents 4 0 R /Rect [10 10 {} 40] \
+             /DA (/Helv {} Tf 0 g)",
+            thousandths(i),
+            thousandths(i).replace("100.", "10.")
+        )
+    });
+    shared_once("", &shared, |i| {
+        format!(
+            "/Subtype /Widget /FT /Tx /Ff 4096 /V 4 0 R /Rect [10 10 {} 40] \
+             /DA (/Helv {} Tf 0 g)",
+            thousandths(i),
+            thousandths(i).replace("100.", "10.")
+        )
+    });
+    // Starting below a run of spaces as tall as the box shows: the box shows
+    // the spaces' lines alone, each of a few dozen tokens.
+    let spaces = vec![format!("({})", " ".repeat(20_000))];
+    shared_once("", &spaces, |i| {
+        format!(
+            "/Subtype /Widget /FT /Tx /Ff 4096 /V 4 0 R /Rect [10 10 {} 40] \
+             /DA (/Helv {} Tf 0 g)",
+            thousandths(i),
+            thousandths(i).replace("100.", "10.")
+        )
+    });
+}

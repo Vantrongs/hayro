@@ -440,7 +440,20 @@ pub(super) fn line<'a>(
             } else if top {
                 0.2 * size
             } else {
-                gap = Some((mid - width / 2.0 - 3.0, mid + width / 2.0 + 3.0));
+                let (g0, g1) = (mid - width / 2.0 - 3.0, mid + width / 2.0 + 3.0);
+                // Whether the gap breaks the line, or the line is drawn whole, is
+                // told from the caption's advance, which viewers add up in their
+                // own order: where an end of the gap lies within how far that and
+                // the line's length and middle may round of an end of the line,
+                // which they draw cannot be told.
+                let margin = text::aligned(&text, 0..text.len(), SIZE, mid, len)
+                    .plus(Rounding::of(8.0, len.abs() + co[0].abs() + 3.0))
+                    .bound()
+                    .x;
+                if g0.abs() <= margin || (len - g1).abs() <= margin {
+                    return Err(Unsupported::Measure);
+                }
+                gap = Some((g0, g1));
                 -0.3 * size
             };
             caption_text = Some((text, mid - width / 2.0, rise));

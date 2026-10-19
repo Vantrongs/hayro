@@ -295,6 +295,11 @@ pub(super) fn draw(
 /// read in, each a rounding of at most the advance.
 const PER_GLYPH: f64 = 5.0;
 
+/// How far, in units of a glyph's form (1000 to the em), a glyph is written from
+/// the first of its run ([`Pen`]): 2^16, so that the number written is exact to
+/// 2^-8 of a unit, well within the 2^23 a number may reach.
+const RUN: f64 = 65_536.0;
+
 /// A clip that cuts nothing away.
 const EVERYWHERE: Rect = Rect::new(
     f64::NEG_INFINITY,
@@ -381,7 +386,17 @@ impl Pen {
         .scaled(1.0 / s);
         // The first glyph written is placed where it lies, not from the baseline's
         // origin, which may lie as far before it as the text passed over is long;
-        // each after it, in a `q`, from the first.
+        // each after it, in a `q`, from the first, as long as it lies within
+        // [`RUN`] of it, so that what is written for a glyph is bounded however
+        // long the line; one farther starts a run of its own, placed where it lies.
+        let far = |from: f64| {
+            let units = ((x - from) / s).abs();
+            units.is_nan() || units >= RUN
+        };
+        if self.at.is_some_and(far) {
+            out.op("Q");
+            self.at = None;
+        }
         out.op("q");
         match self.at {
             Some(from) => {
@@ -564,6 +579,11 @@ pub(super) struct Shaped {
     in_points: Vec<usize>,
     /// The runs of glyphs other than `' '` of each paragraph, in order.
     words: Vec<Range<usize>>,
+    /// The spaces that do not follow a glyph other than `' '` of their paragraph:
+    /// each is a token of its own where plain text breaks lines ([`Shaped::lines`]).
+    lone_spaces: usize,
+    /// The advance at size 1 as viewers measure it ([`Shaped::em`]).
+    em: f32,
     /// The box around a glyph's origin the points of every glyph lie in, in em.
     ink: Option<Rect>,
     /// The largest advance, in em, either way.
@@ -598,8 +618,26 @@ pub(super) struct LaidLine {
     pub(super) size: f32,
     /// The alignment of its paragraph, but left for the last line of a justified one.
     pub(super) align: Align,
-    /// Its advance, at the base size.
+    /// The glyphs it is aligned by: of plain text, all but the spaces after its
+    /// last word.
+    pub(super) measured: Range<usize>,
+    /// The advance of `measured` at the base size.
     pub(super) width: f64,
+    /// That advance as a viewer measures it ([`Shaped::walk`]), where the line was
+    /// laid out so; else a viewer's is within [`aligned`]'s bound of `width`.
+    pub(super) exact: Option<f32>,
+    /// Whether where viewers break it cannot be told ([`Shaped::rich_line_end`]):
+    /// what is drawn of it and of the lines after it is [`Unsupported::Measure`].
+    pub(super) uncertain: bool,
+}
+
+/// Where a plain line ends ([`Shaped::walk`]).
+struct Walked {
+    end: usize,
+    /// The end of the glyphs the line is aligned by, and their advance as viewers
+    /// measure it, where it was measured to the end.
+    measured: usize,
+    exact: Option<f32>,
 }
 
 /// Which way the advances of text laid out at a base size run.
@@ -667,6 +705,8 @@ impl Fonts {
             paragraphs: Vec::new(),
             in_points: Vec::new(),
             words: Vec::new(),
+            lone_spaces: 0,
+            em: 0.0,
             ink: None,
             widest: 0.0,
             rest: Vec::new(),
@@ -709,6 +749,7 @@ impl Fonts {
                 s.stretch.push(s.chars.len());
             }
             s.widest = s.widest.max(advance.abs());
+            s.em += g.advance;
             s.blank &= c.is_whitespace();
             s.chars.push(c);
             s.advances.push(g.advance);
@@ -774,6 +815,9 @@ impl Shaped {
             let mut w = start;
             while w < k {
                 if self.chars[w] == ' ' {
+                    if w == start || self.chars[w - 1] == ' ' {
+                        self.lone_spaces += 1;
+                    }
                     w += 1;
                     continue;
                 }
@@ -888,9 +932,18 @@ impl Shaped {
     }
 
     /// The most lines the text can be laid out in at any width: a paragraph's
-    /// lines each hold a word, but for a last one of the spaces after them.
+    /// lines each hold a word, or, of plain text, a space that follows none, but
+    /// for a last one of the spaces after them.
     fn most_lines(&self) -> usize {
-        self.words.len() + self.paragraphs.len()
+        self.words.len() + self.lone_spaces + self.paragraphs.len()
+    }
+
+    /// The advance of the text at size 1 as viewers measure it to fit plain text
+    /// to a box: each glyph's advance in em, the font's width over 1000, added in
+    /// order in 32-bit numbers (observed: the automatic size of 200 single-line and
+    /// comb fields in `PyMuPDF` 1.28.2 is the room over this sum, to the bit).
+    pub(super) fn em(&self) -> f32 {
+        self.em
     }
 
     /// The largest size in points and the largest multiple of the base size of
@@ -967,15 +1020,22 @@ impl Shaped {
         self.reaching(2 * node + 1, middle..under.end, seek, visit)
     }
 
-    /// The lines of the text at base size `base`: a paragraph's words wrapped to
-    /// fit `width` when there is one, a word wider than a line alone on its line,
-    /// overflowing it, as viewers set them. Lines are laid out as they are asked
-    /// for: each costs a search over the text's words, not a pass over them.
-    pub(super) fn lines(&self, base: f32, width: Option<f64>, align: Align) -> Lines<'_> {
+    /// The lines of the text at base size `base`, broken to fit `room` when there
+    /// is one, as viewers set them: as plain text ([`Shaped::walk`]), or, `rich`,
+    /// as viewers lay out rich text ([`Shaped::rich_line_end`]), whatever the text
+    /// was read from. Lines are laid out as they are asked for.
+    pub(super) fn lines(
+        &self,
+        base: f32,
+        room: Option<f32>,
+        align: Align,
+        rich: bool,
+    ) -> Lines<'_> {
         Lines {
             text: self,
             base,
-            width,
+            room,
+            rich,
             forward: !(self.in_multiples_any && base < 0.0),
             align,
             paragraph: 0,
@@ -1006,25 +1066,137 @@ impl Shaped {
         }
     }
 
-    /// Where the line from glyph `start` of paragraph `par` ends, and where the next
-    /// starts, broken to fit `width`.
-    fn line_end(&self, start: usize, par: Range<usize>, width: f64, base: f32) -> (usize, usize) {
-        let fits = |end: usize| self.width(start..end, base) <= width;
+    /// Where the line of plain text from glyph `start` of the paragraph ending at
+    /// `end` ends, broken to fit `room` as viewers break it (observed in
+    /// `PyMuPDF` 1.28.2, for text fields and `FreeText`, glyph for glyph in 3,900
+    /// random texts of runs of spaces and paragraph breaks, and to the bit at 800
+    /// boundaries): the paragraph is a run of tokens, each the glyphs up to a
+    /// space and that space, so that a space after another is a token of its own;
+    /// a line takes its first token, then each next one while the line up to that
+    /// token's space fits; the next line starts after it, its spaces included.
+    ///
+    /// A line fits when its advance as viewers measure it is at most `room`:
+    /// each glyph's advance in em times the size, both 32-bit numbers, added from
+    /// 0 at the line's first glyph in order in 32-bit numbers (to the bit in 640
+    /// boundary cases of Helvetica, Times and Courier at sizes from 3 to 40; a
+    /// product by 0.001 for the width, a sum of advances in em then scaled, or a
+    /// sum in 64 bits each fail 60–75% of them). Advances are not negative where
+    /// lines are broken ([`Shaped::direction`]), so the sum does not fall: the
+    /// walk stops at the first glyph past `room`, and costs the glyphs of the line
+    /// and of the next token up to that glyph, and a token whose space ends it at
+    /// once. A token wider than `room` that starts a line is passed whole by a
+    /// search of the words.
+    fn walk(&self, start: usize, end: usize, room: f32, base: f32) -> Walked {
+        let advance = |i: usize| self.advances[i] * base;
+        // The end of the glyphs other than `' '` of the token from `i`.
+        let word_end = |i: usize| {
+            if i >= end || self.chars[i] == ' ' {
+                return i;
+            }
+            let w = self.words.partition_point(|w| w.end <= i);
+            self.words.get(w).map_or(end, |w| w.end.min(end))
+        };
+        // Past its space.
+        let token_end = |i: usize| if i < end { i + 1 } else { i };
+        // Past the room, or no number.
+        let past = |y: f32| y.is_nan() || y > room;
+        let mut x = 0.0_f32;
+        let mut i = start;
+        let (mut measured, mut exact) = (start, None);
+        let mut first = true;
+        while i < end {
+            let we = word_end(i);
+            let mut y = x;
+            let mut k = i;
+            while k < we && !past(y) {
+                work(1);
+                y += advance(k);
+                k += 1;
+            }
+            if past(y) {
+                if first {
+                    // The first token is the line's however wide; its width is
+                    // not measured to the end.
+                    return Walked {
+                        end: token_end(we),
+                        measured: we,
+                        exact: None,
+                    };
+                }
+                break;
+            }
+            first = false;
+            (measured, exact) = (we, Some(y));
+            x = y;
+            i = we;
+            if i < end {
+                x += advance(i);
+                i += 1;
+            }
+        }
+        Walked {
+            end: i,
+            measured,
+            exact,
+        }
+    }
+
+    /// Where the line of rich text from glyph `start` of paragraph `par` ends, and
+    /// where the next starts, broken to fit `room`: as many words as fit, a word
+    /// wider than a line alone on it, the spaces where it breaks on neither.
+    /// Viewers lay rich text out by their own measure, which no arithmetic tried
+    /// matches to the bit, so a line fits where its advance is within `room` by
+    /// more than any sum of the glyphs' advances in 32-bit numbers may round
+    /// ([`Rounding::sum`]) and the room more than a few roundings; where it is
+    /// nearer, where it breaks cannot be told: the line is broken as its advance
+    /// says, and is uncertain ([`LaidLine::uncertain`]).
+    fn rich_line_end(
+        &self,
+        start: usize,
+        par: Range<usize>,
+        room: f32,
+        base: f32,
+    ) -> (usize, usize, bool) {
+        let room = f64::from(room);
+        let most = self.widest * f64::from(self.rest(start, base));
+        let fits = |end: usize| {
+            let width = self.width(start..end, base);
+            let n = (end - start) as f64;
+            let margin = Rounding::sum(0.0, n, most, width.abs(), PER_GLYPH)
+                .plus(Rounding::of(4.0, room.abs()))
+                .bound()
+                .x;
+            // As its advance says, and whether that may not be what viewers
+            // find: not where nothing rounds.
+            let fits = width <= room;
+            (fits, margin > 0.0 && (width - room).abs() <= margin)
+        };
         // The words of the paragraph from the one that ends after `start`.
         let first = self.words.partition_point(|w| w.end <= start);
         let after = self.words.partition_point(|w| w.start < par.end);
         if first >= after {
             // Spaces alone.
-            return (par.end, par.end);
+            return (par.end, par.end, false);
         }
-        if fits(par.end) {
-            return (par.end, par.end);
+        let (all, near) = fits(par.end);
+        if all {
+            return (par.end, par.end, near);
         }
         // The first word always; then as many more as fit.
-        let more = partition(after - first - 1, |j| fits(self.words[first + 1 + j].end));
+        let more = partition(after - first - 1, |j| fits(self.words[first + 1 + j].end).0);
         let last = first + more;
         let next = self.words.get(last + 1).filter(|w| w.start < par.end);
-        (self.words[last].end, next.map_or(par.end, |w| w.start))
+        // Untold where the paragraph, the last word taken or the next, as their
+        // advance says, may fit otherwise; the words before the last fit more
+        // surely, and those after the next fit less.
+        let untold = near
+            || (more > 0 && fits(self.words[last].end).1)
+            || next.is_some_and(|w| fits(w.end).1);
+        (
+            self.words[last].end,
+            next.map_or(par.end, |w| w.start),
+            untold,
+        )
     }
 }
 
@@ -1045,7 +1217,9 @@ struct Seek<'p> {
 pub(super) struct Lines<'s> {
     text: &'s Shaped,
     base: f32,
-    width: Option<f64>,
+    room: Option<f32>,
+    /// Whether lines break as rich text's do.
+    rich: bool,
     /// Whether no advance is negative, so that lines are broken.
     forward: bool,
     align: Align,
@@ -1084,11 +1258,18 @@ impl Iterator for Lines<'_> {
         work(1);
         let par = &text.paragraphs[self.paragraph];
         let start = self.at.unwrap_or(par.glyphs.start);
-        let (end, next) = match self.width {
-            Some(width) if self.forward && start < par.glyphs.end => {
-                text.line_end(start, par.glyphs.clone(), width, self.base)
+        let whole = (par.glyphs.end, par.glyphs.end, par.glyphs.end, None, false);
+        let (end, next, measured, exact, uncertain) = match self.room {
+            Some(room) if self.forward && start < par.glyphs.end && !self.rich => {
+                let w = text.walk(start, par.glyphs.end, room, self.base);
+                (w.end, w.end, w.measured, w.exact, false)
             }
-            _ => (par.glyphs.end, par.glyphs.end),
+            Some(room) if self.forward && start < par.glyphs.end => {
+                let (end, next, uncertain) =
+                    text.rich_line_end(start, par.glyphs.clone(), room, self.base);
+                (end, next, end, None, uncertain)
+            }
+            _ => whole,
         };
         let last = end == par.glyphs.end && next == par.glyphs.end;
         // The span that sizes and aligns a line without glyphs: its paragraph's first
@@ -1122,7 +1303,10 @@ impl Iterator for Lines<'_> {
             glyphs: start..end,
             size,
             align,
-            width: text.width(start..end, self.base),
+            measured: start..measured,
+            width: text.width(start..measured, self.base),
+            exact,
+            uncertain,
         })
     }
 }
@@ -1359,6 +1543,45 @@ pub(super) fn aligned(
         .plus(Rounding::of(4.0, x.abs() + width + room.abs()))
 }
 
+/// How a viewer computes where `line` of `text` at base size `base` starts at `x`
+/// when that is aligned in `room` by its advance: from the advance it measured
+/// in laying the line out, in a few roundings of `x`, it and `room`; else as
+/// [`aligned`] says.
+fn line_start(text: &Shaped, line: &LaidLine, base: f32, x: f64, room: f32) -> Rounding {
+    match line.exact {
+        Some(width) => Rounding::of(
+            4.0,
+            x.abs() + f64::from(width).abs() + f64::from(room).abs(),
+        ),
+        None => aligned(text, line.measured.clone(), base, x, f64::from(room)),
+    }
+}
+
+/// The starts of the lines of plain text as viewers write them: each line's
+/// start from the last's (observed: `PyMuPDF` 1.28.2 writes `dx -13.392 Td` for
+/// each line after the first), so that a viewer adds the moves up, each sum a
+/// rounding of at most the start it reaches, each move one of at most the move.
+#[derive(Default)]
+struct Moves {
+    at: f64,
+    rounding: Rounding,
+}
+
+impl Moves {
+    /// How a viewer computes the start `x` of the next line, beyond the
+    /// roundings of `x` itself.
+    fn to(&mut self, x: f64) -> Rounding {
+        let step = x - self.at;
+        if step != 0.0 {
+            self.rounding = self
+                .rounding
+                .plus(Rounding::of(2.0, x.abs().max(step.abs())));
+        }
+        self.at = x;
+        self.rounding
+    }
+}
+
 /// Draws `text` on one line, line breaks as spaces, along the baseline from
 /// `origin`, computed as `computed` says across and up, in `frame`: the glyphs that
 /// can reach `seen`, in the content's space.
@@ -1442,17 +1665,20 @@ pub(super) fn draw_rows(
         return Ok(());
     }
     let mut brush = Brush::new(None, Some(set.color));
+    let mut moves = Moves::default();
     for (j, line) in text
-        .lines(size, Some(f64::from(avail)), Align::Left)
+        .lines(size, Some(avail), Align::Left, false)
         .enumerate()
     {
         let y = baseline(j);
         let r = reach + off(j);
         let near = !(y + r < seen.y0 || y - r > seen.y1);
+        // Viewers move to each line's start from the last's ([`Moves`]).
+        let x = f64::from(align(line.exact.unwrap_or(line.width as f32)));
+        let moved = moves.to(x);
         if !skips() || (!line.glyphs.is_empty() && near) {
-            let x = f64::from(align(line.width as f32));
             let across = if by_width {
-                aligned(text, line.glyphs.clone(), size, x, f64::from(avail))
+                line_start(text, &line, size, x, avail).plus(moved)
             } else {
                 Rounding::of(2.0, x)
             };
@@ -1651,6 +1877,8 @@ pub(super) fn draw_options(
 /// before, as many as fit together in `room` (lines beyond are not drawn), in a box
 /// that `frame` maps to the content's space, under a clip to `clip`, in that space.
 pub(super) struct TextBox {
+    /// Whether lines break as rich text's do ([`Shaped::lines`]).
+    pub(super) rich: bool,
     pub(super) pad: f32,
     pub(super) top: f32,
     pub(super) room: f32,
@@ -1710,6 +1938,10 @@ pub(super) fn draw_box(
     };
     let off = |j: usize, below: f64| level(j, below).bound().x + slack;
     let mut brush = Brush::new(Some(area.clip), None);
+    let mut moves = Moves::default();
+    // Whether a line laid out so far broke where viewers may not: what is drawn
+    // from it on lies where they may not draw it.
+    let mut uncertain = false;
     let (mut height, mut filled) = (0.0_f32, f32::NEG_INFINITY);
     let mut way = None;
     let mut laid = 0_usize;
@@ -1723,7 +1955,7 @@ pub(super) fn draw_box(
             }
             way = Some(direction);
         }
-        let mut lines = text.lines(set.base, Some(f64::from(avail)), set.align);
+        let mut lines = text.lines(set.base, Some(avail), set.align, area.rich);
         let last = pieces.peek().is_none();
         // The pieces after this one, whose sizes and glyphs are within the bound.
         let later = if last {
@@ -1752,6 +1984,7 @@ pub(super) fn draw_box(
             }
         }
         for line in lines {
+            uncertain |= line.uncertain;
             let below = height + ascent * line.size;
             height += 1.2 * line.size;
             filled = filled.max(height);
@@ -1764,23 +1997,34 @@ pub(super) fn draw_box(
             let near = line.size != 0.0
                 && !line.glyphs.is_empty()
                 && !(y + reach < view.y0 || y - reach > view.y1);
+            let width = line.exact.unwrap_or(line.width as f32);
+            let x0 = match line.align {
+                Align::Left => 0.0,
+                Align::Center => (avail - width) / 2.0,
+                Align::Right => avail - width,
+                Align::Justify => 0.0,
+            };
+            let x = pad + f64::from(x0);
+            // Plain text: viewers move to each line's start from the last's.
+            let moved = if area.rich {
+                Rounding::NONE
+            } else {
+                moves.to(x)
+            };
             if near || !skips() {
-                let width = line.width as f32;
                 let spaces = text.stretched(line.glyphs.clone());
-                let (x0, spacing) = match line.align {
-                    Align::Left => (0.0, 0.0),
-                    Align::Center => ((avail - width) / 2.0, 0.0),
-                    Align::Right => (avail - width, 0.0),
-                    Align::Justify if spaces == 0 => (0.0, 0.0),
-                    Align::Justify => (0.0, ((avail - width) / spaces as f32).max(0.0)),
+                let spacing = match line.align {
+                    Align::Justify if spaces > 0 => ((avail - width) / spaces as f32).max(0.0),
+                    _ => 0.0,
                 };
-                let x = pad + f64::from(x0);
                 // A line aligned or stretched by its advance starts, or stretches,
                 // where a viewer measures it.
                 let across = match line.align {
                     Align::Left => Rounding::of(2.0, x),
-                    _ => aligned(&text, line.glyphs.clone(), set.base, x, f64::from(avail)),
-                };
+                    _ => line_start(&text, &line, set.base, x, avail),
+                }
+                .plus(moved);
+                let drawn = out.forms();
                 draw_glyphs(
                     fonts,
                     &text,
@@ -1794,6 +2038,9 @@ pub(super) fn draw_box(
                     out,
                     &mut brush,
                 )?;
+                if uncertain && out.forms() > drawn {
+                    return Err(Unsupported::Measure);
+                }
             }
             laid += 1;
             // The lines after this one lie below the top of the next, at a positive
@@ -2194,12 +2441,12 @@ mod tests {
     use super::{Align, Family, Fonts};
     use std::ops::Range;
 
-    /// The lines `n` glyphs are broken into to fit `width`, as viewers break them:
-    /// each line as many words as fit, with the spaces before each but the first; a
-    /// word wider than a line alone on its line, overflowing it. Each word is
-    /// measured as it is reached: the reference [`super::Shaped::lines`] searches
-    /// for the same lines.
-    fn breaks(
+    /// The lines `n` glyphs of rich text are broken into to fit `width`: each line
+    /// as many words as fit, with the spaces before each but the first; a word
+    /// wider than a line alone on its line, overflowing it. Each word is measured
+    /// as it is reached: the reference [`super::Shaped::lines`] searches for the
+    /// same lines.
+    fn rich_breaks(
         n: usize,
         space: impl Fn(usize) -> bool,
         advance: impl Fn(usize) -> f64,
@@ -2233,41 +2480,132 @@ mod tests {
         lines
     }
 
-    /// Lines are those the reference breaks each paragraph into, glyph for glyph:
-    /// paragraphs at LF, CR and CR LF, words wrapped, a word wider than the line
-    /// alone on its line, trailing spaces that do not fit on a line of none.
+    /// The lines `n` glyphs of plain text are broken into to fit `room`, as bake
+    /// breaks them: tokens of the glyphs up to a space and that space; a line
+    /// takes its first token, then each next while the line up to that token's
+    /// space, its advances `advance(k)` added from 0 in order in 32-bit numbers,
+    /// is at most `room`. Each sum is taken anew from the line's start.
+    fn plain_breaks(
+        n: usize,
+        space: impl Fn(usize) -> bool,
+        advance: impl Fn(usize) -> f32,
+        room: f32,
+    ) -> Vec<Range<usize>> {
+        let mut tokens = Vec::new();
+        let mut i = 0;
+        while i < n {
+            let mut j = i;
+            while j < n && !space(j) {
+                j += 1;
+            }
+            tokens.push((i, j, (j + 1).min(n)));
+            i = (j + 1).min(n);
+        }
+        let sum = |a: usize, b: usize| (a..b).fold(0.0_f32, |x, k| x + advance(k));
+        let mut lines = Vec::new();
+        let Some(&(first, _, mut end)) = tokens.first() else {
+            return std::iter::once(0..0).collect();
+        };
+        let mut start = first;
+        for &(from, word, to) in &tokens[1..] {
+            if sum(start, word) <= room {
+                end = to;
+            } else {
+                lines.push(start..end);
+                (start, end) = (from, to);
+            }
+        }
+        lines.push(start..end);
+        lines
+    }
+
+    const TEXTS: [&str; 15] = [
+        "",
+        "one",
+        "a b  c d",
+        "word\r\nnext\rthird\n\nlast",
+        "averyveryverylongword short words after it",
+        " lead",
+        "   three lead",
+        "trail  ",
+        "trail      ",
+        "\r\n",
+        "x\r",
+        "\n\r",
+        "ab cd ef gh ij kl mn op qr st uv wx yz",
+        "AAAAA   BBBBB CC",
+        "AAAAA BBBBB   CC DD",
+    ];
+
+    /// Plain lines are those the reference breaks each paragraph into, glyph for
+    /// glyph: paragraphs at LF, CR and CR LF, tokens wrapped, a token wider than
+    /// the line alone on its line, spaces after a space tokens of their own; at
+    /// rooms that are the measure of a token's end, and the number just below.
     #[test]
-    fn lines_break_as_viewers_break_them() {
+    fn plain_lines_break_as_viewers_break_them() {
         let fonts = Fonts::new(crate::InterpreterSettings::default().font_resolver);
-        let texts = [
-            "",
-            "one",
-            "a b  c d",
-            "word\r\nnext\rthird\n\nlast",
-            "averyveryverylongword short words after it",
-            " lead",
-            "trail  ",
-            "trail      ",
-            "\r\n",
-            "x\r",
-            "\n\r",
-            "ab cd ef gh ij kl mn op qr st uv wx yz",
-        ];
-        for text in texts {
+        for text in TEXTS {
+            for (family, size) in [
+                (Family::Sans, 12.0),
+                (Family::Mono, 9.7),
+                (Family::Serif, 17.25),
+            ] {
+                let shaped = fonts.shape_plain(family, text).expect("drawable");
+                let advance = |k: usize| shaped.advances[k] * size;
+                let mut rooms = vec![-1.0_f32, 0.0, 10.0, 20.0, 40.0, 1000.0];
+                for p in &shaped.paragraphs {
+                    for w in shaped.words.iter().filter(|w| p.glyphs.contains(&w.start)) {
+                        let at = (p.glyphs.start..w.end).fold(0.0_f32, |x, k| x + advance(k));
+                        rooms.extend([at, f32::from_bits(at.to_bits() - 1)]);
+                    }
+                }
+                for room in rooms {
+                    let got: Vec<Range<usize>> = shaped
+                        .lines(size, Some(room), Align::Left, false)
+                        .map(|l| l.glyphs)
+                        .collect();
+                    let mut expected = Vec::new();
+                    for p in &shaped.paragraphs {
+                        let r = p.glyphs.clone();
+                        let lines = plain_breaks(
+                            r.len(),
+                            |k| shaped.chars[r.start + k] == ' ',
+                            |k| advance(r.start + k),
+                            room,
+                        );
+                        expected.extend(
+                            lines
+                                .into_iter()
+                                .map(|l| r.start + l.start..r.start + l.end),
+                        );
+                    }
+                    assert_eq!(got, expected, "{text:?} at {room}");
+                }
+            }
+        }
+    }
+
+    /// Rich lines are those the reference breaks each paragraph into, glyph for
+    /// glyph, at rooms no line's measure lies near.
+    #[test]
+    fn rich_lines_break_by_words() {
+        let fonts = Fonts::new(crate::InterpreterSettings::default().font_resolver);
+        for text in TEXTS {
             let shaped = fonts.shape_plain(Family::Sans, text).expect("drawable");
             for width in [0.0, 10.0, 20.0, 40.0, 1000.0] {
                 let got: Vec<Range<usize>> = shaped
-                    .lines(12.0, Some(width), Align::Left)
+                    .lines(12.0, Some(width), Align::Left, true)
+                    .inspect(|l| assert!(!l.uncertain, "{text:?} at {width}"))
                     .map(|l| l.glyphs)
                     .collect();
                 let mut expected = Vec::new();
                 for p in &shaped.paragraphs {
                     let r = p.glyphs.clone();
-                    let lines = breaks(
+                    let lines = rich_breaks(
                         r.len(),
                         |k| shaped.chars[r.start + k] == ' ',
                         |k| shaped.width(r.start + k..r.start + k + 1, 12.0),
-                        width,
+                        f64::from(width),
                     );
                     expected.extend(
                         lines
@@ -2278,6 +2616,25 @@ mod tests {
                 assert_eq!(got, expected, "{text:?} at {width}");
             }
         }
+    }
+
+    /// A rich line whose measure lies within the rounding of its room cannot be
+    /// told to fit or not, and is refused; one clear of it is broken.
+    #[test]
+    fn a_rich_line_at_its_room_is_refused() {
+        let fonts = Fonts::new(crate::InterpreterSettings::default().font_resolver);
+        let shaped = fonts
+            .shape_plain(Family::Mono, "AAAAA AAAAA")
+            .expect("drawable");
+        let lines = |room: f32| -> Vec<(usize, bool)> {
+            shaped
+                .lines(12.0, Some(room), Align::Left, true)
+                .map(|l| (l.glyphs.len(), l.uncertain))
+                .collect()
+        };
+        assert!(lines(79.2)[0].1);
+        assert_eq!(lines(79.3), [(11, false)]);
+        assert_eq!(lines(79.1), [(5, false), (5, false)]);
     }
 
     /// Lines are laid out as they are asked for, each by a search: the first line of
@@ -2291,7 +2648,10 @@ mod tests {
                 .shape_plain(Family::Sans, &"ab ".repeat(n))
                 .expect("drawable");
             let before = work_done();
-            let first = shaped.lines(12.0, Some(100.0), Align::Left).next().unwrap();
+            let first = shaped
+                .lines(12.0, Some(100.0), Align::Left, false)
+                .next()
+                .unwrap();
             costs.push(work_done() - before);
             assert!(first.glyphs.len() < 30, "{n}");
         }
@@ -2519,6 +2879,7 @@ mod tests {
             };
             let avail = rng.pick(&[0.0, 8.0, 60.0, 200.0, 1000.0]);
             let area = TextBox {
+                rich: rng.below(2) == 0,
                 pad: rng.pick(&[0.0, 2.0]),
                 top: rng.pick(&[40.0, 120.0, 200.0, 200.0, 400.0, 5000.0, -20.0, -300.0]),
                 room: rng.pick(&[f32::INFINITY, f32::INFINITY, 30.0, 300.0]),
@@ -2568,6 +2929,7 @@ mod tests {
         ] {
             let inner = Rect::new(rect[0], rect[1], rect[2], rect[3]);
             let area = TextBox {
+                rich: false,
                 pad: 0.0,
                 top: inner.height() as f32,
                 room: f32::INFINITY,
@@ -2649,7 +3011,7 @@ mod tests {
             // How far below the top the last line's baseline lies, laid out as
             // `draw_box` lays it out.
             let (mut height, mut below) = (0.0_f32, 0.0_f32);
-            for line in text.lines(base, Some(f64::from(avail)), Align::Left) {
+            for line in text.lines(base, Some(avail), Align::Left, rich) {
                 below = height + 0.8 * line.size;
                 height += 1.2 * line.size;
             }
@@ -2664,6 +3026,7 @@ mod tests {
             let mut drew = 0;
             for &end in ends {
                 let area = TextBox {
+                    rich,
                     pad: 0.0,
                     top: end + below,
                     room: f32::INFINITY,

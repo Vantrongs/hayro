@@ -195,9 +195,24 @@ pub(super) fn free_text<'a>(
         clip = clip.intersect(layout.bounding_box());
     }
     // Rich text is laid out to twice the padding from the right (observed).
-    let right = if rich_size.is_some() { 2.0 * pad } else { pad };
-    let avail = (fw as f32 - pad - right).max(0.0);
+    // Plain text's room is the box's side, each end moved in by its `/RD` entry,
+    // less four border widths, in 32-bit numbers, not held at 0 (observed: to the
+    // bit at 120 boundaries with `/RD` and border widths from 0 to 3).
+    let avail = if rich_size.is_some() {
+        (fw as f32 - pad - 2.0 * pad).max(0.0)
+    } else {
+        let side = |hi: f64, rd_hi: f64, lo: f64, rd_lo: f64| {
+            (hi as f32 - rd_hi as f32) - (lo as f32 + rd_lo as f32)
+        };
+        let side = if matches!(rotate, 90 | 270) {
+            side(r.y1, rd[3], r.y0, rd[1])
+        } else {
+            side(r.x1, rd[2], r.x0, rd[0])
+        };
+        side - 2.0 * pad
+    };
     let area = TextBox {
+        rich: text.rich,
         pad,
         top: fh as f32 - pad,
         room: f32::INFINITY,
