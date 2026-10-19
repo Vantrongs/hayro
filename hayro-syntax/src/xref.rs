@@ -409,15 +409,8 @@ fn fallback_xref_map<'a>(
     let mut listed = old.listed;
     let (read, unreadable) = read_unread(&mut scan, &old.unread);
     listed.extend(read);
-    fallback_xref_map_inner(
-        data,
-        &mut scan,
-        ReaderContext::dummy(),
-        None,
-        password,
-        &listed,
-        &unreadable,
-    )
+    let walk = walk(data, &mut scan);
+    fallback_xref_map_inner(data, &walk, None, password, &listed, &unreadable)
 }
 
 /// The entries of `unread`, sorted by offset, that lead to an object read to its end,
@@ -446,29 +439,26 @@ fn read_unread(scan: &mut Scan<'_>, unread: &[Unfinished]) -> (Vec<Listed>, Vec<
     (listed, unreadable)
 }
 
-/// The table a scan of the file rebuilds, where objects in object streams are
-/// decrypted by `decryptor`, `None` until the trailer is known: a document whose
-/// trailer has /Encrypt is scanned again with its decryptor.
-///
-/// Every object the rebuild reads, an object stream it finds or a catalog a trailer
-/// names, is read as the table it rebuilds reads it, through a table of what it has
-/// found, by place ([`XRef::object_stream_at`], [`XRef::get_with`]): each body once,
-/// in its slot, and each object stream's data decoded once, cut at the next place
-/// holding a stream, however many objects the scan finds in it, entries name it or
-/// trailers name a catalog in it. The places are every header the scan finds with an
-/// object after it, and every one the old table leads to, the same for the rebuild's
-/// reads and for the rebuilt table's ([`Layout`]): so the bodies read, and the data
-/// of object streams decoded, are disjoint, whichever definitions of one number the
-/// table keeps.
-fn fallback_xref_map_inner<'a>(
-    data: &'a PdfData,
-    scan: &mut Scan<'_>,
-    mut dummy_ctx: ReaderContext<'a>,
-    decryptor: Option<Arc<Decryptor>>,
-    password: &[u8],
-    listed: &[Listed],
-    unread: &[ObjectIdentifier],
-) -> (XrefMap, Rebuilt, Option<XRefInput<'a>>) {
+/// What a scan of the file finds, which does not depend on how the document is
+/// decrypted: the objects, where their bodies start, the headers with no object after
+/// them, the dictionaries that may be trailers, the last header before a catalog, and
+/// the object streams. Found once, also for a document whose table is rebuilt again
+/// with its decryptor.
+struct Walk<'a> {
+    xref_map: XrefMap,
+    found: Vec<(ObjectIdentifier, usize)>,
+    bodies: Vec<usize>,
+    broken: Vec<ObjectIdentifier>,
+    trailer_dicts: Vec<Dict<'a>>,
+    root_ref: Option<ObjectIdentifier>,
+    object_streams: Vec<(ObjectIdentifier, usize)>,
+}
+
+/// Walks the file for [`fallback_xref_map_inner`], reading each part of it a bounded
+/// number of times with `scan`. The keys it reads of a dictionary are names, which
+/// encryption leaves as they are.
+fn walk<'a>(data: &'a PdfData, scan: &mut Scan<'_>) -> Walk<'a> {
+    let mut dummy_ctx = ReaderContext::dummy();
     let mut xref_map = hash::Map::default();
     // Each object found, in the order of the file, and where its body starts.
     let mut found = vec![];
@@ -558,7 +548,51 @@ fn fallback_xref_map_inner<'a>(
         }
     }
 
-    let listed = into_headers(listed, &found, &bodies);
+    Walk {
+        xref_map,
+        found,
+        bodies,
+        broken,
+        trailer_dicts,
+        root_ref,
+        object_streams,
+    }
+}
+
+/// The table a scan of the file rebuilds from its `walk`, where objects in object
+/// streams are decrypted by `decryptor`, `None` until the trailer is known: a
+/// document whose trailer has /Encrypt is rebuilt again with its decryptor, from the
+/// same walk.
+///
+/// Every object the rebuild reads, an object stream it finds or a catalog a trailer
+/// names, is read as the table it rebuilds reads it, through a table of what it has
+/// found, by place ([`XRef::object_stream_at`], [`XRef::get_with`]): each body once,
+/// in its slot, and each object stream's data decoded once, cut at the next place
+/// holding a stream, however many objects the scan finds in it, entries name it or
+/// trailers name a catalog in it. The places are every header the scan finds with an
+/// object after it, and every one the old table leads to, the same for the rebuild's
+/// reads and for the rebuilt table's ([`Layout`]): so the bodies read, and the data
+/// of object streams decoded, are disjoint, whichever definitions of one number the
+/// table keeps.
+fn fallback_xref_map_inner<'a>(
+    data: &'a PdfData,
+    walk: &Walk<'a>,
+    decryptor: Option<Arc<Decryptor>>,
+    password: &[u8],
+    listed: &[Listed],
+    unread: &[ObjectIdentifier],
+) -> (XrefMap, Rebuilt, Option<XRefInput<'a>>) {
+    let Walk {
+        found,
+        bodies,
+        broken,
+        root_ref,
+        ..
+    } = walk;
+    let mut xref_map = walk.xref_map.clone();
+    let object_streams = walk.object_streams.clone();
+    let trailer_dicts = walk.trailer_dicts.clone();
+    let listed = into_headers(listed, found, bodies);
     let listed = listed.as_slice();
     let layout = Layout::over(
         found
@@ -614,10 +648,10 @@ fn fallback_xref_map_inner<'a>(
         }
     }
 
-    let headers = keep_listed(&mut xref_map, &found, listed);
+    let headers = keep_listed(&mut xref_map, found, listed);
     let unreadable: Unreadable = unread
         .iter()
-        .chain(&broken)
+        .chain(broken)
         .filter(|id| !xref_map.contains_key(id))
         .copied()
         .collect();
@@ -662,10 +696,9 @@ fn fallback_xref_map_inner<'a>(
             XRefInput::TrailerDictData(trailer_dict.as_ref().map(|d| d.data()).unwrap()),
             password,
         ) {
-            let ctx = ReaderContext::new(&xref, false);
             let decryptor = xref.decryptor();
             let (patched_map, patched, _) =
-                fallback_xref_map_inner(data, scan, ctx, Some(decryptor), password, listed, unread);
+                fallback_xref_map_inner(data, walk, Some(decryptor), password, listed, unread);
             xref_map = patched_map;
             rebuilt = patched;
         }
