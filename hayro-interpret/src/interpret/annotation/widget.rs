@@ -550,7 +550,8 @@ fn comb_dividers(
     let wrote = |o: Option<()>| o.ok_or(Unsupported::Coordinates);
     let cells = cells as f64;
     let height = (fh - 2.0 * w).abs();
-    if cells < 2.0 || height == 0.0 {
+    // Every line covers `w..fh - w` up, so none shows above or below that.
+    if cells < 2.0 || height == 0.0 || shown.y1 < w.min(fh - w) || shown.y0 > w.max(fh - w) {
         return Ok(());
     }
     let step = (fw - 2.0 * w) / cells;

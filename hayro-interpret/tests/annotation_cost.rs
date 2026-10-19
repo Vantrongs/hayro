@@ -127,6 +127,8 @@ fn comb_dividers_are_drawn_each_unless_they_touch() {
         comb("100000000", "0.000001", field),
         Err(Unsupported::Coordinates)
     );
+    // A field above the page shows none of its dividers, however many.
+    assert_eq!(comb("1000000", "0.000001", "[20 1000 180 1030]"), Ok(0));
 }
 
 /// A comb field's `/MaxLen` beyond a 32-bit integer makes no comb, as viewers read
