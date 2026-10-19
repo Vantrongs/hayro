@@ -724,12 +724,17 @@ fn split_decode(decode: &[f32]) -> Option<([f32; 4], &[f32])> {
 }
 
 /// Generate triangles from a grid of points using a mapping function.
+/// The points along each side of the grid a patch is cut into.
+const GRID_SIZE: usize = 20;
+
+/// The triangles each patch is cut into.
+pub(crate) const PATCH_TRIANGLES: usize = 2 * (GRID_SIZE - 1) * (GRID_SIZE - 1);
+
 fn generate_patch_triangles<F, I>(map_coordinate: F, interpolate: I, buffer: &mut Vec<Triangle>)
 where
     F: Fn(Point) -> Point,
     I: Fn(Point) -> ColorComponents,
 {
-    const GRID_SIZE: usize = 20;
     let mut grid = vec![vec![Point::ZERO; GRID_SIZE]; GRID_SIZE];
 
     // Create grid by mapping unit square coordinates.
