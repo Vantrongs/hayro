@@ -21,7 +21,7 @@
 //! coarser.) The reference takes every piece of shapes of a few thousand, one by
 //! one; the generators find them among billions.
 
-use hayro_interpret::annotation::{Appearances, Look, Unsupported, set_most_pieces};
+use hayro_interpret::annotation::{Appearances, Look, Unsupported, View, set_most_pieces};
 use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::{AnnotationSelection, InterpreterSettings};
 use kurbo::{Affine, BezPath, Cap, Join, PathEl, Point, Rect, Shape, Stroke, StrokeOpts, Vec2};
@@ -48,7 +48,11 @@ fn look(annot: &str, visible: Rect, unit: f64) -> Result<String, Unsupported> {
     ))
     .expect("valid pdf");
     let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-    let drawn = appearances.page(&pdf.pages()[0], AnnotationSelection::View, visible, unit);
+    let drawn = appearances.page(
+        &pdf.pages()[0],
+        AnnotationSelection::View,
+        &View::new(visible, unit),
+    );
     let look = drawn
         .iter()
         .find(|d| d.index() == 0)

@@ -3,6 +3,7 @@
 // Each test crate uses a different part of this module.
 #![allow(dead_code, unused_imports)]
 
+use hayro_interpret::annotation::View;
 use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::{Context, Device, InterpreterCache, InterpreterSettings, interpret_page};
 use kurbo::{Affine, Rect};
@@ -18,6 +19,18 @@ pub(crate) fn interpret_first_page<'a>(
     settings: InterpreterSettings,
     device: &mut impl Device<'a>,
 ) {
+    let view = View::of(&pdf.pages()[0]);
+    interpret_first_page_as(pdf, settings, &view, device);
+}
+
+/// [`interpret_first_page`], with annotations as they look on the page shown as
+/// `view` says.
+pub(crate) fn interpret_first_page_as<'a>(
+    pdf: &'a Pdf,
+    settings: InterpreterSettings,
+    view: &View,
+    device: &mut impl Device<'a>,
+) {
     let page = &pdf.pages()[0];
     let (w, h) = page.render_dimensions();
     let cache = InterpreterCache::new();
@@ -28,5 +41,5 @@ pub(crate) fn interpret_first_page<'a>(
         page.xref(),
         settings,
     );
-    interpret_page(page, &mut ctx, device);
+    interpret_page(page, view, &mut ctx, device);
 }

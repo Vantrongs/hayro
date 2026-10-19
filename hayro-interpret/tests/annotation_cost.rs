@@ -7,7 +7,7 @@
 //! allocated in all ([`allocated`]).
 
 use hayro_interpret::annotation::{
-    Appearances, Drawn, Look, Unsupported, set_most_pieces, work_done,
+    Appearances, Drawn, Look, Unsupported, View, set_most_pieces, work_done,
 };
 use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::hayro_syntax::object::ObjectIdentifier;
@@ -73,7 +73,11 @@ const PAGE: kurbo::Rect = kurbo::Rect::new(0.0, 0.0, 200.0, 200.0);
 
 /// The annotations the first page of `pdf` draws as viewed on a 200 pt page.
 fn drawn<'a>(appearances: &Appearances<'a>, pdf: &'a Pdf) -> std::rc::Rc<[Drawn<'a>]> {
-    appearances.page(&pdf.pages()[0], AnnotationSelection::View, PAGE, 1.0)
+    appearances.page(
+        &pdf.pages()[0],
+        AnnotationSelection::View,
+        &View::new(PAGE, 1.0),
+    )
 }
 
 /// What the first annotation of the first page of `pdf` looks like as viewed on a
@@ -489,7 +493,7 @@ fn pages_below_one_chain_of_fields_read_each_field_once() {
             page.xref(),
             InterpreterSettings::default(),
         );
-        interpret_page(page, &mut ctx, &mut DummyDevice);
+        interpret_page(page, &View::new(PAGE, 1.0), &mut ctx, &mut DummyDevice);
     }
     let bytes = allocated() - before;
     // About 15 KiB a page; reading the whole chain for each page takes 1.7 GB.
@@ -832,8 +836,8 @@ fn a_stream_read_for_no_text_is_not_decoded() {
             Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
         let page = &pdf.pages()[0];
         let before = allocated();
-        let flattened = appearances.page(page, AnnotationSelection::Flatten, PAGE, 1.0);
-        let viewed = appearances.page(page, AnnotationSelection::View, PAGE, 1.0);
+        let flattened = appearances.page(page, AnnotationSelection::Flatten, &View::new(PAGE, 1.0));
+        let viewed = appearances.page(page, AnnotationSelection::View, &View::new(PAGE, 1.0));
         for drawn in [flattened, viewed] {
             assert!(
                 matches!(drawn.first().map(Drawn::look), Some(Look::Generated(_))),
@@ -1652,7 +1656,7 @@ fn pages_sharing_their_annotations_read_them_once() {
 fn drew<'a>(appearances: &Appearances<'a>, page: &Page<'a>, visible: kurbo::Rect) -> Drew {
     let mut drew = Drew::default();
     for d in appearances
-        .page(page, AnnotationSelection::View, visible, 1.0)
+        .page(page, AnnotationSelection::View, &View::new(visible, 1.0))
         .iter()
     {
         match d.look() {

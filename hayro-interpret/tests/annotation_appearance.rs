@@ -1,6 +1,6 @@
 //! Annotations without a usable `/AP` get an appearance generated from their entries.
 
-use hayro_interpret::annotation::{Appearances, Look, Unsupported, rect_transform};
+use hayro_interpret::annotation::{Appearances, Look, Unsupported, View, rect_transform};
 use hayro_interpret::font::GlyphRun;
 use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::hayro_syntax::object::{Array, Dict};
@@ -862,11 +862,11 @@ fn the_renderer_counts_pieces_in_its_page_unit() {
             warning_sink: Arc::new(move |_| {
                 count.fetch_add(1, Ordering::Relaxed);
             }),
-            page_unit: unit,
             ..Default::default()
         };
         let mut rec = Rec::default();
-        common::interpret_first_page(&pdf, settings, &mut rec);
+        let view = View::new(View::of(&pdf.pages()[0]).visible(), unit);
+        common::interpret_first_page_as(&pdf, settings, &view, &mut rec);
         let strokes = rec
             .0
             .iter()
@@ -884,6 +884,39 @@ fn the_renderer_counts_pieces_in_its_page_unit() {
     }
 }
 
+/// Annotations are generated for the area the caller shows, not for hayro's own
+/// page boxes: on a page without a `/MediaBox`, which hayro reads as A4 (595 pt wide)
+/// and `MuPDF` as US Letter (612 pt; `PyMuPDF` 1.28.2 renders and bakes 400 red px
+/// of this square at 1 px/pt), a caller showing Letter draws the square at x = 600,
+/// and hayro's own view leaves it out.
+#[test]
+fn annotations_are_generated_for_the_view_the_caller_shows() {
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /Resources << >> /Annots [4 0 R] >>".to_vec(),
+    ];
+    objects.push(
+        b"<< /Type /Annot /Subtype /Square /Rect [600 20 610 60] /C [1 0 0] /IC [1 0 0] \
+          /BS << /W 0 >> >>"
+            .to_vec(),
+    );
+    let pdf = Pdf::new(common::file(&objects, "")).expect("valid pdf");
+    let page = &pdf.pages()[0];
+    let letter = View::new(kurbo::Rect::new(0.0, 0.0, 612.0, 792.0), 1.0);
+    assert!(View::of(page).visible().x1 < 600.0);
+    for (view, drawn) in [(letter, true), (View::of(page), false)] {
+        let mut rec = Rec::default();
+        common::interpret_first_page_as(&pdf, InterpreterSettings::default(), &view, &mut rec);
+        let fills = rec
+            .0
+            .iter()
+            .filter(|e| matches!(e, Ev::Fill { .. }))
+            .count();
+        assert_eq!(fills > 0, drawn, "{view:?}: {:?}", rec.0);
+    }
+}
+
 /// The first page's annotations, in a file with `objects` numbered from 4.
 fn annotations(page_entries: &str, objects: Vec<Vec<u8>>) -> Pdf {
     Pdf::new(common::one_page(200, page_entries, objects)).expect("valid pdf")
@@ -897,7 +930,7 @@ const PAGE: kurbo::Rect = kurbo::Rect::new(0.0, 0.0, 200.0, 200.0);
 fn looks_of(pdf: &Pdf) -> Vec<Look<'_>> {
     let page = &pdf.pages()[0];
     let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-    let drawn = appearances.page(page, AnnotationSelection::View, PAGE, 1.0);
+    let drawn = appearances.page(page, AnnotationSelection::View, &View::new(PAGE, 1.0));
     page.raw()
         .get::<Array<'_>>(b"Annots")
         .unwrap()
@@ -1615,7 +1648,7 @@ fn entries_of_two_dictionaries_in_one_object_are_two_values() {
         let appearances =
             Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
         for i in order {
-            let drawn = appearances.page(&pages[i], VIEW, PAGE, 1.0);
+            let drawn = appearances.page(&pages[i], VIEW, &View::new(PAGE, 1.0));
             assert_eq!(drawn.len(), 1);
             assert_eq!(
                 &content(drawn[0].look()),
@@ -2054,6 +2087,78 @@ fn every_number_too_large_to_write_is_unsupported() {
             "Coordinates"
         };
         assert_eq!(looks(&pdf), [expected], "{rect} {matrix}");
+    }
+}
+
+/// An appearance stream is left out only where no viewer computing its place in
+/// 32-bit numbers puts any of it on the page, not by its `/Rect`: viewers compose its
+/// `/Matrix` and placement, and rounding the large numbers summed can land it well
+/// beside its `/Rect`. On a 200 pt page, `PyMuPDF` 1.28.2 bakes each fixture so: the
+/// `/BBox` near -8e6 under a `/Rect` at x = 201 paints 800 px at x = 192..199 (1 px/pt),
+/// with a `/Matrix` bringing it back to `/Rect` so that every number can be written
+/// too; the `/BBox` at 1e8 under a `/Rect` left of the page, 320 px at x = 0..7. Those
+/// whose placement cannot be written refuse; the writable one is drawn; with the
+/// `/BBox` at 0, nothing is baked and nothing is drawn.
+#[test]
+fn an_appearance_stream_is_left_out_only_where_no_viewer_puts_it_on_the_page() {
+    let near = "/BBox [-7999999 0 -7999998 1]";
+    let far = "/BBox [100000000 0 100000128 100]";
+    for (rect, form, expected) in [
+        ("[201 20 301 120]", near.to_owned(), "Coordinates"),
+        ("[-100 20 -2 60]", far.to_owned(), "Coordinates"),
+        (
+            "[201 20 301 120]",
+            format!("{near} /Matrix [1 0 0 1 7999999 0]"),
+            "1 0 0 rg 0 0 1 1 re f",
+        ),
+        (
+            "[210 20 310 120]",
+            format!("{near} /Matrix [1 0 0 1 7999999 0]"),
+            "1 0 0 rg 0 0 1 1 re f",
+        ),
+        ("[201 20 301 120]", "/BBox [0 0 1 1]".to_owned(), "nothing"),
+        (
+            "[-100 20 -2 60]",
+            "/BBox [0 0 128 100]".to_owned(),
+            "nothing",
+        ),
+        // Within a quarter of a point of the page a stroke still paints there.
+        (
+            "[200.2 20 300 120]",
+            "/BBox [0 0 1 1]".to_owned(),
+            "1 0 0 rg 0 0 1 1 re f",
+        ),
+        (
+            "[200.3 20 300 120]",
+            "/BBox [0 0 1 1]".to_owned(),
+            "nothing",
+        ),
+        // Far off the page, whatever a viewer rounds: nothing, though the placement
+        // cannot be written.
+        (
+            "[10000000 20 10000100 120]",
+            "/BBox [0 0 1 1]".to_owned(),
+            "nothing",
+        ),
+        ("[20 -30000000 120 -29000000]", far.to_owned(), "nothing"),
+        // A /Rect of numbers whose reading is not established is placed nowhere
+        // known: refused, not left out.
+        (
+            "[10000000000000000000000000000000000000000 20 \
+              20000000000000000000000000000000000000000 120]",
+            "/BBox [0 0 1 1]".to_owned(),
+            "Number",
+        ),
+    ] {
+        let pdf = annotations(
+            "/Annots [4 0 R]",
+            vec![
+                format!("<< /Type /Annot /Subtype /Square /Rect {rect} /AP << /N 5 0 R >> >>")
+                    .into_bytes(),
+                common::stream(&form, b"1 0 0 rg 0 0 1 1 re f"),
+            ],
+        );
+        assert_eq!(looks(&pdf), [expected], "{rect} {form}");
     }
 }
 
@@ -2869,7 +2974,11 @@ fn real_flags_are_read_as_viewers_read_them() {
         );
         let appearances =
             Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-        let drawn = appearances.page(&pdf.pages()[0], AnnotationSelection::Flatten, PAGE, 1.0);
+        let drawn = appearances.page(
+            &pdf.pages()[0],
+            AnnotationSelection::Flatten,
+            &View::new(PAGE, 1.0),
+        );
         match drawn.first().map(|d| d.look()) {
             None => Ok(false),
             Some(Look::Unsupported(why)) => Err(*why),
@@ -3336,7 +3445,7 @@ fn damaged_annots_arrays_are_read_as_bake_reads_them() {
             Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
         for selection in [VIEW, AnnotationSelection::Flatten] {
             let listed: Vec<_> = appearances
-                .page(page, selection, PAGE, 1.0)
+                .page(page, selection, &View::new(PAGE, 1.0))
                 .iter()
                 .map(|d| (d.index(), d.subtype() == Some(b"Square".as_slice())))
                 .collect();
@@ -3474,7 +3583,11 @@ fn what_reading_annotations_lost_is_told_each_time() {
             for i in order {
                 for view in [PAGE, kurbo::Rect::new(0.0, 0.0, 150.0, 150.0), PAGE] {
                     let (_, lost) = pdf.xref().watch(|| {
-                        appearances.page(&all[i], AnnotationSelection::Flatten, view, 1.0)
+                        appearances.page(
+                            &all[i],
+                            AnnotationSelection::Flatten,
+                            &View::new(view, 1.0),
+                        )
                     });
                     assert_eq!(
                         lost.map(|id| id.obj_number),

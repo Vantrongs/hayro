@@ -35,7 +35,12 @@ fn main() {
 
     // Run everything!
     let page = &pdf.pages()[0];
-    interpret_page(page, &mut context, &mut extractor);
+    interpret_page(
+        page,
+        &hayro_interpret::annotation::View::of(page),
+        &mut context,
+        &mut extractor,
+    );
 
     // Then just save all of the images!
     for (idx, img) in extractor.0.iter().enumerate() {

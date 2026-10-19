@@ -124,7 +124,22 @@ pub(super) struct Region {
     grow: f64,
     /// From the current space to the page, as written.
     ctm: Affine,
+    /// The same transforms composed with each coefficient's magnitude: of a point
+    /// `p`, `abs * |p|` bounds the magnitudes summed in computing `ctm * p`.
+    abs: Affine,
 }
+
+/// How far, relative to the magnitudes summed, a viewer computing a point's place
+/// in 32-bit numbers may put it: γ₄₀ = 40u/(1 − 40u), u = 2⁻²⁴, a bound that holds
+/// in any order of evaluation (Higham, *Accuracy and Stability of Numerical
+/// Algorithms*, 3.5). The place is a product of at most 7 affine factors
+/// (`/Matrix`, the placement, the page's translation, turn and flip, `/UserUnit`,
+/// the device scale) and the point, each product summing 3 terms: 21 roundings,
+/// and 1 to the rasterizer's grid. The placement's entries the viewer computes
+/// itself from `/Rect` and the box under `/Matrix`, in at most 8 roundings each,
+/// its translation of two terms as large as the sum: 16 more, 38 in all.
+const VIEWER_ROUNDING: f64 =
+    40.0 * 5.960_464_477_539_063e-8 / (1.0 - 40.0 * 5.960_464_477_539_063e-8);
 
 /// The axes across x and up.
 const AXES: [Vec2; 2] = [Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)];
@@ -160,6 +175,65 @@ impl Region {
     /// whose place cannot be told (it then cannot be written either).
     pub(super) fn meets(&self, points: &[Point]) -> bool {
         self.near(points, 0.0)
+    }
+
+    /// `points`, of the current space, on the page as transformed further by
+    /// `then` (each number as read), and how far, across and up, a viewer computing
+    /// in 32-bit numbers may put each from there ([`VIEWER_ROUNDING`]): the
+    /// magnitudes the transforms sum, and the page's, which its own transform to
+    /// the device sums too, twice (its translation, and the device's offset into it).
+    fn as_any_viewer_computes(&self, then: &[[f32; 6]], points: &[Point]) -> (Vec<Point>, f64) {
+        let (mut ctm, mut abs) = (self.ctm, self.abs);
+        for m in then {
+            let m = m.map(f64::from);
+            ctm *= Affine::new(m);
+            abs *= Affine::new(m.map(f64::abs));
+        }
+        let page = self
+            .shown
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .fold(0.0_f64, |m, p| m.max(p.x.abs()).max(p.y.abs()));
+        let most = points.iter().fold(0.0_f64, |m, p| {
+            let s = abs * Point::new(p.x.abs(), p.y.abs());
+            m.max(s.x).max(s.y)
+        });
+        let on_page = points.iter().map(|p| ctm * *p).collect();
+        (on_page, VIEWER_ROUNDING * (most + 2.0 * page))
+    }
+
+    /// Whether what a form placed by `placement` paints (its box, clipped, after
+    /// its matrix and transform, each number as a viewer reads it, whether or not
+    /// it can be written) may meet what shows grown, wherever a viewer computing in
+    /// 32-bit numbers puts it: false only where no such viewer can put any of it
+    /// there. Also true where a number is none.
+    pub(super) fn may_show_form(&self, placement: &super::Placement) -> bool {
+        let Some(shown) = &self.shown else {
+            return true;
+        };
+        if shown.is_empty() {
+            return false;
+        }
+        let [x0, y0, x1, y1] = placement.bbox.map(f64::from);
+        let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(|(x, y)| Point::new(x, y));
+        let (page, r) =
+            self.as_any_viewer_computes(&[placement.transform, placement.matrix], &corners);
+        if !(r.is_finite() && page.iter().all(|p| p.is_finite())) {
+            return true;
+        }
+        Self::axes(shown).chain(sides(&page)).all(|n| {
+            let (g0, g1) = self.extent(shown, n);
+            let (p0, p1) = along(page.iter().copied(), n);
+            let r = r * (n.x.abs() + n.y.abs());
+            p1 + r >= g0 && p0 - r <= g1
+        })
+    }
+
+    /// Transformed by `m`, which a `cm` writes.
+    fn transform(&mut self, m: Affine) {
+        self.ctm *= m;
+        self.abs *= Affine::new(m.as_coeffs().map(f64::abs));
     }
 
     /// Whether the convex hull of `points`, in the current space, may come within
@@ -574,6 +648,7 @@ impl Out {
                     shown,
                     grow,
                     ctm: Affine::IDENTITY,
+                    abs: Affine::IDENTITY,
                 },
                 width: 1.0,
             },
@@ -756,7 +831,7 @@ impl Out {
             Kind::Transforms | Kind::Width | Kind::Sets => {
                 if let (Kind::Transforms, [a, b, c, d, e, f]) = (&kind, values) {
                     let m = Affine::new([*a, *b, *c, *d, *e, *f]);
-                    self.state.region.ctm *= m;
+                    self.state.region.transform(m);
                 }
                 if let (Kind::Width, [w]) = (&kind, values) {
                     self.state.width = *w;

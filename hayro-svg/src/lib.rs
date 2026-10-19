@@ -87,7 +87,12 @@ pub fn convert<'a>(
     let mut device = SvgRenderer::new(page, render_settings.clone());
     device.write_header(page.render_dimensions());
 
-    interpret_page(page, &mut state, &mut device);
+    interpret_page(
+        page,
+        &hayro_interpret::annotation::View::of(page),
+        &mut state,
+        &mut device,
+    );
 
     device.finish()
 }

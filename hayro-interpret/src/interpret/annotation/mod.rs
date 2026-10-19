@@ -264,11 +264,14 @@ struct Annotation<'a> {
 /// What an annotation a page lists comes to before the area the page shows is known.
 enum Plan<'a> {
     /// The same on every page: an appearance stream, or why it cannot be drawn;
-    /// nothing on a page where the box `within`, on the page, cannot paint, if the
-    /// look has one: a stream's `/Rect`, which its box is placed on and clipped to.
+    /// nothing on a page where the stream, `placed` as a viewer reads its numbers
+    /// (written or not), can paint nothing, wherever a viewer computing in 32-bit
+    /// numbers puts it ([`out::Region::may_show_form`]). A look without a
+    /// placement, such as a stream on an annotation without a `/Rect`, or one
+    /// whose flags cannot be read, is the same on every page.
     Fixed {
         annotation: Rc<Annotation<'a>>,
-        within: Option<kurbo::Rect>,
+        placed: Option<Placement>,
     },
     /// An appearance generated for each area shown, from `annot`, read as its own
     /// the first time and as a shared object's after.
@@ -294,22 +297,63 @@ enum State<'a> {
 
 /// What an annotation comes to before generating: an appearance stream, nothing,
 /// why it cannot be drawn, or an appearance to generate. For a stream, or why it
-/// cannot be placed, also its `/Rect`, where it has one: what it paints lies in it.
+/// cannot be placed, also where it lands as a viewer reads its numbers, where it
+/// has a `/Rect` ([`placement`]).
 enum Prepared<'a> {
     Look(Look<'a>),
-    Placed(Look<'a>, Option<kurbo::Rect>),
+    Placed(Look<'a>, Option<Placement>),
     Generate,
 }
 
 /// The annotations a page lists that may draw, each with its place in `/Annots`.
 type Plans<'a> = Rc<[(usize, Rc<Plan<'a>>)]>;
 
-/// The area a page shows and the points of its unit, as a key: their bits.
-type View = [u64; 5];
-
-fn view(visible: kurbo::Rect, unit: f64) -> View {
-    [visible.x0, visible.y0, visible.x1, visible.y1, unit].map(f64::to_bits)
+/// What a caller shows of a page: the area, in default user space, and the points
+/// of one unit of that space. Annotations are generated for it, and what cannot
+/// paint in the area is left out, so the caller that decides what is shown, and
+/// clips the page to it, makes the one `View` it draws and generates with: a
+/// renderer or writer with page boxes of its own passes them ([`View::new`]), and
+/// one that draws by hayro's boxes takes [`View::of`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct View {
+    visible: kurbo::Rect,
+    unit: f64,
 }
+
+impl View {
+    /// A page showing `visible` of its default user space, whose unit is `unit`
+    /// points: the page's `/UserUnit` where the caller draws the page in points, 1
+    /// where it draws it in its own units, as hayro does.
+    pub fn new(visible: kurbo::Rect, unit: f64) -> Self {
+        Self { visible, unit }
+    }
+
+    /// The page as hayro shows it: its crop box within its media box (A4 where it
+    /// has none, [`hayro_syntax::page::A4`]), in its own units.
+    pub fn of(page: &Page<'_>) -> Self {
+        use crate::util::RectExt;
+        Self::new(page.intersected_crop_box().to_kurbo(), 1.0)
+    }
+
+    /// The area shown, in default user space.
+    pub fn visible(&self) -> kurbo::Rect {
+        self.visible
+    }
+
+    /// The points of one unit of default user space.
+    pub fn unit(&self) -> f64 {
+        self.unit
+    }
+
+    /// The view as a key: the bits of its numbers.
+    fn key(&self) -> ViewKey {
+        let v = self.visible;
+        [v.x0, v.y0, v.x1, v.y1, self.unit].map(f64::to_bits)
+    }
+}
+
+/// A [`View`] as a key.
+type ViewKey = [u64; 5];
 
 /// Whether `annot` is drawn as `selection` says (PDF 32000-1 12.5.3), by its flags
 /// (`/F`), read as a number.
@@ -359,12 +403,12 @@ struct Known<'a> {
     /// `None` for one that draws nothing on any page.
     plans: Kept<(Id<'a>, AnnotationSelection), Option<Rc<Plan<'a>>>>,
     /// The appearances generated, by annotation and area shown.
-    generated: Kept<(Id<'a>, View), Option<Rc<Annotation<'a>>>>,
+    generated: Kept<(Id<'a>, ViewKey), Option<Rc<Annotation<'a>>>>,
     /// Of each `/Annots` array, an object or written in a page, by selection, the
     /// annotations it lists that may draw, each with its place.
     lists: Kept<(Id<'a>, AnnotationSelection), Plans<'a>>,
     /// What a page draws, by its `/Annots` array, the selection and the area shown.
-    pages: Kept<(Id<'a>, AnnotationSelection, View), Rc<[Drawn<'a>]>>,
+    pages: Kept<(Id<'a>, AnnotationSelection, ViewKey), Rc<[Drawn<'a>]>>,
     /// The states `/AS` entries held in objects of their own name, by the
     /// dictionary of states and the entry ([`Appearances::state`]).
     states: Kept<(ContentKey<'a>, Source<'a>), State<'a>>,
@@ -487,17 +531,17 @@ impl<'a> Appearances<'a> {
     }
 
     /// The annotations of `page` that `selection` draws and that draw something or
-    /// cannot be drawn, in the order of its `/Annots`, as they look on a page that
-    /// shows `visible` (in default user space, whose unit is `unit` points: the
-    /// page's `/UserUnit`, 1 for a page drawn in its own units) of them, with text
-    /// in the fonts of these appearances. An entry of `/Annots` that names no dictionary names no
-    /// annotation; one whose flags cannot be read as viewers read them cannot be
-    /// drawn ([`Unsupported::Number`]).
+    /// cannot be drawn, in the order of its `/Annots`, as they look on a page shown
+    /// as `view` says, with text in the fonts of these appearances. An entry of
+    /// `/Annots` that names no dictionary names no annotation; one whose flags
+    /// cannot be read as viewers read them cannot be drawn ([`Unsupported::Number`]).
     ///
     /// The normal appearance is `/AP /N`, or, when that is a dictionary of states, the
     /// state `/AS` names. A stream there draws when it has a `/BBox` that, after its
     /// `/Matrix`, has some area, and nothing otherwise; without a `/Rect` it cannot
-    /// be drawn ([`placement`]).
+    /// be drawn ([`placement`]). It is left out of a page where no viewer computing
+    /// its place in 32-bit numbers puts any of it in the area shown, whether it can
+    /// be drawn or not; elsewhere it is drawn, or the page cannot be.
     /// An `/AP` that is not a dictionary, or refers to no object, draws nothing, but on a
     /// button widget, which viewers draw anew. Without an appearance there
     /// (no `/AP`, no `/N`, no stream for the state), one is generated from the
@@ -512,13 +556,13 @@ impl<'a> Appearances<'a> {
         &self,
         page: &Page<'a>,
         selection: AnnotationSelection,
-        visible: kurbo::Rect,
-        unit: f64,
+        view: &View,
     ) -> Rc<[Drawn<'a>]> {
         let Some(annots) = self.objects.annots(page.raw()) else {
             return Rc::from([]);
         };
-        let view = view(visible, unit);
+        let View { visible, unit } = *view;
+        let view = view.key();
         // A page of no size, or of none that is a number, shows no piece more than
         // what lies in it.
         let beyond = if unit.abs() > 0.0 && unit.is_finite() {
@@ -566,12 +610,12 @@ impl<'a> Appearances<'a> {
     fn plan(&self, listed: &Listed<'a>, selection: AnnotationSelection) -> Option<Rc<Plan<'a>>> {
         let annot = self.objects.annotation(listed)?;
         let subtype = annot.name(SUBTYPE);
-        let fixed = |look, within| {
+        let fixed = |look, placed| {
             let annotation = Rc::new(Annotation {
                 look,
                 subtype: subtype.clone(),
             });
-            Some(Rc::new(Plan::Fixed { annotation, within }))
+            Some(Rc::new(Plan::Fixed { annotation, placed }))
         };
         match entries::read(|| selected(&annot, selection)) {
             Ok(true) => {}
@@ -581,7 +625,7 @@ impl<'a> Appearances<'a> {
         match entries::read(|| self.prepare(&annot)) {
             Ok(Prepared::Look(Look::Nothing) | Prepared::Placed(Look::Nothing, _)) => None,
             Ok(Prepared::Look(look)) => fixed(look, None),
-            Ok(Prepared::Placed(look, within)) => fixed(look, within),
+            Ok(Prepared::Placed(look, placed)) => fixed(look, placed),
             Ok(Prepared::Generate) => Some(Rc::new(Plan::Generate {
                 id: listed.id,
                 annot,
@@ -600,7 +644,7 @@ impl<'a> Appearances<'a> {
         plans: &[(usize, Rc<Plan<'a>>)],
         visible: kurbo::Rect,
         beyond: f64,
-        view: View,
+        view: ViewKey,
     ) -> Vec<Drawn<'a>> {
         // What the page shows, grown by how far a stroke paints beyond it.
         let region = Out::new(visible, beyond).region();
@@ -608,8 +652,8 @@ impl<'a> Appearances<'a> {
             .iter()
             .filter_map(|(index, plan)| {
                 let annotation = match &**plan {
-                    Plan::Fixed { annotation, within } => {
-                        if within.is_some_and(|r| !region.meets(&corners(r))) {
+                    Plan::Fixed { annotation, placed } => {
+                        if placed.is_some_and(|p| !region.may_show_form(&p)) {
                             return None;
                         }
                         annotation.clone()
@@ -681,7 +725,8 @@ impl<'a> Appearances<'a> {
                     _ => None,
                 };
                 if let Some(stream) = stream {
-                    let look = match placement(&stream, annot) {
+                    let (placed, read) = placement(&stream, annot);
+                    let look = match placed {
                         Ok(Some(placement)) => Look::Stream {
                             stream: stream.into_stream(),
                             placement,
@@ -689,7 +734,7 @@ impl<'a> Appearances<'a> {
                         Ok(None) => Look::Nothing,
                         Err(why) => Look::Unsupported(why),
                     };
-                    return Prepared::Placed(look, rect(annot));
+                    return Prepared::Placed(look, read);
                 }
             }
             _ => return self.not_a_dictionary(annot),
@@ -750,14 +795,34 @@ impl<'a> Appearances<'a> {
 /// `/BBox` that, after its `/Matrix`, encloses some area; [`Unsupported::Coordinates`]
 /// when one of its numbers cannot be written, and when the annotation has no
 /// `/Rect` that is an array, where viewers place the box on one from about 2^31 to
-/// -2^31 (observed in `PyMuPDF` 1.28.2 bake), too large to write.
+/// -2^31 (observed in `PyMuPDF` 1.28.2 bake), too large to write. Also where it
+/// lands as a viewer reads each number, a 32-bit number, whether or not it can be
+/// written; `None` without a `/BBox` or a `/Rect`.
 fn placement(
     stream: &StreamEntries<'_>,
     annot: &Entries<'_>,
-) -> Result<Option<Placement>, Unsupported> {
+) -> (Result<Option<Placement>, Unsupported>, Option<Placement>) {
     let Some((bbox, matrix)) = box_and_matrix(&stream.dict()) else {
-        return Ok(None);
+        return (Ok(None), None);
     };
+    let read = rect(annot).map(|rect| {
+        let (bbox, matrix) = (bbox.map(|v| v as f32), matrix.map(|v| v as f32));
+        let transform = rect_transform(rect, bbox, Affine::new(matrix.map(f64::from)));
+        Placement {
+            bbox,
+            matrix,
+            transform: transform.as_coeffs().map(|v| v as f32),
+        }
+    });
+    (written_placement(bbox, matrix, annot), read)
+}
+
+/// [`placement`]'s placement, of a stream with `/BBox` `bbox` and `/Matrix` `matrix`.
+fn written_placement(
+    bbox: [f64; 4],
+    matrix: [f64; 6],
+    annot: &Entries<'_>,
+) -> Result<Option<Placement>, Unsupported> {
     let bbox = written_all(bbox)?;
     let matrix = written_all(matrix)?;
     let affine = Affine::new(matrix.map(f64::from));
@@ -1195,9 +1260,4 @@ fn dash(annot: &Entries<'_>) -> Vec<f64> {
 fn rect(annot: &Entries<'_>) -> Option<kurbo::Rect> {
     let n = annot.numbers(RECT, 4)?;
     Some(kurbo::Rect::new(n[0], n[1], n[2], n[3]).abs())
-}
-
-/// The corners of `r`.
-fn corners(r: kurbo::Rect) -> [kurbo::Point; 4] {
-    [(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1)].map(kurbo::Point::from)
 }

@@ -11,7 +11,7 @@ use crate::interpret::state::{TextStateFont, handle_gs};
 use crate::interpret::text::TextRenderingMode;
 use crate::pattern::{Pattern, ShadingPattern};
 use crate::shading::Shading;
-use crate::util::{OptionLog, RectExt};
+use crate::util::OptionLog;
 use crate::x_object::{FormXObject, ImageXObject, XObject};
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
@@ -103,12 +103,6 @@ pub struct InterpreterSettings {
     pub render_annotations: bool,
     /// Which annotations are drawn.
     pub annotations: AnnotationSelection,
-    /// The points of one unit of the page's space: its `/UserUnit` where the caller
-    /// draws the page in points, 1 (the default) where it draws the page in its own
-    /// units, as hayro does. Generated annotations count the pieces they draw by
-    /// how far a stroke paints beyond its outline on the page
-    /// ([`annotation::Appearances::page`]).
-    pub page_unit: f64,
 }
 
 /// Which annotations a page is drawn with (PDF 32000-1 12.5.3).
@@ -139,7 +133,6 @@ impl Default for InterpreterSettings {
             warning_sink: Arc::new(|_| {}),
             render_annotations: true,
             annotations: AnnotationSelection::View,
-            page_unit: 1.0,
         }
     }
 }
@@ -159,9 +152,12 @@ pub enum InterpreterWarning {
     UnsupportedAnnotation,
 }
 
-/// interpret the contents of the page and render them into the device.
+/// interpret the contents of the page and render them into the device, with its
+/// annotations as they look on the page shown as `view` says: the view the caller
+/// clips the page to ([`annotation::View`]).
 pub fn interpret_page<'a>(
     page: &Page<'a>,
+    view: &annotation::View,
     context: &mut Context<'a>,
     device: &mut impl Device<'a>,
 ) {
@@ -175,13 +171,7 @@ pub fn interpret_page<'a>(
             context.settings.font_resolver.clone(),
             context.interpreter_cache.annotation_fields.clone(),
         );
-        let visible = page.intersected_crop_box().to_kurbo();
-        let drawn = appearances.page(
-            page,
-            context.settings.annotations,
-            visible,
-            context.settings.page_unit,
-        );
+        let drawn = appearances.page(page, context.settings.annotations, view);
         for annot in drawn.iter() {
             match annot.look() {
                 annotation::Look::Stream { stream, placement } => {

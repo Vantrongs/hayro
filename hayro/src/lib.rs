@@ -38,11 +38,12 @@ use hayro_interpret::Device;
 use hayro_interpret::FillRule;
 use hayro_interpret::InterpreterCache;
 use hayro_interpret::InterpreterSettings;
+use hayro_interpret::annotation::View;
 use hayro_interpret::font::GlyphRun;
 use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::hayro_syntax::hash;
 use hayro_interpret::hayro_syntax::page::Page;
-use hayro_interpret::util::{RectExt, TransformExt};
+use hayro_interpret::util::TransformExt;
 use hayro_interpret::{BlendMode, Context, DrawMode, DrawProps, ImageDrawProps, SoftMask};
 use hayro_interpret::{ClipPath, interpret_page};
 use kurbo::{Affine, BezPath, Rect, Shape};
@@ -295,14 +296,16 @@ pub fn render_into<'a>(
 
     let global = GlobalState::new(cache, render_settings);
     let mut device = Renderer::new(ctx, &global);
-    let mut clip_path = page.intersected_crop_box().to_kurbo().to_path(0.1);
+    // One view for the clip and the annotations: hayro's own page boxes.
+    let view = View::of(page);
+    let mut clip_path = view.visible().to_path(0.1);
     clip_path.apply_affine(transform);
     device.push_clip_path(&ClipPath {
         path: clip_path,
         fill: FillRule::NonZero,
     });
 
-    interpret_page(page, &mut state, &mut device);
+    interpret_page(page, &view, &mut state, &mut device);
 
     device.pop_clip();
 }

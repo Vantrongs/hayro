@@ -57,7 +57,12 @@ fn main() {
         extractor.dimensions.1
     ).unwrap();
 
-    interpret_page(page, &mut context, &mut extractor);
+    interpret_page(
+        page,
+        &hayro_interpret::annotation::View::of(page),
+        &mut context,
+        &mut extractor,
+    );
 
     writeln!(extractor.text, "</div>").unwrap();
 
