@@ -622,6 +622,13 @@ pub fn interpret<'a>(
 
                 text::show_text_string(context, device, resources, s.0);
             }
+            // An array with an entry that is neither a number nor a string draws
+            // nothing and moves the text on by nothing, as `MuPDF` (`PyMuPDF` 1.28.2)
+            // draws it.
+            TypedInstruction::ShowTexts(s)
+                if s.0
+                    .iter::<Object<'_>>()
+                    .any(|o| !matches!(o, Object::Number(_) | Object::String(_))) => {}
             TypedInstruction::ShowTexts(s) => {
                 if context.get().text_state.font.is_none() {
                     // Even if no explicit font was set, we try to assume Helvetica. Acrobat
@@ -634,8 +641,6 @@ pub fn interpret<'a>(
                 }
 
                 text::begin_glyph_run(context);
-                // An entry that is neither a number nor a string is passed over;
-                // `MuPDF` (`PyMuPDF` 1.28.2) draws nothing of such an array.
                 for obj in s.0.iter::<Object<'_>>() {
                     match obj {
                         Object::Number(num) => {

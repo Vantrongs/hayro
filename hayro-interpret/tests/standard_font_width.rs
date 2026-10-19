@@ -36,11 +36,16 @@ impl<'a> Device<'a> for Rec {
 /// Where `text` places its glyphs in 10-point Helvetica, drawn by Liberation Sans,
 /// with `differences`.
 fn placed(text: &str, differences: &str) -> Vec<f64> {
+    shown(&format!("{text} Tj"), differences)
+}
+
+/// Where the text operators `ops` place their glyphs, as [`placed`].
+fn shown(ops: &str, differences: &str) -> Vec<f64> {
     let file = common::one_page(
         100,
         "/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >>",
         vec![
-            common::stream("", format!("BT /F1 10 Tf 0 50 Td {text} Tj ET").as_bytes()),
+            common::stream("", format!("BT /F1 10 Tf 0 50 Td {ops} ET").as_bytes()),
             format!(
                 "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << \
                  /Differences {differences} >> >>"
@@ -86,4 +91,20 @@ fn an_entry_of_the_differences_that_is_no_name_takes_no_code() {
     ] {
         assert_eq!(placed("(ABC)", differences), expected, "{differences}");
     }
+}
+
+/// A `TJ` array with an entry that is neither a number nor a string draws nothing
+/// and moves the text on by nothing, and the text after it is drawn, as `MuPDF`
+/// draws it (`PyMuPDF` 1.28.2: `[(AB) null (CD)] TJ (EF) Tj` draws EF where it
+/// would stand alone; so with `true`, `truefoo`, a name, an array or a dictionary).
+#[test]
+fn a_text_array_with_an_entry_of_another_kind_draws_nothing() {
+    let none = "[]";
+    let alone = shown("(EF) Tj", none);
+    assert_eq!(alone.len(), 2);
+    for entry in ["null", "true", "truefoo", "/N", "[1]", "<< >>"] {
+        let ops = format!("[(AB) {entry} (CD)] TJ (EF) Tj");
+        assert_eq!(shown(&ops, none), alone, "{entry}");
+    }
+    assert_eq!(shown("[(AB) -100 (CD)] TJ (EF) Tj", none).len(), 6);
 }
