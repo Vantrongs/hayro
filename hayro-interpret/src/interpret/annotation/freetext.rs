@@ -34,13 +34,15 @@ pub(super) fn free_text<'a>(
     out: &mut Out,
 ) -> Result<Option<()>, Unsupported> {
     // Without a box, viewers draw over coordinates of ±2^32.
-    let r = rect(annot).ok_or(Unsupported::Coordinates)?;
-    // The box: `/Rect` with each side moved in by its `/RD` entry (left, bottom,
-    // right, top; 0 for one it lacks or that is not a number), as given, negative
-    // or not; one this turns inside out is laid out as it is, its width or height
-    // negative, as viewers lay it out.
-    let rd = annot.numbers(b"RD", 4).unwrap_or_else(|| vec![0.0; 4]);
-    let inner = kurbo::Rect::new(r.x0 + rd[0], r.y0 + rd[1], r.x1 - rd[2], r.y1 - rd[3]);
+    let Boxes {
+        r,
+        rd,
+        inner,
+        w,
+        callout,
+        cl,
+        clip,
+    } = boxes(annot).ok_or(Unsupported::Coordinates)?;
     let (family, size, da_color) = doc.default_appearance(Some(annot.source(b"DA")), || {
         annot.text(Text::DefaultAppearance)
     });
@@ -91,29 +93,7 @@ pub(super) fn free_text<'a>(
     // Rich text is laid out in a box of its own, sized by the default appearance's.
     let rich_size = text.rich.then(|| size.unwrap_or(0.0));
     let ascent = if text.rich { RICH_ASCENT } else { 0.8 };
-    let w = border_width(annot);
 
-    // The callout line, from the point it points at to the box.
-    let callout = annot.is(b"IT", b"FreeTextCallout");
-    // Of more than six, none are read beyond the seventh.
-    let cl: Vec<Point> = annot
-        .items(b"CL")
-        .map(|items| items.first(7))
-        .filter(|n| n.len() == 4 || n.len() == 6)
-        .unwrap_or_default()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|[x, y]| Point::new(*x, *y))
-        .collect();
-
-    // Viewers clip the appearance to the box, or, with a callout, to the box, the
-    // callout's points and its ending, as [`Ending::callout_box`] says.
-    let drawn = cl.iter().fold(inner.abs(), |b, p| b.union_pt(*p));
-    let clip = match cl.as_slice() {
-        [tip, from, ..] if callout => Ending::of_callout(annot).callout_box(*tip, *from, w, drawn),
-        _ => inner.abs(),
-    };
     out.op("q");
     out.clip(clip).ok_or(Unsupported::Kind)?;
     if let Some(fill) = color_of(annot, C) {
@@ -233,6 +213,67 @@ pub(super) fn free_text<'a>(
     )?;
     out.op("Q");
     Ok(Some(()))
+}
+
+/// Where a `FreeText` is drawn ([`free_text`]).
+pub(super) struct Boxes {
+    /// `/Rect`.
+    r: kurbo::Rect,
+    /// `/RD`, four numbers.
+    rd: Vec<f64>,
+    /// The box the text is laid out in.
+    inner: kurbo::Rect,
+    /// The border width.
+    w: f64,
+    /// Whether it has a callout line.
+    callout: bool,
+    /// The callout line's points.
+    cl: Vec<Point>,
+    /// The box all it draws is clipped to.
+    pub(super) clip: kurbo::Rect,
+}
+
+/// Where `FreeText` `annot` is drawn; `None` without a `/Rect`.
+pub(super) fn boxes(annot: &Entries<'_>) -> Option<Boxes> {
+    let r = rect(annot)?;
+    // The box: `/Rect` with each side moved in by its `/RD` entry (left, bottom,
+    // right, top; 0 for one it lacks or that is not a number), as given, negative
+    // or not; one this turns inside out is laid out as it is, its width or height
+    // negative, as viewers lay it out.
+    let rd = annot.numbers(b"RD", 4).unwrap_or_else(|| vec![0.0; 4]);
+    let inner = kurbo::Rect::new(r.x0 + rd[0], r.y0 + rd[1], r.x1 - rd[2], r.y1 - rd[3]);
+    let w = border_width(annot);
+
+    // The callout line, from the point it points at to the box.
+    let callout = annot.is(b"IT", b"FreeTextCallout");
+    // Of more than six, none are read beyond the seventh.
+    let cl: Vec<Point> = annot
+        .items(b"CL")
+        .map(|items| items.first(7))
+        .filter(|n| n.len() == 4 || n.len() == 6)
+        .unwrap_or_default()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[x, y]| Point::new(*x, *y))
+        .collect();
+
+    // Viewers clip the appearance to the box, or, with a callout, to the box, the
+    // callout's points and its ending, as [`Ending::callout_box`] says.
+    let drawn = cl.iter().fold(inner.abs(), |b, p| b.union_pt(*p));
+    let clip = match cl.as_slice() {
+        [tip, from, ..] if callout => Ending::of_callout(annot).callout_box(*tip, *from, w, drawn),
+        _ => inner.abs(),
+    };
+    Some(Boxes {
+        r,
+        rd,
+        inner,
+        w,
+        callout,
+        cl,
+        clip,
+    })
 }
 
 /// The baseline of the first line of rich text below the top of its box, in

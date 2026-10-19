@@ -7,7 +7,7 @@
 //! quadrilaterals, a line width wider on each side.
 
 use super::entries::{Derived, Entries, Items, Value};
-use super::out::{Color, MITER_LIMIT, Out, Region, Rounding, as_written};
+use super::out::{Color, MITER_LIMIT, Out, Region, Rounding, as_written, stroke_reach};
 use super::{Unsupported, border_width, c_color, color_of, dash, most_pieces, rect};
 use hayro_syntax::object::dict::keys::{C, IC, INKLIST, QUADPOINTS};
 use kurbo::{Point, Rect, Vec2};
@@ -28,20 +28,9 @@ pub(super) fn shape(annot: &Entries<'_>, circle: bool, out: &mut Out) -> Option<
     if fill.is_none() && stroke.is_none() {
         return None;
     }
-    let r = rect(annot)?;
-    // Each side moved in by its rectangle difference (`/RD`: left, bottom, right,
-    // top; 0 for one it lacks), or by half the border width where that is more.
-    let rd = annot.numbers(b"RD", 4).unwrap_or_else(|| vec![0.0; 4]);
-    let inset = |i: usize| rd[i].max(width / 2.0);
-    let (x0, y0) = (r.x0 + inset(0), r.y0 + inset(1));
-    let (x1, y1) = (
-        (r.x1 - inset(2)).max(x0 + 1.0),
-        (r.y1 - inset(3)).max(y0 + 1.0),
-    );
-    // Viewers clip the shape to its box: `/Rect`, grown to the right and up to
-    // hold the shape and its insets where it is too small for them.
+    let (Rect { x0, y0, x1, y1 }, clip) = shape_box(annot)?;
     out.op("q");
-    out.clip(Rect::new(r.x0, r.y0, x1 + inset(2), y1 + inset(3)))?;
+    out.clip(clip)?;
     if let Some(stroke) = &stroke {
         out.stroke_color(stroke)?;
         out.stroke_state(width, &dash(annot))?;
@@ -69,6 +58,25 @@ pub(super) fn shape(annot: &Entries<'_>, circle: bool, out: &mut Out) -> Option<
     });
     out.op("Q");
     Some(())
+}
+
+/// The shape of a Square or Circle and the box viewers clip it to ([`shape`]):
+/// `/Rect` with each side moved in by its rectangle difference (`/RD`: left,
+/// bottom, right, top; 0 for one it lacks), or by half the border width where
+/// that is more, at least 1 wide and high; and `/Rect`, grown to the right and up
+/// to hold the shape and its insets where it is too small for them.
+pub(super) fn shape_box(annot: &Entries<'_>) -> Option<(Rect, Rect)> {
+    let width = border_width(annot);
+    let r = rect(annot)?;
+    let rd = annot.numbers(b"RD", 4).unwrap_or_else(|| vec![0.0; 4]);
+    let inset = |i: usize| rd[i].max(width / 2.0);
+    let (x0, y0) = (r.x0 + inset(0), r.y0 + inset(1));
+    let (x1, y1) = (
+        (r.x1 - inset(2)).max(x0 + 1.0),
+        (r.y1 - inset(3)).max(y0 + 1.0),
+    );
+    let clip = Rect::new(r.x0, r.y0, x1 + inset(2), y1 + inset(3));
+    Some((Rect::new(x0, y0, x1, y1), clip))
 }
 
 /// A quadrilateral of `/QuadPoints`, its points in the order of the array: as text
@@ -153,7 +161,7 @@ fn union(boxes: impl IntoIterator<Item = Rect>) -> Option<Rect> {
 /// The quadrilaterals of a text markup annotation and the box viewers clip it to: the
 /// box of each, a line width wider on each side. `None` without quadrilaterals, or
 /// when that box has no area: quadrilaterals of no height mark no text.
-fn marked(annot: &Entries<'_>) -> Option<(Rc<Quads>, Rect)> {
+pub(super) fn marked(annot: &Entries<'_>) -> Option<(Rc<Quads>, Rect)> {
     let quads = quads(annot)?;
     let clip = quads.clip?;
     Some((quads, clip))
@@ -165,8 +173,32 @@ fn marked(annot: &Entries<'_>) -> Option<(Rc<Quads>, Rect)> {
 /// curves' control points at the origin, and so does this.
 pub(super) fn highlight(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     let fill = c_color(annot, Color::Rgb([1.0, 1.0, 0.0]));
+    let (shapes, clip) = highlights(annot)?;
+    out.op("q");
+    out.clip(clip)?;
+    out.fill_color(&fill)?;
+    for (q, controls) in shapes {
+        let [tl, tr, bl, br] = q.0;
+        let [c1, c2, c3, c4] = controls.unwrap_or([Point::ZERO; 4]);
+        out.nums(&[bl.x, bl.y], "m")?;
+        out.nums(&[c1.x, c1.y, c2.x, c2.y, tl.x, tl.y], "c")?;
+        out.nums(&[tr.x, tr.y], "l")?;
+        out.nums(&[c3.x, c3.y, c4.x, c4.y, br.x, br.y], "c")?;
+        out.op("f");
+    }
+    out.op("Q");
+    Some(())
+}
+
+/// A quad a highlight fills, with the control points of its sides where its bottom
+/// edge has a direction ([`highlight`]).
+type Rounded = (Quad, Option<[Point; 4]>);
+
+/// Each quad a highlight fills ([`Rounded`]), and the box viewers clip them to: the
+/// box of the quads, a line width wider on each side, and of the control points.
+pub(super) fn highlights(annot: &Entries<'_>) -> Option<(Vec<Rounded>, Rect)> {
     let (quads, around) = marked(annot)?;
-    let shapes: Vec<(Quad, Option<[Point; 4]>)> = quads
+    let shapes: Vec<Rounded> = quads
         .all
         .iter()
         .map(|&q| {
@@ -193,20 +225,7 @@ pub(super) fn highlight(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
         .filter_map(|(_, c)| *c)
         .flatten()
         .fold(around, |r, p| r.union_pt(p));
-    out.op("q");
-    out.clip(clip)?;
-    out.fill_color(&fill)?;
-    for (q, controls) in shapes {
-        let [tl, tr, bl, br] = q.0;
-        let [c1, c2, c3, c4] = controls.unwrap_or([Point::ZERO; 4]);
-        out.nums(&[bl.x, bl.y], "m")?;
-        out.nums(&[c1.x, c1.y, c2.x, c2.y, tl.x, tl.y], "c")?;
-        out.nums(&[tr.x, tr.y], "l")?;
-        out.nums(&[c3.x, c3.y, c4.x, c4.y, br.x, br.y], "c")?;
-        out.op("f");
-    }
-    out.op("Q");
-    Some(())
+    Some((shapes, clip))
 }
 
 pub(super) enum Line {
@@ -876,15 +895,30 @@ pub(super) fn ink(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     Some(())
 }
 
-/// The paths of an `/InkList` that draw, the numbers of each, at least two: made
-/// once for the document ([`Derived`]), so that annotations sharing a list walk
-/// what it holds that draws nothing once.
-struct Paths(Vec<Vec<f64>>);
+/// The box of the `/InkList` paths that [`ink`] strokes, and how far beyond it the
+/// stroke paints; `None` without a path, which draws nothing.
+pub(super) fn ink_extent(annot: &Entries<'_>) -> Option<(Rect, f64)> {
+    let paths = annot.items(INKLIST)?.derived::<Paths>();
+    Some((paths.1?, stroke_reach(border_width(annot))))
+}
+
+/// The paths of an `/InkList` that draw, the numbers of each, at least two, and
+/// the box of their points: made once for the document ([`Derived`]), so that
+/// annotations sharing a list walk what it holds that draws nothing once.
+struct Paths(Vec<Vec<f64>>, Option<Rect>);
 
 impl Derived for Paths {
     fn derive(items: &Items<'_>) -> Self {
         let paths = items.iter().filter_map(Value::items).map(|p| p.numbers());
-        Self(paths.filter(|p| p.len() >= 2).collect())
+        let paths: Vec<Vec<f64>> = paths.filter(|p| p.len() >= 2).collect();
+        let bounds = paths
+            .iter()
+            .flat_map(|p| p.as_chunks::<2>().0)
+            .map(|[x, y]| Point::new(*x, *y))
+            .fold(None, |b: Option<Rect>, p| {
+                Some(b.map_or(Rect::from_points(p, p), |b| b.union_pt(p)))
+            });
+        Self(paths, bounds)
     }
 }
 

@@ -3918,6 +3918,69 @@ fn a_rich_line_viewers_may_break_refuses_only_where_its_box_shows() {
     assert_eq!(look_of(&rich("-60 20 19.19999 135", "")), "measure");
 }
 
+/// An annotation that can paint nothing where the page shows it is nothing, told
+/// before its appearance is generated: fully transparent (`/CA 0`), or placed by
+/// its geometry wholly off the page. Neither its measures nor the errors of the
+/// entries it draws from refuse it, as `PyMuPDF` 1.28.2 bake draws nothing for
+/// each case off the page or at `/CA 0`; seen at `/CA 1` on the page, each refuses
+/// as before.
+#[test]
+fn what_cannot_paint_on_the_page_refuses_nothing() {
+    let caption = |at: f64| {
+        format!(
+            "/Subtype /Line /C [0] /Cap true /Contents (AAAAA AAAAA) \
+             /L [{at} {at} {} {at}] /Rect [{} {} {} {}]",
+            at + 89.376,
+            at - 10.0,
+            at - 10.0,
+            at + 100.0,
+            at + 20.0
+        )
+    };
+    let rich_line = |rect: &str| {
+        format!(
+            "/Subtype /FreeText /BS << /W 0 >> /DA (/Cour 12 Tf 0 g) /Rect [{rect}] \
+             /Contents (x) /RC (<body style=\"font-family:Courier;font-size:12pt\">\
+             <p>AAAAA AAAAA</p></body>)"
+        )
+    };
+    let rich = |rect: &str| format!("/Subtype /FreeText /Rect [{rect}] /RC (<p>a<u>b</u></p>)");
+    let nul = |rect: &str| format!("/Subtype /FreeText /Rect [{rect}] /Contents <FEFF0000>");
+    let ending =
+        |l: &str| format!("/Subtype /Line /L [{l}] /C [1 0 0] /BS << /W -6 >> /LE [/Square /None]");
+    let cases = [
+        (caption(1000.0), caption(50.0), "measure"),
+        (
+            rich_line("1010 1020 1089.2 1135"),
+            rich_line("10 20 89.2 135"),
+            "measure",
+        ),
+        (
+            rich("1000 1000 1100 1100"),
+            rich("10 10 110 110"),
+            "RichText",
+        ),
+        (
+            nul("1000 1000 1100 1100"),
+            nul("10 10 110 110"),
+            "Character('\\0')",
+        ),
+        (
+            ending("1000 1000 1100 1100"),
+            ending("10 10 110 110"),
+            "Ending",
+        ),
+    ];
+    for (off, on, refused) in cases {
+        for ca in ["", " /CA 1", " /CA 0"] {
+            assert_eq!(look_of(&format!("{off}{ca}")), "nothing", "{off}{ca}");
+        }
+        assert_eq!(look_of(&on), refused, "{on}");
+        assert_eq!(look_of(&format!("{on} /CA 1")), refused, "{on}");
+        assert_eq!(look_of(&format!("{on} /CA 0")), "nothing", "{on}");
+    }
+}
+
 /// A paragraph of one word is laid out on its line whether viewers find that it
 /// fits or not: `PyMuPDF` 1.28.2 bake draws the same line, from (10, 75.800003), in
 /// boxes 35.99999, 36 and 36.00001 wide, which the word's 36 fills.

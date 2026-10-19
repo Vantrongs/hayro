@@ -940,6 +940,13 @@ impl Out {
         self.state.region.clone()
     }
 
+    /// Whether a piece within `reach` of the convex hull of `points`, in the
+    /// current space, each computed as `local` says, may paint where the page shows
+    /// it ([`Region::may_show`]).
+    pub(super) fn may_show(&self, points: &[Point], reach: f64, local: Rounding) -> bool {
+        self.state.region.may_show(points, reach, local).is_some()
+    }
+
     /// Whether the convex hull of `points`, in the current space, can paint where
     /// the page shows it ([`Region::meets`]).
     pub(super) fn meets(&self, points: &[Point]) -> bool {

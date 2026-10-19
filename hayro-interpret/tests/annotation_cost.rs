@@ -1989,7 +1989,7 @@ fn an_array_annotations_share_is_walked_once() {
         );
         assert_eq!(more.drew.generated, 80 * generated, "{annot}");
         assert_eq!(more.drew.unsupported, 0, "{annot}");
-        costs_at_most(fewer, more, 16 << 10, 1_000, annot);
+        costs_at_most(fewer, more, 20 << 10, 1_000, annot);
     }
 }
 

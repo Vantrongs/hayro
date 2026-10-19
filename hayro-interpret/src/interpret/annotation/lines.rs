@@ -251,12 +251,21 @@ fn points(n: &[f64]) -> Vec<Point> {
         .collect()
 }
 
-/// The points of `/Vertices`, made once for the document ([`Derived`]).
-struct Vertices(Vec<Point>);
+/// The points of `/Vertices` and their bounds, made once for the document
+/// ([`Derived`]).
+struct Vertices(Vec<Point>, Option<kurbo::Rect>);
 
 impl Derived for Vertices {
     fn derive(items: &Items<'_>) -> Self {
-        Self(points(&items.numbers()))
+        let vertices = points(&items.numbers());
+        let bounds = vertices.first().map(|first| {
+            vertices
+                .iter()
+                .fold(kurbo::Rect::from_points(*first, *first), |b, p| {
+                    b.union_pt(*p)
+                })
+        });
+        Self(vertices, bounds)
     }
 }
 
@@ -271,11 +280,13 @@ pub(super) fn poly(
     closed: bool,
     out: &mut Out,
 ) -> Result<Option<()>, Unsupported> {
-    let vertices = annot.items(b"Vertices").map(|i| i.derived::<Vertices>());
-    let vertices = vertices.as_ref().map_or(&[][..], |v| &v.0);
-    if vertices.len() < 2 {
+    let derived = annot.items(b"Vertices").map(|i| i.derived::<Vertices>());
+    let (vertices, bounds) = derived
+        .as_ref()
+        .map_or((&[][..], None), |v| (&v.0[..], v.1));
+    let Some(bounds) = bounds.filter(|_| vertices.len() >= 2) else {
         return Ok(None);
-    }
+    };
     let endings = if closed {
         [Ending::None; 2]
     } else {
@@ -289,7 +300,7 @@ pub(super) fn poly(
             (endings[1], vertices[n - 1], vertices[n - 2]),
         ],
     )?;
-    Ok(draw_poly(annot, vertices, closed, endings, out))
+    Ok(draw_poly(annot, vertices, bounds, closed, endings, out))
 }
 
 /// [`Unsupported::Ending`] when a line, polyline or callout draws an ending, each
@@ -318,6 +329,7 @@ pub(super) fn ends_drawable(
 fn draw_poly(
     annot: &Entries<'_>,
     vertices: &[Point],
+    bounds: kurbo::Rect,
     closed: bool,
     endings: [Ending; 2],
     out: &mut Out,
@@ -332,10 +344,6 @@ fn draw_poly(
     }
     if closed || !ends {
         let w = border_width(annot);
-        let bounds = vertices.iter().fold(
-            kurbo::Rect::from_points(vertices[0], vertices[0]),
-            |b, p| b.union_pt(*p),
-        );
         out.clip(bounds.inflate(w, w))?;
     }
     if closed {
@@ -364,6 +372,88 @@ fn draw_poly(
     let n = vertices.len();
     ending(first, vertices[0], vertices[1], &paint, out)?;
     ending(last, vertices[n - 1], vertices[n - 2], &paint, out)
+}
+
+/// Where a `Polygon` or `PolyLine` ([`poly`]) may paint: within the reach returned
+/// of the box returned; `None` for fewer than two vertices, which draw nothing.
+pub(super) fn poly_extent(annot: &Entries<'_>, closed: bool) -> Option<(kurbo::Rect, f64)> {
+    let vertices = annot.items(b"Vertices")?.derived::<Vertices>();
+    let bounds = vertices.1.filter(|_| vertices.0.len() >= 2)?;
+    let w = border_width(annot);
+    // Viewers clip a polygon, or a polyline without endings, to the bounds of
+    // its vertices out by the border width as given ([`draw_poly`]); a polyline's
+    // endings reach beyond them.
+    let ends = !closed && Ending::of(annot).iter().any(|e| *e != Ending::None);
+    Some(if ends {
+        (bounds, stroke_reach(w).max(ending_reach(w)))
+    } else {
+        (bounds.inflate(w, w), 0.0)
+    })
+}
+
+/// How far from its tip an ending of a line `width` wide may paint, its stroke
+/// included: an arrow's arms reach 8.8 widths of at least 1 back and 4.5 across,
+/// the farthest of the endings ([`Ending::path`]), here of the width's magnitude,
+/// as a viewer may size it.
+fn ending_reach(width: f64) -> f64 {
+    10.0 * width.abs().max(1.0) + stroke_reach(width)
+}
+
+/// Where a `Line` ([`line`]) may paint: within the reach returned of the points
+/// returned. Those of the line moved by its leader line, at its ends, and of the
+/// leader lines; and with a caption, the box in the line's frame of `/Contents`
+/// set as each byte a glyph at most 2 em wide, at 12 pt, from the line's middle
+/// moved by `/CO`, between 2 em above the highest baseline viewers set it on and
+/// 1 em below the lowest; turned any way about the line's start where the line
+/// has no direction.
+pub(super) fn line_extent(annot: &Entries<'_>) -> (Vec<Point>, f64) {
+    let ends = points(&annot.numbers(b"L", 4).unwrap_or_else(|| vec![0.0; 4]));
+    let (a, b) = (ends[0], ends[1]);
+    let len = (b - a).hypot();
+    let dir = direction(b - a);
+    let normal = Vec2::new(-dir.y, dir.x);
+    let num = |key: &[u8]| annot.number(key).unwrap_or(0.0);
+    let ll = num(b"LL");
+    let (lle, llo) = if ll == 0.0 {
+        (0.0, 0.0)
+    } else {
+        (num(b"LLE"), num(b"LLO"))
+    };
+    let sign = if ll < 0.0 { -1.0 } else { 1.0 };
+    let shift = normal * (sign * llo + ll);
+    let (la, lb) = (a + shift, b + shift);
+    let mut drawn = vec![a, b, la, lb];
+    for p in [a, b] {
+        drawn.push(p + normal * (sign * llo));
+        drawn.push(p + normal * (sign * llo + ll + sign * lle));
+    }
+    let w = border_width(annot);
+    let reach = stroke_reach(w).max(ending_reach(w));
+    let caption = annot.bool(b"Cap").unwrap_or(false);
+    let bytes = annot.text(Text::Contents).map_or(0, |t| t.len());
+    if caption && bytes > 0 {
+        const SIZE: f64 = 12.0;
+        let width = bytes as f64 * 2.0 * SIZE;
+        let co = annot.numbers(b"CO", 2).unwrap_or_else(|| vec![0.0; 2]);
+        let mid = len / 2.0 + co[0];
+        let (x0, x1) = (mid - width / 2.0 - SIZE, mid + width / 2.0 + SIZE);
+        // The baseline: `/CO`'s rise, or a size below it where that is negative;
+        // 0.2 em above the line on top, 0.3 em below it inline.
+        let lowest = (co[1] - SIZE).min(-0.3 * SIZE);
+        let highest = co[1].max(0.2 * SIZE);
+        let (y0, y1) = (lowest - SIZE, highest + 2.0 * SIZE);
+        let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(|(x, y)| Point::new(x, y));
+        if len > 0.0 {
+            let frame = Affine::new([dir.x, dir.y, normal.x, normal.y, la.x, la.y]);
+            drawn.extend(corners.map(|p| frame * p));
+        } else {
+            let r = corners
+                .iter()
+                .fold(0.0_f64, |r, p| r.max(p.to_vec2().hypot()));
+            drawn.extend([(-r, -r), (r, -r), (r, r), (-r, r)].map(|(x, y)| la + Vec2::new(x, y)));
+        }
+    }
+    (drawn, reach)
 }
 
 fn polyline(points: &[Point], out: &mut Out) -> Option<()> {

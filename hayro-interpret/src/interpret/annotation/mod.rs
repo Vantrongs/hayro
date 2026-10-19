@@ -872,6 +872,24 @@ impl<'a> Appearances<'a> {
         let Some(subtype) = annot.name(SUBTYPE) else {
             return Ok(None);
         };
+        // An annotation that can paint nothing where the page shows it is nothing,
+        // whatever a generator would make of the rest of its entries: neither
+        // drawn nor refused.
+        if !may_paint(&subtype, annot, &Out::new(visible, unit)) {
+            return Ok(None);
+        }
+        self.generated_anyway(annot, &subtype, visible, unit)
+    }
+
+    /// The appearance generated for `annot` of subtype `subtype` ([`Self::generate`]),
+    /// whether or not it may paint where the page shows it.
+    fn generated_anyway(
+        &self,
+        annot: &Entries<'a>,
+        subtype: &Name<'_>,
+        visible: kurbo::Rect,
+        unit: f64,
+    ) -> Generated {
         // What cannot paint where the page shows it is not written ([`Out`]).
         let mut out = Out::new(visible, unit);
         let fonts = &self.fonts;
@@ -1179,6 +1197,68 @@ impl<'a> Field<'a> {
     }
 }
 
+/// Whether annotation `annot` of subtype `subtype` may paint where `out`'s page
+/// shows it, told before its appearance is generated, from its opacity and the
+/// entries that place what it draws ([`extent`]): a generator's errors and
+/// refusals are reached only where this holds.
+fn may_paint(subtype: &[u8], annot: &Entries<'_>, out: &Out) -> bool {
+    // A widget is drawn opaque whatever its /CA says ([`Appearances::generate`]).
+    if subtype != b"Widget" && opacity(annot) == 0.0 {
+        return false;
+    }
+    let Some((points, reach)) = extent(subtype, annot) else {
+        return true;
+    };
+    // Each point computed from a few numbers read, in 32-bit numbers as viewers
+    // compute it ([`out::Rounding`]).
+    let most = points
+        .iter()
+        .fold(reach.abs(), |m, p| m.max(p.x.abs()).max(p.y.abs()));
+    let local = out::Rounding::point(
+        out::Rounding::of(EXTENT_ROUNDINGS, most),
+        out::Rounding::of(EXTENT_ROUNDINGS, most),
+    );
+    out.may_show(&points, reach, local)
+}
+
+/// The most roundings a viewer takes in computing a point of an annotation's
+/// [`extent`] from the numbers it reads.
+const EXTENT_ROUNDINGS: f64 = 16.0;
+
+/// Where an annotation of subtype `subtype` may paint, as its generator draws it
+/// and viewers draw it: within the distance returned, on the page, of the convex
+/// hull of the points returned; `None` where that is not bounded by its entries
+/// alone, or it draws nothing, which its generator tells. For the subtypes drawn
+/// under a clip, the box of that clip; for the others, the points the pieces they
+/// draw are laid from and how far beyond them the pieces reach.
+fn extent(subtype: &[u8], annot: &Entries<'_>) -> Option<(Vec<kurbo::Point>, f64)> {
+    let around = |(r, reach): (kurbo::Rect, f64)| {
+        let points = [(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1)];
+        (points.map(|(x, y)| kurbo::Point::new(x, y)).to_vec(), reach)
+    };
+    let corners = |r: kurbo::Rect| around((r, 0.0));
+    Some(match subtype {
+        b"Square" | b"Circle" => corners(markup::shape_box(annot)?.1),
+        b"Highlight" => corners(markup::highlights(annot)?.1),
+        b"Underline" | b"StrikeOut" | b"Squiggly" => corners(markup::marked(annot)?.1),
+        b"Ink" => around(markup::ink_extent(annot)?),
+        b"Text" | b"FileAttachment" | b"Sound" => {
+            let (corner, s) = icons::icon_square(annot)?;
+            // Framed by a stroke 1.25 wide at 20 pt.
+            let square = kurbo::Rect::from_origin_size(corner, (s, s));
+            around((square, out::stroke_reach(1.25 * s / 20.0)))
+        }
+        b"Caret" => corners(icons::caret_box(annot)?),
+        b"Redact" => corners(icons::redact_clip(annot)?),
+        b"Stamp" | b"Widget" => corners(rect(annot)?),
+        b"FreeText" => corners(freetext::boxes(annot)?.clip),
+        b"Line" => lines::line_extent(annot),
+        b"Polygon" => around(lines::poly_extent(annot, true)?),
+        b"PolyLine" => around(lines::poly_extent(annot, false)?),
+        _ => return None,
+    })
+}
+
 /// /CA clamped to 0–1, 1 when absent or not a number.
 fn opacity(annot: &Entries<'_>) -> f32 {
     let opacity = annot.number(CA).unwrap_or(1.0);
@@ -1260,4 +1340,357 @@ fn dash(annot: &Entries<'_>) -> Vec<f64> {
 fn rect(annot: &Entries<'_>) -> Option<kurbo::Rect> {
     let n = annot.numbers(RECT, 4)?;
     Some(kurbo::Rect::new(n[0], n[1], n[2], n[3]).abs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::entries::Entries;
+    use super::{Appearances, Out, SUBTYPE, extent};
+    use hayro_syntax::Pdf;
+    use hayro_syntax::object::{Dict, FromBytes};
+    use kurbo::Rect;
+
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        /// A number from `lo` to `hi`, to two decimals.
+        fn num(&mut self, lo: f64, hi: f64) -> f64 {
+            let t = (self.next() % 1_000_001) as f64 / 1_000_000.0;
+            ((lo + t * (hi - lo)) * 100.0).round() / 100.0
+        }
+
+        fn pick<'s>(&mut self, of: &[&'s str]) -> &'s str {
+            of[(self.next() % of.len() as u64) as usize]
+        }
+
+        fn chance(&mut self, percent: u64) -> bool {
+            self.next() % 100 < percent
+        }
+
+        fn nums(&mut self, n: usize, lo: f64, hi: f64) -> String {
+            (0..n)
+                .map(|_| self.num(lo, hi).to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        fn rect(&mut self) -> String {
+            let (x, y) = (self.num(-40.0, 160.0), self.num(-40.0, 160.0));
+            let (w, h) = (self.num(0.5, 140.0), self.num(0.5, 140.0));
+            format!("[{x} {y} {} {}]", x + w, y + h)
+        }
+
+        fn width(&mut self) -> String {
+            let w = self.pick(&["0", "0.5", "1", "3", "12", "-4", "40"]);
+            format!("/BS << /W {w} >>")
+        }
+
+        fn ending(&mut self) -> &'static str {
+            self.pick(&[
+                "/None",
+                "/Square",
+                "/Circle",
+                "/Diamond",
+                "/OpenArrow",
+                "/ClosedArrow",
+                "/Butt",
+                "/ROpenArrow",
+                "/RClosedArrow",
+                "/Slash",
+            ])
+        }
+
+        fn quads(&mut self) -> String {
+            let mut q = vec![];
+            for _ in 0..1 + self.next() % 3 {
+                let (x, y) = (self.num(-40.0, 160.0), self.num(-40.0, 160.0));
+                let (len, h, turn) = (
+                    self.num(1.0, 150.0),
+                    self.num(0.0, 40.0),
+                    self.num(-3.2, 3.2),
+                );
+                let (c, s) = (turn.cos(), turn.sin());
+                let at = |u: f64, v: f64| format!("{} {}", x + u * c - v * s, y + u * s + v * c);
+                q.push(format!(
+                    "{} {} {} {}",
+                    at(0.0, h),
+                    at(len, h),
+                    at(0.0, 0.0),
+                    at(len, 0.0)
+                ));
+            }
+            format!("[{}]", q.join(" "))
+        }
+
+        fn words(&mut self) -> String {
+            let n = 1 + self.next() % 12;
+            (0..n)
+                .map(|_| self.pick(&["A", "Wide", "text", "MMMMMM", "a b", "\\(x\\)"]))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
+
+    /// The entries of an annotation of each subtype that has an extent, drawn
+    /// from `r`.
+    fn annotation(r: &mut Random, subtype: &str) -> String {
+        let color = |r: &mut Random, key: &str| {
+            if r.chance(80) {
+                format!(
+                    "/{key} [{}]",
+                    r.pick(&["1 0 0", "0", "0 0 1 0", "0.2 0.5 0.9"])
+                )
+            } else {
+                String::new()
+            }
+        };
+        let rest = match subtype {
+            "Square" | "Circle" => format!(
+                "/Rect {} /RD [{}] {} {} {}",
+                r.rect(),
+                r.nums(4, -10.0, 30.0),
+                r.width(),
+                color(r, "C"),
+                color(r, "IC")
+            ),
+            "Highlight" | "Underline" | "StrikeOut" | "Squiggly" | "Redact" => format!(
+                "/Rect {} /QuadPoints {} {}",
+                r.rect(),
+                r.quads(),
+                color(r, "C")
+            ),
+            "Ink" => {
+                let paths: Vec<String> = (0..1 + r.next() % 3)
+                    .map(|_| {
+                        let n = 2 * (1 + r.next() % 6) as usize;
+                        format!("[{}]", r.nums(n, -40.0, 240.0))
+                    })
+                    .collect();
+                format!(
+                    "/Rect [0 0 1 1] /InkList [{}] {} /C [0 0 1]",
+                    paths.join(" "),
+                    r.width()
+                )
+            }
+            "Text" | "FileAttachment" | "Sound" => {
+                let (x, y) = (r.num(-40.0, 160.0), r.num(-40.0, 160.0));
+                let s = r.num(1.0, 40.0);
+                let name = r.pick(&[
+                    "/Help", "/Comment", "/Key", "/PushPin", "/Mic", "/Other", "",
+                ]);
+                format!(
+                    "/Rect [{x} {y} {} {}] /Name {name} {}",
+                    x + s,
+                    y + r.num(1.0, 40.0),
+                    color(r, "C")
+                )
+            }
+            "Caret" | "Stamp" => {
+                let name = r.pick(&["/Draft", "/NotForPublicRelease", "/Custom", "(x)"]);
+                format!("/Rect {} /Name {name} {}", r.rect(), color(r, "C"))
+            }
+            "FreeText" => {
+                let text = r.words();
+                let body = if r.chance(40) {
+                    format!(
+                        "/RC (<body style=\\\"font-size:{}pt\\\"><p>{text}</p></body>)",
+                        r.pick(&["9", "14", "30"])
+                    )
+                } else {
+                    format!("/Contents ({text})")
+                };
+                let callout = if r.chance(50) {
+                    let n = if r.chance(50) { 4 } else { 6 };
+                    format!(
+                        "/IT /FreeTextCallout /CL [{}] /LE {}",
+                        r.nums(n, -60.0, 260.0),
+                        r.ending()
+                    )
+                } else {
+                    String::new()
+                };
+                format!(
+                    "/Rect {} /RD [{}] /DA (/Helv {} Tf 0 g) {body} {callout} {} {} /Rotate {}",
+                    r.rect(),
+                    r.nums(4, -5.0, 20.0),
+                    r.pick(&["0", "8", "12", "40"]),
+                    r.width(),
+                    color(r, "C"),
+                    r.pick(&["0", "90", "180", "33"])
+                )
+            }
+            "Line" => {
+                let leader = if r.chance(50) {
+                    format!(
+                        "/LL {} /LLE {} /LLO {}",
+                        r.num(-40.0, 40.0),
+                        r.num(-10.0, 20.0),
+                        r.num(-10.0, 20.0)
+                    )
+                } else {
+                    String::new()
+                };
+                let caption = if r.chance(60) {
+                    format!(
+                        "/Cap true /Contents ({}) {} {}",
+                        r.words(),
+                        if r.chance(30) { "/CP /Top" } else { "" },
+                        if r.chance(40) {
+                            format!("/CO [{}]", r.nums(2, -30.0, 30.0))
+                        } else {
+                            String::new()
+                        }
+                    )
+                } else {
+                    String::new()
+                };
+                format!(
+                    "/Rect [0 0 1 1] /L [{}] {leader} /LE [{} {}] {} {} {} {caption}",
+                    r.nums(4, -40.0, 240.0),
+                    r.ending(),
+                    r.ending(),
+                    r.width(),
+                    color(r, "C"),
+                    color(r, "IC")
+                )
+            }
+            "Polygon" | "PolyLine" => {
+                let n = 2 * (2 + r.next() % 5) as usize;
+                format!(
+                    "/Rect [0 0 1 1] /Vertices [{}] /LE [{} {}] {} {} {}",
+                    r.nums(n, -40.0, 240.0),
+                    r.ending(),
+                    r.ending(),
+                    r.width(),
+                    color(r, "C"),
+                    color(r, "IC")
+                )
+            }
+            _ => {
+                let field = r.pick(&[
+                    "/FT /Tx /V (Some text here)",
+                    "/FT /Tx /Ff 4096 /V (Many words of a long value to wrap)",
+                    "/FT /Btn /AS /Yes",
+                    "/FT /Btn /Ff 65536 /MK << /CA (Push) >>",
+                    "/FT /Ch /Ff 131072 /V (Pick) /Opt [(Pick) (Other)]",
+                ]);
+                format!(
+                    "/Rect {} {field} /DA (/Helv {} Tf 0 g) /MK << /BG [0.9] /BC [0 0 1] /R {} >> {}",
+                    r.rect(),
+                    r.pick(&["0", "9", "24"]),
+                    r.pick(&["0", "90", "270", "45"]),
+                    r.width()
+                )
+            }
+        };
+        format!("<< /Type /Annot /Subtype /{subtype} {rest} /F 4 >>")
+    }
+
+    /// A file of one empty page, to read fonts for.
+    fn empty() -> Pdf {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>",
+        ];
+        let mut data = b"%PDF-1.7\n".to_vec();
+        let mut offsets = vec![];
+        for (i, o) in objects.iter().enumerate() {
+            offsets.push(data.len());
+            data.extend(format!("{} 0 obj\n{o}\nendobj\n", i + 1).bytes());
+        }
+        let xref = data.len();
+        data.extend(b"xref\n0 4\n0000000000 65535 f \n");
+        for o in offsets {
+            data.extend(format!("{o:010} 00000 n \n").bytes());
+        }
+        data.extend(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").bytes(),
+        );
+        Pdf::new(data).expect("valid pdf")
+    }
+
+    /// No generator paints beyond the extent the gate tells from an annotation's
+    /// entries ([`extent`]): seen from just beyond each side of the box of that
+    /// extent, each annotation of a generated set of every subtype paints nothing,
+    /// whatever it makes of the rest; seen whole, most paint.
+    #[test]
+    fn no_annotation_paints_beyond_its_extent() {
+        let pdf = empty();
+        let doc = Appearances::new(
+            pdf.xref(),
+            crate::InterpreterSettings::default().font_resolver,
+        );
+        let mut r = Random(0x9e37_79b9_7f4a_7c15);
+        let subtypes = [
+            "Square",
+            "Circle",
+            "Highlight",
+            "Underline",
+            "StrikeOut",
+            "Squiggly",
+            "Ink",
+            "Text",
+            "FileAttachment",
+            "Sound",
+            "Caret",
+            "Redact",
+            "Stamp",
+            "FreeText",
+            "Line",
+            "Polygon",
+            "PolyLine",
+            "Widget",
+        ];
+        for subtype in subtypes {
+            let mut painted = 0;
+            const CASES: usize = 300;
+            for _ in 0..CASES {
+                // As long as the document's appearances, which hold what they read.
+                let entries: &str = Box::leak(annotation(&mut r, subtype).into_boxed_str());
+                let dict = Dict::from_bytes(entries.as_bytes()).expect("valid dict");
+                let annot = Entries::detached(dict);
+                let name = annot.name(SUBTYPE).expect("a subtype");
+                let (points, reach) = extent(&name, &annot).expect("an extent");
+                let b = points
+                    .iter()
+                    .fold(Rect::from_points(points[0], points[0]), |b, p| {
+                        b.union_pt(*p)
+                    })
+                    .inflate(reach, reach);
+                let size = [b.x0, b.y0, b.x1, b.y1]
+                    .iter()
+                    .fold(1.0_f64, |m, v| m.max(v.abs()));
+                // Beyond what [`Out`] grows a piece by, and what a viewer moves it by.
+                let m = 1.0 + size * 1e-5;
+                let far = 1000.0 + size;
+                let beyond = [
+                    Rect::new(b.x0 - far, b.y0 - far, b.x0 - m, b.y1 + far),
+                    Rect::new(b.x1 + m, b.y0 - far, b.x1 + far, b.y1 + far),
+                    Rect::new(b.x0 - far, b.y0 - far, b.x1 + far, b.y0 - m),
+                    Rect::new(b.x0 - far, b.y1 + m, b.x1 + far, b.y1 + far),
+                ];
+                for view in beyond {
+                    let drawn = doc.generated_anyway(&annot, &name, view, 1.0);
+                    assert!(!matches!(drawn, Ok(Some(_))), "{entries} seen in {view:?}");
+                }
+                let whole = b.inflate(far, far);
+                assert!(
+                    super::may_paint(&name, &annot, &Out::new(whole, 1.0))
+                        || annot.number(super::CA) == Some(0.0)
+                );
+                if let Ok(Some(_)) = doc.generated_anyway(&annot, &name, whole, 1.0) {
+                    painted += 1;
+                }
+            }
+            assert!(painted > CASES / 3, "{subtype}: {painted} of {CASES} paint");
+        }
+    }
 }

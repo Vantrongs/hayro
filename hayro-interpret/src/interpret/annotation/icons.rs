@@ -39,11 +39,10 @@ pub(super) enum Icon {
 /// `/Name` names, whichever subtype names it, the subtype's own without a name,
 /// and a star for another name or a `/Name` that is not one.
 pub(super) fn icon(annot: &Entries<'_>, kind: Icon, fonts: &Fonts, out: &mut Out) -> Drawn {
-    let Some(r) = rect(annot) else {
+    let Some((corner, s)) = icon_square(annot) else {
         return Ok(None);
     };
-    let s = r.width().min(r.height()).clamp(10.0, 20.0);
-    let place = Affine::translate((r.x0, r.y1 - s)) * Affine::scale(s / 20.0);
+    let place = Affine::translate(corner.to_vec2()) * Affine::scale(s / 20.0);
     let symbol = match annot.name(b"Name") {
         Some(name) => Symbol::named(name.as_ref()),
         None if annot.present(b"Name") => Symbol::Star,
@@ -70,6 +69,14 @@ pub(super) fn icon(annot: &Entries<'_>, kind: Icon, fonts: &Fonts, out: &mut Out
     symbol.draw(Affine::translate((5.0, 5.0)), fonts, out)?;
     out.op("Q");
     Ok(Some(()))
+}
+
+/// The square an icon is drawn in ([`icon`]), which holds all it draws: its
+/// bottom left corner and side.
+pub(super) fn icon_square(annot: &Entries<'_>) -> Option<(Point, f64)> {
+    let r = rect(annot)?;
+    let s = r.width().min(r.height()).clamp(10.0, 20.0);
+    Some((Point::new(r.x0, r.y1 - s), s))
 }
 
 enum Symbol {
@@ -305,6 +312,7 @@ pub(super) fn caret(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     let r = rect(annot)?;
     let fill = c_color(annot, Color::BLACK);
     let c = r.center();
+    // Within [`caret_box`].
     let (x, y) = (c.x, c.y);
     out.fill_color(&fill)?;
     out.nums(&[x - 10.0, y - 7.0], "m")?;
@@ -314,18 +322,29 @@ pub(super) fn caret(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     Some(())
 }
 
+/// The box a caret fills ([`caret`]): 20 × 14 pt about the centre of `/Rect`.
+pub(super) fn caret_box(annot: &Entries<'_>) -> Option<kurbo::Rect> {
+    let c = rect(annot)?.center();
+    Some(kurbo::Rect::new(
+        c.x - 10.0,
+        c.y - 7.0,
+        c.x + 10.0,
+        c.y + 7.0,
+    ))
+}
+
 /// `Redact`: each quadrilateral outlined in red, 1 pt wide, clipped as viewers clip it
 /// to the box of the quadrilaterals a point wider on each side; or `/Rect` less a
 /// point without `/QuadPoints`, clipped to `/Rect`.
 pub(super) fn redact(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
+    let clip = redact_clip(annot)?;
     // Without quadrilaterals, as with an empty `/QuadPoints`, the box.
     let Some(quads) = quads(annot).filter(|q| !q.all.is_empty()) else {
         // Clipped to the box, as viewers clip it, so that a box under two points
         // wide shows only the part of the outline within it.
-        let r = rect(annot)?;
-        let inner = r.inset(-1.0);
+        let inner = clip.inset(-1.0);
         out.op("q");
-        out.clip(r)?;
+        out.clip(clip)?;
         out.op("1 0 0 RG");
         out.stroke_state(1.0, &[])?;
         out.nums(&[inner.x0, inner.y0, inner.width(), inner.height()], "re")?;
@@ -333,11 +352,6 @@ pub(super) fn redact(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
         out.op("Q");
         return Some(());
     };
-    let clip = quads
-        .all
-        .iter()
-        .map(|q| q.bounds(1.0))
-        .reduce(|a, b| a.union(b))?;
     out.op("q");
     out.clip(clip)?;
     out.op("1 0 0 RG");
@@ -351,6 +365,19 @@ pub(super) fn redact(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     }
     out.op("Q");
     Some(())
+}
+
+/// The box viewers clip a redaction to ([`redact`]): of its quadrilaterals, each a
+/// point wider on each side, or `/Rect` without them.
+pub(super) fn redact_clip(annot: &Entries<'_>) -> Option<kurbo::Rect> {
+    match quads(annot).filter(|q| !q.all.is_empty()) {
+        Some(quads) => quads
+            .all
+            .iter()
+            .map(|q| q.bounds(1.0))
+            .reduce(|a, b| a.union(b)),
+        None => rect(annot),
+    }
 }
 
 /// The text of each standard stamp name, its lines and size.
