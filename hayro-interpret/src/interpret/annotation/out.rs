@@ -182,8 +182,9 @@ impl Out {
     }
 
     /// Whether `ink`, a box around points, after `at` can reach `clip`; `None`,
-    /// failing the content, when a corner cannot be written, which a point inside it
-    /// then may not either.
+    /// failing the content, when it can and a corner cannot be written, which a
+    /// point inside it then may not either, and when a corner is no finite number.
+    /// A box that cannot reach `clip` is not drawn, and its numbers are not written.
     pub(super) fn box_reaches(
         &mut self,
         at: kurbo::Affine,
@@ -202,9 +203,16 @@ impl Out {
             .fold(kurbo::Rect::from_points(corners[0], corners[0]), |r, &p| {
                 r.union_pt(p)
             });
-        self.within(b)?;
         let c = clip.abs();
-        Some(b.x1 >= c.x0 && b.x0 <= c.x1 && b.y1 >= c.y0 && b.y0 <= c.y1)
+        let reaches = b.x1 >= c.x0 && b.x0 <= c.x1 && b.y1 >= c.y0 && b.y0 <= c.y1;
+        if !corners.iter().all(|p| p.is_finite()) {
+            self.failed = true;
+            return None;
+        }
+        if reaches {
+            self.within(b)?;
+        }
+        Some(reaches)
     }
 
     /// `None`, failing the content, when a corner of `area` cannot be written.
@@ -263,5 +271,29 @@ impl Out {
         self.nums(&[r.x0, r.y0, r.width(), r.height()], "re")?;
         self.op("W n");
         Some(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Out;
+    use kurbo::{Affine, Rect};
+
+    /// A glyph's box with corners too far to write fails the content only where it
+    /// can reach the clip: one that cannot is not drawn.
+    #[test]
+    fn a_box_off_the_clip_need_not_be_writable() {
+        let clip = Rect::new(0.0, 0.0, 200.0, 200.0);
+        let far = Rect::new(-1e7, 300.0, 1e7, 400.0);
+        let mut out = Out::default();
+        assert_eq!(out.box_reaches(Affine::IDENTITY, far, clip), Some(false));
+        assert!(out.finish().is_ok());
+        let over = Rect::new(-1e7, 100.0, 1e7, 400.0);
+        let mut out = Out::default();
+        assert_eq!(out.box_reaches(Affine::IDENTITY, over, clip), None);
+        assert!(out.finish().is_err());
+        let nan = Rect::new(f64::NAN, 300.0, 1.0, 400.0);
+        let mut out = Out::default();
+        assert_eq!(out.box_reaches(Affine::IDENTITY, nan, clip), None);
     }
 }
