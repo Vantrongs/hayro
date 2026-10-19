@@ -336,6 +336,13 @@ impl Pen {
         if self.at.is_none() {
             brush.ready(out)?;
         }
+        // The glyph's box in the current space: before the first glyph written,
+        // the one `at` is written in; after it, the last glyph's, which this one
+        // lies `dx` on from.
+        let place = match self.at {
+            Some(from) => Affine::translate(((x - from) / s, 0.0)),
+            None => at,
+        };
         let ink = outline.ink;
         let corners = [
             (ink.x0, ink.y0),
@@ -343,7 +350,7 @@ impl Pen {
             (ink.x1, ink.y1),
             (ink.x0, ink.y1),
         ]
-        .map(|(x, y)| at * kurbo::Point::new(x, y));
+        .map(|(x, y)| place * kurbo::Point::new(x, y));
         if !out.meets(&corners) {
             return Some(());
         }

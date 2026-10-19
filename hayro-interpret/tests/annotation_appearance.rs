@@ -2135,6 +2135,32 @@ fn what_cannot_paint_on_the_page_is_not_written() {
     }
 }
 
+/// Each glyph is tested where it is written: after the first, in the space the
+/// glyphs before it moved to, not where the first was placed from. A field's
+/// glyphs after the first, under a clip that leaves the field's left side, were
+/// left out as if beside it.
+#[test]
+fn every_glyph_of_a_field_is_drawn() {
+    for w in ["-2", "1", "0"] {
+        let pdf = annotations(
+            "/Annots [4 0 R]",
+            vec![
+                format!(
+                    "<< /Type /Annot /Subtype /Widget /FT /Tx /Rect [20 80 180 120] /V (WORLD) \
+                     /MK << /BC [0] /BG [0.9 0.9 1] >> /DA (/Helv 14 Tf 0 0 1 rg) /BS << /W {w} >> >>"
+                )
+                .into_bytes(),
+            ],
+        );
+        match first_look(&pdf) {
+            Look::Generated(a) => {
+                assert_eq!(a.content.matches(" Do\n").count(), 5, "{w}: {}", a.content)
+            }
+            _ => panic!("{w}: not generated"),
+        }
+    }
+}
+
 /// The numbers of the path operators and line widths in `content`, in order.
 fn path_numbers(content: &str) -> Vec<f64> {
     content
