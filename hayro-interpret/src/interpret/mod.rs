@@ -103,6 +103,12 @@ pub struct InterpreterSettings {
     pub render_annotations: bool,
     /// Which annotations are drawn.
     pub annotations: AnnotationSelection,
+    /// The points of one unit of the page's space: its `/UserUnit` where the caller
+    /// draws the page in points, 1 (the default) where it draws the page in its own
+    /// units, as hayro does. Generated annotations count the pieces they draw by
+    /// how far a stroke paints beyond its outline on the page
+    /// ([`annotation::Appearances::page`]).
+    pub page_unit: f64,
 }
 
 /// Which annotations a page is drawn with (PDF 32000-1 12.5.3).
@@ -133,6 +139,7 @@ impl Default for InterpreterSettings {
             warning_sink: Arc::new(|_| {}),
             render_annotations: true,
             annotations: AnnotationSelection::View,
+            page_unit: 1.0,
         }
     }
 }
@@ -169,8 +176,12 @@ pub fn interpret_page<'a>(
             context.interpreter_cache.annotation_fields.clone(),
         );
         let visible = page.intersected_crop_box().to_kurbo();
-        // The page is drawn in its own units, whatever its /UserUnit.
-        let drawn = appearances.page(page, context.settings.annotations, visible, 1.0);
+        let drawn = appearances.page(
+            page,
+            context.settings.annotations,
+            visible,
+            context.settings.page_unit,
+        );
         for annot in drawn.iter() {
             match annot.look() {
                 annotation::Look::Stream { stream, placement } => {

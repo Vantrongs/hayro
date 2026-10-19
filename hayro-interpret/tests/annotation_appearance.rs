@@ -835,6 +835,55 @@ fn an_annotation_without_a_generator_warns_and_draws_nothing() {
     assert_eq!((rec.0, warned.load(Ordering::Relaxed)), (vec![], 1));
 }
 
+/// The renderer counts a comb's dividers by how far a stroke paints beyond them in
+/// the unit it draws the page in. A field turned half a turn, its box starting
+/// 0.05 unit inside the page's left edge and running off it, with dividers 10^-6
+/// unit apart: where a unit is a point, those within a quarter of a point of the
+/// page are about 295 000, refused; where it is 1000 points, those within as much
+/// are about 45 000, drawn.
+#[test]
+fn the_renderer_counts_pieces_in_its_page_unit() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let file = common::one_page(
+        200,
+        "/Resources << >> /Annots [4 0 R]",
+        vec![
+            b"<< /Subtype /Widget /FT /Tx /Ff 16777216 /MaxLen 100000000 /BS << /W .01 >> \
+              /MK << /BC [0] /R 180 >> /Rect [-100 50 .05 80] >>"
+                .to_vec(),
+        ],
+    );
+    let pdf = Pdf::new(file).expect("valid pdf");
+    for (unit, refused) in [(1.0, true), (1000.0, false)] {
+        let warned = Arc::new(AtomicUsize::new(0));
+        let count = warned.clone();
+        let settings = InterpreterSettings {
+            warning_sink: Arc::new(move |_| {
+                count.fetch_add(1, Ordering::Relaxed);
+            }),
+            page_unit: unit,
+            ..Default::default()
+        };
+        let mut rec = Rec::default();
+        common::interpret_first_page(&pdf, settings, &mut rec);
+        let strokes = rec
+            .0
+            .iter()
+            .filter(|e| matches!(e, Ev::Stroke { .. }))
+            .count();
+        let warned = warned.load(Ordering::Relaxed);
+        if refused {
+            assert_eq!((strokes, warned), (0, 1), "{unit}");
+        } else {
+            assert!(
+                warned == 0 && (40_000..50_000).contains(&strokes),
+                "{unit}: {strokes}"
+            );
+        }
+    }
+}
+
 /// The first page's annotations, in a file with `objects` numbered from 4.
 fn annotations(page_entries: &str, objects: Vec<Vec<u8>>) -> Pdf {
     Pdf::new(common::one_page(200, page_entries, objects)).expect("valid pdf")
