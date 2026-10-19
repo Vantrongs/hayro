@@ -181,6 +181,19 @@ fn unescape(data: &[u8], mut out: impl FnMut(u8)) {
     }
 }
 
+/// Skips the word `word`, a keyword such as `true` or `null`, only when it is the
+/// whole token: `truefoo` and `nullable` are other words, which are left unread.
+pub(crate) fn skip_keyword(r: &mut Reader<'_>, word: &[u8]) -> Option<()> {
+    let start = r.offset();
+    r.forward_while(is_regular_character);
+    if r.range(start..r.offset()) == Some(word) {
+        Some(())
+    } else {
+        r.jump(start);
+        None
+    }
+}
+
 // This method is shared by `Name` and the parser for content stream operators (which behave like
 // names, except that they aren't preceded by a solidus.
 pub(crate) fn skip_name_like(r: &mut Reader<'_>, solidus: bool) -> Option<()> {

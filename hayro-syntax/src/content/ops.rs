@@ -115,6 +115,7 @@ mod tests {
         MarkedContentPointWithProperties, MoveTo, NonStrokeColorDeviceRgb, NonStrokeColorNamed,
         SetGraphicsState, StrokeColorNamed, Transform, TypedInstruction,
     };
+    use crate::content::ops::{InlineImage, ShowTexts};
     use crate::object::Name;
     use crate::object::Number;
     use crate::object::Object;
@@ -326,6 +327,49 @@ f
         assert!(matches!(
             iter.next(),
             Some(TypedInstruction::EndMarkedContent(EndMarkedContent))
+        ));
+        assert!(iter.next().is_none());
+    }
+
+    /// In a content array or dictionary, a word is a boolean or null only as the
+    /// whole token; another (`truefoo`, `trust`) is one null entry, and the stream
+    /// goes on, as `MuPDF` reads it (`PyMuPDF` 1.28.2: the fill after such a `TJ` is
+    /// drawn, an inline image with `/IM truefoo` is no mask).
+    #[test]
+    fn words_that_only_start_as_keywords() {
+        let input =
+            b"[(a) truefoo trust nullfoo true 1] TJ BI /IM truefoo /W 8 /H 1 /BPC 1 ID \xAA EI 0 0 1 rg";
+        let mut iter = TypedIter::new(input);
+        match iter.next() {
+            Some(TypedInstruction::ShowTexts(ShowTexts(array))) => {
+                let items: Vec<_> = array.iter::<Object<'_>>().collect();
+                assert!(
+                    matches!(
+                        items[..],
+                        [
+                            Object::String(_),
+                            Object::Null(_),
+                            Object::Null(_),
+                            Object::Null(_),
+                            Object::Boolean(true),
+                            Object::Number(_),
+                        ]
+                    ),
+                    "{items:?}"
+                );
+            }
+            other => panic!("unexpected instruction: {other:?}"),
+        }
+        match iter.next() {
+            Some(TypedInstruction::InlineImage(InlineImage(image))) => {
+                assert_eq!(image.dict().get::<bool>(b"IM"), None);
+                assert_eq!(image.dict().get::<i32>(b"W"), Some(8));
+            }
+            other => panic!("unexpected instruction: {other:?}"),
+        }
+        assert!(matches!(
+            iter.next(),
+            Some(TypedInstruction::NonStrokeColorDeviceRgb(_))
         ));
         assert!(iter.next().is_none());
     }

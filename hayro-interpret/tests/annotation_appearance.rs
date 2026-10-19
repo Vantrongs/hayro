@@ -1097,6 +1097,34 @@ fn a_caption_keeps_all_its_lines() {
     assert_eq!(ends, [20, 102, 198, 280], "{content}");
 }
 
+/// `/Cap` is true only as the whole word: `truefoo` is another word, null, and
+/// the line is drawn whole without its caption, as `PyMuPDF` 1.28.2 bake draws it.
+#[test]
+fn a_caption_is_drawn_only_for_the_word_true() {
+    let line = |cap: &str| {
+        generated(&format!(
+            "/Subtype /Line /L [20 100 180 100] /C [0] /BS << /W 2 >> /Cap {cap} \
+             /Contents (CAPTION) /Rect [0 0 200 200]"
+        ))
+    };
+    for cap in ["true", "truefoo", "trust", "falsefoo", "false"] {
+        let content = line(cap);
+        let ends: Vec<i32> = content
+            .lines()
+            .take_while(|l| *l != "S")
+            .filter(|l| l.ends_with(" m") || l.ends_with(" l"))
+            .map(|l| l.split(' ').next().unwrap().parse::<f32>().unwrap().round() as i32)
+            .collect();
+        if cap == "true" {
+            assert!(content.lines().any(|l| l == "f"), "{cap}: {content}");
+            assert_eq!(ends.len(), 4, "{cap}: {content}");
+        } else {
+            assert!(!content.lines().any(|l| l == "f"), "{cap}: {content}");
+            assert_eq!(ends, [20, 180], "{cap}: {content}");
+        }
+    }
+}
+
 /// The generated content of the first annotation of a page with `annot`.
 fn generated(annot: &str) -> String {
     let pdf = annotations(

@@ -456,13 +456,13 @@ pub(crate) fn leaf<'a, L: Leaf<'a>>(
             };
             match word {
                 Some(word) => word,
-                // Outside content, another word starting so is read as `null`, as
-                // other unknown words are (`trust`, not `true`).
-                None if !is_content_stream => {
+                // Another word starting so (`trust`, `truefoo`) is read as `null`, as
+                // other unknown words are, in content too: `MuPDF` reads such a word
+                // in a content array as it reads `null`, and goes on with the stream.
+                None => {
                     skip_name_like(r, false)?;
                     make.null()
                 }
-                None => return None,
             }
         }
         b'/' => match r.skip::<Name<'_>>(is_content_stream) {
@@ -663,12 +663,22 @@ mod tests {
         assert!(matches!(object_impl(b"true").unwrap(), Object::Boolean(_)));
     }
 
-    /// Outside content, a word that starts as `null`, `true` or `false` do but is
-    /// none of them reads as null, as other unknown words do, so a dictionary with
-    /// one keeps its other entries.
+    /// A word that starts as `null`, `true` or `false` do but is none of them reads
+    /// as null, as other unknown words do, so a dictionary with one keeps its other
+    /// entries and an array holds it as one entry (as in `MuPDF`).
     #[test]
     fn unknown_words_read_as_null() {
-        for word in [&b"two"[..], b"t", b"nul", b"fals", b"bar"] {
+        for word in [
+            &b"two"[..],
+            b"t",
+            b"nul",
+            b"fals",
+            b"bar",
+            b"truefoo",
+            b"falsefoo",
+            b"trust",
+            b"nullfoo",
+        ] {
             assert!(
                 matches!(object_impl(word), Some(Object::Null(_))),
                 "{word:?}"
@@ -682,6 +692,30 @@ mod tests {
             panic!("not an array");
         };
         assert_eq!(a.iter::<Object<'_>>().count(), 2);
+        let Some(Object::Array(a)) = object_impl(b"[truefoo falsefoo true false]") else {
+            panic!("not an array");
+        };
+        let items: Vec<_> = a.iter::<Object<'_>>().collect();
+        assert!(matches!(
+            items[..],
+            [
+                Object::Null(_),
+                Object::Null(_),
+                Object::Boolean(true),
+                Object::Boolean(false)
+            ]
+        ));
+        let Some(Object::Dict(d)) = object_impl(b"<< /A truefoo /B 1 /C true >>") else {
+            panic!("not a dictionary");
+        };
+        assert_eq!(d.get::<bool>(b"A"), None);
+        assert_eq!(d.get::<i32>(b"B"), Some(1));
+        assert_eq!(d.get::<bool>(b"C"), Some(true));
+        // Skipping reads the same tokens: the array is skipped whole.
+        let mut r = Reader::new(b"[truefoo nullfoo] 7");
+        assert!(r.skip::<Object<'_>>(false).is_some());
+        r.skip_white_spaces_and_comments();
+        assert_eq!(r.tail(), Some(&b"7"[..]));
     }
 
     #[test]
