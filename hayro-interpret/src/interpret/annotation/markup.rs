@@ -8,7 +8,7 @@
 
 use super::entries::{Derived, Entries, Items, Value};
 use super::out::{Color, MITER_LIMIT, Out, written_all};
-use super::{MOST_PIECES, PAINTS_BEYOND, Unsupported, border_width, c_color, color_of, dash, rect};
+use super::{Unsupported, border_width, c_color, color_of, dash, most_pieces, rect};
 use hayro_syntax::object::dict::keys::{C, IC, INKLIST, QUADPOINTS};
 use kurbo::{Point, Rect, Vec2};
 use std::rc::Rc;
@@ -238,10 +238,12 @@ pub(super) fn text_lines(annot: &Entries<'_>, line: Line, out: &mut Out) -> Opti
 
 /// `Squiggly`: per quad, a zigzag in /C (default black), a sixteenth of the quad's
 /// height `h` wide, between its bottom edge and the line a seventh of the way up
-/// (see [`zigzag`]).
+/// (see [`zigzag`]): the steps that come within `beyond` of `visible` under the
+/// clip.
 pub(super) fn squiggly(
     annot: &Entries<'_>,
     visible: Rect,
+    beyond: f64,
     out: &mut Out,
 ) -> Result<Option<()>, Unsupported> {
     let stroke = c_color(annot, Color::BLACK);
@@ -258,7 +260,7 @@ pub(super) fn squiggly(
     let clip = Rect::new(x, y, x + w, y + h);
     if visible.overlaps(clip) {
         // A stroke paints a little beyond its outline, but not beyond the clip.
-        let shown = visible.intersect(clip).inset(PAINTS_BEYOND);
+        let shown = visible.intersect(clip).inset(beyond);
         // A quad of no height draws nothing ([`zigzag`]).
         for q in &quads.high {
             zigzag(q, shown, out)?;
@@ -281,9 +283,10 @@ pub(super) fn squiggly(
 /// neighbouring step is left out, the run drawn ends there with a butt cap; the
 /// join it lacks paints nothing in `shown`, as the neighbour, whose join it is too,
 /// would be drawn otherwise. Every step is drawn as it is, however fine: the content
-/// can be scaled and zoomed any amount. A quad that would draw more than
-/// [`MOST_PIECES`] is [`Unsupported::Coordinates`]: one whose part on the page is
-/// more than about 37 000 times as long as high, which no text is.
+/// can be scaled and zoomed any amount. A quad that would draw more steps than
+/// [`super::set_most_pieces`] allows is [`Unsupported::Coordinates`]: at the
+/// default, one whose part on the page is more than about 37 000 times as long as
+/// high, which no text is.
 ///
 /// The steps drawn are found by halving the range of steps, from all of them down
 /// to single steps: a range is left out when what its steps can paint is apart from
@@ -346,7 +349,7 @@ fn zigzag(q: &Quad, shown: Rect, out: &mut Out) -> Result<(), Unsupported> {
     // The ranges of steps left to look at, the first last; step `k` runs from
     // corner `k` to corner `k + 1`.
     let mut ranges = vec![(0.0, steps)];
-    let mut drawn = 0.0;
+    let (mut drawn, most) = (0.0, most_pieces());
     // The corner the last step drawn ends at.
     let mut until = None;
     while let Some((a, b)) = ranges.pop() {
@@ -379,7 +382,7 @@ fn zigzag(q: &Quad, shown: Rect, out: &mut Out) -> Result<(), Unsupported> {
         // The steps `a..b`, each of which paints: its segment, if not all of it, is
         // in `shown`.
         drawn += b - a;
-        if drawn > MOST_PIECES {
+        if drawn > most {
             return Err(Unsupported::Coordinates);
         }
         if until != Some(a) {
@@ -765,7 +768,7 @@ mod tests {
         let annot = format!("<< /Subtype /Squiggly /Rect [0 0 1 1] /QuadPoints [{quads}] >>");
         let dict = Dict::from_bytes(annot.as_bytes()).expect("valid dict");
         let mut out = Out::default();
-        squiggly(&Entries::detached(dict), visible, &mut out)
+        squiggly(&Entries::detached(dict), visible, PAINTS_BEYOND, &mut out)
             .expect("drawable")
             .expect("an appearance");
         out.finish().expect("written").0
@@ -824,7 +827,7 @@ mod tests {
             /QuadPoints [33554432 24 33554440 24 33554432 10 33554440 10] >>";
         let dict = Dict::from_bytes(annot.as_bytes()).expect("valid dict");
         let mut out = Out::default();
-        let got = squiggly(&Entries::detached(dict), PAGE, &mut out);
+        let got = squiggly(&Entries::detached(dict), PAGE, PAINTS_BEYOND, &mut out);
         assert!(matches!(got, Err(super::Unsupported::Coordinates)));
     }
 

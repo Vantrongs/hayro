@@ -17,8 +17,8 @@ use super::freetext;
 use super::out::{Color, Out};
 use super::text::{self, Align, Family, Fonts, Setting, Shaped, Style, TextBox};
 use super::{
-    Appearances, FIELD, Field, Inherited, MOST_PIECES, PAINTS_BEYOND, TEXT, TextKey, Unsupported,
-    border_width, circle, color_of, rect,
+    Appearances, FIELD, Field, Inherited, TEXT, TextKey, Unsupported, border_width, circle,
+    color_of, most_pieces, rect,
 };
 use hayro_syntax::object::dict::keys::AS;
 use kurbo::{Affine, Shape};
@@ -49,6 +49,7 @@ pub(super) fn widget<'a>(
     field: &Field<'a>,
     doc: &Appearances<'a>,
     visible: kurbo::Rect,
+    beyond: f64,
     out: &mut Out,
 ) -> Drawn {
     let field_type = field.get(Inherited::Type);
@@ -104,7 +105,7 @@ pub(super) fn widget<'a>(
     let turn = turned(rotation);
     let place = super::rect_transform(r, [0.0, 0.0, fw as f32, fh as f32], turn) * turn;
     let bbox = kurbo::Rect::new(0.0, 0.0, fw, fh);
-    let shown = Shown::of(visible, place);
+    let shown = Shown::of(visible, place, beyond);
     out.op("q");
     fail(out.nums(&place.as_coeffs(), "cm"))?;
     fail(out.clip(bbox))?;
@@ -128,18 +129,18 @@ pub(super) fn widget<'a>(
 
 /// What the page shows of a widget's box, in the box's space: the visible part of
 /// the page, a parallelogram there where the box is turned, and the rectangle that
-/// holds it.
+/// holds it; and how far beyond its outline a stroke paints there.
 struct Shown {
     corners: [kurbo::Point; 4],
     rect: kurbo::Rect,
-    /// [`PAINTS_BEYOND`] in the box's space, as far as it stretches there.
-    beyond: f64,
+    /// Half the sides of the square a stroke paints beyond its outline on the page
+    /// (`beyond` across and up), in the box's space: a parallelogram there.
+    beyond: [kurbo::Vec2; 2],
 }
 
 impl Shown {
-    fn of(visible: kurbo::Rect, place: Affine) -> Self {
+    fn of(visible: kurbo::Rect, place: Affine, beyond: f64) -> Self {
         let to_box = place.inverse();
-        let [a, b, c, d, _, _] = to_box.as_coeffs();
         let corners = [
             (visible.x0, visible.y0),
             (visible.x1, visible.y0),
@@ -148,8 +149,11 @@ impl Shown {
         ]
         .map(|(x, y)| to_box * kurbo::Point::new(x, y));
         let rect = (to_box * visible.to_path(0.1)).bounding_box();
-        // No direction stretches more than the matrix's Frobenius norm.
-        let beyond = PAINTS_BEYOND * (a * a + b * b + c * c + d * d).sqrt();
+        let [a, b, c, d, _, _] = to_box.as_coeffs();
+        let beyond = [
+            kurbo::Vec2::new(a * beyond, b * beyond),
+            kurbo::Vec2::new(c * beyond, d * beyond),
+        ];
         Self {
             corners,
             rect,
@@ -157,31 +161,67 @@ impl Shown {
         }
     }
 
-    /// The span across of what it shows between `y0` and `y1` up (`y0 <= y1`), or
-    /// `None` where it shows nothing there.
-    fn across(&self, y0: f64, y1: f64) -> Option<(f64, f64)> {
-        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-        // The span is that of the corners of its part between the two lines: corners
-        // of the parallelogram there, and where its edges cross the lines.
-        for i in 0..4 {
-            let (a, b) = (self.corners[i], self.corners[(i + 1) % 4]);
-            let dy = b.y - a.y;
-            let (t0, t1) = if dy == 0.0 {
-                if a.y < y0 || a.y > y1 {
-                    continue;
+    /// The span of `u` for which the rectangle `u ± half` across and `y0..y1` up
+    /// meets what it shows inside `clip`, grown on the page by how far a stroke
+    /// paints beyond its outline; `None` for none. Both are convex: they meet unless
+    /// the side of one or the other is a line that parts them, and along each such
+    /// line the rectangle's extent moves with `u`.
+    fn strips(&self, clip: kurbo::Rect, half: f64, (y0, y1): (f64, f64)) -> Option<(f64, f64)> {
+        use kurbo::{Point, Vec2};
+        // What it shows inside the clip: the parallelogram cut by each of its sides.
+        let mut region: Vec<Point> = self.corners.to_vec();
+        let sides: [(Vec2, f64); 4] = [
+            (Vec2::new(1.0, 0.0), clip.x0),
+            (Vec2::new(-1.0, 0.0), -clip.x1),
+            (Vec2::new(0.0, 1.0), clip.y0),
+            (Vec2::new(0.0, -1.0), -clip.y1),
+        ];
+        for (n, at) in sides {
+            let inside = |p: Point| n.dot(p.to_vec2()) - at;
+            let mut kept = Vec::with_capacity(region.len() + 1);
+            for (i, &p) in region.iter().enumerate() {
+                let q = region[(i + 1) % region.len()];
+                let (dp, dq) = (inside(p), inside(q));
+                if dp >= 0.0 {
+                    kept.push(p);
                 }
-                (0.0, 1.0)
-            } else {
-                let (s0, s1) = ((y0 - a.y) / dy, (y1 - a.y) / dy);
-                (s0.min(s1).max(0.0), s0.max(s1).min(1.0))
-            };
-            if t0 > t1 {
-                continue;
+                if (dp >= 0.0) != (dq >= 0.0) {
+                    kept.push(p.lerp(q, dp / (dp - dq)));
+                }
             }
-            for t in [t0, t1] {
-                let x = a.x + (b.x - a.x) * t;
-                lo = lo.min(x);
-                hi = hi.max(x);
+            region = kept;
+            if region.is_empty() {
+                return None;
+            }
+        }
+        let [e1, e2] = self.beyond;
+        let edges = (0..region.len()).map(|i| region[(i + 1) % region.len()] - region[i]);
+        let axes = [e1, e2]
+            .into_iter()
+            .chain(edges)
+            .map(Vec2::turn_90)
+            .chain([Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)]);
+        let (ylo, yhi) = (y0.min(y1), y0.max(y1));
+        let (mut lo, mut hi) = (f64::NEG_INFINITY, f64::INFINITY);
+        for n in axes {
+            // The grown region along `n`, and the rectangle's extent but for `u`.
+            let grow = n.dot(e1).abs() + n.dot(e2).abs();
+            let along = region.iter().map(|p| n.dot(p.to_vec2()));
+            let g0 = along.clone().fold(f64::INFINITY, f64::min) - grow;
+            let g1 = along.fold(f64::NEG_INFINITY, f64::max) + grow;
+            let (r0, r1) = (
+                (n.y * ylo).min(n.y * yhi) - n.x.abs() * half,
+                (n.y * ylo).max(n.y * yhi) + n.x.abs() * half,
+            );
+            // They meet along `n` where `n.x u + r1 >= g0` and `n.x u + r0 <= g1`.
+            if n.x == 0.0 {
+                if r1 < g0 || r0 > g1 {
+                    return None;
+                }
+            } else {
+                let (a, b) = ((g0 - r1) / n.x, (g1 - r0) / n.x);
+                lo = lo.max(a.min(b));
+                hi = hi.min(a.max(b));
             }
         }
         (lo <= hi).then_some((lo, hi))
@@ -593,15 +633,15 @@ fn draw<'a>(
 /// The lines between the `cells` cells of a comb field `fw` × `fh`, inside its
 /// border of width `w` (> 0), stroked `w` wide with butt caps (line `i` covers
 /// `w + step i ± w/2` across and `w..fh - w` up, `step` = `(fw - 2w) / cells`),
-/// those that paint where `shown` shows the box under the clips they are drawn in
-/// (the box, and the box inside the border), or come as close to it as a stroke
-/// paints beyond its outline.
+/// those whose outline meets what `shown` shows of the box under the clips they are
+/// drawn in (the box, and the box inside the border), grown on the page by how far
+/// a stroke paints beyond its outline.
 ///
 /// Each line is its own stroke, however close or overlapping the lines: the
 /// content can be scaled and zoomed any amount, and viewers draw lines within a
 /// pixel solid when they are one path or one band, where lines stroked each are
-/// grey, as in bake (observed). More than [`MOST_PIECES`] lines that paint are
-/// [`Unsupported::Coordinates`]. Lines of no height draw nothing.
+/// grey, as in bake (observed). More lines that paint than
+/// [`super::set_most_pieces`] allows are [`Unsupported::Coordinates`]. Lines of no height draw nothing.
 fn comb_dividers(
     cells: i64,
     fw: f64,
@@ -617,7 +657,7 @@ fn comb_dividers(
     }
     // Where the lines can paint: under the box's clip and the clip to the box
     // inside the border (`re` of negative size covers the same rectangle as its
-    // absolute), across the lines' height. Of that, what the page shows across.
+    // absolute).
     let clip = |size: f64| {
         let (lo, hi) = (w.min(size - w), w.max(size - w));
         (lo.max(0.0), hi.min(size))
@@ -626,32 +666,25 @@ fn comb_dividers(
     if cx0 > cx1 || cy0 > cy1 {
         return Ok(());
     }
-    let Some((x0, x1)) = shown.across(cy0, cy1) else {
+    let clip = kurbo::Rect::new(cx0, cy0, cx1, cy1);
+    let Some((u0, u1)) = shown.strips(clip, w / 2.0, (w, fh - w)) else {
         return Ok(());
     };
-    let (x0, x1) = (x0.max(cx0), x1.min(cx1));
-    if x0 > x1 {
-        return Ok(());
-    }
-    // A line paints a little beyond its outline ([`PAINTS_BEYOND`]), but not beyond
-    // the clips: it paints in what they let show if it comes that close to it, and
-    // it covers their whole height.
-    let (x0, x1) = (x0 - shown.beyond, x1 + shown.beyond);
-    // The lines whose `u ± w/2` meets `x0..x1`, and one more on each side.
+    // The lines whose `u` is in `u0..u1`.
     let step = (fw - 2.0 * w) / cells;
     let (first, last) = if step == 0.0 {
-        if x0 - w / 2.0 > w || w > x1 + w / 2.0 {
+        if w < u0 || w > u1 {
             return Ok(());
         }
         (1.0, cells - 1.0)
     } else {
-        let (a, b) = ((x0 - 1.5 * w) / step, (x1 - 0.5 * w) / step);
-        (a.min(b).floor().max(1.0), a.max(b).ceil().min(cells - 1.0))
+        let (a, b) = ((u0 - w) / step, (u1 - w) / step);
+        (a.min(b).ceil().max(1.0), a.max(b).floor().min(cells - 1.0))
     };
     if first > last {
         return Ok(());
     }
-    if last - first >= MOST_PIECES {
+    if last - first >= most_pieces() {
         return Err(Unsupported::Coordinates);
     }
     wrote(out.stroke_state(w, &[]))?;

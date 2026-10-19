@@ -169,7 +169,8 @@ pub fn interpret_page<'a>(
             context.interpreter_cache.annotation_fields.clone(),
         );
         let visible = page.intersected_crop_box().to_kurbo();
-        let drawn = appearances.page(page, context.settings.annotations, visible);
+        // The page is drawn in its own units, whatever its /UserUnit.
+        let drawn = appearances.page(page, context.settings.annotations, visible, 1.0);
         for annot in drawn.iter() {
             match annot.look() {
                 annotation::Look::Stream { stream, placement } => {

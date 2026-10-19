@@ -71,7 +71,7 @@ const PAGE: kurbo::Rect = kurbo::Rect::new(0.0, 0.0, 200.0, 200.0);
 
 /// The annotations the first page of `pdf` draws as viewed on a 200 pt page.
 fn drawn<'a>(appearances: &Appearances<'a>, pdf: &'a Pdf) -> std::rc::Rc<[Drawn<'a>]> {
-    appearances.page(&pdf.pages()[0], AnnotationSelection::View, PAGE)
+    appearances.page(&pdf.pages()[0], AnnotationSelection::View, PAGE, 1.0)
 }
 
 /// What the first annotation of the first page of `pdf` looks like as viewed on a
@@ -141,8 +141,8 @@ fn comb_dividers_are_drawn_each() {
     // Dividers 0.001 pt wide, 0.005 pt apart, each shown: as many as /MaxLen less one.
     assert_eq!(comb("32000", "0.001", field), Ok(31_999));
     // Of a field 160 times as wide as the page, with dividers about 1 pt apart, the
-    // 199 on the page, the one at its edge and the next.
-    assert_eq!(comb("32000", "0.001", "[0 100 32000 130]"), Ok(201));
+    // 200 within a quarter of a point of it.
+    assert_eq!(comb("32000", "0.001", "[0 100 32000 130]"), Ok(200));
     assert_eq!(
         comb("100000000", "0.000001", field),
         Err(Unsupported::Coordinates)
@@ -188,8 +188,7 @@ fn a_max_len_beyond_32_bits_makes_no_comb() {
 #[test]
 fn a_comb_wider_than_the_page_draws_the_dividers_on_it() {
     // Cells 500 pt wide: the page shows the divider at 2 pt (501 in the field's frame,
-    // which starts at -499); the one at 502 pt is drawn too, the search for those
-    // shown keeping a step of margin.
+    // which starts at -499), and no other.
     let content = generated(
         "/Subtype /Widget /FT /Tx /Ff 16777216 /MK << /BC [0] >> /MaxLen 16000 \
          /Rect [-499 100 8000000 130]",
@@ -199,7 +198,7 @@ fn a_comb_wider_than_the_page_draws_the_dividers_on_it() {
         .filter(|l| l.ends_with(" m"))
         .map(|l| l.split(' ').next().unwrap().parse::<f64>().unwrap().round() as i64)
         .collect();
-    assert_eq!(starts, [501, 1001], "{content}");
+    assert_eq!(starts, [501], "{content}");
 }
 
 /// A squiggle is drawn step by step, however fine, across the page only; one that
@@ -777,8 +776,8 @@ fn a_stream_read_for_no_text_is_not_decoded() {
             Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
         let page = &pdf.pages()[0];
         let before = allocated();
-        let flattened = appearances.page(page, AnnotationSelection::Flatten, PAGE);
-        let viewed = appearances.page(page, AnnotationSelection::View, PAGE);
+        let flattened = appearances.page(page, AnnotationSelection::Flatten, PAGE, 1.0);
+        let viewed = appearances.page(page, AnnotationSelection::View, PAGE, 1.0);
         for drawn in [flattened, viewed] {
             assert!(
                 matches!(drawn.first().map(Drawn::look), Some(Look::Generated(_))),
@@ -1597,7 +1596,7 @@ fn pages_sharing_their_annotations_read_them_once() {
 fn drew<'a>(appearances: &Appearances<'a>, page: &Page<'a>, visible: kurbo::Rect) -> Drew {
     let mut drew = Drew::default();
     for d in appearances
-        .page(page, AnnotationSelection::View, visible)
+        .page(page, AnnotationSelection::View, visible, 1.0)
         .iter()
     {
         match d.look() {

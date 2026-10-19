@@ -52,6 +52,7 @@ use std::rc::Rc;
 
 thread_local! {
     static WORK: Cell<u64> = const { Cell::new(0) };
+    static MOST_PIECES: Cell<u32> = const { Cell::new(262_144) };
 }
 
 /// Counts `n` units of the work of generating appearances ([`work_done`]).
@@ -66,6 +67,20 @@ fn work(n: usize) {
 /// annotations share an entry; tests bound it.
 pub fn work_done() -> u64 {
     WORK.with(Cell::get)
+}
+
+/// Sets the most pieces one shape of repeated pieces draws where the page shows it
+/// (the steps of a squiggle, the dividers of a comb field), for appearances
+/// generated on this thread from then on: 262 144 unless set, 5 to 10 MB of
+/// content. A shape that would draw more is [`Unsupported::Coordinates`]; tests
+/// set a few to reach that with few pieces.
+pub fn set_most_pieces(n: u32) {
+    MOST_PIECES.with(|m| m.set(n));
+}
+
+/// The most pieces one shape draws ([`set_most_pieces`]).
+fn most_pieces() -> f64 {
+    f64::from(MOST_PIECES.with(Cell::get))
 }
 
 /// What an annotation draws.
@@ -279,11 +294,11 @@ enum Prepared<'a> {
 /// The annotations a page lists that may draw, each with its place in `/Annots`.
 type Plans<'a> = Rc<[(usize, Rc<Plan<'a>>)]>;
 
-/// The area a page shows, as a key: its coordinates' bits.
-type View = [u64; 4];
+/// The area a page shows and the points of its unit, as a key: their bits.
+type View = [u64; 5];
 
-fn view(visible: kurbo::Rect) -> View {
-    [visible.x0, visible.y0, visible.x1, visible.y1].map(f64::to_bits)
+fn view(visible: kurbo::Rect, unit: f64) -> View {
+    [visible.x0, visible.y0, visible.x1, visible.y1, unit].map(f64::to_bits)
 }
 
 /// Whether `annot` is drawn as `selection` says (PDF 32000-1 12.5.3), by its flags
@@ -463,8 +478,9 @@ impl<'a> Appearances<'a> {
 
     /// The annotations of `page` that `selection` draws and that draw something or
     /// cannot be drawn, in the order of its `/Annots`, as they look on a page that
-    /// shows `visible` (in default user space) of them, with text in the fonts of
-    /// these appearances. An entry of `/Annots` that names no dictionary names no
+    /// shows `visible` (in default user space, whose unit is `unit` points: the
+    /// page's `/UserUnit`, 1 for a page drawn in its own units) of them, with text
+    /// in the fonts of these appearances. An entry of `/Annots` that names no dictionary names no
     /// annotation; one whose flags cannot be read as viewers read them cannot be
     /// drawn ([`Unsupported::Number`]).
     ///
@@ -487,11 +503,19 @@ impl<'a> Appearances<'a> {
         page: &Page<'a>,
         selection: AnnotationSelection,
         visible: kurbo::Rect,
+        unit: f64,
     ) -> Rc<[Drawn<'a>]> {
         let Some(annots) = self.objects.annots(page.raw()) else {
             return Rc::from([]);
         };
-        let view = view(visible);
+        let view = view(visible, unit);
+        // A page of no size, or of none that is a number, shows no piece more than
+        // what lies in it.
+        let beyond = if unit.abs() > 0.0 && unit.is_finite() {
+            PAINTS_BEYOND / unit.abs()
+        } else {
+            0.0
+        };
         let array = annots.id();
         self.once(
             |k| &mut k.pages,
@@ -502,7 +526,7 @@ impl<'a> Appearances<'a> {
                     Some((array, selection)),
                     || self.plans(&annots, selection).into(),
                 );
-                self.drawn(&plans, visible, view).into()
+                self.drawn(&plans, visible, beyond, view).into()
             },
         )
     }
@@ -557,12 +581,14 @@ impl<'a> Appearances<'a> {
         }
     }
 
-    /// The annotations of `plans` as drawn on a page that shows `visible`, whose
-    /// key is `view`: those generated, once for the document for each area shown.
+    /// The annotations of `plans` as drawn on a page that shows `visible`, where a
+    /// stroke paints `beyond` its outline, whose key is `view`: those generated,
+    /// once for the document for each area shown.
     fn drawn(
         &self,
         plans: &[(usize, Rc<Plan<'a>>)],
         visible: kurbo::Rect,
+        beyond: f64,
         view: View,
     ) -> Vec<Drawn<'a>> {
         plans
@@ -573,7 +599,7 @@ impl<'a> Appearances<'a> {
                     Plan::Generate { id, .. } => self.once(
                         |k| &mut k.generated,
                         Some((*id, view)),
-                        || self.generated(plan, visible),
+                        || self.generated(plan, visible, beyond),
                     )?,
                 };
                 Some(Drawn {
@@ -585,8 +611,14 @@ impl<'a> Appearances<'a> {
     }
 
     /// The appearance `plan`, [`Plan::Generate`], generates for a page that shows
-    /// `visible`; `None` when it paints nothing.
-    fn generated(&self, plan: &Plan<'a>, visible: kurbo::Rect) -> Option<Rc<Annotation<'a>>> {
+    /// `visible`, where a stroke paints `beyond` its outline; `None` when it paints
+    /// nothing.
+    fn generated(
+        &self,
+        plan: &Plan<'a>,
+        visible: kurbo::Rect,
+        beyond: f64,
+    ) -> Option<Rc<Annotation<'a>>> {
         let Plan::Generate {
             annot,
             subtype,
@@ -601,7 +633,7 @@ impl<'a> Appearances<'a> {
         } else {
             annot.clone()
         };
-        let look = match entries::read(|| self.generate(&annot, visible)) {
+        let look = match entries::read(|| self.generate(&annot, visible, beyond)) {
             Ok(Ok(Some(appearance))) => Look::Generated(Rc::new(appearance)),
             Ok(Ok(None)) => return None,
             Ok(Err(why)) | Err(why) => Look::Unsupported(why),
@@ -750,8 +782,9 @@ pub fn rect_transform(rect: kurbo::Rect, bbox: [f32; 4], matrix: Affine) -> Affi
 type Generated = Result<Option<Appearance>, Unsupported>;
 
 impl<'a> Appearances<'a> {
-    /// The appearance generated for `annot` from its entries.
-    fn generate(&self, annot: &Entries<'a>, visible: kurbo::Rect) -> Generated {
+    /// The appearance generated for `annot` from its entries, for a page that shows
+    /// `visible`, where a stroke paints `beyond` its outline (in the page's units).
+    fn generate(&self, annot: &Entries<'a>, visible: kurbo::Rect, beyond: f64) -> Generated {
         let Some(subtype) = annot.name(SUBTYPE) else {
             return Ok(None);
         };
@@ -764,7 +797,7 @@ impl<'a> Appearances<'a> {
             b"Highlight" => ok(markup::highlight(annot, &mut out)),
             b"Underline" => ok(markup::text_lines(annot, markup::Line::Under, &mut out)),
             b"StrikeOut" => ok(markup::text_lines(annot, markup::Line::Through, &mut out)),
-            b"Squiggly" => markup::squiggly(annot, visible, &mut out),
+            b"Squiggly" => markup::squiggly(annot, visible, beyond, &mut out),
             b"Ink" => ok(markup::ink(annot, &mut out)),
             b"Text" => icons::icon(annot, icons::Icon::Note, fonts, &mut out),
             b"FileAttachment" => icons::icon(annot, icons::Icon::FileAttachment, fonts, &mut out),
@@ -777,7 +810,7 @@ impl<'a> Appearances<'a> {
             b"Polygon" => lines::poly(annot, true, &mut out),
             b"PolyLine" => lines::poly(annot, false, &mut out),
             b"Widget" => match self.field(annot) {
-                Some(field) => widget::widget(annot, &field, self, visible, &mut out),
+                Some(field) => widget::widget(annot, &field, self, visible, beyond, &mut out),
                 // A widget whose /Parent chain loops is a broken field: nothing.
                 None => Ok(None),
             },
@@ -1071,20 +1104,15 @@ fn opacity(annot: &Entries<'_>) -> f32 {
     }
 }
 
-/// How far beyond its outline a stroke paints, in points: `MuPDF` paints a stroke
-/// up to about a tenth of a pixel beyond its edge, and draws the thinnest strokes
-/// that wide on each side of their line (observed in `PyMuPDF` 1.28.2 from 0.5 to
-/// 8 px/pt: a line 0.00004 pt wide 0.08 px below the page greys its bottom row,
-/// 0.1 px below it does not), which at 1 px/pt or finer is within a quarter of a
-/// point. A clip cuts it off where it lies. A generator choosing the pieces that
-/// show counts those that come that close to what the clips let show.
+/// How far beyond its outline a stroke paints, in points on the page, across and
+/// up: `MuPDF` paints a stroke up to about a tenth of a pixel beyond its edge, and
+/// draws the thinnest strokes that wide on each side of their line (observed in
+/// `PyMuPDF` 1.28.2 from 0.5 to 8 px/pt: a line 0.00004 pt wide 0.08 px below the
+/// page greys its bottom row, 0.1 px below it does not), which at 0.4 px/pt or
+/// finer is within a quarter of a point. A clip cuts it off where it lies. A
+/// generator choosing the pieces that show counts those that come that close to
+/// what the clips let show: whose outline meets it grown by this on every side.
 const PAINTS_BEYOND: f64 = 0.25;
-
-/// The most pieces one shape of repeated pieces draws where the page can show it
-/// (the steps of a squiggle, the dividers of a comb field): 5 to 10 MB of content.
-/// The pieces are drawn each, however small, as the content can be scaled and
-/// zoomed any amount; a shape that would draw more is [`Unsupported::Coordinates`].
-const MOST_PIECES: f64 = 262_144.0;
 
 /// A circle as viewers draw one: four cubic quarter arcs from its top, clockwise, so
 /// that it costs the same at any size.

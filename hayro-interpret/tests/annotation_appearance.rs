@@ -848,7 +848,7 @@ const PAGE: kurbo::Rect = kurbo::Rect::new(0.0, 0.0, 200.0, 200.0);
 fn looks_of(pdf: &Pdf) -> Vec<Look<'_>> {
     let page = &pdf.pages()[0];
     let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-    let drawn = appearances.page(page, AnnotationSelection::View, PAGE);
+    let drawn = appearances.page(page, AnnotationSelection::View, PAGE, 1.0);
     page.raw()
         .get::<Array<'_>>(b"Annots")
         .unwrap()
@@ -1566,7 +1566,7 @@ fn entries_of_two_dictionaries_in_one_object_are_two_values() {
         let appearances =
             Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
         for i in order {
-            let drawn = appearances.page(&pages[i], VIEW, PAGE);
+            let drawn = appearances.page(&pages[i], VIEW, PAGE, 1.0);
             assert_eq!(drawn.len(), 1);
             assert_eq!(
                 &content(drawn[0].look()),
@@ -2711,7 +2711,7 @@ fn real_flags_are_read_as_viewers_read_them() {
         );
         let appearances =
             Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
-        let drawn = appearances.page(&pdf.pages()[0], AnnotationSelection::Flatten, PAGE);
+        let drawn = appearances.page(&pdf.pages()[0], AnnotationSelection::Flatten, PAGE, 1.0);
         match drawn.first().map(|d| d.look()) {
             None => Ok(false),
             Some(Look::Unsupported(why)) => Err(*why),
@@ -3178,7 +3178,7 @@ fn damaged_annots_arrays_are_read_as_bake_reads_them() {
             Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
         for selection in [VIEW, AnnotationSelection::Flatten] {
             let listed: Vec<_> = appearances
-                .page(page, selection, PAGE)
+                .page(page, selection, PAGE, 1.0)
                 .iter()
                 .map(|d| (d.index(), d.subtype() == Some(b"Square".as_slice())))
                 .collect();
@@ -3315,9 +3315,9 @@ fn what_reading_annotations_lost_is_told_each_time() {
         for order in [[0, 1], [1, 0]] {
             for i in order {
                 for view in [PAGE, kurbo::Rect::new(0.0, 0.0, 150.0, 150.0), PAGE] {
-                    let (_, lost) = pdf
-                        .xref()
-                        .watch(|| appearances.page(&all[i], AnnotationSelection::Flatten, view));
+                    let (_, lost) = pdf.xref().watch(|| {
+                        appearances.page(&all[i], AnnotationSelection::Flatten, view, 1.0)
+                    });
                     assert_eq!(
                         lost.map(|id| id.obj_number),
                         lose[i].then_some(9),
