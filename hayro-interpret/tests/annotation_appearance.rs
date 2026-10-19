@@ -2154,7 +2154,7 @@ fn every_glyph_of_a_field_is_drawn() {
         );
         match first_look(&pdf) {
             Look::Generated(a) => {
-                assert_eq!(a.content.matches(" Do\n").count(), 5, "{w}: {}", a.content)
+                assert_eq!(a.content.matches(" Do\n").count(), 5, "{w}: {}", a.content);
             }
             _ => panic!("{w}: not generated"),
         }
