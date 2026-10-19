@@ -587,11 +587,12 @@ fn draw<'a>(
 /// those `shown` shows.
 ///
 /// Lines that touch or overlap cover one band, drawn as one stroke as wide. Lines
-/// apart are drawn each, however close: the content can be scaled and zoomed any
-/// amount, and one stroke dashed `[w, step - w]`, which covers the same rectangles,
-/// is drawn solid, or not at all, by viewers once its dashes are finer than a pixel,
-/// where separate lines are grey (observed). More than [`MOST_PIECES`] lines shown are
-/// [`Unsupported::Coordinates`]. Lines of no height draw nothing.
+/// apart are drawn each, however close, each stroked on its own: the content can be
+/// scaled and zoomed any amount, and viewers draw several lines within a pixel solid
+/// when they are one path, or one stroke dashed `[w, step - w]` (which covers the
+/// same rectangles), where separate strokes are grey, as in bake (observed). More
+/// than [`MOST_PIECES`] lines shown are [`Unsupported::Coordinates`]. Lines of no
+/// height draw nothing.
 fn comb_dividers(
     cells: i64,
     fw: f64,
@@ -634,8 +635,8 @@ fn comb_dividers(
         let u = w + step * (first + i as f64);
         wrote(out.nums(&[u, w], "m"))?;
         wrote(out.nums(&[u, fh - w], "l"))?;
+        out.op("S");
     }
-    out.op("S");
     Ok(())
 }
 

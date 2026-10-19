@@ -108,8 +108,10 @@ fn lines(content: &str) -> usize {
 }
 
 /// Comb dividers that touch are drawn as the band they cover, at a cost that does
-/// not grow with `/MaxLen`; dividers apart are drawn each, however close, those the
-/// page shows, and a comb that would draw more than 262 144 is refused.
+/// not grow with `/MaxLen`; dividers apart are drawn each, however close, each its
+/// own stroke (`MuPDF` draws lines closer than a pixel solid when they are one path,
+/// grey as in bake when stroked each), those the page shows, and a comb that would
+/// draw more than 262 144 is refused.
 #[test]
 fn comb_dividers_are_drawn_each_unless_they_touch() {
     let comb = |max_len: &str, w: &str, rect: &str| {
@@ -118,7 +120,11 @@ fn comb_dividers_are_drawn_each_unless_they_touch() {
              /BS << /W {w} >> /Rect {rect}"
         ));
         match first_look(&pdf) {
-            Look::Generated(a) => Ok(lines(&a.content)),
+            Look::Generated(a) => {
+                let n = lines(&a.content);
+                assert_eq!(a.content.matches(" l\nS\n").count(), n, "{max_len} {w}");
+                Ok(n)
+            }
             Look::Unsupported(why) => Err(why),
             _ => panic!("{max_len} {w}: drawn otherwise"),
         }
@@ -137,15 +143,17 @@ fn comb_dividers_are_drawn_each_unless_they_touch() {
     );
     // A field above the page shows none of its dividers, however many.
     assert_eq!(comb("1000000", "0.000001", "[20 1000 180 1030]"), Ok(0));
-    // Nor does one beside the page, turned so that the rectangle holding the page,
-    // in the field's space, reaches the field.
-    let turned = one_annotation(
-        "/Subtype /Widget /FT /Tx /Ff 16777216 /MK << /R 45 /BC [0] >> /MaxLen 1000000 \
-         /BS << /W .000001 >> /Rect [201 20 361 50]",
-    );
-    match first_look(&turned) {
-        Look::Generated(a) => assert_eq!(lines(&a.content), 0),
-        _ => panic!("turned comb beside the page: drawn otherwise"),
+    // Nor does one above or beside the page, turned so that the rectangle holding
+    // the page, in the field's space, reaches the field.
+    for rect in ["[201 20 361 50]", "[20 201 180 231]"] {
+        let turned = one_annotation(&format!(
+            "/Subtype /Widget /FT /Tx /Ff 16777216 /MK << /R 45 /BC [0] >> /MaxLen 1000000 \
+             /BS << /W .000001 >> /Rect {rect}"
+        ));
+        match first_look(&turned) {
+            Look::Generated(a) => assert_eq!(lines(&a.content), 0, "{rect}"),
+            _ => panic!("turned comb at {rect}: drawn otherwise"),
+        }
     }
 }
 
