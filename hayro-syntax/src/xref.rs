@@ -470,8 +470,9 @@ fn fallback_xref_map_inner<'a>(
     unread: &[ObjectIdentifier],
 ) -> (XrefMap, Rebuilt, Option<XRefInput<'a>>) {
     let mut xref_map = hash::Map::default();
-    // Each object found, in the order of the file.
+    // Each object found, in the order of the file, and where its body starts.
     let mut found = vec![];
+    let mut bodies = vec![];
     // Each header found with no object that can be read after it.
     let mut broken = vec![];
     let mut trailer_dicts = vec![];
@@ -495,6 +496,7 @@ fn fallback_xref_map_inner<'a>(
                 Some((obj_id, Some(body))) => {
                     xref_map.insert(obj_id, EntryType::Normal(cur_pos));
                     found.push((obj_id, cur_pos));
+                    bodies.push(body);
                     last_obj_num = Some(obj_id);
                     last_header = Some((obj_id, cur_pos, body));
                     dummy_ctx.set_obj_number(obj_id);
@@ -556,6 +558,8 @@ fn fallback_xref_map_inner<'a>(
         }
     }
 
+    let listed = into_headers(listed, &found, &bodies);
+    let listed = listed.as_slice();
     let layout = Layout::over(
         found
             .iter()
@@ -673,6 +677,35 @@ fn fallback_xref_map_inner<'a>(
         root_ref.map(XRefInput::RootRef)
     };
     (xref_map, rebuilt, input)
+}
+
+/// The entries of the old table, `listed`, each leading where it leads, but an entry
+/// that leads into a header the scan `found`, after its start and before its body
+/// (`bodies`, where each body starts), to the header: there it reads a header of
+/// another number, the tail of the one found (`4 0 obj` in `1024 0 obj`, as in a
+/// file whose offsets all miss by a few bytes), over the same body. Its offset is no
+/// place an object starts at, so it does not cut the slot of the object found
+/// ([`Place`]), which would then not be read, and every such entry reads the body
+/// at one place, however many lead into one header.
+fn into_headers(
+    listed: &[Listed],
+    found: &[(ObjectIdentifier, usize)],
+    bodies: &[usize],
+) -> Vec<Listed> {
+    listed
+        .iter()
+        .map(|entry| {
+            let next = found.partition_point(|(_, at)| *at <= entry.offset);
+            match next.checked_sub(1) {
+                Some(i) if found[i].1 < entry.offset && entry.offset < bodies[i] => Listed {
+                    id: entry.id,
+                    offset: found[i].1,
+                    header: found[i].0,
+                },
+                _ => *entry,
+            }
+        })
+        .collect()
 }
 
 /// What a rebuild finds at `r`: `None` where no header can start, as no number can;
@@ -2930,6 +2963,52 @@ mod tests {
             one_page(file.into_bytes()),
             (600.0, 700.0, BLUE.as_bytes().to_vec())
         );
+    }
+
+    // A table whose every offset leads a few bytes into its object's header, as in a
+    // file cut at its start, leads to a shorter header of another number, over the
+    // object's own body: the rebuild finds each object at its header, and reads it
+    // there, not cut where the table's offset is.
+    #[test]
+    fn a_table_whose_offsets_lead_into_the_headers_is_rebuilt() {
+        for first in [11, 101, 1001] {
+            let digits = first.to_string().len();
+            let objects = [
+                format!("<< /Type /Catalog /Pages {} 0 R >>", first + 1),
+                format!("<< /Type /Pages /Kids [{} 0 R] /Count 1 >>", first + 2),
+                format!(
+                    "<< /Type /Page /Parent {} 0 R /MediaBox [0 0 600 700] /Contents {} 0 R >>",
+                    first + 1,
+                    first + 3
+                ),
+                stream("", BLUE),
+            ];
+            for into in 1..digits {
+                let mut out = b"%PDF-1.7\n".to_vec();
+                let mut offsets = vec![];
+                for (i, object) in objects.iter().enumerate() {
+                    offsets.push((first + i, out.len() + into));
+                    out.extend(format!("{} 0 obj\n{object}\nendobj\n", first + i).bytes());
+                }
+                let xref = out.len();
+                out.extend(b"xref\n");
+                for (number, offset) in &offsets {
+                    out.extend(format!("{number} 1\n{offset:010} 00000 n \n").bytes());
+                }
+                out.extend(
+                    format!(
+                        "trailer\n<< /Size {} /Root {first} 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                        first + objects.len()
+                    )
+                    .bytes(),
+                );
+                assert_eq!(
+                    one_page(out),
+                    (600.0, 700.0, BLUE.as_bytes().to_vec()),
+                    "objects from {first}, offsets {into} bytes into their headers"
+                );
+            }
+        }
     }
 
     // Entries whose objects each hold, in a string, the header the next entry leads
