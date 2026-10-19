@@ -26,7 +26,7 @@ use crate::trivia::{is_eol_character, is_white_space_character};
 use crate::util::findr_needle;
 use crate::{PdfData, object};
 use alloc::borrow::Cow;
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::max;
@@ -211,7 +211,7 @@ struct Old {
 }
 
 /// Objects a table lists in object streams, each with the number of its stream.
-type InStreams = BTreeSet<(ObjectIdentifier, u32)>;
+type InStreams = BTreeMap<ObjectIdentifier, u32>;
 
 /// An entry of a table that is rebuilt that leads to no object read before the next
 /// offset any entry names, its slot.
@@ -644,20 +644,18 @@ fn fallback_xref_map_inner<'a>(
             }
         }
         xref_map = probe.into_map();
-        // An object of an object stream is kept over a definition outside one
-        // where the table rebuilt lists it in that stream, as an update that moves
-        // an object into an object stream does; else the one outside is kept, as a
-        // file whose table cannot be read may hold object streams of objects it
-        // does not use under the numbers of those it does.
-        for (obj_num, stream, idx) in held {
-            let id = ObjectIdentifier::new(obj_num as i32, 0);
-            let stream_num = stream.obj_number as u32;
-            if old.held.contains(&(id, stream_num))
-                || xref_map
-                    .get(&id)
-                    .is_none_or(|e| !matches!(e, &EntryType::Normal(_)))
-            {
-                xref_map.insert(id, EntryType::ObjStream(stream_num, idx as u32));
+        // Each object's definitions in object streams, in the order the scan
+        // meets them.
+        held.sort_by_key(|(obj_num, _, _)| *obj_num);
+        for candidates in held.chunk_by(|a, b| a.0 == b.0) {
+            let id = ObjectIdentifier::new(candidates[0].0 as i32, 0);
+            let candidates: Vec<(u32, u32)> = candidates
+                .iter()
+                .map(|(_, stream, idx)| (stream.obj_number as u32, *idx as u32))
+                .collect();
+            let direct = matches!(xref_map.get(&id), Some(EntryType::Normal(_)));
+            if let Some((stream, idx)) = kept_in_stream(&candidates, old.held.get(&id), direct) {
+                xref_map.insert(id, EntryType::ObjStream(stream, idx));
             }
         }
     }
@@ -724,6 +722,30 @@ fn fallback_xref_map_inner<'a>(
         root_ref.map(XRefInput::RootRef)
     };
     (xref_map, rebuilt, input)
+}
+
+/// Of an object's definitions in object streams, `candidates` (each the stream's
+/// number and the index in it) in the order the scan meets them, the one a rebuilt
+/// table keeps, if any: the last in the stream the old table lists the object in,
+/// `listed`, where that stream holds it, as an update that moves an object into an
+/// object stream does; else none where the scan found a definition outside an object
+/// stream, `direct`, as a file whose table cannot be read may hold object streams of
+/// objects it does not use under the numbers of those it does; else the last.
+///
+/// The choice depends on the order of the candidates only among those of one stream
+/// or, where the old table names no stream that holds the object, among all.
+fn kept_in_stream(
+    candidates: &[(u32, u32)],
+    listed: Option<&u32>,
+    direct: bool,
+) -> Option<(u32, u32)> {
+    let in_listed =
+        listed.and_then(|listed| candidates.iter().rev().find(|(stream, _)| stream == listed));
+    match in_listed {
+        Some(kept) => Some(*kept),
+        None if direct => None,
+        None => candidates.last().copied(),
+    }
 }
 
 /// The entries of the old table, `listed`, each leading where it leads, but an entry
@@ -1989,7 +2011,7 @@ fn populate_xref_impl<'a>(data: &'a [u8], pos: usize, xref_map: &mut XrefMap) ->
 /// Where the sections of a chain read so far were read: the start and end of the
 /// bytes each was read on.
 #[derive(Default)]
-struct Sections(alloc::collections::BTreeMap<usize, usize>);
+struct Sections(BTreeMap<usize, usize>);
 
 impl Sections {
     /// The section at `pos` of `data`, read on the bytes up to the first that another
