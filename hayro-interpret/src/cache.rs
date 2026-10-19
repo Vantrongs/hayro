@@ -268,6 +268,25 @@ mod tests {
         assert_ne!(a.cache_key(), b.cache_key());
     }
 
+    /// Two objects holding one profile, as documents embed it, build it once.
+    #[test]
+    fn objects_holding_equal_profiles_share_the_built_profile() {
+        let pdf = icc_pdf(&[1.0, 1.0]);
+        let cache = Cache::new();
+        let profile = |index: usize| {
+            let object = pdf
+                .xref()
+                .get(ObjectIdentifier::new(4 + index as i32 * 2, 0))
+                .unwrap();
+            ColorSpace::new(object, &cache)
+                .unwrap()
+                .icc()
+                .unwrap()
+                .clone()
+        };
+        assert!(profile(0).same(&profile(1)));
+    }
+
     #[test]
     fn streams_in_different_documents_do_not_share_icc_colors() {
         let first = icc_pdf(&[1.0]);
