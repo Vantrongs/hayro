@@ -3918,6 +3918,21 @@ fn a_rich_line_viewers_may_break_refuses_only_where_its_box_shows() {
     assert_eq!(look_of(&rich("-60 20 19.19999 135", "")), "measure");
 }
 
+/// A paragraph of one word is laid out on its line whether viewers find that it
+/// fits or not: `PyMuPDF` 1.28.2 bake draws the same line, from (10, 75.800003), in
+/// boxes 35.99999, 36 and 36.00001 wide, which the word's 36 fills.
+#[test]
+fn a_word_alone_on_its_line_is_drawn_however_near_it_fills_it() {
+    for right in ["45.99999", "46", "46.00001"] {
+        let annot = format!(
+            "/Subtype /FreeText /BS << /W 0 >> /DA (/Cour 12 Tf 0 g) /Rect [10 20 {right} 135] \
+             /Contents (x) /RC (<body style=\"font-family:Courier;font-size:12pt\">\
+             <p>AAAAA</p></body>)"
+        );
+        assert_eq!(look_of(&annot), "generated", "{right}");
+    }
+}
+
 /// A run of spaces breaks as `PyMuPDF` 1.28.2 bake breaks it: a line takes a word
 /// and the space after it, and each space after that is a token of its own, which
 /// starts the next line when the line does not fit; spaces at a line's start are

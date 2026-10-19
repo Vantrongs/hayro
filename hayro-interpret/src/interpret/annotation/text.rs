@@ -1155,8 +1155,9 @@ impl Shaped {
     /// matches to the bit, so a line fits where its advance is within `room` by
     /// more than any sum of the glyphs' advances in 32-bit numbers may round
     /// ([`Rounding::sum`]) and the room more than a few roundings; where it is
-    /// nearer, where it breaks cannot be told: the line is broken as its advance
-    /// says, and is uncertain ([`LaidLine::uncertain`]).
+    /// nearer, whether it fits cannot be told: the line is broken as its advance
+    /// says, and is uncertain ([`LaidLine::uncertain`]) where the other way ends it,
+    /// or starts the next, elsewhere.
     fn rich_line_end(
         &self,
         start: usize,
@@ -1186,24 +1187,27 @@ impl Shaped {
             return (par.end, par.end, false);
         }
         let (all, near) = fits(par.end);
-        if all {
-            return (par.end, par.end, near);
+        if all && !near {
+            return (par.end, par.end, false);
         }
         // The first word always; then as many more as fit.
         let more = partition(after - first - 1, |j| fits(self.words[first + 1 + j].end).0);
         let last = first + more;
         let next = self.words.get(last + 1).filter(|w| w.start < par.end);
-        // Untold where the paragraph, the last word taken or the next, as their
-        // advance says, may fit otherwise; the words before the last fit more
-        // surely, and those after the next fit less.
-        let untold = near
-            || (more > 0 && fits(self.words[last].end).1)
-            || next.is_some_and(|w| fits(w.end).1);
-        (
-            self.words[last].end,
-            next.map_or(par.end, |w| w.start),
-            untold,
-        )
+        let broken = (self.words[last].end, next.map_or(par.end, |w| w.start));
+        // Untold where the last word taken or the next, as their advance says, may
+        // fit otherwise: the line ends elsewhere. The words before the last fit
+        // more surely, and those after the next fit less.
+        let untold =
+            (more > 0 && fits(self.words[last].end).1) || next.is_some_and(|w| fits(w.end).1);
+        // And where the paragraph may fit otherwise and that ends the line
+        // elsewhere: not where it is one word, or words that fit, to its end.
+        let untold = untold || (near && broken != (par.end, par.end));
+        if all {
+            (par.end, par.end, untold)
+        } else {
+            (broken.0, broken.1, untold)
+        }
     }
 }
 
@@ -2704,6 +2708,27 @@ mod tests {
         assert!(lines(79.2)[0].1);
         assert_eq!(lines(79.3), [(11, false)]);
         assert_eq!(lines(79.1), [(5, false), (5, false)]);
+    }
+
+    /// A paragraph of one word is laid out on one line whether or not it fits: at
+    /// its room it is not refused. A space after it, which a line that does not
+    /// fit leaves to a line of its own, is.
+    #[test]
+    fn a_word_alone_at_its_room_is_laid_out() {
+        let fonts = Fonts::new(crate::InterpreterSettings::default().font_resolver);
+        let lines = |text: &str, room: f32| -> Vec<(usize, bool)> {
+            let shaped = fonts.shape_plain(Family::Mono, text).expect("drawable");
+            shaped
+                .lines(12.0, Some(room), Align::Left, true)
+                .map(|l| (l.glyphs.len(), l.uncertain))
+                .collect()
+        };
+        for room in [35.99999, 36.0, 36.00001] {
+            assert_eq!(lines("AAAAA", room), [(5, false)], "{room}");
+        }
+        assert!(lines("AAAA ", 36.0)[0].1);
+        // Two words, the second's fit untold, as the paragraph's.
+        assert!(lines("AA AA", 36.0)[0].1);
     }
 
     /// Lines are laid out as they are asked for, each by a search: the first line of
