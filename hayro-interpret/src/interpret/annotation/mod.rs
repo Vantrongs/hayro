@@ -157,7 +157,8 @@ pub struct Appearance {
     pub content: String,
     /// The glyphs the content draws, each once.
     pub glyphs: Vec<Rc<Glyph>>,
-    /// The annotation's `/CA`, clamped to 0–1, for both fills and strokes.
+    /// The annotation's `/CA`, clamped to 0–1, for both fills and strokes; 1 for a
+    /// widget. `/ca` is not read: viewers draw these appearances without it.
     pub opacity: f32,
     /// Multiply for highlights, Normal otherwise.
     pub blend: BlendMode,
@@ -805,10 +806,17 @@ impl<'a> Appearances<'a> {
         } else {
             BlendMode::Normal
         };
+        // A widget is drawn opaque whatever its /CA says (observed in `PyMuPDF`
+        // 1.28.2 bake: text, choice and button fields alike, /CA 0 or 0.5).
+        let opacity = if **subtype == *b"Widget" {
+            1.0
+        } else {
+            opacity(annot)
+        };
         Ok(Some(Appearance {
             content,
             glyphs,
-            opacity: opacity(annot),
+            opacity,
             blend,
         }))
     }

@@ -140,6 +140,36 @@ fn highlight_fills_each_quad_in_multiply_at_ca() {
     );
 }
 
+/// A form field is drawn opaque whatever its /CA, as `PyMuPDF` 1.28.2 bake draws
+/// text, choice and button fields; other annotations at /CA.
+#[test]
+fn a_widget_is_drawn_opaque_whatever_its_ca() {
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    for ca in ["0", "0.5", "1"] {
+        for field in [
+            "/FT /Tx /V (A)",
+            "/FT /Ch /Ff 131072 /V (A)",
+            "/FT /Btn /Ff 65536",
+            "/FT /Btn /AS /Off",
+        ] {
+            let ev = draw(
+                &[&format!(
+                    "/Subtype /Widget /T (f) {field} /Rect [20 20 180 60] \
+                     /MK << /BG [1 0 0] >> /CA {ca}"
+                )],
+                VIEW,
+            );
+            let red: Vec<_> = fills(&ev).into_iter().filter(|f| f.1 == RED).collect();
+            assert!(!red.is_empty(), "{field} /CA {ca}: {ev:?}");
+        }
+    }
+    let ev = draw(
+        &["/Subtype /Square /Rect [20 20 180 60] /IC [1 0 0] /BS << /W 0 >> /CA 0.5"],
+        VIEW,
+    );
+    assert!(fills(&ev).iter().any(|f| f.1 == [255, 0, 0, 128]), "{ev:?}");
+}
+
 /// A translucent fill and border of one operator are drawn as viewers draw them:
 /// the border covers the fill under it rather than blending over it, as if the
 /// pair were drawn opaque and then at /CA as one.
