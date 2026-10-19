@@ -14,19 +14,20 @@ use hayro_interpret::hayro_syntax::work;
 use hayro_interpret::{AnnotationSelection, InterpreterSettings};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod common;
 
-/// The system allocator, refusing to hold more than [`LIMIT`] bytes at once, and
-/// counting the bytes each thread allocates.
+/// The system allocator, refusing to let one thread hold more than [`LIMIT`] bytes
+/// at once, and counting the bytes each thread allocates. Each test runs on a thread
+/// of its own, so one test's memory never fails another's; what one thread frees of
+/// what another allocated counts as freed by the one that frees it.
 struct Limited;
 
-const LIMIT: usize = 256 << 20;
-static HELD: AtomicUsize = AtomicUsize::new(0);
+const LIMIT: isize = 256 << 20;
 
 thread_local! {
     static ALLOCATED: Cell<usize> = const { Cell::new(0) };
+    static HELD: Cell<isize> = const { Cell::new(0) };
 }
 
 /// The bytes this thread has allocated so far, freed or not.
@@ -38,11 +39,18 @@ fn allocated() -> usize {
 // `GlobalAlloc::alloc` allows.
 unsafe impl GlobalAlloc for Limited {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if HELD.fetch_add(layout.size(), Ordering::Relaxed) + layout.size() > LIMIT {
-            HELD.fetch_sub(layout.size(), Ordering::Relaxed);
+        let size = layout.size() as isize;
+        // A thread being torn down has no counters left; its allocations count for
+        // none.
+        let fits = HELD
+            .try_with(|held| {
+                let now = held.get().saturating_add(size);
+                (now <= LIMIT).then(|| held.set(now)).is_some()
+            })
+            .unwrap_or(true);
+        if !fits {
             return std::ptr::null_mut();
         }
-        // A thread being torn down has no counter left; its allocations count for none.
         let _ = ALLOCATED.try_with(|a| a.set(a.get() + layout.size()));
         // SAFETY: the caller's layout, as `alloc` requires.
         unsafe { System.alloc(layout) }
@@ -51,7 +59,7 @@ unsafe impl GlobalAlloc for Limited {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: allocated by `alloc` above with this layout.
         unsafe { System.dealloc(ptr, layout) };
-        HELD.fetch_sub(layout.size(), Ordering::Relaxed);
+        let _ = HELD.try_with(|held| held.set(held.get() - layout.size() as isize));
     }
 }
 
