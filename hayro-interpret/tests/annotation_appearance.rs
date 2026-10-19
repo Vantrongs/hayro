@@ -3857,6 +3857,67 @@ fn a_line_as_wide_as_its_box_stays_on_it() {
     }
 }
 
+/// What the one annotation `annot` of a 200 pt page looks like, in short ([`looks`]),
+/// `measure` for [`Unsupported::Measure`].
+fn look_of(annot: &str) -> String {
+    let pdf = annotations(
+        "/Annots [4 0 R]",
+        vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
+    );
+    match first_look(&pdf) {
+        Look::Unsupported(Unsupported::Measure(_)) => "measure".into(),
+        _ => looks(&pdf).swap_remove(0),
+    }
+}
+
+/// A caption whose gap starts at the start of its line: viewers may break the line
+/// for it or draw it whole. That refuses the line only where the gap may paint where
+/// the page shows it: not where the whole line lies off the page, nor where the line
+/// is not stroked.
+#[test]
+fn a_caption_viewers_may_break_its_line_for_refuses_only_where_it_shows() {
+    // The caption, "AAAAA AAAAA" in Helvetica at 12 pt, is 83.376 wide, and the gap
+    // 3 more to each side: the line's length.
+    let line = |at: f64, color: &str| {
+        format!(
+            "/Subtype /Line {color} /Cap true /Contents (AAAAA AAAAA) \
+             /L [{at} {at} {} {at}] /Rect [{} {} {} {}]",
+            at + 89.376,
+            at - 10.0,
+            at - 10.0,
+            at + 100.0,
+            at + 20.0
+        )
+    };
+    assert_eq!(look_of(&line(1000.0, "/C [0]")), "nothing");
+    assert_eq!(look_of(&line(50.0, "/C [0]")), "measure");
+    assert_eq!(look_of(&line(50.0, "")), "generated");
+}
+
+/// A rich line as wide as its box: viewers may keep it on one line or break it.
+/// That refuses the text only where its box, from that line down, may paint where
+/// the page shows it: not where the box lies off the page, nor where the line lies
+/// below what the page shows; but where the line's first word lies off the page
+/// and its second on it, which one way draws and the other breaks off the page.
+#[test]
+fn a_rich_line_viewers_may_break_refuses_only_where_its_box_shows() {
+    let rich = |rect: &str, before: &str| {
+        format!(
+            "/Subtype /FreeText /BS << /W 0 >> /DA (/Cour 12 Tf 0 g) /Rect [{rect}] \
+             /Contents (x) /RC (<body style=\"font-family:Courier;font-size:12pt\">\
+             {before}<p>AAAAA AAAAA</p></body>)"
+        )
+    };
+    assert_eq!(look_of(&rich("10 20 89.2 135", "")), "measure");
+    assert_eq!(look_of(&rich("1010 1020 1089.2 1135", "")), "nothing");
+    // Five lines of B above it, from 30 down: the line's top is 42 below the page.
+    let above = "<p>B</p>".repeat(5);
+    assert_eq!(look_of(&rich("10 -200 89.2 30", &above)), "generated");
+    // Just narrower than the line: it is broken, and no glyph of either line shows,
+    // but a viewer keeping it whole draws the second word on the page.
+    assert_eq!(look_of(&rich("-60 20 19.19999 135", "")), "measure");
+}
+
 /// A run of spaces breaks as `PyMuPDF` 1.28.2 bake breaks it: a line takes a word
 /// and the space after it, and each space after that is a token of its own, which
 /// starts the next line when the line does not fit; spaces at a line's start are

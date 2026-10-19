@@ -634,7 +634,7 @@ pub(super) struct LaidLine {
     /// laid out so; else a viewer's is within [`aligned`]'s bound of `width`.
     pub(super) exact: Option<f32>,
     /// Whether where viewers break it cannot be told ([`Shaped::rich_line_end`]):
-    /// what is drawn of it and of the lines after it is [`Unsupported::Measure`].
+    /// they may lay it and the lines after it out otherwise ([`draw_box`]).
     pub(super) uncertain: bool,
 }
 
@@ -1924,6 +1924,10 @@ pub(super) fn draw_box(
     if skips() && bound.0 == 0.0 {
         return Ok(());
     }
+    // Whether what is laid out from here on cannot show, whichever way viewers
+    // break its lines: the searches pass over it, and a line that may break
+    // otherwise there refuses nothing.
+    let mut gone = bound.0 == 0.0;
     let view = area.frame.inverse().transform_rect_bbox(shown);
     let (pad, top) = (f64::from(area.pad), area.top);
     // How far a viewer may put the baseline of a line `below` the top, the
@@ -1946,9 +1950,6 @@ pub(super) fn draw_box(
     let off = |j: usize, below: f64| level(j, below).bound().x + slack;
     let mut brush = Brush::new(Some(area.clip), None);
     let mut moves = Moves::default();
-    // Whether a line laid out so far broke where viewers may not: what is drawn
-    // from it on lies where they may not draw it.
-    let mut uncertain = false;
     let (mut height, mut filled) = (0.0_f32, f32::NEG_INFINITY);
     let mut way = None;
     let mut laid = 0_usize;
@@ -1973,7 +1974,7 @@ pub(super) fn draw_box(
         };
         let ink = text.ink.map_or(0.0, |r| r.y0.abs().max(r.y1.abs()));
         // The last piece: none of its lines is laid out when none can reach the view.
-        if skips() && last {
+        if last {
             let most = text.most_lines();
             let depth = Depth {
                 top,
@@ -1987,11 +1988,41 @@ pub(super) fn draw_box(
                 ),
             };
             if depth.cannot_reach(direction, ink, view) {
-                return Ok(());
+                if skips() {
+                    return Ok(());
+                }
+                gone = true;
             }
         }
         for line in lines {
-            uncertain |= line.uncertain;
+            if line.uncertain && !gone {
+                // Viewers may break this line otherwise, and lay it and every line
+                // after it out otherwise: anywhere in the box from its top down,
+                // and above that as far as the glyphs from its first on reach
+                // above the top of their line, wherever a viewer puts it (as the
+                // lines past the view are passed over, below).
+                let rest = f64::from(text.rest(line.glyphs.start, set.base).max(later.0));
+                let up = rest * ink.max(later.1)
+                    + off(
+                        laid + text.most_lines(),
+                        f64::from(height).abs() + text.most_lines() as f64 * tallest,
+                    );
+                let clip = area.frame.inverse().transform_rect_bbox(area.clip);
+                let y1 = match direction {
+                    Direction::Forward => clip.y1.min(f64::from(top - height) + up),
+                    Direction::Backward | Direction::Nowhere => clip.y1,
+                };
+                if y1.partial_cmp(&clip.y0).is_none_or(|o| o.is_ge()) {
+                    let differ = [
+                        (clip.x0, clip.y0),
+                        (clip.x1, clip.y0),
+                        (clip.x1, y1),
+                        (clip.x0, y1),
+                    ]
+                    .map(|(x, y)| area.frame * kurbo::Point::new(x, y));
+                    out.undecided(Some(area.clip), &differ, 0.0, Rounding::NONE);
+                }
+            }
             let below = height + ascent * line.size;
             height += 1.2 * line.size;
             filled = filled.max(height);
@@ -2031,7 +2062,6 @@ pub(super) fn draw_box(
                     _ => line_start(&text, &line, set.base, x, avail),
                 }
                 .plus(moved);
-                let drawn = out.forms();
                 draw_glyphs(
                     fonts,
                     &text,
@@ -2045,9 +2075,6 @@ pub(super) fn draw_box(
                     out,
                     &mut brush,
                 )?;
-                if uncertain && out.forms() > drawn {
-                    return Err(Unsupported::Measure);
-                }
             }
             laid += 1;
             // The lines after this one lie below the top of the next, at a positive
@@ -2066,8 +2093,11 @@ pub(super) fn draw_box(
                 Direction::Backward => next - reach > view.y1,
                 Direction::Nowhere => false,
             };
-            if skips() && past {
-                return Ok(());
+            if past {
+                if skips() {
+                    return Ok(());
+                }
+                gone = true;
             }
         }
     }

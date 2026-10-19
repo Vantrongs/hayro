@@ -5,7 +5,7 @@
 //! endings look as common viewers draw them.
 
 use super::entries::{Derived, Entries, Items, Text};
-use super::out::{Color, Out, Rounding};
+use super::out::{Color, Out, Rounding, stroke_reach};
 use super::text::{self, Align, Family, Setting};
 use super::{Appearances, CAPTION, Unsupported, border_width, circle, color_of, dash};
 use hayro_syntax::object::dict::keys::{C, IC};
@@ -415,6 +415,9 @@ pub(super) fn line<'a>(
     // line, is set once for the document, and only what the page shows of it drawn.
     let caption = annot.bool(b"Cap").unwrap_or(false);
     let mut gap = None;
+    // Where viewers may break the line for the gap or not otherwise than the gap
+    // here does: the part of the line between where they may start and end it.
+    let mut undecided = None;
     let mut caption_text = None;
     if caption {
         const SIZE: f32 = 12.0;
@@ -451,7 +454,8 @@ pub(super) fn line<'a>(
                     .bound()
                     .x;
                 if g0.abs() <= margin || (len - g1).abs() <= margin {
-                    return Err(Unsupported::Measure);
+                    let at = |t: f64| t.clamp(0.0, len.max(0.0));
+                    undecided = Some((at(g0 - margin), at(g1 + margin)));
                 }
                 gap = Some((g0, g1));
                 -0.3 * size
@@ -462,6 +466,17 @@ pub(super) fn line<'a>(
 
     // Read only where the line is drawn.
     let paint = Paint::of(annot);
+    if let Some((from, to)) = undecided
+        && paint.stroke.is_some()
+    {
+        // The ways differ where one strokes the gap and the other does not, and,
+        // where the line is dashed, after it: the dashes start anew where the line
+        // starts again.
+        let to = if paint.dash.is_empty() { to } else { len };
+        let dir = direction(lb - la);
+        let differ = [la + dir * from, la + dir * to];
+        out.undecided(None, &differ, stroke_reach(paint.width), Rounding::NONE);
+    }
     draw_line(
         &paint,
         [a, b],

@@ -38,6 +38,20 @@ pub(super) fn written_all<const L: usize>(v: [f64; L]) -> Result<[f32; L], Unsup
     Ok(n)
 }
 
+/// Why an appearance is refused for a measure ([`Unsupported::Measure`]): a decision
+/// viewers may take the other way changes what the page shows. Made only by
+/// [`Out::finish`], where [`Out::undecided`] found that the outcomes may differ
+/// where the page shows them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Undecided(());
+
+/// How far beyond its outline a stroke `width` wide paints: half the width times
+/// the miter limit, or the half-diagonal of a square cap's corner where that is
+/// more.
+pub(super) fn stroke_reach(width: f64) -> f64 {
+    width.abs() / 2.0 * MITER_LIMIT.max(std::f64::consts::SQRT_2)
+}
+
 /// A colour (PDF 32000-1 8.6.4): gray, RGB or CMYK components as given, each
 /// clamped to 0–1 where it is written, as renderers clamp it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -842,11 +856,12 @@ impl Kind {
 pub(super) struct Out {
     content: String,
     failed: bool,
+    /// Whether a decision viewers may take the other way changes what may show
+    /// ([`Out::undecided`]).
+    undecided: bool,
     /// The glyphs drawn, each once, and their names.
     glyphs: Vec<Rc<Glyph>>,
     named: hash::Set<Rc<str>>,
-    /// How many glyph forms were drawn.
-    forms: usize,
     state: State,
     frames: Vec<Frame>,
     /// The state set since the last thing painted, held back.
@@ -898,9 +913,9 @@ impl Out {
         Self {
             content: String::new(),
             failed: false,
+            undecided: false,
             glyphs: Vec::new(),
             named: hash::Set::default(),
-            forms: 0,
             state: State {
                 region: Region {
                     shown,
@@ -921,11 +936,6 @@ impl Out {
     }
 
     /// What the page shows of the current space, under the clips written so far.
-    /// How many glyph forms have been drawn.
-    pub(super) fn forms(&self) -> usize {
-        self.forms
-    }
-
     pub(super) fn region(&self) -> Region {
         self.state.region.clone()
     }
@@ -942,14 +952,39 @@ impl Out {
         self.state.region.slack(most, local)
     }
 
-    /// The content written and the glyphs it draws; [`Unsupported::Coordinates`]
-    /// when a number written could not be.
+    /// The content written and the glyphs it draws; [`Unsupported::Measure`] where
+    /// a decision taken may change what shows ([`Out::undecided`]), and
+    /// [`Unsupported::Coordinates`] when a number written could not be.
     pub(super) fn finish(self) -> Result<(String, Vec<Rc<Glyph>>), Unsupported> {
-        if self.failed {
+        if self.undecided {
+            Err(Unsupported::Measure(Undecided(())))
+        } else if self.failed {
             Err(Unsupported::Coordinates)
         } else {
             Ok((self.content, self.glyphs))
         }
+    }
+
+    /// A decision taken by a measure that viewers may take the other way, which the
+    /// content is drawn by as the generator takes it: every way of taking it draws
+    /// the same but within the convex hull of `differ`, points of the current space
+    /// each computed as `local` says, grown by `reach`, under a clip to `under`
+    /// where what differs is drawn under one not set yet ([`Out::clip`]). Where
+    /// that may paint where the page shows it ([`Region::may_show`]), the content
+    /// fails with [`Unsupported::Measure`]; where it may not, every way shows the
+    /// same, and the decision refuses nothing.
+    pub(super) fn undecided(
+        &mut self,
+        under: Option<kurbo::Rect>,
+        differ: &[Point],
+        reach: f64,
+        local: Rounding,
+    ) {
+        let mut region = self.state.region.clone();
+        if let Some((_, _, corners)) = under.and_then(|r| self.clip_rect(r)) {
+            region.cut(&corners);
+        }
+        self.undecided |= region.may_show(differ, reach, local).is_some();
     }
 
     /// Writes what was held back, before something painted.
@@ -983,7 +1018,6 @@ impl Out {
         self.content.push('/');
         self.content.push_str(&glyph.name);
         self.content.push_str(" Do\n");
-        self.forms += 1;
         if self.named.insert(glyph.name.clone()) {
             self.glyphs.push(glyph.clone());
         }
@@ -1066,7 +1100,7 @@ impl Out {
             }
             Kind::Paints { stroke, open } => {
                 let reach = if stroke {
-                    self.state.width.abs() / 2.0 * MITER_LIMIT.max(std::f64::consts::SQRT_2)
+                    stroke_reach(self.state.width)
                 } else {
                     0.0
                 };
@@ -1248,6 +1282,18 @@ impl Out {
     /// that holds what shows ([`Region::bounds`]), which cuts nothing that shows,
     /// so that its numbers are those of what shows, whatever lies beyond.
     pub(super) fn clip(&mut self, r: kurbo::Rect) -> Option<()> {
+        let (text, ok, corners) = self.clip_rect(r)?;
+        self.state.region.cut(&corners);
+        // The path being built, if any, ends in the clip, unpainted.
+        self.path.clear();
+        self.held.push_str(&text);
+        self.held_failed |= !ok;
+        Some(())
+    }
+
+    /// The clip to `r` as [`Out::clip`] writes it, whether each of its numbers can
+    /// be written, and its corners as a viewer reads them, on the page.
+    fn clip_rect(&self, r: kurbo::Rect) -> Option<(String, bool, [Point; 4])> {
         let mut r = r;
         let as_is = [r.x0, r.y0, r.width(), r.height()]
             .iter()
@@ -1274,17 +1320,11 @@ impl Out {
             *v = f64::from(n);
         }
         text.push_str("re\nW n\n");
-        // The rectangle as a viewer reads it, on the page.
         let [x, y, w, h] = v;
         let ctm = self.state.region.ctm;
         let corners =
             [(x, y), (x + w, y), (x + w, y + h), (x, y + h)].map(|(x, y)| ctm * Point::new(x, y));
-        self.state.region.cut(&corners);
-        // The path being built, if any, ends in the clip, unpainted.
-        self.path.clear();
-        self.held.push_str(&text);
-        self.held_failed |= !ok;
-        Some(())
+        Some((text, ok, corners))
     }
 
     /// Clips what follows to the path built (`W n`), and ends it: what shows is

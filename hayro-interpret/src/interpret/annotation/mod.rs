@@ -34,6 +34,7 @@ mod text;
 mod widget;
 
 use entries::{Annots, Entries, Id, Items, Label, Listed, Objects, Source, StreamEntries, Value};
+pub use out::Undecided;
 use out::{Color, Out, written_all};
 use text::{Family, Fonts, Shaped, Style, StyleKey, Typeface};
 
@@ -165,9 +166,10 @@ pub enum Unsupported {
     ValueStream,
     /// It lays text out where viewers' measure of a line, or of a caption against
     /// its line, lies so near the room it is measured against that which way
-    /// viewers decide cannot be told: their arithmetic for rich text and for a
-    /// line's caption is not reproduced to the bit.
-    Measure,
+    /// viewers decide cannot be told (their arithmetic for rich text and for a
+    /// line's caption is not reproduced to the bit), and the ways they may decide
+    /// differ where the page shows them.
+    Measure(Undecided),
 }
 
 /// An appearance generated for an annotation without a usable appearance stream.
