@@ -246,6 +246,59 @@ fn a_squiggle_off_the_page_costs_nothing_however_steep() {
     assert_eq!(look(steep).0, Ok(0));
 }
 
+/// A squiggle's steps whose stroke and joins paint nothing on the page are
+/// neither drawn nor counted, however near their corners, nor looked at one by
+/// one: quads just below the page, their steps within half the miter limit times
+/// the width of it but their joins' tips further than a viewer paints beyond it,
+/// beside a quad on the page, draw what that quad draws alone; so do such quads
+/// slanted, their tips leaning, and with sides apart from parallel, whose steps
+/// change shape along them. Where the steps come closer than a viewer paints
+/// beyond the page, they paint its edge (`MuPDF` draws the thinnest strokes a
+/// fifth of a pixel wide): two million such steps are refused.
+#[test]
+fn a_squiggle_whose_joins_stay_off_the_page_costs_nothing() {
+    let shown = "20 114 180 114 20 100 180 100";
+    let look = |quads: &str| {
+        let work = work_done();
+        let pdf = one_annotation(&format!(
+            "/Subtype /Squiggly /C [0] /QuadPoints [{quads}] /Rect [0 0 200 200]"
+        ));
+        let corners = match first_look(&pdf) {
+            Look::Generated(a) => Ok(a
+                .content
+                .lines()
+                .filter(|l| l.ends_with(" m") || l.ends_with(" l"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()),
+            Look::Unsupported(why) => Err(why),
+            _ => panic!("{quads}: drawn otherwise"),
+        };
+        (corners, work_done() - work)
+    };
+    let (alone, one) = look(shown);
+    assert_eq!(alone.as_ref().map(Vec::len), Ok(81));
+    // 7 high, so 2.19 within half the miter limit times the width; the joins' tips
+    // reach 0.31 from the corners on the bottom edge, 0.6 below the page.
+    for below in [
+        "0 -7.9 200 -7.9 0 -0.9 200 -0.9",
+        // Slanted: the sides lean right by the height.
+        "7 -7.9 207 -7.9 0 -0.9 200 -0.9",
+        // The right side a tenth longer than the left.
+        "0 -7.9 200 -8.6 0 -0.9 200 -0.9",
+    ] {
+        let (both, two) = look(&format!("{shown} {below}"));
+        assert_eq!(both, alone, "{below}");
+        assert!(
+            two < one + 200,
+            "{below}: {one} for one quad, {two} for both"
+        );
+    }
+    // 0.0007 high, 0.0001 below the page: 2 000 001 steps whose hairline greys the
+    // page's bottom row in bake.
+    let (both, _) = look(&format!("{shown} 0 -.0008 200 -.0008 0 -.0001 200 -.0001"));
+    assert_eq!(both, Err(Unsupported::Coordinates));
+}
+
 /// 4·10^6: twice it is below 2^23, from which numbers are not written.
 fn huge() -> String {
     "4000000".to_owned()

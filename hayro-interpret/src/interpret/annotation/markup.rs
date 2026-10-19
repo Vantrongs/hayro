@@ -7,8 +7,8 @@
 //! quadrilaterals, a line width wider on each side.
 
 use super::entries::{Derived, Entries, Items, Value};
-use super::out::{Color, MITER_LIMIT, Out};
-use super::{MOST_PIECES, Unsupported, border_width, c_color, color_of, dash, rect};
+use super::out::{Color, MITER_LIMIT, Out, written_all};
+use super::{MOST_PIECES, PAINTS_BEYOND, Unsupported, border_width, c_color, color_of, dash, rect};
 use hayro_syntax::object::dict::keys::{C, IC, INKLIST, QUADPOINTS};
 use kurbo::{Point, Rect, Vec2};
 use std::rc::Rc;
@@ -253,8 +253,12 @@ pub(super) fn squiggly(
     out.op("q");
     wrote(out.clip(clip))?;
     wrote(out.stroke_color(&stroke))?;
+    // The clip as written, in the numbers a viewer reads.
+    let [x, y, w, h] = written_all([clip.x0, clip.y0, clip.width(), clip.height()])?.map(f64::from);
+    let clip = Rect::new(x, y, x + w, y + h);
     if visible.overlaps(clip) {
-        let shown = visible.intersect(clip);
+        // A stroke paints a little beyond its outline, but not beyond the clip.
+        let shown = visible.intersect(clip).inset(PAINTS_BEYOND);
         // A quad of no height draws nothing ([`zigzag`]).
         for q in &quads.high {
             zigzag(q, shown, out)?;
@@ -267,26 +271,34 @@ pub(super) fn squiggly(
 /// The zigzag of a `Squiggly` quad as viewers draw it: steps of a seventh of its
 /// height `h` along its bottom edge, from its bottom left, to the first step at or
 /// past its bottom right; the corners alternately on the bottom edge and on the line
-/// a seventh of the way up each side, stroked `h`/16 wide. A quad of no height
-/// draws nothing.
+/// a seventh of the way up each side, stroked `h`/16 wide with butt caps and joins
+/// mitred up to [`MITER_LIMIT`]. A quad of no height draws nothing.
 ///
-/// Only the steps whose stroke can reach `shown`, the part of the page the clip lets
-/// show, are drawn: those that come within half the miter limit times the width of
-/// it, which holds the stroke and every join. Where a neighbouring step is left out,
-/// the run drawn ends there with a butt cap; the join it lacks lies outside `shown`,
-/// as the corner they share is further than that from it. Every step is drawn as it
-/// is, however fine: the content can be scaled and zoomed any amount. A quad that
-/// would draw more than [`MOST_PIECES`] is [`Unsupported::Coordinates`]: one whose
-/// part on the page is more than about 37 000 times as long as high, which no text
-/// is.
+/// Only the steps that paint in `shown`, the part of the page the clip lets show,
+/// are drawn and counted ([`Zigzag::paints`]): a step's stroke, and the joins it
+/// shares with its neighbours, at the width written and within what writing the
+/// corners moves them. Where a
+/// neighbouring step is left out, the run drawn ends there with a butt cap; the
+/// join it lacks paints nothing in `shown`, as the neighbour, whose join it is too,
+/// would be drawn otherwise. Every step is drawn as it is, however fine: the content
+/// can be scaled and zoomed any amount. A quad that would draw more than
+/// [`MOST_PIECES`] is [`Unsupported::Coordinates`]: one whose part on the page is
+/// more than about 37 000 times as long as high, which no text is.
 ///
 /// The steps drawn are found by halving the range of steps, from all of them down
-/// to single steps, and leaving out each range whose corners' convex hull, that of
-/// its first and last corner on each line, is further than that from `shown`
-/// ([`near`]). The steps run from one line to the other, so a range near `shown`
-/// holds a step near it, but for those at the ends of the part of the zigzag near
-/// `shown`: at most a few at each depth. The work is within about twice the depth,
-/// the bits of the number of steps, times the steps drawn and those few.
+/// to single steps: a range is left out when what its steps can paint is apart from
+/// `shown` ([`Zigzag::may_paint`]), and drawn whole when its corners lie in `shown`.
+/// What the steps of a range paint lies in the convex hull of the first and last
+/// step's strokes and joins of each kind (on the bottom edge, on the line above):
+/// exactly, where the quad is a parallelogram (the steps of each kind are then the
+/// same shape moved along), and within a bound that shrinks with the range
+/// otherwise. The steps run from one line to the other and the joins stand out
+/// from the lines between them, so a range that hull meets holds a step that
+/// paints, but for those at the ends of what the zigzag paints in `shown`: at most
+/// a few at each depth. The work is within about twice the depth, the bits of the
+/// number of steps, times those few and the ranges drawn; for a quad that is no
+/// parallelogram, also the ranges whose bound reaches `shown` where their steps do
+/// not, fewer the closer the quad is to a parallelogram.
 fn zigzag(q: &Quad, shown: Rect, out: &mut Out) -> Result<(), Unsupported> {
     let wrote = |o: Option<()>| o.ok_or(Unsupported::Coordinates);
     let [_, _, bl, br] = q.0;
@@ -303,29 +315,34 @@ fn zigzag(q: &Quad, shown: Rect, out: &mut Out) -> Result<(), Unsupported> {
         return Ok(());
     }
     let (top_left, top_right) = q.across(1.0 / 7.0);
-    let bottom = |t: f64| bl.lerp(br, t);
-    let top = |t: f64| top_left.lerp(top_right, t);
-    let hull = |ta: f64, tb: f64| [bottom(ta), bottom(tb), top(tb), top(ta)];
-    let reach = MITER_LIMIT * width / 2.0;
-    // The corners are `delta` apart along the bottom edge, at `t = k delta / len`.
+    // The most a corner written moves from where it is computed.
+    let size = [bl, br, top_left, top_right]
+        .iter()
+        .map(|p| p.x.abs().max(p.y.abs()))
+        .fold(0.0, f64::max)
+        + delta;
+    let z = Zigzag {
+        bl,
+        along,
+        top_left,
+        top_along: top_right - top_left,
+        // The corners are `delta` apart along the bottom edge, at `t = k dt`.
+        dt: delta / len,
+        // Half the width as written.
+        half: f64::from(width as f32) / 2.0,
+        slack: size * f64::from(f32::EPSILON),
+        shown,
+    };
     let steps = (len / delta).ceil();
     if !steps.is_finite() {
         // Steps too many to number, which no viewer tells apart: refused where the
         // quad can show.
-        return if near(&hull(0.0, 1.0), shown, reach) {
+        return if near(&z.hull(0.0, 1.0), shown, z.reach()) {
             Err(Unsupported::Coordinates)
         } else {
             Ok(())
         };
     }
-    let t = |k: f64| k * delta / len;
-    let corner = |k: f64| {
-        if k % 2.0 == 0.0 {
-            bottom(t(k))
-        } else {
-            top(t(k))
-        }
-    };
     // The ranges of steps left to look at, the first last; step `k` runs from
     // corner `k` to corner `k + 1`.
     let mut ranges = vec![(0.0, steps)];
@@ -334,36 +351,310 @@ fn zigzag(q: &Quad, shown: Rect, out: &mut Out) -> Result<(), Unsupported> {
     let mut until = None;
     while let Some((a, b)) = ranges.pop() {
         super::work(1);
-        if b - a > 1.0 {
-            if near(&hull(t(a), t(b)), shown, reach) {
-                let mid = ((a + b) / 2.0).floor();
-                // Past 2^53, neighbouring steps' numbers are no longer apart.
-                if !(a < mid && mid < b) {
-                    return Err(Unsupported::Coordinates);
+        let hull = z.hull(z.t(a), z.t(b));
+        if !near(&hull, shown, z.reach()) {
+            continue;
+        }
+        let inside = hull.iter().all(|p| shown.contains(*p));
+        if !inside {
+            if b - a > 1.0 {
+                // Where the corners' hull meets `shown`, a step crosses it but where
+                // `shown` lies between two steps; else what the strokes and joins
+                // paint decides.
+                if near(&hull, shown, 0.0) || z.may_paint(a, b) {
+                    let mid = ((a + b) / 2.0).floor();
+                    // Past 2^53, neighbouring steps' numbers are no longer apart.
+                    if !(a < mid && mid < b) {
+                        return Err(Unsupported::Coordinates);
+                    }
+                    ranges.push((mid, b));
+                    ranges.push((a, mid));
                 }
-                ranges.push((mid, b));
-                ranges.push((a, mid));
+                continue;
             }
-            continue;
+            if !z.paints(a, steps) {
+                continue;
+            }
         }
-        let (from, to) = (corner(a), corner(b));
-        if !near(&[from, to], shown, reach) {
-            continue;
-        }
-        drawn += 1.0;
+        // The steps `a..b`, each of which paints: its segment, if not all of it, is
+        // in `shown`.
+        drawn += b - a;
         if drawn > MOST_PIECES {
             return Err(Unsupported::Coordinates);
         }
         if until != Some(a) {
+            let from = z.corner(a);
             wrote(out.nums(&[from.x, from.y], "m"))?;
         }
-        wrote(out.nums(&[to.x, to.y], "l"))?;
+        for i in 1..=(b - a) as u64 {
+            let to = z.corner(a + i as f64);
+            wrote(out.nums(&[to.x, to.y], "l"))?;
+        }
         until = Some(b);
     }
     if until.is_some() {
         out.op("S");
     }
     Ok(())
+}
+
+/// A zigzag ([`zigzag`]) and the part of the page it is drawn on.
+struct Zigzag {
+    bl: Point,
+    along: Vec2,
+    top_left: Point,
+    top_along: Vec2,
+    dt: f64,
+    half: f64,
+    slack: f64,
+    shown: Rect,
+}
+
+impl Zigzag {
+    fn t(&self, k: f64) -> f64 {
+        k * self.dt
+    }
+
+    fn bottom(&self, t: f64) -> Point {
+        self.bl + self.along * t
+    }
+
+    fn top(&self, t: f64) -> Point {
+        self.top_left + self.top_along * t
+    }
+
+    /// Corner `k`: on the bottom edge for an even `k`, on the line above for an odd.
+    fn corner(&self, k: f64) -> Point {
+        if k % 2.0 == 0.0 {
+            self.bottom(self.t(k))
+        } else {
+            self.top(self.t(k))
+        }
+    }
+
+    /// The corners of the steps from `t = ta` to `tb`, on the two lines, whose
+    /// convex hull holds them.
+    fn hull(&self, ta: f64, tb: f64) -> [Point; 4] {
+        [self.bottom(ta), self.bottom(tb), self.top(tb), self.top(ta)]
+    }
+
+    /// The most any stroke or join reaches from the steps' segments: half the
+    /// miter limit times the width, and what writing the corners moves them.
+    fn reach(&self) -> f64 {
+        MITER_LIMIT * self.half + self.slack
+    }
+
+    /// The steps into and out of a corner at `t`, on the bottom edge (`odd`
+    /// false) or the line above, as functions of `t` that hold at every corner of
+    /// that kind: each affine in `t`.
+    fn ways(&self, odd: bool, t: f64) -> (Vec2, Vec2) {
+        let dt = self.dt;
+        if odd {
+            (
+                self.top(t) - self.bottom(t - dt),
+                self.bottom(t + dt) - self.top(t),
+            )
+        } else {
+            (
+                self.bottom(t) - self.top(t - dt),
+                self.top(t + dt) - self.bottom(t),
+            )
+        }
+    }
+
+    /// Whether step `k` of `steps` paints in `shown`: its rectangle, half the
+    /// width to each side of it from corner to corner, or the join at either end
+    /// it shares with a neighbour; or comes within what writing the corners moves
+    /// them of it. A step or a neighbour of no length or direction counts as
+    /// reaching as far as a join can.
+    fn paints(&self, k: f64, steps: f64) -> bool {
+        let (shown, half, slack) = (self.shown, self.half, self.slack);
+        let (from, to) = (self.corner(k), self.corner(k + 1.0));
+        let Some(d) = unit(to - from) else {
+            return near(&[from, to], shown, self.reach());
+        };
+        let n = d.turn_90() * half;
+        if near(&[from, to], shown, slack)
+            || near(&[from + n, to + n, to - n, from - n], shown, slack)
+        {
+            return true;
+        }
+        let join = |a: Point, c: Point, b: Point| match Join::of(c - a, b - c, half) {
+            Some(join) => join.region(c).is_some_and(|r| near(&r, shown, slack)),
+            None => near(&[c], shown, self.reach()),
+        };
+        (k > 0.0 && join(self.corner(k - 1.0), from, to))
+            || (k + 1.0 < steps && join(from, to, self.corner(k + 2.0)))
+    }
+
+    /// Whether the steps `a..b` may paint in `shown`: whether the convex
+    /// hull of what the first and last corners of each kind and their strokes and
+    /// joins can paint comes within the bound below of it. The steps into and out
+    /// of the corners of a kind change along the range by at most `dv` each, being
+    /// affine in `t`, so that their directions change by at most `2 dv / m`, `m`
+    /// the shortest of them; the strokes' corners and the joins' tips move by at
+    /// most as much times half the width and what the join's shape makes of it.
+    fn may_paint(&self, a: f64, b: f64) -> bool {
+        let mut points = Vec::with_capacity(24);
+        let mut bound: f64 = 0.0;
+        for odd in [false, true] {
+            let parity = |k: f64| (k % 2.0 == 1.0) == odd;
+            let first = if parity(a) { a } else { a + 1.0 };
+            let last = if parity(b) { b } else { b - 1.0 };
+            if first > last {
+                continue;
+            }
+            let (c0, c1) = (self.corner(first), self.corner(last));
+            let (tf, tl) = (self.t(first), self.t(last));
+            let ((i0, o0), (i1, o1)) = (self.ways(odd, tf), self.ways(odd, tl));
+            let shortest = segment_from_origin(i0, i1).min(segment_from_origin(o0, o1));
+            let dv = (i1 - i0).hypot().max((o1 - o0).hypot());
+            let turned = (2.0 * dv / shortest).min(2.0);
+            let join = Join::of(i0, o0, self.half);
+            let Some(join) = join.filter(|_| shortest > 0.0 && turned.is_finite()) else {
+                // No direction to bound by: as far as a join can reach.
+                points.extend([c0, c1]);
+                bound = bound.max(self.reach());
+                continue;
+            };
+            // Whether the outer side, and whether the join is mitred, can change
+            // along the range: then both sides, and the tip as far as the limit
+            // lets it reach.
+            let (either_side, miter) = join.along(turned);
+            let mut reach = self.half * turned;
+            match miter {
+                Some(true) => reach += join.tip_moves(turned),
+                Some(false) => {}
+                None => reach = reach.max(self.reach()),
+            }
+            bound = bound.max(reach);
+            for o in join.offsets(either_side, miter == Some(true)) {
+                points.extend([c0 + o, c1 + o]);
+            }
+        }
+        // The ends of the zigzag are butt caps, not joins: what is added for them
+        // is more than they paint.
+        near(&points, self.shown, bound + self.slack)
+    }
+}
+
+/// `v` of length 1; `None` for no length or none that is finite.
+fn unit(v: Vec2) -> Option<Vec2> {
+    let n = v.hypot();
+    (n > 0.0 && n.is_finite()).then(|| v / n)
+}
+
+/// The distance from the origin to the segment from `a` to `b`.
+fn segment_from_origin(a: Vec2, b: Vec2) -> f64 {
+    let ab = b - a;
+    let f = (-a).dot(ab) / ab.hypot2();
+    let f = if f.is_finite() {
+        f.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (a + ab * f).hypot()
+}
+
+/// The join of two steps of a stroke `2 half` wide, along `d1` into a corner and
+/// `d2` out of it, mitred up to [`MITER_LIMIT`] (PDF 32000-1 8.4.3.5): on the outer
+/// side of the turn, the bevel between the two strokes' corners and, where the
+/// miter is within the limit, the miter's tip.
+struct Join {
+    /// Of length `half`, to the left of each step.
+    n1: Vec2,
+    n2: Vec2,
+    /// The sine of the turn, positive to the left.
+    turn: f64,
+    /// 1 + the cosine of the turn: the miter is within the limit where this is at
+    /// least `2 / MITER_LIMIT²`, its tip `half (n1 + n2) / this` from the corner on
+    /// the outer side.
+    bend: f64,
+    half: f64,
+}
+
+/// The least [`Join::bend`] of a mitred join.
+const LEAST_MITER_BEND: f64 = 2.0 / (MITER_LIMIT * MITER_LIMIT);
+
+impl Join {
+    fn of(d1: Vec2, d2: Vec2, half: f64) -> Option<Self> {
+        let (u1, u2) = (unit(d1)?, unit(d2)?);
+        Some(Self {
+            n1: u1.turn_90() * half,
+            n2: u2.turn_90() * half,
+            turn: u1.cross(u2),
+            bend: 1.0 + u1.dot(u2),
+            half,
+        })
+    }
+
+    /// Of the outer side.
+    fn outer(&self) -> f64 {
+        if self.turn > 0.0 { -1.0 } else { 1.0 }
+    }
+
+    /// The tip of the miter from the corner, on the outer side.
+    fn tip(&self) -> Vec2 {
+        (self.n1 + self.n2) * (self.outer() / self.bend)
+    }
+
+    /// The join at corner `c`, a convex polygon: the corner, the two strokes'
+    /// corners on the outer side, and the miter's tip between them where it is
+    /// within the limit. `None` for a turn of none, straight on or back, where the
+    /// strokes' ends cover the corner.
+    fn region(&self, c: Point) -> Option<Vec<Point>> {
+        if self.turn == 0.0 {
+            return None;
+        }
+        let s = self.outer();
+        let mut p = vec![c, c + self.n1 * s];
+        if self.bend >= LEAST_MITER_BEND {
+            p.push(c + self.tip());
+        }
+        p.push(c + self.n2 * s);
+        Some(p)
+    }
+
+    /// For a range along which each step's direction changes by at most
+    /// `turned`: whether the outer side can change, and whether the join is
+    /// mitred all along (`Some(true)`), bevelled all along (`Some(false)`) or
+    /// either.
+    fn along(&self, turned: f64) -> (bool, Option<bool>) {
+        // The sine and the cosine of the turn change by at most twice as much.
+        let change = 2.0 * turned;
+        let either_side = self.turn.abs() <= change;
+        let miter = if self.bend - change >= LEAST_MITER_BEND {
+            Some(true)
+        } else if self.bend + change < LEAST_MITER_BEND {
+            Some(false)
+        } else {
+            None
+        };
+        (either_side, miter)
+    }
+
+    /// The most the tip moves where each step's direction changes by at most
+    /// `turned` and the join stays mitred: `half (n1 + n2) / bend`, its numerator
+    /// moving by `2 half turned` at most, its denominator by `2 turned`.
+    fn tip_moves(&self, turned: f64) -> f64 {
+        let least = (self.bend - 2.0 * turned).max(LEAST_MITER_BEND);
+        self.half * (2.0 * turned / least + 2.0 * 2.0 * turned / (least * least))
+    }
+
+    /// What the strokes and the join can paint around a corner, from it: the
+    /// strokes' corners on both sides, and the miter's tip, on the outer side or
+    /// on either.
+    fn offsets(&self, either_side: bool, miter: bool) -> Vec<Vec2> {
+        let mut o = vec![self.n1, -self.n1, self.n2, -self.n2];
+        if miter {
+            let tip = self.tip();
+            o.push(tip);
+            if either_side {
+                o.push(-tip);
+            }
+        }
+        o
+    }
 }
 
 /// Whether the convex hull of `points` comes within `reach` of `r`; also where a
@@ -460,6 +751,7 @@ impl Derived for Paths {
 
 #[cfg(test)]
 mod tests {
+    use super::super::PAINTS_BEYOND;
     use super::super::entries::Entries;
     use super::super::out::Out;
     use super::squiggly;
@@ -591,32 +883,80 @@ mod tests {
             .fold(f64::INFINITY, f64::min)
     }
 
+    /// Whether step `k` of the polyline through `corners`, stroked `width` wide with
+    /// butt caps and mitred joins up to 10 by kurbo's stroker, paints in `r`: the
+    /// step with a stub of 10^-9 of each neighbour, which carries the join it shares
+    /// with it.
+    fn step_paints(corners: &[(f64, f64)], k: usize, width: f64, r: Rect) -> bool {
+        use kurbo::{BezPath, Cap, Join, PathEl, Point, Shape, Stroke, StrokeOpts};
+        let p = |i: usize| Point::new(corners[i].0, corners[i].1);
+        let stub = |from: Point, to: Point| from + (to - from).normalize() * 1e-9;
+        let mut path = BezPath::new();
+        path.move_to(if k > 0 { stub(p(k), p(k - 1)) } else { p(k) });
+        path.line_to(p(k));
+        path.line_to(p(k + 1));
+        if k + 2 < corners.len() {
+            path.line_to(stub(p(k + 1), p(k + 2)));
+        }
+        let style = Stroke::new(width)
+            .with_join(Join::Miter)
+            .with_miter_limit(10.0)
+            .with_caps(Cap::Butt);
+        let outline = kurbo::stroke(path, &style, &StrokeOpts::default(), 1e-9);
+        let corners_of_r = [(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1)];
+        if corners_of_r
+            .iter()
+            .any(|&(x, y)| outline.winding(Point::new(x, y)) != 0)
+        {
+            return true;
+        }
+        let mut last = Point::ZERO;
+        let mut start = Point::ZERO;
+        let mut meets = false;
+        kurbo::flatten(&outline, 1e-9, |el| {
+            let (a, b) = match el {
+                PathEl::MoveTo(q) => {
+                    (last, start) = (q, q);
+                    return;
+                }
+                PathEl::LineTo(q) => (last, q),
+                PathEl::ClosePath => (last, start),
+                _ => unreachable!("flattened"),
+            };
+            meets |= distance((a.x, a.y), (b.x, b.y), r) == 0.0;
+            last = b;
+        });
+        meets
+    }
+
     /// A quad whose line a seventh of the way up leans far back over the page, while
-    /// its bottom edge lies beside it: of its thousand steps, those whose stroke can
-    /// reach the page, within half the miter limit times the line width of it, are
-    /// drawn, and no other (the 30 steps from 86 on; before, every step was).
+    /// its bottom edge lies beside it: of its thousand steps, those whose stroke or
+    /// joins paint on the page are drawn, and no other (the 26 steps from 88 on;
+    /// within half the miter limit times the width of it, before, the 30 from 86;
+    /// before that, every step).
     #[test]
     fn a_steep_zigzag_draws_the_steps_that_reach_the_page() {
         let page = Rect::new(0.0, 0.0, 200.0, 200.0);
         let c = squiggly_content("300 7 -13700 14000 300 0 1300 0", page);
         // Height 7: steps of 1 along the bottom edge from x = 300, a line 7/16 wide;
         // the line a seventh of the way up runs from (300, 1) to (1300 - 15000 / 7,
-        // 2000).
+        // 2000). The corners as written, in 32-bit numbers.
         let (top_left, top_right) = ((300.0, 1.0), (1300.0 - 15000.0 / 7.0, 2000.0));
         let corner = |k: usize| {
             let t = k as f64 / 1000.0;
-            if k.is_multiple_of(2) {
+            let (x, y) = if k.is_multiple_of(2) {
                 (300.0 + 1000.0 * t, 0.0)
             } else {
                 (
                     top_left.0 + (top_right.0 - top_left.0) * t,
                     top_left.1 + (top_right.1 - top_left.1) * t,
                 )
-            }
+            };
+            (f64::from(x as f32), f64::from(y as f32))
         };
-        let reach = 10.0 * (7.0 / 16.0) / 2.0;
+        let corners: Vec<(f64, f64)> = (0..=1000).map(corner).collect();
         let near: Vec<usize> = (0..1000)
-            .filter(|&k| distance(corner(k), corner(k + 1), page) <= reach)
+            .filter(|&k| step_paints(&corners, k, 7.0 / 16.0, page))
             .collect();
         // The runs of steps drawn, as the steps of each.
         let mut drawn = vec![];
@@ -644,9 +984,227 @@ mod tests {
         assert_eq!(drawn, near, "{c}");
     }
 
+    /// The steps drawn in `c`, by the corner nearest where each `l` ends.
+    fn steps_drawn(c: &str, corners: &[(f64, f64)]) -> Vec<usize> {
+        corners_drawn(c)
+            .into_iter()
+            .map(|(x, y)| {
+                let d = |k: usize| (corners[k].0 - x).hypot(corners[k].1 - y);
+                (0..corners.len())
+                    .min_by(|&a, &b| d(a).total_cmp(&d(b)))
+                    .unwrap()
+                    - 1
+            })
+            .collect()
+    }
+
+    /// Where each `l` of `c` ends.
+    fn corners_drawn(c: &str) -> Vec<(f64, f64)> {
+        c.lines()
+            .filter(|l| l.ends_with(" l"))
+            .map(|l| {
+                let n: Vec<f64> = l.split(' ').take(2).map(|v| v.parse().unwrap()).collect();
+                (n[0], n[1])
+            })
+            .collect()
+    }
+
+    /// Zigzags along each side of the page, just off it, upside down so that the
+    /// joins' tips of the corners nearest the page reach towards it, by less or more
+    /// than the gap: rectangles, slanted ones, and quads whose sides are not
+    /// parallel, whose steps change shape along them. The steps drawn are exactly
+    /// those whose stroke or joins, as kurbo's stroker outlines them, come within
+    /// [`PAINTS_BEYOND`] of the page inside the clip.
+    #[test]
+    fn zigzags_along_the_page_draw_the_steps_that_paint_on_it() {
+        let page = Rect::new(0.0, 0.0, 200.0, 200.0);
+        // A small linear congruential generator: the same quads each run.
+        let mut seed = 0x2545_f491_u64;
+        let mut next = |lo: f64, hi: f64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            lo + (hi - lo) * ((seed >> 11) as f64 / (1_u64 << 53) as f64)
+        };
+        let mut tried = 0;
+        let mut painted = 0;
+        for i in 0..48 {
+            let h = next(2.0, 9.0);
+            let width = h / 16.0;
+            // From the page's edge to the bottom edge, outwards: from a little
+            // inside to past the miter tips of the steepest joins.
+            let gap = next(-0.5 * width, 3.0 * width);
+            let slant = next(-1.5 * h, 1.5 * h);
+            let spread = next(-0.3, 0.3) * h * f64::from(i % 3 != 0);
+            let (x0, x1) = (next(-40.0, 20.0), next(120.0, 240.0));
+            // Along the bottom side of the page, then turned onto each other side.
+            let q = [
+                (x0 + slant, -gap - h),
+                (x1 + slant, -gap - h - spread),
+                (x0, -gap),
+                (x1, -gap),
+            ];
+            let turn = |(x, y): (f64, f64)| match i % 4 {
+                0 => (x, y),
+                1 => (200.0 - y, x),
+                2 => (200.0 - x, 200.0 - y),
+                _ => (y, 200.0 - x),
+            };
+            let q = q.map(turn);
+            let quads = q
+                .iter()
+                .map(|(x, y)| format!("{x} {y}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let c = squiggly_content(&quads, page);
+            // The zigzag as `zigzag` draws it: corners a seventh of the height
+            // apart along the bottom edge, alternately on it and on the line a
+            // seventh of the way up.
+            let pt = |(x, y): (f64, f64)| kurbo::Point::new(x, y);
+            let [tl, tr, bl, br] = q.map(pt);
+            let height = (tl - bl).hypot();
+            let delta = height / 7.0;
+            let len = (br - bl).hypot();
+            let steps = (len / delta).ceil() as usize;
+            let (top_left, top_right) = (bl.lerp(tl, 1.0 / 7.0), br.lerp(tr, 1.0 / 7.0));
+            let corners: Vec<(f64, f64)> = (0..=steps)
+                .map(|k| {
+                    let t = k as f64 * delta / len;
+                    let p = if k % 2 == 0 {
+                        bl.lerp(br, t)
+                    } else {
+                        top_left.lerp(top_right, t)
+                    };
+                    (f64::from(p.x as f32), f64::from(p.y as f32))
+                })
+                .collect();
+            let width = height / 16.0;
+            // Clipped to the box of the quad, a width wider on each side, as written.
+            let clip = Rect::from_points(tl, tr)
+                .union_pt(bl)
+                .union_pt(br)
+                .inset(width);
+            let [x, y, w, h] =
+                [clip.x0, clip.y0, clip.width(), clip.height()].map(|v| f64::from(v as f32));
+            // A clip that leaves nothing of the page shows nothing, however close.
+            let clip = Rect::new(x, y, x + w, y + h);
+            let shown = page.intersect(clip).inset(PAINTS_BEYOND);
+            let width = f64::from(width as f32);
+            let expected: Vec<usize> = (0..steps)
+                .filter(|&k| page.overlaps(clip) && step_paints(&corners, k, width, shown))
+                .collect();
+            assert_eq!(steps_drawn(&c, &corners), expected, "{quads}");
+            tried += 1;
+            painted += usize::from(!expected.is_empty());
+        }
+        // Some paint and some do not.
+        assert!(painted > 8 && painted < tried - 8, "{painted} of {tried}");
+    }
+
+    /// A range of steps is left out only when none of its steps paints: for quads
+    /// of every shape (their sides far from parallel, so that the steps' joins
+    /// change from bevels to long miters and back along them), ranges of every
+    /// length, and small parts of the page around the zigzag.
+    #[test]
+    fn a_range_left_out_holds_no_step_that_paints() {
+        use super::{Quad, Zigzag};
+        use kurbo::Point;
+        let mut seed = 0x9e37_79b9_u64;
+        let mut next = |lo: f64, hi: f64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            lo + (hi - lo) * ((seed >> 11) as f64 / (1_u64 << 53) as f64)
+        };
+        let (mut left_out, mut specks) = (0, 0);
+        for _ in 0..300 {
+            let mut p = || Point::new(next(0.0, 100.0), next(0.0, 100.0));
+            let (bl, br) = (p(), p());
+            let tl = bl + kurbo::Vec2::new(next(-30.0, 30.0), next(-30.0, 30.0));
+            let tr = br + kurbo::Vec2::new(next(-60.0, 60.0), next(-60.0, 60.0));
+            let q = Quad([tl, tr, bl, br]);
+            let delta = q.height() / 7.0;
+            let len = (br - bl).hypot();
+            let steps = (len / delta).ceil();
+            if !(steps > 4.0 && steps < 400.0) {
+                continue;
+            }
+            let (top_left, top_right) = q.across(1.0 / 7.0);
+            let c = Point::new(next(0.0, 100.0), next(0.0, 100.0));
+            let (w, h) = (next(0.0, 3.0), next(0.0, 3.0));
+            let mut z = Zigzag {
+                bl,
+                along: br - bl,
+                top_left,
+                top_along: top_right - top_left,
+                dt: delta / len,
+                half: f64::from((q.height() / 16.0) as f32) / 2.0,
+                // As `zigzag` sets it: the most writing moves a corner.
+                slack: (150.0 + delta) * f64::from(f32::EPSILON),
+                shown: Rect::new(c.x, c.y, c.x + w, c.y + h),
+            };
+            for _ in 0..20 {
+                let a = next(0.0, steps - 1.0).floor();
+                let b = (a + 1.0 + next(0.0, steps - a).floor()).min(steps);
+                if b - a < 2.0 || z.may_paint(a, b) {
+                    continue;
+                }
+                left_out += 1;
+                for k in a as usize..b as usize {
+                    assert!(
+                        !z.paints(k as f64, steps),
+                        "step {k} of {a}..{b} paints: {:?} in {:?}",
+                        q.0,
+                        z.shown
+                    );
+                }
+            }
+            // A speck of the page at the outermost points of a step's joins and
+            // stroke, which that step paints: no range holding it is left out.
+            for _ in 0..20 {
+                let a = next(0.0, steps - 1.0).floor();
+                let b = (a + 1.0 + next(0.0, steps - a).floor()).min(steps);
+                let k = (a + next(0.0, b - a).floor()).min(b - 1.0);
+                let from = z.corner(k);
+                let joins = [
+                    (k > 0.0).then(|| (z.corner(k - 1.0), from, z.corner(k + 1.0))),
+                    (k + 1.0 < steps).then(|| (from, z.corner(k + 1.0), z.corner(k + 2.0))),
+                ];
+                let to = z.corner(k + 1.0);
+                let n = (to - from).normalize().turn_90() * z.half;
+                let stroke = [from + n, from - n, to + n, to - n];
+                let regions = joins.into_iter().flatten().filter_map(|(p0, c, p1)| {
+                    super::Join::of(c - p0, p1 - c, z.half).and_then(|j| j.region(c))
+                });
+                for points in regions.chain([stroke.to_vec()]) {
+                    for point in points {
+                        let e = 1e-9 * (1.0 + point.x.abs().max(point.y.abs()));
+                        z.shown = Rect::new(point.x - e, point.y - e, point.x + e, point.y + e);
+                        if z.paints(k, steps) {
+                            assert!(
+                                z.may_paint(a, b),
+                                "step {k} of {a}..{b} paints at {point:?}: {:?}",
+                                q.0
+                            );
+                            specks += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(left_out > 100, "{left_out}");
+        assert!(specks > 1000, "{specks}");
+    }
+
+    /// Of a zigzag below the page, whose bottom corners are nearer the page than
+    /// half the miter limit times the width but whose stroke and joins stay below
+    /// it, no step is drawn (2 000 001 steps; before, more than 262 144 were
+    /// counted and the page refused).
+    #[test]
+    fn a_zigzag_whose_joins_stay_off_the_page_draws_nothing() {
+        let page = Rect::new(0.0, 0.0, 200.0, 200.0);
+        let c = squiggly_content("0 -.0008 200 -.0008 0 -.0001 200 -.0001", page);
+        assert!(corners(&c).is_empty(), "{c}");
+    }
+
     /// A quad 4·10^6 or 8·10^6 pt wide, starting at its left end or far left of the page,
-    /// draws the steps across the page and a few beyond each side, with the corners
-    /// its own start puts them at.
+    /// draws the steps across the page, with the corners its own start puts them at.
     #[test]
     fn a_huge_quad_draws_the_steps_the_page_shows() {
         let page = Rect::new(100.0, 0.0, 712.0, 800.0);
@@ -655,8 +1213,10 @@ mod tests {
             let corners = corners(&c);
             let start: f64 = x0.parse().unwrap();
             let (first, last) = (corners[0].0, corners[corners.len() - 1].0);
-            assert!((90.0..=98.0).contains(&first), "{x0}: {first}");
-            assert!((714.0..=722.0).contains(&last), "{x0}: {last}");
+            // The steps across each side of the page, or as close to it as a stroke
+            // paints beyond its outline, are drawn, and none further.
+            assert!((96.0..100.0).contains(&first), "{x0}: {first}");
+            assert!((712.0..716.0).contains(&last), "{x0}: {last}");
             assert_eq!(corners.len(), ((last - first) / 2.0) as usize + 1, "{x0}");
             for &(x, y) in &corners {
                 let i = ((x - start) / 2.0).round() as i64;

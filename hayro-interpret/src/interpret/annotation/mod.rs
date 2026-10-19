@@ -1071,6 +1071,15 @@ fn opacity(annot: &Entries<'_>) -> f32 {
     }
 }
 
+/// How far beyond its outline a stroke paints, in points: `MuPDF` paints a stroke
+/// up to about a tenth of a pixel beyond its edge, and draws the thinnest strokes
+/// that wide on each side of their line (observed in `PyMuPDF` 1.28.2 from 0.5 to
+/// 8 px/pt: a line 0.00004 pt wide 0.08 px below the page greys its bottom row,
+/// 0.1 px below it does not), which at 1 px/pt or finer is within a quarter of a
+/// point. A clip cuts it off where it lies. A generator choosing the pieces that
+/// show counts those that come that close to what the clips let show.
+const PAINTS_BEYOND: f64 = 0.25;
+
 /// The most pieces one shape of repeated pieces draws where the page can show it
 /// (the steps of a squiggle, the dividers of a comb field): 5 to 10 MB of content.
 /// The pieces are drawn each, however small, as the content can be scaled and
