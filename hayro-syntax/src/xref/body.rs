@@ -100,17 +100,25 @@ pub(super) type DataAt = (usize, usize, usize);
 
 /// Where the slot of a body ends in the bytes it is in ([`Place`]), and whether those
 /// bytes go on, unknown, past their end: those of an object stream whose data are cut
-/// ([`Taken::Contained`]), whose end is no end of a body.
+/// ([`Taken::Contained`]), whose end is no end of a body. And where the slot after it
+/// ends, `next`: a comment that starts past the slot is read where it ends before
+/// that, as reading the next slot's body reads it ([`stream_follows`]).
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(super) struct Slot {
     pub(super) end: usize,
     pub(super) open: bool,
+    pub(super) next: usize,
 }
 
 impl Slot {
-    /// A slot that ends at `end`, where the bytes it is in go on if they do.
+    /// A slot that ends at `end`, where the bytes it is in go on if they do, past
+    /// which no comment is read: in a file, where the next slot starts at a header.
     pub(super) fn to(end: usize) -> Self {
-        Self { end, open: false }
+        Self {
+            end,
+            open: false,
+            next: end,
+        }
     }
 }
 
@@ -379,17 +387,24 @@ impl<O, D> Read<O, D> {
 /// Whether the keyword `stream` follows, after white space and comments, a
 /// dictionary that ends at `end` of `data` in its slot, `slot`, as reading on the
 /// whole of `data` finds; and where looking for it stopped. `None` where that is not
-/// known from the slot and the white space after it: a comment runs past the slot's
-/// end or starts after it, or the bytes end, going on unknown, before it is known.
+/// known from the slot, the white space after it and the comments the next slot
+/// holds: a comment runs past the slot's end, or one past the slot starts or runs
+/// past the next slot's end ([`Slot::next`]), or the bytes end, going on unknown,
+/// before it is known.
 ///
-/// Past the slot, only white space is read, which the dictionary of no other body
-/// reads, as a run of white space after one dictionary's end holds no other's end:
-/// so looking for the keyword after every dictionary of a buffer reads each byte a
-/// bounded number of times. In a file, a slot ends at a header, so the keyword is
-/// looked for in the slot; in an object stream, the next object may start after
-/// white space past it.
+/// Past the slot, white space is read, and comments that start and end in the next
+/// slot, where white space and comments alone separate them from the slot: a body
+/// starts there, at the first comment, so that slot's body reads them alike, before
+/// its object. So past the slot, a dictionary reads only what the dictionary of no
+/// other body reads, as a run of white space after one dictionary's end holds no
+/// other's end, and the comments of one slot, which its own body reads before any
+/// object: looking for the keyword after every dictionary of a buffer reads each
+/// byte a bounded number of times. In a file, a slot ends at a header, so the
+/// keyword is looked for in the slot; in an object stream, the next object may start
+/// after white space past it, or after comments (`% 3 0 obj`, which pdfTeX writes
+/// before each object).
 pub(super) fn stream_follows(data: &[u8], end: usize, slot: Slot) -> Option<(bool, usize)> {
-    let (open, slot) = (slot.open, slot.end);
+    let (open, next, slot) = (slot.open, slot.next, slot.end);
     // In the slot, and the byte after it, white space and comments.
     let mut r = Reader::new(&data[..data.len().min(slot.saturating_add(1))]);
     r.jump(end);
@@ -410,12 +425,23 @@ pub(super) fn stream_follows(data: &[u8], end: usize, slot: Slot) -> Option<(boo
             _ => break,
         }
     }
-    // Past the slot, white space only.
+    // Past the slot, white space, and comments that end in the next slot.
     let mut r = Reader::new_with(data, r.offset());
     if r.offset() >= slot {
         r.skip_white_spaces();
-        if r.peek_byte() == Some(b'%') {
-            return None;
+        while r.peek_byte() == Some(b'%') {
+            // Read in the next slot only, which no other dictionary reads past its
+            // slot: a comment running on is not read to its end.
+            if r.offset() >= next {
+                return None;
+            }
+            let mut comment = Reader::new_with(&data[..next.min(data.len())], r.offset());
+            comment.forward_while(|b| !is_eol_character(b));
+            if comment.at_end() {
+                return None;
+            }
+            r.jump(comment.offset());
+            r.skip_white_spaces();
         }
     }
     let at = r.offset();
@@ -528,10 +554,10 @@ mod tests {
     }
 
     /// Whether whether a dictionary that ends at `end` of `data` is a stream's depends,
-    /// for a slot that ends at `slot`, on what follows a comment the slot does not
-    /// hold: after white space and comments, a comment runs past the slot's end or
-    /// starts at or after it.
-    fn depends(data: &[u8], end: usize, slot: usize) -> bool {
+    /// for a slot that ends at `slot`, the slot after it at `next`, on what follows a
+    /// comment that neither holds: after white space and comments, a comment runs
+    /// past the slot's end, or one that starts past it starts or runs past `next`.
+    fn depends(data: &[u8], end: usize, slot: usize, next: usize) -> bool {
         let mut at = end;
         while let Some(&b) = data.get(at) {
             if b == b'%' {
@@ -539,7 +565,12 @@ mod tests {
                     .iter()
                     .position(|b| *b == b'\n' || *b == b'\r')
                     .map_or(data.len(), |line| at + line);
-                if at >= slot || eol > slot {
+                let held = if at < slot {
+                    eol <= slot
+                } else {
+                    at < next && eol < next
+                };
+                if !held {
                     return true;
                 }
                 at = eol;
@@ -577,6 +608,9 @@ mod tests {
     fn a_body_read_in_its_slot_is_the_body_read_whole_or_nothing() {
         let mut random = Random(0x5eed);
         let mut read_in_slot = 0;
+        // Read where a comment past the slot, in the next, tells whether a stream
+        // follows.
+        let mut read_past = 0;
         let mut cut = 0;
         for case in 0..6000 {
             let header = random.below(2) == 0;
@@ -591,22 +625,33 @@ mod tests {
             let data = text.as_bytes();
             let at = if header { 0 } else { random.below(data.len()) };
             let ctx = ReaderContext::dummy();
-            let read = |slot: usize| {
+            let read = |slot: Slot| {
                 Read::in_slot(
                     data,
                     at,
-                    Slot::to(slot),
+                    slot,
                     header,
                     |r| DictNode::read(r, data, &ctx).map(Arc::new),
                     |r| Top::read(r, data, &ctx),
                 )
                 .0
             };
-            let whole = read(data.len());
-            for _ in 0..8 {
-                let slot = at + random.below(data.len() - at + 1);
-                let what = || format!("case {case}, at {at}, slot {slot} of {text:?}");
-                match (read(slot), &whole) {
+            let whole = read(Slot::to(data.len()));
+            // Random ends, and ends at each comment, as in an object stream whose
+            // objects each start with one.
+            let mut slots: Vec<usize> = (0..8)
+                .map(|_| at + random.below(data.len() - at + 1))
+                .collect();
+            slots.extend((at..data.len()).filter(|i| data[*i] == b'%'));
+            for slot in slots {
+                let next = slot + random.below(data.len() - slot + 1);
+                let what = || format!("case {case}, at {at}, slot {slot}, next {next} of {text:?}");
+                let within = Slot {
+                    end: slot,
+                    open: false,
+                    next,
+                };
+                match (read(within), &whole) {
                     (Some((part, end)), Some((whole, whole_end))) => {
                         assert!(*whole_end <= slot, "{}", what());
                         assert_eq!(
@@ -616,6 +661,11 @@ mod tests {
                             what()
                         );
                         read_in_slot += 1;
+                        if !matches!(whole, Read::Object(_))
+                            && depends(data, *whole_end, slot, slot)
+                        {
+                            read_past += 1;
+                        }
                     }
                     (Some((part, end)), None) => {
                         panic!(
@@ -627,7 +677,7 @@ mod tests {
                     (None, Some((whole, end))) if *end <= slot => {
                         let dict = !matches!(whole, Read::Object(_));
                         assert!(
-                            dict && depends(data, *end, slot),
+                            dict && depends(data, *end, slot, next),
                             "{}: {} whole, nothing in the slot",
                             what(),
                             shown(whole, *end, data)
@@ -639,8 +689,8 @@ mod tests {
         }
         // Both outcomes are met often.
         assert!(
-            read_in_slot > 5000 && cut > 5000,
-            "{read_in_slot} read, {cut} cut"
+            read_in_slot > 5000 && cut > 5000 && read_past > 100,
+            "{read_in_slot} read, {read_past} past the slot, {cut} cut"
         );
     }
 
@@ -673,7 +723,14 @@ mod tests {
                 .map(|(read, end)| shown(&read, end, data))
             };
             let cut = &text.as_bytes()[..end];
-            let Some(open) = read(cut, Slot { end, open: true }) else {
+            let Some(open) = read(
+                cut,
+                Slot {
+                    end,
+                    open: true,
+                    next: end,
+                },
+            ) else {
                 continue;
             };
             read_open += 1;

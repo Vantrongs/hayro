@@ -2322,17 +2322,20 @@ impl ObjectStream {
     }
 
     /// The slot of the object at `at`: up to the next offset the header lists, or the
-    /// end of the data, which goes on unknown where they are cut.
+    /// end of the data, which goes on unknown where they are cut; and where the slot
+    /// after it ends.
     fn slot(&self, at: usize) -> Slot {
         let next = self.starts.partition_point(|start| *start <= at);
-        let end = self
-            .starts
-            .get(next)
-            .map_or(self.data.len(), |next| *next)
-            .min(self.data.len());
+        let end = |next: usize| {
+            self.starts
+                .get(next)
+                .map_or(self.data.len(), |next| *next)
+                .min(self.data.len())
+        };
         Slot {
-            end,
-            open: self.cut && end == self.data.len(),
+            end: end(next),
+            open: self.cut && end(next) == self.data.len(),
+            next: end(next + 1),
         }
     }
 
@@ -2963,6 +2966,104 @@ mod tests {
             one_page(file.into_bytes()),
             (600.0, 700.0, BLUE.as_bytes().to_vec())
         );
+    }
+
+    // Objects of an object stream each after a comment, as pdfTeX writes them (`% 3 0
+    // obj`), are read: the comment starts the next object's slot, and is read as that
+    // object's own reading reads it, so a dictionary before it is no stream's.
+    #[test]
+    fn objects_of_an_object_stream_after_comments_are_read() {
+        let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] /Contents 6 0 R >>";
+        let commented = |number: u32, object: &str| format!("% {number} 0 obj\n{object}");
+        let (catalog, tree, page) = (
+            commented(1, CATALOG),
+            commented(2, TREE),
+            commented(3, page),
+        );
+        for order in [
+            [
+                (1, catalog.as_str()),
+                (2, tree.as_str()),
+                (3, page.as_str()),
+            ],
+            [
+                (3, page.as_str()),
+                (2, tree.as_str()),
+                (1, catalog.as_str()),
+            ],
+        ] {
+            let objects = vec![
+                (5, object_stream("/Length LEN", &order)),
+                (6, stream("", BLUE)),
+            ];
+            let indices: Vec<(u32, u32, u32)> = order
+                .iter()
+                .enumerate()
+                .map(|(index, (number, _))| (*number, 5, index as u32))
+                .collect();
+            let file = file_with_stream_table(&objects, &indices);
+            assert_eq!(one_page(file), (600.0, 700.0, BLUE.as_bytes().to_vec()));
+        }
+    }
+
+    // Reading every object of an object stream reads each byte of it a bounded number
+    // of times where comments follow dictionaries: one in the next object's slot is
+    // read as far as that slot, not on along its line, past the slots after it, which
+    // each dictionary would read again (`<<>>%<<>>%…` in one line).
+    #[test]
+    fn objects_of_an_object_stream_after_comments_are_read_in_linear_time() {
+        // The header and the data of an object stream of about `n` objects.
+        type Objects = fn(usize) -> (String, String);
+        let families: [(&str, Objects); 2] = [
+            ("a comment before each object", |n| {
+                let object = "% 9 0 obj\n<< /A 1 >>\n";
+                let header = (0..n).map(|i| format!("{} {} ", 10 + i, i * object.len()));
+                (header.collect(), object.repeat(n))
+            }),
+            ("dictionaries and comments in one line", |n| {
+                let header = (0..2 * n).map(|i| format!("{} {} ", 10 + i, i / 2 * 5 + i % 2 * 4));
+                let line = format!("{}{}\n", "<<>>%".repeat(n), " x".repeat(4 * n));
+                (header.collect(), line)
+            }),
+        ];
+        for (family, objects) in families {
+            let [small, large] = [1000, 2000].map(|n| {
+                let (header, data) = objects(n);
+                let count = header.split(' ').filter(|n| !n.is_empty()).count() / 2;
+                let stream = object_stream_headed(&header, &data, count);
+                let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>";
+                let objects = vec![
+                    (1, CATALOG.to_string()),
+                    (2, TREE.to_string()),
+                    (3, page.to_string()),
+                    (4, stream),
+                ];
+                let entries: Vec<(u32, u32, u32)> =
+                    (0..count as u32).map(|i| (10 + i, 4, i)).collect();
+                let file = file_with_stream_table(&objects, &entries);
+                let pdf = crate::Pdf::new(file).unwrap();
+                crate::work::EXAMINED.set(0);
+                crate::work::BODIES_READ.set(0);
+                let mut read = 0;
+                for i in 0..count {
+                    read += usize::from(pdf.xref().get::<Dict<'_>>(id(10 + i as i32)).is_some());
+                }
+                let work = crate::work::EXAMINED.get() + crate::work::BODIES_READ.get();
+                assert!(
+                    work <= 16 * data.len(),
+                    "{family}: {work} steps for {} bytes",
+                    data.len()
+                );
+                (work, read)
+            });
+            assert!(
+                large.0 <= small.0 * 25 / 10,
+                "{family}: {small:?} steps and objects read for 1000, {large:?} for 2000"
+            );
+            if family == "a comment before each object" {
+                assert_eq!((small.1, large.1), (1000, 2000));
+            }
+        }
     }
 
     // A table whose every offset leads a few bytes into its object's header, as in a
