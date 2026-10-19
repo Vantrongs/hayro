@@ -374,6 +374,7 @@ impl Skippable for Object<'_> {
 }
 
 impl<'a> Readable<'a> for Object<'a> {
+    #[inline]
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         match r.peek_byte()? {
             b'<' if r.peek_bytes(2) == Some(b"<<") => Some(Self::Dict(Dict::read(r, ctx)?)),
@@ -427,6 +428,9 @@ impl<'a> Leaf<'a> for &ReaderContext<'a> {
     fn string(&self, r: &mut Reader<'a>, _: bool) -> Option<Object<'a>> {
         String::read(r, self).map(Object::String)
     }
+    // Inlined into `leaf`, so that the number is made where the object is: called,
+    // its object comes back through memory, which a load of it then waits on.
+    #[inline(always)]
     fn number(&self, r: &mut Reader<'a>) -> Option<Object<'a>> {
         r.read_without_context::<Number>().map(Object::Number)
     }
