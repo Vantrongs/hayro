@@ -206,7 +206,12 @@ struct Old {
     /// but to no object that ends before it: the scan reads such an object to its
     /// end where the header ends before the offset (`read_unread`).
     unread: Vec<Unfinished>,
+    /// Those in an object stream: the object, and the number of the stream.
+    held: InStreams,
 }
+
+/// Objects a table lists in object streams, each with the number of its stream.
+type InStreams = BTreeSet<(ObjectIdentifier, u32)>;
 
 /// An entry of a table that is rebuilt that leads to no object read before the next
 /// offset any entry names, its slot.
@@ -254,9 +259,8 @@ fn opened(_bytes: usize) {
 // next offset any entry names: objects of a table do not overlap.
 // So each header and object is read once however many entries name it, and no further
 // than the next offset, its slot (`body::SlotReader`), which reads each byte of the file
-// once. MuPDF, too, rebuilds a table with an entry past the end of the file or in an
-// object stream the table does not list as an object (`check_xref_entry_offsets` in
-// MuPDF's `pdf-xref.c`); an entry at offset 0 is free.
+// once. A table is also rebuilt where an entry is past the end of the file or in an
+// object stream the table does not list as an object; an entry at offset 0 is free.
 fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Old> {
     xref_map.retain(|_, entry| *entry != EntryType::Normal(0));
     let mut entries = vec![];
@@ -265,13 +269,16 @@ fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Old> {
     for (id, entry) in xref_map.iter() {
         match *entry {
             EntryType::Normal(offset) => entries.push((offset, *id)),
-            EntryType::ObjStream(stream, _) => streams.push(stream),
+            EntryType::ObjStream(stream, _) => streams.push((*id, stream)),
         }
     }
     entries.sort_unstable();
 
     let mut sound = true;
-    let mut old = Old::default();
+    let mut old = Old {
+        held: streams.iter().copied().collect(),
+        ..Old::default()
+    };
     // The entries at each offset, and the next offset.
     let mut rest = entries.as_slice();
     while let Some(&(offset, _)) = rest.first() {
@@ -295,9 +302,9 @@ fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Old> {
     }
     if !streams.is_empty() {
         let objects: BTreeSet<i32> = entries.iter().map(|(_, id)| id.obj_number).collect();
-        sound &= streams
-            .iter()
-            .all(|stream| i32::try_from(*stream).is_ok_and(|stream| objects.contains(&stream)));
+        sound &= streams.iter().all(|(_, stream)| {
+            i32::try_from(*stream).is_ok_and(|stream| objects.contains(&stream))
+        });
     }
 
     if sound {
@@ -349,10 +356,12 @@ fn object_in(data: &[u8], at: usize, slot: usize) -> Checked {
 // Try to manually parse the PDF to build an xref table and trailer dictionary.
 //
 // The objects the scan finds are the table's, the later of two that a damaged file
-// numbers alike, as MuPDF rebuilds a table; an entry of the old table, `listed`, that
-// leads to an object the scan does not find under the entry's number is kept. Such an
-// object is the entry's, not the one its header names: where the scan finds it under
-// its header's number, the scan takes the definition before it.
+// numbers alike, and of a definition in an object stream and one outside, the one
+// outside, unless the old table lists the object in that stream; an entry of the old
+// table, `listed`, that leads to an object the scan does not find under the entry's
+// number is kept. Such an object is the entry's, not the one its header names: where
+// the scan finds it under its header's number, the scan takes the definition before
+// it.
 fn fallback(data: PdfData, password: &[u8], old: Old) -> Option<XRef> {
     warn!("xref table was invalid, trying to manually build xref table");
     let (xref_map, rebuilt, xref_input) = fallback_xref_map(&data, password, old);
@@ -410,7 +419,12 @@ fn fallback_xref_map<'a>(
     let (read, unreadable) = read_unread(&mut scan, &old.unread);
     listed.extend(read);
     let walk = walk(data, &mut scan);
-    fallback_xref_map_inner(data, &walk, None, password, &listed, &unreadable)
+    let old = Old {
+        listed,
+        unread: vec![],
+        held: old.held,
+    };
+    fallback_xref_map_inner(data, &walk, None, password, &old, &unreadable)
 }
 
 /// The entries of `unread`, sorted by offset, that lead to an object read to its end,
@@ -579,7 +593,7 @@ fn fallback_xref_map_inner<'a>(
     walk: &Walk<'a>,
     decryptor: Option<Arc<Decryptor>>,
     password: &[u8],
-    listed: &[Listed],
+    old: &Old,
     unread: &[ObjectIdentifier],
 ) -> (XrefMap, Rebuilt, Option<XRefInput<'a>>) {
     let Walk {
@@ -592,7 +606,7 @@ fn fallback_xref_map_inner<'a>(
     let mut xref_map = walk.xref_map.clone();
     let object_streams = walk.object_streams.clone();
     let trailer_dicts = walk.trailer_dicts.clone();
-    let listed = into_headers(listed, found, bodies);
+    let listed = into_headers(&old.listed, found, bodies);
     let listed = listed.as_slice();
     let layout = Layout::over(
         found
@@ -630,20 +644,20 @@ fn fallback_xref_map_inner<'a>(
             }
         }
         xref_map = probe.into_map();
+        // An object of an object stream is kept over a definition outside one
+        // where the table rebuilt lists it in that stream, as an update that moves
+        // an object into an object stream does; else the one outside is kept, as a
+        // file whose table cannot be read may hold object streams of objects it
+        // does not use under the numbers of those it does.
         for (obj_num, stream, idx) in held {
             let id = ObjectIdentifier::new(obj_num as i32, 0);
-            // If we already found an entry for that object number that was not
-            // inside an object stream. Somewhat arbitrary and maybe
-            // we can do better, but that seems to work for the current
-            // set of tests.
-            if xref_map
-                .get(&id)
-                .is_none_or(|e| !matches!(e, &EntryType::Normal(_)))
+            let stream_num = stream.obj_number as u32;
+            if old.held.contains(&(id, stream_num))
+                || xref_map
+                    .get(&id)
+                    .is_none_or(|e| !matches!(e, &EntryType::Normal(_)))
             {
-                xref_map.insert(
-                    id,
-                    EntryType::ObjStream(stream.obj_number as u32, idx as u32),
-                );
+                xref_map.insert(id, EntryType::ObjStream(stream_num, idx as u32));
             }
         }
     }
@@ -698,7 +712,7 @@ fn fallback_xref_map_inner<'a>(
         ) {
             let decryptor = xref.decryptor();
             let (patched_map, patched, _) =
-                fallback_xref_map_inner(data, walk, Some(decryptor), password, listed, unread);
+                fallback_xref_map_inner(data, walk, Some(decryptor), password, old, unread);
             xref_map = patched_map;
             rebuilt = patched;
         }
