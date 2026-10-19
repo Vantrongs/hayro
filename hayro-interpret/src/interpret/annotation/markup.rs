@@ -7,7 +7,7 @@
 //! quadrilaterals, a line width wider on each side.
 
 use super::entries::{Derived, Entries, Items, Value};
-use super::out::{Color, MITER_LIMIT, Out, Region, as_written};
+use super::out::{Color, MITER_LIMIT, Out, Region, Rounding, as_written};
 use super::{Unsupported, border_width, c_color, color_of, dash, most_pieces, rect};
 use hayro_syntax::object::dict::keys::{C, IC, INKLIST, QUADPOINTS};
 use kurbo::{Point, Rect, Vec2};
@@ -341,6 +341,14 @@ fn zigzag(q: &Quad, region: &Region, pen: &mut Run, out: &mut Out) -> Result<(),
         // Half the width as written.
         half: as_written(width) / 2.0,
         error,
+        lead: Vec2::new(
+            bl.x.abs().max(top_left.x.abs()),
+            bl.y.abs().max(top_left.y.abs()),
+        ),
+        step: Vec2::new(
+            along.x.abs().max(top_along.x.abs()),
+            along.y.abs().max(top_along.y.abs()),
+        ) * (delta / len),
         region: region.clone(),
     };
     let steps = (len / delta).ceil();
@@ -361,11 +369,13 @@ fn zigzag(q: &Quad, region: &Region, pen: &mut Run, out: &mut Out) -> Result<(),
     while let Some((a, b)) = ranges.pop() {
         super::work(1);
         let hull = z.hull(z.t(a), z.t(b));
-        let slack = z.slack(&hull);
-        if !region.near(&hull, z.reach(slack)) || z.still(a, b) || !z.written_near(a, b) {
+        let (slack, place) = (z.slack(&hull), z.place(b));
+        let near = |reach: f64| region.may_show(&hull, reach, place).is_some();
+        if !near(z.reach(slack)) || z.still(a, b) || !z.written_near(a, b) {
             continue;
         }
-        if region.holds(&hull, slack) {
+        let moved = place.bound();
+        if region.holds(&hull, slack + moved.x.max(moved.y)) {
             // Every corner as written lies in `region`: every step of some length
             // paints.
             pen.draw(&z, a, b, out)?;
@@ -375,7 +385,7 @@ fn zigzag(q: &Quad, region: &Region, pen: &mut Run, out: &mut Out) -> Result<(),
             // Where the corners' hull meets `region`, a step crosses it but where
             // `region` lies between two steps; else what the strokes and joins
             // paint decides.
-            if region.near(&hull, slack * SQRT_2) || z.may_paint(a, b, slack) {
+            if near(slack * SQRT_2) || z.may_paint(a, b, slack) {
                 let mid = ((a + b) / 2.0).floor();
                 // Past 2^53, neighbouring steps' numbers are no longer apart.
                 if !(a < mid && mid < b) {
@@ -432,9 +442,9 @@ impl Run {
             self.spend()?;
             let on = self.until.is_some_and(|u| u == k || z.still(u, k));
             if !on {
-                out.nums(&[from.x, from.y], "m");
+                out.computed(&[from.x, from.y], "m", z.place(k));
             }
-            out.nums(&[to.x, to.y], "l");
+            out.computed(&[to.x, to.y], "l", z.place(k + 1.0));
             self.until = Some(k + 1.0);
             k += 1.0;
         }
@@ -452,6 +462,10 @@ struct Zigzag {
     half: f64,
     /// What computing a corner in 64-bit numbers can move it by.
     error: f64,
+    /// The larger of the magnitudes the two lines start from, across and up, and
+    /// of the steps along them ([`Zigzag::place`]).
+    lead: Vec2,
+    step: Vec2,
     region: Region,
 }
 
@@ -554,7 +568,12 @@ impl Zigzag {
             * f64::EPSILON
             * 16.0;
         self.region
-            .near(&points, MITER_LIMIT * self.half * (1.0 + 1e-9) + error)
+            .may_show(
+                &points,
+                MITER_LIMIT * self.half * (1.0 + 1e-9) + error,
+                self.place(b),
+            )
+            .is_some()
     }
 
     /// The corners of the steps from `t = ta` to `tb`, on the two lines, whose
@@ -563,9 +582,10 @@ impl Zigzag {
         [self.bottom(ta), self.bottom(tb), self.top(tb), self.top(ta)]
     }
 
-    /// The most writing, or computing, moves a corner in the hull of `points` by,
-    /// across or up: a 32-bit number is within 2^-24 of its size of the number it
-    /// is written for.
+    /// The most writing, or computing in 64-bit numbers, moves a corner in the hull
+    /// of `points` by, across or up: a 32-bit number is within 2^-24 of its size of
+    /// the number it is written for. What a viewer computing it moves it by is
+    /// [`Zigzag::place`]'s.
     fn slack(&self, points: &[Point]) -> f64 {
         let size = points
             .iter()
@@ -573,6 +593,22 @@ impl Zigzag {
         (size + self.error) * f64::from(f32::EPSILON) / 2.0
             + self.error
             + f64::from(f32::MIN_POSITIVE)
+    }
+
+    /// How a viewer computes corner `k`, or any before it: as `bake` does
+    /// (observed: a squiggle 10,000 steps from -100,000 drifts 9 pt), by adding
+    /// the step to the corner before, from where its line starts, so that each
+    /// coordinate is a running sum of `k` steps ([`Rounding::sum`]), each step and
+    /// which line the corner is on a few roundings more.
+    fn place(&self, k: f64) -> Rounding {
+        let axis = |lead: f64, step: f64| {
+            let total = k * step;
+            Rounding::sum(lead, k, step, total, 2.0).plus(Rounding::of(4.0, lead + total))
+        };
+        Rounding::point(
+            axis(self.lead.x, self.step.x),
+            axis(self.lead.y, self.step.y),
+        )
     }
 
     /// The most any stroke or join reaches from the steps' segments, as computed:
@@ -600,7 +636,8 @@ impl Zigzag {
         }
     }
 
-    /// Whether step `k` of `steps`, as written, paints in `region`: its rectangle,
+    /// Whether step `k` of `steps`, as written, may paint in `region` wherever a
+    /// viewer puts it ([`Zigzag::place`]): its rectangle,
     /// half the width to each side of it from corner to corner, or the join at
     /// either end it shares with the nearest step of some length on that side. A
     /// step of no length paints nothing of its own.
@@ -614,16 +651,19 @@ impl Zigzag {
             return false;
         };
         let n = d.turn_90() * half;
-        if region.meets(&[from + n, to + n, to - n, from - n]) {
+        let after = self.run_end(k + 1.0, steps);
+        // Wherever a viewer puts the corners up to the last this looks at.
+        let place = self.place(after + 1.0);
+        let meets = |points: &[Point]| region.may_show(points, 0.0, place).is_some();
+        if meets(&[from + n, to + n, to - n, from - n]) {
             return true;
         }
         let join = |a: Point, c: Point, b: Point| {
             Join::of(c - a, b - c, half)
                 .and_then(|join| join.region(c))
-                .is_some_and(|r| region.meets(&r))
+                .is_some_and(|r| meets(&r))
         };
         let before = self.run_start(k);
-        let after = self.run_end(k + 1.0, steps);
         (before > 0.0 && join(self.written(before - 1.0), from, to))
             || (after < steps && join(from, to, self.written(after + 1.0)))
     }
@@ -638,6 +678,11 @@ impl Zigzag {
     /// them; the strokes' corners and the joins' tips move by at most as much times
     /// half the width and what the join's shape makes of it.
     fn may_paint(&self, a: f64, b: f64, slack: f64) -> bool {
+        let place = self.place(b);
+        let moved = place.bound();
+        // Each corner may move by what writing and what a viewer computing it
+        // moves it by, and the directions change with them.
+        let moved = slack + moved.x.max(moved.y);
         let mut points = Vec::with_capacity(24);
         let mut bound: f64 = 0.0;
         for odd in [false, true] {
@@ -652,7 +697,7 @@ impl Zigzag {
             let ((i0, o0), (i1, o1)) = (self.ways(odd, tf), self.ways(odd, tl));
             let shortest = segment_from_origin(i0, i1).min(segment_from_origin(o0, o1));
             let dv = (i1 - i0).hypot().max((o1 - o0).hypot());
-            let turned = ((2.0 * dv + 4.0 * SQRT_2 * slack) / shortest).min(2.0);
+            let turned = ((2.0 * dv + 4.0 * SQRT_2 * moved) / shortest).min(2.0);
             let join = Join::of(i0, o0, self.half);
             let Some(join) = join.filter(|_| shortest > 0.0 && turned.is_finite()) else {
                 // No direction to bound by: as far as a join can reach.
@@ -677,7 +722,9 @@ impl Zigzag {
         }
         // The ends of the zigzag are butt caps, not joins: what is added for them
         // is more than they paint.
-        self.region.near(&points, bound + slack * SQRT_2)
+        self.region
+            .may_show(&points, bound + slack * SQRT_2, place)
+            .is_some()
     }
 }
 
@@ -856,7 +903,7 @@ mod tests {
     fn squiggly_content(quads: &str, visible: Rect) -> String {
         let annot = format!("<< /Subtype /Squiggly /Rect [0 0 1 1] /QuadPoints [{quads}] >>");
         let dict = Dict::from_bytes(annot.as_bytes()).expect("valid dict");
-        let mut out = Out::new(visible, PAINTS_BEYOND);
+        let mut out = Out::new(visible, 1.0);
         squiggly(&Entries::detached(dict), &mut out)
             .expect("drawable")
             .expect("an appearance");
@@ -915,7 +962,7 @@ mod tests {
         let annot = "<< /Subtype /Squiggly /Rect [0 0 1 1] \
             /QuadPoints [33554432 24 33554440 24 33554432 10 33554440 10] >>";
         let dict = Dict::from_bytes(annot.as_bytes()).expect("valid dict");
-        let mut out = Out::new(PAGE, PAINTS_BEYOND);
+        let mut out = Out::new(PAGE, 1.0);
         squiggly(&Entries::detached(dict), &mut out).expect("drawable");
         assert!(matches!(out.finish(), Err(super::Unsupported::Coordinates)));
     }
@@ -1229,6 +1276,8 @@ mod tests {
                 dt: delta / len,
                 half: f64::from((q.height() / 16.0) as f32) / 2.0,
                 error: 1e-12,
+                lead: kurbo::Vec2::ZERO,
+                step: kurbo::Vec2::ZERO,
                 region: region(Rect::new(c.x, c.y, c.x + w, c.y + h)),
             };
             let may_paint = |z: &Zigzag, a: f64, b: f64| {
@@ -1304,12 +1353,25 @@ mod tests {
         assert!(corners(&c).is_empty(), "{c}");
     }
 
-    /// A quad 4·10^6 or 8·10^6 pt wide, starting at its left end or far left of the page,
-    /// draws the steps across the page, with the corners its own start puts them at.
+    /// A quad 4·10^6 pt wide starting at its left end draws the steps across the
+    /// page, with the corners its own start puts them at; one starting 4·10^6 pt
+    /// left of the page is refused.
     #[test]
     fn a_huge_quad_draws_the_steps_the_page_shows() {
         let page = Rect::new(100.0, 0.0, 712.0, 800.0);
-        for x0 in ["0", "-4000000", "-3999999"] {
+        // From 4·10^6 off the page, a viewer computing a corner from the quad's
+        // start may put it more than a point off: refused.
+        for x0 in ["-4000000", "-3999999"] {
+            let annot = format!(
+                "<< /Subtype /Squiggly /Rect [0 0 1 1] /QuadPoints \
+                 [{x0} 24 4000000 24 {x0} 10 4000000 10] >>"
+            );
+            let dict = Dict::from_bytes(annot.as_bytes()).expect("valid dict");
+            let mut out = Out::new(page, 1.0);
+            let drew = squiggly(&Entries::detached(dict), &mut out);
+            assert!(drew.is_err() || out.finish().is_err(), "{x0}: drawn");
+        }
+        for x0 in ["0"] {
             let c = squiggly_content(&format!("{x0} 24 4000000 24 {x0} 10 4000000 10"), page);
             let corners = corners(&c);
             let start: f64 = x0.parse().unwrap();

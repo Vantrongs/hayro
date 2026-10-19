@@ -5,7 +5,7 @@
 //! endings look as common viewers draw them.
 
 use super::entries::{Derived, Entries, Items, Text};
-use super::out::{Color, Out};
+use super::out::{Color, Out, Rounding};
 use super::text::{self, Align, Family, Setting};
 use super::{Appearances, CAPTION, Unsupported, border_width, circle, color_of, dash};
 use hayro_syntax::object::dict::keys::{C, IC};
@@ -470,7 +470,14 @@ pub(super) fn line<'a>(
             align: Align::Left,
         };
         let origin = (f64::from(x as f32), f64::from(rise as f32));
-        text::draw_line(&doc.fonts, &text, &set, origin, frame, visible, out)?;
+        // Centred on the line by its advance; up by the size and `/CO`.
+        let computed = (
+            text::aligned(&text, 0..text.len(), set.base, origin.0, (lb - la).hypot()),
+            Rounding::of(3.0, origin.1.abs() + f64::from(set.base)),
+        );
+        text::draw_line(
+            &doc.fonts, &text, &set, origin, computed, frame, visible, out,
+        )?;
     }
     Ok(Some(()))
 }

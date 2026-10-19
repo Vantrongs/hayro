@@ -14,7 +14,7 @@
 
 use super::entries::{Entries, Text, Value};
 use super::freetext;
-use super::out::{Color, Out, as_written};
+use super::out::{Color, Out, Rounding, as_written};
 use super::text::{self, Align, Family, Fonts, Setting, Shaped, Style, TextBox};
 use super::{
     Appearances, FIELD, Field, Inherited, TEXT, TextKey, Unsupported, border_width, circle,
@@ -244,7 +244,21 @@ fn draw<'a>(
             color: text_color,
             align: Align::Left,
         };
-        text::draw_line(fonts, &caption, &set, origin, Affine::IDENTITY, shown, out)?;
+        // Centred by its advance; its baseline from the height and size.
+        let computed = (
+            text::aligned(&caption, 0..caption.len(), size, origin.0, f64::from(fw)),
+            Rounding::of(3.0, f64::from(fh).abs() + f64::from(size).abs()),
+        );
+        text::draw_line(
+            fonts,
+            &caption,
+            &set,
+            origin,
+            computed,
+            Affine::IDENTITY,
+            shown,
+            out,
+        )?;
         return Ok(Some(()));
     }
 
@@ -424,8 +438,11 @@ fn draw<'a>(
                 labels.len(),
                 face,
                 &set(size),
-                f64::from(pad),
-                top,
+                (f64::from(pad), Rounding::of(2.0, f64::from(pad))),
+                (
+                    top,
+                    Rounding::of(2.0, f64::from(fh).abs() + f64::from(pad).abs()),
+                ),
                 step,
                 seen,
                 out,
@@ -442,9 +459,13 @@ fn draw<'a>(
                 &value,
                 &set(size),
                 avail,
-                f64::from(top),
+                (
+                    f64::from(top),
+                    Rounding::of(4.0, f64::from(fh).abs() + 2.0 * f64::from(size).abs()),
+                ),
                 f64::from(1.116 * size),
                 align,
+                q == 1 || q == 2,
                 seen,
                 out,
             )?;
@@ -469,11 +490,17 @@ fn draw<'a>(
                     _ => 0.0,
                 };
                 let origin = (f64::from(x), f64::from(fh / 2.0 - 0.3 * size));
+                let across = if q == 1 || q == 2 {
+                    text::aligned(&value, 0..value.len(), size, origin.0, f64::from(fw))
+                } else {
+                    Rounding::NONE
+                };
                 text::draw_line(
                     fonts,
                     &value,
                     &set(size),
                     origin,
+                    (across, middle(fh, size)),
                     Affine::IDENTITY,
                     seen,
                     out,
@@ -492,7 +519,8 @@ fn draw<'a>(
             // are drawn.
             let count = value.len().min(max_len as usize);
             let y = f64::from(fh / 2.0 - 0.3 * size);
-            text::draw_comb(fonts, &value, &set(size), count, cell, y, seen, out)?;
+            let at = (y, middle(fh, size));
+            text::draw_comb(fonts, &value, &set(size), count, cell, at, seen, out)?;
         }
         // A line break is drawn as a space, as any control character is.
         _ => {
@@ -507,11 +535,17 @@ fn draw<'a>(
                 f64::from(align(em * size)),
                 f64::from(fh / 2.0 - 0.3 * size),
             );
+            let across = if q == 1 || q == 2 {
+                text::aligned(&value, 0..value.len(), size, origin.0, f64::from(fw))
+            } else {
+                Rounding::of(2.0, origin.0)
+            };
             text::draw_line(
                 fonts,
                 &value,
                 &set(size),
                 origin,
+                (across, middle(fh, size)),
                 Affine::IDENTITY,
                 seen,
                 out,
@@ -520,6 +554,13 @@ fn draw<'a>(
     }
     out.op("Q");
     Ok(Some(()))
+}
+
+/// How a viewer computes the baseline of one line of text at `size` in a field
+/// `fh` high, half the height less three tenths of the size: a few roundings of
+/// at most those.
+fn middle(fh: f32, size: f32) -> Rounding {
+    Rounding::of(3.0, f64::from(fh).abs() + f64::from(size).abs())
 }
 
 /// The lines between the `cells` cells of a comb field `fw` × `fh`, inside its
@@ -556,11 +597,18 @@ fn comb_dividers(cells: i64, fw: f64, fh: f64, w: f64, out: &mut Out) -> Result<
     }
     let base =
         [(-half, y0), (half, y0), (half, y1), (-half, y1)].map(|(x, y)| kurbo::Point::new(x, y));
-    let Some((u0, u1)) = region.span(&base, kurbo::Vec2::new(1.0, 0.0)) else {
-        return Ok(());
-    };
     let step = (fw - 2.0 * w) / cells;
     let u = |i: f64| w + step * i;
+    // A viewer computes line `i` at `w` and `i` steps across, the step from the
+    // width and the count ([`text::cell_place`]): the lines are looked for as far
+    // as it may put the last.
+    let place = |i: f64| text::cell_place(i, step, w);
+    let far = fw.abs() + w.abs();
+    let Some((u0, u1)) = region.span(&base, kurbo::Vec2::new(1.0, 0.0), far) else {
+        return Ok(());
+    };
+    let g = place(cells).bound().x;
+    let (u0, u1) = (u0 - g, u1 + g);
     let at = |i: f64| as_written(u(i));
     // The lines 1 to `cells - 1` whose `u` as written lies in `u0..=u1`: before
     // the first, it lies on one side of the span, past the last, on the other.
@@ -585,9 +633,10 @@ fn comb_dividers(cells: i64, fw: f64, fh: f64, w: f64, out: &mut Out) -> Result<
     let wrote = |o: Option<()>| o.ok_or(Unsupported::Coordinates);
     wrote(out.stroke_state(w, &[]))?;
     for k in 0..(end - first) as u64 {
-        let u = u(first + k as f64);
-        wrote(out.nums(&[u, w], "m"))?;
-        wrote(out.nums(&[u, fh - w], "l"))?;
+        let i = first + k as f64;
+        let (u, place) = (u(i), place(i));
+        wrote(out.computed(&[u, w], "m", place))?;
+        wrote(out.computed(&[u, fh - w], "l", place))?;
         out.op("S");
     }
     Ok(())

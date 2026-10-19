@@ -1251,31 +1251,38 @@ fn generated(annot: &str) -> String {
 
 /// The content of `a` with each glyph it draws written in place: the points of its
 /// outline mapped by the transforms of the run of glyphs it is in (a `q`, the
-/// run's `cm`s and the glyphs' `Do`s, then `Q`), which are left out, so that they
-/// lie in the space the run is drawn in.
+/// run's `cm`, then each glyph's `Do`, each after the first in a `q` of its own
+/// with its `cm`, then `Q`), which are left out, so that they lie in the space the
+/// run is drawn in.
 fn expanded(a: &hayro_interpret::annotation::Appearance) -> String {
     let lines: Vec<&str> = a.content.lines().collect();
     let mut out = String::new();
-    let mut run: Option<Affine> = None;
+    // The transforms of the run and of the glyph in it, saved by each `q`.
+    let mut run: Vec<Affine> = vec![];
     for (i, &line) in lines.iter().enumerate() {
         if line == "q" {
-            let starts_run = lines[i + 1..]
-                .iter()
-                .find(|l| !l.ends_with(" cm"))
-                .is_some_and(|l| l.ends_with(" Do"))
+            let starts_run = run.is_empty()
+                && lines[i + 1..]
+                    .iter()
+                    .find(|l| !l.ends_with(" cm"))
+                    .is_some_and(|l| l.ends_with(" Do"))
                 && lines.get(i + 1).is_some_and(|l| l.ends_with(" cm"));
             if starts_run {
-                run = Some(Affine::IDENTITY);
+                run.push(Affine::IDENTITY);
+                continue;
+            }
+            if let Some(&ctm) = run.last() {
+                run.push(ctm);
                 continue;
             }
         }
-        let Some(ctm) = run.as_mut() else {
+        let Some(ctm) = run.last_mut() else {
             out.push_str(line);
             out.push('\n');
             continue;
         };
         if line == "Q" {
-            run = None;
+            run.pop();
             continue;
         }
         if let Some(m) = line.strip_suffix(" cm") {
@@ -1283,6 +1290,7 @@ fn expanded(a: &hayro_interpret::annotation::Appearance) -> String {
             *ctm *= Affine::new([m[0], m[1], m[2], m[3], m[4], m[5]]);
             continue;
         }
+        let ctm = *ctm;
         let name = line
             .strip_prefix('/')
             .and_then(|l| l.strip_suffix(" Do"))
@@ -1292,7 +1300,7 @@ fn expanded(a: &hayro_interpret::annotation::Appearance) -> String {
             let mut words: Vec<&str> = l.split(' ').collect();
             let op = words.pop().unwrap();
             for p in words.chunks(2) {
-                let q = *ctm * kurbo::Point::new(p[0].parse().unwrap(), p[1].parse().unwrap());
+                let q = ctm * kurbo::Point::new(p[0].parse().unwrap(), p[1].parse().unwrap());
                 out.push_str(&format!("{} {} ", q.x, q.y));
             }
             out.push_str(op);
@@ -3293,13 +3301,14 @@ fn an_annotation_that_is_no_object_of_its_own_is_drawn_only_by_its_stream() {
     assert_eq!(looks(&pdf), ["nothing", "0 0 80 30 re f"]);
 }
 
-/// Text whose last lines reach the page from far above is drawn however its line
-/// heights round as they add up: `FreeText`s 240,257 and 432,300 pt high, of
-/// 16,662 and 30,000 words `A`, one a line, whose last lines show at the top of the
-/// page (`PyMuPDF` 1.28.2 bake draws them). Ten line breaks after the last word add
-/// lines below it and change nothing drawn.
+/// Text whose last lines reach the page from far above cannot be drawn where a
+/// viewer adding its line heights puts them: `FreeText`s 240,257 and 432,300 pt
+/// high, of 16,662 and 30,000 words `A`, one a line, are refused. (`PyMuPDF`
+/// 1.28.2 bake writes `0 -14.400001 Td` a line from 240,261.82 down and shows one
+/// line, at y 191.68, where adding the heights exactly puts the last at 229.)
+/// Ten line breaks after the last word add lines below it and change nothing.
 #[test]
-fn the_last_lines_of_a_tall_text_are_drawn() {
+fn the_last_lines_of_a_tall_text_are_refused() {
     for (rect, words) in [("10 -100 19 240157", 16_662), ("10 0 20 432300", 30_000)] {
         let raw = |breaks: &str| {
             let annot = format!(
@@ -3316,7 +3325,7 @@ fn the_last_lines_of_a_tall_text_are_drawn() {
             }
         };
         let (drawn, control) = (raw(""), raw(&"\\n".repeat(10)));
-        assert!(drawn.contains(" Do"), "{rect}: {drawn}");
+        assert_eq!(drawn, "Coordinates", "{rect}");
         assert_eq!(drawn, control, "{rect}");
     }
 }
@@ -3634,4 +3643,132 @@ fn widgets_drawn_by_one_stream_through_two_entries_draw_it_alike() {
             assert_eq!(looks(&pdf), [drawn; 2], "{entries}, {order}");
         }
     }
+}
+
+/// Where each glyph the content `c` draws (a form, `Do`) has its origin on the
+/// page, across.
+fn glyph_origins(c: &str) -> Vec<f64> {
+    let (mut ctm, mut saved, mut out) = (Affine::IDENTITY, vec![], vec![]);
+    for line in c.lines() {
+        if line == "q" {
+            saved.push(ctm);
+        } else if line == "Q" {
+            ctm = saved.pop().unwrap();
+        } else if let Some(m) = line.strip_suffix(" cm") {
+            let m: Vec<f64> = m.split(' ').map(|n| n.parse().unwrap()).collect();
+            ctm *= Affine::new([m[0], m[1], m[2], m[3], m[4], m[5]]);
+        } else if line.ends_with(" Do") {
+            out.push((ctm * kurbo::Point::ZERO).x);
+        }
+    }
+    out
+}
+
+/// The field of merge review 12: one line, its value 50,000 spaces and the word
+/// `IMPORTANT` in Courier at 12 pt, its /Rect from x = -359,795 on a 200 pt page.
+/// A viewer adds up the spaces' advances in 32-bit numbers, and may put the word
+/// hundreds of points from where adding exactly puts it (x = 205): `PyMuPDF`
+/// 1.28.2 bake draws its glyphs from x = 115.25, 7.1875 apart. Refused, not left
+/// out. After 30 spaces, from x = -71, the word is drawn where bake draws it: its
+/// glyphs from x = 145, 7.2 apart.
+#[test]
+fn a_word_after_a_long_run_of_spaces_is_refused() {
+    let field = |spaces: usize, x0: i32| {
+        let annot = format!(
+            "<< /Type /Annot /Subtype /Widget /FT /Tx /T (a) /Rect [{x0} 20 300 100] \
+             /BS << /W 0 >> /DA (/Cour 12 Tf 0 g) /V ({}IMPORTANT) >>",
+            " ".repeat(spaces)
+        );
+        annotations("/Annots [4 0 R]", vec![annot.into_bytes()])
+    };
+    let far = field(50_000, -359_795);
+    assert_eq!(looks(&far), ["Coordinates"]);
+    let near = field(30, -71);
+    let Look::Generated(a) = first_look(&near) else {
+        panic!("{:?}", looks(&near));
+    };
+    let origins = glyph_origins(&a.content);
+    assert_eq!(origins.len(), 8, "{}", a.content);
+    for (i, x) in origins.iter().enumerate() {
+        let bake = 145.0 + 7.2 * i as f64;
+        assert!((x - bake).abs() < 1e-3, "glyph {i} at {x}, bake {bake}");
+    }
+}
+
+/// Words after runs of up to 60,000 spaces, in Courier at several sizes, in
+/// fields from offsets that bring the word near the page: where a viewer adding
+/// the advances left to right in 32-bit numbers, as `PyMuPDF` 1.28.2 bake does
+/// (observed on 54 probes of Courier, Helvetica and Times at six sizes, to the
+/// glyph), puts a glyph on the page, the field is drawn with that glyph within a
+/// point of there, or refused; and every glyph drawn lies within a point of where
+/// that viewer puts it. Long runs are drawn where they stay within a point, and
+/// refused where they may not.
+#[test]
+fn words_after_long_runs_of_spaces_are_drawn_where_a_viewer_adds_them_up_or_refused() {
+    let mut seed = 0x5eed_7e47_u64;
+    let mut next = |lo: f64, hi: f64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        lo + (hi - lo) * ((seed >> 11) as f64 / (1_u64 << 53) as f64)
+    };
+    let (mut drawn_long, mut refused_long) = (0, 0);
+    for case in 0..300 {
+        let spaces = 10_f64.powf(next(0.0, 4.8)) as usize;
+        let size = [9.7_f32, 12.0, 17.25][case % 3];
+        // A viewer's advance of a glyph 600 units wide, and its pen from 0.
+        let advance = (600.0_f32 * 0.001_f32) * size;
+        let mut pen = 0.0_f32;
+        for _ in 0..spaces {
+            pen += advance;
+        }
+        let land = next(-100.0, 300.0) as f32;
+        let x0 = (land - pen).round();
+        let viewer: Vec<f64> = (0..9)
+            .map(|i| {
+                let mut p = pen;
+                for _ in 0..i {
+                    p += advance;
+                }
+                f64::from(p + x0)
+            })
+            .collect();
+        let annot = format!(
+            "<< /Type /Annot /Subtype /Widget /FT /Tx /T (a) /Rect [{x0} 20 {} 100] \
+             /BS << /W 0 >> /DA (/Cour {size} Tf 0 g) /V ({}IMPORTANT) >>",
+            x0 + pen.round() + 400.0,
+            " ".repeat(spaces)
+        );
+        let pdf = annotations("/Annots [4 0 R]", vec![annot.into_bytes()]);
+        let origins = match first_look(&pdf) {
+            Look::Generated(a) => glyph_origins(&a.content),
+            Look::Nothing => vec![],
+            _ => {
+                assert_eq!(looks(&pdf), ["Coordinates"], "{spaces} spaces from {x0}");
+                refused_long += usize::from(spaces >= 500);
+                continue;
+            }
+        };
+        drawn_long += usize::from(spaces >= 500 && !origins.is_empty());
+        let adv = f64::from(advance);
+        for &v in &viewer {
+            if v + adv > 1.0 && v < 199.0 {
+                assert!(
+                    origins.iter().any(|o| (o - v).abs() <= 1.0),
+                    "{spaces} spaces at {size} pt from {x0}: a viewer draws a glyph at \
+                     {v}, drawn at {origins:?}"
+                );
+            }
+        }
+        for o in &origins {
+            assert!(
+                viewer.iter().any(|v| (o - v).abs() <= 1.0),
+                "{spaces} spaces at {size} pt from {x0}: drawn at {o}, a viewer at {viewer:?}"
+            );
+        }
+    }
+    assert!(
+        drawn_long > 10 && refused_long > 10,
+        "of 500 spaces or more, {drawn_long} drawn, {refused_long} refused"
+    );
 }

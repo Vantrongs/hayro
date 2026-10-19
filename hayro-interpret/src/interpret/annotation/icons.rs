@@ -12,7 +12,7 @@
 
 use super::entries::Entries;
 use super::markup::{Quad, quads};
-use super::out::{Color, Out};
+use super::out::{Color, Out, Rounding};
 use super::text::{self, Align, Family, Fonts, Setting, Shaped, Typeface};
 use super::{Appearances, Unsupported, c_color, color_of, rect};
 use hayro_syntax::object::dict::keys::C;
@@ -448,11 +448,17 @@ pub(super) fn stamp<'a>(
     };
     for (line, y) in text.lines.iter().zip(baselines) {
         let x = -line.width(0..line.len(), size) / 2.0;
+        // Centred by its advance.
+        let computed = (
+            text::aligned(line, 0..line.len(), size, x, 0.0),
+            Rounding::of(2.0, *y),
+        );
         text::draw_line(
             &doc.fonts,
             line,
             &set,
             (x, *y),
+            computed,
             at,
             r.intersect(visible),
             out,

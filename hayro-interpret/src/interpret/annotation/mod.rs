@@ -563,13 +563,6 @@ impl<'a> Appearances<'a> {
         };
         let View { visible, unit } = *view;
         let view = view.key();
-        // A page of no size, or of none that is a number, shows no piece more than
-        // what lies in it.
-        let beyond = if unit.abs() > 0.0 && unit.is_finite() {
-            PAINTS_BEYOND / unit.abs()
-        } else {
-            0.0
-        };
         let array = annots.id();
         self.once(
             |k| &mut k.pages,
@@ -580,7 +573,7 @@ impl<'a> Appearances<'a> {
                     Some((array, selection)),
                     || self.plans(&annots, selection).into(),
                 );
-                self.drawn(&plans, visible, beyond, view).into()
+                self.drawn(&plans, visible, unit, view).into()
             },
         )
     }
@@ -636,18 +629,18 @@ impl<'a> Appearances<'a> {
         }
     }
 
-    /// The annotations of `plans` as drawn on a page that shows `visible`, where a
-    /// stroke paints `beyond` its outline, whose key is `view`: those generated,
+    /// The annotations of `plans` as drawn on a page that shows `visible`, in units
+    /// of `unit` points, whose key is `view`: those generated,
     /// once for the document for each area shown.
     fn drawn(
         &self,
         plans: &[(usize, Rc<Plan<'a>>)],
         visible: kurbo::Rect,
-        beyond: f64,
+        unit: f64,
         view: ViewKey,
     ) -> Vec<Drawn<'a>> {
         // What the page shows, grown by how far a stroke paints beyond it.
-        let region = Out::new(visible, beyond).region();
+        let region = Out::new(visible, unit).region();
         plans
             .iter()
             .filter_map(|(index, plan)| {
@@ -661,7 +654,7 @@ impl<'a> Appearances<'a> {
                     Plan::Generate { id, .. } => self.once(
                         |k| &mut k.generated,
                         Some((*id, view)),
-                        || self.generated(plan, visible, beyond),
+                        || self.generated(plan, visible, unit),
                     )?,
                 };
                 Some(Drawn {
@@ -673,13 +666,13 @@ impl<'a> Appearances<'a> {
     }
 
     /// The appearance `plan`, [`Plan::Generate`], generates for a page that shows
-    /// `visible`, where a stroke paints `beyond` its outline; `None` when it paints
+    /// `visible`, in units of `unit` points; `None` when it paints
     /// nothing.
     fn generated(
         &self,
         plan: &Plan<'a>,
         visible: kurbo::Rect,
-        beyond: f64,
+        unit: f64,
     ) -> Option<Rc<Annotation<'a>>> {
         let Plan::Generate {
             annot,
@@ -695,7 +688,7 @@ impl<'a> Appearances<'a> {
         } else {
             annot.clone()
         };
-        let look = match entries::read(|| self.generate(&annot, visible, beyond)) {
+        let look = match entries::read(|| self.generate(&annot, visible, unit)) {
             Ok(Ok(Some(appearance))) => Look::Generated(Rc::new(appearance)),
             Ok(Ok(None)) => return None,
             Ok(Err(why)) | Err(why) => Look::Unsupported(why),
@@ -867,13 +860,13 @@ type Generated = Result<Option<Appearance>, Unsupported>;
 
 impl<'a> Appearances<'a> {
     /// The appearance generated for `annot` from its entries, for a page that shows
-    /// `visible`, where a stroke paints `beyond` its outline (in the page's units).
-    fn generate(&self, annot: &Entries<'a>, visible: kurbo::Rect, beyond: f64) -> Generated {
+    /// `visible`, in units of `unit` points ([`Out::new`]).
+    fn generate(&self, annot: &Entries<'a>, visible: kurbo::Rect, unit: f64) -> Generated {
         let Some(subtype) = annot.name(SUBTYPE) else {
             return Ok(None);
         };
         // What cannot paint where the page shows it is not written ([`Out`]).
-        let mut out = Out::new(visible, beyond);
+        let mut out = Out::new(visible, unit);
         let fonts = &self.fonts;
         let ok = |drew: Option<()>| Ok(drew);
         let drew = match &**subtype {

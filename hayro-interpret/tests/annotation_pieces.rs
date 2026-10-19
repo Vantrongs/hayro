@@ -12,10 +12,19 @@
 //! leaves that part no area (a line or a point) leaves nothing, before growing.
 //! The steps of a squiggle are those of its zigzag as written: a step whose two
 //! corners are one point as written paints nothing of its own, and the steps
-//! either side of it meet in a join there. An annotation with more such pieces
-//! than the limit is refused, and only then, or where a piece that paints has a
-//! number that cannot be written (2^23 or more); what paints nothing never refuses,
-//! however far from the page. (A squiggle finer than the 32-bit numbers it is
+//! either side of it meet in a join there.
+//!
+//! A viewer computes where a piece lies in 32-bit numbers, adding up cells and
+//! steps from far off, so a piece may lie anywhere within a bound of where it
+//! paints exactly: [`Bound`], a generous one, several times the generator's own.
+//! Every piece that paints is drawn, and no piece whose place within that bound
+//! cannot meet what shows. An annotation with more pieces that paint than the
+//! limit is refused, or where a piece that paints has a number that cannot be
+//! written (2^23 or more), or lies where a viewer may put it more than a point
+//! off (forty roundings of its magnitude: a lower bound); it may be refused only
+//! where the pieces that may paint within the bound are more than the limit, or
+//! one of them lies within it of the page and the bound is more than a point. What
+//! no viewer can put on the page never refuses, however far from it. (A squiggle finer than the 32-bit numbers it is
 //! written in, along the edge of what shows, refuses for the steps the generator
 //! looks at one by one too: `annotation_cost.rs` holds those; the shapes here are
 //! coarser.) The reference takes every piece of shapes of a few thousand, one by
@@ -37,6 +46,77 @@ const LIMIT: u32 = 40;
 
 /// The least magnitude that cannot be written in content.
 const UNWRITABLE: f64 = 8_388_608.0;
+
+/// u = 2^-24, the most a 32-bit number rounds a value by, relative to it.
+const U: f64 = 5.960_464_477_539_063e-8;
+
+/// How far a viewer computing a piece's place in 32-bit numbers may put it, on
+/// the page in its units, as bounded here, apart from the generator's own
+/// derivation: `lo`, which no viewer is promised to be within (forty roundings of
+/// the piece's magnitude on the page), and `hi`, a few times what any viewer can
+/// move it by: two hundred roundings of the magnitudes its place sums, the page's
+/// and its own, and those of a running sum of `k` terms of at most `step`, from
+/// `lead`, each way. Infinite where so many roundings bound nothing.
+#[derive(Clone, Copy, Debug)]
+struct Bound {
+    lo: f64,
+    hi: f64,
+}
+
+impl Bound {
+    /// Of a piece of magnitude `most` on the page, a page of magnitude `page`, a
+    /// running sum of `k` terms of at most `step` from `lead`, in a space `scale`
+    /// times the page's.
+    fn of(most: f64, page: f64, k: f64, lead: f64, step: f64, scale: f64) -> Self {
+        let count = 200.0 + k;
+        let summed = 200.0 * (most + 2.0 * page)
+            + scale * (k * lead + step * (k + 2.0) * (k + 2.0) / 2.0 + 20.0 * (lead + k * step));
+        let left = 1.0 - U * count;
+        Self {
+            lo: 40.0 * U * most,
+            hi: if left > 0.0 {
+                3.0 * U * summed / left
+            } else {
+                f64::INFINITY
+            },
+        }
+    }
+}
+
+/// The largest magnitude on the page of the points `p` under `m`, coordinate by
+/// coordinate, each coefficient's magnitude.
+fn magnitude(m: Affine, points: &[Point]) -> f64 {
+    let a = Affine::new(m.as_coeffs().map(f64::abs));
+    points.iter().fold(0.0_f64, |most, p| {
+        let q = a * Point::new(p.x.abs(), p.y.abs());
+        most.max(q.x).max(q.y)
+    })
+}
+
+/// The largest magnitude of the points of `region`.
+fn page_magnitude(region: &[Point]) -> f64 {
+    region
+        .iter()
+        .fold(0.0_f64, |m, p| m.max(p.x.abs()).max(p.y.abs()))
+}
+
+/// Whether the pieces of `drawn` are all among `may`, and those of `must` all
+/// among `drawn`.
+fn between<T: PartialEq + std::fmt::Debug>(
+    must: &[T],
+    drawn: &[T],
+    may: &[T],
+) -> Result<(), String> {
+    if let Some(p) = must.iter().find(|p| !drawn.contains(p)) {
+        return Err(format!("{p:?} paints, but is not drawn"));
+    }
+    if let Some(p) = drawn.iter().find(|p| !may.contains(p)) {
+        return Err(format!(
+            "{p:?} is drawn, but no viewer can put it on the page"
+        ));
+    }
+    Ok(())
+}
 
 /// The content generated for `annot` on a page that shows `visible`, in units of
 /// `unit` points; empty when it draws nothing.
@@ -444,33 +524,79 @@ fn check_comb(
     let cells = f64::from(max_len);
     let step = (fw - 2.0 * w) / cells;
     let (wy0, wy1) = (f32ed(w), f32ed(fh - w));
+    let tolerance = 1.0 / unit;
+    let page = page_magnitude(&region);
+    let [a, b, c, d, _, _] = place.as_coeffs();
+    let scale = a.abs().max(b.abs()).max(c.abs()).max(d.abs());
+    // Each divider, where it lies exactly, and how far a viewer may put it: its
+    // place is the cell's width times its number, a product, not a running sum.
+    let dividers: Vec<(f64, BezPath, Bound)> = (1..max_len)
+        .map(|i| {
+            let u = f32ed(w + step * f64::from(i));
+            let mut line = BezPath::new();
+            line.move_to((u, wy0));
+            line.line_to((u, wy1));
+            let most = magnitude(place, &[Point::new(u, wy0), Point::new(u, wy1)]);
+            let lead = (step * f64::from(i)).abs() + step.abs() + w;
+            let bound = Bound::of(most, page, 0.0, lead, 0.0, scale);
+            (u, place * stroke(line, w), bound)
+        })
+        .collect();
     // Of no length as written, a line paints nothing; under a clip of no area,
     // nothing paints.
-    let paints: Vec<f64> = if max_len < 2 || wy0 == wy1 || region.is_empty() {
+    let none = max_len < 2 || wy0 == wy1 || region.is_empty();
+    let paints: Vec<&(f64, BezPath, Bound)> = if none {
         vec![]
     } else {
-        (1..max_len)
-            .map(|i| f32ed(w + step * f64::from(i)))
-            .filter(|&u| {
-                let mut line = BezPath::new();
-                line.move_to((u, wy0));
-                line.line_to((u, wy1));
-                meets(&(place * stroke(line, w)), &g)
-            })
+        dividers.iter().filter(|(_, s, _)| meets(s, &g)).collect()
+    };
+    let may: Vec<&(f64, BezPath, Bound)> = if none {
+        vec![]
+    } else {
+        dividers
+            .iter()
+            .filter(|(_, s, b)| b.hi.is_infinite() || meets(s, &grown(&g, b.hi)))
             .collect()
     };
     let refused = paints.len() > limit as usize
         || (!paints.is_empty()
             && (place.as_coeffs().iter().any(|c| c.abs() >= UNWRITABLE)
-                || paints.iter().any(|u| u.abs() >= UNWRITABLE)));
-    match got {
+                || paints.iter().any(|(u, _, _)| u.abs() >= UNWRITABLE)))
+        || paints.iter().any(|(_, _, b)| b.lo > tolerance);
+    // The field's box and border, drawn as any piece is: refused where a viewer
+    // may put them a point off.
+    let corners = rect_corners(Rect::new(0.0, 0.0, box_w, box_h))
+        .into_iter()
+        .map(|p| place * p)
+        .collect::<Vec<_>>();
+    let visible_corners = rect_corners(visible);
+    let frame = Bound::of(
+        magnitude(Affine::IDENTITY, &corners),
+        page_magnitude(&visible_corners),
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    );
+    let may_refuse = refused
+        || may.len() > limit as usize
+        || may.iter().any(|(_, _, b)| b.hi > tolerance)
+        || (frame.hi > tolerance
+            && convex_meets(
+                &hull(corners),
+                &grown(&visible_corners, frame.hi + w * scale + beyond),
+            ));
+    let paints: Vec<f64> = paints.iter().map(|(u, _, _)| *u).collect();
+    let may: Vec<f64> = may.iter().map(|(u, _, _)| *u).collect();
+    match &got {
         Err(why) => {
             assert!(
-                refused,
-                "{annot} {visible:?} unit {unit}: {why:?}, {} paint",
-                paints.len()
+                may_refuse,
+                "{annot} {visible:?} unit {unit}: {why:?}, {} paint, {} may",
+                paints.len(),
+                may.len()
             );
-            assert_eq!(why, Unsupported::Coordinates, "{annot}");
+            assert_eq!(*why, Unsupported::Coordinates, "{annot}");
         }
         Ok(content) => {
             assert!(
@@ -478,17 +604,19 @@ fn check_comb(
                 "{annot} {visible:?} unit {unit}: {} paint",
                 paints.len()
             );
-            let drawn: Vec<f64> = operations(&content)
+            let drawn: Vec<f64> = operations(content)
                 .into_iter()
                 .filter(|(_, op)| *op == "m")
                 .map(|(n, _)| n[0])
                 .collect();
-            assert_eq!(drawn, paints, "{annot} {visible:?} unit {unit}\n{content}");
+            if let Err(e) = between(&paints, &drawn, &may) {
+                panic!("{annot} {visible:?} unit {unit}: {e}\n{content}");
+            }
         }
     }
     Checked {
         painting: paints.len(),
-        refused,
+        refused: got.is_err(),
     }
 }
 
@@ -548,13 +676,15 @@ fn edges(r: Rect) -> [f64; 4] {
     [x0, y0, x1 - x0, y1 - y0]
 }
 
-/// The steps of the zigzag through `corners`, `width` wide, that paint in `g`:
-/// those of some length as written whose own stroke meets it, or the join they
-/// share with the nearest step of some length on either side.
-fn steps_that_paint(corners: &[Point], width: f64, g: &[Point]) -> Vec<usize> {
-    if g.is_empty() {
-        return vec![];
-    }
+/// The steps of the zigzag through `corners`, `width` wide, that paint in `g(k)`
+/// for step `k` (`None` where it may lie anywhere): those of some length as
+/// written whose own stroke meets it, or the join they share with the nearest step
+/// of some length on either side.
+fn steps_that_paint(
+    corners: &[Point],
+    width: f64,
+    g: &dyn Fn(usize, usize) -> Option<Vec<Point>>,
+) -> Vec<usize> {
     let long: Vec<usize> = (0..corners.len().saturating_sub(1))
         .filter(|&k| corners[k] != corners[k + 1])
         .collect();
@@ -562,16 +692,38 @@ fn steps_that_paint(corners: &[Point], width: f64, g: &[Point]) -> Vec<usize> {
     (0..long.len())
         .filter(|&i| {
             let k = long[i];
+            // The last corner its joins reach.
+            let last = long.get(i + 1).map_or(k + 1, |&n| n + 1);
+            let Some(g) = g(k, last) else {
+                return true;
+            };
+            if g.is_empty() {
+                return false;
+            }
             let mut line = BezPath::new();
             line.move_to(c[k]);
             line.line_to(c[k + 1]);
-            meets(&stroke(line, width), g)
-                || (i > 0 && convex_meets(&join(c[long[i - 1]], c[k], c[k + 1], width), g))
+            meets(&stroke(line, width), &g)
+                || (i > 0 && convex_meets(&join(c[long[i - 1]], c[k], c[k + 1], width), &g))
                 || (i + 1 < long.len()
-                    && convex_meets(&join(c[k], c[k + 1], c[long[i + 1] + 1], width), g))
+                    && convex_meets(&join(c[k], c[k + 1], c[long[i + 1] + 1], width), &g))
         })
         .map(|i| long[i])
         .collect()
+}
+
+/// How far a viewer may put corner `k` of the zigzag of `q` and those before it,
+/// adding up its steps from the quad's start ([`Bound`]): of magnitude at most
+/// `most` on a page of magnitude `page`.
+fn corner_bound(q: [Point; 4], k: usize, most: f64, page: f64) -> Bound {
+    let [tl, tr, bl, br] = q;
+    let (len, height) = ((br - bl).hypot(), (tl - bl).hypot());
+    let (top_left, top_right) = (bl.lerp(tl, 1.0 / 7.0), br.lerp(tr, 1.0 / 7.0));
+    let dt = height / 7.0 / len;
+    let size = |v: Vec2| v.x.abs().max(v.y.abs());
+    let lead = size(bl.to_vec2()).max(size(top_left.to_vec2()));
+    let step = size(br - bl).max(size(top_right - top_left)) * dt;
+    Bound::of(most, page, k as f64, lead, step, 1.0)
 }
 
 /// Checks a squiggle of the quads `quads` (each `tl tr bl br`) against the
@@ -597,52 +749,92 @@ fn check_squiggle(quads: &[[Point; 4]], visible: Rect, unit: f64, limit: u32) ->
     set_most_pieces(limit);
     let got = look(&annot, visible, unit);
     let written = got.as_ref().ok().and_then(|c| clips_written(c));
-    let g = match (&written, &spec) {
-        (_, None) => vec![],
+    let (region, g) = match (&written, &spec) {
+        (_, None) => (vec![], vec![]),
         (Some((_, written)), Some(spec)) => {
             let (region, g) = shown(visible, written, beyond);
             assert!(
                 same_shown(&region, &shown(visible, spec, beyond).0),
                 "{annot}: clip {written:?}"
             );
-            g
+            (region, g)
         }
-        (None, Some(spec)) => shown(visible, spec, beyond).1,
+        (None, Some(spec)) => shown(visible, spec, beyond),
     };
+    let (tolerance, page) = (1.0 / unit, page_magnitude(&region));
     let mut all: Vec<(usize, usize)> = vec![];
+    let mut may: Vec<(usize, usize)> = vec![];
     let mut zigzags = vec![];
-    let mut refused = false;
-    let mut painting = 0;
+    let (mut refused, mut may_refuse) = (false, false);
+    let (mut painting, mut looked) = (0, 0);
     for (n, q) in quads.iter().enumerate() {
         let (corners, width) = zigzag(*q);
-        let paints = steps_that_paint(&corners, width, &g);
-        refused |= paints
+        let bound = |k: usize, last: usize| {
+            let most = magnitude(Affine::IDENTITY, &corners[k.saturating_sub(1)..=last]);
+            corner_bound(*q, last, most, page)
+        };
+        let paints = steps_that_paint(&corners, width, &|_, _| Some(g.clone()));
+        let wide = |k: usize, last: usize| {
+            let b = bound(k, last);
+            if g.is_empty() {
+                Some(vec![])
+            } else if b.hi.is_finite() {
+                Some(grown(&g, b.hi))
+            } else {
+                None
+            }
+        };
+        let maybe = steps_that_paint(&corners, width, &wide);
+        // The steps the generator may look at one by one, which count against the
+        // limit: those whose segment comes within the reach of a join (half the
+        // miter limit, 10, times the width) and the bound of `g`.
+        looked += (0..corners.len().saturating_sub(1))
+            .filter(|&k| {
+                let b = bound(k, (k + 2).min(corners.len() - 1));
+                !g.is_empty()
+                    && (b.hi.is_infinite()
+                        || segment_meets(
+                            corners[k],
+                            corners[k + 1],
+                            &grown(&g, 5.0 * width + b.hi),
+                        ))
+            })
+            .count();
+        let last = |k: usize| maybe.iter().find(|&&m| m > k).map_or(k + 1, |&m| m + 1);
+        refused |= paints.iter().any(|&k| {
+            unwritable(corners[k]) || unwritable(corners[k + 1]) || bound(k, k + 1).lo > tolerance
+        });
+        may_refuse |= maybe
             .iter()
-            .any(|&k| unwritable(corners[k]) || unwritable(corners[k + 1]));
+            .any(|&k| bound(k, last(k).min(corners.len() - 1)).hi > tolerance);
         painting += paints.len();
         all.extend(paints.into_iter().map(|k| (n, k)));
+        may.extend(maybe.into_iter().map(|k| (n, k)));
         zigzags.push(corners);
     }
     // The limit holds for the annotation's steps in all.
     refused |= painting > limit as usize;
-    match got {
+    may_refuse |= refused || may.len() > limit as usize || looked > limit as usize;
+    match &got {
         Err(why) => {
             assert!(
-                refused,
-                "{annot} {visible:?} unit {unit}: {why:?}, {all:?} paint"
+                may_refuse,
+                "{annot} {visible:?} unit {unit}: {why:?}, {all:?} paint, {may:?} may, {looked} near"
             );
-            assert_eq!(why, Unsupported::Coordinates, "{annot}");
+            assert_eq!(*why, Unsupported::Coordinates, "{annot}");
         }
         Ok(content) => {
             assert!(!refused, "{annot} {visible:?} unit {unit}: {all:?} paint");
-            assert_eq!(
-                drawn_steps(&content, &zigzags),
-                all,
-                "{annot} {visible:?} unit {unit}\n{content}"
-            );
+            let drawn = drawn_steps(content, &zigzags);
+            if let Err(e) = between(&all, &drawn, &may) {
+                panic!("{annot} {visible:?} unit {unit}: {e}\n{content}");
+            }
         }
     }
-    Checked { painting, refused }
+    Checked {
+        painting,
+        refused: got.is_err(),
+    }
 }
 
 /// The steps `content` draws, as the quad and step of each, found by walking the
@@ -715,7 +907,7 @@ fn place(rng: &mut Random) -> (f64, f64) {
 #[test]
 fn combs_draw_and_count_exactly_the_dividers_that_paint() {
     let mut rng = Random(0x5eed_c0b5);
-    let (mut refused, mut drawn, mut none, mut flat) = (0, 0, 0, 0);
+    let (mut refused, mut drawn, mut none, mut flat, mut long) = (0, 0, 0, 0, 0);
     for _ in 0..500 {
         let (mut x, mut y) = place(&mut rng);
         if rng.next(0.0, 1.0) < 0.1 {
@@ -745,10 +937,16 @@ fn combs_draw_and_count_exactly_the_dividers_that_paint() {
             _ => bh / 2.0,
         };
         flat += usize::from(w == bw / 2.0 || w == bh / 2.0);
-        let max_len = rng.pick(&[2, 3, 30, 60, 200, 300]);
+        let mut max_len = rng.pick(&[2, 3, 30, 60, 200, 300]);
         let unit = rng.pick(&[1.0, 1.0, 1.0, 0.5, 100.0, 1000.0]);
         let v = visible(&mut rng);
-        let rect = [x - fw / 2.0, y - fh / 2.0, x + fw / 2.0, y + fh / 2.0];
+        let mut rect = [x - fw / 2.0, y - fh / 2.0, x + fw / 2.0, y + fh / 2.0];
+        if rng.next(0.0, 1.0) < 0.15 {
+            // A long accumulation: thousands of cells from far off to here.
+            long += 1;
+            max_len = rng.pick(&[1000, 5000]);
+            rect[0] = rng.pick(&[-14_400.0, -100_000.0, -1_000_000.0]) * rng.next(0.5, 1.0);
+        }
         let c = check_comb(rect, turn, max_len, w, v, unit, LIMIT);
         match (c.refused, c.painting) {
             (true, _) => refused += 1,
@@ -758,8 +956,8 @@ fn combs_draw_and_count_exactly_the_dividers_that_paint() {
     }
     // Each outcome is reached.
     assert!(
-        refused > 20 && drawn > 50 && none > 50 && flat > 30,
-        "refused {refused}, drawn {drawn}, none {none}, flat {flat}"
+        refused > 20 && drawn > 50 && none > 50 && flat > 30 && long > 50,
+        "refused {refused}, drawn {drawn}, none {none}, flat {flat}, long {long}"
     );
 }
 
@@ -781,11 +979,19 @@ fn near_quad(rng: &mut Random) -> [Point; 4] {
 }
 
 /// A second quad of a squiggle: one far from the page (10^6 to 10^7 away); one
-/// just off the page, which widens the clip the quads share over it; or one from
-/// far off to the page, of a height that makes its steps a few thousand.
+/// just off the page, which widens the clip the quads share over it; one from far
+/// off to the page, of a height that makes its steps a few thousand; or one from
+/// up to 14,400 pt off, of 1,000 or 10,000 steps, a long accumulation.
 fn other_quad(rng: &mut Random) -> [Point; 4] {
     let p = Point::new;
-    match rng.pick(&[0, 1, 2]) {
+    match rng.pick(&[0, 1, 2, 3]) {
+        3 => {
+            let start = -14_400.0 * rng.next(0.1, 1.0);
+            let end = rng.next(-20.0, 220.0);
+            let h = (end - start) * 7.0 / rng.pick(&[1_000.0, 10_000.0]);
+            let y = rng.next(-h, 200.0);
+            [p(start, y + h), p(end, y + h), p(start, y), p(end, y)]
+        }
         0 => {
             let (x, y) = if rng.next(0.0, 1.0) < 0.5 {
                 (rng.far(), rng.next(-50.0, 250.0))

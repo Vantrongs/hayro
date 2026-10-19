@@ -199,8 +199,8 @@ fn a_comb_wider_than_the_page_draws_the_dividers_on_it() {
     // Cells 500 pt wide: the page shows the divider at 2 pt (501 in the field's frame,
     // which starts at -499), and no other.
     let content = generated(
-        "/Subtype /Widget /FT /Tx /Ff 16777216 /MK << /BC [0] >> /MaxLen 16000 \
-         /Rect [-499 100 8000000 130]",
+        "/Subtype /Widget /FT /Tx /Ff 16777216 /MK << /BC [0] >> /MaxLen 400 \
+         /Rect [-499 100 199503 130]",
     );
     let starts: Vec<i64> = content
         .lines()
@@ -210,8 +210,9 @@ fn a_comb_wider_than_the_page_draws_the_dividers_on_it() {
     assert_eq!(starts, [501], "{content}");
 }
 
-/// A squiggle is drawn step by step, however fine, across the page only; one that
-/// would draw more than 262 144 steps there is refused.
+/// A squiggle is drawn step by step across the page only; one that would draw more
+/// than 262 144 steps there is refused, and so is one whose corners a viewer adds
+/// up from so many steps that it may put them a point off.
 #[test]
 fn a_flat_squiggle_is_drawn_at_a_bounded_cost() {
     let steps = |quad: &str| {
@@ -224,9 +225,15 @@ fn a_flat_squiggle_is_drawn_at_a_bounded_cost() {
             _ => panic!("{quad}: drawn otherwise"),
         }
     };
-    // Steps of 0.001 pt across a quad 4·10^6 pt wide: about 200 000 on the page.
-    let n = steps("0 100.007 4000000 100.007 0 100 4000000 100").unwrap();
-    assert!((199_000..201_000).contains(&n), "{n} steps");
+    // Steps of 0.01 pt across a quad 4,000 pt wide: about 20 000 on the page.
+    let n = steps("0 100.07 4000 100.07 0 100 4000 100").unwrap();
+    assert!((19_900..20_100).contains(&n), "{n} steps");
+    // Steps of 0.001 pt: about 200 000 on the page, the last a sum of as many,
+    // which a viewer may put more than a point off.
+    assert_eq!(
+        steps("0 100.007 4000000 100.007 0 100 4000000 100"),
+        Err(Unsupported::Coordinates)
+    );
     // Steps of 0.0001 pt: about 2 000 000.
     assert_eq!(
         steps("0 100.0007 4000000 100.0007 0 100 4000000 100"),
@@ -357,9 +364,10 @@ fn a_squiggle_finer_than_its_numbers_along_the_page_is_refused_at_a_bounded_cost
         assert_eq!(got, Err(Unsupported::Coordinates), "{h} {d}");
         assert!(work < 2 * 4096 + 1000, "{h} {d}: {work}");
     }
-    // A hundred times coarser, the steps are told apart by range: drawn at a cost
-    // that does not grow with the limit.
-    let (got, work) = look(&quad(1e-2, 2.0));
+    // Tens of thousands of times coarser, the steps are told apart by range, past
+    // what a viewer adding them up from the quad's start can move them: drawn at
+    // a cost that does not grow with the limit.
+    let (got, work) = look(&quad(3.0, 2.0));
     assert_eq!(got, Ok(()));
     assert!(work < 1000, "{work}");
     // At the default most, as within it: 0.8 s in a release build, 6.4 s in a
@@ -370,13 +378,15 @@ fn a_squiggle_finer_than_its_numbers_along_the_page_is_refused_at_a_bounded_cost
     assert!(work < 2 * 262_144 + 1000, "{work}");
 }
 
-/// 4·10^6: twice it is below 2^23, from which numbers are not written.
+/// 10^5: a place this far from the page is still within a point of where any
+/// viewer puts it.
 fn huge() -> String {
-    "4000000".to_owned()
+    "100000".to_owned()
 }
 
-/// A radio button as large as a written number allows is four curves for each circle,
-/// as viewers draw it: the work does not grow with its size.
+/// A radio button 200,000 pt across, as large as its place stays within a point of
+/// where any viewer puts it, is four curves for each circle, as viewers draw it:
+/// the work does not grow with its size.
 #[test]
 fn a_huge_radio_button_costs_what_a_small_one_does() {
     let h = huge();
@@ -388,10 +398,10 @@ fn a_huge_radio_button_costs_what_a_small_one_does() {
     assert_eq!(radio.matches(" c\n").count(), 12, "{radio}");
 }
 
-/// So is a circle line ending of a line as wide as its ending allows.
+/// So is a circle line ending of a line 30,000 pt wide.
 #[test]
 fn a_huge_circle_ending_costs_what_a_small_one_does() {
-    let h = "1000000";
+    let h = "30000";
     let ending = generated(&format!(
         "/Subtype /Line /C [0] /BS << /W {h} >> /LE [/Circle /None] /L [50 50 100 50] \
          /Rect [0 0 200 200]"
@@ -861,6 +871,19 @@ struct Cost {
 /// file whose catalog has `catalog` besides its pages, and whose objects from 4 are
 /// `shared`, the annotations after them. None may be unsupported.
 fn cost_of(n: usize, catalog: &str, shared: &[String], annot: &dyn Fn(usize) -> String) -> Cost {
+    cost_refused(n, catalog, shared, annot, false)
+}
+
+/// [`cost_of`], where each annotation may also be refused for its coordinates
+/// when `refused`: a long text centred by its advance, which a viewer measures by
+/// adding it up, lies where no viewer can be told to put it, but is set as any.
+fn cost_refused(
+    n: usize,
+    catalog: &str,
+    shared: &[String],
+    annot: &dyn Fn(usize) -> String,
+    refused: bool,
+) -> Cost {
     let first = 4 + shared.len();
     let refs: Vec<String> = (0..n).map(|i| format!("{} 0 R", first + i)).collect();
     let mut objects = vec![
@@ -880,6 +903,7 @@ fn cost_of(n: usize, catalog: &str, shared: &[String], annot: &dyn Fn(usize) -> 
     for d in drawn(&appearances, &pdf).iter() {
         match d.look() {
             Look::Generated(g) => assert!(g.content.len() < 64 << 10, "{}", annot(0)),
+            Look::Unsupported(Unsupported::Coordinates) if refused => {}
             Look::Unsupported(why) => panic!("{why:?}: {}", annot(0)),
             _ => {}
         }
@@ -896,10 +920,21 @@ fn cost_of(n: usize, catalog: &str, shared: &[String], annot: &dyn Fn(usize) -> 
 /// read the whole of a shared entry of 20,000 characters or numbers take ten times
 /// that.
 fn shared_once(catalog: &str, shared: &[String], annot: impl Fn(usize) -> String) {
+    shared_once_or_refused(catalog, shared, annot, false);
+}
+
+/// [`shared_once`], where each annotation may be refused for its coordinates when
+/// `refused` ([`cost_refused`]).
+fn shared_once_or_refused(
+    catalog: &str,
+    shared: &[String],
+    annot: impl Fn(usize) -> String,
+    refused: bool,
+) {
     const N: usize = 40;
     let (one, two) = (
-        cost_of(N, catalog, shared, &annot),
-        cost_of(2 * N, catalog, shared, &annot),
+        cost_refused(N, catalog, shared, &annot, refused),
+        cost_refused(2 * N, catalog, shared, &annot, refused),
     );
     let (bytes, work) = (two.bytes - one.bytes, two.work - one.work);
     assert!(
@@ -973,18 +1008,22 @@ fn a_shared_text_is_set_once_whatever_each_annotation_draws_it_in() {
             thousandths(i).replace("100.", "10.")
         )
     });
-    shared_once("", &text, |i| {
+    // A caption is centred by its advance: this one, refused.
+    let caption = |i| {
         format!(
             "/Subtype /Widget /FT /Btn /Ff 65536 /MK << /CA 4 0 R >> /Rect [10 10 {} 40]",
             thousandths(i)
         )
-    });
-    shared_once("", &text, |i| {
+    };
+    shared_once_or_refused("", &text, caption, true);
+    // So is a line's caption.
+    let line_caption = |i| {
         format!(
             "/Subtype /Line /C [0] /Cap true /Contents 4 0 R /L [20 100 {} 100] /Rect [0 0 200 200]",
             thousandths(i)
         )
-    });
+    };
+    shared_once_or_refused("", &text, line_caption, true);
 }
 
 /// Annotations that share a text, each with a default style written in it, set the
@@ -1144,8 +1183,9 @@ fn text_in_a_negative_size_is_laid_out_as_far_as_it_shows() {
 
 /// A glyph is written once for an appearance, as a form, and each place it is drawn
 /// costs a few bytes: a comb of 10,000 cells, all shown, and a `FreeText` full of
-/// text, each some 30 bytes a glyph drawn, as `bake` writes some 11 (before either
-/// is compressed).
+/// text, each some 36 bytes a glyph drawn (each glyph after a run's first in a `q`
+/// of its own, so that a viewer places it from the first, not from each before
+/// it), as `bake` writes some 11 (before either is compressed).
 #[test]
 fn a_drawn_glyph_costs_a_few_bytes() {
     let value: String = "ABCDEFGHIJ0123456789"
@@ -1171,7 +1211,7 @@ fn a_drawn_glyph_costs_a_few_bytes() {
         assert!(drawn > 1_000, "{drawn}");
         assert!(g.glyphs.len() <= 20, "{}", g.glyphs.len());
         let per_glyph = g.content.len() / drawn;
-        assert!(per_glyph <= 32, "{per_glyph} bytes a glyph");
+        assert!(per_glyph <= 40, "{per_glyph} bytes a glyph");
     }
 }
 
@@ -1956,8 +1996,9 @@ fn an_array_annotations_share_is_walked_once() {
 /// Stamps that share a long name read it once for the document, and set it once:
 /// those of no area, which draw nothing; those whose name is spaces, which draw
 /// their frame alone; and those whose name runs far past their box, which draw the
-/// part of it the box shows. Twice as many cost what the added ones draw, and no
-/// more for a name twice as long.
+/// part of it the box shows, or refuse it when it is centred so far off that a
+/// viewer's rounding moves it. Twice as many cost what the added ones draw, and
+/// for a name twice as long no more than a step more of a search through it.
 #[test]
 fn stamps_sharing_a_long_name_read_it_once() {
     const N: usize = 40;
@@ -1967,9 +2008,10 @@ fn stamps_sharing_a_long_name_read_it_once() {
             let annot = |_: usize| format!("/Subtype /Stamp /Name 4 0 R /Rect {rect}");
             let added = |n: usize| {
                 let shared = [format!("/{}", name(n))];
+                // A name is centred by its advance: a long one, refused.
                 let (one, two) = (
-                    cost_of(N, "", &shared, &annot),
-                    cost_of(2 * N, "", &shared, &annot),
+                    cost_refused(N, "", &shared, &annot, true),
+                    cost_refused(2 * N, "", &shared, &annot, true),
                 );
                 Cost {
                     bytes: two.bytes - one.bytes,
@@ -1981,7 +2023,7 @@ fn stamps_sharing_a_long_name_read_it_once() {
                 long.bytes < N * (64 << 10)
                     && long.work < (N * 4_000) as u64
                     && long.bytes < short.bytes + N * 256
-                    && long.work < short.work + (N * 4) as u64,
+                    && long.work < short.work + (N * 8) as u64,
                 "{} {rect}: {short:?} added at 20,000, {long:?} at 40,000",
                 &name(4)
             );
@@ -1990,26 +2032,34 @@ fn stamps_sharing_a_long_name_read_it_once() {
 }
 
 /// A glyph far along its line, past text the box does not show, is placed where it
-/// lies, by numbers as small as its place: the end of a long right-aligned word,
-/// the middle of a long stamp name, is drawn, and only it.
+/// lies, by numbers as small as its place: the end of a right-aligned word of 1,000
+/// letters, the middle of a stamp name as long, is drawn, and only it. Of 40,000
+/// letters, the word starts so far off that a viewer adding up its advances in
+/// single precision may put its end anywhere within some points: it is refused.
 #[test]
 fn a_glyph_far_along_its_line_is_drawn() {
-    let word = "A".repeat(40_000);
-    for annot in [
-        format!(
-            "/Subtype /FreeText /Q 2 /DA (/Helv 12 Tf) /Contents ({word}) /Rect [10 10 190 190]"
-        ),
-        format!("/Subtype /Stamp /Name /{word} /Rect [10 10 200 60]"),
-    ] {
-        let pdf = one_annotation(&annot);
-        let Look::Generated(g) = first_look(&pdf) else {
-            panic!("not generated: {}", &annot[..20]);
-        };
-        let drawn = g.content.matches(" Do\n").count();
-        assert!(
-            (1..100).contains(&drawn),
-            "{drawn} glyphs: {}",
-            &annot[..20]
-        );
+    for (letters, drawn_where) in [(1_000, true), (40_000, false)] {
+        let word = "A".repeat(letters);
+        for annot in [
+            format!(
+                "/Subtype /FreeText /Q 2 /DA (/Helv 12 Tf) /Contents ({word}) \
+                 /Rect [10 10 190 190]"
+            ),
+            format!("/Subtype /Stamp /Name /{word} /Rect [10 10 200 60]"),
+        ] {
+            let pdf = one_annotation(&annot);
+            match first_look(&pdf) {
+                Look::Generated(g) if drawn_where => {
+                    let drawn = g.content.matches(" Do").count();
+                    assert!(
+                        (1..100).contains(&drawn),
+                        "{drawn} glyphs: {}",
+                        &annot[..20]
+                    );
+                }
+                Look::Unsupported(Unsupported::Coordinates) if !drawn_where => {}
+                _ => panic!("{letters} letters: {}", &annot[..20]),
+            }
+        }
     }
 }

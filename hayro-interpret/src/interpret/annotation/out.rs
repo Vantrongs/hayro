@@ -114,7 +114,8 @@ pub(super) const MITER_LIMIT: f64 = 10.0;
 /// clip that leaves it no area, a line or a point, leaves nothing: what it shows
 /// is empty however close a piece comes. Made only by [`Out::region`], from what
 /// the content wrote; the generators that choose pieces test them against it, and
-/// [`Out`] tests every painting operator against it.
+/// [`Out`] tests every painting operator against it, each piece wherever a viewer
+/// computing its place in 32-bit numbers may put it ([`Rounding`]).
 #[derive(Clone, Debug)]
 pub(super) struct Region {
     /// The part shown, on the page: a convex polygon of some area, counterclockwise,
@@ -122,24 +123,180 @@ pub(super) struct Region {
     shown: Option<Vec<Point>>,
     /// Half the side of the square a piece paints beyond its outline, on the page.
     grow: f64,
+    /// How far from where it lies a viewer may draw a piece that is drawn, on the
+    /// page: one that may lie farther cannot be drawn where `bake` draws it.
+    tolerance: f64,
     /// From the current space to the page, as written.
     ctm: Affine,
     /// The same transforms composed with each coefficient's magnitude: of a point
     /// `p`, `abs * |p|` bounds the magnitudes summed in computing `ctm * p`.
     abs: Affine,
+    /// What a viewer composing the transforms written in 32-bit numbers rounds
+    /// ([`Rounding`]): of each coefficient, the magnitudes its roundings round,
+    /// summed, carried through the transforms after them, so that `chain * |p|`
+    /// sums those of `p`'s place; and the most roundings one passes through.
+    chain: Affine,
+    chain_count: f64,
 }
 
-/// How far, relative to the magnitudes summed, a viewer computing a point's place
-/// in 32-bit numbers may put it: γ₄₀ = 40u/(1 − 40u), u = 2⁻²⁴, a bound that holds
-/// in any order of evaluation (Higham, *Accuracy and Stability of Numerical
-/// Algorithms*, 3.5). The place is a product of at most 7 affine factors
-/// (`/Matrix`, the placement, the page's translation, turn and flip, `/UserUnit`,
-/// the device scale) and the point, each product summing 3 terms: 21 roundings,
-/// and 1 to the rasterizer's grid. The placement's entries the viewer computes
-/// itself from `/Rect` and the box under `/Matrix`, in at most 8 roundings each,
-/// its translation of two terms as large as the sum: 16 more, 38 in all.
-const VIEWER_ROUNDING: f64 =
-    40.0 * 5.960_464_477_539_063e-8 / (1.0 - 40.0 * 5.960_464_477_539_063e-8);
+/// u = 2⁻²⁴, the most a 32-bit number rounds a value by, relative to it.
+const U: f64 = 5.960_464_477_539_063e-8;
+
+/// How far a viewer computing a point in 32-bit arithmetic, in any order, may put
+/// it from its value: for each coordinate, across and up, the roundings it takes,
+/// `count` along the longest chain of them, and the magnitudes they round,
+/// `summed`. Each rounding moves what it rounds by at most u of it, and after n
+/// roundings that is at most 1/(1 − n u) of what it is computed exactly from
+/// magnitudes, so the error is at most u · `summed` / (1 − u `count`)
+/// ([`Rounding::bound`]; Higham, *Accuracy and Stability of Numerical Algorithms*,
+/// 3.1–3.5): of `count` roundings of a value each at most M, the forward bound
+/// γₙ M.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct Rounding {
+    count: Vec2,
+    summed: Vec2,
+}
+
+impl Rounding {
+    /// No rounding: a number as written.
+    pub(super) const NONE: Self = Self {
+        count: Vec2::ZERO,
+        summed: Vec2::ZERO,
+    };
+
+    /// `count` roundings, each of a value at most `most` across.
+    pub(super) fn of(count: f64, most: f64) -> Self {
+        Self {
+            count: Vec2::new(count, 0.0),
+            summed: Vec2::new(count * most.abs(), 0.0),
+        }
+    }
+
+    /// A sum across of `lead` and `n` terms, each at most `most` and `total` in all,
+    /// in magnitude, each term itself computed in `per_term` roundings of a value
+    /// no larger than it: in whatever order, or tree, a viewer adds them. Each
+    /// addition rounds a partial sum, at most the magnitudes of the terms under it,
+    /// so the roundings sum each term's magnitude as many times as it is added
+    /// into: most where the largest are added first, one at a time; the `j`
+    /// largest are at most `lead + min(total, j most)`.
+    pub(super) fn sum(lead: f64, n: f64, most: f64, total: f64, per_term: f64) -> Self {
+        let (lead, most, total) = (lead.abs(), most.abs(), total.abs());
+        // Adding terms that are all 0 rounds nothing.
+        if n <= 0.0 || most == 0.0 {
+            return Self::NONE;
+        }
+        // Σ_{j=2}^{n+1} min(total, j most): j most up to q, total after.
+        let partial = if most > 0.0 && total.is_finite() {
+            let q = (total / most).floor().clamp(1.0, n + 1.0);
+            most * (q * (q + 1.0) / 2.0 - 1.0) + (n + 1.0 - q) * total
+        } else {
+            n * total
+        };
+        Self {
+            count: Vec2::new(n + per_term, 0.0),
+            summed: Vec2::new(n * lead + partial + per_term * total, 0.0),
+        }
+    }
+
+    /// Both: a number computed from two so computed.
+    pub(super) fn plus(self, other: Self) -> Self {
+        Self {
+            count: self.count + other.count,
+            summed: self.summed + other.summed,
+        }
+    }
+
+    /// Of a point, `x` across and `y` up, each computed as a [`Rounding`] across.
+    pub(super) fn point(x: Self, y: Self) -> Self {
+        Self {
+            count: Vec2::new(x.count.x, y.count.x),
+            summed: Vec2::new(x.summed.x, y.summed.x),
+        }
+    }
+
+    /// The larger of two, coordinate by coordinate: for points each computed as
+    /// one of them says.
+    fn either(self, other: Self) -> Self {
+        let max = |a: Vec2, b: Vec2| Vec2::new(a.x.max(b.x), a.y.max(b.y));
+        Self {
+            count: max(self.count, other.count),
+            summed: max(self.summed, other.summed),
+        }
+    }
+
+    /// In a space `k` times as large.
+    pub(super) fn scaled(self, k: f64) -> Self {
+        Self {
+            count: self.count,
+            summed: self.summed * k.abs(),
+        }
+    }
+
+    /// The most the point may lie from its value, across and up: u · `summed` /
+    /// (1 − u `count`); none where no rounding rounds anything but 0.
+    pub(super) fn bound(self) -> Vec2 {
+        let one = |count: f64, summed: f64| {
+            let left = 1.0 - U * count;
+            if summed == 0.0 {
+                0.0
+            } else if left > 0.0 {
+                summed * (U / left)
+            } else {
+                f64::INFINITY
+            }
+        };
+        Vec2::new(
+            one(self.count.x, self.summed.x),
+            one(self.count.y, self.summed.y),
+        )
+    }
+}
+
+/// `k v`, 0 for `k` 0 whatever `v`: a coefficient of 0 carries nothing, however
+/// uncertain.
+fn times(k: f64, v: f64) -> f64 {
+    if k == 0.0 { 0.0 } else { k * v }
+}
+
+/// How many roundings a viewer composing `c` then `m` takes for each coefficient,
+/// whatever `c` holds: a product rounds unless its factor of `m` is 0 or ±1, and
+/// each term of `m`'s factor not 0, and the translation, add one but the first.
+fn composed_roundings(m: [f64; 6]) -> [f64; 6] {
+    let [a, b, c, d, e, f] = m;
+    let terms = |factors: &[f64], translation: bool| {
+        let nonzero = factors.iter().filter(|v| **v != 0.0).count() + usize::from(translation);
+        let products = factors
+            .iter()
+            .filter(|v| **v != 0.0 && v.abs() != 1.0)
+            .count();
+        (products + nonzero.saturating_sub(1)) as f64
+    };
+    [
+        terms(&[a, b], false),
+        terms(&[a, b], false),
+        terms(&[c, d], false),
+        terms(&[c, d], false),
+        terms(&[e, f], true),
+        terms(&[e, f], true),
+    ]
+}
+
+/// How far a drawn piece may lie from where a viewer computing in 32-bit numbers
+/// draws it before a page compared at 2 px/pt shows it apart: 1 pt, the 2 px within
+/// which `annot_diff`'s comparison finds a pixel's ink (`LOSS_RADIUS` at `SCALE`).
+/// A piece whose place is less certain is refused ([`Out`]).
+pub(super) const TOLERANCE: f64 = 1.0;
+
+/// How many roundings, each of at most the magnitudes a point's place sums or the
+/// page's, a viewer takes in computing the place of a point it reads: the place is
+/// a product of at most 7 affine factors (`/Matrix`, the placement, the page's
+/// translation, turn and flip, `/UserUnit`, the device scale) and the point, each
+/// product summing 3 terms: 21 roundings, and 1 to the rasterizer's grid. The
+/// placement's entries the viewer computes itself from `/Rect` and the box under
+/// `/Matrix`, in at most 8 roundings each, its translation of two terms as large as
+/// the sum: 16 more, 38 in all. The transforms generated content writes add their
+/// own ([`Region::chain`]).
+const VIEWER_ROUNDINGS: f64 = 40.0;
 
 /// The axes across x and up.
 const AXES: [Vec2; 2] = [Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)];
@@ -170,19 +327,28 @@ impl Region {
         points.iter().map(|p| self.ctm * *p).collect()
     }
 
-    /// Whether the convex hull of `points`, in the current space, meets what shows
-    /// grown: no side of either parts them. Also where a point is no finite number,
-    /// whose place cannot be told (it then cannot be written either).
+    /// Whether the convex hull of `points`, in the current space, may meet what
+    /// shows grown wherever a viewer computing their places in 32-bit numbers puts
+    /// them ([`Self::may_show`]). Also where a point is no finite number, whose
+    /// place cannot be told (it then cannot be written either).
     pub(super) fn meets(&self, points: &[Point]) -> bool {
         self.near(points, 0.0)
     }
 
     /// `points`, of the current space, on the page as transformed further by
     /// `then` (each number as read), and how far, across and up, a viewer computing
-    /// in 32-bit numbers may put each from there ([`VIEWER_ROUNDING`]): the
-    /// magnitudes the transforms sum, and the page's, which its own transform to
-    /// the device sums too, twice (its translation, and the device's offset into it).
-    fn as_any_viewer_computes(&self, then: &[[f32; 6]], points: &[Point]) -> (Vec<Point>, f64) {
+    /// in 32-bit numbers may put each from there, each way ([`Rounding`]): of
+    /// [`VIEWER_ROUNDINGS`] roundings each at most the magnitudes the transforms
+    /// sum, or the page's, which its own transform to the device sums too, twice
+    /// (its translation, and the device's offset into it); those composing the
+    /// transforms written ([`Self::chain`]); and those of computing each point,
+    /// `local`, carried to the page.
+    fn as_any_viewer_computes(
+        &self,
+        then: &[[f32; 6]],
+        points: &[Point],
+        local: Rounding,
+    ) -> (Vec<Point>, Vec2) {
         let (mut ctm, mut abs) = (self.ctm, self.abs);
         for m in then {
             let m = m.map(f64::from);
@@ -195,12 +361,53 @@ impl Region {
             .unwrap_or_default()
             .iter()
             .fold(0.0_f64, |m, p| m.max(p.x.abs()).max(p.y.abs()));
-        let most = points.iter().fold(0.0_f64, |m, p| {
-            let s = abs * Point::new(p.x.abs(), p.y.abs());
-            m.max(s.x).max(s.y)
-        });
+        // Each coordinate on the page sums the magnitudes its row of the transforms
+        // takes: a coefficient of 0 is one as a viewer computes it too, so that a
+        // magnitude across moves no place up where no transform turns one into
+        // the other.
+        let (mut most, mut chained) = (Vec2::ZERO, Vec2::ZERO);
+        for p in points {
+            let p = Point::new(p.x.abs(), p.y.abs());
+            let (s, c) = (abs * p, self.chain * p);
+            most = Vec2::new(most.x.max(s.x), most.y.max(s.y));
+            chained = Vec2::new(chained.x.max(c.x), chained.y.max(c.y));
+        }
+        let [a, b, c, d, _, _] = abs.as_coeffs();
+        let l = local;
+        let row = |own: f64, kx: f64, ky: f64| {
+            let count = |k: f64, count: f64, summed: f64| {
+                if times(k, summed) > 0.0 { count } else { 0.0 }
+            };
+            Rounding {
+                count: Vec2::new(
+                    VIEWER_ROUNDINGS
+                        + self.chain_count
+                        + count(kx, l.count.x, l.summed.x).max(count(ky, l.count.y, l.summed.y)),
+                    0.0,
+                ),
+                summed: Vec2::new(own + times(kx, l.summed.x) + times(ky, l.summed.y), 0.0),
+            }
+        };
+        let own = Vec2::new(most.x + 2.0 * page, most.y + 2.0 * page) * VIEWER_ROUNDINGS + chained;
+        let r = Rounding::point(row(own.x, a, c), row(own.y, b, d)).bound();
+        let r = Vec2::new(
+            if r.x.is_nan() { f64::INFINITY } else { r.x },
+            if r.y.is_nan() { f64::INFINITY } else { r.y },
+        );
         let on_page = points.iter().map(|p| ctm * *p).collect();
-        (on_page, VIEWER_ROUNDING * (most + 2.0 * page))
+        (on_page, r)
+    }
+
+    /// Whether the convex hull of `page`, points on the page each within `r.x`
+    /// across and `r.y` up of where they lie and `reach` all round, meets what
+    /// shows grown, `shown`: no side of either parts them.
+    fn meets_on_page(&self, shown: &[Point], page: &[Point], reach: f64, r: Vec2) -> bool {
+        Self::axes(shown).chain(sides(page)).all(|n| {
+            let (g0, g1) = self.extent(shown, n);
+            let (p0, p1) = along(page.iter().copied(), n);
+            let r = reach * n.hypot() + times(n.x.abs(), r.x) + times(n.y.abs(), r.y);
+            p1 + r >= g0 && p0 - r <= g1
+        })
     }
 
     /// Whether what a form placed by `placement` paints (its box, clipped, after
@@ -217,49 +424,83 @@ impl Region {
         }
         let [x0, y0, x1, y1] = placement.bbox.map(f64::from);
         let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(|(x, y)| Point::new(x, y));
-        let (page, r) =
-            self.as_any_viewer_computes(&[placement.transform, placement.matrix], &corners);
-        if !(r.is_finite() && page.iter().all(|p| p.is_finite())) {
-            return true;
-        }
-        Self::axes(shown).chain(sides(&page)).all(|n| {
-            let (g0, g1) = self.extent(shown, n);
-            let (p0, p1) = along(page.iter().copied(), n);
-            let r = r * (n.x.abs() + n.y.abs());
-            p1 + r >= g0 && p0 - r <= g1
-        })
-    }
-
-    /// Transformed by `m`, which a `cm` writes.
-    fn transform(&mut self, m: Affine) {
-        self.ctm *= m;
-        self.abs *= Affine::new(m.as_coeffs().map(f64::abs));
-    }
-
-    /// Whether the convex hull of `points`, in the current space, may come within
-    /// `reach` of what shows grown, `reach` measured in the current space: true
-    /// when it does; it may be true when it does not (a bound for passing over
-    /// what cannot reach it). Exact for a `reach` of 0 ([`Self::meets`]).
-    pub(super) fn near(&self, points: &[Point], reach: f64) -> bool {
-        let Some(shown) = &self.shown else {
-            return true;
-        };
-        if shown.is_empty() || points.is_empty() {
-            return false;
-        }
-        let page = self.on_page(points);
+        let (page, r) = self.as_any_viewer_computes(
+            &[placement.transform, placement.matrix],
+            &corners,
+            Rounding::NONE,
+        );
         if !page.iter().all(|p| p.is_finite()) {
             return true;
+        }
+        self.meets_on_page(shown, &page, 0.0, r)
+    }
+
+    /// Transformed by `m`, which a `cm` writes: a viewer composes it with the
+    /// transform before, rounding each coefficient as [`composed_roundings`]
+    /// counts, each rounding at most the magnitudes that coefficient sums.
+    fn transform(&mut self, m: Affine) {
+        let abs_m = Affine::new(m.as_coeffs().map(f64::abs));
+        let k = composed_roundings(m.as_coeffs());
+        let rounded = (self.abs * abs_m).as_coeffs();
+        let mut new = [0.0; 6];
+        for i in 0..6 {
+            new[i] = k[i] * rounded[i];
+        }
+        let carried = (self.chain * abs_m).as_coeffs();
+        for i in 0..6 {
+            new[i] += carried[i];
+        }
+        self.chain = Affine::new(new);
+        self.chain_count += k.iter().fold(0.0_f64, |m, v| m.max(*v));
+        self.ctm *= m;
+        self.abs *= abs_m;
+    }
+
+    /// Whether a piece whose outline lies within `reach` (in the current space) of
+    /// the convex hull of `points`, each computed as `local` says, may paint in
+    /// what shows grown, wherever a viewer computing in 32-bit numbers puts it
+    /// ([`Self::as_any_viewer_computes`]): `None` where no viewer can; else how far
+    /// on the page, across or up, a viewer may put it from where it lies
+    /// (infinite where a point is no finite number, whose place cannot be told).
+    pub(super) fn may_show(&self, points: &[Point], reach: f64, local: Rounding) -> Option<f64> {
+        let (page, r) = self.as_any_viewer_computes(&[], points, local);
+        let Some(shown) = &self.shown else {
+            return Some(r.x.max(r.y));
+        };
+        if shown.is_empty() || points.is_empty() {
+            return None;
+        }
+        if !page.iter().all(|p| p.is_finite()) {
+            return Some(f64::INFINITY);
         }
         let [a, b, c, d, _, _] = self.ctm.as_coeffs();
         // The most the transform stretches a length: no more than this.
         let reach = reach * (a * a + b * b + c * c + d * d).sqrt();
-        Self::axes(shown).chain(sides(&page)).all(|n| {
-            let (g0, g1) = self.extent(shown, n);
-            let (p0, p1) = along(page.iter().copied(), n);
-            let r = reach * n.hypot();
-            p1 + r >= g0 && p0 - r <= g1
-        })
+        self.meets_on_page(shown, &page, reach, r)
+            .then_some(r.x.max(r.y))
+    }
+
+    /// How far, in the current space, a viewer computing in 32-bit numbers may put
+    /// a point of magnitude at most `most` across and up, computed as `local` says,
+    /// from where it lies: its distance on the page ([`Self::as_any_viewer_computes`])
+    /// over the least the transform stretches a length. For a search to widen what
+    /// it looks for by, so that it passes over no piece [`Self::may_show`] keeps.
+    pub(super) fn slack(&self, most: f64, local: Rounding) -> f64 {
+        let (_, r) = self.as_any_viewer_computes(&[], &[Point::new(most, most)], local);
+        let r = r.x.max(r.y);
+        let [a, b, c, d, _, _] = self.ctm.as_coeffs();
+        // The least stretch: |det| over the most, which is at most the norm below.
+        let least = (a * d - b * c).abs() / (a * a + b * b + c * c + d * d).sqrt();
+        let s = r * std::f64::consts::SQRT_2 / least;
+        if s.is_nan() { f64::INFINITY } else { s }
+    }
+
+    /// Whether the convex hull of `points`, in the current space, may come within
+    /// `reach` of what shows grown, `reach` measured in the current space, wherever
+    /// a viewer puts it ([`Self::may_show`]): true when it does; it may be true
+    /// when it does not (a bound for passing over what cannot reach it).
+    pub(super) fn near(&self, points: &[Point], reach: f64) -> bool {
+        self.may_show(points, reach, Rounding::NONE).is_some()
     }
 
     /// Whether every point of the current space within `margin` of one of
@@ -287,10 +528,11 @@ impl Region {
     }
 
     /// The `u` for which the convex hull of `base` moved by `u dir`, in the current
-    /// space, meets what shows grown: a span, as both are convex; `None` for none.
-    /// Along each side's normal the hull's extent moves with `u` and must meet
-    /// that of what shows.
-    pub(super) fn span(&self, base: &[Point], dir: Vec2) -> Option<(f64, f64)> {
+    /// space, may meet what shows grown wherever a viewer puts it, `u` at most
+    /// `far` either way ([`Self::may_show`]): a span, as both are convex; `None`
+    /// for none. Along each side's normal the hull's extent moves with `u` and must
+    /// meet that of what shows.
+    pub(super) fn span(&self, base: &[Point], dir: Vec2, far: f64) -> Option<(f64, f64)> {
         let Some(shown) = &self.shown else {
             return Some((f64::NEG_INFINITY, f64::INFINITY));
         };
@@ -298,10 +540,17 @@ impl Region {
             return None;
         }
         let page = self.on_page(base);
+        let reach: Vec<Point> = base
+            .iter()
+            .flat_map(|p| [*p + dir * far, *p - dir * far])
+            .collect();
+        let (_, r) = self.as_any_viewer_computes(&[], &reach, Rounding::NONE);
         let dir = self.ctm * Point::new(dir.x, dir.y) - self.ctm * Point::ZERO;
         let (mut lo, mut hi) = (f64::NEG_INFINITY, f64::INFINITY);
         for n in Self::axes(shown).chain(sides(&page)) {
             let (g0, g1) = self.extent(shown, n);
+            let r = times(n.x.abs(), r.x) + times(n.y.abs(), r.y);
+            let (g0, g1) = (g0 - r, g1 + r);
             let (p0, p1) = along(page.iter().copied(), n);
             let k = n.dot(dir);
             // They meet along `n` where `p1 + u k >= g0` and `p0 + u k <= g1`.
@@ -467,6 +716,8 @@ struct Subpath {
     /// Whether a point of it is no finite number, whose place cannot be told.
     lost: bool,
     failed: bool,
+    /// How its points were computed.
+    rounding: Rounding,
 }
 
 impl Subpath {
@@ -477,6 +728,7 @@ impl Subpath {
             hi: Point::new(f64::NEG_INFINITY, f64::NEG_INFINITY),
             lost: false,
             failed: false,
+            rounding: Rounding::NONE,
         }
     }
 
@@ -604,14 +856,16 @@ pub(super) struct Out {
 impl Default for Out {
     /// Content no page bounds: everything it paints is written.
     fn default() -> Self {
-        Self::with(None, 0.0)
+        Self::with(None, 0.0, f64::INFINITY)
     }
 }
 
 impl Out {
-    /// Content for a page that shows `visible`, where a piece paints `beyond` its
-    /// outline, in its units.
-    pub(super) fn new(visible: kurbo::Rect, beyond: f64) -> Self {
+    /// Content for a page that shows `visible`, in units of `unit` points: a piece
+    /// paints [`super::PAINTS_BEYOND`] points beyond its outline there, and may be
+    /// drawn [`TOLERANCE`] points from where a viewer draws it. A page of no unit,
+    /// or of none that is a number, shows no piece more than what lies in it.
+    pub(super) fn new(visible: kurbo::Rect, unit: f64) -> Self {
         let v = visible.abs();
         // An area of no size or of none that is a number shows nothing; one of
         // endless size is bounded far beyond any writable number.
@@ -629,15 +883,16 @@ impl Out {
             ];
             if area(&p) > 0.0 { p } else { vec![] }
         };
-        let beyond = if beyond.is_finite() {
-            beyond.max(0.0)
+        let unit = unit.abs();
+        let (beyond, tolerance) = if unit > 0.0 && unit.is_finite() {
+            (super::PAINTS_BEYOND / unit, TOLERANCE / unit)
         } else {
-            0.0
+            (0.0, TOLERANCE)
         };
-        Self::with(Some(shown), beyond)
+        Self::with(Some(shown), beyond, tolerance)
     }
 
-    fn with(shown: Option<Vec<Point>>, grow: f64) -> Self {
+    fn with(shown: Option<Vec<Point>>, grow: f64, tolerance: f64) -> Self {
         Self {
             content: String::new(),
             failed: false,
@@ -647,8 +902,11 @@ impl Out {
                 region: Region {
                     shown,
                     grow,
+                    tolerance,
                     ctm: Affine::IDENTITY,
                     abs: Affine::IDENTITY,
+                    chain: Affine::new([0.0; 6]),
+                    chain_count: 0.0,
                 },
                 width: 1.0,
             },
@@ -668,6 +926,12 @@ impl Out {
     /// the page shows it ([`Region::meets`]).
     pub(super) fn meets(&self, points: &[Point]) -> bool {
         self.state.region.meets(points)
+    }
+
+    /// How far, in the current space, a viewer may put a point of magnitude at
+    /// most `most`, computed as `local` says, from where it lies ([`Region::slack`]).
+    pub(super) fn slack(&self, most: f64, local: Rounding) -> f64 {
+        self.state.region.slack(most, local)
     }
 
     /// The content written and the glyphs it draws; [`Unsupported::Coordinates`]
@@ -692,12 +956,20 @@ impl Out {
     }
 
     /// Draws the form of `glyph` where the current transform puts it ([`super::text::Pen`]),
-    /// where its box can paint on the page.
-    pub(super) fn form(&mut self, glyph: &Rc<Glyph>) {
+    /// its place computed as `local` says in the current space, where its box may
+    /// paint on the page ([`Region::may_show`]): `Some(true)` when it is drawn,
+    /// `Some(false)` when no viewer puts it where the page shows it, `None`, failing
+    /// the content, when one may and may put it farther from where it lies than
+    /// [`TOLERANCE`].
+    pub(super) fn form(&mut self, glyph: &Rc<Glyph>, local: Rounding) -> Option<bool> {
         let [x0, y0, x1, y1] = glyph.bbox.map(f64::from);
         let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(|(x, y)| Point::new(x, y));
-        if !self.meets(&corners) {
-            return;
+        let Some(r) = self.state.region.may_show(&corners, 0.0, local) else {
+            return Some(false);
+        };
+        if r.is_nan() || r > self.state.region.tolerance {
+            self.failed = true;
+            return None;
         }
         self.release();
         self.content.push('/');
@@ -706,6 +978,7 @@ impl Out {
         if self.named.insert(glyph.name.clone()) {
             self.glyphs.push(glyph.clone());
         }
+        Some(true)
     }
 
     /// `nums`, then operator `op`.
@@ -722,6 +995,21 @@ impl Out {
         text.push_str(op);
         text.push('\n');
         self.act(op, &text, &values, ok);
+        Some(())
+    }
+
+    /// `nums`, path construction operator `op`, its points computed as `local`
+    /// says ([`Rounding`]): the subpath is tested wherever a viewer may put them.
+    pub(super) fn computed(
+        &mut self,
+        nums: &[f64],
+        op: &'static str,
+        local: Rounding,
+    ) -> Option<()> {
+        self.nums(nums, op)?;
+        if let Some(sub) = self.path.last_mut() {
+            sub.rounding = sub.rounding.either(local);
+        }
         Some(())
     }
 
@@ -775,11 +1063,24 @@ impl Out {
                 };
                 let path = std::mem::take(&mut self.path);
                 let n = path.len();
+                let region = &self.state.region;
+                let mut refused = false;
                 let kept: Vec<(usize, Subpath)> = path
                     .into_iter()
                     .enumerate()
-                    .filter(|(_, p)| self.state.region.meets(&p.corners(reach)))
+                    .filter(|(_, p)| {
+                        match region.may_show(&p.corners(reach), 0.0, p.rounding) {
+                            None => false,
+                            Some(r) => {
+                                // Drawn where it lies, it may be too far from where a
+                                // viewer draws it: refused.
+                                refused |= r.is_nan() || r > region.tolerance;
+                                true
+                            }
+                        }
+                    })
                     .collect();
+                self.failed |= refused;
                 if kept.is_empty() {
                     return;
                 }
@@ -1010,7 +1311,7 @@ mod tests {
     #[test]
     fn what_cannot_paint_is_left_out() {
         // A square far off the page, its numbers past what can be written.
-        let mut out = Out::new(PAGE, 0.25);
+        let mut out = Out::new(PAGE, 1.0);
         out.op("q");
         out.nums(&[1.0, 0.0, 0.0, 1.0, 1e7, 1e7], "cm");
         out.clip(Rect::new(0.0, 0.0, 100.0, 100.0));
@@ -1021,7 +1322,7 @@ mod tests {
         // A stroke 1 wide 3 below the page reaches 5 from its line: it paints
         // within a quarter of a point of the page; at 4.5 below, it does not.
         for (y, drawn) in [(-3.0, true), (-5.3, false)] {
-            let mut out = Out::new(PAGE, 0.25);
+            let mut out = Out::new(PAGE, 1.0);
             out.stroke_state(1.0, &[]);
             out.nums(&[10.0, y], "m");
             out.nums(&[100.0, y], "l");
@@ -1031,7 +1332,7 @@ mod tests {
         }
         // Of a path, the subpath off the page is left out; the one closed by `s`
         // being left out, the stroke closes none.
-        let mut out = Out::new(PAGE, 0.25);
+        let mut out = Out::new(PAGE, 1.0);
         out.nums(&[10.0, 10.0], "m");
         out.nums(&[20.0, 10.0], "l");
         out.nums(&[1e7, 10.0], "m");
@@ -1039,7 +1340,7 @@ mod tests {
         out.op("s");
         assert_eq!(out.finish().unwrap().0, "10 10 m\n20 10 l\nS\n");
         // Partly on the page, a number that cannot be written fails it.
-        let mut out = Out::new(PAGE, 0.25);
+        let mut out = Out::new(PAGE, 1.0);
         out.nums(&[-1e7, 10.0], "m");
         out.nums(&[20.0, 10.0], "l");
         out.op("S");
@@ -1050,7 +1351,7 @@ mod tests {
     /// shows; one of no area leaves nothing to paint.
     #[test]
     fn clips_are_cut_to_the_page_and_of_no_area_show_nothing() {
-        let mut out = Out::new(PAGE, 0.25);
+        let mut out = Out::new(PAGE, 1.0);
         out.clip(Rect::new(-1e7, 10.0, 100.0, 20.0));
         out.nums(&[0.0, 10.0, 10.0, 10.0], "re");
         out.op("f");
@@ -1059,7 +1360,7 @@ mod tests {
             content.starts_with("-1.45025 10 101.45025 10 re\nW n\n"),
             "{content}"
         );
-        let mut out = Out::new(PAGE, 0.25);
+        let mut out = Out::new(PAGE, 1.0);
         out.clip(Rect::new(1.0, 1.0, 1.0, 39.0));
         assert!(out.region().is_empty());
         out.nums(&[0.0, 0.0, 10.0, 10.0], "re");
