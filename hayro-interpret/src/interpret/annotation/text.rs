@@ -149,7 +149,14 @@ impl Fonts {
             .get_or_init(|| {
                 let query = typeface.query();
                 let (data, index) = (self.resolver)(&query)?;
-                Face::new(data, index, query.standard_substitute(), typeface.index())
+                let stands_in = matches!(query, FontQuery::Standard(_));
+                Face::new(
+                    data,
+                    index,
+                    query.standard_substitute(),
+                    stands_in,
+                    typeface.index(),
+                )
             })
             .as_ref()
     }
@@ -2155,7 +2162,12 @@ enum Font {
         standard: StandardFont,
         glyphs: hash::Map<char, (GlyphId, f32)>,
     },
-    OpenType(OpenTypeFontBlob),
+    OpenType {
+        blob: OpenTypeFontBlob,
+        /// For a font standing in for a standard font, the standard font's widths
+        /// of the glyphs it names, in em.
+        standard: Option<hash::Map<GlyphId, f32>>,
+    },
 }
 
 impl Face {
@@ -2163,10 +2175,11 @@ impl Face {
         data: crate::font::FontData,
         index: u32,
         standard: StandardFont,
+        stands_in: bool,
         typeface: usize,
     ) -> Option<Self> {
         Some(Self {
-            font: Font::new(data, index, standard)?,
+            font: Font::new(data, index, standard, stands_in)?,
             index: typeface,
             outlines: RefCell::default(),
             bound: OnceCell::new(),
@@ -2179,7 +2192,7 @@ impl Face {
         *self.bound.get_or_init(|| {
             let count = match &self.font {
                 Font::Cff { blob, .. } => blob.num_glyphs(),
-                Font::OpenType(blob) => {
+                Font::OpenType { blob, .. } => {
                     use skrifa::raw::TableProvider;
                     blob.font_ref()
                         .maxp()
@@ -2226,7 +2239,14 @@ impl Face {
 }
 
 impl Font {
-    fn new(data: crate::font::FontData, index: u32, standard: StandardFont) -> Option<Self> {
+    /// The font in `data`; `stands_in` when it stands in for `standard`, whose
+    /// widths viewers measure text by.
+    fn new(
+        data: crate::font::FontData,
+        index: u32,
+        standard: StandardFont,
+        stands_in: bool,
+    ) -> Option<Self> {
         if let Some(blob) = CffFontBlob::new(data.clone()) {
             let mut glyphs = hash::Map::default();
             for (id, name) in blob.glyph_names() {
@@ -2243,21 +2263,40 @@ impl Font {
                 glyphs,
             });
         }
-        OpenTypeFontBlob::new(data, index).map(Self::OpenType)
+        let blob = OpenTypeFontBlob::new(data, index)?;
+        let standard = stands_in.then(|| {
+            blob.glyph_names()
+                .into_iter()
+                .filter_map(|(name, id)| Some((id, standard.get_width(&name)? / 1000.0)))
+                .collect()
+        });
+        Some(Self::OpenType { blob, standard })
     }
 
     /// The glyph of `c` and its advance in em.
     fn glyph(&self, c: char) -> Option<(GlyphId, f32)> {
         match self {
             Self::Cff { glyphs, .. } => glyphs.get(&c).copied(),
-            Self::OpenType(blob) => {
+            Self::OpenType { blob, standard } => {
                 use skrifa::raw::TableProvider;
                 let id = blob.font_ref().cmap().ok()?.map_codepoint(c)?;
                 if id == GlyphId::NOTDEF {
                     return None;
                 }
                 let advance = blob.glyph_metrics().advance_width(id)?;
-                Some((id, advance / 1000.0))
+                Some((
+                    id,
+                    match standard {
+                        // Viewers' standard fonts have the standard widths, and
+                        // whole thousandths of an em for the glyphs those lack
+                        // (`a_standard_font_stand_in_measures_as_viewers_do`).
+                        Some(widths) => widths
+                            .get(&id)
+                            .copied()
+                            .unwrap_or_else(|| advance.round() / 1000.0),
+                        None => advance / 1000.0,
+                    },
+                ))
             }
         }
     }
@@ -2266,7 +2305,7 @@ impl Font {
     fn outline(&self, id: GlyphId) -> BezPath {
         match self {
             Self::Cff { blob, .. } => blob.outline_glyph(id),
-            Self::OpenType(blob) => blob.outline_glyph(id),
+            Self::OpenType { blob, .. } => blob.outline_glyph(id),
         }
     }
 }
@@ -3220,5 +3259,30 @@ mod tests {
             }
         }
         assert!(drew > 10, "{drew}");
+    }
+
+    /// A font standing in for Helvetica (Liberation Sans here, whose advances are
+    /// 2048ths of an em) measures text as `PyMuPDF` 1.28.2's Helvetica does
+    /// (`Font("helv").glyph_advance`): the AFM width of each glyph the AFM lists
+    /// (Liberation's ±, ď and ľ are 549, 615 and 292), and whole thousandths of
+    /// its own advance for the others (Ж 923.34, њ 812.5).
+    #[test]
+    fn a_standard_font_stand_in_measures_as_viewers_do() {
+        use crate::font::{FontQuery, StandardFont};
+        let liberation: &'static [u8] =
+            include_bytes!("../../../../hayro-tests/assets/LiberationSans-Regular.ttf");
+        let fonts = Fonts::new(std::sync::Arc::new(move |query: &FontQuery| match query {
+            FontQuery::Standard(StandardFont::Helvetica) => {
+                Some((std::sync::Arc::new(liberation), 0))
+            }
+            _ => None,
+        }));
+        let glyphs = fonts.shape(Family::Sans, "AbcW ±ďľЖжњЁ").expect("drawable");
+        let advances: Vec<f32> = glyphs.iter().map(|g| g.advance).collect();
+        let viewers = [
+            667.0, 556.0, 500.0, 944.0, 278.0, 584.0, 643.0, 299.0, 923.0, 669.0, 813.0, 667.0,
+        ]
+        .map(|w: f32| w / 1000.0);
+        assert_eq!(advances, viewers);
     }
 }
