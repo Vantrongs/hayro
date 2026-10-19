@@ -28,7 +28,7 @@ use hayro_interpret::hayro_syntax::page::Page;
 use hayro_interpret::util::{Float32Ext, TransformExt};
 use hayro_interpret::{
     BlendMode, CacheKey, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps,
-    InterpreterCache, InterpreterSettings, SoftMask, StrokeProps, interpret_page,
+    InterpreterCache, InterpreterSettings, SoftMask, SoftMasks, StrokeProps, interpret_page,
 };
 use kurbo::{Affine, BezPath, Cap, Join, Rect};
 use siphasher::sip128::{Hasher128, SipHasher13};
@@ -121,6 +121,8 @@ pub(crate) struct SvgRenderer<'a> {
     pub(crate) type3_glyphs: Deduplicator<CachedType3Glyph<'a>>,
     pub(crate) clip_paths: Deduplicator<CachedClipPath>,
     pub(crate) masks: Deduplicator<MaskKind<'a>>,
+    /// The ids of the soft masks in `masks`, each for the uses it serves.
+    pub(crate) soft_masks: SoftMasks<Id>,
     pub(crate) shadings: Deduplicator<CachedShading>,
     pub(crate) gradients: Deduplicator<CachedNativeGradient>,
     pub(crate) shading_patterns: Deduplicator<CachedShadingPattern>,
@@ -380,6 +382,7 @@ impl<'a> SvgRenderer<'a> {
             type3_glyphs: Deduplicator::new('e'),
             clip_paths: Deduplicator::new('c'),
             masks: Deduplicator::new('m'),
+            soft_masks: SoftMasks::default(),
             shadings: Deduplicator::new('s'),
             gradients: Deduplicator::new('n'),
             shading_patterns: Deduplicator::new('v'),

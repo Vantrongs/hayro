@@ -44,7 +44,9 @@ use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::hayro_syntax::hash;
 use hayro_interpret::hayro_syntax::page::Page;
 use hayro_interpret::util::TransformExt;
-use hayro_interpret::{BlendMode, Context, DrawMode, DrawProps, ImageDrawProps, SoftMask};
+use hayro_interpret::{
+    BlendMode, Context, DrawMode, DrawProps, ImageDrawProps, SoftMask, SoftMasks,
+};
 use hayro_interpret::{ClipPath, interpret_page};
 use kurbo::{Affine, BezPath, Rect, Shape};
 use pic_scale::Scaler;
@@ -91,7 +93,7 @@ pub(crate) struct Renderer<'a> {
     global: &'a GlobalState,
     pub(crate) ctx: &'a mut RenderContext,
     pub(crate) inside_pattern: bool,
-    pub(crate) soft_mask_cache: hash::Map<u128, Mask>,
+    pub(crate) soft_masks: SoftMasks<Mask>,
     pub(crate) in_type3_glyph: bool,
     /// The clips pushed on the device, each with those outside it, the innermost last.
     pub(crate) clips: Vec<clip::ClipBounds>,
@@ -103,7 +105,7 @@ impl<'r> Renderer<'r> {
             global,
             ctx,
             inside_pattern: false,
-            soft_mask_cache: hash::Map::default(),
+            soft_masks: SoftMasks::default(),
             in_type3_glyph: false,
             clips: Vec::new(),
         }

@@ -1,5 +1,5 @@
 use crate::{GlobalState, Renderer, convert_blend_mode, derive_settings};
-use hayro_interpret::{BlendMode, CacheKey, MaskType, SoftMask};
+use hayro_interpret::{BlendMode, Interpreted, MaskType, SoftMask};
 use kurbo::{Affine, Rect};
 use vello_cpu::color::palette::css::BLACK;
 use vello_cpu::color::{AlphaColor, Srgb};
@@ -7,17 +7,7 @@ use vello_cpu::{Mask, Pixmap, RenderSettings};
 
 impl Renderer<'_> {
     pub(super) fn apply_soft_mask(&mut self, mask: Option<&SoftMask<'_>>) {
-        let settings = *self.ctx.render_settings();
-        let global = self.global;
-        let mask = mask.map(|m| {
-            let width = self.ctx.width();
-            let height = self.ctx.height();
-
-            self.soft_mask_cache
-                .entry(m.cache_key())
-                .or_insert_with(|| draw_soft_mask(m, settings, width, height, global))
-                .clone()
-        });
+        let mask = mask.map(|m| self.soft_mask(m));
 
         if let Some(mask) = mask {
             self.ctx.set_mask(mask);
@@ -33,8 +23,7 @@ impl Renderer<'_> {
         blend_mode: BlendMode,
         bounds: Option<Rect>,
     ) {
-        let settings = *self.ctx.render_settings();
-        let global = self.global;
+        let mask = mask.map(|m| self.soft_mask(&m));
         let clip = bounds.and_then(|bounds| self.layer_clip(bounds));
         let (transform, fill_rule) = (*self.ctx.transform(), *self.ctx.fill_rule());
         self.ctx.set_transform(Affine::IDENTITY);
@@ -43,20 +32,24 @@ impl Renderer<'_> {
             clip.as_ref(),
             Some(convert_blend_mode(blend_mode)),
             Some(opacity),
-            // TODO: Deduplicate
-            mask.map(|m| {
-                let width = self.ctx.width();
-                let height = self.ctx.height();
-
-                self.soft_mask_cache
-                    .entry(m.cache_key())
-                    .or_insert_with(|| draw_soft_mask(&m, settings, width, height, global))
-                    .clone()
-            }),
+            mask,
             None,
         );
         self.ctx.set_transform(transform);
         self.ctx.set_fill_rule(fill_rule);
+    }
+
+    /// The mask `mask` draws on this device's pixels, drawn once for the uses it
+    /// serves.
+    fn soft_mask(&mut self, mask: &SoftMask<'_>) -> Mask {
+        if let Some(drawn) = self.soft_masks.get(mask) {
+            return drawn.clone();
+        }
+        let settings = *self.ctx.render_settings();
+        let (width, height) = (self.ctx.width(), self.ctx.height());
+        let (drawn, interpreted) = draw_soft_mask(mask, settings, width, height, self.global);
+        self.soft_masks.insert(interpreted, drawn.clone());
+        drawn
     }
 
     pub(super) fn pop_transparency_group(&mut self) {
@@ -70,7 +63,7 @@ fn draw_soft_mask(
     width: u16,
     height: u16,
     global: &GlobalState,
-) -> Mask {
+) -> (Mask, Interpreted) {
     let mut ctx = vello_cpu::RenderContext::new_with(width, height, derive_settings(&settings));
     let mut renderer = Renderer::new(&mut ctx, global);
 
@@ -87,7 +80,7 @@ fn draw_soft_mask(
         renderer.ctx.push_layer(None, None, None, None, None);
     }
 
-    mask.interpret(&mut renderer);
+    let interpreted = mask.interpret(&mut renderer);
 
     if apply_bg {
         renderer.ctx.pop_layer();
@@ -119,5 +112,5 @@ fn draw_soft_mask(
         rendered_mask = Mask::from_parts(map, rendered_mask.width(), rendered_mask.height());
     }
 
-    rendered_mask
+    (rendered_mask, interpreted)
 }

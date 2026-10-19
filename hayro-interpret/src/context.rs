@@ -15,7 +15,7 @@ use hayro_syntax::page::Resources;
 use hayro_syntax::xref::XRef;
 use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape};
 use smallvec::smallvec;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 /// Maximum nesting depth for interpreting `XObject`'s/patterns/streams.
@@ -59,6 +59,9 @@ pub struct Context<'a> {
     clip: Option<FillRule>,
     root_transforms: Vec<Affine>,
     bbox: Vec<Rect>,
+    /// Whether anything drawn read `bbox`, the box the context was made with as the
+    /// clips leave it: what is drawn from it then depends on that box.
+    bbox_read: Cell<bool>,
     pub(crate) settings: InterpreterSettings,
     pub(crate) interpreter_cache: InterpreterCache<'a>,
     pub(crate) xref: &'a XRef,
@@ -109,6 +112,7 @@ impl<'a> Context<'a> {
             sub_path_start: Point::default(),
             clip: None,
             bbox: vec![bbox],
+            bbox_read: Cell::new(false),
             path: BezPath::new(),
             interpreter_cache: cache.clone(),
             ocg_state,
@@ -127,7 +131,19 @@ impl<'a> Context<'a> {
         self.states.push(cur);
     }
 
+    /// The box the context was made with, as the clips in effect leave it. What reads
+    /// it depends on the box: [`Context::bbox_read`].
     pub(crate) fn bbox(&self) -> Rect {
+        self.bbox_read.set(true);
+        self.current_bbox()
+    }
+
+    /// Whether anything drawn in the context read [`Context::bbox`].
+    pub(crate) fn bbox_read(&self) -> bool {
+        self.bbox_read.get()
+    }
+
+    fn current_bbox(&self) -> Rect {
         self.bbox.last().copied().unwrap_or_else(|| {
             warn!("failed to get a bbox");
 
@@ -135,8 +151,9 @@ impl<'a> Context<'a> {
         })
     }
 
+    /// Narrows the box by a clip's; only what reads the box narrowed reads it.
     fn push_bbox(&mut self, bbox: Rect) {
-        let new = self.bbox().intersect(bbox);
+        let new = self.current_bbox().intersect(bbox);
         self.bbox.push(new);
     }
 
