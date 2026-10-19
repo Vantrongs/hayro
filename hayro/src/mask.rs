@@ -1,6 +1,6 @@
 use crate::{GlobalState, Renderer, convert_blend_mode, derive_settings};
 use hayro_interpret::{BlendMode, CacheKey, MaskType, SoftMask};
-use kurbo::Rect;
+use kurbo::{Affine, Rect};
 use vello_cpu::color::palette::css::BLACK;
 use vello_cpu::color::{AlphaColor, Srgb};
 use vello_cpu::{Mask, Pixmap, RenderSettings};
@@ -31,11 +31,16 @@ impl Renderer<'_> {
         opacity: f32,
         mask: Option<SoftMask<'_>>,
         blend_mode: BlendMode,
+        bounds: Option<Rect>,
     ) {
         let settings = *self.ctx.render_settings();
         let global = self.global;
+        let clip = bounds.and_then(|bounds| self.layer_clip(bounds));
+        let (transform, fill_rule) = (*self.ctx.transform(), *self.ctx.fill_rule());
+        self.ctx.set_transform(Affine::IDENTITY);
+        self.ctx.set_fill_rule(vello_cpu::peniko::Fill::NonZero);
         self.ctx.push_layer(
-            None,
+            clip.as_ref(),
             Some(convert_blend_mode(blend_mode)),
             Some(opacity),
             // TODO: Deduplicate
@@ -50,6 +55,8 @@ impl Renderer<'_> {
             }),
             None,
         );
+        self.ctx.set_transform(transform);
+        self.ctx.set_fill_rule(fill_rule);
     }
 
     pub(super) fn pop_transparency_group(&mut self) {

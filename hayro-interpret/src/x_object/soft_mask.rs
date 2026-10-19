@@ -12,7 +12,7 @@ use hayro_syntax::object::dict::keys::*;
 use hayro_syntax::object::{Dict, Object};
 use hayro_syntax::page::Resources;
 use hayro_syntax::xref::XRef;
-use kurbo::Affine;
+use kurbo::{Affine, Rect, Shape};
 use smallvec::smallvec;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
@@ -35,7 +35,7 @@ struct Repr<'a> {
     mask_type: MaskType,
     parent_resources: Resources<'a>,
     root_transform: Affine,
-    bbox: kurbo::Rect,
+    bbox: Rect,
     interpreter_cache: InterpreterCache<'a>,
     transfer_function: Option<TransferFunction>,
     settings: InterpreterSettings,
@@ -81,14 +81,24 @@ impl<'a> SoftMask<'a> {
         context: &Context<'a>,
         parent_resources: Resources<'a>,
     ) -> Option<Self> {
+        let group_stream = dict.get::<Stream<'_>>(G)?;
+        let group = FormXObject::new(&group_stream)?;
         // The mask is drawn from all of these: its dictionary (`/S`, `/G`, `/BC`,
-        // `/TR`), the transform and box it is drawn in, and the resources its group
-        // falls back to; each dictionary named by where it is read from, as the
-        // document holds it while it is loaded.
-        let key = hash128(&(
-            dict.content_key(),
-            context.get().ctm.cache_key(),
-            context.bbox().cache_key(),
+        // `/TR`), the transform it is drawn in, the part of its group's box the clips
+        // it is set under leave, and, where its group has no resources of its own,
+        // the resources it falls back to; each dictionary named by where it is read
+        // from, as the document holds it while it is loaded. Outside its group's box
+        // the mask is its backdrop, so clips that leave the same part of the box draw
+        // it alike, but for the phase of a shading sampled from the box's corner and
+        // the antialiasing of the box's edges, and one serves them all, where drawing
+        // it again for each would cost a page each time. It is drawn in the clips'
+        // box of the first.
+        let bbox = context.bbox();
+        let [x0, y0, x1, y1] = group.bbox.map(f64::from);
+        let group_box = context.get().ctm * group.matrix * Rect::new(x0, y0, x1, y1).to_path(0.1);
+        let group_box = group_box.bounding_box();
+        let drawn = bbox.intersect(group_box);
+        let fallback = (!group.has_resources()).then(|| {
             [
                 &parent_resources.ext_g_states,
                 &parent_resources.fonts,
@@ -98,10 +108,14 @@ impl<'a> SoftMask<'a> {
                 &parent_resources.patterns,
                 &parent_resources.shadings,
             ]
-            .map(Dict::content_key),
+            .map(Dict::content_key)
+        });
+        let key = hash128(&(
+            dict.content_key(),
+            context.get().ctm.cache_key(),
+            drawn.cache_key(),
+            fallback,
         ));
-        let group_stream = dict.get::<Stream<'_>>(G)?;
-        let group = FormXObject::new(&group_stream)?;
         let transfer_function = dict
             .get::<Object<'_>>(TR)
             .and_then(|o| Function::new(&o))
@@ -134,7 +148,7 @@ impl<'a> SoftMask<'a> {
             mask_type,
             root_transform: context.get().ctm,
             transfer_function,
-            bbox: context.bbox(),
+            bbox,
             interpreter_cache: context.interpreter_cache.clone(),
             settings: context.settings.clone(),
             xref: context.xref,

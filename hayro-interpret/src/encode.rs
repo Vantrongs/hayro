@@ -6,8 +6,9 @@ use crate::pattern::ShadingPattern;
 use crate::shading::{ShadingFunction, ShadingType, Triangle};
 use crate::util::x_y_advances;
 use hayro_syntax::hash;
-use kurbo::{Affine, Point, Rect};
+use kurbo::{Affine, Point, Rect, Shape};
 use smallvec::{ToSmallVec, smallvec};
+use std::ops::Range;
 use std::sync::Arc;
 
 /// A shading pattern that was encoded so it can be sampled.
@@ -55,8 +56,45 @@ pub struct EncodedRadialAxialShading {
 /// Encoded sampled mesh shading.
 #[derive(Clone, Debug)]
 pub struct EncodedSampledShading {
-    pub(crate) samples: Arc<hash::Map<(u16, u16), ColorComponents>>,
+    pub(crate) samples: Arc<Samples>,
     pub(crate) function: Option<ShadingFunction>,
+}
+
+/// The colors of a mesh shading at the device pixels its triangles cover, a later
+/// triangle's where two cover one.
+#[derive(Debug)]
+pub(crate) enum Samples {
+    /// Every pixel of the box from `x0`, `y0` that holds the covered ones, `width` to
+    /// a row: looked up without hashing, in the order it is drawn in.
+    Grid {
+        x0: u16,
+        y0: u16,
+        width: usize,
+        cells: Vec<Option<ColorComponents>>,
+    },
+    /// The covered pixels, where the box that holds them is much larger than the
+    /// triangles' own boxes, which sampling them reads anyway.
+    Map(hash::Map<(u16, u16), ColorComponents>),
+}
+
+impl Samples {
+    fn get(&self, (x, y): (u16, u16)) -> Option<&ColorComponents> {
+        match self {
+            Self::Grid {
+                x0,
+                y0,
+                width,
+                cells,
+            } => {
+                let (x, y) = (x.checked_sub(*x0)?, y.checked_sub(*y0)?);
+                if usize::from(x) >= *width {
+                    return None;
+                }
+                cells.get(usize::from(y) * width + usize::from(x))?.as_ref()
+            }
+            Self::Map(map) => map.get(&(x, y)),
+        }
+    }
 }
 
 /// Encoded dummy shading.
@@ -329,41 +367,105 @@ fn encode_axial_shading(
     )
 }
 
-fn sample_triangles(
+fn sample_triangles(triangles: &[Triangle], transform: Affine) -> Samples {
+    // The pixels sampling reads, and the box that holds them: a grid of the box
+    // takes no more cells than sampling reads pixels, as where the triangles tile it.
+    let boxes: Vec<_> = triangles.iter().map(|t| pixels(t, transform)).collect();
+    let mut read = 0;
+    let mut bounds: Option<(u16, u16, u16, u16)> = None;
+    for (xs, ys) in boxes.iter().flatten() {
+        read += xs.len() * ys.len();
+        let (x0, x1, y0, y1) = bounds.unwrap_or((xs.start, xs.end, ys.start, ys.end));
+        bounds = Some((
+            x0.min(xs.start),
+            x1.max(xs.end),
+            y0.min(ys.start),
+            y1.max(ys.end),
+        ));
+    }
+    let grid =
+        bounds.filter(|(x0, x1, y0, y1)| usize::from(x1 - x0) * usize::from(y1 - y0) <= read);
+
+    match grid {
+        Some((x0, x1, y0, y1)) => {
+            let width = usize::from(x1 - x0);
+            let mut cells = vec![None; width * usize::from(y1 - y0)];
+            sample(triangles, &boxes, transform, |x, y, color| {
+                cells[usize::from(y - y0) * width + usize::from(x - x0)] = Some(color);
+            });
+            Samples::Grid {
+                x0,
+                y0,
+                width,
+                cells,
+            }
+        }
+        None => {
+            let mut map = hash::Map::default();
+            sample(triangles, &boxes, transform, |x, y, color| {
+                map.insert((x, y), color);
+            });
+            Samples::Map(map)
+        }
+    }
+}
+
+/// The device pixels of the box of `t` placed by `transform`, where it has any.
+fn pixels(t: &Triangle, transform: Affine) -> Option<(Range<u16>, Range<u16>)> {
+    let placed = kurbo::Triangle::new(
+        transform * t.p0.point,
+        transform * t.p1.point,
+        transform * t.p2.point,
+    );
+    let bbox = placed.bounding_box();
+    let xs = span(bbox.x0, bbox.x1);
+    let ys = span(bbox.y0, bbox.y1);
+    (!xs.is_empty() && !ys.is_empty()).then_some((xs, ys))
+}
+
+/// `lo.floor() as u16..hi.ceil() as u16`, without the calls `floor` and `ceil` are
+/// on targets without SSE4.1: a float converts to `u16` rounded towards zero and
+/// saturated, which is its floor for any `lo` that converts to more than 0.
+fn span(lo: f64, hi: f64) -> Range<u16> {
+    let end = hi as u16;
+    let end = if f64::from(end) < hi {
+        end.saturating_add(1)
+    } else {
+        end
+    };
+    (lo as u16)..end
+}
+
+/// Puts the color of each pixel of each triangle's box, `boxes` in the order of the
+/// triangles, that the triangle, placed by `transform`, covers, in that order.
+fn sample(
     triangles: &[Triangle],
+    boxes: &[Option<(Range<u16>, Range<u16>)>],
     transform: Affine,
-) -> hash::Map<(u16, u16), ColorComponents> {
-    let mut map = hash::Map::default();
-
-    for t in triangles {
+    mut put: impl FnMut(u16, u16, ColorComponents),
+) {
+    for (t, pixels) in triangles.iter().zip(boxes) {
+        let Some((xs, ys)) = pixels.clone() else {
+            continue;
+        };
         let t = {
-            let p0 = transform * t.p0.point;
-            let p1 = transform * t.p1.point;
-            let p2 = transform * t.p2.point;
-
             let mut v0 = t.p0.clone();
-            v0.point = p0;
+            v0.point = transform * t.p0.point;
             let mut v1 = t.p1.clone();
-            v1.point = p1;
+            v1.point = transform * t.p1.point;
             let mut v2 = t.p2.clone();
-            v2.point = p2;
-
+            v2.point = transform * t.p2.point;
             Triangle::new(v0, v1, v2)
         };
-
-        let bbox = t.bounding_box();
-
-        for y in (bbox.y0.floor() as u16)..(bbox.y1.ceil() as u16) {
-            for x in (bbox.x0.floor() as u16)..(bbox.x1.ceil() as u16) {
+        for y in ys {
+            for x in xs.clone() {
                 let point = Point::new(x as f64, y as f64);
                 if t.contains_point(point) {
-                    map.insert((x, y), t.interpolate(point));
+                    put(x, y, t.interpolate(point));
                 }
             }
         }
     }
-
-    map
 }
 
 fn encode_function_shading(domain: &[f32; 4], function: &ShadingFunction) -> EncodedShadingType {
@@ -445,7 +547,7 @@ impl EncodedShadingType {
             Self::Sampled(EncodedSampledShading { samples, function }) => {
                 let sample_point = (pos.x as u16, pos.y as u16);
 
-                if let Some(color) = samples.get(&sample_point) {
+                if let Some(color) = samples.get(sample_point) {
                     if let Some(function) = function {
                         let val = function.eval(&color.to_smallvec())?;
                         Some(color_space.to_rgba(&val, 1.0))
@@ -547,5 +649,138 @@ fn radial_pos(
         (Some(min), None) => Some(min),
         (None, Some(max)) => Some(max),
         (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::span;
+    use super::{Samples, sample_triangles};
+    use crate::shading::{Triangle, TriangleVertex};
+    use hayro_syntax::hash;
+    use kurbo::{Affine, Point};
+    use smallvec::smallvec;
+
+    struct Random(u64);
+
+    impl Random {
+        fn below(&mut self, n: f64) -> f64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % 1_000_000) as f64 / 1_000_000.0 * n
+        }
+    }
+
+    fn triangle(points: [(f64, f64); 3], color: f32) -> Triangle {
+        let [a, b, c] = points.map(|(x, y)| {
+            TriangleVertex::at(Point::new(x, y), smallvec![color, color / 2.0, 1.0 - color])
+        });
+        Triangle::new(a, b, c)
+    }
+
+    /// Whether the samples are what putting each covered pixel of each triangle into a
+    /// map, the later over the earlier, finds, at every pixel around them.
+    fn check(triangles: &[Triangle], transform: Affine) -> Samples {
+        let samples = sample_triangles(triangles, transform);
+        let mut expected = hash::Map::default();
+        for t in triangles {
+            let [p0, p1, p2] = [&t.p0, &t.p1, &t.p2].map(|v| {
+                let mut v = (*v).clone();
+                v.point = transform * v.point;
+                v
+            });
+            let t = Triangle::new(p0, p1, p2);
+            let bbox = t.bounding_box();
+            for y in (bbox.y0.floor() as u16)..(bbox.y1.ceil() as u16) {
+                for x in (bbox.x0.floor() as u16)..(bbox.x1.ceil() as u16) {
+                    let point = Point::new(x as f64, y as f64);
+                    if t.contains_point(point) {
+                        expected.insert((x, y), t.interpolate(point));
+                    }
+                }
+            }
+        }
+        for y in 0..400 {
+            for x in 0..400 {
+                assert_eq!(samples.get((x, y)), expected.get(&(x, y)), "({x}, {y})");
+            }
+        }
+        samples
+    }
+
+    #[test]
+    fn a_mesh_is_sampled_as_a_map_of_its_covered_pixels_would_hold_it() {
+        let mut random = Random(0x2545_f491_4f6c_dd1d);
+        // A tiling of a box, with triangles over it that cover others.
+        let mut tiles = vec![];
+        for row in 0..6 {
+            for column in 0..6 {
+                let (x, y) = (20.0 + column as f64 * 30.0, 40.0 + row as f64 * 25.0);
+                let color = random.below(1.0) as f32;
+                tiles.push(triangle([(x, y), (x + 30.0, y), (x, y + 25.0)], color));
+                tiles.push(triangle(
+                    [(x + 30.0, y), (x + 30.0, y + 25.0), (x, y + 25.0)],
+                    color / 3.0,
+                ));
+            }
+        }
+        for _ in 0..10 {
+            let corner =
+                |random: &mut Random| (20.0 + random.below(180.0), 40.0 + random.below(150.0));
+            let points = [
+                corner(&mut random),
+                corner(&mut random),
+                corner(&mut random),
+            ];
+            tiles.push(triangle(points, random.below(1.0) as f32));
+        }
+        for transform in [
+            Affine::IDENTITY,
+            Affine::new([1.5, 0.3, -0.2, 1.1, 10.0, -12.5]),
+        ] {
+            assert!(matches!(check(&tiles, transform), Samples::Grid { .. }));
+        }
+
+        // Slivers far apart, whose box the grid would mostly fill with nothing.
+        let slivers = [
+            triangle([(1.0, 1.0), (3.0, 1.0), (1.0, 390.0)], 0.25),
+            triangle([(380.0, 1.0), (383.0, 1.0), (380.0, 390.0)], 0.75),
+        ];
+        assert!(matches!(check(&slivers, Affine::IDENTITY), Samples::Map(_)));
+        // Nothing, and a mesh off the device.
+        assert!(matches!(check(&[], Affine::IDENTITY), Samples::Map(_)));
+        check(&tiles, Affine::translate((-500.0, -500.0)));
+    }
+
+    #[test]
+    fn a_span_is_the_floor_to_the_ceiling() {
+        let values = [
+            -70000.0,
+            -1.5,
+            -0.5,
+            -0.0,
+            0.0,
+            0.25,
+            1.0,
+            1.5,
+            2.0,
+            65534.5,
+            65535.0,
+            65535.5,
+            70000.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        for lo in values {
+            for hi in values {
+                assert_eq!(
+                    span(lo, hi),
+                    (lo.floor() as u16)..(hi.ceil() as u16),
+                    "{lo} {hi}"
+                );
+            }
+        }
     }
 }

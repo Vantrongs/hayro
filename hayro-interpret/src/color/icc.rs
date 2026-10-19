@@ -107,6 +107,11 @@ impl ICCProfile {
         })))
     }
 
+    #[cfg(test)]
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub(super) fn number_components(&self) -> usize {
         self.0.number_components
     }

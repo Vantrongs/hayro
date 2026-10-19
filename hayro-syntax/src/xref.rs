@@ -206,7 +206,12 @@ struct Old {
     /// but to no object that ends before it: the scan reads such an object to its
     /// end where the header ends before the offset (`read_unread`).
     unread: Vec<Unfinished>,
+    /// Those in an object stream: the object, and the number of the stream.
+    held: InStreams,
 }
+
+/// Objects a table lists in object streams, each with the number of its stream.
+type InStreams = BTreeSet<(ObjectIdentifier, u32)>;
 
 /// An entry of a table that is rebuilt that leads to no object read before the next
 /// offset any entry names, its slot.
@@ -254,9 +259,8 @@ fn opened(_bytes: usize) {
 // next offset any entry names: objects of a table do not overlap.
 // So each header and object is read once however many entries name it, and no further
 // than the next offset, its slot (`body::SlotReader`), which reads each byte of the file
-// once. MuPDF, too, rebuilds a table with an entry past the end of the file or in an
-// object stream the table does not list as an object (`check_xref_entry_offsets` in
-// MuPDF's `pdf-xref.c`); an entry at offset 0 is free.
+// once. A table is also rebuilt where an entry is past the end of the file or in an
+// object stream the table does not list as an object; an entry at offset 0 is free.
 fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Old> {
     xref_map.retain(|_, entry| *entry != EntryType::Normal(0));
     let mut entries = vec![];
@@ -265,13 +269,16 @@ fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Old> {
     for (id, entry) in xref_map.iter() {
         match *entry {
             EntryType::Normal(offset) => entries.push((offset, *id)),
-            EntryType::ObjStream(stream, _) => streams.push(stream),
+            EntryType::ObjStream(stream, _) => streams.push((*id, stream)),
         }
     }
     entries.sort_unstable();
 
     let mut sound = true;
-    let mut old = Old::default();
+    let mut old = Old {
+        held: streams.iter().copied().collect(),
+        ..Old::default()
+    };
     // The entries at each offset, and the next offset.
     let mut rest = entries.as_slice();
     while let Some(&(offset, _)) = rest.first() {
@@ -295,9 +302,9 @@ fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Old> {
     }
     if !streams.is_empty() {
         let objects: BTreeSet<i32> = entries.iter().map(|(_, id)| id.obj_number).collect();
-        sound &= streams
-            .iter()
-            .all(|stream| i32::try_from(*stream).is_ok_and(|stream| objects.contains(&stream)));
+        sound &= streams.iter().all(|(_, stream)| {
+            i32::try_from(*stream).is_ok_and(|stream| objects.contains(&stream))
+        });
     }
 
     if sound {
@@ -349,10 +356,12 @@ fn object_in(data: &[u8], at: usize, slot: usize) -> Checked {
 // Try to manually parse the PDF to build an xref table and trailer dictionary.
 //
 // The objects the scan finds are the table's, the later of two that a damaged file
-// numbers alike, as MuPDF rebuilds a table; an entry of the old table, `listed`, that
-// leads to an object the scan does not find under the entry's number is kept. Such an
-// object is the entry's, not the one its header names: where the scan finds it under
-// its header's number, the scan takes the definition before it.
+// numbers alike, and of a definition in an object stream and one outside, the one
+// outside, unless the old table lists the object in that stream; an entry of the old
+// table, `listed`, that leads to an object the scan does not find under the entry's
+// number is kept. Such an object is the entry's, not the one its header names: where
+// the scan finds it under its header's number, the scan takes the definition before
+// it.
 fn fallback(data: PdfData, password: &[u8], old: Old) -> Option<XRef> {
     warn!("xref table was invalid, trying to manually build xref table");
     let (xref_map, rebuilt, xref_input) = fallback_xref_map(&data, password, old);
@@ -409,15 +418,13 @@ fn fallback_xref_map<'a>(
     let mut listed = old.listed;
     let (read, unreadable) = read_unread(&mut scan, &old.unread);
     listed.extend(read);
-    fallback_xref_map_inner(
-        data,
-        &mut scan,
-        ReaderContext::dummy(),
-        None,
-        password,
-        &listed,
-        &unreadable,
-    )
+    let walk = walk(data, &mut scan);
+    let old = Old {
+        listed,
+        unread: vec![],
+        held: old.held,
+    };
+    fallback_xref_map_inner(data, &walk, None, password, &old, &unreadable)
 }
 
 /// The entries of `unread`, sorted by offset, that lead to an object read to its end,
@@ -446,32 +453,30 @@ fn read_unread(scan: &mut Scan<'_>, unread: &[Unfinished]) -> (Vec<Listed>, Vec<
     (listed, unreadable)
 }
 
-/// The table a scan of the file rebuilds, where objects in object streams are
-/// decrypted by `decryptor`, `None` until the trailer is known: a document whose
-/// trailer has /Encrypt is scanned again with its decryptor.
-///
-/// Every object the rebuild reads, an object stream it finds or a catalog a trailer
-/// names, is read as the table it rebuilds reads it, through a table of what it has
-/// found, by place ([`XRef::object_stream_at`], [`XRef::get_with`]): each body once,
-/// in its slot, and each object stream's data decoded once, cut at the next place
-/// holding a stream, however many objects the scan finds in it, entries name it or
-/// trailers name a catalog in it. The places are every header the scan finds with an
-/// object after it, and every one the old table leads to, the same for the rebuild's
-/// reads and for the rebuilt table's ([`Layout`]): so the bodies read, and the data
-/// of object streams decoded, are disjoint, whichever definitions of one number the
-/// table keeps.
-fn fallback_xref_map_inner<'a>(
-    data: &'a PdfData,
-    scan: &mut Scan<'_>,
-    mut dummy_ctx: ReaderContext<'a>,
-    decryptor: Option<Arc<Decryptor>>,
-    password: &[u8],
-    listed: &[Listed],
-    unread: &[ObjectIdentifier],
-) -> (XrefMap, Rebuilt, Option<XRefInput<'a>>) {
+/// What a scan of the file finds, which does not depend on how the document is
+/// decrypted: the objects, where their bodies start, the headers with no object after
+/// them, the dictionaries that may be trailers, the last header before a catalog, and
+/// the object streams. Found once, also for a document whose table is rebuilt again
+/// with its decryptor.
+struct Walk<'a> {
+    xref_map: XrefMap,
+    found: Vec<(ObjectIdentifier, usize)>,
+    bodies: Vec<usize>,
+    broken: Vec<ObjectIdentifier>,
+    trailer_dicts: Vec<Dict<'a>>,
+    root_ref: Option<ObjectIdentifier>,
+    object_streams: Vec<(ObjectIdentifier, usize)>,
+}
+
+/// Walks the file for [`fallback_xref_map_inner`], reading each part of it a bounded
+/// number of times with `scan`. The keys it reads of a dictionary are names, which
+/// encryption leaves as they are.
+fn walk<'a>(data: &'a PdfData, scan: &mut Scan<'_>) -> Walk<'a> {
+    let mut dummy_ctx = ReaderContext::dummy();
     let mut xref_map = hash::Map::default();
-    // Each object found, in the order of the file.
+    // Each object found, in the order of the file, and where its body starts.
     let mut found = vec![];
+    let mut bodies = vec![];
     // Each header found with no object that can be read after it.
     let mut broken = vec![];
     let mut trailer_dicts = vec![];
@@ -495,6 +500,7 @@ fn fallback_xref_map_inner<'a>(
                 Some((obj_id, Some(body))) => {
                     xref_map.insert(obj_id, EntryType::Normal(cur_pos));
                     found.push((obj_id, cur_pos));
+                    bodies.push(body);
                     last_obj_num = Some(obj_id);
                     last_header = Some((obj_id, cur_pos, body));
                     dummy_ctx.set_obj_number(obj_id);
@@ -556,6 +562,52 @@ fn fallback_xref_map_inner<'a>(
         }
     }
 
+    Walk {
+        xref_map,
+        found,
+        bodies,
+        broken,
+        trailer_dicts,
+        root_ref,
+        object_streams,
+    }
+}
+
+/// The table a scan of the file rebuilds from its `walk`, where objects in object
+/// streams are decrypted by `decryptor`, `None` until the trailer is known: a
+/// document whose trailer has /Encrypt is rebuilt again with its decryptor, from the
+/// same walk.
+///
+/// Every object the rebuild reads, an object stream it finds or a catalog a trailer
+/// names, is read as the table it rebuilds reads it, through a table of what it has
+/// found, by place ([`XRef::object_stream_at`], [`XRef::get_with`]): each body once,
+/// in its slot, and each object stream's data decoded once, cut at the next place
+/// holding a stream, however many objects the scan finds in it, entries name it or
+/// trailers name a catalog in it. The places are every header the scan finds with an
+/// object after it, and every one the old table leads to, the same for the rebuild's
+/// reads and for the rebuilt table's ([`Layout`]): so the bodies read, and the data
+/// of object streams decoded, are disjoint, whichever definitions of one number the
+/// table keeps.
+fn fallback_xref_map_inner<'a>(
+    data: &'a PdfData,
+    walk: &Walk<'a>,
+    decryptor: Option<Arc<Decryptor>>,
+    password: &[u8],
+    old: &Old,
+    unread: &[ObjectIdentifier],
+) -> (XrefMap, Rebuilt, Option<XRefInput<'a>>) {
+    let Walk {
+        found,
+        bodies,
+        broken,
+        root_ref,
+        ..
+    } = walk;
+    let mut xref_map = walk.xref_map.clone();
+    let object_streams = walk.object_streams.clone();
+    let trailer_dicts = walk.trailer_dicts.clone();
+    let listed = into_headers(&old.listed, found, bodies);
+    let listed = listed.as_slice();
     let layout = Layout::over(
         found
             .iter()
@@ -592,28 +644,28 @@ fn fallback_xref_map_inner<'a>(
             }
         }
         xref_map = probe.into_map();
+        // An object of an object stream is kept over a definition outside one
+        // where the table rebuilt lists it in that stream, as an update that moves
+        // an object into an object stream does; else the one outside is kept, as a
+        // file whose table cannot be read may hold object streams of objects it
+        // does not use under the numbers of those it does.
         for (obj_num, stream, idx) in held {
             let id = ObjectIdentifier::new(obj_num as i32, 0);
-            // If we already found an entry for that object number that was not
-            // inside an object stream. Somewhat arbitrary and maybe
-            // we can do better, but that seems to work for the current
-            // set of tests.
-            if xref_map
-                .get(&id)
-                .is_none_or(|e| !matches!(e, &EntryType::Normal(_)))
+            let stream_num = stream.obj_number as u32;
+            if old.held.contains(&(id, stream_num))
+                || xref_map
+                    .get(&id)
+                    .is_none_or(|e| !matches!(e, &EntryType::Normal(_)))
             {
-                xref_map.insert(
-                    id,
-                    EntryType::ObjStream(stream.obj_number as u32, idx as u32),
-                );
+                xref_map.insert(id, EntryType::ObjStream(stream_num, idx as u32));
             }
         }
     }
 
-    let headers = keep_listed(&mut xref_map, &found, listed);
+    let headers = keep_listed(&mut xref_map, found, listed);
     let unreadable: Unreadable = unread
         .iter()
-        .chain(&broken)
+        .chain(broken)
         .filter(|id| !xref_map.contains_key(id))
         .copied()
         .collect();
@@ -658,10 +710,9 @@ fn fallback_xref_map_inner<'a>(
             XRefInput::TrailerDictData(trailer_dict.as_ref().map(|d| d.data()).unwrap()),
             password,
         ) {
-            let ctx = ReaderContext::new(&xref, false);
             let decryptor = xref.decryptor();
             let (patched_map, patched, _) =
-                fallback_xref_map_inner(data, scan, ctx, Some(decryptor), password, listed, unread);
+                fallback_xref_map_inner(data, walk, Some(decryptor), password, old, unread);
             xref_map = patched_map;
             rebuilt = patched;
         }
@@ -673,6 +724,35 @@ fn fallback_xref_map_inner<'a>(
         root_ref.map(XRefInput::RootRef)
     };
     (xref_map, rebuilt, input)
+}
+
+/// The entries of the old table, `listed`, each leading where it leads, but an entry
+/// that leads into a header the scan `found`, after its start and before its body
+/// (`bodies`, where each body starts), to the header: there it reads a header of
+/// another number, the tail of the one found (`4 0 obj` in `1024 0 obj`, as in a
+/// file whose offsets all miss by a few bytes), over the same body. Its offset is no
+/// place an object starts at, so it does not cut the slot of the object found
+/// ([`Place`]), which would then not be read, and every such entry reads the body
+/// at one place, however many lead into one header.
+fn into_headers(
+    listed: &[Listed],
+    found: &[(ObjectIdentifier, usize)],
+    bodies: &[usize],
+) -> Vec<Listed> {
+    listed
+        .iter()
+        .map(|entry| {
+            let next = found.partition_point(|(_, at)| *at <= entry.offset);
+            match next.checked_sub(1) {
+                Some(i) if found[i].1 < entry.offset && entry.offset < bodies[i] => Listed {
+                    id: entry.id,
+                    offset: found[i].1,
+                    header: found[i].0,
+                },
+                _ => *entry,
+            }
+        })
+        .collect()
 }
 
 /// What a rebuild finds at `r`: `None` where no header can start, as no number can;
@@ -2289,17 +2369,20 @@ impl ObjectStream {
     }
 
     /// The slot of the object at `at`: up to the next offset the header lists, or the
-    /// end of the data, which goes on unknown where they are cut.
+    /// end of the data, which goes on unknown where they are cut; and where the slot
+    /// after it ends.
     fn slot(&self, at: usize) -> Slot {
         let next = self.starts.partition_point(|start| *start <= at);
-        let end = self
-            .starts
-            .get(next)
-            .map_or(self.data.len(), |next| *next)
-            .min(self.data.len());
+        let end = |next: usize| {
+            self.starts
+                .get(next)
+                .map_or(self.data.len(), |next| *next)
+                .min(self.data.len())
+        };
         Slot {
-            end,
-            open: self.cut && end == self.data.len(),
+            end: end(next),
+            open: self.cut && end(next) == self.data.len(),
+            next: end(next + 1),
         }
     }
 
@@ -2930,6 +3013,150 @@ mod tests {
             one_page(file.into_bytes()),
             (600.0, 700.0, BLUE.as_bytes().to_vec())
         );
+    }
+
+    // Objects of an object stream each after a comment, as pdfTeX writes them (`% 3 0
+    // obj`), are read: the comment starts the next object's slot, and is read as that
+    // object's own reading reads it, so a dictionary before it is no stream's.
+    #[test]
+    fn objects_of_an_object_stream_after_comments_are_read() {
+        let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] /Contents 6 0 R >>";
+        let commented = |number: u32, object: &str| format!("% {number} 0 obj\n{object}");
+        let (catalog, tree, page) = (
+            commented(1, CATALOG),
+            commented(2, TREE),
+            commented(3, page),
+        );
+        for order in [
+            [
+                (1, catalog.as_str()),
+                (2, tree.as_str()),
+                (3, page.as_str()),
+            ],
+            [
+                (3, page.as_str()),
+                (2, tree.as_str()),
+                (1, catalog.as_str()),
+            ],
+        ] {
+            let objects = vec![
+                (5, object_stream("/Length LEN", &order)),
+                (6, stream("", BLUE)),
+            ];
+            let indices: Vec<(u32, u32, u32)> = order
+                .iter()
+                .enumerate()
+                .map(|(index, (number, _))| (*number, 5, index as u32))
+                .collect();
+            let file = file_with_stream_table(&objects, &indices);
+            assert_eq!(one_page(file), (600.0, 700.0, BLUE.as_bytes().to_vec()));
+        }
+    }
+
+    // Reading every object of an object stream reads each byte of it a bounded number
+    // of times where comments follow dictionaries: one in the next object's slot is
+    // read as far as that slot, not on along its line, past the slots after it, which
+    // each dictionary would read again (`<<>>%<<>>%…` in one line).
+    #[test]
+    fn objects_of_an_object_stream_after_comments_are_read_in_linear_time() {
+        // The header and the data of an object stream of about `n` objects.
+        type Objects = fn(usize) -> (String, String);
+        let families: [(&str, Objects); 2] = [
+            ("a comment before each object", |n| {
+                let object = "% 9 0 obj\n<< /A 1 >>\n";
+                let header = (0..n).map(|i| format!("{} {} ", 10 + i, i * object.len()));
+                (header.collect(), object.repeat(n))
+            }),
+            ("dictionaries and comments in one line", |n| {
+                let header = (0..2 * n).map(|i| format!("{} {} ", 10 + i, i / 2 * 5 + i % 2 * 4));
+                let line = format!("{}{}\n", "<<>>%".repeat(n), " x".repeat(4 * n));
+                (header.collect(), line)
+            }),
+        ];
+        for (family, objects) in families {
+            let [small, large] = [1000, 2000].map(|n| {
+                let (header, data) = objects(n);
+                let count = header.split(' ').filter(|n| !n.is_empty()).count() / 2;
+                let stream = object_stream_headed(&header, &data, count);
+                let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>";
+                let objects = vec![
+                    (1, CATALOG.to_string()),
+                    (2, TREE.to_string()),
+                    (3, page.to_string()),
+                    (4, stream),
+                ];
+                let entries: Vec<(u32, u32, u32)> =
+                    (0..count as u32).map(|i| (10 + i, 4, i)).collect();
+                let file = file_with_stream_table(&objects, &entries);
+                let pdf = crate::Pdf::new(file).unwrap();
+                crate::work::EXAMINED.set(0);
+                crate::work::BODIES_READ.set(0);
+                let mut read = 0;
+                for i in 0..count {
+                    read += usize::from(pdf.xref().get::<Dict<'_>>(id(10 + i as i32)).is_some());
+                }
+                let work = crate::work::EXAMINED.get() + crate::work::BODIES_READ.get();
+                assert!(
+                    work <= 16 * data.len(),
+                    "{family}: {work} steps for {} bytes",
+                    data.len()
+                );
+                (work, read)
+            });
+            assert!(
+                large.0 <= small.0 * 25 / 10,
+                "{family}: {small:?} steps and objects read for 1000, {large:?} for 2000"
+            );
+            if family == "a comment before each object" {
+                assert_eq!((small.1, large.1), (1000, 2000));
+            }
+        }
+    }
+
+    // A table whose every offset leads a few bytes into its object's header, as in a
+    // file cut at its start, leads to a shorter header of another number, over the
+    // object's own body: the rebuild finds each object at its header, and reads it
+    // there, not cut where the table's offset is.
+    #[test]
+    fn a_table_whose_offsets_lead_into_the_headers_is_rebuilt() {
+        for first in [11, 101, 1001] {
+            let digits = first.to_string().len();
+            let objects = [
+                format!("<< /Type /Catalog /Pages {} 0 R >>", first + 1),
+                format!("<< /Type /Pages /Kids [{} 0 R] /Count 1 >>", first + 2),
+                format!(
+                    "<< /Type /Page /Parent {} 0 R /MediaBox [0 0 600 700] /Contents {} 0 R >>",
+                    first + 1,
+                    first + 3
+                ),
+                stream("", BLUE),
+            ];
+            for into in 1..digits {
+                let mut out = b"%PDF-1.7\n".to_vec();
+                let mut offsets = vec![];
+                for (i, object) in objects.iter().enumerate() {
+                    offsets.push((first + i, out.len() + into));
+                    out.extend(format!("{} 0 obj\n{object}\nendobj\n", first + i).bytes());
+                }
+                let xref = out.len();
+                out.extend(b"xref\n");
+                for (number, offset) in &offsets {
+                    out.extend(format!("{number} 1\n{offset:010} 00000 n \n").bytes());
+                }
+                out.extend(
+                    format!(
+                        "trailer\n<< /Size {} /Root {first} 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                        first + objects.len()
+                    )
+                    .bytes(),
+                );
+                assert_eq!(
+                    one_page(out),
+                    (600.0, 700.0, BLUE.as_bytes().to_vec()),
+                    "objects from {first}, offsets {into} bytes into their headers"
+                );
+            }
+        }
     }
 
     // Entries whose objects each hold, in a string, the header the next entry leads

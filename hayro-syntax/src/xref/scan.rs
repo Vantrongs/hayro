@@ -40,7 +40,7 @@
 //! and a reading that meets another reads on only to the next marked byte. The
 //! tests count this work over families of damaged files (`opening_a_file_reads_it_
 //! in_linear_time`) and check that each answer is what reading the object finds
-//! (`scan_ends_objects_as_reading_them_does`).
+//! (`rebuilding_and_checking_a_table_read_objects_as_reading_them_does`).
 
 use crate::hash;
 use crate::object::dict::keys::{ROOT, TYPE};
@@ -61,6 +61,18 @@ const BLOCK: usize = 64;
 // bound: bytes of white space and strings read, and blocks, tree nodes and outcomes
 // looked at; the bytes its readers lex, they count (`crate::work::EXAMINED`).
 use super::opened as step;
+
+/// The bytes the first pass of a scan reads for more than ending an escape: those
+/// that open or close a string, escape, end a line, or start a comment.
+const MARKS: [bool; 256] = {
+    let mut marks = [false; 256];
+    let mut i = 0;
+    while i < 6 {
+        marks[b"()\\\r\n%"[i] as usize] = true;
+        i += 1;
+    }
+    marks
+};
 
 /// A set of offsets in the file.
 struct Bits(Vec<u64>);
@@ -350,8 +362,22 @@ impl<'a> Scan<'a> {
         for (block, bytes) in data.chunks(BLOCK).enumerate() {
             starts.push((depth, escaped));
             let mut least = i64::MAX;
-            for (i, &b) in bytes.iter().enumerate() {
+            let mut i = 0;
+            while i < bytes.len() {
+                let b = bytes[i];
+                if !MARKS[usize::from(b)] {
+                    // A run of bytes that only end an escape: most of a file, in
+                    // streams, read without the steps below.
+                    escaped = false;
+                    least = least.min(depth);
+                    i += 1;
+                    while i < bytes.len() && !MARKS[usize::from(bytes[i])] {
+                        i += 1;
+                    }
+                    continue;
+                }
                 let at = block * BLOCK + i;
+                i += 1;
                 if !escaped {
                     if b == b'(' {
                         depth += 1;
@@ -1125,6 +1151,17 @@ mod tests {
                 read.and(header),
                 "case {case}, header scan at {at} of {:?}",
                 shown()
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_pass_reads_the_bytes_that_open_close_or_end_strings_and_comments() {
+        for b in 0..=u8::MAX {
+            assert_eq!(
+                MARKS[usize::from(b)],
+                b"()\\%".contains(&b) || is_eol_character(b),
+                "{b}"
             );
         }
     }
