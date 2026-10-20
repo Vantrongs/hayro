@@ -9,27 +9,28 @@ use alloc::vec::Vec;
 use hayro_ccitt::{DecodeSettings, Decoder, DecoderContext, EncodingMode};
 
 /// Appends `count` copies of `byte` to `output`, a counted piece at a time; stops
-/// appending once `meter`'s hook asks to stop. Room is made for the rest of the
-/// `declared` bytes, but at most for seven times what is held with the next piece,
-/// as flate grows its output: the output holds at most eight times what was written
-/// and a piece, so a stream cut short or stopped costs what it decoded, not what
-/// `Rows` and `Columns` declare, and a long one is reallocated a few times rather
-/// than at every doubling.
+/// appending once `meter`'s hook asks to stop. The output is grown to the `declared`
+/// bytes divided by a power of eight, the least that holds the next piece: no more
+/// than eight times what it holds with that piece, so a stream cut short or stopped
+/// costs what it decoded, not what `Rows` and `Columns` declare, while the last
+/// growth to the declared size copies an eighth of it. Past the declared size, or
+/// without one, it doubles.
 fn push_counted(output: &mut Vec<u8>, byte: u8, count: usize, declared: usize, meter: &Meter<'_>) {
     let mut left = count;
     while left > 0 && !meter.cancelled() {
         let n = left.min(POLL_BYTES);
-        let held = output.len();
-        if held + n > output.capacity() {
-            let rest = declared.saturating_sub(held);
-            let room = if rest >= n {
-                rest.min(held.max(n).saturating_mul(7))
-            } else {
-                held.max(n)
-            };
-            output.reserve_exact(room);
+        let needed = output.len() + n;
+        if needed > output.capacity() {
+            let mut target = declared;
+            while target / 8 >= needed {
+                target /= 8;
+            }
+            if target < needed {
+                target = needed.max(2 * output.len());
+            }
+            output.reserve_exact(target - output.len());
         }
-        output.resize(held + n, byte);
+        output.resize(needed, byte);
         left -= n;
         let _ = meter.work(n);
     }
