@@ -62,17 +62,30 @@ const BLOCK: usize = 64;
 // looked at; the bytes its readers lex, they count (`crate::work::EXAMINED`).
 use super::opened as step;
 
-/// The bytes the first pass of a scan reads for more than ending an escape: those
-/// that open or close a string, escape, end a line, or start a comment.
-const MARKS: [bool; 256] = {
-    let mut marks = [false; 256];
-    let mut i = 0;
-    while i < 6 {
-        marks[b"()\\\r\n%"[i] as usize] = true;
-        i += 1;
+/// Whether the first pass of a scan reads `b` for more than ending an escape: a byte
+/// that opens or closes a string, escapes, ends a line, or starts a comment.
+#[inline(always)]
+fn is_mark(b: u8) -> bool {
+    (b == b'(') | (b == b')') | (b == b'\\') | (b == b'\r') | (b == b'\n') | (b == b'%')
+}
+
+/// The marks of `block` ([`is_mark`]), as bits: bit `i` is set where `block[i]` is
+/// one. The bytes are compared all at once, and each 8 of the flags made into 8 bits
+/// by one multiplication, rather than one byte at a time: the first pass's work on
+/// a byte that is no mark, most of a file, in streams.
+fn marked(block: &[u8; BLOCK]) -> u64 {
+    let mut flags = [0_u8; BLOCK];
+    for (flag, &b) in flags.iter_mut().zip(block) {
+        *flag = u8::from(is_mark(b));
+    }
+    let mut marks = 0;
+    for (i, eight) in flags.as_chunks::<8>().0.iter().enumerate() {
+        let eight = u64::from_le_bytes(*eight);
+        // Flag `j`, at bit `8 j`, moves to bit `56 + j`; no two flags add up.
+        marks |= (eight.wrapping_mul(0x0102_0408_1020_4080) >> 56) << (8 * i);
     }
     marks
-};
+}
 
 /// A set of offsets in the file.
 struct Bits(Vec<u64>);
@@ -354,31 +367,33 @@ impl<'a> Scan<'a> {
         let mut comment_ends = vec![];
 
         let mut depth = 0_i64;
-        let mut escaped = false;
+        // A byte is escaped where it is right after an unescaped backslash: the first
+        // byte after the last one read, if that was one. Any other byte ends an
+        // escape, and changes nothing else, so only the marks are read.
+        let mut escaped_at = usize::MAX;
         let mut percent = false;
         // The depths at which strings opened at an escaped `(` have not ended yet, in
         // rising order: each ends where the depth falls below it.
         let mut escaped_opens: Vec<i64> = vec![];
         for (block, bytes) in data.chunks(BLOCK).enumerate() {
-            starts.push((depth, escaped));
-            let mut least = i64::MAX;
-            let mut i = 0;
-            while i < bytes.len() {
-                let b = bytes[i];
-                if !MARKS[usize::from(b)] {
-                    // A run of bytes that only end an escape: most of a file, in
-                    // streams, read without the steps below.
-                    escaped = false;
-                    least = least.min(depth);
-                    i += 1;
-                    while i < bytes.len() && !MARKS[usize::from(bytes[i])] {
-                        i += 1;
-                    }
-                    continue;
-                }
-                let at = block * BLOCK + i;
-                i += 1;
-                if !escaped {
+            let from = block * BLOCK;
+            starts.push((depth, escaped_at == from));
+            let mut marks = match <&[u8; BLOCK]>::try_from(bytes) {
+                Ok(full) => marked(full),
+                Err(_) => bytes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, b)| is_mark(**b))
+                    .fold(0, |marks, (i, _)| marks | 1 << i),
+            };
+            // The depth after a byte that is no mark is the depth before it: the
+            // depth at the block's start, where the block starts with one.
+            let mut least = if marks & 1 == 0 { depth } else { i64::MAX };
+            while marks != 0 {
+                let i = marks.trailing_zeros() as usize;
+                marks &= marks - 1;
+                let (at, b) = (from + i, bytes[i]);
+                if at != escaped_at {
                     if b == b'(' {
                         depth += 1;
                     } else if b == b')' {
@@ -387,11 +402,12 @@ impl<'a> Scan<'a> {
                             meets.set(at + 1);
                         }
                         depth -= 1;
+                    } else if b == b'\\' {
+                        escaped_at = at + 1;
                     }
                 } else if b == b'(' && escaped_opens.last() != Some(&depth) {
                     escaped_opens.push(depth);
                 }
-                escaped = !escaped && b == b'\\';
                 least = least.min(depth);
                 if is_eol_character(b) {
                     if percent {
@@ -1159,10 +1175,27 @@ mod tests {
     fn the_first_pass_reads_the_bytes_that_open_close_or_end_strings_and_comments() {
         for b in 0..=u8::MAX {
             assert_eq!(
-                MARKS[usize::from(b)],
+                is_mark(b),
                 b"()\\%".contains(&b) || is_eol_character(b),
                 "{b}"
             );
+        }
+        // A block's marks are the bits of the bytes that are marks, however many.
+        let mut random = Random(0x2545_f491_4f6c_dd1d);
+        for case in 0..20_000 {
+            let mut block = [0_u8; BLOCK];
+            for b in &mut block {
+                let pick = |bytes: &[u8], random: &mut Random| bytes[random.below(bytes.len())];
+                *b = match case % 3 {
+                    0 => pick(b"()\\\r\n%a\x80", &mut random),
+                    1 => random.below(256) as u8,
+                    _ => pick(b"(\\", &mut random),
+                };
+            }
+            let expected = (0..BLOCK)
+                .filter(|i| is_mark(block[*i]))
+                .fold(0_u64, |marks, i| marks | 1 << i);
+            assert_eq!(marked(&block), expected, "{block:?}");
         }
     }
 }

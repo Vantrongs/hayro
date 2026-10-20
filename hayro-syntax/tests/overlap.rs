@@ -339,7 +339,9 @@ fn objects_nested_in_an_object_stream_are_read_in_linear_work_and_memory() {
 // streams after them: each is cut at the next, so that what is decoded and kept is
 // linear in the file, and each still holds its object, read and kept once; finding
 // the data, and the `endstream` after white space, searches the file once, whatever
-// table finds the streams.
+// table finds the streams. A rebuilt table finds only the first stream, as the scan
+// does not read a stream's data, which holds the others' headers, and so does
+// PyMuPDF 1.28.2: what refers to the others' objects refers to none.
 #[test]
 fn overlapping_object_streams_are_read_in_linear_work_and_memory() {
     for length in [Length::Whole, Length::Padded, Length::Wrong] {
@@ -347,7 +349,12 @@ fn overlapping_object_streams_are_read_in_linear_work_and_memory() {
             let ((pages, units), _) = loaded(overlapping_object_streams(64, length, broken));
             assert_eq!(pages, 64);
             assert!(
-                units.iter().all(|unit| *unit == (Some(5.0), None)),
+                units.iter().enumerate().all(|(page, unit)| *unit
+                    == if broken && page > 0 {
+                        (None, None)
+                    } else {
+                        (Some(5.0), None)
+                    }),
                 "{length:?}, broken {broken}: {units:?}"
             );
             linear(&format!("overlapping, {length:?}, broken {broken}"), |n| {
