@@ -774,10 +774,13 @@ struct Frame {
     written: bool,
 }
 
-/// A subpath of the path being built: its text, the box of its points in the
+/// A subpath of the path being built: its text, its points and their box in the
 /// current space, and whether a number of it cannot be written.
 struct Subpath {
     text: String,
+    /// Its finite points, control points included, whose hull holds it: a clip
+    /// cuts what shows by that hull, not by the box, which a turned clip overfills.
+    points: Vec<Point>,
     lo: Point,
     hi: Point,
     /// Whether a point of it is no finite number, whose place cannot be told.
@@ -791,6 +794,7 @@ impl Subpath {
     fn new() -> Self {
         Self {
             text: String::new(),
+            points: vec![],
             lo: Point::new(f64::INFINITY, f64::INFINITY),
             hi: Point::new(f64::NEG_INFINITY, f64::NEG_INFINITY),
             lost: false,
@@ -801,6 +805,7 @@ impl Subpath {
 
     fn add(&mut self, p: Point) {
         if p.is_finite() {
+            self.points.push(p);
             self.lo = Point::new(self.lo.x.min(p.x), self.lo.y.min(p.y));
             self.hi = Point::new(self.hi.x.max(p.x), self.hi.y.max(p.y));
         } else {
@@ -1459,7 +1464,11 @@ impl Out {
         let path = std::mem::take(&mut self.path);
         let mut points = vec![];
         for p in &path {
-            points.extend(p.corners(0.0));
+            if p.lost {
+                points.push(Point::new(f64::NAN, f64::NAN));
+            } else {
+                points.extend(&p.points);
+            }
             self.held.push_str(&p.text);
             self.held_failed |= p.failed;
         }

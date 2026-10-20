@@ -4423,6 +4423,16 @@ fn a_part_is_told_under_the_clips_it_is_drawn_under() {
             bidi,
         ),
         (
+            // The rich box's clip turned by 340°, written as its four corners: the
+            // page lies outside it though inside its box, and the fill shows there.
+            "rich free text turned",
+            free_text(&format!("/Rotate 340 /RC ({hebrew})")),
+            free_text("/Rotate 340 /RC (<p>ab</p>)"),
+            rect(15.0, 140.0, 25.0, 150.0),
+            rect(60.0, 140.0, 120.0, 160.0),
+            bidi,
+        ),
+        (
             "plain free text",
             free_text("/Contents <FEFF0000>"),
             free_text("/Contents (ab)"),
