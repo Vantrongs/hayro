@@ -10,7 +10,7 @@ use crate::object::Name;
 use crate::object::ObjectIdentifier;
 use crate::object::Stream;
 use crate::object::dict::keys::{
-    AUTHOR, CREATION_DATE, CREATOR, ENCRYPT, FIRST, ID, INDEX, INFO, KEYWORDS, MOD_DATE, N,
+    AUTHOR, CREATION_DATE, CREATOR, ENCRYPT, FIRST, ID, INDEX, INFO, KEYWORDS, LENGTH, MOD_DATE, N,
     OCPROPERTIES, PAGES, PREV, PRODUCER, ROOT, SIZE, SUBJECT, TITLE, TYPE, VERSION, W, XREF_STM,
 };
 use crate::object::indirect::IndirectObject;
@@ -514,6 +514,7 @@ fn walk<'a>(data: &'a PdfData, scan: &mut Scan<'_>) -> Walk<'a> {
     // The last header found with an object after it, where it is, and where its
     // object starts.
     let mut last_header = None;
+    let mut endstreams = NextEndstream::default();
 
     loop {
         let cur_pos = r.offset();
@@ -541,9 +542,21 @@ fn walk<'a>(data: &'a PdfData, scan: &mut Scan<'_>) -> Walk<'a> {
                 && let Some(found) = scan.object(cur_pos)
             {
                 r.jump(found.end);
-                if found.root || found.kind {
+                // The dictionary of a stream that is a header's object, whose data the
+                // walk skips (`after_stream`).
+                let body = last_header.is_some_and(|(_, _, body)| body == cur_pos);
+                let stream = body
+                    .then(|| stream_data_start(data.as_ref(), found.end))
+                    .flatten();
+                if found.root || found.kind || stream.is_some() {
                     let mut dict_reader = Reader::new(&data.as_ref()[cur_pos..found.end]);
                     if let Some(dict) = dict_reader.read_with_context::<Dict<'_>>(&dummy_ctx) {
+                        if let Some(start) = stream
+                            && let Some(after) =
+                                after_stream(data.as_ref(), start, &dict, &mut endstreams)
+                        {
+                            r.jump(after);
+                        }
                         if found.root && dict.contains_key(ROOT) {
                             trailer_dicts.push(dict.clone());
                         }
@@ -559,8 +572,8 @@ fn walk<'a>(data: &'a PdfData, scan: &mut Scan<'_>) -> Walk<'a> {
                         // once the scan has found every place, which its data may
                         // not reach past ([`XRef::object_stream_at`]).
                         if dict.get::<Name<'_>>(TYPE).as_deref() == Some(b"ObjStm")
-                            && let Some((id, at, body)) = last_header
-                            && body == cur_pos
+                            && let Some((id, at, _)) = last_header
+                            && body
                         {
                             object_streams.push((id, at));
                         }
@@ -572,11 +585,11 @@ fn walk<'a>(data: &'a PdfData, scan: &mut Scan<'_>) -> Walk<'a> {
             } else {
                 // We can skip everything until the next white space character,
                 // as there cannot possibly be any new dictionary/object identifier
-                // until then.
+                // until then; and a run of white space, where none starts.
                 let old_pos = r.offset;
                 r.forward_while(|b| !is_white_space_character(b));
                 if r.offset == old_pos {
-                    r.read_byte();
+                    r.forward_while(is_white_space_character);
                 }
             }
         }
@@ -594,6 +607,82 @@ fn walk<'a>(data: &'a PdfData, scan: &mut Scan<'_>) -> Walk<'a> {
         trailer_dicts,
         root_ref,
         object_streams,
+    }
+}
+
+/// Where the data of a stream start, whose dictionary ends at `end` of `data`: after
+/// the keyword `stream`, after white space and comments, and the end of line after
+/// it, if there is one; `None` where no `stream` follows.
+fn stream_data_start(data: &[u8], end: usize) -> Option<usize> {
+    let mut r = Reader::new(data);
+    r.jump(end);
+    r.skip_white_spaces_and_comments();
+    r.forward_tag(b"stream")?;
+    let _ = r
+        .forward_tag(b"\n")
+        .or_else(|| r.forward_tag(b"\r\n"))
+        .or_else(|| r.forward_tag(b"\r"));
+    Some(r.offset())
+}
+
+/// Where the walk of a rebuild goes on after the data of a stream that is a header's
+/// object, which start at `start` of `data`, `dict` its dictionary: after the
+/// `endstream` that its /Length, if a number, leads to past at most [`NEAR`] bytes of
+/// white space, as reading the stream finds its data; else after the first
+/// `endstream` from `start` on, as reading finds the data of a stream whose /Length
+/// does not lead to one. `None` where no `endstream` follows: the walk reads the data.
+///
+/// So a header or dictionary in a stream's data is not taken for one of the file's,
+/// and the walk does not read the data, most of a file. A /Length that is a reference
+/// is not resolved: the table that would resolve it is the one being rebuilt.
+fn after_stream(
+    data: &[u8],
+    start: usize,
+    dict: &Dict<'_>,
+    endstreams: &mut NextEndstream,
+) -> Option<usize> {
+    // As MuPDF repairs a table: PyMuPDF 1.28.2 finds no object whose header is in a
+    // stream's data up to where /Length leads, if it is a number leading to
+    // `endstream`, else up to the first `endstream`. Where none follows, it finds no
+    // object after the stream at all; the walk reads the data then, keeping the
+    // objects after a stream cut short.
+    let by_length = dict.get::<u32>(LENGTH).and_then(|length| {
+        let to = start.checked_add(length as usize)?;
+        let near = data.get(to..)?;
+        let white = near
+            .iter()
+            .take(NEAR)
+            .take_while(|b| is_white_space_character(**b))
+            .count();
+        opened(white + 1);
+        (white < NEAR && near[white..].starts_with(b"endstream")).then_some(to + white)
+    });
+    let endstream = match by_length {
+        Some(at) => at,
+        None => endstreams.at_or_after(data, start)?,
+    };
+    Some(endstream + b"endstream".len())
+}
+
+/// Where the first `endstream` at or after an offset of a file is, for offsets asked
+/// in rising order: each part of the file is searched once, as the one found is the
+/// first after every offset up to it.
+#[derive(Default)]
+struct NextEndstream {
+    /// The offset last searched from, and the first `endstream` found from it, if any.
+    last: Option<(usize, Option<usize>)>,
+}
+
+impl NextEndstream {
+    fn at_or_after(&mut self, data: &[u8], at: usize) -> Option<usize> {
+        match self.last {
+            Some((from, Some(found))) if from <= at && at <= found => return Some(found),
+            Some((from, None)) if from <= at => return None,
+            _ => {}
+        }
+        let found = object::stream::searched(data.get(at..)?, b"endstream").map(|i| at + i);
+        self.last = Some((at, found));
+        found
     }
 }
 
@@ -2603,7 +2692,7 @@ mod tests {
     #[test]
     fn opening_a_file_reads_it_in_linear_time() {
         type Family = (&'static str, fn(usize) -> Vec<u8>);
-        let families: [Family; 23] = [
+        let families: [Family; 26] = [
             // Entries at each `0` of `0…09 0 obj`: each reads a header in its slot of
             // one byte, which the next `0` ends, not on to `obj`.
             ("entries in the zeros of a header", |n| {
@@ -2700,6 +2789,29 @@ mod tests {
                 }
                 catalog.extend(b">> >>\nendobj\n");
                 file_with(&catalog, &[], true)
+            }),
+            // Streams that are headers' objects, whose data no `endstream` ends: the
+            // first search for one reads to the end of the file, once for them all.
+            ("streams that do not end", |n| {
+                repeated("5 0 obj << /Length 1 >> stream\n", n)
+            }),
+            // Streams whose /Length leads into one long run of white space, with no
+            // `endstream` after it: each reads a bounded part of the run.
+            ("streams whose length leads into white space", |n| {
+                let unit = "5 0 obj << /Length 0000000000 >> stream\n";
+                let length = unit.len() * n;
+                let units = unit
+                    .replace("0000000000", &format!("{length:010}"))
+                    .repeat(n);
+                around(&format!("{units}{}", " ".repeat(length + 100)))
+            }),
+            // Streams, each holding a header, whose /Length is a reference and whose
+            // data end at an `endstream`: each is read past, the header unread.
+            ("streams holding headers", |n| {
+                repeated(
+                    "5 0 obj << /Length 9 0 R >> stream\n6 0 obj << >> endobj\nendstream ",
+                    n,
+                )
             }),
             // A trailer names a large catalog many times.
             ("trailers naming a large catalog", |n| {
@@ -3196,6 +3308,63 @@ mod tests {
                     "objects from {first}, offsets {into} bytes into their headers"
                 );
             }
+        }
+    }
+
+    // A rebuild takes no header in a stream's data for one of the file's, where the
+    // data end at the `endstream` /Length leads to, or else at the first one, as
+    // PyMuPDF 1.28.2 does; it finds one after that `endstream`, and one in data that
+    // no `endstream` ends, as the walk reads such data.
+    #[test]
+    fn a_rebuild_takes_no_header_in_a_streams_data_for_the_files() {
+        let header = "9 0 obj\n<< /Type /Font >>\nendobj\n";
+        let length = header.len();
+        let cases = [
+            (
+                format!("<< /Length {length} >>\nstream\n{header}\nendstream"),
+                false,
+            ),
+            (
+                format!("<< /Length 5 0 R >>\nstream\n{header}\nendstream"),
+                false,
+            ),
+            (
+                format!("<< /Length 1 >>\nstream\n{header}\nendstream"),
+                false,
+            ),
+            (format!("<< >>\nstream\n{header}\nendstream"), false),
+            (
+                format!("<< /Length 1 >>\nstream\nx\nendstream\n{header}\nendstream"),
+                true,
+            ),
+            (format!("<< /Length {length} >>\nstream\n{header}"), true),
+        ];
+        for (object, found) in cases {
+            let body = format!("4 0 obj\n{object}\nendobj\n5 0 obj\n{length}\nendobj\n");
+            let pdf = crate::Pdf::new(file_with(body.as_bytes(), &[0], true)).unwrap();
+            assert_eq!(pdf.xref().has_entry(id(9)), found, "{object}");
+            assert!(pdf.xref().has_entry(id(5)), "{object}");
+        }
+    }
+
+    // A rebuild does not lex a stream's data: opening a file that is mostly the data
+    // of a stream full of numbers and headers lexes a bounded part of it, however
+    // long the data ([`crate::work::EXAMINED`]).
+    #[test]
+    fn a_rebuild_does_not_lex_a_streams_data() {
+        for n in [1024, 4096] {
+            let data = "12 0 obj [1 0 R] ".repeat(n);
+            let stream = format!(
+                "4 0 obj\n<< /Length {} >>\nstream\n{data}\nendstream\nendobj\n",
+                data.len()
+            );
+            work(&file_with(stream.as_bytes(), &[0], true));
+            let lexed = crate::work::EXAMINED.get();
+            assert!(
+                lexed < 4096,
+                "{lexed} bytes lexed to open {} bytes",
+                stream.len()
+            );
         }
     }
 
