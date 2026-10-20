@@ -215,6 +215,52 @@ fn whole_flate_decoding_allocates_with_its_output() {
     assert!(used.peak < 2 * POLL_BYTES, "{used:?}");
 }
 
+/// A grayscale baseline JPEG of `width` by `height` gray pixels, each block coded in
+/// two bits, its frame declaring height 0 and a DNL marker after the scan giving it.
+fn dnl_jpeg(width: u16, height: u16) -> Vec<u8> {
+    let mut jpeg = vec![0xff, 0xd8, 0xff, 0xdb, 0, 67, 0];
+    jpeg.extend([1; 64]);
+    jpeg.extend([0xff, 0xc0, 0, 11, 8, 0, 0]);
+    jpeg.extend(width.to_be_bytes());
+    jpeg.extend([1, 1, 0x11, 0]);
+    // One code of one bit for each table: DC difference 0, end of block.
+    for class in [0x00, 0x10] {
+        jpeg.extend([0xff, 0xc4, 0, 20, class, 1]);
+        jpeg.extend([0; 16]);
+    }
+    jpeg.extend([0xff, 0xda, 0, 8, 1, 1, 0, 0, 63, 0]);
+    let blocks = usize::from(width.div_ceil(8)) * usize::from(height.div_ceil(8));
+    jpeg.extend(vec![0; (2 * blocks).div_ceil(8)]);
+    jpeg.extend([0xff, 0xdc, 0, 4]);
+    jpeg.extend(height.to_be_bytes());
+    jpeg.extend([0xff, 0xd9]);
+    jpeg
+}
+
+/// A JPEG frame of height 0, whose height a DNL marker after the scan gives, decodes
+/// with its output allocated for the image the dictionary declares, not for the
+/// decoder's height limit, which its own width could fill with gigabytes.
+#[test]
+fn a_dnl_frame_is_allocated_as_the_declared_image() {
+    let (width, height) = (64, 64);
+    let data = dnl_jpeg(width, height);
+    let pdf = stream_file(&format!("/Filter /DCTDecode /Length {}", data.len()), &data);
+    let stream = object_3(&pdf);
+    let params = ImageDecodeParams {
+        width: width.into(),
+        height: height.into(),
+        num_components: Some(1),
+        ..Default::default()
+    };
+    let (result, used) = measure(|| stream.decoded_image(&params).unwrap());
+    let image = result.image_data.unwrap();
+    assert_eq!((image.width, image.height), (64, 64));
+    assert_eq!(result.data, vec![128; 64 * 64]);
+    // The image and the decoder's own state, about 30 KiB whatever the image; the
+    // decoder's default limit of 16,384 rows would take 1 MiB here.
+    assert!(used.peak < 64 * 64 + (64 << 10), "{used:?}");
+}
+
 fn assert_cancelled(name: &str, stream: &Stream<'_>) {
     let params = ImageDecodeParams {
         width: 100_000,
