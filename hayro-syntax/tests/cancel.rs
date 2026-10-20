@@ -166,6 +166,11 @@ fn whole_decoding_is_cancelled_within_bounded_work() {
             vec![0xff; 50],
         ),
         (
+            "CCITT narrow white lines",
+            "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 30000 /Rows 400 >>".into(),
+            vec![0xff; 50],
+        ),
+        (
             // Horizontal mode with a white and a black run of 0, then a line
             // ended by a vertical code and an EOFB.
             "CCITT codes writing nothing",

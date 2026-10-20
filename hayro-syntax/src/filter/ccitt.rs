@@ -8,28 +8,40 @@ use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use hayro_ccitt::{DecodeSettings, Decoder, DecoderContext, EncodingMode};
 
-/// Appends `count` copies of `byte` to `output`, a counted piece at a time; stops
-/// appending once `meter`'s hook asks to stop. The output is grown to the `declared`
-/// bytes divided by a power of eight, the least that holds the next piece: no more
-/// than eight times what it holds with that piece, so a stream cut short or stopped
-/// costs what it decoded, not what `Rows` and `Columns` declare, while the last
-/// growth to the declared size copies an eighth of it. Past the declared size, or
-/// without one, it doubles.
+/// Makes room in `output` for `needed` bytes: it grows to the `declared` bytes
+/// divided by eight as often as that leaves room for them, and no further once they
+/// are at most [`POLL_BYTES`]. It so holds less than eight times `needed`, or at most
+/// `POLL_BYTES`: a stream cut short or stopped costs what it decoded, not what `Rows`
+/// and `Columns` declare, while the last growth to the declared size copies an eighth
+/// of it. Past the declared size, or without one, it doubles.
+#[inline(always)]
+fn reserve(output: &mut Vec<u8>, needed: usize, declared: usize) {
+    if needed > output.capacity() {
+        grow_to(output, needed, declared);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn grow_to(output: &mut Vec<u8>, needed: usize, declared: usize) {
+    let mut target = declared;
+    while target > POLL_BYTES && target / 8 >= needed {
+        target /= 8;
+    }
+    if target < needed {
+        target = needed.max(2 * output.len());
+    }
+    output.reserve_exact(target - output.len());
+}
+
+/// Appends `count` copies of `byte` to `output`, a counted piece at a time, with room
+/// made as in [`reserve`]; stops appending once `meter`'s hook asks to stop.
 fn push_counted(output: &mut Vec<u8>, byte: u8, count: usize, declared: usize, meter: &Meter<'_>) {
     let mut left = count;
     while left > 0 && !meter.cancelled() {
         let n = left.min(POLL_BYTES);
         let needed = output.len() + n;
-        if needed > output.capacity() {
-            let mut target = declared;
-            while target / 8 >= needed {
-                target /= 8;
-            }
-            if target < needed {
-                target = needed.max(2 * output.len());
-            }
-            output.reserve_exact(target - output.len());
-        }
+        reserve(output, needed, declared);
         output.resize(needed, byte);
         left -= n;
         let _ = meter.work(n);
@@ -50,8 +62,37 @@ fn grow(output: &mut Vec<u8>, end: usize, declared: usize, white: u8, meter: &Me
     output.len() >= end
 }
 
+/// Like [`grow`], but fills all the room made with white, so that the rows that
+/// follow are written into it without growing `output` row by row.
+#[cold]
+#[inline(never)]
+fn grow_room(
+    output: &mut Vec<u8>,
+    end: usize,
+    declared: usize,
+    white: u8,
+    meter: &Meter<'_>,
+) -> bool {
+    reserve(output, end, declared);
+    let room = output.capacity();
+    grow(output, room, declared, white, meter);
+    output.len() >= end
+}
+
 /// White pixels a stream that ends early is padded with whatever it decoded.
 const MIN_WHITE_PAD: usize = 1 << 16;
+
+/// The widest row, in pixels, that is written whole into white room made ahead of
+/// it ([`grow_room`]) and then counted at once ([`row_work`]): at most one and a half
+/// times as much, which stays within [`POLL_BYTES`].
+const WHOLE_ROW: usize = POLL_BYTES / 2;
+
+/// The work of writing the black spans `changes` gives over a white row of `bytes`:
+/// at most the row's bytes, and a step per span, counted without going through them.
+#[inline(always)]
+fn row_work(bytes: usize, changes: &[u32]) -> usize {
+    bytes + changes.len().div_ceil(2)
+}
 
 /// The data decoded, its work counted on `meter`; `None` once its hook asks to stop.
 pub(crate) fn decode(
@@ -112,6 +153,47 @@ pub(crate) fn decode(
             fn push_row(&mut self, changes: &[u32]) {
                 let start = self.decoded_rows as usize * self.stride;
                 let end = start + self.stride;
+
+                if self.columns as usize <= WHOLE_ROW {
+                    // Rows pushed after a stop, until the decoder asks again, cost nothing.
+                    if self.meter.cancelled()
+                        || end > self.output.len()
+                            && !grow_room(
+                                &mut self.output,
+                                end,
+                                self.declared,
+                                self.white,
+                                self.meter,
+                            )
+                    {
+                        return;
+                    }
+
+                    let row = &mut self.output[start..end];
+
+                    for (start, end) in black_spans(changes, self.columns) {
+                        let (first, last) = (start / 8, (end - 1) / 8);
+                        let first_mask = 0xFF_u8 >> (start % 8);
+                        let last_mask = 0xFF_u8 << (7 - (end - 1) % 8);
+
+                        if first == last {
+                            row[first] ^= first_mask & last_mask;
+                        } else {
+                            row[first] ^= first_mask;
+                            row[last] ^= last_mask;
+                            fill_short(&mut row[first + 1..last], !self.white);
+                        }
+                    }
+
+                    if let Some(last) = row.last_mut() {
+                        *last &= self.last_byte_mask;
+                    }
+
+                    if self.meter.work(row_work(self.stride, changes)).is_ok() {
+                        self.decoded_rows += 1;
+                    }
+                    return;
+                }
 
                 if !grow(&mut self.output, end, self.declared, self.white, self.meter) {
                     return;
@@ -193,6 +275,33 @@ pub(crate) fn decode(
                 let start = self.decoded_rows as usize * self.columns as usize;
                 let end = start + self.columns as usize;
 
+                if self.columns as usize <= WHOLE_ROW {
+                    // Rows pushed after a stop, until the decoder asks again, cost nothing.
+                    if self.meter.cancelled()
+                        || end > self.output.len()
+                            && !grow_room(
+                                &mut self.output,
+                                end,
+                                self.declared,
+                                self.white,
+                                self.meter,
+                            )
+                    {
+                        return;
+                    }
+
+                    let row = &mut self.output[start..end];
+
+                    for (start, end) in black_spans(changes, self.columns) {
+                        fill_short(&mut row[start..end], !self.white);
+                    }
+
+                    if self.meter.work(row_work(row.len(), changes)).is_ok() {
+                        self.decoded_rows += 1;
+                    }
+                    return;
+                }
+
                 if !grow(&mut self.output, end, self.declared, self.white, self.meter) {
                     return;
                 }
@@ -228,6 +337,10 @@ pub(crate) fn decode(
         if result.is_err() && decoder.decoded_rows == 0 || meter.cancelled() {
             return None;
         }
+
+        decoder
+            .output
+            .truncate(decoder.decoded_rows as usize * columns as usize);
 
         // Rows a stream that ends early leaves out are white, while padding them takes
         // no more than the rows decoded (or a small image); otherwise the image ends
