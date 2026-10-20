@@ -6,7 +6,7 @@ use crate::font::{Font, FontData, FontQuery, StandardFont};
 use crate::interpret::path::{
     close_path, end_path, fill_path, fill_path_impl, fill_stroke_path, stroke_path,
 };
-use crate::interpret::state::{TextStateFont, handle_gs};
+use crate::interpret::state::{TextClip, TextStateFont, convert_dash_array, handle_gs};
 use crate::interpret::text::TextRenderingMode;
 use crate::pattern::{Pattern, ShadingPattern};
 use crate::shading::Shading;
@@ -465,12 +465,7 @@ pub fn interpret<'a>(
             }
             TypedInstruction::DashPattern(p) => {
                 context.stroke_props_mut().dash_offset = p.1.as_f32();
-                // kurbo apparently cannot properly deal with offsets that are exactly 0.
-                context.stroke_props_mut().dash_array =
-                    p.0.items::<f32>()
-                        .map_while(|n| n)
-                        .map(|n| if n == 0.0 { 0.01 } else { n })
-                        .collect();
+                context.stroke_props_mut().dash_array = convert_dash_array(p.0);
             }
             TypedInstruction::RenderingIntent(_) => {
                 // Ignore for now.
@@ -557,15 +552,18 @@ pub fn interpret<'a>(
                 context.text_state_mut().text_matrix = m;
             }
             TypedInstruction::EndText(_) => {
-                let has_outline = context.text_state().clip_paths.segments().next().is_some();
+                if !context.text_state().clip_paths.is_empty() {
+                    let clip_path = context.text_state().clip_paths.path();
+                    let has_outline = clip_path.segments().next().is_some();
 
-                if has_outline {
-                    let clip_path = context.ctm() * context.text_state().clip_paths.clone();
+                    if has_outline {
+                        let clip_path = context.ctm() * clip_path;
 
-                    context.push_clip_path(clip_path, FillRule::NonZero, device);
+                        context.push_clip_path(clip_path, FillRule::NonZero, device);
+                    }
+
+                    context.text_state_mut().clip_paths = TextClip::default();
                 }
-
-                context.text_state_mut().clip_paths.truncate(0);
             }
             TypedInstruction::TextFont(t) => {
                 let name = t.0;

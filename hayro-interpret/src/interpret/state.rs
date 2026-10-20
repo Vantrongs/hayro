@@ -14,8 +14,11 @@ use hayro_syntax::object::dict::keys::{FONT, SMASK, TR, TR2};
 use hayro_syntax::object::{Array, Dict, Name, Number, Object};
 use hayro_syntax::page::Resources;
 use kurbo::{Affine, BezPath, Vec2};
-use smallvec::smallvec;
+use smallvec::{SmallVec, smallvec};
+use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
+use std::rc::Rc;
+use std::sync::Arc;
 
 /// A transfer function.
 #[derive(Clone, Debug)]
@@ -137,7 +140,67 @@ pub(crate) struct TextState<'a> {
 
     // When setting the text rendering mode to `clip`, the glyphs should instead be collected
     // as paths and then applied as 1 single clip path. This field stores those clip paths.
-    pub(crate) clip_paths: BezPath,
+    pub(crate) clip_paths: TextClip,
+}
+
+/// The glyph outlines a text object has gathered to clip by at its end, one path per
+/// glyph run, shared by the copies of the text state that hold them: a copy, which a
+/// Type 3 glyph and the first change of the text state after a `q` take, costs the
+/// same however many glyphs clip, and a run adds its outlines without copying the
+/// others.
+#[derive(Clone, Default)]
+pub(crate) struct TextClip(Option<Rc<ClipRun>>);
+
+struct ClipRun {
+    path: BezPath,
+    before: TextClip,
+}
+
+impl TextClip {
+    /// Adds the outlines of a glyph run after those gathered.
+    pub(crate) fn push(&mut self, path: BezPath) {
+        if path.elements().is_empty() {
+            return;
+        }
+        let before = std::mem::take(self);
+        self.0 = Some(Rc::new(ClipRun { path, before }));
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+
+    /// The outlines gathered, in the order their runs were shown.
+    pub(crate) fn path(&self) -> BezPath {
+        let mut runs = Vec::new();
+        let mut next = self.0.as_deref();
+        while let Some(run) = next {
+            runs.push(&run.path);
+            next = run.before.0.as_deref();
+        }
+        let mut path = BezPath::with_capacity(runs.iter().map(|r| r.elements().len()).sum());
+        for run in runs.into_iter().rev() {
+            path.extend(run.elements().iter().copied());
+        }
+        path
+    }
+}
+
+impl Debug for TextClip {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TextClip").field(&self.path()).finish()
+    }
+}
+
+impl Drop for TextClip {
+    // Drops the runs no other copy holds one after another, where each dropping the
+    // one before it would recurse once per run.
+    fn drop(&mut self) {
+        let mut next = self.0.take();
+        while let Some(run) = next {
+            next = Rc::into_inner(run).and_then(|mut run| run.before.0.take());
+        }
+    }
 }
 
 impl<'a> TextState<'a> {
@@ -233,7 +296,7 @@ impl Default for TextState<'_> {
             text_matrix: Affine::IDENTITY,
             text_line_matrix: Affine::IDENTITY,
             rise: 0.0,
-            clip_paths: BezPath::default(),
+            clip_paths: TextClip::default(),
         }
     }
 }
@@ -383,18 +446,29 @@ pub(crate) fn handle_gs_single<'a>(
             let dash_phase = iter.next()??.into_number()?.as_f32();
 
             context.stroke_props_mut().dash_offset = dash_phase;
-            context.stroke_props_mut().dash_array = dash_array
-                .items::<f32>()
-                .map_while(|n| n)
-                // kurbo apparently cannot properly deal with offsets that are exactly 0.
-                .map(|n| if n == 0.0 { 0.01 } else { n })
-                .collect();
+            context.stroke_props_mut().dash_array = convert_dash_array(&dash_array);
         }
         "Type" => {}
         _ => {}
     }
 
     Some(())
+}
+
+/// The dash array of the `d` operator or the `D` entry of a graphics state.
+pub(crate) fn convert_dash_array(array: &Array<'_>) -> Arc<[f32]> {
+    let dashes: SmallVec<[f32; 4]> = array
+        .items::<f32>()
+        .map_while(|n| n)
+        // kurbo apparently cannot properly deal with offsets that are exactly 0.
+        .map(|n| if n == 0.0 { 0.01 } else { n })
+        .collect();
+    // An empty array shares one allocation for all; another is copied once.
+    if dashes.is_empty() {
+        Arc::default()
+    } else {
+        Arc::from(dashes.as_slice())
+    }
 }
 
 fn convert_blend_mode(name: &str) -> Option<BlendMode> {
@@ -419,4 +493,37 @@ fn convert_blend_mode(name: &str) -> Option<BlendMode> {
     };
 
     Some(bm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TextClip;
+    use kurbo::{BezPath, Shape};
+
+    #[test]
+    fn a_text_clip_keeps_its_runs_in_order_and_copies_share_them() {
+        let a = kurbo::Rect::new(0.0, 0.0, 1.0, 1.0).to_path(0.1);
+        let b = kurbo::Rect::new(2.0, 0.0, 3.0, 1.0).to_path(0.1);
+        let mut clip = TextClip::default();
+        clip.push(a.clone());
+        let copy = clip.clone();
+        clip.push(BezPath::new());
+        clip.push(b.clone());
+        let mut both = a.clone();
+        both.extend(b);
+        assert_eq!(clip.path(), both);
+        assert_eq!(copy.path(), a);
+    }
+
+    #[test]
+    fn a_text_clip_of_many_runs_drops_without_recursing() {
+        let run = kurbo::Rect::new(0.0, 0.0, 1.0, 1.0).to_path(0.1);
+        let mut clip = TextClip::default();
+        for _ in 0..1_000_000 {
+            clip.push(run.clone());
+        }
+        let copy = clip.clone();
+        drop(clip);
+        drop(copy);
+    }
 }

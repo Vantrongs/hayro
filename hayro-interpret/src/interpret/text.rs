@@ -134,7 +134,7 @@ pub(crate) fn show_glyph_run<'a>(ctx: &mut Context<'a>, device: &mut impl Device
     };
 
     if let Some(clip_path) = clip_path {
-        ctx.text_state_mut().clip_paths.extend(clip_path);
+        ctx.text_state_mut().clip_paths.push(clip_path);
     }
 
     ctx.glyph_scratch.clear();

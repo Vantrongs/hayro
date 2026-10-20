@@ -8,6 +8,7 @@ use crate::x_object::soft_mask::SoftMask;
 use hayro_syntax::object::Stream;
 use kurbo::{Affine, BezPath, Cap, Join};
 use smallvec::{SmallVec, smallvec};
+use std::sync::Arc;
 
 /// A clip path.
 #[derive(Debug, Clone)]
@@ -366,8 +367,9 @@ pub struct StrokeProps {
     pub line_join: Join,
     /// The miter limit.
     pub miter_limit: f32,
-    /// The dash array.
-    pub dash_array: SmallVec<[f32; 4]>,
+    /// The dash array, shared by the copies of the graphics state that hold it, so
+    /// that a copy costs the same however long the array is.
+    pub dash_array: Arc<[f32]>,
     /// The dash offset.
     pub dash_offset: f32,
 }
@@ -379,7 +381,7 @@ impl Default for StrokeProps {
             line_cap: Cap::Butt,
             line_join: Join::Miter,
             miter_limit: 10.0,
-            dash_array: smallvec![],
+            dash_array: Arc::default(),
             dash_offset: 0.0,
         }
     }
