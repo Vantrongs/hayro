@@ -9,35 +9,43 @@ use alloc::vec::Vec;
 use hayro_ccitt::{DecodeSettings, Decoder, DecoderContext, EncodingMode};
 
 /// Appends `count` copies of `byte` to `output`, a counted piece at a time; stops
-/// appending once `meter`'s hook asks to stop.
-fn push_counted(output: &mut Vec<u8>, byte: u8, count: usize, meter: &Meter<'_>) {
+/// appending once `meter`'s hook asks to stop. Room is made for the rest of the
+/// `declared` bytes, but at most for seven times what is held with the next piece,
+/// as flate grows its output: the output holds at most eight times what was written
+/// and a piece, so a stream cut short or stopped costs what it decoded, not what
+/// `Rows` and `Columns` declare, and a long one is reallocated a few times rather
+/// than at every doubling.
+fn push_counted(output: &mut Vec<u8>, byte: u8, count: usize, declared: usize, meter: &Meter<'_>) {
     let mut left = count;
     while left > 0 && !meter.cancelled() {
         let n = left.min(POLL_BYTES);
-        output.resize(output.len() + n, byte);
+        let held = output.len();
+        if held + n > output.capacity() {
+            let rest = declared.saturating_sub(held);
+            let room = if rest >= n {
+                rest.min(held.max(n).saturating_mul(7))
+            } else {
+                held.max(n)
+            };
+            output.reserve_exact(room);
+        }
+        output.resize(held + n, byte);
         left -= n;
         let _ = meter.work(n);
     }
 }
 
 /// Grows `output` with white rows up to `end`, the end of the row about to be
-/// written, counted on `meter`; `false`, with the row left out, once its hook asks
-/// to stop. The output grows with the rows decoded: room is made for the rest of the
-/// `declared` bytes, but at most for seven times what is held with the new row, so a
-/// stream cut short costs at most eight times what it decoded, not what `Rows`
-/// declares, and a long one is reallocated a few times rather than at every doubling.
+/// written, counted on `meter` (see [`push_counted`]); `false`, with the row left
+/// out, once its hook asks to stop.
 fn grow(output: &mut Vec<u8>, end: usize, declared: usize, white: u8, meter: &Meter<'_>) -> bool {
-    if end > output.capacity() {
-        let (held, row) = (output.len(), end - output.len());
-        let rest = declared.saturating_sub(held);
-        let room = if rest >= row {
-            rest.min(held.max(row).saturating_mul(7))
-        } else {
-            held.max(row)
-        };
-        output.reserve_exact(room);
-    }
-    push_counted(output, white, end.saturating_sub(output.len()), meter);
+    push_counted(
+        output,
+        white,
+        end.saturating_sub(output.len()),
+        declared,
+        meter,
+    );
     output.len() >= end
 }
 
@@ -223,7 +231,7 @@ pub(crate) fn decode(
         // with the rows decoded, as one whose data breaks off does.
         let missing = output_len.saturating_sub(decoder.output.len());
         if result.is_ok() && rows != 0 && missing <= decoder.output.len().max(MIN_WHITE_PAD) {
-            push_counted(&mut decoder.output, white, missing, meter);
+            push_counted(&mut decoder.output, white, missing, output_len, meter);
             if meter.cancelled() {
                 return None;
             }

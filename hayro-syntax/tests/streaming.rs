@@ -2,7 +2,7 @@
 //! with the data read, not with what the dictionary declares or the stream holds.
 
 use hayro_syntax::Pdf;
-use hayro_syntax::object::stream::ImageDecodeParams;
+use hayro_syntax::object::stream::{DecodeFailure, ImageDecodeParams};
 use hayro_syntax::object::stream::{DecodedReader, ReadError};
 use hayro_syntax::object::{ObjectIdentifier, Stream};
 use hayro_syntax::work::{Cancelled, Meter, POLL_BYTES};
@@ -346,5 +346,30 @@ fn a_ccitt_stream_cut_short_holds_a_multiple_of_its_rows() {
         let (decoded, held) = measure(|| stream.decoded_image(&params).unwrap().data.len());
         assert_eq!(decoded, 8 * row);
         assert!(held.peak <= 8 * 9 * row, "{held:?}");
+    }
+}
+
+/// A CCITT row declared as wide as `Columns` allows is written a counted piece at a
+/// time, with room made for what was written: a stop asked for at the first poll
+/// ends it holding a few pieces, not the row.
+#[test]
+fn a_wide_ccitt_row_is_stopped_before_room_is_made_for_it() {
+    // One white row, a bit against the white row above, then the end of data.
+    let data = [0x80, 0x00, 0x10, 0x01];
+    let stop = || true;
+    for is_indexed in [false, true] {
+        let pdf = stream_file(
+            "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 4294967294 /Rows 65535 >>",
+            &data,
+        );
+        let stream = object_3(&pdf);
+        let params = ImageDecodeParams {
+            is_indexed,
+            ..Default::default()
+        };
+        let meter = Meter::new(Some(&stop));
+        let (result, held) = measure(|| stream.decoded_image_metered(&params, &meter).err());
+        assert!(matches!(result, Some(DecodeFailure::Cancelled)), "{result:?}");
+        assert!(held.peak <= 8 * POLL_BYTES + 4096, "{held:?}");
     }
 }
