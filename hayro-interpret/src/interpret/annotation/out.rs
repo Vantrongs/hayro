@@ -562,6 +562,44 @@ impl Region {
         if s.is_nan() { f64::INFINITY } else { s }
     }
 
+    /// Whether a subpath of `extent`, its points computed as `local` says, painting
+    /// `reach` beyond them, may paint in what shows grown ([`Self::may_show`] of the
+    /// corners of its box grown by `reach`): what [`Out`] tests each subpath it
+    /// paints by.
+    pub(super) fn paints(&self, extent: &Extent, reach: f64, local: Rounding) -> Option<f64> {
+        self.may_show(&extent.corners(reach), 0.0, local)
+    }
+
+    /// The bits of every number that decides what may show in it: equal keys tell
+    /// every piece alike.
+    pub(super) fn key(&self) -> Vec<u64> {
+        let mut key = vec![];
+        match &self.shown {
+            None => key.push(0),
+            Some(shown) => {
+                key.push(1 + shown.len() as u64);
+                key.extend(shown.iter().flat_map(|p| [p.x.to_bits(), p.y.to_bits()]));
+            }
+        }
+        key.extend([self.grow, self.tolerance, self.chain_count].map(f64::to_bits));
+        for m in [self.ctm, self.abs, self.chain] {
+            key.extend(m.as_coeffs().map(f64::to_bits));
+        }
+        key
+    }
+
+    /// Whether what `part` may paint may show in what shows grown.
+    pub(super) fn shows(&self, part: &Part) -> bool {
+        match part {
+            Part::Anywhere => !self.is_empty(),
+            Part::Near {
+                points,
+                reach,
+                local,
+            } => self.may_show(points, *reach, *local).is_some(),
+        }
+    }
+
     /// Whether the convex hull of `points`, in the current space, may come within
     /// `reach` of what shows grown, `reach` measured in the current space, wherever
     /// a viewer puts it ([`Self::may_show`]): true when it does; it may be true
@@ -774,38 +812,50 @@ struct Frame {
     written: bool,
 }
 
-/// A subpath of the path being built: its text, its points and their box in the
-/// current space, and whether a number of it cannot be written.
-struct Subpath {
-    text: String,
-    /// Its finite points, control points included, whose hull holds it: a clip
-    /// cuts what shows by that hull, not by the box, which a turned clip overfills.
-    points: Vec<Point>,
+/// The box of a subpath's points as a viewer reads them, and whether one of them is
+/// no finite number, whose place cannot be told: what decides whether the subpath
+/// may paint where the page shows it ([`Region::paints`]). A generator that walks a
+/// shared array once for many annotations tells its pieces by this, as [`Out`]
+/// tells what it writes.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Extent {
     lo: Point,
     hi: Point,
-    /// Whether a point of it is no finite number, whose place cannot be told.
     lost: bool,
-    failed: bool,
-    /// How its points were computed.
-    rounding: Rounding,
 }
 
-impl Subpath {
-    fn new() -> Self {
-        Self {
-            text: String::new(),
-            points: vec![],
-            lo: Point::new(f64::INFINITY, f64::INFINITY),
-            hi: Point::new(f64::NEG_INFINITY, f64::NEG_INFINITY),
-            lost: false,
-            failed: false,
-            rounding: Rounding::NONE,
+impl Extent {
+    /// Of no point.
+    const NONE: Self = Self {
+        lo: Point::new(f64::INFINITY, f64::INFINITY),
+        hi: Point::new(f64::NEG_INFINITY, f64::NEG_INFINITY),
+        lost: false,
+    };
+
+    /// Of a subpath of `points`, each written as [`Out::nums`] writes it.
+    pub(super) fn written(points: impl IntoIterator<Item = Point>) -> Self {
+        let mut extent = Self::NONE;
+        for p in points {
+            extent.add(Point::new(as_written(p.x), as_written(p.y)));
         }
+        extent
     }
 
+    /// The largest magnitude of a coordinate of it; 0 for none, infinite where a
+    /// point of it is no finite number.
+    pub(super) fn size(&self) -> f64 {
+        if self.lost {
+            return f64::INFINITY;
+        }
+        [self.lo.x, self.lo.y, self.hi.x, self.hi.y]
+            .iter()
+            .filter(|v| v.is_finite())
+            .fold(0.0, |m: f64, v| m.max(v.abs()))
+    }
+
+    /// With `p`, as written.
     fn add(&mut self, p: Point) {
         if p.is_finite() {
-            self.points.push(p);
             self.lo = Point::new(self.lo.x.min(p.x), self.lo.y.min(p.y));
             self.hi = Point::new(self.hi.x.max(p.x), self.hi.y.max(p.y));
         } else {
@@ -827,6 +877,38 @@ impl Subpath {
             self.hi + Vec2::new(reach, reach),
         );
         vec![lo, Point::new(hi.x, lo.y), hi, Point::new(lo.x, hi.y)]
+    }
+}
+
+/// A subpath of the path being built: its text, its points and their extent in the
+/// current space, and whether a number of it cannot be written.
+struct Subpath {
+    text: String,
+    /// Its finite points, control points included, whose hull holds it: a clip
+    /// cuts what shows by that hull, not by the box, which a turned clip overfills.
+    points: Vec<Point>,
+    extent: Extent,
+    failed: bool,
+    /// How its points were computed.
+    rounding: Rounding,
+}
+
+impl Subpath {
+    fn new() -> Self {
+        Self {
+            text: String::new(),
+            points: vec![],
+            extent: Extent::NONE,
+            failed: false,
+            rounding: Rounding::NONE,
+        }
+    }
+
+    fn add(&mut self, p: Point) {
+        if p.is_finite() {
+            self.points.push(p);
+        }
+        self.extent.add(p);
     }
 }
 
@@ -1004,6 +1086,16 @@ impl Out {
         self.state.region.clone()
     }
 
+    /// How far beyond its points a subpath painted now paints: as far as a stroke
+    /// of the line width set reaches ([`stroke_reach`]), or nothing for a fill.
+    pub(super) fn reach(&self, stroke: bool) -> f64 {
+        if stroke {
+            stroke_reach(self.state.width)
+        } else {
+            0.0
+        }
+    }
+
     /// Whether the convex hull of `points`, in the current space, can paint where
     /// the page shows it ([`Region::meets`]).
     pub(super) fn meets(&self, points: &[Point]) -> bool {
@@ -1070,14 +1162,7 @@ impl Out {
 
     /// Whether what `part` may paint may show where the page shows it.
     pub(super) fn shows(&self, part: &Part) -> bool {
-        match part {
-            Part::Anywhere => !self.state.region.is_empty(),
-            Part::Near {
-                points,
-                reach,
-                local,
-            } => self.state.region.may_show(points, *reach, *local).is_some(),
-        }
+        self.state.region.shows(part)
     }
 
     /// `drew`, what drawing pieces through `Out` came to: `None` where a piece that
@@ -1213,11 +1298,7 @@ impl Out {
                 }
             }
             Kind::Paints { stroke, open } => {
-                let reach = if stroke {
-                    stroke_reach(self.state.width)
-                } else {
-                    0.0
-                };
+                let reach = self.reach(stroke);
                 let path = std::mem::take(&mut self.path);
                 let n = path.len();
                 let region = &self.state.region;
@@ -1226,7 +1307,7 @@ impl Out {
                     .into_iter()
                     .enumerate()
                     .filter(|(_, p)| {
-                        match region.may_show(&p.corners(reach), 0.0, p.rounding) {
+                        match region.paints(&p.extent, reach, p.rounding) {
                             None => false,
                             Some(r) => {
                                 // Drawn where it lies, it may be too far from where a
@@ -1464,7 +1545,7 @@ impl Out {
         let path = std::mem::take(&mut self.path);
         let mut points = vec![];
         for p in &path {
-            if p.lost {
+            if p.extent.lost {
                 points.push(Point::new(f64::NAN, f64::NAN));
             } else {
                 points.extend(&p.points);

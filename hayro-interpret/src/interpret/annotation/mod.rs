@@ -1290,8 +1290,8 @@ fn extent(subtype: &[u8], annot: &Entries<'_>) -> Option<(Vec<kurbo::Point>, f64
     let corners = |r: kurbo::Rect| around((r, 0.0));
     Some(match subtype {
         b"Square" | b"Circle" => corners(markup::shape_box(annot)?.1),
-        b"Highlight" => corners(markup::highlights(annot)?.1),
-        b"Underline" | b"StrikeOut" | b"Squiggly" => corners(markup::marked(annot)?.1),
+        b"Highlight" => corners(markup::highlights(annot)?.2),
+        b"Underline" | b"StrikeOut" | b"Squiggly" => corners(markup::marked(annot)?.2),
         b"Ink" => around(markup::ink_extent(annot)?),
         b"Text" | b"FileAttachment" | b"Sound" => {
             let (corner, s) = icons::icon_square(annot)?;

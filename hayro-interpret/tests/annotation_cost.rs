@@ -2087,6 +2087,186 @@ fn a_shared_payload_costs_each_annotation_the_same_however_long() {
     }
 }
 
+/// Annotations that share geometry of which a part may paint on the page and the
+/// rest may not each write the part that may, and walk none of the rest: each
+/// annotation added costs the same, in bytes, work and bytes looked at, whether
+/// the part off the page is short or long, and draws what it draws with that part
+/// one piece long. Cases: an `/InkList` of a short path on the page and a long one
+/// off it; `/QuadPoints` of a quad on the page between many off it, of each text
+/// markup subtype and of a redaction.
+#[test]
+fn shared_geometry_costs_each_annotation_what_it_draws() {
+    const N: usize = 40;
+    let ink = |n: usize| format!("[[20 20 80 80] [{}]]", "1000 1000 ".repeat(n));
+    let visible = "20 60 120 60 20 40 120 40";
+    let quads = |n: usize| {
+        let off = vec!["1000 1010 1010 1010 1000 1000 1010 1000"; n].join(" ");
+        format!("[{off} {visible} {off}]")
+    };
+    let many = [1_000, 40_000];
+    type Case<'a> = (&'a dyn Fn(usize) -> String, &'a str);
+    let cases: [Case<'_>; 6] = [
+        (&ink, "/Subtype /Ink /C [1 0 0] /BS << /W 1 >> /InkList"),
+        (&quads, "/Subtype /Highlight /C [1 1 0] /QuadPoints"),
+        (&quads, "/Subtype /Underline /C [0] /QuadPoints"),
+        (&quads, "/Subtype /StrikeOut /C [0] /QuadPoints"),
+        (&quads, "/Subtype /Squiggly /C [0] /QuadPoints"),
+        (&quads, "/Subtype /Redact /QuadPoints"),
+    ];
+    for (payload, annot) in cases {
+        let shared_annot = format!("{annot} 4 0 R /Rect [0 0 200 200]");
+        let added = |n: usize| {
+            let shared = [payload(n)];
+            let (one, two) = (
+                sharing_cost(N, &shared, &shared_annot),
+                sharing_cost(2 * N, &shared, &shared_annot),
+            );
+            assert_eq!(one.drew.generated, N, "{annot}");
+            assert_eq!(two.drew.generated, 2 * N, "{annot}");
+            (
+                two.bytes.saturating_sub(one.bytes),
+                two.work.saturating_sub(one.work),
+                two.examined.saturating_sub(one.examined),
+            )
+        };
+        let (short, long) = (added(many[0]), added(many[1]));
+        if std::env::var_os("COST_REPORT").is_some() {
+            println!(
+                "CASE {annot}: +{N}: {short:?} at {}, {long:?} at {}",
+                many[0], many[1]
+            );
+        }
+        // At most what drawing a zigzag costs, the same but for the allocator
+        // rounding what it grows the same tables to.
+        assert!(
+            long.0 < N * (32 << 10)
+                && long.0 <= short.0 + N * 64
+                && long.1 == short.1
+                && long.2 == short.2,
+            "{annot}: {short:?} added at {}, {long:?} at {}",
+            many[0],
+            many[1]
+        );
+        // What is drawn is what is drawn with one piece off the page, which clips
+        // the quads alike.
+        let alone = generated(&format!("{annot} {} /Rect [0 0 200 200]", payload(1)));
+        for n in many {
+            let mixed = generated(&format!("{annot} {} /Rect [0 0 200 200]", payload(n)));
+            assert_eq!(mixed, alone, "{annot} at {n}");
+        }
+    }
+}
+
+/// Ink annotations of widths each its own sharing an `/InkList` of many short paths
+/// off the page and one on it find the paths their stroke reaches by a search:
+/// each annotation added costs the same, in bytes, work and bytes looked at,
+/// whether the list holds a thousand paths or forty thousand, and draws the path
+/// on the page alone.
+#[test]
+fn ink_of_widths_each_its_own_finds_the_paths_it_reaches() {
+    const N: usize = 40;
+    let ink = |n: usize| format!("[[20 20 80 80] {}]", "[1000 1000 1001 1001] ".repeat(n));
+    let annot = |i: usize| {
+        format!("/Subtype /Ink /C [1 0 0] /BS << /W 1.{i:04} >> /InkList 4 0 R /Rect [0 0 200 200]")
+    };
+    let added = |n: usize| {
+        let shared = [ink(n)];
+        let (one, two) = (
+            cost_of(N, "", &shared, &annot),
+            cost_of(2 * N, "", &shared, &annot),
+        );
+        (two.bytes.saturating_sub(one.bytes), two.work - one.work)
+    };
+    let (short, long) = (added(1_000), added(40_000));
+    if std::env::var_os("COST_REPORT").is_some() {
+        println!("CASE ink of own widths: +{N}: {short:?} at 1000, {long:?} at 40000");
+    }
+    assert!(
+        long.0 < N * (32 << 10) && long.0 <= short.0 + N * 64 && long.1 == short.1,
+        "{short:?} added at 1,000, {long:?} at 40,000"
+    );
+    let content = generated(&annot(7).replace("4 0 R", &ink(1_000)));
+    assert_eq!(content.matches(" m\n").count(), 1, "{content}");
+}
+
+/// What is kept of the parts of shared geometry that may paint is told for the
+/// view, the width and the kind of part it was found for: annotations sharing an
+/// `/InkList`, of widths that reach the part off the page or not, and annotations
+/// of each text markup subtype and a redaction sharing `/QuadPoints`, viewed one
+/// view after another by one [`Appearances`], each look as when viewed alone.
+#[test]
+fn the_parts_that_may_paint_are_told_for_each_view_width_and_kind() {
+    let ink = "[[20 20 80 80] [1000 1000 1010 1000]]";
+    let quads = "[20 60 120 60 20 40 120 40 1000 1010 1010 1010 1000 1000 1010 1000]";
+    let annots = [
+        "/Subtype /Ink /C [1 0 0] /BS << /W 1 >> /InkList 4 0 R",
+        "/Subtype /Ink /C [1 0 0] /BS << /W 400 >> /InkList 4 0 R",
+        "/Subtype /Highlight /C [1 1 0] /QuadPoints 5 0 R",
+        "/Subtype /Underline /C [0] /QuadPoints 5 0 R",
+        "/Subtype /StrikeOut /C [0] /QuadPoints 5 0 R",
+        "/Subtype /Squiggly /C [0] /QuadPoints 5 0 R",
+        "/Subtype /Redact /QuadPoints 5 0 R",
+    ];
+    // The annotations sharing the arrays, or each holding its own.
+    let file = |shared: bool| {
+        let refs: Vec<String> = (0..annots.len())
+            .map(|i| format!("{} 0 R", 6 + i))
+            .collect();
+        let mut objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [{}] >>",
+                refs.join(" ")
+            )
+            .into_bytes(),
+            ink.as_bytes().to_vec(),
+            quads.as_bytes().to_vec(),
+        ];
+        objects.extend(annots.iter().map(|a| {
+            let a = if shared {
+                a.to_string()
+            } else {
+                a.replace("4 0 R", ink).replace("5 0 R", quads)
+            };
+            format!("<< /Type /Annot {a} /Rect [0 0 200 200] >>").into_bytes()
+        }));
+        Pdf::new(common::file(&objects, "")).expect("valid pdf")
+    };
+    fn looks<'a>(appearances: &Appearances<'a>, page: &Page<'a>, view: kurbo::Rect) -> Vec<String> {
+        let drawn = appearances.page(page, AnnotationSelection::View, &View::new(view, 1.0));
+        drawn
+            .iter()
+            .map(|d| match d.look() {
+                Look::Generated(g) => format!("{}: {}", d.index(), g.content),
+                Look::Unsupported(why) => format!("{}: {why:?}", d.index()),
+                _ => format!("{}: stream or nothing", d.index()),
+            })
+            .collect()
+    }
+    let views = [
+        PAGE,
+        kurbo::Rect::new(990.0, 990.0, 1020.0, 1020.0),
+        kurbo::Rect::new(-500.0, -500.0, 2000.0, 2000.0),
+        kurbo::Rect::new(300.0, 300.0, 500.0, 500.0),
+    ];
+    let font_resolver = || InterpreterSettings::default().font_resolver;
+    let (shared, own) = (file(true), file(false));
+    let (page, own_page) = (&shared.pages()[0], &own.pages()[0]);
+    let one = Appearances::new(shared.xref(), font_resolver());
+    let mut drew = 0;
+    for view in views.iter().chain(views.iter().rev()) {
+        let alone = looks(
+            &Appearances::new(own.xref(), font_resolver()),
+            own_page,
+            *view,
+        );
+        assert_eq!(looks(&one, page, *view), alone, "{view:?}");
+        drew += alone.len();
+    }
+    assert!(drew > 2 * annots.len(), "{drew} looks");
+}
+
 /// Stamps that share a long name read it once for the document, and set it once:
 /// those of no area, which draw nothing; those whose name is spaces, which draw
 /// their frame alone; and those whose name runs far past their box, which draw the

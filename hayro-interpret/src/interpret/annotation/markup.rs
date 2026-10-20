@@ -8,7 +8,7 @@
 
 use super::entries::{Derived, Entries, Items, Value};
 use super::out::{
-    Color, MITER_LIMIT, Out, Part, Refused, Region, Rounding, as_written, stroke_reach,
+    Color, Extent, MITER_LIMIT, Out, Part, Refused, Region, Rounding, as_written, stroke_reach,
 };
 use super::{Drew, Unsupported, border_width, c_color, color_of, dash, most_pieces, rect};
 use hayro_syntax::object::dict::keys::{C, IC, INKLIST, QUADPOINTS};
@@ -162,10 +162,12 @@ impl Derived for Quads {
     }
 }
 
-/// The quadrilaterals of `/QuadPoints` ([`Quads`]); `None` when there is no such
-/// array.
-pub(super) fn quads(annot: &Entries<'_>) -> Option<Rc<Quads>> {
-    Some(annot.items(QUADPOINTS)?.derived::<Quads>())
+/// The quadrilaterals of `/QuadPoints` ([`Quads`]), and the array; `None` when
+/// there is no such array.
+pub(super) fn quads<'a>(annot: &Entries<'a>) -> Option<(Items<'a>, Rc<Quads>)> {
+    let items = annot.items(QUADPOINTS)?;
+    let quads = items.derived::<Quads>();
+    Some((items, quads))
 }
 
 /// The width of a text markup line on `quad`: a sixteenth of its height.
@@ -178,13 +180,63 @@ fn union(boxes: impl IntoIterator<Item = Rect>) -> Option<Rect> {
     boxes.into_iter().reduce(|a, b| a.union(b))
 }
 
+/// The places of the parts of geometry made of a shared array that may paint where
+/// a page shows them ([`shown`]), in order.
+pub(super) struct Shown(pub(super) Vec<usize>);
+
+/// Which parts of an array [`shown`] tells, each drawn as its generator draws it.
+#[derive(Clone, Copy)]
+pub(super) enum Pieces {
+    Ink,
+    Highlight,
+    Under,
+    Through,
+    Squiggly,
+    Redact,
+}
+
+/// The places of the parts of what is made of `items` that may paint where
+/// `region` shows them: what `find` tells, once for the document for each array,
+/// kind of part and region ([`super::entries::Items::seen`]), so that annotations
+/// sharing the array each write those alone and walk none of the rest. Each kind
+/// of quad paints as far beyond its points as the kind and the quad alone say (a
+/// highlight's fill nothing, a redaction's outline a 1 pt stroke, a text line its
+/// own width), so that nothing else decides; an ink path as far as each
+/// annotation's stroke reaches ([`Reaches`]). `find` reads nothing: it tells what
+/// is already made of the array.
+pub(super) fn shown<T: 'static>(
+    items: &Items<'_>,
+    pieces: Pieces,
+    region: &Region,
+    find: impl FnOnce() -> T,
+) -> Rc<T> {
+    let mut by = region.key();
+    by.push(pieces as u64);
+    items.seen(by, find)
+}
+
+/// The places of the quads of `quads` whose subpath, its extent and how far beyond
+/// it it paints as `piece` gives them, may paint in `region`, as [`Out`] tells it
+/// where it paints them.
+pub(super) fn painting(
+    quads: &[Quad],
+    region: &Region,
+    piece: impl Fn(&Quad) -> (Extent, f64),
+) -> Shown {
+    let paints = |q: &Quad| {
+        let (extent, reach) = piece(q);
+        region.paints(&extent, reach, Rounding::NONE).is_some()
+    };
+    Shown((0..quads.len()).filter(|&i| paints(&quads[i])).collect())
+}
+
 /// The quadrilaterals of a text markup annotation and the box viewers clip it to: the
 /// box of each, a line width wider on each side. `None` without quadrilaterals, or
 /// when that box has no area: quadrilaterals of no height mark no text.
-pub(super) fn marked(annot: &Entries<'_>) -> Option<(Rc<Quads>, Rect)> {
-    let quads = quads(annot)?;
+pub(super) fn marked<'a>(annot: &Entries<'a>) -> Option<(Items<'a>, Rc<Quads>, Rect)> {
+    let (items, quads) = quads(annot)?;
     let clip = quads.clip?;
-    Some((quads, clip))
+    Some((items, quads, clip))
 }
 
 /// Highlight: each quad filled with /C (default yellow), blended with Multiply, its
@@ -193,13 +245,16 @@ pub(super) fn marked(annot: &Entries<'_>) -> Option<(Rc<Quads>, Rect)> {
 /// curves' control points at the origin, and so does this.
 pub(super) fn highlight(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     let fill = c_color(annot, Color::Rgb([1.0, 1.0, 0.0]));
-    let (quads, clip) = highlights(annot)?;
+    let (items, quads, clip) = highlights(annot)?;
     out.op("q");
     out.clip(clip)?;
     out.fill_color(&fill)?;
-    for q in &quads.all {
-        let [tl, tr, bl, br] = q.0;
-        let [c1, c2, c3, c4] = controls(q).unwrap_or([Point::ZERO; 4]);
+    let (region, reach) = (out.region(), out.reach(false));
+    let shown = shown(&items, Pieces::Highlight, &region, || {
+        painting(&quads.all, &region, |q| (Extent::written(bulge(q)), reach))
+    });
+    for &i in &shown.0 {
+        let [bl, c1, c2, tl, tr, c3, c4, br] = bulge(&quads.all[i]);
         out.nums(&[bl.x, bl.y], "m")?;
         out.nums(&[c1.x, c1.y, c2.x, c2.y, tl.x, tl.y], "c")?;
         out.nums(&[tr.x, tr.y], "l")?;
@@ -208,6 +263,15 @@ pub(super) fn highlight(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     }
     out.op("Q");
     Some(())
+}
+
+/// The points of the path a highlight fills on quad `q`, in order: its bottom left,
+/// the left side's control points, its top left and right, the right side's
+/// control points, its bottom right ([`highlight`]).
+fn bulge(q: &Quad) -> [Point; 8] {
+    let [tl, tr, bl, br] = q.0;
+    let [c1, c2, c3, c4] = controls(q).unwrap_or([Point::ZERO; 4]);
+    [bl, c1, c2, tl, tr, c3, c4, br]
 }
 
 /// The control points of the sides of quad `q` a highlight fills, where its
@@ -233,10 +297,10 @@ fn controls(q: &Quad) -> Option<[Point; 4]> {
 /// The quads a highlight fills and the box viewers clip them to: the box of the
 /// quads, a line width wider on each side, and of the control points; made once
 /// for the document ([`Quads`]).
-pub(super) fn highlights(annot: &Entries<'_>) -> Option<(Rc<Quads>, Rect)> {
-    let quads = quads(annot)?;
+pub(super) fn highlights<'a>(annot: &Entries<'a>) -> Option<(Items<'a>, Rc<Quads>, Rect)> {
+    let (items, quads) = quads(annot)?;
     let clip = quads.highlight?;
-    Some((quads, clip))
+    Some((items, quads, clip))
 }
 
 pub(super) enum Line {
@@ -249,16 +313,29 @@ pub(super) enum Line {
 /// sevenths of the way up each side.
 pub(super) fn text_lines(annot: &Entries<'_>, line: Line, out: &mut Out) -> Option<()> {
     let stroke = c_color(annot, Color::BLACK);
-    let (quads, clip) = marked(annot)?;
+    let (items, quads, clip) = marked(annot)?;
     out.op("q");
     out.clip(clip)?;
     out.stroke_color(&stroke)?;
-    for q in &quads.all {
+    let (f, pieces) = match line {
+        Line::Under => (1.0 / 7.0, Pieces::Under),
+        Line::Through => (3.0 / 7.0, Pieces::Through),
+    };
+    let region = out.region();
+    // Each stroked as wide as its own line, as written.
+    let shown = shown(&items, pieces, &region, || {
+        painting(&quads.all, &region, |q| {
+            let (a, b) = q.across(f);
+            (
+                Extent::written([a, b]),
+                stroke_reach(as_written(line_width(q))),
+            )
+        })
+    });
+    for &i in &shown.0 {
+        let q = &quads.all[i];
         out.stroke_state(line_width(q), &[])?;
-        let (a, b) = q.across(match line {
-            Line::Under => 1.0 / 7.0,
-            Line::Through => 3.0 / 7.0,
-        });
+        let (a, b) = q.across(f);
         out.nums(&[a.x, a.y], "m")?;
         out.nums(&[b.x, b.y], "l")?;
         out.op("S");
@@ -273,7 +350,7 @@ pub(super) fn text_lines(annot: &Entries<'_>, line: Line, out: &mut Out) -> Opti
 /// clip.
 pub(super) fn squiggly(annot: &Entries<'_>, out: &mut Out) -> Drew {
     let stroke = c_color(annot, Color::BLACK);
-    let Some((quads, clip)) = marked(annot) else {
+    let Some((items, quads, clip)) = marked(annot) else {
         return Ok(None);
     };
     out.op("q");
@@ -288,9 +365,18 @@ pub(super) fn squiggly(annot: &Entries<'_>, out: &mut Out) -> Drew {
             most: most_pieces(),
             until: None,
         };
-        // A quad of no height draws nothing ([`zigzag`]).
-        for q in &quads.high {
-            zigzag(q, &region, &mut pen, out)?;
+        // A quad of no height draws nothing ([`zigzag`]), nor one whose zigzag
+        // stays apart from `region`.
+        let high = &quads.high;
+        let drawn = shown(&items, Pieces::Squiggly, &region, || {
+            Shown(
+                (0..high.len())
+                    .filter(|&i| Zigzag::may_draw(&high[i], &region))
+                    .collect(),
+            )
+        });
+        for &i in &drawn.0 {
+            zigzag(&high[i], &region, &mut pen, out)?;
         }
     }
     out.op("Q");
@@ -341,46 +427,12 @@ pub(super) fn squiggly(annot: &Entries<'_>, out: &mut Out) -> Drew {
 /// for steps shorter than a few times what writing moves their corners, those whose
 /// joins' reach comes that close.
 fn zigzag(q: &Quad, region: &Region, pen: &mut Run, out: &mut Out) -> Result<(), Refused> {
-    let [_, _, bl, br] = q.0;
-    let width = line_width(q);
-    let delta = q.height() / 7.0;
-    // Viewers never end a zigzag of no step.
-    if delta.is_nan() || delta <= 0.0 {
-        return Ok(());
-    }
-    out.stroke_state(width, &[]);
-    let along = br - bl;
-    let len = along.hypot();
-    if len == 0.0 {
-        return Ok(());
-    }
-    let (top_left, top_right) = q.across(1.0 / 7.0);
-    let top_along = top_right - top_left;
-    // What computing a corner in 64-bit numbers can move it by.
-    let size = |v: Vec2| v.x.abs().max(v.y.abs());
-    let error = (size(bl.to_vec2()) + size(along) + size(top_left.to_vec2()) + size(top_along))
-        * f64::EPSILON
-        * 4.0;
-    let z = Zigzag {
-        bl,
-        along,
-        top_left,
-        top_along,
-        // The corners are `delta` apart along the bottom edge, at `t = k dt`.
-        dt: delta / len,
-        // Half the width as written.
-        half: as_written(width) / 2.0,
-        error,
-        lead: Vec2::new(
-            bl.x.abs().max(top_left.x.abs()),
-            bl.y.abs().max(top_left.y.abs()),
-        ),
-        step: Vec2::new(
-            along.x.abs().max(top_along.x.abs()),
-            along.y.abs().max(top_along.y.abs()),
-        ) * (delta / len),
-        region: region.clone(),
+    let (z, steps) = match Zigzag::start(q, region) {
+        Start::Nothing => return Ok(()),
+        Start::Unnumbered(part) => return out.refuse(Unsupported::Coordinates, part),
+        Start::Steps(z, steps) => (z, steps),
     };
+    out.stroke_state(line_width(q), &[]);
     // The steps `a..b`, which may paint where the page shows them, drawn as
     // viewers draw them only by steps more than this draws: refused, or left out
     // where they cannot show, the steps after them drawn as given.
@@ -390,26 +442,16 @@ fn zigzag(q: &Quad, region: &Region, pen: &mut Run, out: &mut Out) -> Result<(),
         let part = Part::near(hull.to_vec(), reach).computed(z.place(b));
         out.refuse(Unsupported::Coordinates, part)
     };
-    let steps = (len / delta).ceil();
-    if !steps.is_finite() {
-        // Steps too many to number, which no viewer tells apart: refused where the
-        // quad can show.
-        let hull = z.hull(0.0, 1.0);
-        let part = Part::near(hull.to_vec(), z.reach(z.slack(&hull)));
-        return out.refuse(Unsupported::Coordinates, part);
-    }
     pen.until = None;
     // The ranges of steps left to look at, the first last; step `k` runs from
     // corner `k` to corner `k + 1`.
     let mut ranges = vec![(0.0, steps)];
     while let Some((a, b)) = ranges.pop() {
         super::work(1);
-        let hull = z.hull(z.t(a), z.t(b));
-        let (slack, place) = (z.slack(&hull), z.place(b));
-        let near = |reach: f64| region.may_show(&hull, reach, place).is_some();
-        if !near(z.reach(slack)) || z.still(a, b) || !z.written_near(a, b) {
+        let Some((hull, slack, place)) = z.looked_at(a, b) else {
             continue;
-        }
+        };
+        let near = |reach: f64| region.may_show(&hull, reach, place).is_some();
         let moved = place.bound();
         if region.holds(&hull, slack + moved.x.max(moved.y)) {
             // Every corner as written lies in `region`: every step of some length
@@ -493,6 +535,18 @@ impl Run {
     }
 }
 
+/// What the zigzag of a quad comes to where a page shows it, before its steps are
+/// looked at ([`Zigzag::start`]).
+enum Start {
+    /// Nothing: a quad of no height or whose bottom edge has no length.
+    Nothing,
+    /// Steps too many to number, which no viewer tells apart: refused where the
+    /// part may show.
+    Unnumbered(Part),
+    /// The zigzag, and its number of steps.
+    Steps(Box<Zigzag>, f64),
+}
+
 /// A zigzag ([`zigzag`]) and what the page shows of it.
 struct Zigzag {
     bl: Point,
@@ -511,6 +565,82 @@ struct Zigzag {
 }
 
 impl Zigzag {
+    /// The zigzag of quad `q` where `region` shows it ([`Start`]).
+    fn start(q: &Quad, region: &Region) -> Start {
+        let [_, _, bl, br] = q.0;
+        let width = line_width(q);
+        let delta = q.height() / 7.0;
+        // Viewers never end a zigzag of no step.
+        if delta.is_nan() || delta <= 0.0 {
+            return Start::Nothing;
+        }
+        let along = br - bl;
+        let len = along.hypot();
+        if len == 0.0 {
+            return Start::Nothing;
+        }
+        let (top_left, top_right) = q.across(1.0 / 7.0);
+        let top_along = top_right - top_left;
+        // What computing a corner in 64-bit numbers can move it by.
+        let size = |v: Vec2| v.x.abs().max(v.y.abs());
+        let error = (size(bl.to_vec2()) + size(along) + size(top_left.to_vec2()) + size(top_along))
+            * f64::EPSILON
+            * 4.0;
+        let z = Self {
+            bl,
+            along,
+            top_left,
+            top_along,
+            // The corners are `delta` apart along the bottom edge, at `t = k dt`.
+            dt: delta / len,
+            // Half the width as written.
+            half: as_written(width) / 2.0,
+            error,
+            lead: Vec2::new(
+                bl.x.abs().max(top_left.x.abs()),
+                bl.y.abs().max(top_left.y.abs()),
+            ),
+            step: Vec2::new(
+                along.x.abs().max(top_along.x.abs()),
+                along.y.abs().max(top_along.y.abs()),
+            ) * (delta / len),
+            region: region.clone(),
+        };
+        let steps = (len / delta).ceil();
+        if !steps.is_finite() {
+            // Refused where the quad can show.
+            let hull = z.hull(0.0, 1.0);
+            return Start::Unnumbered(Part::near(hull.to_vec(), z.reach(z.slack(&hull))));
+        }
+        Start::Steps(Box::new(z), steps)
+    }
+
+    /// Whether the zigzag of quad `q` may draw a step or be refused where `region`
+    /// shows it: whether [`zigzag`] looks at anything past the range of all its
+    /// steps ([`Zigzag::looked_at`]).
+    fn may_draw(q: &Quad, region: &Region) -> bool {
+        match Self::start(q, region) {
+            Start::Nothing => false,
+            Start::Unnumbered(part) => region.shows(&part),
+            Start::Steps(z, steps) => z.looked_at(0.0, steps).is_some(),
+        }
+    }
+
+    /// The hull of the corners of the steps `a..b` ([`Zigzag::hull`]), how far
+    /// writing moves them ([`Zigzag::slack`]) and how a viewer computes the last
+    /// ([`Zigzag::place`]); `None` where none of them may paint in `region`: their
+    /// strokes and joins come nowhere near it, as computed or as written, or their
+    /// corners are one point as written.
+    fn looked_at(&self, a: f64, b: f64) -> Option<([Point; 4], f64, Rounding)> {
+        let hull = self.hull(self.t(a), self.t(b));
+        let (slack, place) = (self.slack(&hull), self.place(b));
+        let near = self
+            .region
+            .may_show(&hull, self.reach(slack), place)
+            .is_some();
+        (near && !self.still(a, b) && self.written_near(a, b)).then_some((hull, slack, place))
+    }
+
     fn t(&self, k: f64) -> f64 {
         k * self.dt
     }
@@ -895,7 +1025,8 @@ impl Join {
 pub(super) fn ink(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     let width = border_width(annot);
     let stroke = color_of(annot, C)?;
-    let paths = annot.items(INKLIST)?.derived::<Paths>();
+    let items = annot.items(INKLIST)?;
+    let paths = items.derived::<Paths>();
     if paths.0.is_empty() {
         return None;
     }
@@ -903,7 +1034,13 @@ pub(super) fn ink(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     out.stroke_state(width, &dash(annot))?;
     // Round ends and corners, as a pen draws.
     out.op("1 J 1 j");
-    for p in &paths.0 {
+    // The paths that may paint, each a subpath of the stroke; those that may not
+    // would be left out of it with nothing else changed.
+    let (region, reach) = (out.region(), out.reach(true));
+    let reaches = shown(&items, Pieces::Ink, &region, || {
+        Reaches::of(&paths.2, &region)
+    });
+    for p in reaches.paint(&paths.2, &region, reach).map(|i| &paths.0[i]) {
         out.nums(&p[..2], "m")?;
         // A path of one point is a dot.
         let rest = if p.len() < 4 { &p[..2] } else { &p[2..] };
@@ -917,6 +1054,73 @@ pub(super) fn ink(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     Some(())
 }
 
+/// Of parts told against a region, each by its extent ([`Extent`]): how far beyond
+/// its points each must paint, at the least, to paint there, the parts in that
+/// order, so that the parts that may paint as far as an annotation's stroke reaches
+/// are found for any reach by a search and a test of each found
+/// ([`Reaches::paint`]).
+struct Reaches(Vec<(f64, usize)>);
+
+impl Reaches {
+    /// Of the parts of `extents`, as told against `region`. Whether a part may paint
+    /// as [`Region::paints`] tells it only grows with the reach: the box it tests
+    /// grows with it, and so do the magnitudes that bound how far a viewer may put
+    /// it from where it lies. The reach is found by halving: the most at which it
+    /// does not paint, within 1/4096 of it, less a margin for what computing in
+    /// 64-bit numbers moves; `-∞` where it paints at no reach, and the most a stroke
+    /// written as a number reaches where it paints at none of those.
+    fn of(extents: &[Extent], region: &Region) -> Self {
+        let below = |e: &Extent| {
+            let paints = |reach: f64| region.paints(e, reach, Rounding::NONE).is_some();
+            if paints(0.0) {
+                return f64::NEG_INFINITY;
+            }
+            // A stroke reaches no farther than this but where it is wider than a
+            // 32-bit number, which is written as none, and reaches everywhere;
+            // up to this, no number told overflows.
+            const MOST: f64 = 1e40;
+            if !paints(MOST) {
+                return MOST;
+            }
+            // Of the bits of the reaches, which run as the reaches do, from one at
+            // which it does not paint to one at which it does.
+            let (mut lo, mut hi) = (0_u64, MOST.to_bits());
+            while hi - lo > 1 << 40 {
+                let mid = lo + (hi - lo) / 2;
+                if paints(f64::from_bits(mid)) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            let reach = f64::from_bits(lo);
+            reach - reach / 65_536.0 - e.size() / (1_u64 << 40) as f64
+        };
+        let mut reaches: Vec<(f64, usize)> = (0..extents.len())
+            .map(|i| (below(&extents[i]), i))
+            .collect();
+        reaches.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        Self(reaches)
+    }
+
+    /// The places, in order, of the parts of `extents` that may paint in `region`
+    /// painted `reach` beyond their points, as [`Out`] tells it: each part that
+    /// needs no more than `reach`, tested.
+    fn paint<'e>(
+        &self,
+        extents: &'e [Extent],
+        region: &'e Region,
+        reach: f64,
+    ) -> impl Iterator<Item = usize> + 'e {
+        let near = self.0.partition_point(|(below, _)| *below < reach);
+        let mut places: Vec<usize> = self.0[..near].iter().map(|&(_, i)| i).collect();
+        places.sort_unstable();
+        places
+            .into_iter()
+            .filter(move |&i| region.paints(&extents[i], reach, Rounding::NONE).is_some())
+    }
+}
+
 /// The box of the `/InkList` paths that [`ink`] strokes, and how far beyond it the
 /// stroke paints; `None` without a path, which draws nothing.
 pub(super) fn ink_extent(annot: &Entries<'_>) -> Option<(Rect, f64)> {
@@ -924,23 +1128,28 @@ pub(super) fn ink_extent(annot: &Entries<'_>) -> Option<(Rect, f64)> {
     Some((paths.1?, stroke_reach(border_width(annot))))
 }
 
-/// The paths of an `/InkList` that draw, the numbers of each, at least two, and
-/// the box of their points: made once for the document ([`Derived`]), so that
-/// annotations sharing a list walk what it holds that draws nothing once.
-struct Paths(Vec<Vec<f64>>, Option<Rect>);
+/// The paths of an `/InkList` that draw, the numbers of each, at least two, the
+/// box of their points, and the extent of each as written ([`Extent`]): made once
+/// for the document ([`Derived`]), so that annotations sharing a list walk what it
+/// holds that draws nothing once.
+struct Paths(Vec<Vec<f64>>, Option<Rect>, Vec<Extent>);
 
 impl Derived for Paths {
     fn derive(items: &Items<'_>) -> Self {
         let paths = items.iter().filter_map(Value::items).map(|p| p.numbers());
         let paths: Vec<Vec<f64>> = paths.filter(|p| p.len() >= 2).collect();
+        let points = |p: &[f64]| -> Vec<Point> {
+            let pairs = p.as_chunks::<2>().0;
+            pairs.iter().map(|[x, y]| Point::new(*x, *y)).collect()
+        };
         let bounds = paths
             .iter()
-            .flat_map(|p| p.as_chunks::<2>().0)
-            .map(|[x, y]| Point::new(*x, *y))
+            .flat_map(|p| points(p))
             .fold(None, |b: Option<Rect>, p| {
                 Some(b.map_or(Rect::from_points(p, p), |b| b.union_pt(p)))
             });
-        Self(paths, bounds)
+        let extents = paths.iter().map(|p| Extent::written(points(p))).collect();
+        Self(paths, bounds, extents)
     }
 }
 
@@ -1448,5 +1657,253 @@ mod tests {
         // Off the page, nothing.
         let c = squiggly_content("0 2000 4000000 2000 0 1986 4000000 1986", page);
         assert!(corners(&c).is_empty(), "{c}");
+    }
+
+    /// What content `c` paints: each painting operator and clip with the path it
+    /// paints and the state it paints in, whatever state is set and not painted
+    /// with.
+    fn painted(c: &str) -> Vec<String> {
+        use std::collections::BTreeMap;
+        let mut state: BTreeMap<&str, &str> = BTreeMap::new();
+        let mut saved = vec![];
+        let (mut path, mut painted) = (String::new(), vec![]);
+        for line in c.lines() {
+            match line.rsplit(' ').next().expect("an operator") {
+                _ if line == "W n" => painted.push(format!("{state:?}\n{path}W n")),
+                "m" | "l" | "c" | "re" | "h" => {
+                    path.push_str(line);
+                    path.push('\n');
+                    continue;
+                }
+                "f" | "S" | "s" => painted.push(format!("{state:?}\n{path}{line}")),
+                "q" => saved.push(state.clone()),
+                "Q" => state = saved.pop().expect("a q"),
+                op => {
+                    state.insert(op, line);
+                }
+            }
+            path.clear();
+        }
+        painted
+    }
+
+    /// A number from `seed`, from 0 below 1.
+    fn next(seed: &mut u64) -> f64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        (*seed >> 11) as f64 / (1_u64 << 53) as f64
+    }
+
+    /// Text markup, redactions and ink drawn by the parts of their geometry that
+    /// may paint where the page shows them ([`super::shown`]) paint what drawing
+    /// every part paints, or are refused alike: on generated quads and paths,
+    /// turned, of no height or length, on, across and off generated views, and
+    /// of widths of all sizes.
+    #[test]
+    fn the_parts_that_may_paint_draw_what_all_parts_draw() {
+        use super::super::icons::redact;
+        use super::super::{Drew, border_width, c_color, color_of, dash};
+        use super::{
+            Line, Quad, Run, controls, highlights, ink, line_width, marked, text_lines, zigzag,
+        };
+        use hayro_syntax::object::dict::keys::{C, INKLIST};
+        use kurbo::Point;
+
+        // What each generator drew before it drew by the parts that may paint.
+        fn every_quad(annot: &Entries<'_>, kind: &str, out: &mut Out) -> Drew {
+            let ok = |drew: Option<()>| Ok(drew);
+            match kind {
+                "Highlight" => ok((|| {
+                    let fill = c_color(annot, super::super::out::Color::Rgb([1.0, 1.0, 0.0]));
+                    let (_, quads, clip) = highlights(annot)?;
+                    out.op("q");
+                    out.clip(clip)?;
+                    out.fill_color(&fill)?;
+                    for q in &quads.all {
+                        let [tl, tr, bl, br] = q.0;
+                        let [c1, c2, c3, c4] = controls(q).unwrap_or([Point::ZERO; 4]);
+                        out.nums(&[bl.x, bl.y], "m")?;
+                        out.nums(&[c1.x, c1.y, c2.x, c2.y, tl.x, tl.y], "c")?;
+                        out.nums(&[tr.x, tr.y], "l")?;
+                        out.nums(&[c3.x, c3.y, c4.x, c4.y, br.x, br.y], "c")?;
+                        out.op("f");
+                    }
+                    out.op("Q");
+                    Some(())
+                })()),
+                "Underline" | "StrikeOut" => ok((|| {
+                    let stroke = c_color(annot, super::super::out::Color::BLACK);
+                    let (_, quads, clip) = marked(annot)?;
+                    out.op("q");
+                    out.clip(clip)?;
+                    out.stroke_color(&stroke)?;
+                    for q in &quads.all {
+                        out.stroke_state(line_width(q), &[])?;
+                        let f = if kind == "Underline" { 1.0 } else { 3.0 };
+                        let (a, b) = q.across(f / 7.0);
+                        out.nums(&[a.x, a.y], "m")?;
+                        out.nums(&[b.x, b.y], "l")?;
+                        out.op("S");
+                    }
+                    out.op("Q");
+                    Some(())
+                })()),
+                "Squiggly" => {
+                    let stroke = c_color(annot, super::super::out::Color::BLACK);
+                    let Some((_, quads, clip)) = marked(annot) else {
+                        return Ok(None);
+                    };
+                    out.op("q");
+                    out.clip(clip);
+                    out.stroke_color(&stroke);
+                    let region = out.region();
+                    if !region.is_empty() {
+                        let mut pen = Run {
+                            spent: 0.0,
+                            most: super::most_pieces(),
+                            until: None,
+                        };
+                        for q in &quads.high {
+                            zigzag(q, &region, &mut pen, out)?;
+                        }
+                    }
+                    out.op("Q");
+                    Ok(Some(()))
+                }
+                "Redact" => ok((|| {
+                    let (_, quads) = super::quads(annot).filter(|(_, q)| !q.all.is_empty())?;
+                    out.op("q");
+                    out.clip(quads.redact?)?;
+                    out.op("1 0 0 RG");
+                    out.stroke_state(1.0, &[])?;
+                    for &Quad([tl, tr, bl, br]) in &quads.all {
+                        out.nums(&[bl.x, bl.y], "m")?;
+                        for p in [br, tr, tl] {
+                            out.nums(&[p.x, p.y], "l")?;
+                        }
+                        out.op("s");
+                    }
+                    out.op("Q");
+                    Some(())
+                })()),
+                _ => ok((|| {
+                    let stroke = color_of(annot, C)?;
+                    let paths = annot.items(INKLIST)?.derived::<super::Paths>();
+                    if paths.0.is_empty() {
+                        return None;
+                    }
+                    out.stroke_color(&stroke)?;
+                    out.stroke_state(border_width(annot), &dash(annot))?;
+                    out.op("1 J 1 j");
+                    for p in &paths.0 {
+                        out.nums(&p[..2], "m")?;
+                        let rest = if p.len() < 4 { &p[..2] } else { &p[2..] };
+                        for pt in rest.as_chunks::<2>().0 {
+                            out.nums(pt, "l")?;
+                        }
+                    }
+                    out.op("S");
+                    Some(())
+                })()),
+            }
+        }
+        fn by_parts(annot: &Entries<'_>, kind: &str, out: &mut Out) -> Drew {
+            match kind {
+                "Highlight" => Ok(super::highlight(annot, out)),
+                "Underline" => Ok(text_lines(annot, Line::Under, out)),
+                "StrikeOut" => Ok(text_lines(annot, Line::Through, out)),
+                "Squiggly" => squiggly(annot, out),
+                "Redact" => Ok(redact(annot, out)),
+                _ => Ok(ink(annot, out)),
+            }
+        }
+
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut differ = 0;
+        for case in 0..6_000 {
+            let r = &mut seed;
+            let kind = [
+                "Highlight",
+                "Underline",
+                "StrikeOut",
+                "Squiggly",
+                "Redact",
+                "Ink",
+            ][case % 6];
+            let (x, y) = (next(r) * 300.0 - 50.0, next(r) * 300.0 - 50.0);
+            let view = Rect::new(x, y, x + 1.0 + next(r) * 150.0, y + 1.0 + next(r) * 150.0);
+            // A place on, across or off the view, sometimes far off.
+            let place = |r: &mut u64| {
+                let far = if next(r) < 0.3 { 3_000.0 } else { 0.0 };
+                (
+                    x - 60.0 + next(r) * 280.0 + far * (next(r) - 0.5),
+                    y - 60.0 + next(r) * 280.0 + far * (next(r) - 0.5),
+                )
+            };
+            let pieces = 1 + (next(r) * 6.0) as usize;
+            let geometry = if kind == "Ink" {
+                let paths: Vec<String> = (0..pieces)
+                    .map(|_| {
+                        let (px, py) = place(r);
+                        let n = 1 + (next(r) * 5.0) as usize;
+                        let points: Vec<String> = (0..n)
+                            .map(|_| {
+                                let (dx, dy) = (next(r) * 80.0 - 40.0, next(r) * 80.0 - 40.0);
+                                format!("{} {}", px + dx, py + dy)
+                            })
+                            .collect();
+                        format!("[{}]", points.join(" "))
+                    })
+                    .collect();
+                let w = match (next(r) * 8.0) as usize {
+                    0 => String::from("0"),
+                    1 => String::from("-3"),
+                    6 => String::from("1e20"),
+                    7 => String::from("1e39"),
+                    2 => format!("{}", next(r) * 2.0),
+                    3 => format!("{}", next(r) * 600.0),
+                    _ => format!("{}", next(r) * 30.0),
+                };
+                format!("/C [0 0 1] /BS << /W {w} >> /InkList [{}]", paths.join(" "))
+            } else {
+                let quads: Vec<String> = (0..pieces)
+                    .map(|_| {
+                        let (qx, qy) = place(r);
+                        let len = if next(r) < 0.1 { 0.0 } else { next(r) * 120.0 };
+                        let h = if next(r) < 0.1 { 0.0 } else { next(r) * 40.0 };
+                        let turn = next(r) * 6.4 - 3.2;
+                        let (c, s) = (turn.cos(), turn.sin());
+                        let at = |u: f64, v: f64| {
+                            format!("{} {}", qx + u * c - v * s, qy + u * s + v * c)
+                        };
+                        format!(
+                            "{} {} {} {}",
+                            at(0.0, h),
+                            at(len, h),
+                            at(0.0, 0.0),
+                            at(len, 0.0)
+                        )
+                    })
+                    .collect();
+                format!("/C [1 0 0] /QuadPoints [{}]", quads.join(" "))
+            };
+            let annot = format!("<< /Subtype /{kind} /Rect [0 0 1 1] {geometry} >>");
+            let dict = Dict::from_bytes(annot.as_bytes()).expect("valid dict");
+            let entries = Entries::detached(dict);
+            let drawn = |draw: fn(&Entries<'_>, &str, &mut Out) -> Drew| {
+                let mut out = Out::new(view, 1.0);
+                let drew = draw(&entries, kind, &mut out);
+                out.finish(drew)
+                    .map(|(drew, content, _)| drew.map(|()| painted(&content)))
+            };
+            let (all, parts) = (drawn(every_quad), drawn(by_parts));
+            assert_eq!(parts, all, "{annot} in {view:?}");
+            if matches!(&all, Ok(Some(p)) if !p.is_empty()) {
+                differ += 1;
+            }
+        }
+        // Most paint something.
+        assert!(differ > 2_000, "{differ} of 6,000 paint");
     }
 }

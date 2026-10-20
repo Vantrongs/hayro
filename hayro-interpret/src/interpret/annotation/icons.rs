@@ -11,8 +11,8 @@
 //! The symbols are drawn here, each in a 10 pt square.
 
 use super::entries::Entries;
-use super::markup::{Quad, quads};
-use super::out::{Color, Out, Part, Refused, Rounding, corners};
+use super::markup::{Pieces, Quad, painting, quads, shown};
+use super::out::{Color, Extent, Out, Part, Refused, Rounding, corners};
 use super::text::{self, Align, Family, Fonts, Setting, Shaped, Typeface};
 use super::{Appearances, Drew, Unsupported, c_color, color_of, rect};
 use hayro_syntax::object::dict::keys::C;
@@ -350,7 +350,7 @@ pub(super) fn caret_box(annot: &Entries<'_>) -> Option<kurbo::Rect> {
 pub(super) fn redact(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     let clip = redact_clip(annot)?;
     // Without quadrilaterals, as with an empty `/QuadPoints`, the box.
-    let Some(quads) = quads(annot).filter(|q| !q.all.is_empty()) else {
+    let Some((items, quads)) = quads(annot).filter(|(_, q)| !q.all.is_empty()) else {
         // Clipped to the box, as viewers clip it, so that a box under two points
         // wide shows only the part of the outline within it.
         let inner = clip.inset(-1.0);
@@ -367,7 +367,14 @@ pub(super) fn redact(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     out.clip(clip)?;
     out.op("1 0 0 RG");
     out.stroke_state(1.0, &[])?;
-    for &Quad([tl, tr, bl, br]) in &quads.all {
+    let (region, reach) = (out.region(), out.reach(true));
+    // Each 1 pt wide.
+    let shown = shown(&items, Pieces::Redact, &region, || {
+        painting(&quads.all, &region, |&Quad([tl, tr, bl, br])| {
+            (Extent::written([bl, br, tr, tl]), reach)
+        })
+    });
+    for &Quad([tl, tr, bl, br]) in shown.0.iter().map(|&i| &quads.all[i]) {
         out.nums(&[bl.x, bl.y], "m")?;
         for p in [br, tr, tl] {
             out.nums(&[p.x, p.y], "l")?;
@@ -381,8 +388,8 @@ pub(super) fn redact(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
 /// The box viewers clip a redaction to ([`redact`]): of its quadrilaterals, each a
 /// point wider on each side, or `/Rect` without them.
 pub(super) fn redact_clip(annot: &Entries<'_>) -> Option<kurbo::Rect> {
-    match quads(annot).filter(|q| !q.all.is_empty()) {
-        Some(quads) => quads.redact,
+    match quads(annot).filter(|(_, q)| !q.all.is_empty()) {
+        Some((_, quads)) => quads.redact,
         None => rect(annot),
     }
 }
