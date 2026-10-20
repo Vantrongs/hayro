@@ -162,12 +162,11 @@ impl<'a> Parse<'_, 'a> {
             return None;
         }
         let from = r.offset();
-        // The entries, each key borrowed while they are few, in a map that is built
-        // by the same insertions as the map of a dictionary read from its bytes, so
-        // that the last of a key's entries is its value; past `LISTED`, the keys are
-        // held.
-        let mut few = new_offsets();
-        let mut keys = Vec::new();
+        // The entries, each key borrowed while they are few, in a list where a key's
+        // later entry replaces its value, as a map built by the same insertions as
+        // the map of a dictionary read from its bytes keeps the last; past `LISTED`
+        // keys, in such a map, the keys held.
+        let mut few: Vec<(Name<'a>, Node)> = Vec::new();
         let mut many: Option<hash::Map<Name<'static>, Node>> = None;
         let bytes = parse_dict_with(r, false, depth + 1, Some(b"<<"), b">>", |r, key, _| {
             let key = Name::new(key)?;
@@ -176,19 +175,18 @@ impl<'a> Parse<'_, 'a> {
                 Some(many) => {
                     many.insert(key.to_static(), value);
                 }
-                None => {
-                    keys.push(key.clone());
-                    few.insert(key, value);
-                    if few.len() > LISTED {
+                None => match few.iter().position(|(listed, _)| *listed == key) {
+                    Some(at) => few[at].1 = value,
+                    None if few.len() < LISTED => few.push((key, value)),
+                    None => {
                         let mut held = new_offsets();
-                        for key in keys.drain(..) {
-                            let value = few[&key].clone();
+                        for (key, value) in few.drain(..) {
                             held.insert(key.to_static(), value);
                         }
-                        few.clear();
+                        held.insert(key.to_static(), value);
                         many = Some(held);
                     }
-                }
+                },
             }
             Some(())
         })?;
