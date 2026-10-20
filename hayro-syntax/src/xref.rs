@@ -647,9 +647,10 @@ impl<'a> Streams<'a> {
     /// reading the stream finds its data ([`endstream_past_white`]); else after the
     /// first `endstream` from `start` on, as reading finds the data of a stream whose
     /// /Length does not lead to one, unless another stream starts before it; then
-    /// after the `endstream` a /Length that is a reference leads to, read as the table
-    /// being rebuilt will hold it ([`Self::by_reference`]). `None` where none of these
-    /// ends the data: the walk reads them.
+    /// after the `endstream` a /Length that is a reference leads to, read from a
+    /// header of its object that the data it delimits do not hold
+    /// ([`Self::by_reference`]). `None` where none of these ends the data: the walk
+    /// reads them.
     ///
     /// So a header or dictionary in a stream's data, such as an object of a PDF
     /// attached uncompressed, is not taken for one of the file's, and the walk does
@@ -689,16 +690,22 @@ impl<'a> Streams<'a> {
     }
 
     /// Where the `endstream` is that the /Length of a stream leads to, whose data start
-    /// at `start`, where it is a reference to `id`: the object the table being rebuilt
-    /// will hold, the last header of `id` in the file outside the stream's data, read
-    /// as a non-negative integer. That is the last header in the file where it is
-    /// after the `endstream` its value leads to; else, where no header of `id` is in
-    /// the file after that `endstream`, the last header the walk has found, in
-    /// `found`, which holds none in data it did not read.
+    /// at `start`, where it is a reference to `id`: the value, a non-negative integer,
+    /// of a header of `id` that the data it delimits do not hold, so that the walk,
+    /// skipping them, can reach it. Which header the rebuilt table holds is not known
+    /// until the walk ends, and a header of `id` in data the walk skips later, such as
+    /// an attached PDF's, never enters it: so a header is taken only where it agrees
+    /// with itself. First the header the walk has found, in `found`, before the data;
+    /// else the first after them, in the order of the file, that is after the
+    /// `endstream` its value leads to, among at most [`LENGTH_HEADERS`] of them.
+    /// `None` where none agrees: the walk reads the data, as it did before skipping
+    /// them, and takes any object they hold.
     ///
     /// The headers of the file are found once, at the first such /Length, and each
-    /// object read once, so the walk reads each part of the file a bounded number of
-    /// times however many streams refer to one object.
+    /// object's value read once, after white space only: so each byte is read for at
+    /// most two headers, the number ending one's value being the next one's number.
+    /// Each stream tries a bounded number of headers, a lookup each, however many
+    /// headers of `id` the file holds.
     fn by_reference(
         &mut self,
         data: &'a [u8],
@@ -706,25 +713,42 @@ impl<'a> Streams<'a> {
         id: ObjectIdentifier,
         found: &XrefMap,
     ) -> Option<usize> {
-        let ends = |length| led(data, start, length, &self.ends);
         let objects = self.lengths.get_or_insert_with(|| LengthObjects::new(data));
-        let last = objects.last.get(&id).copied();
-        let past = |object: usize, at: usize| object >= at + b"endstream".len();
-        if let Some(object) = last.filter(|object| *object >= start)
-            && let Some(length) = objects.value(object)
-            && let Some(at) = ends(length)
-            && past(object, at)
+        let ends = &self.ends;
+        let led =
+            |length: u32| endstream_after_white(ends, data, start.checked_add(length as usize)?);
+        if let Some(EntryType::Normal(object)) = found.get(&id)
+            && let Some(at) = objects.value(*object).and_then(led)
         {
             return Some(at);
         }
-        let Some(EntryType::Normal(object)) = found.get(&id) else {
-            return None;
-        };
-        let at = ends(objects.value(*object)?)?;
-        last.is_none_or(|last| last < start || !past(last, at))
-            .then_some(at)
+        // A header after the `endstream` its value leads to is after the first one.
+        let (first, _) = first_endstream(ends, data, start)?;
+        let mut tried = [None; LENGTH_HEADERS];
+        for (slot, object) in tried
+            .iter_mut()
+            .zip(objects.after(id, first + b"endstream".len()))
+        {
+            *slot = Some(object);
+        }
+        for object in tried.into_iter().flatten() {
+            opened(1);
+            if let Some(at) = objects.value(object).and_then(led)
+                && object >= at + b"endstream".len()
+            {
+                return Some(at);
+            }
+        }
+        None
     }
 }
+
+/// How many headers of the object an indirect /Length refers to, after a stream's
+/// data, the walk of a rebuild tries for the stream. More would let headers that
+/// lead to no `endstream`, after many streams, cost each of them a lookup; a stream
+/// whose own length object comes after more of them, in its data or after them, has
+/// its data read, as before the walk skipped them.
+const LENGTH_HEADERS: usize = 16;
 
 /// Where the `endstream` is that a /Length `length` leads to, of a stream whose data
 /// start at `start` of `data` ([`endstream_past_white`]).
@@ -749,6 +773,13 @@ fn endstream_past_white(data: &[u8], to: usize, ends: &Ends) -> Option<usize> {
             .starts_with(b"endstream")
             .then_some(to + white);
     }
+    endstream_after_white(ends, data, to)
+}
+
+/// Where the `endstream` is that the data of a stream end before, past white space
+/// only, where they end at `to` of `data`, among where each is in the file, `ends`,
+/// found once: what [`endstream_past_white`] finds, with a lookup and no byte read.
+fn endstream_after_white(ends: &Ends, data: &[u8], to: usize) -> Option<usize> {
     let (stop, trimmed) = first_endstream(ends, data, to)?;
     (trimmed <= to).then_some(stop)
 }
@@ -775,13 +806,13 @@ fn first_endstream(ends: &Ends, data: &[u8], from: usize) -> Option<(usize, usiz
         .copied()
 }
 
-/// Where the last header of each object is in a file, and the value of the objects
+/// Where the headers of each object are in a file, and the value of the objects
 /// asked about: the objects an indirect /Length may be, for the walk of a rebuild.
 struct LengthObjects<'a> {
     data: &'a [u8],
-    /// The last header `N G obj` of each object, as the walk reads one, after white
-    /// space or a delimiter.
-    last: hash::Map<ObjectIdentifier, usize>,
+    /// Each header `N G obj`, as the walk reads one, after white space or a
+    /// delimiter, and where it is, by object and then place.
+    headers: Vec<(ObjectIdentifier, usize)>,
     /// The object after each header asked about, where it is a non-negative integer.
     values: hash::Map<usize, Option<u32>>,
 }
@@ -791,7 +822,7 @@ impl<'a> LengthObjects<'a> {
     /// white space, which hold no `obj`: each byte is read a bounded number of times.
     /// Each number is a run of digits, read as reading a header reads it.
     fn new(data: &'a [u8]) -> Self {
-        let mut last = hash::Map::default();
+        let mut headers = vec![];
         for keyword in object::stream::searched_all(data, b"obj") {
             let before = |end: usize, f: fn(&u8) -> bool| {
                 let run = data[..end].iter().rev().take_while(|b| f(b)).count();
@@ -817,31 +848,45 @@ impl<'a> LengthObjects<'a> {
                 && let Some(obj_number) = number(&data[num_start..num_end])
                 && let Some(gen_number) = number(&data[gen_start..gen_end])
             {
-                last.insert(ObjectIdentifier::new(obj_number, gen_number), num_start);
+                headers.push((ObjectIdentifier::new(obj_number, gen_number), num_start));
             }
         }
+        // Found in the order of the file: sorting by object keeps it for each.
+        headers.sort_by_key(|(id, _)| *id);
         Self {
             data,
-            last,
+            headers,
             values: hash::Map::default(),
         }
     }
 
-    /// The object after the header at `at`, where it is a non-negative integer, as
-    /// reading a /Length that refers to it reads it.
+    /// Where the headers of `id` are at or after `from`, in the order of the file.
+    fn after(&self, id: ObjectIdentifier, from: usize) -> impl Iterator<Item = usize> + '_ {
+        let first = self.headers.partition_point(|header| *header < (id, from));
+        self.headers[first..]
+            .iter()
+            .take_while(move |(header, _)| *header == id)
+            .map(|(_, at)| *at)
+    }
+
+    /// The object after the header at `at`, where it is a non-negative integer after
+    /// white space, as reading a /Length that refers to it reads it. A comment
+    /// between the two, which reading skips, is not read: one could run past the
+    /// headers after it, each of which would read it again.
     fn value(&mut self, at: usize) -> Option<u32> {
         let data = self.data;
         *self.values.entry(at).or_insert_with(|| {
             let mut r = Reader::new(data);
             r.jump(at);
             scan_header(&mut r)?;
-            r.skip_white_spaces_and_comments();
+            r.skip_white_spaces();
             if !r.peek_byte().is_some_and(object::starts_number) {
+                opened(r.offset() - at);
                 return None;
             }
-            let value = r.read_with_context::<Object<'_>>(ReaderContext::dummy_ref());
+            let value = r.read_without_context::<u32>();
             opened(r.offset() - at);
-            u32::try_from(value?).ok()
+            value
         })
     }
 }
@@ -2881,7 +2926,7 @@ mod tests {
     #[test]
     fn opening_a_file_reads_it_in_linear_time() {
         type Family = (&'static str, fn(usize) -> Vec<u8>);
-        let families: [Family; 31] = [
+        let families: [Family; 33] = [
             // Entries at each `0` of `0…09 0 obj`: each reads a header in its slot of
             // one byte, which the next `0` ends, not on to `obj`.
             ("entries in the zeros of a header", |n| {
@@ -3040,6 +3085,30 @@ mod tests {
                     "5 0 obj << /Length 9 0 R >> stream\n9 0 obj 1 endobj stream\nendstream endobj\n",
                     n,
                 )
+            }),
+            // Streams holding the keyword `stream`, each /Length a reference to another
+            // object, whose headers are in one comment line after them all, each before
+            // a `%`: no object after a header is read past the white space after it.
+            ("streams whose length objects are in a comment line", |n| {
+                let streams: String = (0..n)
+                    .map(|k| {
+                        format!(
+                            "{} 0 obj << /Length {} 0 R >> stream\nx stream x\nendstream endobj\n",
+                            2 * k + 10,
+                            2 * k + 11
+                        )
+                    })
+                    .collect();
+                let headers: String = (0..n).map(|k| format!(" {} 0 obj %", 2 * k + 11)).collect();
+                around(&format!("{streams}%{headers}\n0\n"))
+            }),
+            // Streams holding the keyword `stream`, whose /Length is a reference to an
+            // object of which each of as many headers after them all leads to no
+            // `endstream`: each stream tries a bounded number of them.
+            ("streams with many headers of their length object", |n| {
+                let streams =
+                    "5 0 obj << /Length 9 0 R >> stream\nx stream x\nendstream endobj\n".repeat(n);
+                around(&format!("{streams}{}", "9 0 obj 1 endobj\n".repeat(n)))
             }),
             // Streams that no `endstream` ends, before a later stream's: the data of
             // each are read, the searches for both keywords reading each part once.
@@ -3707,29 +3776,46 @@ mod tests {
                         .bytes(),
                 );
                 let length_object = format!("5 0 obj\n{}\nendobj\n", inner.len());
+                // A later stream, whose /Length is right, holding an object 5 that does
+                // not lead to the attached PDF's end: the table never holds it, as the
+                // walk skips its data.
+                let later =
+                    "8 0 obj\n<< /Length 17 >>\nstream\n5 0 obj 23 endobj\nendstream\nendobj\n";
                 for outer_length in ["direct", "after", "before"] {
-                    let mut body = vec![];
-                    let length = if outer_length == "direct" {
-                        inner.len().to_string()
-                    } else {
-                        "5 0 R".to_string()
-                    };
-                    if outer_length == "before" {
-                        body.extend(length_object.bytes());
+                    for later in ["", later] {
+                        let mut body = vec![];
+                        let length = if outer_length == "direct" {
+                            inner.len().to_string()
+                        } else {
+                            "5 0 R".to_string()
+                        };
+                        if outer_length == "before" {
+                            body.extend(length_object.bytes());
+                        }
+                        body.extend(
+                            format!(
+                                "4 0 obj\n<< /Type /EmbeddedFile /Subtype /application#2Fpdf /Length {length} >>\nstream\n"
+                            )
+                            .bytes(),
+                        );
+                        body.extend(&inner);
+                        body.extend(b"\nendstream\nendobj\n");
+                        if outer_length == "after" {
+                            body.extend(length_object.bytes());
+                        }
+                        body.extend(later.bytes());
+                        let file = file_with(&body, &[0], true);
+                        // Opens to the document's 100 × 100 page.
+                        work(&file);
+                        if outer_length != "direct" {
+                            let pdf = crate::Pdf::new(file).unwrap();
+                            assert_eq!(
+                                pdf.xref().get::<u32>(id(5)),
+                                Some(inner.len() as u32),
+                                "{outer_length}, {later}"
+                            );
+                        }
                     }
-                    body.extend(
-                        format!(
-                            "4 0 obj\n<< /Type /EmbeddedFile /Subtype /application#2Fpdf /Length {length} >>\nstream\n"
-                        )
-                        .bytes(),
-                    );
-                    body.extend(&inner);
-                    body.extend(b"\nendstream\nendobj\n");
-                    if outer_length == "after" {
-                        body.extend(length_object.bytes());
-                    }
-                    // Opens to the document's 100 × 100 page.
-                    work(&file_with(&body, &[0], true));
                 }
             }
         }
