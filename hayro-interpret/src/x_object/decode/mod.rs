@@ -40,11 +40,23 @@ pub(crate) fn sample_format(
     obj: &ImageXObject<'_>,
     image_data: Option<&ImageData>,
 ) -> SampleFormat {
-    let dict = obj.stream.dict();
-    let dict_bpc = dict
-        .get::<u8>(BPC)
-        .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT));
+    sample_format_with(obj, image_data, dict_bpc(obj))
+}
 
+/// The bits per component the image's dictionary gives.
+fn dict_bpc(obj: &ImageXObject<'_>) -> Option<u8> {
+    let dict = obj.stream.dict();
+    dict.get::<u8>(BPC)
+        .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT))
+}
+
+/// [`sample_format`], with the bits per component of the dictionary already read.
+fn sample_format_with(
+    obj: &ImageXObject<'_>,
+    image_data: Option<&ImageData>,
+    dict_bpc: Option<u8>,
+) -> SampleFormat {
+    let dict = obj.stream.dict();
     let color_space = obj
         .color_space
         .clone()
@@ -92,10 +104,7 @@ fn decode_context<'a>(
     target_dimension: Option<(u32, u32)>,
     meter: &Meter<'_>,
 ) -> Option<DecodeContext<'a>> {
-    let dict = obj.stream.dict();
-    let dict_bpc = dict
-        .get::<u8>(BPC)
-        .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT));
+    let dict_bpc = dict_bpc(obj);
     let color_space = obj.color_space.clone();
     let is_indexed = obj.color_space.as_ref().is_some_and(|cs| cs.is_indexed());
 
@@ -135,7 +144,7 @@ fn decode_context<'a>(
         color_space,
         bits_per_component,
         decode_arr,
-    } = sample_format(obj, decoded.image_data.as_ref());
+    } = sample_format_with(obj, decoded.image_data.as_ref(), dict_bpc);
 
     Some(DecodeContext {
         decoded,
