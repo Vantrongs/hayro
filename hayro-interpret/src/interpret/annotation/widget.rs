@@ -26,12 +26,11 @@ use std::rc::Rc;
 
 type Drawn = Drew;
 
-/// What a text or choice field shows, read once for the document: its value or
-/// options as plain text, rich text, or, for a list without `/RV` but with `/DS`,
-/// its options from `/TI` on in the style of `/DS`, one a paragraph.
+/// What a text or choice field with rich text shows, read once for the document:
+/// rich text, or, for a list without `/RV` but with `/DS`, its options from `/TI` on
+/// in the style of `/DS`, one a paragraph.
 #[derive(Clone)]
 pub(super) enum FieldText {
-    Plain,
     Rich(Rc<Shaped>),
     Options(Rc<Style>),
 }
@@ -301,10 +300,43 @@ fn draw<'a>(
     // from and the style `/DS` sets, whose values are not read for each widget:
     // `/RV`; else, of a list, the style alone, that of its options; else the value.
     let rich = annot.has_text(Text::RichValue);
-    let shows = if matches!(kind, Kind::Text | Kind::List | Kind::Combo)
+    if matches!(kind, Kind::Text | Kind::List | Kind::Combo)
         && (rich || annot.has_text(Text::DefaultStyle))
     {
         let options = kind == Kind::List && !rich;
+        let size = rich_size;
+        let multiline = multiline || kind == Kind::List;
+        // As viewers lay rich text out: from the top less twice the border width
+        // on several lines; on one line, in a band twice the size high whose top
+        // lies 1.3 sizes and four border widths above the field's middle, of which
+        // the lines that fit are drawn. Either is as wide as the field less twice
+        // the border width on the left and four on the right, and the text is
+        // wrapped to that width. Laid out and clipped from the values alone, so
+        // that text that cannot be set is told under the clip it is drawn under.
+        let w = w as f32;
+        let (top, room) = if multiline {
+            (fh - pad, f32::INFINITY)
+        } else {
+            (1.3 * size + 4.0 * w - fh / 2.0, 2.0 * size)
+        };
+        let bottom = if multiline { -2.0 * size } else { top - room };
+        let band = kurbo::Rect::new(
+            f64::from(pad),
+            f64::from(bottom),
+            f64::from(fw - 4.0 * w),
+            f64::from(top),
+        );
+        let avail = (fw - 3.0 * pad).max(0.0);
+        out.op("q");
+        let area = TextBox {
+            rich: true,
+            pad,
+            top,
+            room,
+            frame: Affine::IDENTITY,
+            clip: clip.intersect(band),
+        }
+        .enter(out)?;
         let shows = doc.default_style(annot, positive).and_then(|style| {
             let read = if rich {
                 Some(annot.source(Text::RichValue.key()))
@@ -335,47 +367,11 @@ fn draw<'a>(
                 },
             )
         });
-        let Some(shows) = out.part(shows, in_clip)? else {
-            return Ok(Some(()));
-        };
-        shows
-    } else {
-        FieldText::Plain
-    };
-    if !matches!(shows, FieldText::Plain) {
-        let size = rich_size;
-        let multiline = multiline || kind == Kind::List;
-        // As viewers lay rich text out: from the top less twice the border width
-        // on several lines; on one line, in a band twice the size high whose top
-        // lies 1.3 sizes and four border widths above the field's middle, of which
-        // the lines that fit are drawn. Either is as wide as the field less twice
-        // the border width on the left and four on the right, and the text is
-        // wrapped to that width.
-        let w = w as f32;
-        let (top, room) = if multiline {
-            (fh - pad, f32::INFINITY)
-        } else {
-            (1.3 * size + 4.0 * w - fh / 2.0, 2.0 * size)
-        };
-        let bottom = if multiline { -2.0 * size } else { top - room };
-        let band = kurbo::Rect::new(
-            f64::from(pad),
-            f64::from(bottom),
-            f64::from(fw - 4.0 * w),
-            f64::from(top),
-        );
-        let area = TextBox {
-            rich: true,
-            pad,
-            top,
-            room,
-            frame: Affine::IDENTITY,
-            clip: clip.intersect(band),
-        };
-        let avail = (fw - 3.0 * pad).max(0.0);
-        out.op("q");
+        // Text that cannot be set would be drawn under the clips above (observed:
+        // viewers draw the rest of the field as given).
+        let shows = out.part(shows, || Part::rect(clip.intersect(band)))?;
         match shows {
-            FieldText::Rich(text) => {
+            Some(FieldText::Rich(text)) => {
                 let set = Setting {
                     base: size,
                     color: Color::BLACK,
@@ -394,7 +390,7 @@ fn draw<'a>(
                     out,
                 )?;
             }
-            FieldText::Options(ds) => {
+            Some(FieldText::Options(ds)) => {
                 // The options from /TI on, one a paragraph, in the style of /DS: each
                 // label set once for the document, and only those reached.
                 let set = Setting {
@@ -423,7 +419,7 @@ fn draw<'a>(
                     out,
                 )?;
             }
-            FieldText::Plain => {}
+            None => {}
         }
         out.op("Q");
         return Ok(Some(()));

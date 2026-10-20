@@ -454,16 +454,17 @@ pub(super) fn stamp<'a>(
         return Ok(None);
     }
     let color = c_color(annot, Color::BLACK);
-    // All a stamp draws is clipped to `/Rect`.
+    // All a stamp draws is clipped to `/Rect`, its text too.
+    out.op("q");
+    out.writes(|out| out.clip(r))?;
     let Some(text) = out.part(doc.stamp_text(annot), || Part::rect(r))? else {
+        out.op("Q");
         return Ok(None);
     };
     let at = Affine::translate(r.center().to_vec2())
         * Affine::rotate(0.6_f64.to_radians())
         * Affine::scale(scale);
-    out.op("q");
     out.writes(|out| {
-        out.clip(r)?;
         out.stroke_color(&color)?;
         out.stroke_state(2.0 * scale, &[])?;
         let corners = [(-93.0, -22.0), (93.0, -22.0), (93.0, 22.0), (-93.0, 22.0)]

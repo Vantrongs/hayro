@@ -294,7 +294,7 @@ pub(super) fn draw(
     }
     let (x0, y) = (f64::from(origin.0), f64::from(origin.1));
     let mut pen = Pen::new(transform, size, y, Rounding::of(1.0, y), EVERYWHERE);
-    let mut brush = Brush::new(None, None);
+    let mut brush = Brush::new(None);
     let most = glyphs
         .iter()
         .fold(0.0_f64, |m, g| m.max(f64::from(g.advance).abs()))
@@ -469,29 +469,21 @@ fn reaches(em: Rect, size: f64, (x, y): (f64, f64), view: Rect) -> bool {
 }
 
 /// What glyphs drawn so far have set, and what the next glyph written needs set
-/// first: a clip, set once, and the fill colour; so text that writes no glyph
-/// writes nothing else either, whatever was passed over to find that.
+/// first, the fill colour; so text that writes no glyph writes nothing else
+/// either, whatever was passed over to find that.
 pub(super) struct Brush {
-    clip: Option<Rect>,
     color: Option<Color>,
     want: Option<Color>,
 }
 
 impl Brush {
-    /// A brush that sets `clip` before the first glyph, with fill colour `color` set.
-    pub(super) fn new(clip: Option<Rect>, color: Option<Color>) -> Self {
-        Self {
-            clip,
-            color,
-            want: color,
-        }
+    /// A brush with fill colour `color` set.
+    pub(super) fn new(color: Option<Color>) -> Self {
+        Self { color, want: color }
     }
 
     /// Sets what the next glyph needs.
     fn ready(&mut self, out: &mut Out) -> Option<()> {
-        if let Some(clip) = self.clip.take() {
-            out.clip(clip)?;
-        }
         if let Some(want) = self.want
             && self.color != Some(want)
         {
@@ -629,8 +621,6 @@ pub(super) struct Shaped {
     /// each such size is positive (the rich text parser refuses others).
     in_points_any: bool,
     in_multiples_any: bool,
-    /// Whether it is rich text, laid out as such.
-    pub(super) rich: bool,
     /// Whether every character is white space.
     blank: bool,
     /// Whether it ends with a carriage return.
@@ -692,7 +682,7 @@ impl Fonts {
             color: None,
             align: None,
         };
-        self.shape_spans(text.chars().map(|c| (c, 0)), vec![style], false)
+        self.shape_spans(text.chars().map(|c| (c, 0)), vec![style])
     }
 
     /// Rich text `spans`, set as viewers set it.
@@ -710,7 +700,7 @@ impl Fonts {
             .iter()
             .enumerate()
             .flat_map(|(i, s)| s.text.chars().map(move |c| (c, i)));
-        self.shape_spans(chars, styles, true)
+        self.shape_spans(chars, styles)
     }
 
     /// The characters `chars`, each with its span among `styles`, set.
@@ -718,7 +708,6 @@ impl Fonts {
         &self,
         chars: impl Iterator<Item = (char, usize)>,
         styles: Vec<SpanStyle>,
-        rich: bool,
     ) -> Result<Shaped, Unsupported> {
         let mut s = Shaped {
             chars: Vec::new(),
@@ -741,7 +730,6 @@ impl Fonts {
             leaves: 0,
             in_points_any: false,
             in_multiples_any: false,
-            rich,
             blank: true,
             ends_with_cr: false,
         };
@@ -1650,7 +1638,7 @@ pub(super) fn draw_line(
         frame,
         view,
         out,
-        &mut Brush::new(None, Some(set.color)),
+        &mut Brush::new(Some(set.color)),
     )
 }
 
@@ -1702,7 +1690,7 @@ pub(super) fn draw_rows(
     if skips() && before {
         return Ok(());
     }
-    let mut brush = Brush::new(None, Some(set.color));
+    let mut brush = Brush::new(Some(set.color));
     let mut moves = Moves::default();
     for (j, line) in text
         .lines(size, Some(avail), Align::Left, false)
@@ -1784,7 +1772,7 @@ pub(super) fn draw_comb(
     let seen = Rect::new(seen.x0 - gx, seen.y0 - gy, seen.x1 + gx, seen.y1 + gy);
     let face = text.styles[0].face;
     let mut pen = Pen::new(Affine::IDENTITY, size, y, y_rounding, seen);
-    let mut brush = Brush::new(None, None);
+    let mut brush = Brush::new(None);
     let cells = if skips() {
         cells(text, size, cell, &start, &middle, count, seen)
     } else {
@@ -1936,7 +1924,9 @@ pub(super) fn draw_options(
 /// Where laid out text is drawn ([`draw_box`]): its lines from `pad` across, the
 /// top of the first at `top` and each line 1.2 times its largest size below the one
 /// before, as many as fit together in `room` (lines beyond are not drawn), in a box
-/// that `frame` maps to the content's space, under a clip to `clip`, in that space.
+/// that `frame` maps to the content's space, under a clip to `clip`, in that space,
+/// written before anything of the text is told ([`TextBox::enter`]).
+#[derive(Clone, Copy)]
 pub(super) struct TextBox {
     /// Whether lines break as rich text's do ([`Shaped::lines`]).
     pub(super) rich: bool,
@@ -1945,6 +1935,18 @@ pub(super) struct TextBox {
     pub(super) room: f32,
     pub(super) frame: Affine,
     pub(super) clip: Rect,
+}
+
+/// A [`TextBox`] whose clip is written: a part of its text told from here on is
+/// told under it, as it is drawn ([`Out::refuse`]).
+pub(super) struct Entered(TextBox);
+
+impl TextBox {
+    /// Writes the clip of this box, which all its text is drawn under.
+    pub(super) fn enter(self, out: &mut Out) -> Result<Entered, Refused> {
+        out.writes(|out| out.clip(self.clip))?;
+        Ok(Entered(self))
+    }
 }
 
 /// Draws texts `pieces`, each made when its lines are reached, as one text whose
@@ -1965,10 +1967,11 @@ pub(super) fn draw_box(
     set: &Setting,
     avail: f32,
     ascent: f32,
-    area: &TextBox,
+    area: &Entered,
     seen: Rect,
     out: &mut Out,
 ) -> Result<(), Refused> {
+    let area = &area.0;
     let shown = area.clip.intersect(seen);
     if !(shown.width() >= 0.0 && shown.height() >= 0.0) {
         return Ok(());
@@ -2002,7 +2005,7 @@ pub(super) fn draw_box(
         ))
     };
     let off = |j: usize, below: f64| level(j, below).bound().x + slack;
-    let mut brush = Brush::new(Some(area.clip), None);
+    let mut brush = Brush::new(None);
     let mut moves = Moves::default();
     let (mut height, mut filled) = (0.0_f32, f32::NEG_INFINITY);
     let mut way = None;
@@ -2083,8 +2086,7 @@ pub(super) fn draw_box(
                         (clip.x0, y1),
                     ]
                     .map(|(x, y)| area.frame * kurbo::Point::new(x, y));
-                    let part = Part::near(differ.to_vec(), 0.0).under(area.clip);
-                    out.refuse(Unsupported::Measure, part)?;
+                    out.refuse(Unsupported::Measure, Part::near(differ.to_vec(), 0.0))?;
                 }
             }
             let below = height + ascent * line.size;
@@ -2986,7 +2988,7 @@ mod tests {
                 set,
                 avail,
                 0.8,
-                area,
+                &area.enter(out)?,
                 seen,
                 out,
             )
@@ -3050,7 +3052,7 @@ mod tests {
                     &set,
                     avail,
                     ascent,
-                    &area,
+                    &area.enter(out)?,
                     seen,
                     out,
                 )

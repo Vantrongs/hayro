@@ -4331,6 +4331,194 @@ fn a_caption_that_cannot_be_set_refuses_only_what_it_changes() {
     assert_eq!(line("/D [3 2]", "(TEST)"), "generated");
 }
 
+/// What the first annotation of a page with `annot` looks like where the page shows
+/// `view`: its content, or the look in short ([`looks`]).
+fn look_in(view: kurbo::Rect, annot: &str) -> String {
+    let pdf = annotations(
+        "/Annots [4 0 R]",
+        vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
+    );
+    let page = &pdf.pages()[0];
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    let drawn = appearances.page(page, AnnotationSelection::View, &View::new(view, 1.0));
+    match drawn.first().map(|d| d.look()) {
+        Some(Look::Generated(a)) => a.content.clone(),
+        Some(Look::Unsupported(why)) => format!("{why:?}"),
+        Some(Look::Stream { .. }) => "stream".into(),
+        Some(Look::Nothing) | None => "nothing".into(),
+    }
+}
+
+/// A part that cannot be drawn is told under every clip it is drawn under, the
+/// clips laid out from the annotation's values alone: where the page shows what
+/// the annotation's extent holds but not what the part's clip lets through, the
+/// part is left out, and the page shows the same as with a part that can be drawn;
+/// where it shows inside the clip, the part is refused. For each refusal site whose
+/// clip is narrower than the extent the annotation is told by:
+///
+/// - rich free text (round 18's fixture: `/MediaBox [10 50 15 100]` shows the box
+///   and its red fill but not the rich text's own clip, `[20 -24 160 180]`), plain
+///   free text, whose clip is the box less the border, and free text whose line may
+///   break either way, under its rich text clip;
+/// - a rich text field on several lines and on one, and a list's options in the
+///   style of `/DS`, under the band rich text is laid out in;
+/// - a line of no length whose caption cannot be set (round 18's fixture: `PyMuPDF`
+///   1.28.2 bake clips it to `/BBox [217 87 243 113]`, beyond the page, and inks
+///   nothing) or whose ending has no direction, under the box viewers clip it to.
+///
+/// The other sites tell parts their clip holds whole, or are drawn under no clip
+/// narrower than the extent: a callout's ending and a stamp's text (the extent is
+/// the clip), a polyline's ending (the extent is its clip), a field's own value,
+/// caption, check mark and tag (the part is the field's clip), the lines, options and
+/// glyphs of plain field text (within what shows of the clip), an icon's symbol, a
+/// zigzag's steps, and lines and endings at a negative width (no clip).
+#[test]
+fn a_part_is_told_under_the_clips_it_is_drawn_under() {
+    let free_text = |text: &str| {
+        format!(
+            "/Subtype /FreeText /Rect [0 0 200 200] /BS << /W 10 >> /C [1 0 0] \
+             /DA (/Helv 12 Tf 0 g) {text}"
+        )
+    };
+    let measure = |text: &str| {
+        format!(
+            "/Subtype /FreeText /BS << /W 3 >> /DA (/Cour 12 Tf 0 g) /Rect [10 20 107.2 135] \
+             /C [1 0 0] /Contents (x) /RC (<body style=\"font-family:Courier;font-size:12pt\">\
+             <p>{text}</p></body>)"
+        )
+    };
+    let field = |kind: &str, text: &str| {
+        format!(
+            "/Subtype /Widget {kind} /T (a) /Rect [0 0 200 100] /DA (/Helv 12 Tf 0 g) \
+             /MK << /BG [1 0 0] >> /BS << /W 10 >> {text}"
+        )
+    };
+    // On one line, rich text is laid out in a band about the field's middle less
+    // half its height (observed): a field 20 high shows it.
+    let one_line = |text: &str| {
+        format!(
+            "/Subtype /Widget /FT /Tx /T (a) /Rect [0 0 200 20] /DA (/Helv 12 Tf 0 g) \
+             /MK << /BG [1 0 0] >> /BS << /W 1 >> {text}"
+        )
+    };
+    let line = |x: u32, more: &str| {
+        format!(
+            "/Subtype /Line /Rect [10 10 150 150] /L [{x} 100 {x} 100] /C [1 0 0] \
+             /BS << /W 1 >> /Cap true {more}"
+        )
+    };
+    let rect = |x0, y0, x1, y1| kurbo::Rect::new(x0, y0, x1, y1);
+    let hebrew = "<p>&#1488;&#1489;</p>";
+    let bidi = "Bidi('\u{5D0}')";
+    // Of each: the annotation with a part that cannot be drawn and with one that
+    // can; where the page shows the extent but not the part's clip, and where it
+    // shows the clip; and why the part is refused there.
+    let cases = [
+        (
+            "rich free text",
+            free_text(&format!("/RC ({hebrew})")),
+            free_text("/RC (<p>ab</p>)"),
+            rect(10.0, 50.0, 15.0, 100.0),
+            rect(20.0, 150.0, 100.0, 190.0),
+            bidi,
+        ),
+        (
+            "plain free text",
+            free_text("/Contents <FEFF0000>"),
+            free_text("/Contents (ab)"),
+            rect(2.0, 50.0, 8.0, 100.0),
+            rect(20.0, 150.0, 100.0, 190.0),
+            "Character('\\0')",
+        ),
+        (
+            "free text whose line may break either way",
+            measure("AAAAA AAAAA"),
+            measure("AAAAA"),
+            // Inside the border, right of the rich text's box, which ends twice the
+            // padding from the right.
+            rect(97.0, 40.0, 103.0, 130.0),
+            rect(20.0, 40.0, 90.0, 130.0),
+            "measure",
+        ),
+        (
+            "rich text field on several lines",
+            field("/FT /Tx /Ff 4096", &format!("/RV ({hebrew})")),
+            field("/FT /Tx /Ff 4096", "/RV (<p>ab</p>)"),
+            rect(165.0, 20.0, 185.0, 80.0),
+            rect(30.0, 20.0, 100.0, 80.0),
+            bidi,
+        ),
+        (
+            "rich text field on one line",
+            one_line(&format!("/RV ({hebrew})")),
+            one_line("/RV (<p>ab</p>)"),
+            // Inside the border, right of the band, which ends four border widths
+            // from the right.
+            rect(196.5, 2.0, 198.5, 9.0),
+            rect(0.0, 0.0, 100.0, 20.0),
+            bidi,
+        ),
+        (
+            "options of a list in the style of /DS",
+            field(
+                "/FT /Ch",
+                &format!(
+                    "/DS (font: 12pt Helvetica) /Opt [{}]",
+                    utf16("\u{5D0}\u{5D1}")
+                ),
+            ),
+            field("/FT /Ch", "/DS (font: 12pt Helvetica) /Opt [(ab)]"),
+            rect(165.0, 20.0, 185.0, 95.0),
+            rect(30.0, 20.0, 100.0, 95.0),
+            bidi,
+        ),
+        (
+            "caption of a line of no length",
+            line(230, "/CO [0 1000] /Contents <FEFF0000>"),
+            line(230, "/CO [0 1000] /Contents (TEST)"),
+            PAGE,
+            // The page beyond the line, which the clip around it reaches.
+            rect(205.0, 0.0, 400.0, 200.0),
+            "Character('\\0')",
+        ),
+        (
+            "ending of a line of no length",
+            line(230, "/Contents (Hi) /LE [/OpenArrow /None]"),
+            line(230, "/Contents (Hi)"),
+            PAGE,
+            rect(150.0, 0.0, 225.0, 200.0),
+            "Ending",
+        ),
+    ];
+    for (case, cannot, can, beside, inside) in cases.iter().map(|c| (c.0, &c.1, &c.2, c.3, c.4)) {
+        let drawn = look_in(beside, can);
+        assert_eq!(look_in(beside, cannot), drawn, "{case}: {cannot}");
+        // The fill and border show, and inside the clip the text that can be set;
+        // of a line of no length, nothing, as in bake.
+        if case.contains("no length") {
+            assert_eq!(drawn, "nothing", "{case}: {can} at {beside:?}");
+        } else {
+            assert!(
+                drawn.contains(" re\nf\n"),
+                "{case}: {can} at {beside:?}: {drawn}"
+            );
+            assert!(
+                look_in(inside, can).contains(" Do"),
+                "{case}: {can} at {inside:?}"
+            );
+        }
+    }
+    for (case, cannot, refused, inside) in cases.iter().map(|c| (c.0, &c.1, c.5, c.4)) {
+        let look = look_in(inside, cannot);
+        let look = if look == "Measure" {
+            "measure".into()
+        } else {
+            look
+        };
+        assert_eq!(look, refused, "{case}: {cannot} at {inside:?}");
+    }
+}
+
 /// Text viewers may draw in an order other than its own is refused, in every kind
 /// of text, where it may show: `PyMuPDF` 1.28.2 bake draws Hebrew right to left,
 /// a run of it among Latin text reversed in place (the review's free text puts

@@ -84,13 +84,11 @@ pub(super) fn free_text<'a>(
         doc.plain(source, family.into(), TEXT, || Ok(contents(annot)))
     };
     // Of a callout whose ending has no direction, viewers draw the ending
-    // otherwise ([`lost_part`], in the box all it draws is clipped to); the rest as given (observed).
+    // otherwise ([`lost_part`], under the clip all it draws is clipped to); the
+    // rest as given (observed).
     let lost = callout
         && (cl.len() == 2 || cl.len() == 3)
         && Ending::of_callout(annot).lost_at(cl[0], cl[1]);
-    if lost {
-        out.refuse(Unsupported::Ending, lost_part(cl[0], w, Some(clip)))?;
-    }
     out.op("q");
     out.writes(|out| {
         out.clip(clip)?;
@@ -99,15 +97,23 @@ pub(super) fn free_text<'a>(
             out.nums(&[inner.x0, inner.y0, inner.width(), inner.height()], "re")?;
             out.op("f");
         }
-        // The callout is drawn at the border width as given, however thin or
-        // negative.
-        if callout && (cl.len() == 2 || cl.len() == 3) {
-            let paint = Paint {
-                stroke: Some(border_color),
-                width: w,
-                dash: Vec::new(),
-                fill: None,
-            };
+        Some(())
+    })?;
+    // The callout is drawn at the border width as given, however thin or negative,
+    // in a frame of its own: what is told of its ending is told under the clip
+    // above alone ([`Out::refuse`]).
+    if callout && (cl.len() == 2 || cl.len() == 3) {
+        out.op("q");
+        if lost {
+            out.refuse(Unsupported::Ending, lost_part(cl[0], w))?;
+        }
+        let paint = Paint {
+            stroke: Some(border_color),
+            width: w,
+            dash: Vec::new(),
+            fill: None,
+        };
+        out.writes(|out| {
             out.stroke_color(&border_color)?;
             out.stroke_state(w, &[])?;
             out.nums(&[cl[0].x, cl[0].y], "m")?;
@@ -118,7 +124,11 @@ pub(super) fn free_text<'a>(
             if !lost {
                 ending(Ending::of_callout(annot), cl[0], cl[1], &paint, out)?;
             }
-        }
+            Some(())
+        })?;
+        out.op("Q");
+    }
+    out.writes(|out| {
         if w > 0.0 {
             out.stroke_color(&border_color)?;
             out.stroke_state(w, &dash(annot))?;
@@ -157,20 +167,14 @@ pub(super) fn free_text<'a>(
                 * Affine::rotate(f64::from(rotate).to_radians()),
         ),
     };
-    // The text is clipped to the box less the border width.
-    let mut clip = within(inner, w).abs();
-    // Text that cannot be set as viewers set it would be drawn within that box
-    // (and the box all is clipped to, set above); viewers draw the rest as given
-    // (observed).
-    let Some(text) = out.part(text, || Part::rect(clip))? else {
-        out.op("Q");
-        return Ok(Some(()));
-    };
+    // The text is laid out and clipped from the values alone, whether or not it can
+    // be set: rich text where the annotation has `/RC` or `/DS`.
+    let rich_layout = rich || annot.has_text(Text::DefaultStyle);
     // Plain text is drawn at the default appearance's size, 12 pt for a size fit to
     // the box; rich text's base size is the default appearance's, and a size fit to
     // the box is none: it is drawn 0 high, as viewers draw it.
     let set = Setting {
-        base: if text.rich {
+        base: if rich_layout {
             size.unwrap_or(0.0)
         } else {
             size.unwrap_or(12.0)
@@ -179,9 +183,10 @@ pub(super) fn free_text<'a>(
         align,
     };
     // Rich text is laid out in a box of its own, sized by the default appearance's.
-    let rich_size = text.rich.then(|| size.unwrap_or(0.0));
-    let ascent = if text.rich { RICH_ASCENT } else { 0.8 };
-
+    let rich_size = rich_layout.then(|| size.unwrap_or(0.0));
+    let ascent = if rich_layout { RICH_ASCENT } else { 0.8 };
+    // The text is clipped to the box less the border width.
+    let mut clip = within(inner, w).abs();
     let pad = 2.0 * w as f32;
     if let Some(size) = rich_size {
         // Rich text, also to its box in the frame: from the padding on the left to
@@ -212,12 +217,19 @@ pub(super) fn free_text<'a>(
         side - 2.0 * pad
     };
     let area = TextBox {
-        rich: text.rich,
+        rich: rich_layout,
         pad,
         top: fh as f32 - pad,
         room: f32::INFINITY,
         frame,
         clip,
+    }
+    .enter(out)?;
+    // Text that cannot be set as viewers set it would be drawn under the clips
+    // above; viewers draw the rest as given (observed).
+    let Some(text) = out.part(text, || Part::rect(clip))? else {
+        out.op("Q");
+        return Ok(Some(()));
     };
     let bound = text.bound(set.base);
     text::draw_box(

@@ -5,8 +5,9 @@
 //! A glyph is written once, as a form the content draws wherever the glyph is
 //! ([`Out::form`]). What cannot paint where the page shows it is not written
 //! ([`Out`], [`Region`]), and a part of an appearance its generator cannot draw as
-//! viewers draw it refuses the appearance only where it may show: a generator fails
-//! only with [`Refused`], which only [`Out`] makes ([`Out::refuse`]).
+//! viewers draw it refuses the appearance only where it may show under the clips it
+//! is drawn under, which are written before it is told: a generator fails only with
+//! [`Refused`], which only [`Out`] makes ([`Out::refuse`]).
 
 use super::{Glyph, Unsupported};
 use hayro_syntax::hash;
@@ -49,16 +50,15 @@ pub(super) fn written_all<const L: usize>(v: [f64; L]) -> Result<[f32; L], Unsup
 pub(super) struct Refused(());
 
 /// Where a part of an appearance may paint that its generator cannot draw as viewers
-/// draw it ([`Out::refuse`]).
+/// draw it ([`Out::refuse`]), under the clips written so far: a part is told only
+/// where all the clips it is drawn under are written, as it carries none of its own.
 pub(super) enum Part {
     /// Within `reach` of the convex hull of `points`, of the current space, each
-    /// computed as `local` says ([`Rounding`]), under a clip to `under` where it is
-    /// drawn under one not set yet ([`Out::clip`]).
+    /// computed as `local` says ([`Rounding`]).
     Near {
         points: Vec<Point>,
         reach: f64,
         local: Rounding,
-        under: Option<kurbo::Rect>,
     },
     /// Anywhere the page shows something: no entry the generator reads bounds
     /// where viewers draw it.
@@ -72,7 +72,6 @@ impl Part {
             points,
             reach,
             local: Rounding::NONE,
-            under: None,
         }
     }
 
@@ -84,34 +83,10 @@ impl Part {
     /// This part, its points each computed as `local` says.
     pub(super) fn computed(self, local: Rounding) -> Self {
         match self {
-            Self::Near {
-                points,
-                reach,
-                under,
-                ..
-            } => Self::Near {
+            Self::Near { points, reach, .. } => Self::Near {
                 points,
                 reach,
                 local,
-                under,
-            },
-            Self::Anywhere => Self::Anywhere,
-        }
-    }
-
-    /// This part, drawn under a clip to `clip`, which is not set yet.
-    pub(super) fn under(self, clip: kurbo::Rect) -> Self {
-        match self {
-            Self::Near {
-                points,
-                reach,
-                local,
-                ..
-            } => Self::Near {
-                points,
-                reach,
-                local,
-                under: Some(clip),
             },
             Self::Anywhere => Self::Anywhere,
         }
@@ -937,6 +912,11 @@ pub(super) struct Out {
     /// Why the appearance is refused, the first part refused that may show
     /// ([`Out::refuse`]).
     refused: Option<Unsupported>,
+    /// The depth, in `q`s not yet ended, of the outermost frame in which a part was
+    /// told left out or refused ([`Out::refuse`]) whose frame has not ended: a clip
+    /// written then may be one that part is drawn under, which it was not told
+    /// under ([`Out::clip`]).
+    decided: Option<usize>,
     /// The glyphs drawn, each once, and their names.
     glyphs: Vec<Rc<Glyph>>,
     named: hash::Set<Rc<str>>,
@@ -992,6 +972,7 @@ impl Out {
             content: String::new(),
             failed: false,
             refused: None,
+            decided: None,
             glyphs: Vec::new(),
             named: hash::Set::default(),
             state: State {
@@ -1049,12 +1030,19 @@ impl Out {
     }
 
     /// A part of the appearance the generator cannot draw as viewers draw it, for
-    /// `why`, which may paint within `part`: where that may show where the page
-    /// shows it ([`Region::may_show`]), the appearance is refused for it, and the
-    /// generator stops; where it may not, the part is left out, as what viewers draw
-    /// of it does not show either, and the generator goes on with the rest. A part
-    /// the page shows nothing of is left out wherever it lies.
+    /// `why`, which may paint within `part` under the clips written so far: where
+    /// that may show where the page shows it ([`Region::may_show`]), the appearance
+    /// is refused for it, and the generator stops; where it may not, the part is left
+    /// out, as what viewers draw of it does not show either, and the generator goes
+    /// on with the rest. A part the page shows nothing of is left out wherever it
+    /// lies.
+    ///
+    /// The part is told where it would be drawn, under every clip it is drawn under
+    /// and no other: until the frame it is told in ends, no clip may be written
+    /// ([`Out::clip`]).
     pub(super) fn refuse(&mut self, why: Unsupported, part: Part) -> Result<(), Refused> {
+        let depth = self.frames.len();
+        self.decided = Some(self.decided.map_or(depth, |d| d.min(depth)));
         if !self.shows(&part) {
             return Ok(());
         }
@@ -1083,14 +1071,7 @@ impl Out {
                 points,
                 reach,
                 local,
-                under,
-            } => {
-                let mut region = self.state.region.clone();
-                if let Some((_, _, corners)) = under.and_then(|r| self.clip_rect(r)) {
-                    region.cut(&corners);
-                }
-                region.may_show(points, *reach, *local).is_some()
-            }
+            } => self.state.region.may_show(points, *reach, *local).is_some(),
         }
     }
 
@@ -1299,6 +1280,9 @@ impl Out {
                     self.held_failed = frame.held_failed;
                 }
                 self.state = frame.saved;
+                if self.decided.is_some_and(|d| d > self.frames.len()) {
+                    self.decided = None;
+                }
             }
             Kind::Transforms | Kind::Width | Kind::Sets => {
                 if let (Kind::Transforms, [a, b, c, d, e, f]) = (&kind, values) {
@@ -1408,8 +1392,10 @@ impl Out {
 
     /// Clips what follows to `r`; one that cannot be written as it is, cut to a box
     /// that holds what shows ([`Region::bounds`]), which cuts nothing that shows,
-    /// so that its numbers are those of what shows, whatever lies beyond.
+    /// so that its numbers are those of what shows, whatever lies beyond. Fails the
+    /// content after a part told in a frame not yet ended ([`Out::refuse`]).
     pub(super) fn clip(&mut self, r: kurbo::Rect) -> Option<()> {
+        self.clips_after_decision();
         let (text, ok, corners) = self.clip_rect(r)?;
         self.state.region.cut(&corners);
         // The path being built, if any, ends in the clip, unpainted.
@@ -1417,6 +1403,16 @@ impl Out {
         self.held.push_str(&text);
         self.held_failed |= !ok;
         Some(())
+    }
+
+    /// Fails the content where a clip is written while a part told left out or
+    /// refused may still be drawn under it ([`Out::refuse`]): the generator told it
+    /// before laying out all it is clipped by.
+    fn clips_after_decision(&mut self) {
+        if self.decided.is_some() {
+            debug_assert!(false, "a clip written after a part under it was told");
+            self.failed = true;
+        }
     }
 
     /// The clip to `r` as [`Out::clip`] writes it, whether each of its numbers can
@@ -1459,6 +1455,7 @@ impl Out {
     /// cut by the convex hull of the boxes of its subpaths, which holds the area it
     /// clips to.
     fn clip_path(&mut self) {
+        self.clips_after_decision();
         let path = std::mem::take(&mut self.path);
         let mut points = vec![];
         for p in &path {
@@ -1477,7 +1474,8 @@ impl Out {
 
 #[cfg(test)]
 mod tests {
-    use super::Out;
+    use super::{Out, Part};
+    use crate::interpret::annotation::Unsupported;
     use kurbo::Rect;
 
     const PAGE: Rect = Rect::new(0.0, 0.0, 200.0, 200.0);
@@ -1522,6 +1520,45 @@ mod tests {
         out.nums(&[20.0, 10.0], "l");
         out.op("S");
         assert!(out.finish(Ok(())).is_err());
+    }
+
+    /// A part is told under the clips written: one whose clip leaves nothing of
+    /// the page is left out, and after it the generator draws on.
+    #[test]
+    fn a_part_is_told_under_the_clips_written() {
+        let mut out = Out::new(PAGE, 1.0);
+        out.op("q");
+        out.clip(Rect::new(300.0, 0.0, 400.0, 200.0));
+        let part = || Part::rect(Rect::new(100.0, 100.0, 350.0, 150.0));
+        assert!(out.refuse(Unsupported::Character('\0'), part()).is_ok());
+        out.op("Q");
+        // The frame it was told in ended: a clip may follow.
+        out.clip(Rect::new(0.0, 0.0, 50.0, 50.0));
+        assert!(out.refuse(Unsupported::Character('\0'), part()).is_ok());
+        assert!(out.finish(Ok(())).is_ok());
+        let mut out = Out::new(PAGE, 1.0);
+        assert!(out.refuse(Unsupported::Character('\0'), part()).is_err());
+        assert_eq!(
+            out.finish(Ok(())).map(|_| ()),
+            Err(Unsupported::Character('\0'))
+        );
+    }
+
+    /// A clip written after a part was told, in a frame that has not ended, is one
+    /// the part may be drawn under but was not told under: it fails the content.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "a clip written after"))]
+    fn a_clip_after_a_part_told_fails() {
+        let mut out = Out::new(PAGE, 1.0);
+        out.op("q");
+        let part = Part::rect(Rect::new(250.0, 0.0, 300.0, 50.0));
+        assert!(out.refuse(Unsupported::Character('\0'), part).is_ok());
+        out.op("q");
+        out.clip(Rect::new(0.0, 0.0, 50.0, 50.0));
+        assert_eq!(
+            out.finish(Ok(())).map(|_| ()),
+            Err(Unsupported::Coordinates)
+        );
     }
 
     /// A clip that cannot be written as it is is written cut to what the page

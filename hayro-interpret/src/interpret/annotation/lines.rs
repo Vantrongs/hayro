@@ -297,19 +297,20 @@ pub(super) fn poly(annot: &Entries<'_>, closed: bool, out: &mut Out) -> Drew {
     let ends = poly_ends(annot, vertices, closed);
     let w = border_width(annot);
     let clip = poly_clip(bounds, w, &ends);
-    // Laid out from the values alone; an ending left out ([`ends_drawable`]) is not
-    // drawn, and changes nothing else.
-    let Some(drawn) = ends_drawable(
-        annot,
-        ends,
-        || corners(bounds).to_vec(),
-        (w >= 0.0).then_some(clip),
-        out,
-    )?
-    else {
+    // Laid out from the values alone, and clipped first, so that an ending is told
+    // under the clip it is drawn under ([`ends_drawable`]); one left out is not
+    // drawn, and changes nothing else. At a negative width, where viewers clip
+    // otherwise, an ending is refused or nothing drawn: clipped after.
+    if w >= 0.0 {
+        out.writes(|out| out.clip(clip))?;
+    }
+    let Some(drawn) = ends_drawable(annot, ends, || corners(bounds).to_vec(), out)? else {
         return Ok(None);
     };
-    Ok(draw_poly(annot, vertices, clip, closed, ends, drawn, out))
+    if w < 0.0 {
+        out.writes(|out| out.clip(clip))?;
+    }
+    Ok(draw_poly(annot, vertices, closed, ends, drawn, out))
 }
 
 /// The endings of a polyline with vertices `vertices` (two or more), each at its
@@ -358,12 +359,12 @@ fn point_clip(tip: Point, w: f64, cap: bool, ends: &[(Ending, Point, Point); 2])
 
 /// Which endings of a line or polyline, each at its tip arriving from a point, are
 /// drawn as given ([`Unsupported::Ending`] refused where it may show, [`Out::refuse`],
-/// for the others), when its content is clipped to `clip` where that is known:
+/// for the others), told under the clip its content is drawn under, written before
+/// where it is known:
 ///
 /// - an ending laid along or across a line of no length, whose points viewers put at
-///   the page's origin, is never drawn: what may differ is where [`lost_part`] says
-///   under `clip`, or, without one, along all its line from the origin; the rest is
-///   drawn as given;
+///   the page's origin, is never drawn: what may differ is where [`lost_part`] says,
+///   under that clip; the rest is drawn as given;
 /// - at a negative border width with an ending, where the box viewers clip to
 ///   shrinks and a closed ending widens it, showing more of the line anywhere along
 ///   it: viewers draw all of it within the box of the points `body` gives and the
@@ -379,7 +380,6 @@ pub(super) fn ends_drawable(
     annot: &Entries<'_>,
     ends: [(Ending, Point, Point); 2],
     body: impl FnOnce() -> Vec<Point>,
-    clip: Option<kurbo::Rect>,
     out: &mut Out,
 ) -> Result<Option<[bool; 2]>, Refused> {
     let painted = color_of(annot, C).is_some() || color_of(annot, IC).is_some();
@@ -389,7 +389,7 @@ pub(super) fn ends_drawable(
         let lost = ending.lost_at(*tip, *from);
         *draws = *ending != Ending::None && !lost;
         if lost && painted {
-            out.refuse(Unsupported::Ending, lost_part(*tip, w, clip))?;
+            out.refuse(Unsupported::Ending, lost_part(*tip, w))?;
         }
     }
     let any = ends.iter().filter(|(e, _, _)| *e != Ending::None);
@@ -408,12 +408,12 @@ pub(super) fn ends_drawable(
 }
 
 /// Where an ending of no direction at `tip`, of a line `w` wide, may change what
-/// viewers draw, who clip the annotation to `within` where that is known: they draw
-/// it from the page's origin to its tip and back (observed: an open arrow at 50 60
+/// viewers draw, under the clip they draw the annotation under: they draw it from
+/// the page's origin to its tip and back (observed: an open arrow at 50 60
 /// is `0 0 m 50 60 l 0 0 l`), with butt ends, within half its width, at least a
 /// half, of that line (observed in `PyMuPDF` 1.28.2 at widths 0.25 to 10: past the
 /// tip by 0.375 widths along each axis of a line at 45 degrees).
-pub(super) fn lost_part(tip: Point, w: f64, within: Option<kurbo::Rect>) -> Part {
+pub(super) fn lost_part(tip: Point, w: f64) -> Part {
     let half = w.abs().max(1.0) / 2.0;
     let across = direction(tip.to_vec2());
     let across = Vec2::new(-across.y, across.x) * half;
@@ -423,17 +423,13 @@ pub(super) fn lost_part(tip: Point, w: f64, within: Option<kurbo::Rect>) -> Part
         tip - across,
         Point::ORIGIN - across,
     ];
-    let part = Part::near(band.to_vec(), 0.0);
-    match within {
-        Some(within) => part.under(within),
-        None => part,
-    }
+    Part::near(band.to_vec(), 0.0)
 }
 
+/// Draws a polygon or polyline under its clip, written ([`poly`]).
 fn draw_poly(
     annot: &Entries<'_>,
     vertices: &[Point],
-    clip: kurbo::Rect,
     closed: bool,
     ends: [(Ending, Point, Point); 2],
     drawn: [bool; 2],
@@ -447,7 +443,6 @@ fn draw_poly(
     if stroke.is_none() && (if closed { fill.is_none() } else { !any }) {
         return None;
     }
-    out.clip(clip)?;
     if closed {
         if let Some(stroke) = &stroke {
             out.stroke_color(stroke)?;
@@ -743,10 +738,13 @@ pub(super) fn line<'a>(
     let ends = [(first, la, lb), (last, lb, la)];
     let w = border_width(annot);
     let caption = annot.bool(b"Cap").unwrap_or(false);
-    let clip = (len == 0.0 && w >= 0.0).then(|| point_clip(la, w, caption, &ends));
-    // Laid out from the values alone; an ending or a caption left out changes
-    // nothing else drawn.
-    let Some(drawn) = ends_drawable(annot, ends, || layout.body(annot), clip, out)? else {
+    // Laid out from the values alone, and clipped first, so that an ending or a
+    // caption is told under the clip it is drawn under ([`Out::refuse`]); one left
+    // out changes nothing else drawn.
+    if len == 0.0 && w >= 0.0 {
+        out.writes(|out| out.clip(point_clip(la, w, caption, &ends)))?;
+    }
+    let Some(drawn) = ends_drawable(annot, ends, || layout.body(annot), out)? else {
         return Ok(None);
     };
     // Read only where the line is drawn.
@@ -819,7 +817,6 @@ pub(super) fn line<'a>(
         normal,
         [ll, lle, llo, sign],
         gap,
-        clip,
         (ends, drawn),
         out,
     );
@@ -846,7 +843,7 @@ pub(super) fn line<'a>(
     Ok(Some(()))
 }
 
-/// Draws a line from its layout (see [`line`]), clipped to `clip` where known, with
+/// Draws a line from its layout (see [`line`]), under the clip written for it, with
 /// the endings `ends` of which `drawn` says they are drawn.
 #[allow(clippy::too_many_arguments)]
 fn draw_line(
@@ -856,15 +853,11 @@ fn draw_line(
     normal: Vec2,
     [ll, lle, llo, sign]: [f64; 4],
     gap: Option<(f64, f64)>,
-    clip: Option<kurbo::Rect>,
     (ends, drawn): ([(Ending, Point, Point); 2], [bool; 2]),
     out: &mut Out,
 ) -> Option<()> {
     let len = (lb - la).hypot();
     let dir = direction(lb - la);
-    if let Some(clip) = clip {
-        out.clip(clip)?;
-    }
     paint.start(out)?;
     if ll != 0.0 {
         for p in [a, b] {
