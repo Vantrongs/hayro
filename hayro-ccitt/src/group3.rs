@@ -1,6 +1,6 @@
 use crate::bit_reader::BitReader;
 use crate::context::{Color, DecoderContext, decode_1d_line, decode_2d_line};
-use crate::{DecodeError, Decoder, EncodingMode, Result, stop};
+use crate::{DecodeError, Decoder, EncodingMode, Result};
 
 /// Group 3 1D decoding (T.4 Section 4.1).
 pub(crate) fn decode_1d(
@@ -13,7 +13,7 @@ pub(crate) fn decode_1d(
     ctx.has_eols = reader.read_eol_if_available(decoder)? > 0 || ctx.settings.end_of_line;
 
     loop {
-        stop(decoder)?;
+        reader.poll(decoder)?;
         let line_start = reader.clone();
 
         if let Err(e) = decode_1d_line(ctx, reader, decoder) {
@@ -41,7 +41,7 @@ pub(crate) fn decode_2d(
     ctx.has_eols = reader.read_eol_if_available(decoder)? > 0 || ctx.settings.end_of_line;
 
     loop {
-        stop(decoder)?;
+        reader.poll(decoder)?;
         let line_start = reader.clone();
 
         let result = reader.read_bit().and_then(|tag_bit| {

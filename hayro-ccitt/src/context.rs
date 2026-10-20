@@ -1,6 +1,6 @@
 use crate::bit_reader::BitReader;
 use crate::codes::Mode;
-use crate::{DecodeError, DecodeSettings, Decoder, Result, stop};
+use crate::{DecodeError, DecodeSettings, Decoder, Result};
 use alloc::vec::Vec;
 
 /// The most changes per line that room is made for before decoding.
@@ -176,7 +176,7 @@ pub(crate) fn decode_1d_line(
     decoder: &mut impl Decoder,
 ) -> Result<()> {
     while !ctx.at_eol() {
-        stop(decoder)?;
+        reader.poll(decoder)?;
         let run_length = reader.decode_run(ctx.color, decoder)?;
         ctx.push_pixels(run_length)?;
         ctx.color = ctx.color.opposite();
@@ -193,7 +193,7 @@ pub(crate) fn decode_2d_line(
     decoder: &mut impl Decoder,
 ) -> Result<()> {
     while !ctx.at_eol() {
-        stop(decoder)?;
+        reader.poll(decoder)?;
         let mode = reader.decode_mode()?;
 
         match mode {

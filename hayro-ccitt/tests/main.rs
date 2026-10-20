@@ -10,6 +10,7 @@ mod g4;
 mod modes;
 mod recovery;
 mod settings;
+mod stop;
 
 use hayro_ccitt::{DecodeSettings, Decoder, DecoderContext, EncodingMode, decode};
 use std::path::PathBuf;

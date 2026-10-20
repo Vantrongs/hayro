@@ -146,8 +146,9 @@ pub(crate) fn decode(
                 self.decoded_rows += 1;
             }
 
-            fn stop(&mut self) -> bool {
-                self.meter.work(1).is_err()
+            /// A bit read counts a step, as a code takes at least one.
+            fn stop(&mut self, bits: usize) -> bool {
+                self.meter.work(bits).is_err()
             }
         }
 
@@ -207,8 +208,9 @@ pub(crate) fn decode(
                 self.decoded_rows += 1;
             }
 
-            fn stop(&mut self) -> bool {
-                self.meter.work(1).is_err()
+            /// A bit read counts a step, as a code takes at least one.
+            fn stop(&mut self, bits: usize) -> bool {
+                self.meter.work(bits).is_err()
             }
         }
 
@@ -377,7 +379,8 @@ mod tests {
         assert!(data.chunks(2).all(|pair| pair == [0xFF, 0x00]));
         let (bits, data) = told(true);
         assert!(data.iter().all(|&byte| byte == 0xAA));
-        // The row's bytes and a step per code count anyway; each black span adds one.
+        // The row's bytes and a step per bit read, at least one per code, count anyway;
+        // each black span adds one.
         assert!(luma >= 2 * pairs + pairs + pairs, "{luma}");
         assert!(bits >= 2 * pairs / 8 + pairs + pairs, "{bits}");
     }

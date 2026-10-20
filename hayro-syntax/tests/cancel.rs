@@ -94,6 +94,15 @@ fn lzw_clears(codes: usize) -> Vec<u8> {
     out
 }
 
+/// Bits given as `0` and `1` characters, packed most significant first as CCITT
+/// packs them, the last byte padded with zeros.
+fn msb_bits(bits: &str) -> Vec<u8> {
+    let bits = bits.as_bytes();
+    bits.chunks(8)
+        .map(|byte| (0..8).fold(0, |acc, i| acc << 1 | u8::from(byte.get(i) == Some(&b'1'))))
+        .collect()
+}
+
 /// Decoding stops at the meter's second poll, within three polls' worth of work, and
 /// decoding again without a hook to stop it gives the whole result.
 #[test]
@@ -155,6 +164,27 @@ fn whole_decoding_is_cancelled_within_bounded_work() {
             "CCITT white lines",
             "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 100000 /Rows 400 >>".into(),
             vec![0xff; 50],
+        ),
+        (
+            // Horizontal mode with a white and a black run of 0, then a line
+            // ended by a vertical code and an EOFB.
+            "CCITT codes writing nothing",
+            "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 8 /Rows 1 >>".into(),
+            msb_bits(&format!(
+                "{}1{}",
+                "001001101010000110111".repeat(100_000),
+                "000000000001".repeat(2)
+            )),
+        ),
+        (
+            "CCITT fill",
+            "/Filter /CCITTFaxDecode /DecodeParms << /K 0 /Columns 8 /Rows 1 >>".into(),
+            {
+                // An EOL after a long fill, then a white run of 8.
+                let mut data = vec![0; 100_000];
+                data.extend(msb_bits("110011"));
+                data
+            },
         ),
     ];
     for (name, dict, data) in cases {
