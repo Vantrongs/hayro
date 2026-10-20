@@ -10,8 +10,10 @@
 //! reading of arrays and dictionaries that `Object::skip_with_depth` and
 //! `parse_dict_with` share), so a body parses where it skips, to the same end.
 
+use crate::hash;
 use crate::object::array::parse_array_with;
 use crate::object::dict::parse_dict_with;
+use crate::object::name::{order, same};
 use crate::object::{
     Array, Bytes, Dict, MAX_OBJECT_NESTING_DEPTH, MaybeRef, Name, Null, Number, ObjRef, Object,
     ObjectLike, String, Written, leaf,
@@ -104,6 +106,111 @@ pub(crate) struct DictNode {
 /// in entry by entry; more are sorted by key and searched by halving.
 const LISTED: usize = 8;
 
+/// How the entry of a key is found among those of a dictionary of more than
+/// [`LISTED`], so that a later entry of a key replaces the value at once, as the map
+/// of a dictionary read from its bytes does, and parsing holds the values kept, not
+/// every one replaced.
+enum Large {
+    /// Each key came after the one before it in order, as many files write them: a
+    /// key after the last is new, and the entries need no sorting.
+    Ascending,
+    /// By the key's hash ([`Index`]).
+    Indexed(Index),
+}
+
+/// Where each key of a dictionary of more than [`LISTED`] entries is among them, by
+/// what [`Index::hash`] makes of the key.
+///
+/// Made once for each such dictionary being parsed at once on a thread, one inside
+/// another, and kept emptied for the next ([`Index::take`]), so that a file of many
+/// does not allocate and grow one for each.
+#[derive(Default)]
+struct Index(hash::Map<Hashed, usize>);
+
+/// What an [`Index`] finds a key by: its hash, keyed at random for each index; without
+/// `std`, whose maps are ordered ones ([`hash`]), the key itself.
+#[cfg(feature = "std")]
+type Hashed = u64;
+#[cfg(not(feature = "std"))]
+type Hashed = Name<'static>;
+
+/// At most this many keys' room is kept for the next dictionary parsed on a thread
+/// ([`Index`]); a larger index is freed, so that a thread holds no more than that
+/// once it read a file, whatever the file's dictionaries.
+#[cfg(feature = "std")]
+const KEPT: usize = 1024;
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    static INDEXES: core::cell::RefCell<Vec<Index>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
+impl Index {
+    /// An index of `entries`, each key once, whose keys are kept relative to `held`.
+    fn of(entries: &[(Text, Node)], held: &[u8]) -> Self {
+        let mut index = Self::take();
+        for at in 0..entries.len() {
+            // Each key once, so each is found new.
+            index.find(&entries[..at], held, entries[at].0.as_slice(held));
+        }
+        index
+    }
+
+    /// One emptied, kept on this thread, or else a new one.
+    fn take() -> Self {
+        #[cfg(feature = "std")]
+        if let Some(index) = INDEXES.with_borrow_mut(Vec::pop) {
+            return index;
+        }
+        Self::default()
+    }
+
+    /// Keeps this, emptied, for the next dictionary on this thread, unless it has
+    /// room for more than [`KEPT`] keys.
+    fn keep(mut self) {
+        self.0.clear();
+        #[cfg(feature = "std")]
+        if self.0.capacity() <= KEPT {
+            INDEXES.with_borrow_mut(|kept| kept.push(self));
+        }
+    }
+
+    /// What this index finds `key` by.
+    #[cfg(feature = "std")]
+    fn hash(&self, key: &[u8]) -> Hashed {
+        use core::hash::BuildHasher;
+        self.0.hasher().hash_one(key)
+    }
+
+    /// What this index finds `key` by.
+    #[cfg(not(feature = "std"))]
+    fn hash(&self, key: &[u8]) -> Hashed {
+        Name::from_bytes(Bytes::decoded(SmallVec::from_slice(key)))
+    }
+
+    /// Where the entry of `key` is among `entries`, whose keys are kept relative to
+    /// `held`, the keys compared counted ([`same`]); where it has none, its hash
+    /// leads to the entry it is about to have, after the others, unless the hash
+    /// already leads to another key's.
+    fn find(&mut self, entries: &[(Text, Node)], held: &[u8], key: &[u8]) -> Option<usize> {
+        let new = entries.len();
+        let hash = self.hash(key);
+        let at = *self.0.entry(hash).or_insert(new);
+        if at == new {
+            return None;
+        }
+        if same(entries[at].0.as_slice(held), key) {
+            return Some(at);
+        }
+        // Another key has the same hash, which a file cannot aim at, as the hash is
+        // keyed at random: found entry by entry.
+        entries
+            .iter()
+            .position(|(listed, _)| same(listed.as_slice(held), key))
+    }
+}
+
 /// What parsing is reading: the bytes `r` reads, in `ctx`, which decrypts strings.
 struct Parse<'r, 'a> {
     data: &'a [u8],
@@ -161,34 +268,57 @@ impl<'a> Parse<'_, 'a> {
         let from = r.offset();
         // Where the keys of the entries are kept relative to.
         let held = &self.data[from..];
-        // A key's later entry replaces its value, as the map of a dictionary read
-        // from its bytes keeps the last: while the entries are few, in place; past
-        // `LISTED`, once they are sorted.
+        // A key's later entry replaces its value at once, as the map of a dictionary
+        // read from its bytes keeps the last: the key is found among the entries one
+        // by one while they are few, and past `LISTED` as [`Large`] says, the keys
+        // compared counted ([`same`], [`order`]).
         let mut entries: SmallVec<[(Text, Node); LISTED]> = SmallVec::new();
+        let mut large: Option<Large> = None;
         let bytes = parse_dict_with(r, false, depth + 1, Some(b"<<"), b">>", |r, key, _| {
             let key = Name::new(key)?;
             let value = self.item(r, from, depth + 1)?;
-            if entries.len() <= LISTED
-                && let Some(entry) = entries
-                    .iter_mut()
-                    .find(|(listed, _)| listed.as_slice(held) == key.as_ref())
+            if let Some(Large::Ascending) = large
+                && entries
+                    .last()
+                    .is_some_and(|(last, _)| order(last.as_slice(held), &key).is_ge())
             {
-                entry.1 = value;
-            } else {
-                entries.push((Text::of(key.into_bytes(), self.data, from), value));
+                large = Some(Large::Indexed(Index::of(&entries, held)));
+            }
+            let found = match &mut large {
+                Some(Large::Indexed(index)) => index.find(&entries, held, &key),
+                Some(Large::Ascending) => None,
+                None => entries
+                    .iter()
+                    .position(|(listed, _)| same(listed.as_slice(held), &key)),
+            };
+            if let Some(at) = found {
+                entries[at].1 = value;
+                return Some(());
+            }
+            entries.push((Text::of(key.into_bytes(), self.data, from), value));
+            if large.is_none() && entries.len() > LISTED {
+                let ascending = entries
+                    .windows(2)
+                    .all(|pair| order(pair[0].0.as_slice(held), pair[1].0.as_slice(held)).is_lt());
+                large = Some(if ascending {
+                    Large::Ascending
+                } else {
+                    Large::Indexed(Index::of(&entries, held))
+                });
             }
             Some(())
-        })?;
-        if entries.len() > LISTED {
-            // Stable, so that of a key's entries the last comes last.
-            entries.sort_by(|(a, _), (b, _)| a.as_slice(held).cmp(b.as_slice(held)));
-            entries.dedup_by(|(later_key, later), (key, kept)| {
-                let same = later_key.as_slice(held) == key.as_slice(held);
-                if same {
-                    core::mem::swap(later, kept);
-                }
-                same
-            });
+        });
+        let sort = match large {
+            Some(Large::Indexed(index)) => {
+                index.keep();
+                true
+            }
+            _ => false,
+        };
+        let bytes = bytes?;
+        if sort {
+            // Each key once, so any sort orders them alike.
+            entries.sort_unstable_by(|(a, _), (b, _)| order(a.as_slice(held), b.as_slice(held)));
         }
         let entries = entries.into_boxed_slice();
         Some(DictNode {
@@ -401,5 +531,28 @@ impl<'a> Items<'_, 'a> {
             }
             _ => T::from_items(self, ctx),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A key whose hash leads to another key's entry is found entry by entry, and
+    /// the hash keeps leading to the first.
+    #[test]
+    fn a_key_whose_hash_another_has_is_found_among_the_entries() {
+        let held = b"AB";
+        let mut entries = vec![(Text::At((0, 1)), Node::Null)];
+        let mut index = Index::default();
+        assert_eq!(index.find(&entries, held, b"A"), None);
+        // B's hash leads to A's entry, as if the two keys hashed alike.
+        index.0.insert(index.hash(b"B"), 0);
+        assert_eq!(index.find(&entries, held, b"B"), None);
+        entries.push((Text::At((1, 2)), Node::Boolean(true)));
+        assert_eq!(index.find(&entries, held, b"B"), Some(1));
+        assert_eq!(index.find(&entries, held, b"A"), Some(0));
+        assert_eq!(index.0.get(&index.hash(b"B")), Some(&0));
+        assert_eq!(index.find(&entries, held, b"C"), None);
     }
 }

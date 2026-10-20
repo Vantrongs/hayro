@@ -37,12 +37,26 @@ impl Borrow<[u8]> for Name<'_> {
 }
 
 impl PartialEq for Name<'_> {
-    /// Counts the bytes compared ([`crate::work::TOLD`]): a map compares a key it
-    /// inserts with each key that hashes alike, which tests bound.
+    /// Counts the bytes compared ([`same`]).
     fn eq(&self, other: &Self) -> bool {
-        crate::work::told(1 + self.len().min(other.len()));
-        self.as_ref() == other.as_ref()
+        same(self, other)
     }
+}
+
+/// Whether the bytes of two names are the same, counting the bytes compared
+/// ([`crate::work::TOLD`]): a map compares a key it inserts with each key that
+/// hashes alike, and a parsed dictionary a key with those before it, which tests
+/// bound.
+pub(crate) fn same(a: &[u8], b: &[u8]) -> bool {
+    crate::work::told(1 + a.len().min(b.len()));
+    a == b
+}
+
+/// The order of the bytes of two names, counting the bytes compared, as [`same`]
+/// does: a parsed dictionary sorts its keys with it.
+pub(crate) fn order(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+    crate::work::told(1 + a.len().min(b.len()));
+    a.cmp(b)
 }
 
 impl Eq for Name<'_> {}

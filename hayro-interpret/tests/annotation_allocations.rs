@@ -80,6 +80,8 @@ fn cost(n: usize) -> (usize, usize) {
 /// 20 of each, allocates no more than its ceilings.
 #[test]
 fn a_form_field_allocates_under_its_ceilings() {
+    // What a thread allocates once, before the first form is measured, is not counted.
+    cost(1);
     let (count_20, bytes_20) = cost(20);
     let (count_40, bytes_40) = cost(40);
     ceilings::check_ceilings(

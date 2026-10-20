@@ -91,6 +91,8 @@ fn unit_cost(
 fn assert_unit_cost_ignores_size(what: &str, content: impl Fn(usize, usize) -> String) {
     const SIZE: usize = 1000;
     const UNITS: usize = 100;
+    // What a thread allocates once, before the first page is measured, is not counted.
+    cost(&content(SIZE, UNITS));
     let small = unit_cost(&content, SIZE, UNITS);
     let large = unit_cost(&content, 2 * SIZE, UNITS);
     assert_eq!(

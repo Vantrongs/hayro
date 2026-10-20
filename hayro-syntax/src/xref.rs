@@ -3270,11 +3270,18 @@ mod tests {
             }),
         ];
         for (family, file) in families {
+            // A dictionary of more than 8 keys is kept sorted, which compares each key
+            // with at least the next in order, each time the dictionary is parsed.
+            let most = if family == "names that hash alike" {
+                15
+            } else {
+                13
+            };
             let [small, large] = [1000, 2000].map(|n| {
                 let file = file(n);
                 let work = work(&file);
                 assert!(
-                    work <= 13 * file.len(),
+                    work <= most * file.len(),
                     "{family}: {work} steps to open {} bytes",
                     file.len()
                 );
