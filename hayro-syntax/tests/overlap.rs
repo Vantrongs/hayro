@@ -339,9 +339,12 @@ fn objects_nested_in_an_object_stream_are_read_in_linear_work_and_memory() {
 // streams after them: each is cut at the next, so that what is decoded and kept is
 // linear in the file, and each still holds its object, read and kept once; finding
 // the data, and the `endstream` after white space, searches the file once, whatever
-// table finds the streams. A rebuilt table finds only the first stream, as the scan
-// does not read a stream's data, which holds the others' headers, and so does
-// PyMuPDF 1.28.2: what refers to the others' objects refers to none.
+// table finds the streams. A rebuilt table finds only the first stream: the others'
+// headers are in its data, which its /Length or the first `endstream` ends, and bytes
+// in a stream's data are its content, not the file's objects, or an attached PDF's
+// objects would replace the document's (`a_rebuild_takes_no_object_of_an_embedded_pdf`
+// in `xref.rs`). PyMuPDF 1.28.2 also finds 1 of the 64 values, with each /Length:
+// what refers to the others' objects refers to none.
 #[test]
 fn overlapping_object_streams_are_read_in_linear_work_and_memory() {
     for length in [Length::Whole, Length::Padded, Length::Wrong] {

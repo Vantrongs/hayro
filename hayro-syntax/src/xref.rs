@@ -3347,6 +3347,47 @@ mod tests {
         }
     }
 
+    // A PDF attached to the document uncompressed is the data of a stream, not part of
+    // the document: a rebuild takes none of its objects, catalog or trailer, though
+    // they are numbered as the document's and come after them, where the later of two
+    // objects numbered alike would be the table's. The document keeps its own page, as
+    // PyMuPDF 1.28.2 shows it.
+    #[test]
+    fn a_rebuild_takes_no_object_of_an_embedded_pdf() {
+        let content = "0 0 1 rg 0 0 300 200 re f";
+        let mut inner = b"%PDF-1.7\n".to_vec();
+        let mut offsets = vec![];
+        for object in [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R >>".to_string(),
+            format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            ),
+        ] {
+            offsets.push(inner.len());
+            inner.extend(format!("{} 0 obj\n{object}\nendobj\n", offsets.len()).bytes());
+        }
+        let xref = inner.len();
+        inner.extend(b"xref\n0 5\n0000000000 65535 f \n");
+        for offset in offsets {
+            inner.extend(format!("{offset:010} 00000 n \n").bytes());
+        }
+        inner.extend(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").bytes(),
+        );
+        let mut body = format!(
+            "4 0 obj\n<< /Type /EmbeddedFile /Subtype /application#2Fpdf /Length {} >>\nstream\n",
+            inner.len()
+        )
+        .into_bytes();
+        body.extend(&inner);
+        body.extend(b"\nendstream\nendobj\n");
+        // Opens to the document's 100 × 100 page.
+        work(&file_with(&body, &[0], true));
+    }
+
     // A rebuild does not lex a stream's data: opening a file that is mostly the data
     // of a stream full of numbers and headers lexes a bounded part of it, however
     // long the data ([`crate::work::EXAMINED`]).
