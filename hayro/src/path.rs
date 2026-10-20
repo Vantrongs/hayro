@@ -60,7 +60,13 @@ impl Renderer<'_> {
         if let Some(clip_path) = clip_path.as_ref() {
             self.push_clip_path_inner(clip_path, FillRule::NonZero);
         }
-        if let Some(outline) = single_segment_outline(path, self.ctx.stroke()) {
+        // A stroke no wider than a pixel is outlined by the renderer's hairline path,
+        // which costs less than filling the same outline.
+        let device_width = self.ctx.stroke().width * f64::from(max_factor(self.ctx.transform()));
+        let outline = (device_width > HAIRLINE_MAX_WIDTH)
+            .then(|| single_segment_outline(path, self.ctx.stroke()))
+            .flatten();
+        if let Some(outline) = outline {
             self.ctx.set_fill_rule(convert_fill_rule(FillRule::NonZero));
             self.ctx.fill_path(&outline);
         } else {
@@ -187,6 +193,10 @@ pub(crate) fn max_factor(transform: &Affine) -> f32 {
         .length()
         .max(y_advance.to_vec2().length()) as f32
 }
+
+/// `vello_common::flatten::HAIRLINE_MAX_WIDTH` of the pinned renderer, which the
+/// renderer does not export.
+const HAIRLINE_MAX_WIDTH: f64 = 1.0;
 
 fn single_segment_outline(path: &BezPath, stroke: &kurbo::Stroke) -> Option<BezPath> {
     use kurbo::{Cap, PathEl};
