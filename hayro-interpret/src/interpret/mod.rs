@@ -602,15 +602,9 @@ pub fn interpret<'a>(
 
                 text::show_text_string(context, device, resources, s.0);
             }
-            // An array with an entry that is neither a number nor a string draws
-            // nothing and moves the text on by nothing, as `MuPDF` (`PyMuPDF` 1.28.2)
-            // draws it.
-            TypedInstruction::ShowTexts(s)
-                if s.0
-                    .iter::<Object<'_>>()
-                    .any(|o| !matches!(o, Object::Number(_) | Object::String(_))) => {}
             TypedInstruction::ShowTexts(s) => {
-                if context.text_state().font.is_none() {
+                let had_font = context.text_state().font.is_some();
+                if !had_font {
                     // Even if no explicit font was set, we try to assume Helvetica. Acrobat
                     // seems to do the same.
                     context.text_state_mut().font = Font::new_standard(
@@ -620,7 +614,9 @@ pub fn interpret<'a>(
                     .map(TextStateFont::Fallback);
                 }
 
+                let text_matrix = context.text_state().text_matrix;
                 text::begin_glyph_run(context);
+                let mut drawn = true;
                 for obj in s.0.iter::<Object<'_>>() {
                     match obj {
                         Object::Number(num) => {
@@ -629,10 +625,26 @@ pub fn interpret<'a>(
                         Object::String(text) => {
                             text::append_text_string(context, resources, &text);
                         }
-                        _ => {}
+                        _ => {
+                            drawn = false;
+                            break;
+                        }
                     }
                 }
-                text::show_glyph_run(context, device);
+                if drawn {
+                    text::show_glyph_run(context, device);
+                } else {
+                    // An array with an entry that is neither a number nor a string
+                    // draws nothing and moves the text on by nothing, as `MuPDF`
+                    // (`PyMuPDF` 1.28.2) draws it: the glyphs gathered before the
+                    // entry are dropped and the text state is as before the array.
+                    text::begin_glyph_run(context);
+                    let state = context.text_state_mut();
+                    state.text_matrix = text_matrix;
+                    if !had_font {
+                        state.font = None;
+                    }
+                }
             }
             TypedInstruction::HorizontalScaling(h) => {
                 context.text_state_mut().horizontal_scaling = h.0.as_f32();

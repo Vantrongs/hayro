@@ -107,3 +107,23 @@ fn a_text_array_with_an_entry_of_another_kind_draws_nothing() {
     }
     assert_eq!(shown("[(AB) -100 (CD)] TJ (EF) Tj", none).len(), 6);
 }
+
+/// A `TJ` array's entries are each read once, deciding whether the array is drawn
+/// as they are drawn: 100 more entries of 10 bytes make the readers look at
+/// `TJ_EXAMINED` more bytes, the array parsed as an operand and its entries read
+/// once, with what reading a token looks at past its end (reading them a second time
+/// to decide first, as before, made it 8,400). The count is exact: a change that
+/// moves it sets `TJ_EXAMINED` to the count the failure names.
+#[test]
+fn a_text_array_is_read_once() {
+    use hayro_interpret::hayro_syntax::work::EXAMINED;
+    let examined = |n: usize| {
+        let ops = format!("[{}] TJ", "(AB) -100 ".repeat(n));
+        EXAMINED.set(0);
+        assert_eq!(shown(&ops, "[]").len(), 2 * n);
+        EXAMINED.get()
+    };
+    assert_eq!(examined(200) - examined(100), TJ_EXAMINED);
+}
+
+const TJ_EXAMINED: usize = 5_300;
