@@ -70,15 +70,6 @@ impl<'a> Bytes<'a> {
             Self::Shared(bytes) => Err(Bytes::Shared(bytes)),
         }
     }
-
-    /// A copy of the bytes that needs no data to be held.
-    pub(crate) fn to_static(&self) -> Bytes<'static> {
-        match self {
-            Self::Borrowed(bytes) => Bytes::decoded(SmallVec::from_slice(bytes)),
-            Self::Inline(bytes) => Bytes::Inline(bytes.clone()),
-            Self::Shared(bytes) => Bytes::Shared(bytes.clone()),
-        }
-    }
 }
 
 impl From<Vec<u8>> for Bytes<'_> {

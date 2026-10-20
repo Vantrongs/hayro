@@ -101,11 +101,6 @@ impl<'a> Name<'a> {
         self.0
     }
 
-    /// The name, held without the data it was read from.
-    pub(crate) fn to_static(&self) -> Name<'static> {
-        Name(self.0.to_static())
-    }
-
     /// Return a string representation of the name.
     ///
     /// Returns a placeholder in case the name is not UTF-8 encoded.

@@ -10,9 +10,8 @@
 //! reading of arrays and dictionaries that `Object::skip_with_depth` and
 //! `parse_dict_with` share), so a body parses where it skips, to the same end.
 
-use crate::hash;
 use crate::object::array::parse_array_with;
-use crate::object::dict::{new_offsets, parse_dict_with};
+use crate::object::dict::parse_dict_with;
 use crate::object::{
     Array, Bytes, Dict, MAX_OBJECT_NESTING_DEPTH, MaybeRef, Name, Null, Number, ObjRef, Object,
     ObjectLike, String, Written, leaf,
@@ -21,6 +20,7 @@ use crate::reader::{Reader, ReaderContext, ReaderExt};
 use crate::sync::Arc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use smallvec::SmallVec;
 
 /// Where bytes are, from and up to, in the bytes of what holds them.
 pub(crate) type Span = (usize, usize);
@@ -89,22 +89,19 @@ pub(crate) struct ArrayNode {
     items: Vec<Node>,
 }
 
-/// A dictionary: where it is, and each entry's value, those of a small dictionary in
-/// a list with where each key is, which takes a few dozen bytes an entry where its
-/// map takes hundreds a dictionary, in no particular order ([`Dict::keys`] sorts
-/// them).
+/// A dictionary: where it is, and each entry with where its key is, one entry a key:
+/// those of a small dictionary in the file's order, those of a larger one sorted by
+/// key ([`LISTED`]). A list takes a few dozen bytes an entry, where a map takes
+/// about twice that and grows by doubling; every dictionary of a file is parsed when
+/// it opens and kept while it is open, so a file whose pages each list all the
+/// resources of the pages before them holds tens of thousands of entries.
 pub(crate) struct DictNode {
     span: Span,
-    entries: Entries,
+    entries: Box<[(Text, Node)]>,
 }
 
-enum Entries {
-    List(Box<[(Text, Node)]>),
-    Map(Box<hash::Map<Name<'static>, Node>>),
-}
-
-/// At most this many entries are kept in a list, which a key is searched in entry by
-/// entry.
+/// At most this many entries are kept in the file's order, which a key is searched
+/// in entry by entry; more are sorted by key and searched by halving.
 const LISTED: usize = 8;
 
 /// What parsing is reading: the bytes `r` reads, in `ctx`, which decrypts strings.
@@ -162,45 +159,38 @@ impl<'a> Parse<'_, 'a> {
             return None;
         }
         let from = r.offset();
-        // The entries, each key borrowed while they are few, in a list where a key's
-        // later entry replaces its value, as a map built by the same insertions as
-        // the map of a dictionary read from its bytes keeps the last; past `LISTED`
-        // keys, in such a map, the keys held.
-        let mut few: Vec<(Name<'a>, Node)> = Vec::new();
-        let mut many: Option<hash::Map<Name<'static>, Node>> = None;
+        // Where the keys of the entries are kept relative to.
+        let held = &self.data[from..];
+        // A key's later entry replaces its value, as the map of a dictionary read
+        // from its bytes keeps the last: while the entries are few, in place; past
+        // `LISTED`, once they are sorted.
+        let mut entries: SmallVec<[(Text, Node); LISTED]> = SmallVec::new();
         let bytes = parse_dict_with(r, false, depth + 1, Some(b"<<"), b">>", |r, key, _| {
             let key = Name::new(key)?;
             let value = self.item(r, from, depth + 1)?;
-            match &mut many {
-                Some(many) => {
-                    many.insert(key.to_static(), value);
-                }
-                None => match few.iter().position(|(listed, _)| *listed == key) {
-                    Some(at) => few[at].1 = value,
-                    None if few.len() < LISTED => few.push((key, value)),
-                    None => {
-                        let mut held = new_offsets();
-                        for (key, value) in few.drain(..) {
-                            held.insert(key.to_static(), value);
-                        }
-                        held.insert(key.to_static(), value);
-                        many = Some(held);
-                    }
-                },
+            if entries.len() <= LISTED
+                && let Some(entry) = entries
+                    .iter_mut()
+                    .find(|(listed, _)| listed.as_slice(held) == key.as_ref())
+            {
+                entry.1 = value;
+            } else {
+                entries.push((Text::of(key.into_bytes(), self.data, from), value));
             }
             Some(())
         })?;
-        let entries = match many {
-            Some(many) => Entries::Map(Box::new(many)),
-            None => {
-                let text = |key: Name<'a>| Text::of(key.into_bytes(), self.data, from);
-                Entries::List(
-                    few.into_iter()
-                        .map(|(key, value)| (text(key), value))
-                        .collect(),
-                )
-            }
-        };
+        if entries.len() > LISTED {
+            // Stable, so that of a key's entries the last comes last.
+            entries.sort_by(|(a, _), (b, _)| a.as_slice(held).cmp(b.as_slice(held)));
+            entries.dedup_by(|(later_key, later), (key, kept)| {
+                let same = later_key.as_slice(held) == key.as_slice(held);
+                if same {
+                    core::mem::swap(later, kept);
+                }
+                same
+            });
+        }
+        let entries = entries.into_boxed_slice();
         Some(DictNode {
             span: (from - start, from - start + bytes.len()),
             entries,
@@ -350,21 +340,22 @@ impl DictNode {
     }
 
     pub(crate) fn len(&self) -> usize {
-        match &self.entries {
-            Entries::List(entries) => entries.len(),
-            Entries::Map(entries) => entries.len(),
-        }
+        self.entries.len()
     }
 
     /// The value of `key`, of the dictionary whose bytes are `data`.
     pub(crate) fn get(&self, key: &[u8], data: &[u8]) -> Option<&Node> {
-        match &self.entries {
-            Entries::List(entries) => entries
+        let entries = &self.entries;
+        let at = if entries.len() > LISTED {
+            entries
+                .binary_search_by(|(name, _)| name.as_slice(data).cmp(key))
+                .ok()?
+        } else {
+            entries
                 .iter()
-                .find(|(name, _)| name.as_slice(data) == key)
-                .map(|(_, node)| node),
-            Entries::Map(entries) => entries.get(key),
-        }
+                .position(|(name, _)| name.as_slice(data) == key)?
+        };
+        Some(&entries[at].1)
     }
 
     /// The entries of the dictionary whose bytes are `data`, in no particular order.
@@ -372,19 +363,9 @@ impl DictNode {
         &'s self,
         data: &'a [u8],
     ) -> impl Iterator<Item = (Name<'a>, &'s Node)> + 's {
-        let (list, map) = match &self.entries {
-            Entries::List(entries) => (Some(entries), None),
-            Entries::Map(entries) => (None, Some(entries)),
-        };
-        let list = list
-            .into_iter()
-            .flat_map(|entries| entries.iter())
-            .map(move |(name, node)| (Name::from_bytes(name.bytes(data)), node));
-        let map = map
-            .into_iter()
-            .flat_map(|entries| entries.iter())
-            .map(|(name, node)| (name.clone(), node));
-        list.chain(map)
+        self.entries
+            .iter()
+            .map(move |(name, node)| (Name::from_bytes(name.bytes(data)), node))
     }
 }
 
