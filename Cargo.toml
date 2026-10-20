@@ -129,9 +129,10 @@ overflow-checks = true
 
 [patch.crates-io]
 # Strokes and dashes whose work stays bounded by the view: a dash pattern far finer
-# than a pixel is drawn solid rather than expanded dash by dash.
-vello_common = { git = "https://github.com/Vantrongs/vello", rev = "3144325a81d585715e87cceb5a90fb89c8f6b94b" }
-vello_cpu = { git = "https://github.com/Vantrongs/vello", rev = "3144325a81d585715e87cceb5a90fb89c8f6b94b" }
+# than a pixel is drawn solid rather than expanded dash by dash. An unclipped layer is
+# composited only where each row drew, which knockout groups rely on.
+vello_common = { git = "https://github.com/Vantrongs/vello", rev = "a7b734da1dc3648a19bd26e9a0bd15f9aa1e7de5" }
+vello_cpu = { git = "https://github.com/Vantrongs/vello", rev = "a7b734da1dc3648a19bd26e9a0bd15f9aa1e7de5" }
 # `Inflate::try_clone` and `Inflate::allocation_size`, which Flate checkpoints need.
 zlib-rs = { git = "https://github.com/Vantrongs/zlib-rs", rev = "124359709a6ed94bda6fe1ff4d413e23bbae34e5" }
 # `zune_jpeg::rows`, which grayscale JPEG rows need.
