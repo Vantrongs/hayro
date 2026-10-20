@@ -369,7 +369,10 @@ fn a_wide_ccitt_row_is_stopped_before_room_is_made_for_it() {
         };
         let meter = Meter::new(Some(&stop));
         let (result, held) = measure(|| stream.decoded_image_metered(&params, &meter).err());
-        assert!(matches!(result, Some(DecodeFailure::Cancelled)), "{result:?}");
+        assert!(
+            matches!(result, Some(DecodeFailure::Cancelled)),
+            "{result:?}"
+        );
         assert!(held.peak <= 8 * POLL_BYTES + 4096, "{held:?}");
     }
 }
