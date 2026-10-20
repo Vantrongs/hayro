@@ -7,8 +7,10 @@
 //! quadrilaterals, a line width wider on each side.
 
 use super::entries::{Derived, Entries, Items, Value};
-use super::out::{Color, MITER_LIMIT, Out, Region, Rounding, as_written, stroke_reach};
-use super::{Unsupported, border_width, c_color, color_of, dash, most_pieces, rect};
+use super::out::{
+    Color, MITER_LIMIT, Out, Part, Refused, Region, Rounding, as_written, stroke_reach,
+};
+use super::{Drew, Unsupported, border_width, c_color, color_of, dash, most_pieces, rect};
 use hayro_syntax::object::dict::keys::{C, IC, INKLIST, QUADPOINTS};
 use kurbo::{Point, Rect, Vec2};
 use std::f64::consts::SQRT_2;
@@ -116,6 +118,11 @@ pub(super) struct Quads {
     clip: Option<Rect>,
     /// Those of some height, which a squiggly draws.
     high: Vec<Quad>,
+    /// The box a highlight is clipped to ([`highlight`]); `None` with `clip`.
+    highlight: Option<Rect>,
+    /// The box a redaction is clipped to: of each, a point wider on each side;
+    /// `None` for none ([`super::icons::redact`]).
+    pub(super) redact: Option<Rect>,
 }
 
 impl Derived for Quads {
@@ -138,7 +145,20 @@ impl Derived for Quads {
         let clip = union(all.iter().map(|q| q.bounds(line_width(q))))
             .filter(|clip| clip.width() > 0.0 && clip.height() > 0.0);
         let high = all.iter().filter(|q| q.height() > 0.0).copied().collect();
-        Self { all, clip, high }
+        let highlight = clip.map(|around| {
+            all.iter()
+                .filter_map(controls)
+                .flatten()
+                .fold(around, |r, p| r.union_pt(p))
+        });
+        let redact = union(all.iter().map(|q| q.bounds(1.0)));
+        Self {
+            all,
+            clip,
+            high,
+            highlight,
+            redact,
+        }
     }
 }
 
@@ -173,13 +193,13 @@ pub(super) fn marked(annot: &Entries<'_>) -> Option<(Rc<Quads>, Rect)> {
 /// curves' control points at the origin, and so does this.
 pub(super) fn highlight(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     let fill = c_color(annot, Color::Rgb([1.0, 1.0, 0.0]));
-    let (shapes, clip) = highlights(annot)?;
+    let (quads, clip) = highlights(annot)?;
     out.op("q");
     out.clip(clip)?;
     out.fill_color(&fill)?;
-    for (q, controls) in shapes {
+    for q in &quads.all {
         let [tl, tr, bl, br] = q.0;
-        let [c1, c2, c3, c4] = controls.unwrap_or([Point::ZERO; 4]);
+        let [c1, c2, c3, c4] = controls(q).unwrap_or([Point::ZERO; 4]);
         out.nums(&[bl.x, bl.y], "m")?;
         out.nums(&[c1.x, c1.y, c2.x, c2.y, tl.x, tl.y], "c")?;
         out.nums(&[tr.x, tr.y], "l")?;
@@ -190,42 +210,33 @@ pub(super) fn highlight(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     Some(())
 }
 
-/// A quad a highlight fills, with the control points of its sides where its bottom
-/// edge has a direction ([`highlight`]).
-type Rounded = (Quad, Option<[Point; 4]>);
+/// The control points of the sides of quad `q` a highlight fills, where its
+/// bottom edge has a direction ([`highlight`]): √2/6 of its height out on each axis
+/// of the turned quad.
+fn controls(q: &Quad) -> Option<[Point; 4]> {
+    let [tl, tr, bl, br] = q.0;
+    let k = q.height() * SQRT_2 / 6.0;
+    let along = br - bl;
+    let len = along.hypot();
+    (len > 0.0).then(|| {
+        let (cos, sin) = (along.x / len, along.y / len);
+        let turn = |x: f64, y: f64| Vec2::new(x * cos - y * sin, x * sin + y * cos);
+        [
+            bl + turn(-k, k),
+            tl + turn(-k, -k),
+            tr + turn(k, -k),
+            br + turn(k, k),
+        ]
+    })
+}
 
-/// Each quad a highlight fills ([`Rounded`]), and the box viewers clip them to: the
-/// box of the quads, a line width wider on each side, and of the control points.
-pub(super) fn highlights(annot: &Entries<'_>) -> Option<(Vec<Rounded>, Rect)> {
-    let (quads, around) = marked(annot)?;
-    let shapes: Vec<Rounded> = quads
-        .all
-        .iter()
-        .map(|&q| {
-            let [tl, tr, bl, br] = q.0;
-            // √2/6 of the height, on each axis of the turned quad.
-            let k = q.height() * SQRT_2 / 6.0;
-            let along = br - bl;
-            let len = along.hypot();
-            let controls = (len > 0.0).then(|| {
-                let (cos, sin) = (along.x / len, along.y / len);
-                let turn = |x: f64, y: f64| Vec2::new(x * cos - y * sin, x * sin + y * cos);
-                [
-                    bl + turn(-k, k),
-                    tl + turn(-k, -k),
-                    tr + turn(k, -k),
-                    br + turn(k, k),
-                ]
-            });
-            (q, controls)
-        })
-        .collect();
-    let clip = shapes
-        .iter()
-        .filter_map(|(_, c)| *c)
-        .flatten()
-        .fold(around, |r, p| r.union_pt(p));
-    Some((shapes, clip))
+/// The quads a highlight fills and the box viewers clip them to: the box of the
+/// quads, a line width wider on each side, and of the control points; made once
+/// for the document ([`Quads`]).
+pub(super) fn highlights(annot: &Entries<'_>) -> Option<(Rc<Quads>, Rect)> {
+    let quads = quads(annot)?;
+    let clip = quads.highlight?;
+    Some((quads, clip))
 }
 
 pub(super) enum Line {
@@ -260,7 +271,7 @@ pub(super) fn text_lines(annot: &Entries<'_>, line: Line, out: &mut Out) -> Opti
 /// height `h` wide, between its bottom edge and the line a seventh of the way up
 /// (see [`zigzag`]): the steps that paint where the page shows them under the
 /// clip.
-pub(super) fn squiggly(annot: &Entries<'_>, out: &mut Out) -> Result<Option<()>, Unsupported> {
+pub(super) fn squiggly(annot: &Entries<'_>, out: &mut Out) -> Drew {
     let stroke = c_color(annot, Color::BLACK);
     let Some((quads, clip)) = marked(annot) else {
         return Ok(None);
@@ -329,7 +340,7 @@ pub(super) fn squiggly(annot: &Entries<'_>, out: &mut Out) -> Result<Option<()>,
 /// where their steps do not, fewer the closer the quad is to a parallelogram, and
 /// for steps shorter than a few times what writing moves their corners, those whose
 /// joins' reach comes that close.
-fn zigzag(q: &Quad, region: &Region, pen: &mut Run, out: &mut Out) -> Result<(), Unsupported> {
+fn zigzag(q: &Quad, region: &Region, pen: &mut Run, out: &mut Out) -> Result<(), Refused> {
     let [_, _, bl, br] = q.0;
     let width = line_width(q);
     let delta = q.height() / 7.0;
@@ -370,16 +381,21 @@ fn zigzag(q: &Quad, region: &Region, pen: &mut Run, out: &mut Out) -> Result<(),
         ) * (delta / len),
         region: region.clone(),
     };
+    // The steps `a..b`, which may paint where the page shows them, drawn as
+    // viewers draw them only by steps more than this draws: refused.
+    let refuse = |a: f64, b: f64, out: &mut Out| {
+        let hull = z.hull(z.t(a), z.t(b));
+        let reach = z.reach(z.slack(&hull));
+        let part = Part::near(hull.to_vec(), reach).computed(z.place(b));
+        out.refuse(Unsupported::Coordinates, part)
+    };
     let steps = (len / delta).ceil();
     if !steps.is_finite() {
         // Steps too many to number, which no viewer tells apart: refused where the
         // quad can show.
         let hull = z.hull(0.0, 1.0);
-        return if region.near(&hull, z.reach(z.slack(&hull))) {
-            Err(Unsupported::Coordinates)
-        } else {
-            Ok(())
-        };
+        let part = Part::near(hull.to_vec(), z.reach(z.slack(&hull)));
+        return out.refuse(Unsupported::Coordinates, part);
     }
     pen.until = None;
     // The ranges of steps left to look at, the first last; step `k` runs from
@@ -397,7 +413,9 @@ fn zigzag(q: &Quad, region: &Region, pen: &mut Run, out: &mut Out) -> Result<(),
         if region.holds(&hull, slack + moved.x.max(moved.y)) {
             // Every corner as written lies in `region`: every step of some length
             // paints.
-            pen.draw(&z, a, b, out)?;
+            if !pen.draw(&z, a, b, out) {
+                return refuse(a, b, out);
+            }
             continue;
         }
         if b - a > 1.0 {
@@ -408,17 +426,20 @@ fn zigzag(q: &Quad, region: &Region, pen: &mut Run, out: &mut Out) -> Result<(),
                 let mid = ((a + b) / 2.0).floor();
                 // Past 2^53, neighbouring steps' numbers are no longer apart.
                 if !(a < mid && mid < b) {
-                    return Err(Unsupported::Coordinates);
+                    return refuse(a, b, out);
                 }
                 ranges.push((mid, b));
                 ranges.push((a, mid));
             }
             continue;
         }
-        if z.paints(a, steps) {
-            pen.draw(&z, a, b, out)?;
+        let within = if z.paints(a, steps) {
+            pen.draw(&z, a, b, out)
         } else {
-            pen.spend()?;
+            pen.spend()
+        };
+        if !within {
+            return refuse(a, b, out);
         }
     }
     if pen.until.is_some() {
@@ -437,19 +458,16 @@ struct Run {
 }
 
 impl Run {
-    /// Counts a step looked at that paints nothing.
-    fn spend(&mut self) -> Result<(), Unsupported> {
+    /// Counts a step looked at that paints nothing: whether it is within the most.
+    fn spend(&mut self) -> bool {
         self.spent += 1.0;
-        if self.spent > self.most {
-            return Err(Unsupported::Coordinates);
-        }
-        Ok(())
+        self.spent <= self.most
     }
 
     /// Draws the steps `a..b` of `z` that have some length as written, each of
     /// which paints; a run goes on from the last step drawn where the corners
     /// between are one point as written.
-    fn draw(&mut self, z: &Zigzag, a: f64, b: f64, out: &mut Out) -> Result<(), Unsupported> {
+    fn draw(&mut self, z: &Zigzag, a: f64, b: f64, out: &mut Out) -> bool {
         let mut k = a;
         while k < b {
             let (from, to) = (z.written(k), z.written(k + 1.0));
@@ -458,7 +476,9 @@ impl Run {
                 k = z.run_end(k, b);
                 continue;
             }
-            self.spend()?;
+            if !self.spend() {
+                return false;
+            }
             let on = self.until.is_some_and(|u| u == k || z.still(u, k));
             if !on {
                 out.computed(&[from.x, from.y], "m", z.place(k));
@@ -467,7 +487,7 @@ impl Run {
             self.until = Some(k + 1.0);
             k += 1.0;
         }
-        Ok(())
+        true
     }
 }
 
@@ -938,10 +958,10 @@ mod tests {
         let annot = format!("<< /Subtype /Squiggly /Rect [0 0 1 1] /QuadPoints [{quads}] >>");
         let dict = Dict::from_bytes(annot.as_bytes()).expect("valid dict");
         let mut out = Out::new(visible, 1.0);
-        squiggly(&Entries::detached(dict), &mut out)
-            .expect("drawable")
-            .expect("an appearance");
-        out.finish().expect("written").0
+        let drew = squiggly(&Entries::detached(dict), &mut out);
+        let (drew, content, _) = out.finish(drew).expect("written");
+        drew.expect("an appearance");
+        content
     }
 
     /// The corners of the zigzags drawn in `c`.
@@ -997,8 +1017,11 @@ mod tests {
             /QuadPoints [33554432 24 33554440 24 33554432 10 33554440 10] >>";
         let dict = Dict::from_bytes(annot.as_bytes()).expect("valid dict");
         let mut out = Out::new(PAGE, 1.0);
-        squiggly(&Entries::detached(dict), &mut out).expect("drawable");
-        assert!(matches!(out.finish(), Err(super::Unsupported::Coordinates)));
+        let drew = squiggly(&Entries::detached(dict), &mut out);
+        assert!(matches!(
+            out.finish(drew),
+            Err(super::Unsupported::Coordinates)
+        ));
     }
 
     /// A quad's zigzag is the same alone and among quads that take more than
@@ -1403,7 +1426,7 @@ mod tests {
             let dict = Dict::from_bytes(annot.as_bytes()).expect("valid dict");
             let mut out = Out::new(page, 1.0);
             let drew = squiggly(&Entries::detached(dict), &mut out);
-            assert!(drew.is_err() || out.finish().is_err(), "{x0}: drawn");
+            assert!(out.finish(drew).is_err(), "{x0}: drawn");
         }
         for x0 in ["0"] {
             let c = squiggly_content(&format!("{x0} 24 4000000 24 {x0} 10 4000000 10"), page);

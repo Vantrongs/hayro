@@ -30,14 +30,19 @@ thread_local! {
 /// Runs `f`, which reads entries; [`Unsupported::Number`] when it read a number
 /// that cannot be read as `MuPDF` reads it, whatever `f` made of it.
 pub(crate) fn read<T>(f: impl FnOnce() -> T) -> Result<T, Unsupported> {
+    match reading(f) {
+        (_, true) => Err(Unsupported::Number),
+        (value, false) => Ok(value),
+    }
+}
+
+/// Runs `f`, which reads entries, and tells whether it read a number that cannot be
+/// read as `MuPDF` reads it, for the caller to tell where that may matter.
+pub(crate) fn reading<T>(f: impl FnOnce() -> T) -> (T, bool) {
     let before = UNREADABLE.with(|u| u.replace(false));
     let value = f();
     let unreadable = UNREADABLE.with(|u| u.replace(before));
-    if unreadable {
-        Err(Unsupported::Number)
-    } else {
-        Ok(value)
-    }
+    (value, unreadable)
 }
 
 /// Runs `f`, which reads entries, and tells whether it read a number that cannot be
@@ -662,6 +667,14 @@ impl<'a> Value<'a> {
         matches!(self, Self::String(_))
     }
 
+    /// The length of [`Value::text`], told without copying it: 0 for no text.
+    pub(crate) fn text_len(&self) -> usize {
+        match self {
+            Self::String(s) => s.as_bytes().len(),
+            _ => 0,
+        }
+    }
+
     /// The bytes of a text entry ([`Text`]) whose value this is: a string's.
     pub(crate) fn text(&self) -> Option<Vec<u8>> {
         match self {
@@ -994,6 +1007,12 @@ impl<'a> Entries<'a> {
     /// The bytes of text entry `entry` ([`Value::text`]).
     pub(crate) fn text(&self, entry: Text) -> Option<Vec<u8>> {
         self.get(entry.key()).text()
+    }
+
+    /// The length of the bytes of text entry `entry` ([`Value::text_len`]), told
+    /// without copying them.
+    pub(crate) fn text_len(&self, entry: Text) -> usize {
+        self.get(entry.key()).text_len()
     }
 
     /// Whether text entry `entry` gives text ([`Value::is_text`]).

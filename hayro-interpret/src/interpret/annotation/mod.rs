@@ -34,8 +34,7 @@ mod text;
 mod widget;
 
 use entries::{Annots, Entries, Id, Items, Label, Listed, Objects, Source, StreamEntries, Value};
-pub use out::Undecided;
-use out::{Color, Out, written_all};
+use out::{Color, Out, Part, Refused, written_all};
 use text::{Family, Fonts, Shaped, Style, StyleKey, Typeface};
 
 use super::AnnotationSelection;
@@ -138,7 +137,9 @@ impl Placement {
     }
 }
 
-/// Why no appearance can be generated for an annotation.
+/// Why no appearance can be generated for an annotation. An appearance is refused
+/// only where the part of it that cannot be drawn may show where the page shows it
+/// (see [`Appearances::page`]); elsewhere that part is left out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unsupported {
     /// Its subtype, or its field type for a widget, has no generator.
@@ -169,7 +170,7 @@ pub enum Unsupported {
     /// viewers decide cannot be told (their arithmetic for rich text and for a
     /// line's caption is not reproduced to the bit), and the ways they may decide
     /// differ where the page shows them.
-    Measure(Undecided),
+    Measure,
 }
 
 /// An appearance generated for an annotation without a usable appearance stream.
@@ -207,7 +208,7 @@ impl Glyph {
         let mut out = Out::default();
         out.path(path)?;
         out.op("f");
-        let (content, _) = out.finish().ok()?;
+        let ((), content, _) = out.finish(Ok(())).ok()?;
         let bbox =
             written_all([ink.x0.floor(), ink.y0.floor(), ink.x1.ceil(), ink.y1.ceil()]).ok()?;
         Some(Self {
@@ -281,11 +282,13 @@ enum Plan<'a> {
         placed: Option<Placement>,
     },
     /// An appearance generated for each area shown, from `annot`, read as its own
-    /// the first time and as a shared object's after.
+    /// the first time and as a shared object's after; or, where `refused` tells why
+    /// it cannot be, refused where what it may draw may show ([`Out::refuse`]).
     Generate {
         id: Id<'a>,
         annot: Entries<'a>,
         subtype: Option<Rc<Name<'a>>>,
+        refused: Option<Unsupported>,
         again: Cell<bool>,
     },
 }
@@ -302,14 +305,14 @@ enum State<'a> {
     Absent,
 }
 
-/// What an annotation comes to before generating: an appearance stream, nothing,
-/// why it cannot be drawn, or an appearance to generate. For a stream, or why it
-/// cannot be placed, also where it lands as a viewer reads its numbers, where it
-/// has a `/Rect` ([`placement`]).
+/// What an annotation comes to before generating: nothing; an appearance stream, or
+/// why it cannot be placed, with where it lands as a viewer reads its numbers,
+/// where it has a `/Rect` ([`placement`]); or an appearance to generate, or to
+/// refuse for the reason given where it may show.
 enum Prepared<'a> {
-    Look(Look<'a>),
+    Nothing,
     Placed(Look<'a>, Option<Placement>),
-    Generate,
+    Generate(Option<Unsupported>),
 }
 
 /// The annotations a page lists that may draw, each with its place in `/Annots`.
@@ -617,19 +620,23 @@ impl<'a> Appearances<'a> {
             });
             Some(Rc::new(Plan::Fixed { annotation, placed }))
         };
-        match entries::read(|| selected(&annot, selection)) {
-            Ok(true) => {}
+        // Flags that cannot be read leave whether it is drawn untold: it is refused
+        // where what it draws may show, and left out elsewhere.
+        let unselected = match entries::read(|| selected(&annot, selection)) {
+            Ok(true) => None,
             Ok(false) => return None,
-            Err(why) => return fixed(Look::Unsupported(why), None),
-        }
+            Err(why) => Some(why),
+        };
         match entries::read(|| self.prepare(&annot)) {
-            Ok(Prepared::Look(Look::Nothing) | Prepared::Placed(Look::Nothing, _)) => None,
-            Ok(Prepared::Look(look)) => fixed(look, None),
-            Ok(Prepared::Placed(look, placed)) => fixed(look, placed),
-            Ok(Prepared::Generate) => Some(Rc::new(Plan::Generate {
+            Ok(Prepared::Nothing | Prepared::Placed(Look::Nothing, _)) => None,
+            Ok(Prepared::Placed(look, placed)) => {
+                fixed(unselected.map_or(look, Look::Unsupported), placed)
+            }
+            Ok(Prepared::Generate(refused)) => Some(Rc::new(Plan::Generate {
                 id: listed.id,
                 annot,
                 subtype,
+                refused: unselected.or(refused),
                 again: Cell::new(false),
             })),
             Err(why) => fixed(Look::Unsupported(why), None),
@@ -684,6 +691,7 @@ impl<'a> Appearances<'a> {
         let Plan::Generate {
             annot,
             subtype,
+            refused,
             again,
             ..
         } = plan
@@ -695,10 +703,10 @@ impl<'a> Appearances<'a> {
         } else {
             annot.clone()
         };
-        let look = match entries::read(|| self.generate(&annot, visible, unit)) {
-            Ok(Ok(Some(appearance))) => Look::Generated(Rc::new(appearance)),
-            Ok(Ok(None)) => return None,
-            Ok(Err(why)) | Err(why) => Look::Unsupported(why),
+        let look = match self.generate(*refused, &annot, visible, unit) {
+            Ok(Some(appearance)) => Look::Generated(Rc::new(appearance)),
+            Ok(None) => return None,
+            Err(why) => Look::Unsupported(why),
         };
         Some(Rc::new(Annotation {
             look,
@@ -719,7 +727,7 @@ impl<'a> Appearances<'a> {
                     Value::Stream(stream) => Some(stream),
                     Value::Dict(states) => match self.state(annot, &states) {
                         State::Stream(stream) => Some(stream),
-                        State::Nothing => return Prepared::Look(Look::Nothing),
+                        State::Nothing => return Prepared::Nothing,
                         State::Absent => None,
                     },
                     _ => None,
@@ -775,18 +783,19 @@ impl<'a> Appearances<'a> {
         if button {
             self.to_generate(annot)
         } else {
-            Prepared::Look(Look::Nothing)
+            Prepared::Nothing
         }
     }
 
     /// An appearance to generate for `annot`: none for one held directly in a
     /// page's `/Annots` rather than an object of its own, which viewers draw only by
-    /// its appearance stream (observed in `PyMuPDF` bake).
+    /// its appearance stream (observed in `PyMuPDF` bake); refused where it may show
+    /// for one the file tells neither of.
     fn to_generate(&self, annot: &Entries<'a>) -> Prepared<'a> {
         match annot.own() {
-            Some(true) => Prepared::Generate,
-            Some(false) => Prepared::Look(Look::Nothing),
-            None => Prepared::Look(Look::Unsupported(Unsupported::Kind)),
+            Some(true) => Prepared::Generate(None),
+            Some(false) => Prepared::Nothing,
+            None => Prepared::Generate(Some(Unsupported::Kind)),
         }
     }
 }
@@ -862,79 +871,63 @@ pub fn rect_transform(rect: kurbo::Rect, bbox: [f32; 4], matrix: Affine) -> Affi
     ])
 }
 
-/// What a generator makes: an appearance, nothing to draw, or why it cannot.
+/// What generating an appearance makes: an appearance, nothing to draw, or why it
+/// cannot be drawn.
 type Generated = Result<Option<Appearance>, Unsupported>;
+
+/// What a generator makes: whether it drew something, or its appearance refused
+/// ([`Out::refuse`]).
+type Drew = Result<Option<()>, Refused>;
 
 impl<'a> Appearances<'a> {
     /// The appearance generated for `annot` from its entries, for a page that shows
-    /// `visible`, in units of `unit` points ([`Out::new`]).
-    fn generate(&self, annot: &Entries<'a>, visible: kurbo::Rect, unit: f64) -> Generated {
-        let Some(subtype) = annot.name(SUBTYPE) else {
-            return Ok(None);
-        };
-        // An annotation that can paint nothing where the page shows it is nothing,
-        // whatever a generator would make of the rest of its entries: neither
-        // drawn nor refused.
-        if !may_paint(&subtype, annot, &Out::new(visible, unit)) {
-            return Ok(None);
-        }
-        self.generated_anyway(annot, &subtype, visible, unit)
-    }
-
-    /// The appearance generated for `annot` of subtype `subtype` ([`Self::generate`]),
-    /// whether or not it may paint where the page shows it.
-    fn generated_anyway(
+    /// `visible`, in units of `unit` points ([`Out::new`]); refused for `refused`
+    /// instead where it may show.
+    ///
+    /// An annotation that can paint nothing where the page shows it is nothing,
+    /// whatever a generator would make of the rest of its entries: neither drawn
+    /// nor refused. That is told before generating it from its opacity and the
+    /// entries that place what it draws ([`whole`]). A part of it that cannot be
+    /// drawn as viewers draw it refuses it only where that part may show
+    /// ([`Out::refuse`]); a number read whose reading is not established, where
+    /// what the annotation may draw may show: such a number read to place it may
+    /// put it anywhere.
+    fn generate(
         &self,
+        refused: Option<Unsupported>,
         annot: &Entries<'a>,
-        subtype: &Name<'_>,
         visible: kurbo::Rect,
         unit: f64,
     ) -> Generated {
-        // What cannot paint where the page shows it is not written ([`Out`]).
+        let Some(subtype) = annot.name(SUBTYPE) else {
+            return Ok(None);
+        };
         let mut out = Out::new(visible, unit);
-        let fonts = &self.fonts;
-        let ok = |drew: Option<()>| Ok(drew);
-        let drew = match &**subtype {
-            b"Square" => ok(markup::shape(annot, false, &mut out)),
-            b"Circle" => ok(markup::shape(annot, true, &mut out)),
-            b"Highlight" => ok(markup::highlight(annot, &mut out)),
-            b"Underline" => ok(markup::text_lines(annot, markup::Line::Under, &mut out)),
-            b"StrikeOut" => ok(markup::text_lines(annot, markup::Line::Through, &mut out)),
-            b"Squiggly" => markup::squiggly(annot, &mut out),
-            b"Ink" => ok(markup::ink(annot, &mut out)),
-            b"Text" => icons::icon(annot, icons::Icon::Note, fonts, &mut out),
-            b"FileAttachment" => icons::icon(annot, icons::Icon::FileAttachment, fonts, &mut out),
-            b"Sound" => icons::icon(annot, icons::Icon::Sound, fonts, &mut out),
-            b"Caret" => ok(icons::caret(annot, &mut out)),
-            b"Redact" => ok(icons::redact(annot, &mut out)),
-            b"Stamp" => icons::stamp(annot, self, visible, &mut out),
-            b"FreeText" => freetext::free_text(annot, self, visible, &mut out),
-            b"Line" => lines::line(annot, self, visible, &mut out),
-            b"Polygon" => lines::poly(annot, true, &mut out),
-            b"PolyLine" => lines::poly(annot, false, &mut out),
-            b"Widget" => match self.field(annot) {
-                Some(field) => widget::widget(annot, &field, self, visible, &mut out),
-                // A widget whose /Parent chain loops is a broken field: nothing.
-                None => Ok(None),
-            },
-            // Popup, Link, the media and 3D subtypes, PrinterMark, TrapNet, Watermark,
-            // Projection, stamps of other names and unknown subtypes: nothing.
-            _ => Ok(None),
+        let (whole, unreadable) = entries::reading(|| whole(&subtype, annot));
+        let (whole, refused) = match whole {
+            _ if unreadable => (Part::Anywhere, Some(Unsupported::Number)),
+            None => return Ok(None),
+            Some(whole) => (whole, refused),
+        };
+        if !out.shows(&whole) {
+            return Ok(None);
+        }
+        let drew = match refused {
+            Some(why) => out.refuse(why, whole).map(|()| None),
+            None => {
+                let (drew, unreadable) =
+                    entries::reading(|| self.generated_anyway(annot, &subtype, visible, &mut out));
+                if unreadable {
+                    drew.and_then(|_| out.refuse(Unsupported::Number, whole).map(|()| None))
+                } else {
+                    drew
+                }
+            }
         };
         // A number that could not be written fails the appearance, whatever the
         // generator made of it: `None` from a generator means nothing to draw.
-        let (content, glyphs) = out.finish()?;
-        let drew = drew?;
-        // An appearance that paints nothing, such as a widget with no value, border
-        // or background, is no appearance.
-        let paints = !glyphs.is_empty()
-            || content.lines().any(|l| {
-                matches!(
-                    l.rsplit(' ').next(),
-                    Some("f" | "f*" | "S" | "s" | "b" | "b*" | "B" | "B*")
-                )
-            });
-        if drew.is_none() || !paints {
+        let (drew, content, glyphs) = out.finish(drew)?;
+        if drew.is_none() || !paints(&content, &glyphs) {
             return Ok(None);
         }
         let blend = if **subtype == *b"Highlight" {
@@ -955,6 +948,46 @@ impl<'a> Appearances<'a> {
             opacity,
             blend,
         }))
+    }
+
+    /// What the generator of `annot`, of subtype `subtype`, draws into `out`
+    /// ([`Self::generate`]), whether or not it may paint where the page shows it.
+    fn generated_anyway(
+        &self,
+        annot: &Entries<'a>,
+        subtype: &Name<'_>,
+        visible: kurbo::Rect,
+        out: &mut Out,
+    ) -> Drew {
+        let fonts = &self.fonts;
+        let ok = |drew: Option<()>| Ok(drew);
+        match &**subtype {
+            b"Square" => ok(markup::shape(annot, false, out)),
+            b"Circle" => ok(markup::shape(annot, true, out)),
+            b"Highlight" => ok(markup::highlight(annot, out)),
+            b"Underline" => ok(markup::text_lines(annot, markup::Line::Under, out)),
+            b"StrikeOut" => ok(markup::text_lines(annot, markup::Line::Through, out)),
+            b"Squiggly" => markup::squiggly(annot, out),
+            b"Ink" => ok(markup::ink(annot, out)),
+            b"Text" => icons::icon(annot, icons::Icon::Note, fonts, out),
+            b"FileAttachment" => icons::icon(annot, icons::Icon::FileAttachment, fonts, out),
+            b"Sound" => icons::icon(annot, icons::Icon::Sound, fonts, out),
+            b"Caret" => ok(icons::caret(annot, out)),
+            b"Redact" => ok(icons::redact(annot, out)),
+            b"Stamp" => icons::stamp(annot, self, visible, out),
+            b"FreeText" => freetext::free_text(annot, self, visible, out),
+            b"Line" => lines::line(annot, self, visible, out),
+            b"Polygon" => lines::poly(annot, true, out),
+            b"PolyLine" => lines::poly(annot, false, out),
+            b"Widget" => match self.field(annot) {
+                Some(field) => widget::widget(annot, &field, self, visible, out),
+                // A widget whose /Parent chain loops is a broken field: nothing.
+                None => Ok(None),
+            },
+            // Popup, Link, the media and 3D subtypes, PrinterMark, TrapNet, Watermark,
+            // Projection, stamps of other names and unknown subtypes: nothing.
+            _ => Ok(None),
+        }
     }
 
     /// `make()`, made once for the document under `key` in the map `map` gives;
@@ -1197,17 +1230,30 @@ impl<'a> Field<'a> {
     }
 }
 
-/// Whether annotation `annot` of subtype `subtype` may paint where `out`'s page
-/// shows it, told before its appearance is generated, from its opacity and the
-/// entries that place what it draws ([`extent`]): a generator's errors and
-/// refusals are reached only where this holds.
-fn may_paint(subtype: &[u8], annot: &Entries<'_>, out: &Out) -> bool {
+/// Whether `content`, naming `glyphs`, paints: an appearance that paints nothing,
+/// such as a widget with no value, border or background, is no appearance.
+fn paints(content: &str, glyphs: &[Rc<Glyph>]) -> bool {
+    !glyphs.is_empty()
+        || content.lines().any(|l| {
+            matches!(
+                l.rsplit(' ').next(),
+                Some("f" | "f*" | "S" | "s" | "b" | "b*" | "B" | "B*")
+            )
+        })
+}
+
+/// Where annotation `annot` of subtype `subtype` may paint, told before its
+/// appearance is generated, from its opacity and the entries that place what it
+/// draws ([`extent`]): `None` where it paints nothing, a non-widget whose opacity is
+/// 0; anywhere where those entries do not bound it. A generator's errors and
+/// refusals are reached only where this may show.
+fn whole(subtype: &[u8], annot: &Entries<'_>) -> Option<Part> {
     // A widget is drawn opaque whatever its /CA says ([`Appearances::generate`]).
     if subtype != b"Widget" && opacity(annot) == 0.0 {
-        return false;
+        return None;
     }
     let Some((points, reach)) = extent(subtype, annot) else {
-        return true;
+        return Some(Part::Anywhere);
     };
     // Each point computed from a few numbers read, in 32-bit numbers as viewers
     // compute it ([`out::Rounding`]).
@@ -1218,7 +1264,7 @@ fn may_paint(subtype: &[u8], annot: &Entries<'_>, out: &Out) -> bool {
         out::Rounding::of(EXTENT_ROUNDINGS, most),
         out::Rounding::of(EXTENT_ROUNDINGS, most),
     );
-    out.may_show(&points, reach, local)
+    Some(Part::near(points, reach).computed(local))
 }
 
 /// The most roundings a viewer takes in computing a point of an annotation's
@@ -1677,16 +1723,29 @@ mod tests {
                     Rect::new(b.x0 - far, b.y0 - far, b.x1 + far, b.y0 - m),
                     Rect::new(b.x0 - far, b.y1 + m, b.x1 + far, b.y1 + far),
                 ];
+                // What the generator paints in `view`, gate or no gate: nothing,
+                // and refuses nothing, beyond the extent.
+                let anyway = |view: Rect| {
+                    let mut out = Out::new(view, 1.0);
+                    let drew = doc.generated_anyway(&annot, &name, view, &mut out);
+                    out.finish(drew).map(|(drew, content, glyphs)| {
+                        drew.is_some() && super::paints(&content, &glyphs)
+                    })
+                };
                 for view in beyond {
-                    let drawn = doc.generated_anyway(&annot, &name, view, 1.0);
-                    assert!(!matches!(drawn, Ok(Some(_))), "{entries} seen in {view:?}");
+                    let drawn = anyway(view);
+                    assert!(
+                        matches!(drawn, Ok(false)),
+                        "{entries} seen in {view:?}: {drawn:?}"
+                    );
                 }
                 let whole = b.inflate(far, far);
+                let part = super::whole(&name, &annot);
                 assert!(
-                    super::may_paint(&name, &annot, &Out::new(whole, 1.0))
+                    part.is_some_and(|part| Out::new(whole, 1.0).shows(&part))
                         || annot.number(super::CA) == Some(0.0)
                 );
-                if let Ok(Some(_)) = doc.generated_anyway(&annot, &name, whole, 1.0) {
+                if let Ok(true) = anyway(whole) {
                     painted += 1;
                 }
             }

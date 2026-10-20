@@ -4,7 +4,9 @@
 //! cannot be written fails the whole appearance instead of reaching the content.
 //! A glyph is written once, as a form the content draws wherever the glyph is
 //! ([`Out::form`]). What cannot paint where the page shows it is not written
-//! ([`Out`], [`Region`]).
+//! ([`Out`], [`Region`]), and a part of an appearance its generator cannot draw as
+//! viewers draw it refuses the appearance only where it may show: a generator fails
+//! only with [`Refused`], which only [`Out`] makes ([`Out::refuse`]).
 
 use super::{Glyph, Unsupported};
 use hayro_syntax::hash;
@@ -38,12 +40,88 @@ pub(super) fn written_all<const L: usize>(v: [f64; L]) -> Result<[f32; L], Unsup
     Ok(n)
 }
 
-/// Why an appearance is refused for a measure ([`Unsupported::Measure`]): a decision
-/// viewers may take the other way changes what the page shows. Made only by
-/// [`Out::finish`], where [`Out::undecided`] found that the outcomes may differ
-/// where the page shows them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Undecided(());
+/// A generated appearance refused, which is all a generator fails with: made only
+/// by [`Out`], once it has recorded why, which [`Out::finish`] tells. [`Out::refuse`]
+/// makes one only where the part that cannot be drawn may show where the page shows
+/// it; [`Out::wrote`], where a piece that may show could not be written.
+#[derive(Debug)]
+#[must_use]
+pub(super) struct Refused(());
+
+/// Where a part of an appearance may paint that its generator cannot draw as viewers
+/// draw it ([`Out::refuse`]).
+pub(super) enum Part {
+    /// Within `reach` of the convex hull of `points`, of the current space, each
+    /// computed as `local` says ([`Rounding`]), under a clip to `under` where it is
+    /// drawn under one not set yet ([`Out::clip`]).
+    Near {
+        points: Vec<Point>,
+        reach: f64,
+        local: Rounding,
+        under: Option<kurbo::Rect>,
+    },
+    /// Anywhere the page shows something: no entry the generator reads bounds
+    /// where viewers draw it.
+    Anywhere,
+}
+
+impl Part {
+    /// Within `reach` of the convex hull of `points`, each where it lies.
+    pub(super) fn near(points: Vec<Point>, reach: f64) -> Self {
+        Self::Near {
+            points,
+            reach,
+            local: Rounding::NONE,
+            under: None,
+        }
+    }
+
+    /// In box `r`.
+    pub(super) fn rect(r: kurbo::Rect) -> Self {
+        Self::near(corners(r).to_vec(), 0.0)
+    }
+
+    /// This part, its points each computed as `local` says.
+    pub(super) fn computed(self, local: Rounding) -> Self {
+        match self {
+            Self::Near {
+                points,
+                reach,
+                under,
+                ..
+            } => Self::Near {
+                points,
+                reach,
+                local,
+                under,
+            },
+            Self::Anywhere => Self::Anywhere,
+        }
+    }
+
+    /// This part, drawn under a clip to `clip`, which is not set yet.
+    pub(super) fn under(self, clip: kurbo::Rect) -> Self {
+        match self {
+            Self::Near {
+                points,
+                reach,
+                local,
+                ..
+            } => Self::Near {
+                points,
+                reach,
+                local,
+                under: Some(clip),
+            },
+            Self::Anywhere => Self::Anywhere,
+        }
+    }
+}
+
+/// The corners of `r`, counterclockwise from its bottom left.
+pub(super) fn corners(r: kurbo::Rect) -> [Point; 4] {
+    [(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1)].map(|(x, y)| Point::new(x, y))
+}
 
 /// How far beyond its outline a stroke `width` wide paints: half the width times
 /// the miter limit, or the half-diagonal of a square cap's corner where that is
@@ -856,9 +934,9 @@ impl Kind {
 pub(super) struct Out {
     content: String,
     failed: bool,
-    /// Whether a decision viewers may take the other way changes what may show
-    /// ([`Out::undecided`]).
-    undecided: bool,
+    /// Why the appearance is refused, the first part refused that may show
+    /// ([`Out::refuse`]).
+    refused: Option<Unsupported>,
     /// The glyphs drawn, each once, and their names.
     glyphs: Vec<Rc<Glyph>>,
     named: hash::Set<Rc<str>>,
@@ -913,7 +991,7 @@ impl Out {
         Self {
             content: String::new(),
             failed: false,
-            undecided: false,
+            refused: None,
             glyphs: Vec::new(),
             named: hash::Set::default(),
             state: State {
@@ -940,13 +1018,6 @@ impl Out {
         self.state.region.clone()
     }
 
-    /// Whether a piece within `reach` of the convex hull of `points`, in the
-    /// current space, each computed as `local` says, may paint where the page shows
-    /// it ([`Region::may_show`]).
-    pub(super) fn may_show(&self, points: &[Point], reach: f64, local: Rounding) -> bool {
-        self.state.region.may_show(points, reach, local).is_some()
-    }
-
     /// Whether the convex hull of `points`, in the current space, can paint where
     /// the page shows it ([`Region::meets`]).
     pub(super) fn meets(&self, points: &[Point]) -> bool {
@@ -959,39 +1030,88 @@ impl Out {
         self.state.region.slack(most, local)
     }
 
-    /// The content written and the glyphs it draws; [`Unsupported::Measure`] where
-    /// a decision taken may change what shows ([`Out::undecided`]), and
-    /// [`Unsupported::Coordinates`] when a number written could not be.
-    pub(super) fn finish(self) -> Result<(String, Vec<Rc<Glyph>>), Unsupported> {
-        if self.undecided {
-            Err(Unsupported::Measure(Undecided(())))
-        } else if self.failed {
-            Err(Unsupported::Coordinates)
-        } else {
-            Ok((self.content, self.glyphs))
+    /// What the generator made of the content, `drew`, the content written and the
+    /// glyphs it draws; or why the appearance is refused: the first part refused
+    /// where it may show ([`Out::refuse`]), or [`Unsupported::Coordinates`] where a
+    /// number written could not be.
+    pub(super) fn finish<T>(
+        self,
+        drew: Result<T, Refused>,
+    ) -> Result<(T, String, Vec<Rc<Glyph>>), Unsupported> {
+        if let Some(why) = self.refused {
+            return Err(why);
+        }
+        match drew {
+            Ok(drew) if !self.failed => Ok((drew, self.content, self.glyphs)),
+            // A refusal is made only where one of these is recorded.
+            _ => Err(Unsupported::Coordinates),
         }
     }
 
-    /// A decision taken by a measure that viewers may take the other way, which the
-    /// content is drawn by as the generator takes it: every way of taking it draws
-    /// the same but within the convex hull of `differ`, points of the current space
-    /// each computed as `local` says, grown by `reach`, under a clip to `under`
-    /// where what differs is drawn under one not set yet ([`Out::clip`]). Where
-    /// that may paint where the page shows it ([`Region::may_show`]), the content
-    /// fails with [`Unsupported::Measure`]; where it may not, every way shows the
-    /// same, and the decision refuses nothing.
-    pub(super) fn undecided(
-        &mut self,
-        under: Option<kurbo::Rect>,
-        differ: &[Point],
-        reach: f64,
-        local: Rounding,
-    ) {
-        let mut region = self.state.region.clone();
-        if let Some((_, _, corners)) = under.and_then(|r| self.clip_rect(r)) {
-            region.cut(&corners);
+    /// A part of the appearance the generator cannot draw as viewers draw it, for
+    /// `why`, which may paint within `part`: where that may show where the page
+    /// shows it ([`Region::may_show`]), the appearance is refused for it, and the
+    /// generator stops; where it may not, the part is left out, as what viewers draw
+    /// of it does not show either, and the generator goes on with the rest. A part
+    /// the page shows nothing of is left out wherever it lies.
+    pub(super) fn refuse(&mut self, why: Unsupported, part: Part) -> Result<(), Refused> {
+        if !self.shows(&part) {
+            return Ok(());
         }
-        self.undecided |= region.may_show(differ, reach, local).is_some();
+        self.refused.get_or_insert(why);
+        Err(Refused(()))
+    }
+
+    /// `made`, or, where it is why a part within `part()` cannot be drawn, that part
+    /// left out (`None`) or the appearance refused for it, as [`Out::refuse`] says.
+    pub(super) fn part<T>(
+        &mut self,
+        made: Result<T, Unsupported>,
+        part: impl FnOnce() -> Part,
+    ) -> Result<Option<T>, Refused> {
+        match made {
+            Ok(made) => Ok(Some(made)),
+            Err(why) => self.refuse(why, part()).map(|()| None),
+        }
+    }
+
+    /// Whether what `part` may paint may show where the page shows it.
+    pub(super) fn shows(&self, part: &Part) -> bool {
+        match part {
+            Part::Anywhere => !self.state.region.is_empty(),
+            Part::Near {
+                points,
+                reach,
+                local,
+                under,
+            } => {
+                let mut region = self.state.region.clone();
+                if let Some((_, _, corners)) = under.and_then(|r| self.clip_rect(r)) {
+                    region.cut(&corners);
+                }
+                region.may_show(points, *reach, *local).is_some()
+            }
+        }
+    }
+
+    /// `drew`, what drawing pieces through `Out` came to: `None` where a piece that
+    /// may show could not be written ([`Out::form`], [`Out::within`]), which fails
+    /// the content where it was drawn, refused.
+    pub(super) fn wrote(&mut self, drew: Option<()>) -> Result<(), Refused> {
+        drew.ok_or_else(|| {
+            debug_assert!(self.failed, "Out gives None only where a piece failed");
+            self.failed = true;
+            Refused(())
+        })
+    }
+
+    /// What `draw` wrote through this `Out`, as [`Out::wrote`] says.
+    pub(super) fn writes(
+        &mut self,
+        draw: impl FnOnce(&mut Self) -> Option<()>,
+    ) -> Result<(), Refused> {
+        let drew = draw(self);
+        self.wrote(drew)
     }
 
     /// Writes what was held back, before something painted.
@@ -1039,7 +1159,8 @@ impl Out {
         for &v in nums {
             ok &= written(v).is_some();
             let n = v as f32;
-            write!(text, "{n} ").ok()?;
+            // Writing into a `String` cannot fail.
+            let _ = write!(text, "{n} ");
             values.push(f64::from(n));
         }
         text.push_str(op);
@@ -1278,7 +1399,7 @@ impl Out {
         let mut ok = true;
         for &d in dash {
             ok &= written(d).is_some();
-            write!(text, "{} ", d as f32).ok()?;
+            let _ = write!(text, "{} ", d as f32);
         }
         text.push_str("] 0 d\n");
         self.act("d", &text, &[], ok);
@@ -1323,7 +1444,7 @@ impl Out {
         for (n, v) in nums.iter().zip(&mut v) {
             ok &= written(*n).is_some();
             let n = *n as f32;
-            write!(text, "{n} ").ok()?;
+            let _ = write!(text, "{n} ");
             *v = f64::from(n);
         }
         text.push_str("re\nW n\n");
@@ -1374,7 +1495,7 @@ mod tests {
         out.nums(&[0.0, 0.0, 100.0, 100.0], "re");
         out.op("f");
         out.op("Q");
-        assert_eq!(out.finish().map(|c| c.0), Ok(String::new()));
+        assert_eq!(out.finish(Ok(())).map(|c| c.1), Ok(String::new()));
         // A stroke 1 wide 3 below the page reaches 5 from its line: it paints
         // within a quarter of a point of the page; at 4.5 below, it does not.
         for (y, drawn) in [(-3.0, true), (-5.3, false)] {
@@ -1383,7 +1504,7 @@ mod tests {
             out.nums(&[10.0, y], "m");
             out.nums(&[100.0, y], "l");
             out.op("S");
-            let content = out.finish().unwrap().0;
+            let content = out.finish(Ok(())).unwrap().1;
             assert_eq!(content.contains(" l\nS\n"), drawn, "{y}: {content}");
         }
         // Of a path, the subpath off the page is left out; the one closed by `s`
@@ -1394,13 +1515,13 @@ mod tests {
         out.nums(&[1e7, 10.0], "m");
         out.nums(&[1e7, 20.0], "l");
         out.op("s");
-        assert_eq!(out.finish().unwrap().0, "10 10 m\n20 10 l\nS\n");
+        assert_eq!(out.finish(Ok(())).unwrap().1, "10 10 m\n20 10 l\nS\n");
         // Partly on the page, a number that cannot be written fails it.
         let mut out = Out::new(PAGE, 1.0);
         out.nums(&[-1e7, 10.0], "m");
         out.nums(&[20.0, 10.0], "l");
         out.op("S");
-        assert!(out.finish().is_err());
+        assert!(out.finish(Ok(())).is_err());
     }
 
     /// A clip that cannot be written as it is is written cut to what the page
@@ -1411,7 +1532,7 @@ mod tests {
         out.clip(Rect::new(-1e7, 10.0, 100.0, 20.0));
         out.nums(&[0.0, 10.0, 10.0, 10.0], "re");
         out.op("f");
-        let content = out.finish().unwrap().0;
+        let content = out.finish(Ok(())).unwrap().1;
         assert!(
             content.starts_with("-1.45025 10 101.45025 10 re\nW n\n"),
             "{content}"
@@ -1421,6 +1542,6 @@ mod tests {
         assert!(out.region().is_empty());
         out.nums(&[0.0, 0.0, 10.0, 10.0], "re");
         out.op("f");
-        assert_eq!(out.finish().unwrap().0, "");
+        assert_eq!(out.finish(Ok(())).unwrap().1, "");
     }
 }

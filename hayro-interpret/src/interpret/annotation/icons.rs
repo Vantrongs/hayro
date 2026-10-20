@@ -12,17 +12,13 @@
 
 use super::entries::Entries;
 use super::markup::{Quad, quads};
-use super::out::{Color, Out, Rounding};
+use super::out::{Color, Out, Part, Refused, Rounding, corners};
 use super::text::{self, Align, Family, Fonts, Setting, Shaped, Typeface};
-use super::{Appearances, Unsupported, c_color, color_of, rect};
+use super::{Appearances, Drew, Unsupported, c_color, color_of, rect};
 use hayro_syntax::object::dict::keys::C;
 use kurbo::{Affine, BezPath, Circle, Point, Shape};
 
-type Drawn = Result<Option<()>, Unsupported>;
-
-fn fail(o: Option<()>) -> Result<(), Unsupported> {
-    o.ok_or(Unsupported::Kind)
-}
+type Drawn = Drew;
 
 /// Which symbol an icon shows.
 #[derive(Clone, Copy)]
@@ -54,12 +50,15 @@ pub(super) fn icon(annot: &Entries<'_>, kind: Icon, fonts: &Fonts, out: &mut Out
     };
     let fill = color_of(annot, C).unwrap_or(Color::Gray(1.0));
     out.op("q");
-    fail(out.nums(&place.as_coeffs(), "cm"))?;
-    fail(out.fill_color(&fill))?;
-    out.op("0 G");
-    fail(out.stroke_state(1.25, &[]))?;
-    fail(out.nums(&[0.625, 0.625, 18.75, 18.75], "re"))?;
-    out.op("b");
+    out.writes(|out| {
+        out.nums(&place.as_coeffs(), "cm")?;
+        out.fill_color(&fill)?;
+        out.op("0 G");
+        out.stroke_state(1.25, &[])?;
+        out.nums(&[0.625, 0.625, 18.75, 18.75], "re")?;
+        out.op("b");
+        Some(())
+    })?;
     out.op(if fill.luminance() < 0.25 {
         "1 g"
     } else {
@@ -119,7 +118,7 @@ impl Symbol {
     }
 
     /// Fills the symbol in the 10 pt square `at` maps from (0, 0)–(10, 10).
-    fn draw(&self, at: Affine, fonts: &Fonts, out: &mut Out) -> Result<(), Unsupported> {
+    fn draw(&self, at: Affine, fonts: &Fonts, out: &mut Out) -> Result<(), Refused> {
         let mut p = BezPath::new();
         let poly = |p: &mut BezPath, pts: &[(f64, f64)]| {
             p.move_to(pts[0]);
@@ -181,12 +180,24 @@ impl Symbol {
                 stroke(&mut p, &[(2.2, 2.2), (3.6, 0.8)], 2.0);
             }
             Self::Glyph(c) => {
-                let glyphs = fonts.shape(Family::Sans, &c.to_string())?;
+                // A symbol that cannot be set would be drawn within the icon,
+                // 5 pt around the symbol's square.
+                let icon = || {
+                    Part::near(
+                        corners(kurbo::Rect::new(-5.0, -5.0, 15.0, 15.0))
+                            .map(|p| at * p)
+                            .to_vec(),
+                        0.0,
+                    )
+                };
+                let Some(glyphs) = out.part(fonts.shape(Family::Sans, &c.to_string()), icon)?
+                else {
+                    return Ok(());
+                };
                 // About 10 pt from baseline to top.
                 let size = 13.0;
                 let x = (10.0 - text::width(&glyphs, size)) / 2.0;
-                fail(text::draw(&glyphs, size, (x, 0.3), at, out))?;
-                return Ok(());
+                return out.writes(|out| text::draw(&glyphs, size, (x, 0.3), at, out));
             }
             Self::Triangle(y0, y1) => poly(&mut p, &[(0.0, *y0), (10.0, *y0), (5.0, *y1)]),
             Self::Paragraph => {
@@ -300,7 +311,7 @@ impl Symbol {
             }
         }
         p.apply_affine(at);
-        fail(out.path(&p))?;
+        out.writes(|out| out.path(&p))?;
         out.op("f");
         Ok(())
     }
@@ -371,11 +382,7 @@ pub(super) fn redact(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
 /// point wider on each side, or `/Rect` without them.
 pub(super) fn redact_clip(annot: &Entries<'_>) -> Option<kurbo::Rect> {
     match quads(annot).filter(|q| !q.all.is_empty()) {
-        Some(quads) => quads
-            .all
-            .iter()
-            .map(|q| q.bounds(1.0))
-            .reduce(|a, b| a.union(b)),
+        Some(quads) => quads.redact,
         None => rect(annot),
     }
 }
@@ -438,28 +445,36 @@ pub(super) fn stamp<'a>(
     out: &mut Out,
 ) -> Drawn {
     // Without a box, viewers draw over coordinates of ±2^32.
-    let r = rect(annot).ok_or(Unsupported::Coordinates)?;
+    let Some(r) = rect(annot) else {
+        out.refuse(Unsupported::Coordinates, Part::Anywhere)?;
+        return Ok(None);
+    };
     let scale = (r.width() / 190.0).min(r.height() / 50.0);
     if scale <= 0.0 {
         return Ok(None);
     }
     let color = c_color(annot, Color::BLACK);
-    let text = doc.stamp_text(annot)?;
+    // All a stamp draws is clipped to `/Rect`.
+    let Some(text) = out.part(doc.stamp_text(annot), || Part::rect(r))? else {
+        return Ok(None);
+    };
     let at = Affine::translate(r.center().to_vec2())
         * Affine::rotate(0.6_f64.to_radians())
         * Affine::scale(scale);
     out.op("q");
-    fail(out.clip(r))?;
-    fail(out.stroke_color(&color))?;
-    fail(out.stroke_state(2.0 * scale, &[]))?;
-    let corners = [(-93.0, -22.0), (93.0, -22.0), (93.0, 22.0), (-93.0, 22.0)]
-        .map(|(x, y)| at * Point::new(x, y));
-    fail(out.nums(&[corners[0].x, corners[0].y], "m"))?;
-    for c in &corners[1..] {
-        fail(out.nums(&[c.x, c.y], "l"))?;
-    }
-    out.op("s");
-    fail(out.fill_color(&color))?;
+    out.writes(|out| {
+        out.clip(r)?;
+        out.stroke_color(&color)?;
+        out.stroke_state(2.0 * scale, &[])?;
+        let corners = [(-93.0, -22.0), (93.0, -22.0), (93.0, 22.0), (-93.0, 22.0)]
+            .map(|(x, y)| at * Point::new(x, y));
+        out.nums(&[corners[0].x, corners[0].y], "m")?;
+        for c in &corners[1..] {
+            out.nums(&[c.x, c.y], "l")?;
+        }
+        out.op("s");
+        out.fill_color(&color)
+    })?;
     let size = text.size;
     // Baselines from the box's middle.
     let baselines: &[f64] = match (text.lines.len(), size as u32) {

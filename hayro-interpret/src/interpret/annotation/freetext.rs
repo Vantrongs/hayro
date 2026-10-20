@@ -14,12 +14,12 @@
 //! and the defaults match what common viewers draw for such an annotation.
 
 use super::entries::{Entries, Text};
-use super::lines::{Ending, Paint, ending};
-use super::out::{Color, Out};
+use super::lines::{Ending, Paint, ending, lost_part};
+use super::out::{Color, Out, Part};
 use super::rich;
 use super::text::{self, Align, Family, Setting, Size, Span, Style, TextBox};
 use super::{
-    Appearances, FREE_TEXT, TEXT, TextKey, Unsupported, border_width, color_of, dash, rect,
+    Appearances, Drew, FREE_TEXT, TEXT, TextKey, Unsupported, border_width, color_of, dash, rect,
 };
 use hayro_syntax::object::dict::keys::C;
 use kurbo::{Affine, Point, Shape};
@@ -32,9 +32,9 @@ pub(super) fn free_text<'a>(
     doc: &Appearances<'a>,
     visible: kurbo::Rect,
     out: &mut Out,
-) -> Result<Option<()>, Unsupported> {
+) -> Drew {
     // Without a box, viewers draw over coordinates of ±2^32.
-    let Boxes {
+    let Some(Boxes {
         r,
         rd,
         inner,
@@ -42,7 +42,11 @@ pub(super) fn free_text<'a>(
         callout,
         cl,
         clip,
-    } = boxes(annot).ok_or(Unsupported::Coordinates)?;
+    }) = boxes(annot)
+    else {
+        out.refuse(Unsupported::Coordinates, Part::Anywhere)?;
+        return Ok(None);
+    };
     let (family, size, da_color) = doc.default_appearance(Some(annot.source(b"DA")), || {
         annot.text(Text::DefaultAppearance)
     });
@@ -61,76 +65,69 @@ pub(super) fn free_text<'a>(
     let positive = size.is_some_and(|s| s > 0.0);
     let rich = annot.has_text(Text::Rich);
     let text = if rich || annot.has_text(Text::DefaultStyle) {
-        let style = doc.default_style(annot, positive)?;
-        let read = if rich { Text::Rich } else { Text::Contents };
-        let key = TextKey::new(
-            [annot.source(read.key())],
-            Family::Text.into(),
-            vec![FREE_TEXT, u64::from(positive)],
-        )
-        .styled(&style);
-        doc.shaped(key, || {
-            let rc = rich.then(|| annot.text(Text::Rich)).flatten();
-            let spans = rich_spans(rc.as_deref(), &style, positive, || Ok(contents(annot)))?;
-            doc.fonts.shape_rich(&spans)
-        })?
+        doc.default_style(annot, positive).and_then(|style| {
+            let read = if rich { Text::Rich } else { Text::Contents };
+            let key = TextKey::new(
+                [annot.source(read.key())],
+                Family::Text.into(),
+                vec![FREE_TEXT, u64::from(positive)],
+            )
+            .styled(&style);
+            doc.shaped(key, || {
+                let rc = rich.then(|| annot.text(Text::Rich)).flatten();
+                let spans = rich_spans(rc.as_deref(), &style, positive, || Ok(contents(annot)))?;
+                doc.fonts.shape_rich(&spans)
+            })
+        })
     } else {
         let source = annot.source(Text::Contents.key());
-        doc.plain(source, family.into(), TEXT, || Ok(contents(annot)))?
+        doc.plain(source, family.into(), TEXT, || Ok(contents(annot)))
     };
-    // Plain text is drawn at the default appearance's size, 12 pt for a size fit to
-    // the box; rich text's base size is the default appearance's, and a size fit to
-    // the box is none: it is drawn 0 high, as viewers draw it.
-    let set = Setting {
-        base: if text.rich {
-            size.unwrap_or(0.0)
-        } else {
-            size.unwrap_or(12.0)
-        },
-        color,
-        align,
-    };
-    // Rich text is laid out in a box of its own, sized by the default appearance's.
-    let rich_size = text.rich.then(|| size.unwrap_or(0.0));
-    let ascent = if text.rich { RICH_ASCENT } else { 0.8 };
-
+    // Of a callout whose ending has no direction, viewers draw the ending
+    // otherwise ([`lost_part`], in the box all it draws is clipped to); the rest as given (observed).
+    let lost = callout
+        && (cl.len() == 2 || cl.len() == 3)
+        && Ending::of_callout(annot).lost_at(cl[0], cl[1]);
+    if lost {
+        out.refuse(Unsupported::Ending, lost_part(cl[0], w, clip))?;
+    }
     out.op("q");
-    out.clip(clip).ok_or(Unsupported::Kind)?;
-    if let Some(fill) = color_of(annot, C) {
-        out.fill_color(&fill).ok_or(Unsupported::Kind)?;
-        out.nums(&[inner.x0, inner.y0, inner.width(), inner.height()], "re")
-            .ok_or(Unsupported::Kind)?;
-        out.op("f");
-    }
-    // The callout is drawn at the border width as given, however thin or negative.
-    if callout && (cl.len() == 2 || cl.len() == 3) {
-        if Ending::of_callout(annot).lost_at(cl[0], cl[1]) {
-            return Err(Unsupported::Ending);
+    out.writes(|out| {
+        out.clip(clip)?;
+        if let Some(fill) = color_of(annot, C) {
+            out.fill_color(&fill)?;
+            out.nums(&[inner.x0, inner.y0, inner.width(), inner.height()], "re")?;
+            out.op("f");
         }
-        let paint = Paint {
-            stroke: Some(border_color),
-            width: w,
-            dash: Vec::new(),
-            fill: None,
-        };
-        out.stroke_color(&border_color).ok_or(Unsupported::Kind)?;
-        out.stroke_state(w, &[]).ok_or(Unsupported::Kind)?;
-        out.nums(&[cl[0].x, cl[0].y], "m")
-            .ok_or(Unsupported::Kind)?;
-        for p in &cl[1..] {
-            out.nums(&[p.x, p.y], "l").ok_or(Unsupported::Kind)?;
+        // The callout is drawn at the border width as given, however thin or
+        // negative.
+        if callout && (cl.len() == 2 || cl.len() == 3) {
+            let paint = Paint {
+                stroke: Some(border_color),
+                width: w,
+                dash: Vec::new(),
+                fill: None,
+            };
+            out.stroke_color(&border_color)?;
+            out.stroke_state(w, &[])?;
+            out.nums(&[cl[0].x, cl[0].y], "m")?;
+            for p in &cl[1..] {
+                out.nums(&[p.x, p.y], "l")?;
+            }
+            out.op("S");
+            if !lost {
+                ending(Ending::of_callout(annot), cl[0], cl[1], &paint, out)?;
+            }
         }
-        out.op("S");
-        ending(Ending::of_callout(annot), cl[0], cl[1], &paint, out).ok_or(Unsupported::Kind)?;
-    }
-    if w > 0.0 {
-        out.stroke_color(&border_color).ok_or(Unsupported::Kind)?;
-        out.stroke_state(w, &dash(annot)).ok_or(Unsupported::Kind)?;
-        let b = within(inner, w / 2.0);
-        out.nums(&[b.x0, b.y0, b.width(), b.height()], "re")
-            .ok_or(Unsupported::Kind)?;
-        out.op("S");
-    }
+        if w > 0.0 {
+            out.stroke_color(&border_color)?;
+            out.stroke_state(w, &dash(annot))?;
+            let b = within(inner, w / 2.0);
+            out.nums(&[b.x0, b.y0, b.width(), b.height()], "re")?;
+            out.op("S");
+        }
+        Some(())
+    })?;
 
     // The text, in a frame turned with the box: `(u, v)` from its bottom left. As
     // viewers lay it out, a turn of 90, 180 or 270 degrees, as given, turns the
@@ -162,6 +159,29 @@ pub(super) fn free_text<'a>(
     };
     // The text is clipped to the box less the border width.
     let mut clip = within(inner, w).abs();
+    // Text that cannot be set as viewers set it would be drawn within that box
+    // (and the box all is clipped to, set above); viewers draw the rest as given
+    // (observed).
+    let Some(text) = out.part(text, || Part::rect(clip))? else {
+        out.op("Q");
+        return Ok(Some(()));
+    };
+    // Plain text is drawn at the default appearance's size, 12 pt for a size fit to
+    // the box; rich text's base size is the default appearance's, and a size fit to
+    // the box is none: it is drawn 0 high, as viewers draw it.
+    let set = Setting {
+        base: if text.rich {
+            size.unwrap_or(0.0)
+        } else {
+            size.unwrap_or(12.0)
+        },
+        color,
+        align,
+    };
+    // Rich text is laid out in a box of its own, sized by the default appearance's.
+    let rich_size = text.rich.then(|| size.unwrap_or(0.0));
+    let ascent = if text.rich { RICH_ASCENT } else { 0.8 };
+
     let pad = 2.0 * w as f32;
     if let Some(size) = rich_size {
         // Rich text, also to its box in the frame: from the padding on the left to
@@ -170,7 +190,7 @@ pub(super) fn free_text<'a>(
         let p = f64::from(pad);
         let layout = kurbo::Rect::new(p, -2.0 * f64::from(size), fw - 2.0 * p, fh - p).abs();
         let layout = frame * layout.to_path(0.1);
-        out.path(&layout).ok_or(Unsupported::Kind)?;
+        out.writes(|out| out.path(&layout))?;
         out.op("W n");
         clip = clip.intersect(layout.bounding_box());
     }

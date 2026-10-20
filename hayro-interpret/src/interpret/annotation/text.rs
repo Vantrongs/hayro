@@ -14,7 +14,7 @@
 //! compare.
 
 use super::entries::operand_real;
-use super::out::{Color, Out, Rounding};
+use super::out::{Color, Out, Part, Refused, Rounding, corners};
 use super::{Unsupported, work};
 use crate::FontResolverFn;
 use crate::font::blob::{CffFontBlob, OpenTypeFontBlob};
@@ -985,8 +985,8 @@ impl Shaped {
         node: usize,
         under: Range<usize>,
         seek: &Seek<'_>,
-        visit: &mut dyn FnMut(usize) -> Result<(), Unsupported>,
-    ) -> Result<(), Unsupported> {
+        visit: &mut dyn FnMut(usize) -> Result<(), Refused>,
+    ) -> Result<(), Refused> {
         let (first, last) = (
             self.starts
                 .get(under.start)
@@ -1322,12 +1322,6 @@ impl Iterator for Lines<'_> {
     }
 }
 
-/// Fails with [`Unsupported::Kind`] where `Out` failed, as the content then fails
-/// whatever the generator does next.
-fn fail(o: Option<()>) -> Result<(), Unsupported> {
-    o.ok_or(Unsupported::Kind)
-}
-
 /// The number of indices from 0 below `n` for which `pred`, true for those before
 /// some index and false from it on, holds.
 fn partition(n: usize, pred: impl Fn(usize) -> bool) -> usize {
@@ -1430,7 +1424,7 @@ pub(super) fn draw_glyphs(
     view: Rect,
     out: &mut Out,
     brush: &mut Brush,
-) -> Result<(), Unsupported> {
+) -> Result<(), Refused> {
     let Some(ink) = text.ink else {
         return Ok(());
     };
@@ -1464,7 +1458,7 @@ pub(super) fn draw_glyphs(
     // they lie: not decreasing with `k`.
     let off = |k: usize| place(k).bound().x + slack;
     let up = computed.1.bound().x + slack;
-    let mut draw_span = |span: usize| -> Result<(), Unsupported> {
+    let mut draw_span = |span: usize| -> Result<(), Refused> {
         let i = text.starts[span].max(range.start);
         let end = text
             .starts
@@ -1506,9 +1500,17 @@ pub(super) fn draw_glyphs(
             let mut pen = Pen::new(frame, size, y, computed.1, view);
             for k in i + first..i + last {
                 work(1);
-                let g = fonts.glyph(style.face, text.chars[k])?;
+                // Set once, the glyph is found again: a font lacking it, which the
+                // text was set without, would leave it out where what this draws
+                // cannot show.
+                let glyph = fonts.glyph(style.face, text.chars[k]);
+                let in_view = || Part::near(corners(view).map(|p| frame * p).to_vec(), 0.0);
+                let Some(g) = out.part(glyph, in_view)? else {
+                    continue;
+                };
                 let (at, grow) = (pos(k), (off(k), up));
-                fail(pen.put(out, at, place(k), grow, &g.face.outline(g.id), brush))?;
+                let put = pen.put(out, at, place(k), grow, &g.face.outline(g.id), brush);
+                out.wrote(put)?;
             }
             pen.end(out);
         }
@@ -1606,11 +1608,16 @@ pub(super) fn draw_line(
     frame: Affine,
     seen: Rect,
     out: &mut Out,
-) -> Result<(), Unsupported> {
+) -> Result<(), Refused> {
     if !(seen.width() >= 0.0 && seen.height() >= 0.0) {
         return Ok(());
     }
-    text.direction(set.base)?;
+    if out
+        .part(text.direction(set.base), || Part::rect(seen))?
+        .is_none()
+    {
+        return Ok(());
+    }
     let view = frame.inverse().transform_rect_bbox(seen);
     draw_glyphs(
         fonts,
@@ -1645,7 +1652,7 @@ pub(super) fn draw_rows(
     by_width: bool,
     seen: Rect,
     out: &mut Out,
-) -> Result<(), Unsupported> {
+) -> Result<(), Refused> {
     let size = set.base;
     let Some(ink) = text.ink else {
         return Ok(());
@@ -1739,7 +1746,7 @@ pub(super) fn draw_comb(
     (y, y_rounding): (f64, Rounding),
     seen: Rect,
     out: &mut Out,
-) -> Result<(), Unsupported> {
+) -> Result<(), Refused> {
     let size = set.base;
     if size == 0.0 || count == 0 || !(seen.width() >= 0.0 && seen.height() >= 0.0) {
         return Ok(());
@@ -1765,15 +1772,19 @@ pub(super) fn draw_comb(
     };
     for i in cells {
         work(1);
-        let g = fonts.glyph(face, text.chars[i])?;
-        fail(pen.put(
+        // Found again as it was set ([`draw_glyphs`]).
+        let Some(g) = out.part(fonts.glyph(face, text.chars[i]), || Part::rect(seen))? else {
+            continue;
+        };
+        let put = pen.put(
             out,
             at(i),
             place(i),
             (0.0, 0.0),
             &g.face.outline(g.id),
             &mut brush,
-        ))?;
+        );
+        out.wrote(put)?;
     }
     pen.end(out);
     Ok(())
@@ -1834,7 +1845,7 @@ pub(super) fn draw_options(
     step: f64,
     seen: Rect,
     out: &mut Out,
-) -> Result<(), Unsupported> {
+) -> Result<(), Refused> {
     if !(seen.width() >= 0.0 && seen.height() >= 0.0) {
         return Ok(());
     }
@@ -1851,7 +1862,8 @@ pub(super) fn draw_options(
     // and the baselines, as computed, run down at a positive step and up at a
     // negative one: an option whose box lies wholly above or below the view, as
     // far as a viewer may put it, draws nothing ([`reaches`]).
-    let rows = match scaled(fonts.bound(face), set.base) {
+    let ink = scaled(fonts.bound(face), set.base);
+    let rows = match ink {
         _ if !skips() => 0..count,
         None => 0..0,
         Some((_, _, y0, y1)) if y0.is_finite() && y1.is_finite() => {
@@ -1868,7 +1880,25 @@ pub(super) fn draw_options(
         Some(_) => 0..count,
     };
     for i in rows {
-        let label = label(i)?;
+        // An option that cannot be set draws within its line: across what shows,
+        // up and down as far as the font's glyphs reach from its baseline, wherever
+        // a viewer puts it, or anywhere a size of no number puts it.
+        let line = || match ink {
+            Some((_, _, y0, y1)) if y0.is_finite() && y1.is_finite() => {
+                let (lo, hi) = (y0.min(y1), y0.max(y1));
+                let y = baseline(i);
+                Part::rect(Rect::new(
+                    seen.x0,
+                    y + lo - off(i),
+                    seen.x1,
+                    y + hi + off(i),
+                ))
+            }
+            _ => Part::rect(seen),
+        };
+        let Some(label) = out.part(label(i), line)? else {
+            continue;
+        };
         draw_line(
             fonts,
             &label,
@@ -1918,7 +1948,7 @@ pub(super) fn draw_box(
     area: &TextBox,
     seen: Rect,
     out: &mut Out,
-) -> Result<(), Unsupported> {
+) -> Result<(), Refused> {
     let shown = area.clip.intersect(seen);
     if !(shown.width() >= 0.0 && shown.height() >= 0.0) {
         return Ok(());
@@ -1958,12 +1988,21 @@ pub(super) fn draw_box(
     let mut way = None;
     let mut laid = 0_usize;
     let mut pieces = pieces.peekable();
+    // A piece that cannot be set, or laid out the way the text before it runs,
+    // viewers lay out by rules not reproduced anywhere in the box: refused where
+    // the box may show, and left out (with all the box draws) where it cannot.
+    let clipped = || Part::rect(area.clip);
     while let Some(text) = pieces.next() {
-        let text = text?;
-        let direction = text.direction(set.base)?;
+        let Some(text) = out.part(text, clipped)? else {
+            continue;
+        };
+        let Some(direction) = out.part(text.direction(set.base), clipped)? else {
+            continue;
+        };
         if direction != Direction::Nowhere {
             if way.is_some_and(|w| w != direction) {
-                return Err(Unsupported::RichText);
+                out.refuse(Unsupported::RichText, clipped())?;
+                continue;
             }
             way = Some(direction);
         }
@@ -2024,7 +2063,8 @@ pub(super) fn draw_box(
                         (clip.x0, y1),
                     ]
                     .map(|(x, y)| area.frame * kurbo::Point::new(x, y));
-                    out.undecided(Some(area.clip), &differ, 0.0, Rounding::NONE);
+                    let part = Part::near(differ.to_vec(), 0.0).under(area.clip);
+                    out.refuse(Unsupported::Measure, part)?;
                 }
             }
             let below = height + ascent * line.size;
@@ -2781,19 +2821,15 @@ mod tests {
     }
 
     /// What `draw` writes: its content and the glyphs it names, or why it fails.
-    fn written(
-        seen: Rect,
-        draw: impl FnOnce(&mut Out) -> Result<(), super::Unsupported>,
-    ) -> String {
+    fn written(seen: Rect, draw: impl FnOnce(&mut Out) -> Result<(), super::Refused>) -> String {
         let mut out = Out::new(seen, 0.0);
         let drew = draw(&mut out);
-        match (drew, out.finish()) {
-            (Ok(()), Ok((content, glyphs))) => {
+        match out.finish(drew) {
+            Ok(((), content, glyphs)) => {
                 let names: Vec<&str> = glyphs.iter().map(|g| g.name()).collect();
                 format!("{content}{names:?}")
             }
-            // As the generator: content that failed fails the appearance first.
-            (_, Err(why)) | (Err(why), _) => format!("{why:?}"),
+            Err(why) => format!("{why:?}"),
         }
     }
 
@@ -2803,7 +2839,7 @@ mod tests {
     fn same(
         case: &str,
         seen: Rect,
-        draw: impl Fn(&mut Out) -> Result<(), super::Unsupported>,
+        draw: impl Fn(&mut Out) -> Result<(), super::Refused>,
     ) -> (bool, String) {
         let before = work_done();
         let fast = written(seen, &draw);

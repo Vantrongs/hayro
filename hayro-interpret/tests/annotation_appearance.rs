@@ -3865,7 +3865,7 @@ fn look_of(annot: &str) -> String {
         vec![format!("<< /Type /Annot {annot} >>").into_bytes()],
     );
     match first_look(&pdf) {
-        Look::Unsupported(Unsupported::Measure(_)) => "measure".into(),
+        Look::Unsupported(Unsupported::Measure) => "measure".into(),
         _ => looks(&pdf).swap_remove(0),
     }
 }
@@ -3978,6 +3978,243 @@ fn what_cannot_paint_on_the_page_refuses_nothing() {
         assert_eq!(look_of(&on), refused, "{on}");
         assert_eq!(look_of(&format!("{on} /CA 1")), refused, "{on}");
         assert_eq!(look_of(&format!("{on} /CA 0")), "nothing", "{on}");
+    }
+}
+
+/// `(x, y)` turned `quarters` quarter turns about the middle of the 200 pt page.
+fn turned(quarters: u8, (x, y): (f64, f64)) -> (f64, f64) {
+    (0..quarters).fold((x, y), |(x, y), _| (200.0 - y, x))
+}
+
+/// The numbers of `points`, each turned `quarters` quarter turns ([`turned`]).
+fn turned_points(quarters: u8, points: &[(f64, f64)]) -> String {
+    points
+        .iter()
+        .map(|&p| {
+            let (x, y) = turned(quarters, p);
+            format!("{x} {y}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The box `x0 y0 x1 y1` turned `quarters` quarter turns ([`turned`]).
+fn turned_box(quarters: u8, [x0, y0, x1, y1]: [f64; 4]) -> String {
+    let (a, b) = (turned(quarters, (x0, y0)), turned(quarters, (x1, y1)));
+    format!(
+        "{} {} {} {}",
+        a.0.min(b.0),
+        a.1.min(b.1),
+        a.0.max(b.0),
+        a.1.max(b.1)
+    )
+}
+
+/// A box `w` × `h` across edge `quarters` of the 200 pt page (left, below, right,
+/// above), `overlap` of it on the page, 20 from the page's corner along the edge.
+fn across(quarters: u8, w: f64, h: f64, overlap: f64) -> String {
+    let [x0, y0, x1, y1] = match quarters {
+        0 => [overlap - w, 20.0, overlap, 20.0 + h],
+        1 => [20.0, overlap - h, 20.0 + w, overlap],
+        2 => [200.0 - overlap, 20.0, 200.0 - overlap + w, 20.0 + h],
+        _ => [20.0, 200.0 - overlap, 20.0 + w, 200.0 - overlap + h],
+    };
+    format!("{x0} {y0} {x1} {y1}")
+}
+
+/// A point 30 beyond edge `quarters` of the 200 pt page (left, below, right, above),
+/// `onto` nearer, and a point across the page from it, 150 along, both on a line
+/// across the edge whose line from the page's origin crosses the page only where
+/// it is more than 15 beside them.
+fn beside(quarters: u8, onto: f64) -> [(f64, f64); 2] {
+    match quarters {
+        0 => [(-30.0 + onto, 100.0), (150.0, 100.0)],
+        1 => [(100.0, -30.0 + onto), (100.0, 150.0)],
+        2 => [(230.0 - onto, 170.0), (50.0, 170.0)],
+        _ => [(170.0, 230.0 - onto), (170.0, 50.0)],
+    }
+}
+
+/// A part of an annotation that cannot be drawn as viewers draw it is refused only
+/// where it may show: where it lies beyond the edge of the page, it is left out and
+/// the rest of the annotation is drawn, as `PyMuPDF` 1.28.2 bake draws it (the
+/// failing part draws nothing on the page, and the rest as given); moved onto the
+/// page, it is refused. For each kind of refusal, near each edge of a 200 pt page
+/// (the fixture placed beyond the left edge, turned about the page's middle for
+/// the others), and moved onto the page: a line and a polyline at a negative border
+/// width with an ending (the review's fixtures: bake inks nothing), whose line and
+/// ending lie beyond the page while their `/Rect` meets it; a polyline and a
+/// callout whose ending, at a point of no direction, lies beyond the page, their
+/// line on it; free text whose text cannot be set (a character no font has, rich
+/// text not reproduced), its fill and border on the page, the text's box beyond
+/// it; a text field whose value is a stream not reproduced, likewise; free text
+/// whose line may break either way, its border on the page (moved across each edge
+/// rather than turned, which would change the room). A number not read as
+/// viewers read it may change all the annotation draws: it is refused where any of
+/// it may show, and left out where none can.
+#[test]
+fn a_part_that_cannot_be_drawn_is_refused_only_where_it_shows() {
+    type Fixture = Box<dyn Fn(u8, f64) -> (String, Vec<Vec<u8>>)>;
+    let alone = |s: String| (s, Vec::new());
+    let cases: Vec<(&str, Fixture, f64, &str, &str)> = vec![
+        (
+            "negative line",
+            Box::new(move |q, dx| {
+                alone(format!(
+                    "/Subtype /Line /L [{}] /Rect [{}] /C [1 0 0] /BS << /W -6 >> \
+                     /LE [/Square /None]",
+                    turned_points(q, &[(-50.0 - dx, 10.0), (-50.0 - dx, 110.0)]),
+                    turned_box(q, [-80.0 - dx, -20.0, 20.0 - dx, 140.0]),
+                ))
+            }),
+            -100.0,
+            "nothing",
+            "Ending",
+        ),
+        (
+            "negative polyline",
+            Box::new(move |q, dx| {
+                alone(format!(
+                    "/Subtype /PolyLine /Vertices [{}] /Rect [{}] /C [1 0 0] /BS << /W -6 >> \
+                     /LE [/Square /None]",
+                    turned_points(
+                        q,
+                        &[(-50.0 - dx, 10.0), (-60.0 - dx, 60.0), (-50.0 - dx, 110.0)]
+                    ),
+                    turned_box(q, [-80.0 - dx, -20.0, 20.0 - dx, 140.0]),
+                ))
+            }),
+            -100.0,
+            "nothing",
+            "Ending",
+        ),
+        (
+            "polyline ending of no direction",
+            Box::new(move |q, dx| {
+                let [tip, rest] = beside(q, dx);
+                alone(format!(
+                    "/Subtype /PolyLine /Vertices [{} {} {} {} {} {}] /C [1 0 0] \
+                     /BS << /W 1 >> /LE [/OpenArrow /None]",
+                    tip.0, tip.1, tip.0, tip.1, rest.0, rest.1
+                ))
+            }),
+            60.0,
+            "generated",
+            "Ending",
+        ),
+        (
+            "callout ending of no direction",
+            Box::new(move |q, dx| {
+                let [tip, _] = beside(q, dx);
+                // A box 80 × 20 on the page, the callout from its side towards the
+                // edge.
+                let (to, r) = match q {
+                    0 => ((80.0, 100.0), [80.0, 90.0, 160.0, 110.0]),
+                    1 => ((100.0, 80.0), [90.0, 80.0, 110.0, 160.0]),
+                    2 => ((120.0, 170.0), [40.0, 160.0, 120.0, 180.0]),
+                    _ => ((170.0, 120.0), [160.0, 40.0, 180.0, 120.0]),
+                };
+                alone(format!(
+                    "/Subtype /FreeText /Rect [{} {} {} {}] /DA (/Helv 12 Tf 0 g) /Contents (x) \
+                     /IT /FreeTextCallout /CL [{} {} {} {} {} {}] /LE /OpenArrow /BS << /W 1 >>",
+                    r[0], r[1], r[2], r[3], tip.0, tip.1, tip.0, tip.1, to.0, to.1
+                ))
+            }),
+            60.0,
+            "generated",
+            "Ending",
+        ),
+        (
+            "character",
+            Box::new(move |q, dx| {
+                alone(format!(
+                    "/Subtype /FreeText /Rect [{}] /DA (/Helv 12 Tf 0 g) /C [0.8 0.8 1] \
+                     /BS << /W 3 >> /Contents <FEFF0000>",
+                    turned_box(q, [-50.0 + dx, 40.0, 1.0 + dx, 140.0]),
+                ))
+            }),
+            60.0,
+            "generated",
+            "Character('\\0')",
+        ),
+        (
+            "rich text",
+            Box::new(move |q, dx| {
+                alone(format!(
+                    "/Subtype /FreeText /Rect [{}] /DA (/Helv 12 Tf 0 g) /C [0.8 0.8 1] \
+                     /BS << /W 3 >> /RC (<p>a<u>b</u></p>)",
+                    turned_box(q, [-50.0 + dx, 40.0, 1.0 + dx, 140.0]),
+                ))
+            }),
+            60.0,
+            "generated",
+            "RichText",
+        ),
+        (
+            "value stream",
+            Box::new(move |q, dx| {
+                (
+                    format!(
+                        "/Subtype /Widget /FT /Tx /T (a) /Rect [{}] /DA (/Helv 12 Tf 0 g) \
+                         /MK << /BC [0 0 1] /BG [0.8 0.8 1] >> /BS << /W 3 >> /V 5 0 R",
+                        turned_box(q, [-50.0 + dx, 40.0, 1.0 + dx, 80.0]),
+                    ),
+                    vec![common::stream("/Filter /ASCIIHexDecode", b"41424344>")],
+                )
+            }),
+            60.0,
+            "generated",
+            "ValueStream",
+        ),
+        (
+            "measure",
+            Box::new(move |q, dx| {
+                // A line as wide as the room, laid out inside the border.
+                alone(format!(
+                    "/Subtype /FreeText /BS << /W 3 >> /DA (/Cour 12 Tf 0 g) /Rect [{}] \
+                     /Contents (x) /RC (<body style=\"font-family:Courier;font-size:12pt\">\
+                     <p>AAAAA AAAAA</p></body>)",
+                    across(q, 97.2, 115.0, 2.0 + dx),
+                ))
+            }),
+            105.2,
+            "generated",
+            "Measure",
+        ),
+        (
+            "number",
+            Box::new(move |q, dx| {
+                alone(format!(
+                    "/Subtype /FreeText /Rect [{}] /DA (/Helv 12 Tf 0 g) /C [0.8 0.8 1] \
+                     /Q 9223372036854775808 /BS << /W 3 >> /Contents (x)",
+                    turned_box(q, [-50.0 + dx, 40.0, 1.0 + dx, 140.0]),
+                ))
+            }),
+            0.0,
+            "Number",
+            "Number",
+        ),
+    ];
+    let look = |(annot, more): (String, Vec<Vec<u8>>)| {
+        let mut objects = vec![format!("<< /Type /Annot {annot} >>").into_bytes()];
+        objects.extend(more);
+        let pdf = annotations("/Annots [4 0 R]", objects);
+        (annot, looks(&pdf).swap_remove(0))
+    };
+    for (case, fixture, onto, drawn, refused) in &cases {
+        for q in 0..4 {
+            let (annot, near) = look(fixture(q, 0.0));
+            let (moved, on) = look(fixture(q, *onto));
+            if *case == "number" {
+                // Moved off the page, by its border's width and a point.
+                let (off, nothing) = look(fixture(q, -5.0));
+                assert_eq!(nothing, "nothing", "{case} {q}: {off}");
+                assert_eq!(near, *drawn, "{case} {q}: {annot}");
+                continue;
+            }
+            assert_eq!(near, *drawn, "{case} {q}: {annot}");
+            assert_eq!(on, *refused, "{case} {q}: {moved}");
+        }
     }
 }
 

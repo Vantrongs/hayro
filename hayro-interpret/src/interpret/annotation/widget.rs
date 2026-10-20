@@ -14,17 +14,17 @@
 
 use super::entries::{Entries, Text, Value};
 use super::freetext;
-use super::out::{Color, Out, Rounding, as_written};
+use super::out::{Color, Out, Part, Refused, Rounding, as_written};
 use super::text::{self, Align, Family, Fonts, Setting, Shaped, Style, TextBox};
 use super::{
-    Appearances, FIELD, Field, Inherited, TEXT, TextKey, Unsupported, border_width, circle,
+    Appearances, Drew, FIELD, Field, Inherited, TEXT, TextKey, Unsupported, border_width, circle,
     color_of, most_pieces, rect,
 };
 use hayro_syntax::object::dict::keys::AS;
 use kurbo::{Affine, Shape};
 use std::rc::Rc;
 
-type Drawn = Result<Option<()>, Unsupported>;
+type Drawn = Drew;
 
 /// What a text or choice field shows, read once for the document: its value or
 /// options as plain text, rich text, or, for a list without `/RV` but with `/DS`,
@@ -66,13 +66,11 @@ pub(super) fn widget<'a>(
             Some(b"Tx" | b"Ch") => background.is_some(),
             _ => false,
         };
-        return if shows {
-            Err(Unsupported::Coordinates)
-        } else {
-            Ok(None)
-        };
+        if shows {
+            out.refuse(Unsupported::Coordinates, Part::Anywhere)?;
+        }
+        return Ok(None);
     };
-    let fail = |o: Option<()>| o.ok_or(Unsupported::Kind);
 
     let kind = match field_type.name() {
         Some(b"Tx") => Kind::Text,
@@ -114,8 +112,10 @@ pub(super) fn widget<'a>(
     // for finding the text that can show.
     let shown = (place.inverse() * visible.to_path(0.1)).bounding_box();
     out.op("q");
-    fail(out.nums(&place.as_coeffs(), "cm"))?;
-    fail(out.clip(bbox))?;
+    out.writes(|out| {
+        out.nums(&place.as_coeffs(), "cm")?;
+        out.clip(bbox)
+    })?;
     let drawn = draw(
         annot,
         field,
@@ -161,7 +161,6 @@ fn draw<'a>(
     shown: kurbo::Rect,
     out: &mut Out,
 ) -> Drawn {
-    let fail = |o: Option<()>| o.ok_or(Unsupported::Kind);
     let (fonts, form) = (&doc.fonts, doc.form());
     let form = form.as_ref();
     let (fw, fh) = (bbox.width(), bbox.height());
@@ -174,18 +173,20 @@ fn draw<'a>(
         // The square at the bottom left of the box.
         let sq = kurbo::Rect::new(0.0, 0.0, s, s);
         if kind == Kind::Radio {
-            fail(radio(sq, w, background, border, on, out))?;
+            out.writes(|out| radio(sq, w, background, border, on, out))?;
         } else {
-            fail(frame(sq, w, background, border, out))?;
+            out.writes(|out| frame(sq, w, background, border, out))?;
             if on {
-                // The mark is drawn black whatever the default appearance says.
-                let check = fonts
-                    .named(Family::Dingbats, "a19")
-                    .ok_or(Unsupported::Kind)?;
-                let size = s as f32;
-                out.op("0 g");
-                let origin = (w as f32 + 0.1 * size, 0.2 * size);
-                fail(text::draw(&[check], size, origin, Affine::IDENTITY, out))?;
+                // The mark is drawn black whatever the default appearance says,
+                // within the box.
+                let check = fonts.named(Family::Dingbats, "a19");
+                let check = out.part(check.ok_or(Unsupported::Kind), || Part::rect(bbox))?;
+                if let Some(check) = check {
+                    let size = s as f32;
+                    out.op("0 g");
+                    let origin = (w as f32 + 0.1 * size, 0.2 * size);
+                    out.writes(|out| text::draw(&[check], size, origin, Affine::IDENTITY, out))?;
+                }
             }
         }
         return Ok(Some(()));
@@ -208,13 +209,16 @@ fn draw<'a>(
     if kind == Kind::Push {
         // Viewers lay the bevel and the caption out from the box inside the border,
         // which must be writable even where nothing is drawn at it.
-        fail(out.within(bbox.inset(-(w + 2.0))))?;
         // Viewers draw a push button's colours, and shade its bevel, in RGB.
         let (background, border) = (background.map(Color::rgb), border.map(Color::rgb));
-        fail(frame(bbox, w, background, border, out))?;
-        if let Some(bg) = background {
-            fail(bevel(bbox, w, bg, out))?;
-        }
+        out.writes(|out| {
+            out.within(bbox.inset(-(w + 2.0)))?;
+            frame(bbox, w, background, border, out)?;
+            match background {
+                Some(bg) => bevel(bbox, w, bg, out),
+                None => Some(()),
+            }
+        })?;
         // The caption, read once for the document where it has a source.
         let Some(mk) = mk else {
             return Ok(Some(()));
@@ -225,7 +229,12 @@ fn draw<'a>(
                 .text(Text::Caption)
                 .map(|c| text::text_string(&c))
                 .unwrap_or_default())
-        })?;
+        });
+        // A caption that cannot be set would be drawn within the box (observed:
+        // viewers draw the rest of the button as given).
+        let Some(caption) = out.part(caption, || Part::rect(bbox))? else {
+            return Ok(Some(()));
+        };
         if caption.len() == 0 {
             return Ok(Some(()));
         }
@@ -244,7 +253,7 @@ fn draw<'a>(
             by_height.min(by_width).max(1.0)
         });
         let x = (fw - em * size) / 2.0;
-        fail(out.fill_color(&text_color))?;
+        out.writes(|out| out.fill_color(&text_color))?;
         let origin = (f64::from(x), f64::from(fh / 2.0 - 0.3 * size));
         let set = Setting {
             base: size,
@@ -269,9 +278,12 @@ fn draw<'a>(
         return Ok(Some(()));
     }
 
-    fail(frame(bbox, w, background, border, out))?;
-    // Text is clipped to the box inside the border.
+    out.writes(|out| frame(bbox, w, background, border, out))?;
+    // Text is clipped to the box inside the border: text that cannot be set as
+    // viewers set it would be drawn there (observed: viewers draw the rest of the
+    // field as given).
     let clip = bbox.inset(-w);
+    let in_clip = || Part::rect(clip);
     let pad = 2.0 * w as f32;
     let multiline = kind == Kind::Text && flags & (1 << 12) != 0;
     // Rich text: the widget's own /RV or /DS, whatever its RichText flag says;
@@ -293,34 +305,40 @@ fn draw<'a>(
         && (rich || annot.has_text(Text::DefaultStyle))
     {
         let options = kind == Kind::List && !rich;
-        let style = doc.default_style(annot, positive)?;
-        let read = if rich {
-            Some(annot.source(Text::RichValue.key()))
-        } else if !options {
-            Some(field.source(Inherited::Value))
-        } else {
-            None
+        let shows = doc.default_style(annot, positive).and_then(|style| {
+            let read = if rich {
+                Some(annot.source(Text::RichValue.key()))
+            } else if !options {
+                Some(field.source(Inherited::Value))
+            } else {
+                None
+            };
+            let key = TextKey::new(
+                read,
+                Family::Text.into(),
+                vec![FIELD, u64::from(options), u64::from(positive)],
+            )
+            .styled(&style);
+            doc.once(
+                |k| &mut k.field_text,
+                Some(key),
+                || {
+                    if options {
+                        return Ok(FieldText::Options(Rc::new(style)));
+                    }
+                    // A list shows `/RV` here; its options only without it, above.
+                    let rv = rich.then(|| annot.text(Text::RichValue)).flatten();
+                    let spans = freetext::rich_spans(rv.as_deref(), &style, positive, || {
+                        value_text(field)
+                    })?;
+                    Ok(FieldText::Rich(Rc::new(fonts.shape_rich(&spans)?)))
+                },
+            )
+        });
+        let Some(shows) = out.part(shows, in_clip)? else {
+            return Ok(Some(()));
         };
-        let key = TextKey::new(
-            read,
-            Family::Text.into(),
-            vec![FIELD, u64::from(options), u64::from(positive)],
-        )
-        .styled(&style);
-        doc.once(
-            |k| &mut k.field_text,
-            Some(key),
-            || {
-                if options {
-                    return Ok(FieldText::Options(Rc::new(style)));
-                }
-                // A list shows `/RV` here; its options only without it, above.
-                let rv = rich.then(|| annot.text(Text::RichValue)).flatten();
-                let spans =
-                    freetext::rich_spans(rv.as_deref(), &style, positive, || value_text(field))?;
-                Ok(FieldText::Rich(Rc::new(fonts.shape_rich(&spans)?)))
-            },
-        )?
+        shows
     } else {
         FieldText::Plain
     };
@@ -421,14 +439,19 @@ fn draw<'a>(
         _ => pad,
     };
     out.op("q");
-    fail(out.clip(clip))?;
-    fail(out.fill_color(&text_color))?;
+    out.writes(|out| {
+        out.clip(clip)?;
+        out.fill_color(&text_color)
+    })?;
     let comb = kind == Kind::Text && flags & (1 << 24) != 0 && !multiline;
     // What of the text the page can show: the work of drawing a value grows with
     // that, and the value, which widgets of one field share, is set once.
     let seen = clip.intersect(shown);
     let source = field.source(Inherited::Value);
-    let value = || doc.plain(source, face, TEXT, || value_text(field));
+    let value = |out: &mut Out| {
+        let value = doc.plain(source, face, TEXT, || value_text(field));
+        out.part(value, in_clip)
+    };
     let set = |size: f32| Setting {
         base: size,
         color: text_color,
@@ -461,7 +484,10 @@ fn draw<'a>(
         }
         _ if multiline => {
             let size = size.unwrap_or(12.0);
-            let value = value()?;
+            let Some(value) = value(out)? else {
+                out.op("Q");
+                return Ok(Some(()));
+            };
             // The first line's baseline is at least a fifth of the size above the
             // padding, however low the field (observed).
             let top = (fh - pad).max(pad + 1.316 * size);
@@ -484,7 +510,10 @@ fn draw<'a>(
         // A comb of cells as many as `/MaxLen`; without one, the text from the
         // field's left edge.
         _ if comb => {
-            let value = value()?;
+            let Some(value) = value(out)? else {
+                out.op("Q");
+                return Ok(Some(()));
+            };
             let all = 0..value.len();
             let max_len = field.get(Inherited::MaxLen).int().filter(|n| *n >= 1);
             // Automatic: the field's height, or less for the text to fit across.
@@ -523,7 +552,7 @@ fn draw<'a>(
             let cell = fw / cells;
             // The dividers before the text, which a border wider than a cell covers.
             if let Some(border) = &border {
-                fail(out.stroke_color(border))?;
+                out.writes(|out| out.stroke_color(border))?;
                 comb_dividers(i64::from(max_len), f64::from(fw), f64::from(fh), w, out)?;
             }
             // Each glyph centred in its cell: those whose cells the clip can show
@@ -535,7 +564,10 @@ fn draw<'a>(
         }
         // A line break is drawn as a space, as any control character is.
         _ => {
-            let value = value()?;
+            let Some(value) = value(out)? else {
+                out.op("Q");
+                return Ok(Some(()));
+            };
             let em = value.width(0..value.len(), 1.0) as f32;
             let size = size.unwrap_or_else(|| {
                 let by_height = fh - 2.0 * pad;
@@ -597,7 +629,7 @@ fn middle(fh: f32, size: f32) -> Rounding {
 /// outline meets what shows are those whose `u`, as written, lies in one span
 /// ([`super::out::Region::span`]), and `u` as written runs one way with `i`, so
 /// they are a run of lines, whose ends are found by halving.
-fn comb_dividers(cells: i64, fw: f64, fh: f64, w: f64, out: &mut Out) -> Result<(), Unsupported> {
+fn comb_dividers(cells: i64, fw: f64, fh: f64, w: f64, out: &mut Out) -> Result<(), Refused> {
     let cells = cells as f64;
     if cells < 2.0 {
         return Ok(());
@@ -644,18 +676,20 @@ fn comb_dividers(cells: i64, fw: f64, fh: f64, w: f64, out: &mut Out) -> Result<
         return Ok(());
     }
     if end - first > most_pieces() {
-        return Err(Unsupported::Coordinates);
+        // Lines that paint where the page shows them, under the clips set.
+        return out.refuse(Unsupported::Coordinates, Part::Anywhere);
     }
-    let wrote = |o: Option<()>| o.ok_or(Unsupported::Coordinates);
-    wrote(out.stroke_state(w, &[]))?;
-    for k in 0..(end - first) as u64 {
-        let i = first + k as f64;
-        let (u, place) = (u(i), place(i));
-        wrote(out.computed(&[u, w], "m", place))?;
-        wrote(out.computed(&[u, fh - w], "l", place))?;
-        out.op("S");
-    }
-    Ok(())
+    out.writes(|out| {
+        out.stroke_state(w, &[])?;
+        for k in 0..(end - first) as u64 {
+            let i = first + k as f64;
+            let (u, place) = (u(i), place(i));
+            out.computed(&[u, w], "m", place)?;
+            out.computed(&[u, fh - w], "l", place)?;
+            out.op("S");
+        }
+        Some(())
+    })
 }
 
 /// The first whole number from `lo` to `hi` for which `holds`, which holds from
@@ -793,23 +827,23 @@ fn signature(r: kurbo::Rect, fonts: &Fonts, out: &mut Out) -> Drawn {
         (x0 + h * 2.0 / 3.0, y1 - h / 6.0),
         (x0, y1 - h / 6.0),
     ];
-    let fail = |o: Option<()>| o.ok_or(Unsupported::Kind);
     out.op("0.95 0.33 0.18 rg");
-    fail(out.nums(&[pts[0].0, pts[0].1], "m"))?;
-    for p in &pts[1..] {
-        fail(out.nums(&[p.0, p.1], "l"))?;
-    }
+    out.writes(|out| {
+        out.nums(&[pts[0].0, pts[0].1], "m")?;
+        for p in &pts[1..] {
+            out.nums(&[p.0, p.1], "l")?;
+        }
+        Some(())
+    })?;
     out.op("h f");
-    let glyphs = fonts.shape(Family::Sans, "SIGN")?;
+    // The word is drawn on the tag.
+    let tag = kurbo::Rect::new(x0, y1 - h / 6.0, x0 + h * 3.0 / 4.0, y1);
+    let Some(glyphs) = out.part(fonts.shape(Family::Sans, "SIGN"), || Part::rect(tag))? else {
+        return Ok(Some(()));
+    };
     out.op("1 g");
     let origin = ((x0 + 0.1655 * h) as f32, (y1 - 0.1332 * h) as f32);
-    fail(text::draw(
-        &glyphs,
-        (h / 7.2) as f32,
-        origin,
-        Affine::IDENTITY,
-        out,
-    ))?;
+    out.writes(|out| text::draw(&glyphs, (h / 7.2) as f32, origin, Affine::IDENTITY, out))?;
     Ok(Some(()))
 }
 

@@ -1993,6 +1993,100 @@ fn an_array_annotations_share_is_walked_once() {
     }
 }
 
+/// What deciding whether an annotation may paint on the page reads of a payload
+/// it shares with others, an object of its own, does not grow with that payload:
+/// each annotation added costs the same, in bytes, work and bytes looked at,
+/// whether the payload is short or millions of bytes long, and the output is the
+/// same. Cases: lines off the page sharing `/Contents`, without a caption and with
+/// one, whose length alone bounds where it is drawn; a line on the page sharing
+/// it, without a caption, which does not read it; highlights and redactions off
+/// the page sharing `/QuadPoints` of quads of some area, off the page too.
+#[test]
+fn a_shared_payload_costs_each_annotation_the_same_however_long() {
+    const N: usize = 40;
+    let contents = |n: usize| format!("({})", "A".repeat(n));
+    let quads = |n: usize| {
+        let quad = "1000 1010 1010 1010 1000 1000 1010 1000";
+        format!("[{}]", vec![quad; n].join(" "))
+    };
+    let text = [20 << 10, 4 << 20];
+    // About 40 and 1.6 MB.
+    let many = [1_000, 40_000];
+    type Case<'a> = (&'a dyn Fn(usize) -> String, [usize; 2], &'a str, usize);
+    let cases: [Case<'_>; 6] = [
+        (
+            &contents,
+            text,
+            "/Subtype /Line /L [1000 1000 1100 1000] /C [0] /Contents 4 0 R",
+            0,
+        ),
+        (
+            &contents,
+            text,
+            "/Subtype /Line /L [1000 1000 1100 1000] /C [0] /Cap true /Contents 4 0 R",
+            0,
+        ),
+        (
+            &contents,
+            text,
+            "/Subtype /Line /L [10 10 100 10] /C [0] /Contents 4 0 R",
+            1,
+        ),
+        (
+            &quads,
+            many,
+            "/Subtype /Highlight /Rect [0 0 200 200] /C [1 1 0] /QuadPoints 4 0 R",
+            0,
+        ),
+        (
+            &quads,
+            many,
+            "/Subtype /Redact /Rect [1000 1000 1010 1010] /QuadPoints 4 0 R",
+            0,
+        ),
+        (
+            &quads,
+            many,
+            "/Subtype /Redact /Rect [0 0 200 200] /QuadPoints 4 0 R",
+            0,
+        ),
+    ];
+    for (payload, lengths, annot, generated) in cases {
+        let added = |n: usize| {
+            let shared = [payload(n)];
+            let (one, two) = (
+                sharing_cost(N, &shared, annot),
+                sharing_cost(2 * N, &shared, annot),
+            );
+            assert_eq!(one.drew.generated, N * generated, "{annot}");
+            assert_eq!(two.drew.generated, 2 * N * generated, "{annot}");
+            assert_eq!(two.drew.unsupported, 0, "{annot}");
+            (
+                two.bytes.saturating_sub(one.bytes),
+                two.work.saturating_sub(one.work),
+                two.examined.saturating_sub(one.examined),
+            )
+        };
+        let (short, long) = (added(lengths[0]), added(lengths[1]));
+        if std::env::var_os("COST_REPORT").is_some() {
+            println!(
+                "CASE {annot}: +{N}: {short:?} at {}, {long:?} at {}",
+                lengths[0], lengths[1]
+            );
+        }
+        // The same but for the allocator rounding what it grows the same tables to.
+        assert!(
+            long.0 < N * (16 << 10)
+                && long.0 <= short.0 + N * 64
+                && long.1 == short.1
+                && long.2 == short.2,
+            "{annot}: {short:?} added at {}, {long:?} at {}",
+            lengths[0],
+            lengths[1]
+        );
+    }
+}
+
 /// Stamps that share a long name read it once for the document, and set it once:
 /// those of no area, which draw nothing; those whose name is spaces, which draw
 /// their frame alone; and those whose name runs far past their box, which draw the
