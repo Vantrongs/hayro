@@ -181,67 +181,21 @@ pub(crate) fn open(data: PdfData, password: &[u8]) -> Result<XRef, XRefError> {
         return fallback(data, password, Old::default()).ok_or(XRefError::Unknown);
     };
 
-    let kept = match check(&mut xref_map, data.as_ref()) {
-        Ok(kept) => kept,
-        Err(old) => return fallback(data, password, old).ok_or(XRefError::Unknown),
-    };
-    let Kept {
-        layout,
-        entries,
-        aliases,
-    } = kept;
-    let numbers: BTreeSet<i32> = aliases.keys().map(|id| id.obj_number).collect();
-    if headed_elsewhere(data.as_ref(), &numbers) {
-        let old = unsound(&xref_map, data.as_ref());
-        return fallback(data, password, old).ok_or(XRefError::Unknown);
-    }
-    // Where there are aliases, the table is kept only once no object stream turns out
-    // to hold one: the table read to find that out is dropped, with all it read, where
-    // one does. Without aliases, the entries go here, before the table is read.
-    let aliased = (!aliases.is_empty()).then(|| (xref_map.clone(), entries));
-    match XRef::new(
-        data.clone(),
-        Rebuilt::sound(layout, aliases),
-        xref_map,
-        XRefInput::TrailerDictData(trailer),
-        password,
-    ) {
-        Err(XRefError::Unknown) => {
-            fallback(data, password, Old::default()).ok_or(XRefError::Unknown)
-        }
-        Ok(xref) => match aliased {
-            Some((xref_map, entries)) if xref.holds_in_streams(&entries, &numbers) => {
-                drop(xref);
-                let old = unsound(&xref_map, data.as_ref());
-                fallback(data, password, old).ok_or(XRefError::Unknown)
+    match check(&mut xref_map, data.as_ref()) {
+        Ok(layout) => match XRef::new(
+            data.clone(),
+            Rebuilt::sound(layout),
+            xref_map,
+            XRefInput::TrailerDictData(trailer),
+            password,
+        ) {
+            Err(XRefError::Unknown) => {
+                fallback(data, password, Old::default()).ok_or(XRefError::Unknown)
             }
-            _ => Ok(xref),
+            xref => xref,
         },
-        xref => xref,
+        Err(old) => fallback(data, password, old).ok_or(XRefError::Unknown),
     }
-}
-
-/// The most aliases a table that is kept has ([`Kept::aliases`]).
-const MAX_ALIASES: usize = 8;
-
-/// What the check finds of a table it keeps.
-struct Kept {
-    /// Where the table's objects are.
-    layout: Layout,
-    /// The entries that lead into the file, by offset.
-    entries: Placed,
-    /// The entries that lead to the header of another object the table lists at the
-    /// same offset, each with that object: an entry whose offset a writer copied from
-    /// another's (pdfium 42271312: entries 2239 and 2245 lead to the header of object
-    /// stream 2256). A rebuild of the table keeps such an alias where the scan finds
-    /// no object of its number, leading to the object there (`keep_listed`), and
-    /// changes nothing else where the table's other entries lead to their objects. So
-    /// the table is kept with its aliases, as the rebuild would make them, unless the
-    /// file may hold another object of an alias's number, which the rebuild would
-    /// find instead ([`headed_elsewhere`], [`XRef::holds_in_streams`]); `MuPDF`
-    /// (`PyMuPDF` 1.28.2), which repairs the table only when it reads an alias, finds
-    /// that object too.
-    aliases: Headers,
 }
 
 /// The entries of a table that is rebuilt.
@@ -313,57 +267,8 @@ fn opened(_bytes: usize) {
 // the slot. Only where the table is rebuilt does the check read every body, up to the
 // next offset, to tell the rebuild which entries lead to an object that ends there
 // (`Old`).
-fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<Kept, Old> {
+fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<Layout, Old> {
     xref_map.retain(|_, entry| *entry != EntryType::Normal(0));
-    let (entries, streams) = listing(xref_map);
-
-    let mut sound = true;
-    let mut aliases = Headers::default();
-    for (offset, end, ids) in slots(&entries, data.len()) {
-        let header = SlotReader::new(data, offset, Slot::to(end)).map(|mut r| r.header());
-        for &(_, id) in ids {
-            match header {
-                Some(Header::Read(named)) if named == id => {}
-                Some(Header::Read(named)) if ids.iter().any(|(_, other)| *other == named) => {
-                    aliases.insert(id, named);
-                }
-                _ => sound = false,
-            }
-        }
-    }
-    // Each alias costs a search of the file where the table is kept
-    // ([`headed_elsewhere`]): beyond a few, the table is rebuilt, as it was for any.
-    sound &= aliases.len() <= MAX_ALIASES;
-    if !streams.is_empty() {
-        // Every object stream is an object the table lists, and no alias, which
-        // leads to another object.
-        let objects: BTreeSet<i32> = entries.iter().map(|(_, id)| id.obj_number).collect();
-        let aliased: BTreeSet<i32> = aliases.keys().map(|id| id.obj_number).collect();
-        sound &= streams.iter().all(|(_, stream)| {
-            i32::try_from(*stream)
-                .is_ok_and(|stream| objects.contains(&stream) && !aliased.contains(&stream))
-        });
-    }
-    if sound {
-        let layout = Layout::sorted(entries.iter().map(|(offset, _)| *offset));
-        return Ok(Kept {
-            layout,
-            entries,
-            aliases,
-        });
-    }
-    Err(unsound(xref_map, data))
-}
-
-/// Entries of a table that lead into the file, each by offset.
-type Placed = Vec<(usize, ObjectIdentifier)>;
-
-/// Entries of a table in object streams, each with the number of its stream.
-type Held = Vec<(ObjectIdentifier, u32)>;
-
-/// The entries of `xref_map` that lead into the file, sorted by offset, and those in
-/// object streams.
-fn listing(xref_map: &XrefMap) -> (Placed, Held) {
     let mut entries = vec![];
     let mut streams = vec![];
     #[allow(clippy::iter_over_hash_type, reason = "sorted after")]
@@ -374,14 +279,20 @@ fn listing(xref_map: &XrefMap) -> (Placed, Held) {
         }
     }
     entries.sort_unstable();
-    (entries, streams)
-}
 
-/// The entries of `xref_map`, a table that is rebuilt, for the rebuild: each body
-/// read up to the next offset, to tell which lead to an object that ends there.
-fn unsound(xref_map: &XrefMap, data: &[u8]) -> Old {
+    let listed_streams = || {
+        let objects: BTreeSet<i32> = entries.iter().map(|(_, id)| id.obj_number).collect();
+        streams
+            .iter()
+            .all(|(_, stream)| i32::try_from(*stream).is_ok_and(|stream| objects.contains(&stream)))
+    };
+    if slots(&entries, data.len()).all(|(offset, end, ids)| headed(data, offset, end, ids))
+        && (streams.is_empty() || listed_streams())
+    {
+        return Ok(Layout::sorted(entries.iter().map(|(offset, _)| *offset)));
+    }
+
     warn!("xref table has an entry that does not lead to its object, rebuilding it");
-    let (entries, streams) = listing(xref_map);
     let mut old = Old {
         held: streams.iter().copied().collect(),
         ..Old::default()
@@ -396,36 +307,7 @@ fn unsound(xref_map: &XrefMap, data: &[u8]) -> Old {
             }
         }
     }
-    old
-}
-
-/// Whether a header that names an object of one of `numbers` may be anywhere in
-/// `data`, as the scan that rebuilds a table finds one: where the digits of one of
-/// them are, read as a header from the start of the run of digits they are in, and
-/// its sign. Each run is read once, so each search reads the file once.
-fn headed_elsewhere(data: &[u8], numbers: &BTreeSet<i32>) -> bool {
-    numbers.iter().any(|number| {
-        crate::work::told(data.len());
-        let digits = alloc::format!("{number}");
-        let mut from = 0;
-        while let Some(found) = crate::util::find_needle(&data[from..], digits.as_bytes()) {
-            let at = from + found;
-            let start = data[from..at]
-                .iter()
-                .rposition(|b| !b.is_ascii_digit())
-                .map_or(from, |before| from + before + 1);
-            let start = start - usize::from(start > 0 && matches!(data[start - 1], b'+' | b'-'));
-            let mut r = Reader::new(data);
-            r.jump(start);
-            if r.read_without_context::<ObjectIdentifier>()
-                .is_some_and(|id| id.obj_number == *number)
-            {
-                return true;
-            }
-            from = at + data[at..].iter().take_while(|b| b.is_ascii_digit()).count();
-        }
-        false
-    })
+    Err(old)
 }
 
 /// The entries of `entries`, sorted by offset, at each offset, with the offset and
@@ -447,6 +329,13 @@ fn slots(
         rest = after;
         Some((offset, end, ids))
     })
+}
+
+/// Whether a header that ends in the slot from `at` to `slot` of `data` is at `at`,
+/// naming the object of each entry of `ids`.
+fn headed(data: &[u8], at: usize, slot: usize, ids: &[(usize, ObjectIdentifier)]) -> bool {
+    let header = SlotReader::new(data, at, Slot::to(slot)).map(|mut r| r.header());
+    ids.iter().all(|(_, id)| header == Some(Header::Read(*id)))
 }
 
 /// What checking a table finds where an entry leads, in the entry's slot.
@@ -534,13 +423,12 @@ struct Rebuilt {
 
 impl Rebuilt {
     /// What a table read from the file finds: its objects are where `layout` puts
-    /// them, at its entries, those of its aliases headed as `aliases` says
-    /// ([`Kept::aliases`]).
-    fn sound(layout: Layout, aliases: Headers) -> Self {
+    /// them, at its entries.
+    fn sound(layout: Layout) -> Self {
         Self {
             layout,
             unreadable: Unreadable::default(),
-            headers: aliases,
+            headers: Headers::default(),
         }
     }
 }
@@ -1704,64 +1592,6 @@ impl XRef {
         Some(objects)
     }
 
-    /// Whether an object stream of the file may hold an object of one of `numbers`, as
-    /// the scan that rebuilds a table finds them: one the table lists objects in, or
-    /// the object the bytes `/ObjStm` are in, by the table's `entries`, read as an
-    /// object stream. Where such bytes are in no object that can be read so, a rebuild
-    /// may find one there.
-    fn holds_in_streams(
-        &self,
-        entries: &[(usize, ObjectIdentifier)],
-        numbers: &BTreeSet<i32>,
-    ) -> bool {
-        let Inner::Some(repr) = &self.0 else {
-            return true;
-        };
-        let data = repr.data.get().as_ref();
-        // The object at each place, by the place's offset in `entries`.
-        let at = |offset: usize| {
-            let start = entries.partition_point(|(other, _)| *other < offset);
-            entries[start..]
-                .iter()
-                .take_while(|(other, _)| *other == offset)
-                .find(|(_, id)| repr.map.contains_key(id))
-                .copied()
-        };
-        #[allow(clippy::iter_over_hash_type, reason = "collected into a set")]
-        let streams: BTreeSet<u32> = repr
-            .map
-            .values()
-            .filter_map(|entry| match *entry {
-                EntryType::ObjStream(stream, _) => Some(stream),
-                EntryType::Normal(_) => None,
-            })
-            .collect();
-        let mut places: BTreeSet<usize> = entries
-            .iter()
-            .filter(|(_, id)| u32::try_from(id.obj_number).is_ok_and(|n| streams.contains(&n)))
-            .map(|(offset, _)| *offset)
-            .collect();
-        crate::work::told(data.len());
-        let mut from = 0;
-        while let Some(found) = crate::util::find_needle(&data[from..], b"/ObjStm") {
-            let found = from + found;
-            match entries.partition_point(|(offset, _)| *offset <= found) {
-                0 => return true,
-                next => places.insert(entries[next - 1].0),
-            };
-            from = found + 1;
-        }
-        places.into_iter().any(|offset| {
-            at(offset)
-                .and_then(|(offset, id)| self.object_stream_at(offset, id))
-                .is_none_or(|objects| {
-                    objects.offsets.iter().any(|(number, _)| {
-                        i32::try_from(*number).is_ok_and(|n| numbers.contains(&n))
-                    })
-                })
-        })
-    }
-
     /// The entry of object `id`, and the context to find its place in, reached from
     /// `ctx`: what is read from it is decrypted as its header says and named `id`,
     /// the entry it is reached through, but checked for cycles by its body
@@ -2773,7 +2603,7 @@ mod tests {
     #[test]
     fn opening_a_file_reads_it_in_linear_time() {
         type Family = (&'static str, fn(usize) -> Vec<u8>);
-        let families: [Family; 26] = [
+        let families: [Family; 23] = [
             // Entries at each `0` of `0…09 0 obj`: each reads a header in its slot of
             // one byte, which the next `0` ends, not on to `obj`.
             ("entries in the zeros of a header", |n| {
@@ -2802,20 +2632,6 @@ mod tests {
                 file_with(body.as_bytes(), &entries, false)
             }),
             ("aliases", |n| aliases(n, false)),
-            // An entry with another's offset, which the table keeps after searching
-            // the file for the alias's number: each run of digits is read once.
-            ("an alias, and its number in runs of digits", |n| {
-                let body = format!("4 0 obj\n[{}]\nendobj\n", "5 ".repeat(8 * n));
-                file_with(body.as_bytes(), &[0, 0], false)
-            }),
-            ("an alias, and its number in one run of digits", |n| {
-                let body = format!("4 0 obj\n{}\nendobj\n", "5".repeat(8 * n));
-                file_with(body.as_bytes(), &[0, 0], false)
-            }),
-            ("an alias, and many /ObjStm", |n| {
-                let body = format!("4 0 obj\n[{}]\nendobj\n", "/ObjStm ".repeat(n));
-                file_with(body.as_bytes(), &[0, 0], false)
-            }),
             ("nested", |n| nested(n, false, false)),
             ("nested after space", |n| nested(n, true, false)),
             ("aliases, rebuilt", |n| aliases(n, true)),
@@ -3439,53 +3255,6 @@ mod tests {
         };
         // Sizes whose `startxref` offsets have as many digits, which opening lexes.
         assert_eq!(opened(1024), opened(4096));
-    }
-
-    /// Opens `body` after the catalog, page tree and page, where object 4 is at its
-    /// start and object 5's entry leads there too; returns whether object 5 reads as
-    /// a dictionary, whether that holds /B, and whether the table was rebuilt.
-    fn aliased(body: &str) -> (Option<bool>, bool) {
-        OPEN_BYTES.set(0);
-        let pdf = crate::Pdf::new(file_with(body.as_bytes(), &[0, 0], false)).unwrap();
-        assert_eq!(pdf.pages().len(), 1);
-        let five = pdf
-            .xref()
-            .get::<Dict<'_>>(ObjectIdentifier::new(5, 0))
-            .map(|five| five.contains_key(b"B".as_slice()));
-        (five, OPEN_BYTES.get() > 0)
-    }
-
-    // An entry whose offset is another's, which the table and the header there name,
-    // does not rebuild the table where the file holds no other object of its number:
-    // it leads to the object there, as in a rebuilt table (pdfium 42271312: entries
-    // 2239 and 2245 lead to the header of object stream 2256, which holds neither).
-    #[test]
-    fn an_entry_with_another_s_offset_keeps_the_table() {
-        assert_eq!(
-            aliased("4 0 obj\n<< /A 1 >>\nendobj\n"),
-            (Some(false), false)
-        );
-        let stream = object_stream("/Length LEN", &[(6, "<< /A 1 >>")]);
-        assert_eq!(
-            aliased(&format!("4 0 obj\n{stream}\nendobj\n")),
-            (Some(false), false)
-        );
-    }
-
-    // Where the file holds an object of the alias's number, in the file or in an
-    // object stream, the table is rebuilt, which finds it, as MuPDF (PyMuPDF 1.28.2)
-    // does when it repairs the table.
-    #[test]
-    fn an_entry_with_another_s_offset_leads_to_its_object_found_elsewhere() {
-        assert_eq!(
-            aliased("4 0 obj\n<< /A 1 >>\nendobj\n5 0 obj\n<< /B 2 >>\nendobj\n"),
-            (Some(true), true)
-        );
-        let stream = object_stream("/Length LEN", &[(6, "<< /A 1 >>"), (5, "<< /B 2 >>")]);
-        assert_eq!(
-            aliased(&format!("4 0 obj\n{stream}\nendobj\n")),
-            (Some(true), true)
-        );
     }
 
     /// A file of `objects`, numbered from 1, the first being the catalog, with a table
