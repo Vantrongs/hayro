@@ -77,6 +77,29 @@ pub(crate) fn findr_needle(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     memchr::memmem::rfind(haystack, needle)
 }
 
+/// Where each `needle` is in `haystack`, in order, none overlapping the one before:
+/// the search is set up once for them all.
+#[cfg(feature = "unsafe")]
+pub(crate) fn find_all<'a>(
+    haystack: &'a [u8],
+    needle: &'a [u8],
+) -> impl Iterator<Item = usize> + 'a {
+    memchr::memmem::find_iter(haystack, needle)
+}
+
+#[cfg(not(feature = "unsafe"))]
+pub(crate) fn find_all<'a>(
+    haystack: &'a [u8],
+    needle: &'a [u8],
+) -> impl Iterator<Item = usize> + 'a {
+    let mut at = 0;
+    core::iter::from_fn(move || {
+        let found = at + find_needle(haystack.get(at..)?, needle)?;
+        at = found + needle.len().max(1);
+        Some(found)
+    })
+}
+
 #[cfg(not(feature = "unsafe"))]
 pub(crate) fn find_needle(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {

@@ -163,7 +163,7 @@ fn nested_in_an_object_stream(n: u32) -> Vec<u8> {
 }
 
 /// How the /Length of each of [`overlapping_object_streams`] leads to `endstream`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Length {
     /// Past the pad, to it.
     Whole,
@@ -339,12 +339,14 @@ fn objects_nested_in_an_object_stream_are_read_in_linear_work_and_memory() {
 // streams after them: each is cut at the next, so that what is decoded and kept is
 // linear in the file, and each still holds its object, read and kept once; finding
 // the data, and the `endstream` after white space, searches the file once, whatever
-// table finds the streams. A rebuilt table finds only the first stream: the others'
-// headers are in its data, which its /Length or the first `endstream` ends, and bytes
-// in a stream's data are its content, not the file's objects, or an attached PDF's
+// table finds the streams. A rebuilt table finds only the first stream where its
+// /Length leads to the `endstream`: the others' headers are in its data, and bytes in
+// a stream's data are its content, not the file's objects, or an attached PDF's
 // objects would replace the document's (`a_rebuild_takes_no_object_of_an_embedded_pdf`
-// in `xref.rs`). PyMuPDF 1.28.2 also finds 1 of the 64 values, with each /Length:
-// what refers to the others' objects refers to none.
+// in `xref.rs`); PyMuPDF 1.28.2 also finds 1 of the 64 values. Where /Length leads
+// nowhere, nothing shows the data reach the `endstream`, and the other streams start
+// before it, as where a stream's own `endstream` is missing: a rebuilt table finds
+// every stream, as the rebuild before 9b38fdbe did, where PyMuPDF finds the first.
 #[test]
 fn overlapping_object_streams_are_read_in_linear_work_and_memory() {
     for length in [Length::Whole, Length::Padded, Length::Wrong] {
@@ -353,7 +355,7 @@ fn overlapping_object_streams_are_read_in_linear_work_and_memory() {
             assert_eq!(pages, 64);
             assert!(
                 units.iter().enumerate().all(|(page, unit)| *unit
-                    == if broken && page > 0 {
+                    == if broken && page > 0 && length != Length::Wrong {
                         (None, None)
                     } else {
                         (Some(5.0), None)

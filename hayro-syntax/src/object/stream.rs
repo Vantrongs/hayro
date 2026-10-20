@@ -798,6 +798,18 @@ pub(crate) fn searched(data: &[u8], needle: &[u8]) -> Option<usize> {
     found
 }
 
+/// Where each `needle` is in `data`, as [`searched`] finds them one after another,
+/// searching all of `data`.
+pub(crate) fn searched_all<'a>(
+    data: &'a [u8],
+    needle: &'a [u8],
+) -> impl Iterator<Item = usize> + 'a {
+    crate::work::told(data.len());
+    #[cfg(test)]
+    SEARCHED.set(SEARCHED.get() + data.len());
+    crate::util::find_all(data, needle)
+}
+
 #[cfg(test)]
 std::thread_local! {
     /// The bytes searched for the keywords of streams whose /Length is wrong on this
