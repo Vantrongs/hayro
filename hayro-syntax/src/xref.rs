@@ -442,7 +442,7 @@ fn fallback_xref_map<'a>(
     let mut listed = old.listed;
     let (read, unreadable) = read_unread(&mut scan, &old.unread);
     listed.extend(read);
-    let walk = walk(data, &mut scan);
+    let walk = walk(data, &mut scan, &listed);
     let old = Old {
         listed,
         unread: vec![],
@@ -494,22 +494,26 @@ struct Walk<'a> {
 }
 
 /// Walks the file for [`fallback_xref_map_inner`], reading each part of it a bounded
-/// number of times with `scan`. The keys it reads of a dictionary are names, which
-/// encryption leaves as they are.
-fn walk<'a>(data: &'a PdfData, scan: &mut Scan<'_>) -> Walk<'a> {
+/// number of times with `scan`, where the entries of the old table kept, `listed`,
+/// lead. The keys it reads of a dictionary are names, which encryption leaves as they
+/// are.
+fn walk<'a>(data: &'a PdfData, scan: &mut Scan<'_>, listed: &[Listed]) -> Walk<'a> {
     let mut dummy_ctx = ReaderContext::dummy();
     let mut xref_map = hash::Map::default();
     // Each object found, in the order of the file, and where its body starts.
     let mut found = vec![];
     let mut bodies = vec![];
-    // Each header found with no object that can be read after it.
+    // Each header found with no object that can be read after it, and where it is.
     let mut broken = vec![];
+    // Each dictionary that may be a trailer, and where it is.
     let mut trailer_dicts = vec![];
-    let mut root_ref = None;
+    // Where each catalog is.
+    let mut catalogs = vec![];
+    // Where the walk went on just after an `endstream` ([`Walked::resumed`]).
+    let mut resumed = vec![];
 
     let mut r = Reader::new(data.as_ref());
 
-    let mut last_obj_num = None;
     // The object streams found: the object, and where its header is.
     let mut object_streams = vec![];
     // The last header found with an object after it, where it is, and where its
@@ -520,6 +524,13 @@ fn walk<'a>(data: &'a PdfData, scan: &mut Scan<'_>) -> Walk<'a> {
     loop {
         let cur_pos = r.offset();
 
+        if !streams.unsure.is_empty()
+            && data.as_ref()[..cur_pos].ends_with(b"endstream")
+            && last_header.is_none_or(|(_, _, body)| body < cur_pos)
+        {
+            resumed.push(cur_pos);
+        }
+
         // First try to check if we have an object identifier.
         if let Some(header) = rebuilt_header(&mut r, scan) {
             match header {
@@ -527,11 +538,10 @@ fn walk<'a>(data: &'a PdfData, scan: &mut Scan<'_>) -> Walk<'a> {
                     xref_map.insert(obj_id, EntryType::Normal(cur_pos));
                     found.push((obj_id, cur_pos));
                     bodies.push(body);
-                    last_obj_num = Some(obj_id);
                     last_header = Some((obj_id, cur_pos, body));
                     dummy_ctx.set_obj_number(obj_id);
                 }
-                Some((obj_id, None)) => broken.push(obj_id),
+                Some((obj_id, None)) => broken.push((obj_id, cur_pos)),
                 // There must be a white space before the next object number.
                 None => r.forward_while(|b| !is_white_space_character(b)),
             }
@@ -544,7 +554,7 @@ fn walk<'a>(data: &'a PdfData, scan: &mut Scan<'_>) -> Walk<'a> {
             {
                 r.jump(found.end);
                 // The dictionary of a stream that is a header's object, whose data the
-                // walk skips (`after_stream`).
+                // walk skips ([`Streams::after`]).
                 let body = last_header.is_some_and(|(_, _, body)| body == cur_pos);
                 let stream = body
                     .then(|| stream_data_start(data.as_ref(), found.end))
@@ -553,20 +563,19 @@ fn walk<'a>(data: &'a PdfData, scan: &mut Scan<'_>) -> Walk<'a> {
                     let mut dict_reader = Reader::new(&data.as_ref()[cur_pos..found.end]);
                     if let Some(dict) = dict_reader.read_with_context::<Dict<'_>>(&dummy_ctx) {
                         if let Some(start) = stream
-                            && let Some(after) =
-                                streams.after(data.as_ref(), start, &dict, &xref_map)
+                            && let Some(after) = streams.after(data.as_ref(), start, &dict)
                         {
                             r.jump(after);
                         }
                         if found.root && dict.contains_key(ROOT) {
-                            trailer_dicts.push(dict.clone());
+                            trailer_dicts.push((cur_pos, dict.clone()));
                         }
 
                         if dict
                             .get::<Name<'_>>(TYPE)
                             .is_some_and(|n| n.as_str() == "Catalog")
                         {
-                            root_ref = last_obj_num;
+                            catalogs.push(cur_pos);
                         }
 
                         // An object stream is the body of its header's object, read
@@ -600,12 +609,64 @@ fn walk<'a>(data: &'a PdfData, scan: &mut Scan<'_>) -> Walk<'a> {
         }
     }
 
+    // What the walk read of data a walk skipping them would not have, taken out: as
+    // that walk would have gone on from where this one did, it would have found the
+    // same after them ([`unread_data`]).
+    let mut skipped = vec![];
+    if !streams.unsure.is_empty() {
+        let mut listed: Vec<usize> = listed.iter().map(|entry| entry.offset).collect();
+        listed.sort_unstable();
+        skipped = unread_data(
+            data.as_ref(),
+            &Walked {
+                found: &found,
+                bodies: &bodies,
+                last: &xref_map,
+                unsure: &streams.unsure,
+                resumed: &resumed,
+                listed: &listed,
+                ends: &streams.ends,
+            },
+        );
+    }
+    if !skipped.is_empty() {
+        let read = |at: &usize| {
+            let next = skipped.partition_point(|skipped| skipped.start <= *at);
+            !next.checked_sub(1).is_some_and(|i| skipped[i].holds(*at))
+        };
+        let kept: Vec<usize> = (0..found.len()).filter(|i| read(&found[*i].1)).collect();
+        let table: XrefMap = kept
+            .iter()
+            .map(|i| (found[*i].0, EntryType::Normal(found[*i].1)))
+            .collect();
+        // Checked, not assumed: the table holds each header a /Length was read from.
+        // Where one it does not hold, the walk keeps all it read.
+        let held = skipped.iter().all(|skipped| {
+            table.get(&skipped.length.0) == Some(&EntryType::Normal(skipped.length.1))
+        });
+        debug_assert!(held, "a /Length read from a header the table does not hold");
+        if held {
+            bodies = kept.iter().map(|i| bodies[*i]).collect();
+            found = kept.iter().map(|i| found[*i]).collect();
+            xref_map = table;
+            broken.retain(|(_, at)| read(at));
+            trailer_dicts.retain(|(at, _)| read(at));
+            catalogs.retain(read);
+            object_streams.retain(|(_, at)| read(at));
+        }
+    }
+    // The object of the last header before the last catalog.
+    let root_ref = catalogs.last().and_then(|catalog| {
+        let next = found.partition_point(|(_, at)| at < catalog);
+        Some(found[next.checked_sub(1)?].0)
+    });
+
     Walk {
         xref_map,
         found,
         bodies,
-        broken,
-        trailer_dicts,
+        broken: broken.into_iter().map(|(id, _)| id).collect(),
+        trailer_dicts: trailer_dicts.into_iter().map(|(_, dict)| dict).collect(),
         root_ref,
         object_streams,
         ends: streams.ends,
@@ -629,28 +690,29 @@ fn stream_data_start(data: &[u8], end: usize) -> Option<usize> {
 
 /// What the walk of a rebuild finds of the streams that are headers' objects, to go on
 /// after their data, which it does not read: the first `endstream` and `stream` at or
-/// after an offset, and the objects an indirect /Length may be.
+/// after an offset, and the streams whose data it reads though an indirect /Length
+/// may end them.
 #[derive(Default)]
-struct Streams<'a> {
+struct Streams {
     /// Where each `endstream` of the file is, found the first time one is looked for
     /// past a long run of white space, as reading a stream finds them; the rebuilt
     /// table's [`Layout`] keeps them.
     ends: Arc<Ends>,
     keywords: NextKeyword,
-    lengths: Option<LengthObjects<'a>>,
+    /// Where the data of each such stream start, and the object its /Length refers
+    /// to, in the order of the file ([`unread_data`]).
+    unsure: Vec<(usize, ObjectIdentifier)>,
 }
 
-impl<'a> Streams<'a> {
+impl Streams {
     /// Where the walk goes on after the data of a stream that start at `start` of
-    /// `data`, `dict` its dictionary, `found` what the walk has found before them:
-    /// after the `endstream` a /Length that is a number leads to past white space, as
-    /// reading the stream finds its data ([`endstream_past_white`]); else after the
-    /// first `endstream` from `start` on, as reading finds the data of a stream whose
-    /// /Length does not lead to one, unless another stream starts before it; then
-    /// after the `endstream` a /Length that is a reference leads to, read from a
-    /// header of its object that the data it delimits do not hold
-    /// ([`Self::by_reference`]). `None` where none of these ends the data: the walk
-    /// reads them.
+    /// `data`, `dict` its dictionary: after the `endstream` a /Length that is a
+    /// number leads to past white space, as reading the stream finds its data
+    /// ([`endstream_past_white`]); else after the first `endstream` from `start` on,
+    /// as reading finds the data of a stream whose /Length does not lead to one,
+    /// unless another stream starts before it. `None` where neither ends the data:
+    /// the walk reads them, and a /Length that is a reference is kept, to be read
+    /// once the walk has found the object it refers to ([`unread_data`]).
     ///
     /// So a header or dictionary in a stream's data, such as an object of a PDF
     /// attached uncompressed, is not taken for one of the file's, and the walk does
@@ -658,13 +720,7 @@ impl<'a> Streams<'a> {
     // Not inlined: in the walk's loop it took the registers of the loops that read
     // white space and tokens, which then reload them for each byte.
     #[inline(never)]
-    fn after(
-        &mut self,
-        data: &'a [u8],
-        start: usize,
-        dict: &Dict<'_>,
-        found: &XrefMap,
-    ) -> Option<usize> {
+    fn after(&mut self, data: &[u8], start: usize, dict: &Dict<'_>) -> Option<usize> {
         let reference = dict.get_ref(LENGTH);
         if reference.is_none()
             && let Some(at) = dict
@@ -678,77 +734,19 @@ impl<'a> Streams<'a> {
         // `endstream`, else up to the first `endstream`. That one is another stream's
         // where a `stream` keyword comes before it, such as an attached PDF's, or the
         // next stream's after data whose own `endstream` is missing or misspelled:
-        // the objects up to it are the file's, which PyMuPDF loses. Only then is a
-        // /Length that is a reference read, as finding its object costs a search of
-        // the file; where it does not lead to `endstream` either, the walk reads the
-        // data, as it does where no `endstream` follows, keeping those objects.
-        let at = match self.keywords.at_or_after(data, start)? {
-            Keyword::End(first) => first,
-            Keyword::Start => self.by_reference(data, start, reference?.into(), found)?,
-        };
-        Some(at + b"endstream".len())
-    }
-
-    /// Where the `endstream` is that the /Length of a stream leads to, whose data start
-    /// at `start`, where it is a reference to `id`: the value, a non-negative integer,
-    /// of a header of `id` that the data it delimits do not hold, so that the walk,
-    /// skipping them, can reach it. Which header the rebuilt table holds is not known
-    /// until the walk ends, and a header of `id` in data the walk skips later, such as
-    /// an attached PDF's, never enters it: so a header is taken only where it agrees
-    /// with itself. First the header the walk has found, in `found`, before the data;
-    /// else the first after them, in the order of the file, that is after the
-    /// `endstream` its value leads to, among at most [`LENGTH_HEADERS`] of them.
-    /// `None` where none agrees: the walk reads the data, as it did before skipping
-    /// them, and takes any object they hold.
-    ///
-    /// The headers of the file are found once, at the first such /Length, and each
-    /// object's value read once, after white space only: so each byte is read for at
-    /// most two headers, the number ending one's value being the next one's number.
-    /// Each stream tries a bounded number of headers, a lookup each, however many
-    /// headers of `id` the file holds.
-    fn by_reference(
-        &mut self,
-        data: &'a [u8],
-        start: usize,
-        id: ObjectIdentifier,
-        found: &XrefMap,
-    ) -> Option<usize> {
-        let objects = self.lengths.get_or_insert_with(|| LengthObjects::new(data));
-        let ends = &self.ends;
-        let led =
-            |length: u32| endstream_after_white(ends, data, start.checked_add(length as usize)?);
-        if let Some(EntryType::Normal(object)) = found.get(&id)
-            && let Some(at) = objects.value(*object).and_then(led)
-        {
-            return Some(at);
-        }
-        // A header after the `endstream` its value leads to is after the first one.
-        let (first, _) = first_endstream(ends, data, start)?;
-        let mut tried = [None; LENGTH_HEADERS];
-        for (slot, object) in tried
-            .iter_mut()
-            .zip(objects.after(id, first + b"endstream".len()))
-        {
-            *slot = Some(object);
-        }
-        for object in tried.into_iter().flatten() {
-            opened(1);
-            if let Some(at) = objects.value(object).and_then(led)
-                && object >= at + b"endstream".len()
-            {
-                return Some(at);
+        // the objects up to it are the file's, which PyMuPDF loses. The walk reads
+        // such data, as it does where no `endstream` follows, keeping those objects.
+        match self.keywords.at_or_after(data, start)? {
+            Keyword::End(first) => Some(first + b"endstream".len()),
+            Keyword::Start => {
+                if let Some(reference) = reference {
+                    self.unsure.push((start, reference.into()));
+                }
+                None
             }
         }
-        None
     }
 }
-
-/// How many headers of the object an indirect /Length refers to, after a stream's
-/// data, the walk of a rebuild tries for the stream. More would let headers that
-/// lead to no `endstream`, after many streams, cost each of them a lookup; a stream
-/// whose own length object comes after more of them, in its data or after them, has
-/// its data read, as before the walk skipped them.
-const LENGTH_HEADERS: usize = 16;
 
 /// Where the `endstream` is that a /Length `length` leads to, of a stream whose data
 /// start at `start` of `data` ([`endstream_past_white`]).
@@ -773,13 +771,6 @@ fn endstream_past_white(data: &[u8], to: usize, ends: &Ends) -> Option<usize> {
             .starts_with(b"endstream")
             .then_some(to + white);
     }
-    endstream_after_white(ends, data, to)
-}
-
-/// Where the `endstream` is that the data of a stream end before, past white space
-/// only, where they end at `to` of `data`, among where each is in the file, `ends`,
-/// found once: what [`endstream_past_white`] finds, with a lookup and no byte read.
-fn endstream_after_white(ends: &Ends, data: &[u8], to: usize) -> Option<usize> {
     let (stop, trimmed) = first_endstream(ends, data, to)?;
     (trimmed <= to).then_some(stop)
 }
@@ -806,89 +797,167 @@ fn first_endstream(ends: &Ends, data: &[u8], from: usize) -> Option<(usize, usiz
         .copied()
 }
 
-/// Where the headers of each object are in a file, and the value of the objects
-/// asked about: the objects an indirect /Length may be, for the walk of a rebuild.
-struct LengthObjects<'a> {
-    data: &'a [u8],
-    /// Each header `N G obj`, as the walk reads one, after white space or a
-    /// delimiter, and where it is, by object and then place.
-    headers: Vec<(ObjectIdentifier, usize)>,
-    /// The object after each header asked about, where it is a non-negative integer.
-    values: hash::Map<usize, Option<u32>>,
+/// Data of a stream that a walk skipping them would not read ([`unread_data`]): from
+/// `start` to `end`, the end of the `endstream` that the header at `length.1` of the
+/// object `length.0`, the stream's /Length, leads to.
+#[derive(Debug, Clone, Copy)]
+struct Skipped {
+    start: usize,
+    end: usize,
+    length: (ObjectIdentifier, usize),
 }
 
-impl<'a> LengthObjects<'a> {
-    /// Finds each `obj` of `data` and reads back from it over a header's numbers and
-    /// white space, which hold no `obj`: each byte is read a bounded number of times.
-    /// Each number is a run of digits, read as reading a header reads it.
-    fn new(data: &'a [u8]) -> Self {
-        let mut headers = vec![];
-        for keyword in object::stream::searched_all(data, b"obj") {
-            let before = |end: usize, f: fn(&u8) -> bool| {
-                let run = data[..end].iter().rev().take_while(|b| f(b)).count();
-                opened(run + 1);
-                end - run
-            };
-            let white = |b: &u8| is_white_space_character(*b);
-            let gen_end = before(keyword, white);
-            let gen_start = before(gen_end, u8::is_ascii_digit);
-            let num_end = before(gen_start, white);
-            let num_start = before(num_end, u8::is_ascii_digit);
-            let number = |digits: &[u8]| {
-                digits.iter().try_fold(0_i32, |n, d| {
-                    n.checked_mul(10)?.checked_add(i32::from(d - b'0'))
-                })
-            };
-            if gen_start < gen_end
-                && num_end < gen_start
-                && num_start < num_end
-                && !num_start
-                    .checked_sub(1)
-                    .is_some_and(|i| is_regular_character(data[i]))
-                && let Some(obj_number) = number(&data[num_start..num_end])
-                && let Some(gen_number) = number(&data[gen_start..gen_end])
-            {
-                headers.push((ObjectIdentifier::new(obj_number, gen_number), num_start));
-            }
-        }
-        // Found in the order of the file: sorting by object keeps it for each.
-        headers.sort_by_key(|(id, _)| *id);
-        Self {
-            data,
-            headers,
-            values: hash::Map::default(),
-        }
+impl Skipped {
+    fn holds(&self, at: usize) -> bool {
+        (self.start..self.end).contains(&at)
     }
+}
 
-    /// Where the headers of `id` are at or after `from`, in the order of the file.
-    fn after(&self, id: ObjectIdentifier, from: usize) -> impl Iterator<Item = usize> + '_ {
-        let first = self.headers.partition_point(|header| *header < (id, from));
-        self.headers[first..]
-            .iter()
-            .take_while(move |(header, _)| *header == id)
-            .map(|(_, at)| *at)
-    }
+/// What the walk of a rebuild records of where it went, to take out what it read of
+/// the data of streams whose /Length, a reference, it did not know ([`unread_data`]).
+struct Walked<'a> {
+    /// Each header the walk put in the table, and where it is, in the order of the
+    /// file; and where the object after each starts.
+    found: &'a [(ObjectIdentifier, usize)],
+    bodies: &'a [usize],
+    /// The table the walk built: the last of `found` of each object.
+    last: &'a XrefMap,
+    /// [`Streams::unsure`].
+    unsure: &'a [(usize, ObjectIdentifier)],
+    /// Each place the walk went on from just after an `endstream`, after the first
+    /// stream of `unsure`, with no header before it whose object starts after it.
+    resumed: &'a [usize],
+    /// Where the entries of the old table kept lead, in rising order: places, as the
+    /// headers found are, where a body read ends ([`Layout`]).
+    listed: &'a [usize],
+    ends: &'a Ends,
+}
 
-    /// The object after the header at `at`, where it is a non-negative integer after
-    /// white space, as reading a /Length that refers to it reads it. A comment
-    /// between the two, which reading skips, is not read: one could run past the
-    /// headers after it, each of which would read it again.
-    fn value(&mut self, at: usize) -> Option<u32> {
-        let data = self.data;
-        *self.values.entry(at).or_insert_with(|| {
-            let mut r = Reader::new(data);
-            r.jump(at);
-            scan_header(&mut r)?;
-            r.skip_white_spaces();
-            if !r.peek_byte().is_some_and(object::starts_number) {
-                opened(r.offset() - at);
-                return None;
+/// The data of streams that the walk read but that a walk skipping them by their
+/// /Length, a reference, would not have read: each from where the data start to the
+/// end of the `endstream` that ends them. The table holds none of the objects the
+/// walk found there.
+///
+/// The value of such a /Length is known only from the table, which the walk builds:
+/// so the walk reads the data, as before it skipped any, and records each header it
+/// finds, each such stream, and where it went on just after an `endstream`. Then,
+/// for each stream in the order of the file that no data taken out hold, the object
+/// is read from at most two headers, in this order: the last before the data, which
+/// the walk's table held there, and the last of the file, the table's now. A header
+/// is taken where:
+///
+/// - its value, read as the table reads the object, leads to an `endstream` past
+///   white space, as a /Length that is a number does ([`led`]);
+/// - the walk went on from just after that `endstream`: from there, a walk skipping
+///   the data goes on as this one did, and finds what it found;
+/// - with the headers in the data taken out, the table holds that header for the
+///   object: the /Length is the one a reader of the rebuilt table reads;
+/// - the data hold no header taken for an earlier stream's /Length, which taking
+///   them out would take out of the table.
+///
+/// The header before the data is tried first: an attached PDF can hold, after its
+/// first `endstream`, an object numbered alike whose value leads there.
+///
+/// Where no header is taken, the walk has read the data and takes the objects in
+/// them, as before it skipped any: a PDF attached uncompressed whose /Length the
+/// table does not hold, or holds as no number leading to `endstream`.
+///
+/// Each stream reads at most two headers' objects, each once, in its slot, which no
+/// other's overlaps, and looks up the rest: the work is linear in the walk's, however
+/// streams' data overlap and however many share a /Length.
+fn unread_data(data: &[u8], walked: &Walked<'_>) -> Vec<Skipped> {
+    let Walked {
+        found,
+        bodies,
+        last,
+        unsure,
+        resumed,
+        listed,
+        ends,
+    } = *walked;
+    let ctx = ReaderContext::dummy();
+    let index = |at: usize| found.partition_point(|(_, found)| *found < at);
+    let mut values = hash::Map::default();
+    // The object after the header `found[i]`, read as the table reads it, in its slot:
+    // up to the next header found, or the next place an entry of the old table leads
+    // to, which is past where the object starts.
+    let mut value = |i: usize| -> Option<u32> {
+        *values.entry(i).or_insert_with(|| {
+            let at = found[i].1;
+            let slot = found.get(i + 1).map_or(data.len(), |(_, next)| *next).min(
+                listed
+                    .get(listed.partition_point(|l| *l < bodies[i]))
+                    .map_or(data.len(), |l| *l),
+            );
+            let place = Place {
+                source: Source::File,
+                at,
+                decryption: None,
+            };
+            match body::Shape::read(data, Slot::to(slot), place, &ctx) {
+                body::Shape::Value(top) => top.object(data, &ctx).cast::<u32>(),
+                _ => None,
             }
-            let value = r.read_without_context::<u32>();
-            opened(r.offset() - at);
-            value
         })
+    };
+    let mut skipped: Vec<Skipped> = vec![];
+    // The last header of each object up to the data of the stream looked at, of those
+    // not taken out: the table of the walk skipping the data taken out, there.
+    let mut table: hash::Map<ObjectIdentifier, usize> = hash::Map::default();
+    let mut next = 0;
+    // The headers taken for a /Length after the data they end.
+    let mut kept = BTreeSet::new();
+    for &(start, id) in unsure {
+        // Data in data taken out, which a walk skipping them does not reach.
+        if skipped.last().is_some_and(|unread| start < unread.end) {
+            continue;
+        }
+        while let Some(&(header, at)) = found.get(next)
+            && at < start
+        {
+            if !skipped.last().is_some_and(|unread| unread.holds(at)) {
+                table.insert(header, next);
+            }
+            next += 1;
+        }
+        let before = table.get(&id).copied();
+        let last = match last.get(&id) {
+            Some(EntryType::Normal(at)) if *at > start => Some(index(*at)),
+            _ => before,
+        };
+        let Some(last) = last else { continue };
+        for header in [before, Some(last).filter(|last| Some(*last) != before)]
+            .into_iter()
+            .flatten()
+        {
+            opened(1);
+            let Some(end) = value(header)
+                .and_then(|length| led(data, start, length, ends))
+                .map(|at| at + b"endstream".len())
+            else {
+                continue;
+            };
+            let data_holds = |at: usize| (start..end).contains(&at);
+            let table_holds = if header == last {
+                !data_holds(found[last].1)
+            } else {
+                data_holds(found[last].1)
+            };
+            let rejoined = end >= data.len() || resumed.binary_search(&end).is_ok();
+            if table_holds && rejoined && kept.range(start..end).next().is_none() {
+                skipped.push(Skipped {
+                    start,
+                    end,
+                    length: (id, found[header].1),
+                });
+                if found[header].1 > start {
+                    kept.insert(found[header].1);
+                }
+                break;
+            }
+        }
     }
+    skipped
 }
 
 /// The first keyword at or after an offset of a file that ends or starts the data of
@@ -2926,7 +2995,7 @@ mod tests {
     #[test]
     fn opening_a_file_reads_it_in_linear_time() {
         type Family = (&'static str, fn(usize) -> Vec<u8>);
-        let families: [Family; 33] = [
+        let families: [Family; 37] = [
             // Entries at each `0` of `0…09 0 obj`: each reads a header in its slot of
             // one byte, which the next `0` ends, not on to `obj`.
             ("entries in the zeros of a header", |n| {
@@ -3109,6 +3178,76 @@ mod tests {
                 let streams =
                     "5 0 obj << /Length 9 0 R >> stream\nx stream x\nendstream endobj\n".repeat(n);
                 around(&format!("{streams}{}", "9 0 obj 1 endobj\n".repeat(n)))
+            }),
+            // Streams holding the keyword `stream`, whose /Length is a reference to one
+            // object before them all.
+            ("streams sharing one length object before them", |n| {
+                let streams =
+                    "5 0 obj << /Length 9 0 R >> stream\nx stream x\nendstream endobj\n".repeat(n);
+                around(&format!("9 0 obj 10 endobj\n{streams}"))
+            }),
+            // Streams holding the keyword `stream`, each /Length a reference to another
+            // object after them all, a comment before its value.
+            ("streams whose length objects hold a comment", |n| {
+                let streams: String = (0..n)
+                    .map(|k| {
+                        format!(
+                            "{} 0 obj << /Length {} 0 R >> stream\nx stream x\nendstream endobj\n",
+                            2 * k + 10,
+                            2 * k + 11
+                        )
+                    })
+                    .collect();
+                let objects: String = (0..n)
+                    .map(|k| format!("{} 0 obj % the length\n10 endobj\n", 2 * k + 11))
+                    .collect();
+                around(&format!("{streams}{objects}"))
+            }),
+            // Streams each in the data of the one before, ended by as many `endstream`
+            // after them all, each /Length leading to its own, the last.
+            ("streams whose data nest", |n| {
+                let mut body = String::new();
+                let mut starts = vec![];
+                for k in 0..n {
+                    body.push_str(&format!(
+                        "{} 0 obj << /Length {} 0 R >> stream\n",
+                        k + 10,
+                        k + n + 10
+                    ));
+                    starts.push(body.len());
+                }
+                let mut ends = vec![];
+                for _ in 0..n {
+                    ends.push(body.len());
+                    body.push_str("endstream\n");
+                }
+                for k in 0..n {
+                    body.push_str(&format!(
+                        "{} 0 obj {} endobj\n",
+                        k + n + 10,
+                        ends[n - 1 - k] - starts[k]
+                    ));
+                }
+                around(&body)
+            }),
+            // Streams holding the keyword `stream` and a header of the object their
+            // /Length refers to, whose value leads past the next three streams, before
+            // a last header of it, leading to no `endstream`: the data each /Length
+            // would end overlap the next three streams', and each is read.
+            ("streams whose lengths lead past the next ones", |n| {
+                let unit = |length: usize| {
+                    format!(
+                        "5 0 obj << /Length 9 0 R >> stream\n9 0 obj {length:08} endobj stream\nendstream endobj\n"
+                    )
+                };
+                let size = unit(0).len();
+                let data = size
+                    - "5 0 obj << /Length 9 0 R >> stream\n".len()
+                    - "endstream endobj\n".len();
+                around(&format!(
+                    "{}9 0 obj 1 endobj",
+                    unit(3 * size + data).repeat(n)
+                ))
             }),
             // Streams that no `endstream` ends, before a later stream's: the data of
             // each are read, the searches for both keywords reading each part once.
@@ -3728,97 +3867,164 @@ mod tests {
     // objects numbered alike would be the table's. The document keeps its own page, as
     // PyMuPDF 1.28.2 shows it where /Length is a number or the attached PDF's first
     // `endstream` is its last. A /Length that is a reference is read as the rebuilt
-    // table holds it, the object after the stream or before it, where the attached PDF
-    // has an object numbered alike after that.
+    // table holds it: the document's object, before the stream or after it, after a
+    // comment or not, though an object numbered alike whose value leads to the
+    // attached PDF's first `endstream` follows that `endstream`, in the attached PDF,
+    // or is in the data of a later stream, which the walk skips.
     #[test]
     fn a_rebuild_takes_no_object_of_an_embedded_pdf() {
         let content = "0 0 1 rg 0 0 300 200 re f";
         for content_first in [false, true] {
             for inner_length in [content.len().to_string(), "5 0 R".to_string()] {
-                let mut objects = vec![
-                    (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
-                    (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
-                    (
-                        3,
-                        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R >>"
-                            .to_string(),
-                    ),
-                ];
-                let mut tail = vec![(
-                    4,
-                    format!("<< /Length {inner_length} >>\nstream\n{content}\nendstream"),
-                )];
-                if inner_length == "5 0 R" {
-                    tail.push((5, content.len().to_string()));
+                for decoy_inside in [false, true] {
+                    let objects = attached_objects(content, content_first, &inner_length);
+                    let inner = attached_pdf(&objects, decoy_inside);
+                    embedded_in_document(&inner);
                 }
-                if content_first {
-                    tail.append(&mut objects);
-                    objects = tail;
-                } else {
-                    objects.append(&mut tail);
-                }
-                let mut inner = b"%PDF-1.7\n".to_vec();
-                let mut offsets = vec![];
-                for (number, object) in &objects {
-                    offsets.push((*number, inner.len()));
-                    inner.extend(format!("{number} 0 obj\n{object}\nendobj\n").bytes());
-                }
-                offsets.sort();
-                let xref = inner.len();
-                inner.extend(
-                    format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).bytes(),
-                );
-                for (_, offset) in offsets {
-                    inner.extend(format!("{offset:010} 00000 n \n").bytes());
-                }
-                inner.extend(
-                    format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+            }
+        }
+    }
+
+    /// The objects of a PDF of one 300 × 200 page drawn by `content`, numbered from 1,
+    /// with its content stream first or last, and its /Length `length`: a number, or
+    /// `5 0 R`, object 5 then following the content stream.
+    fn attached_objects(content: &str, content_first: bool, length: &str) -> Vec<(u32, String)> {
+        let mut objects = vec![
+            (1, CATALOG.to_string()),
+            (2, TREE.to_string()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R >>"
+                    .to_string(),
+            ),
+        ];
+        let mut tail = vec![(
+            4,
+            format!("<< /Length {length} >>\nstream\n{content}\nendstream"),
+        )];
+        if length == "5 0 R" {
+            tail.push((5, content.len().to_string()));
+        }
+        if content_first {
+            tail.append(&mut objects);
+            tail
+        } else {
+            objects.append(&mut tail);
+            objects
+        }
+    }
+
+    /// A PDF of `objects`, with its table and trailer; with `decoy`, an object 5 after
+    /// its first `endstream`, whose value leads there from the PDF's start.
+    fn attached_pdf(objects: &[(u32, String)], decoy: bool) -> Vec<u8> {
+        let mut inner = b"%PDF-1.7\n".to_vec();
+        let mut offsets = vec![];
+        for (number, object) in objects {
+            offsets.push((*number, inner.len()));
+            inner.extend(format!("{number} 0 obj\n{object}\nendobj\n").bytes());
+            if decoy && object.contains("endstream") {
+                let first = inner.windows(9).position(|w| w == b"endstream").unwrap();
+                offsets.push((5, inner.len()));
+                inner.extend(format!("5 0 obj\n{first}\nendobj\n").bytes());
+            }
+        }
+        offsets.sort();
+        let xref = inner.len();
+        inner.extend(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).bytes());
+        for (_, offset) in offsets {
+            inner.extend(format!("{offset:010} 00000 n \n").bytes());
+        }
+        inner.extend(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").bytes(),
+        );
+        inner
+    }
+
+    /// Checks that a document whose table is rebuilt, holding `inner` uncompressed as
+    /// its object 4, opens to its own page, its object 4 the attached file and its
+    /// length object 5 its own: whether /Length is a number or a reference to 5, whose
+    /// value follows a comment or not, before the stream or after it, before or after
+    /// a later stream, whose right /Length is a number, holding an object 5 whose value
+    /// leads to the first `endstream` of `inner`, or no such stream.
+    fn embedded_in_document(inner: &[u8]) {
+        let first = inner.windows(9).position(|w| w == b"endstream").unwrap();
+        let held = format!("5 0 obj {first} endobj");
+        let decoy = format!(
+            "8 0 obj\n<< /Length {} >>\nstream\n{held}\nendstream\nendobj\n",
+            held.len()
+        );
+        for place in ["direct", "before", "after", "after the later stream"] {
+            for comment in ["", "% the length\n"] {
+                for later in ["", decoy.as_str()] {
+                    if place == "direct" && !comment.is_empty() {
+                        continue;
+                    }
+                    let length_object = format!("5 0 obj {comment}{}\nendobj\n", inner.len());
+                    let length = if place == "direct" {
+                        inner.len().to_string()
+                    } else {
+                        "5 0 R".to_string()
+                    };
+                    let mut body = vec![];
+                    if place == "before" {
+                        body.extend(length_object.bytes());
+                    }
+                    body.extend(
+                        format!(
+                            "4 0 obj\n<< /Type /EmbeddedFile /Subtype /application#2Fpdf /Length {length} >>\nstream\n"
+                        )
                         .bytes(),
-                );
-                let length_object = format!("5 0 obj\n{}\nendobj\n", inner.len());
-                // A later stream, whose /Length is right, holding an object 5 that does
-                // not lead to the attached PDF's end: the table never holds it, as the
-                // walk skips its data.
-                let later =
-                    "8 0 obj\n<< /Length 17 >>\nstream\n5 0 obj 23 endobj\nendstream\nendobj\n";
-                for outer_length in ["direct", "after", "before"] {
-                    for later in ["", later] {
-                        let mut body = vec![];
-                        let length = if outer_length == "direct" {
-                            inner.len().to_string()
-                        } else {
-                            "5 0 R".to_string()
-                        };
-                        if outer_length == "before" {
-                            body.extend(length_object.bytes());
-                        }
-                        body.extend(
-                            format!(
-                                "4 0 obj\n<< /Type /EmbeddedFile /Subtype /application#2Fpdf /Length {length} >>\nstream\n"
-                            )
-                            .bytes(),
+                    );
+                    body.extend(inner);
+                    body.extend(b"\nendstream\nendobj\n");
+                    if place == "after" {
+                        body.extend(length_object.bytes());
+                    }
+                    body.extend(later.bytes());
+                    if place == "after the later stream" {
+                        body.extend(length_object.bytes());
+                    }
+                    let file = file_with(&body, &[0], true);
+                    let case = format!("{place}, {comment:?}, {later:?}");
+                    // Opens to the document's 100 × 100 page.
+                    work(&file);
+                    let pdf = crate::Pdf::new(file).unwrap();
+                    let attached = pdf.xref().get::<Dict<'_>>(id(4)).unwrap();
+                    assert!(attached.contains_key(object::dict::keys::SUBTYPE), "{case}");
+                    if place != "direct" {
+                        assert_eq!(
+                            pdf.xref().get::<u32>(id(5)),
+                            Some(inner.len() as u32),
+                            "{case}"
                         );
-                        body.extend(&inner);
-                        body.extend(b"\nendstream\nendobj\n");
-                        if outer_length == "after" {
-                            body.extend(length_object.bytes());
-                        }
-                        body.extend(later.bytes());
-                        let file = file_with(&body, &[0], true);
-                        // Opens to the document's 100 × 100 page.
-                        work(&file);
-                        if outer_length != "direct" {
-                            let pdf = crate::Pdf::new(file).unwrap();
-                            assert_eq!(
-                                pdf.xref().get::<u32>(id(5)),
-                                Some(inner.len() as u32),
-                                "{outer_length}, {later}"
-                            );
-                        }
                     }
                 }
             }
         }
+    }
+
+    // The header a stream's /Length was read from stays in the table: a later stream
+    // whose data hold it, and whose own /Length would end them after it, has its data
+    // read, as taking them out would take the first stream's length object out too.
+    #[test]
+    fn a_length_object_in_a_later_streams_data_stays_in_the_table() {
+        let objects = attached_objects("0 0 1 rg 0 0 300 200 re f", true, "25");
+        let inner = attached_pdf(&objects, false);
+        let held = format!("x stream\n7 0 obj {} endobj\n", inner.len());
+        let mut body = b"4 0 obj\n<< /Type /EmbeddedFile /Length 7 0 R >>\nstream\n".to_vec();
+        body.extend(&inner);
+        body.extend(
+            format!(
+                "\nendstream\nendobj\n8 0 obj\n<< /Length 9 0 R >>\nstream\n{held}\nendstream\nendobj\n\
+                 9 0 obj {} endobj\n",
+                held.len() + 1
+            )
+            .bytes(),
+        );
+        let file = file_with(&body, &[0], true);
+        work(&file);
+        let pdf = crate::Pdf::new(file).unwrap();
+        assert_eq!(pdf.xref().get::<u32>(id(7)), Some(inner.len() as u32));
     }
 
     // A rebuild does not lex a stream's data: opening a file that is mostly the data
