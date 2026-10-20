@@ -17,9 +17,14 @@ use hayro_syntax::hash;
 use hayro_syntax::lost::Lost;
 use hayro_syntax::object::{Array, Dict, MaybeRef, Name, Number, ObjRef, Object, Stream};
 use hayro_syntax::xref::{ContentKey, XRef};
+use smallvec::SmallVec;
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+
+/// The first entries of an array read as numbers ([`Items::first`]): those of a
+/// box, a matrix or a colour, held without an allocation.
+pub(crate) type Numbers = SmallVec<[f64; 8]>;
 
 thread_local! {
     /// Whether a number that cannot be read as `MuPDF` reads it was read since
@@ -309,8 +314,8 @@ impl<'a> Read<'a> {
 enum Found<'a> {
     /// Any object but a string or a name.
     Object(Object<'a>),
-    String(Rc<hayro_syntax::object::String<'a>>),
-    Name(Rc<Name<'a>>),
+    String(hayro_syntax::object::String<'a>),
+    Name(Name<'a>),
     None,
 }
 
@@ -318,8 +323,8 @@ impl<'a> Found<'a> {
     /// `object`, read.
     fn of(object: Option<Object<'a>>) -> Self {
         match object {
-            Some(Object::String(s)) => Self::String(Rc::new(s)),
-            Some(Object::Name(n)) => Self::Name(Rc::new(n)),
+            Some(Object::String(s)) => Self::String(s),
+            Some(Object::Name(n)) => Self::Name(n),
             Some(object) => Self::Object(object),
             None => Self::None,
         }
@@ -597,8 +602,8 @@ impl<'a> Annots<'a> {
 pub(crate) enum Value<'a> {
     Number(Number),
     Bool(bool),
-    Name(Rc<Name<'a>>),
-    String(Rc<hayro_syntax::object::String<'a>>),
+    Name(Name<'a>),
+    String(hayro_syntax::object::String<'a>),
     Array(Items<'a>),
     Dict(Entries<'a>),
     /// A stream, decoded only where its text is read ([`Value::field_text`]).
@@ -619,8 +624,8 @@ impl<'a> Value<'a> {
             Object::Number(n) => Self::Number(n),
             Object::Boolean(b) => Self::Bool(b),
             // Read into `Found::Name` and `Found::String`.
-            Object::Name(n) => Self::Name(Rc::new(n)),
-            Object::String(s) => Self::String(Rc::new(s)),
+            Object::Name(n) => Self::Name(n),
+            Object::String(s) => Self::String(s),
             Object::Array(a) => Self::Array(Items(a, objects.clone())),
             Object::Dict(d) => Self::Dict(Entries(d, objects.clone())),
             Object::Stream(s) => Self::Stream(StreamEntries(s, objects.clone())),
@@ -733,14 +738,23 @@ pub(crate) struct Items<'a>(Array<'a>, Objects<'a>);
 
 impl<'a> Items<'a> {
     /// The entries in order; one that refers to no object is [`Value::Null`].
-    pub(crate) fn iter(&self) -> Box<dyn Iterator<Item = Value<'a>> + '_> {
-        match &self.1.read {
-            Some(read) => Box::new(self.0.raw_iter().map(|e| {
-                let (found, objects) = self.1.found(read, Some(e));
-                Value::of(found, &objects)
-            })),
-            None => Box::new(self.0.items::<Object<'a>>().map(Value::read)),
-        }
+    pub(crate) fn iter(&self) -> impl Iterator<Item = Value<'a>> + '_ {
+        // One of the two runs; neither is boxed, as arrays of a few numbers are
+        // read for every annotation.
+        let (with_objects, without) = match &self.1.read {
+            Some(read) => (
+                Some(self.0.raw_iter().map(|e| {
+                    let (found, objects) = self.1.found(read, Some(e));
+                    Value::of(found, &objects)
+                })),
+                None,
+            ),
+            None => (None, Some(self.0.items::<Object<'a>>().map(Value::read))),
+        };
+        with_objects
+            .into_iter()
+            .flatten()
+            .chain(without.into_iter().flatten())
     }
 
     /// `T` made of these entries ([`Derived`]), once for the document: a later use,
@@ -809,7 +823,7 @@ impl<'a> Items<'a> {
     /// refers to; those after them are not read, and in a shared object these are
     /// read once.
     fn prefix(&self, n: usize) -> Vec<(Value<'a>, Option<ObjRef>)> {
-        let Some(read) = self.1.read.as_ref().filter(|_| self.1.shared) else {
+        let Some(read) = self.shared_read() else {
             let refs = self.0.raw_iter().map(|e| e.as_obj_ref());
             return self.iter().zip(refs).take(n).collect();
         };
@@ -846,6 +860,11 @@ impl<'a> Items<'a> {
             .collect()
     }
 
+    /// What reads the entries where the array is shared, whose prefixes are kept.
+    fn shared_read(&self) -> Option<&Rc<Read<'a>>> {
+        self.1.read.as_ref().filter(|_| self.1.shared)
+    }
+
     /// Entry `i`, and the object it refers to; [`Value::Null`] beyond the end.
     fn entry(&self, i: usize) -> (Value<'a>, Option<ObjRef>) {
         match &self.1.read {
@@ -878,11 +897,13 @@ impl<'a> Items<'a> {
 
     /// The first `n` entries, or all when there are fewer, as numbers, one that is
     /// not a number read as 0; those after them are not read.
-    pub(crate) fn first(&self, n: usize) -> Vec<f64> {
-        self.prefix(n)
-            .iter()
-            .map(|(v, _)| v.number().unwrap_or(0.0))
-            .collect()
+    pub(crate) fn first(&self, n: usize) -> Numbers {
+        let number = |v: &Value<'a>| v.number().unwrap_or(0.0);
+        if self.shared_read().is_none() {
+            // As `prefix` reads them, without its list.
+            return self.iter().take(n).map(|v| number(&v)).collect();
+        }
+        self.prefix(n).iter().map(|(v, _)| number(v)).collect()
     }
 
     /// Where entry `i` of this array, which refers to `r`, is held ([`Held`]).
@@ -1017,7 +1038,7 @@ impl<'a> Entries<'a> {
         }
     }
 
-    pub(crate) fn name(&self, key: &[u8]) -> Option<Rc<Name<'a>>> {
+    pub(crate) fn name(&self, key: &[u8]) -> Option<Name<'a>> {
         match self.get(key) {
             Value::Name(n) => Some(n),
             _ => None,
@@ -1026,7 +1047,7 @@ impl<'a> Entries<'a> {
 
     /// Whether entry `key` is the name `name`.
     pub(crate) fn is(&self, key: &[u8], name: &[u8]) -> bool {
-        self.name(key).is_some_and(|n| **n == *name)
+        self.name(key).is_some_and(|n| *n == *name)
     }
 
     /// The bytes of text entry `entry` ([`Value::text`]).
@@ -1059,7 +1080,7 @@ impl<'a> Entries<'a> {
     /// The first `len` entries of array `key` as numbers (see [`Items::first`]),
     /// with 0 for those it lacks; `None` when `key` is not an array. The entries
     /// after them are not read.
-    pub(crate) fn numbers(&self, key: &[u8], len: usize) -> Option<Vec<f64>> {
+    pub(crate) fn numbers(&self, key: &[u8], len: usize) -> Option<Numbers> {
         let mut n = self.items(key)?.first(len);
         n.resize(len, 0.0);
         Some(n)

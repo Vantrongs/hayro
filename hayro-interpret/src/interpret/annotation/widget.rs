@@ -21,7 +21,7 @@ use super::{
     color_of, most_pieces, rect,
 };
 use hayro_syntax::object::dict::keys::AS;
-use kurbo::{Affine, Shape};
+use kurbo::Affine;
 use std::rc::Rc;
 
 type Drawn = Drew;
@@ -109,7 +109,7 @@ pub(super) fn widget<'a>(
     let bbox = kurbo::Rect::new(0.0, 0.0, fw, fh);
     // What the page shows of the box: the rectangle holding it, in the box's space,
     // for finding the text that can show.
-    let shown = (place.inverse() * visible.to_path(0.1)).bounding_box();
+    let shown = place.inverse().transform_rect_bbox(visible);
     out.op("q");
     out.writes(|out| {
         out.nums(&place.as_coeffs(), "cm")?;
@@ -167,7 +167,7 @@ fn draw<'a>(
         return signature(bbox, fonts, out);
     }
     if matches!(kind, Kind::Check | Kind::Radio) {
-        let on = annot.name(AS).is_some_and(|state| **state != *b"Off");
+        let on = annot.name(AS).is_some_and(|state| *state != *b"Off");
         let s = fw.min(fh);
         // The square at the bottom left of the box.
         let sq = kurbo::Rect::new(0.0, 0.0, s, s);

@@ -4,7 +4,7 @@
 //! and diamonds and an arrow 8.8 widths long and 9 wide, are chosen so that the
 //! endings look as common viewers draw them.
 
-use super::entries::{Derived, Entries, Items, Text};
+use super::entries::{Derived, Entries, Items, Numbers, Text};
 use super::out::{Color, Dash, Out, Part, Refused, Rounding, corners, stroke_reach};
 use super::text::{self, Align, Family, Setting};
 use super::{Appearances, CAPTION, Drew, Unsupported, border_width, circle, color_of, dash};
@@ -527,7 +527,11 @@ struct Layout {
 /// line, its extension and offset do not apply; with one, each is laid out on the
 /// side the leader line goes to, as given, negative or not.
 fn layout(annot: &Entries<'_>) -> Layout {
-    let ends = points(&annot.numbers(b"L", 4).unwrap_or_else(|| vec![0.0; 4]));
+    let ends = points(
+        &annot
+            .numbers(b"L", 4)
+            .unwrap_or_else(|| Numbers::from_elem(0.0, 4)),
+    );
     let (a, b) = (ends[0], ends[1]);
     let len = (b - a).hypot();
     let dir = direction(b - a);
@@ -573,7 +577,9 @@ impl Layout {
     /// when it moves down, whatever `/CP` says.
     fn caption_place(&self, annot: &Entries<'_>) -> CaptionPlace {
         let size = f64::from(CAPTION_SIZE);
-        let co = annot.numbers(b"CO", 2).unwrap_or_else(|| vec![0.0; 2]);
+        let co = annot
+            .numbers(b"CO", 2)
+            .unwrap_or_else(|| Numbers::from_elem(0.0, 2));
         let mid = self.len / 2.0 + co[0];
         let (rise, inline) = if co[0] != 0.0 || co[1] != 0.0 {
             (if co[1] < 0.0 { co[1] - size } else { co[1] }, false)
@@ -778,7 +784,9 @@ pub(super) fn line<'a>(
                 // own order: where an end of the gap lies within how far that and
                 // the line's length and middle may round of an end of the line,
                 // which they draw cannot be told.
-                let co = annot.numbers(b"CO", 2).unwrap_or_else(|| vec![0.0; 2]);
+                let co = annot
+                    .numbers(b"CO", 2)
+                    .unwrap_or_else(|| Numbers::from_elem(0.0, 2));
                 let margin = text::aligned(&text, 0..text.len(), CAPTION_SIZE, mid, len)
                     .plus(Rounding::of(8.0, len.abs() + co[0].abs() + 3.0))
                     .bound()

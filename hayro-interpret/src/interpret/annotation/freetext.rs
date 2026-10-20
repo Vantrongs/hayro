@@ -13,7 +13,7 @@
 //! `/Rect`. A callout line is drawn for a `/CL` of two or three points. The layout
 //! and the defaults match what common viewers draw for such an annotation.
 
-use super::entries::{Entries, Text};
+use super::entries::{Entries, Numbers, Text};
 use super::lines::{Ending, Paint, ending, lost_part};
 use super::out::{Color, Out, Part};
 use super::rich;
@@ -252,7 +252,7 @@ pub(super) struct Boxes {
     /// `/Rect`.
     r: kurbo::Rect,
     /// `/RD`, four numbers.
-    rd: Vec<f64>,
+    rd: Numbers,
     /// The box the text is laid out in.
     inner: kurbo::Rect,
     /// The border width.
@@ -272,7 +272,9 @@ pub(super) fn boxes(annot: &Entries<'_>) -> Option<Boxes> {
     // right, top; 0 for one it lacks or that is not a number), as given, negative
     // or not; one this turns inside out is laid out as it is, its width or height
     // negative, as viewers lay it out.
-    let rd = annot.numbers(b"RD", 4).unwrap_or_else(|| vec![0.0; 4]);
+    let rd = annot
+        .numbers(b"RD", 4)
+        .unwrap_or_else(|| Numbers::from_elem(0.0, 4));
     let inner = kurbo::Rect::new(r.x0 + rd[0], r.y0 + rd[1], r.x1 - rd[2], r.y1 - rd[3]);
     let w = border_width(annot);
 

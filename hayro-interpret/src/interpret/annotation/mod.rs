@@ -47,7 +47,7 @@ use hayro_syntax::object::dict::keys::{AP, AS, BORDER, BS, C, CA, D, F, N, RECT,
 use hayro_syntax::object::{Name, Stream};
 use hayro_syntax::page::Page;
 use hayro_syntax::xref::{ContentKey, XRef};
-use kurbo::{Affine, Shape};
+use kurbo::Affine;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -265,14 +265,14 @@ impl<'a> Drawn<'a> {
 
     /// Its `/Subtype`, to tell which annotation it is.
     pub fn subtype(&self) -> Option<&[u8]> {
-        self.annotation.subtype.as_deref().map(|n| &**n)
+        self.annotation.subtype.as_deref()
     }
 }
 
 /// What an annotation looks like on a page, and its subtype.
 struct Annotation<'a> {
     look: Look<'a>,
-    subtype: Option<Rc<Name<'a>>>,
+    subtype: Option<Name<'a>>,
 }
 
 /// What an annotation a page lists comes to before the area the page shows is known.
@@ -293,7 +293,7 @@ enum Plan<'a> {
     Generate {
         id: Id<'a>,
         annot: Entries<'a>,
-        subtype: Option<Rc<Name<'a>>>,
+        subtype: Option<Name<'a>>,
         refused: Option<Unsupported>,
         again: Cell<bool>,
     },
@@ -842,7 +842,7 @@ fn written_placement(
     let matrix = written_all(matrix)?;
     let affine = Affine::new(matrix.map(f64::from));
     let [x0, y0, x1, y1] = bbox.map(f64::from);
-    let transformed = (affine * kurbo::Rect::new(x0, y0, x1, y1).to_path(0.1)).bounding_box();
+    let transformed = affine.transform_rect_bbox(kurbo::Rect::new(x0, y0, x1, y1));
     // A box of no area maps onto no rect; a /Rect of no area maps the box onto
     // nothing, which is drawn as such.
     if !(transformed.width() > 0.0 && transformed.height() > 0.0) {
@@ -862,7 +862,7 @@ fn written_placement(
 /// onto `rect`. The appearance is drawn with `matrix` and then A.
 pub fn rect_transform(rect: kurbo::Rect, bbox: [f32; 4], matrix: Affine) -> Affine {
     let [x0, y0, x1, y1] = bbox.map(f64::from);
-    let transformed = (matrix * kurbo::Rect::new(x0, y0, x1, y1).to_path(0.1)).bounding_box();
+    let transformed = matrix.transform_rect_bbox(kurbo::Rect::new(x0, y0, x1, y1));
     let (sx, sy) = (
         rect.width() / transformed.width(),
         rect.height() / transformed.height(),
@@ -936,14 +936,14 @@ impl<'a> Appearances<'a> {
         if drew.is_none() || !paints(&content, &glyphs) {
             return Ok(None);
         }
-        let blend = if **subtype == *b"Highlight" {
+        let blend = if *subtype == *b"Highlight" {
             BlendMode::Multiply
         } else {
             BlendMode::Normal
         };
         // A widget is drawn opaque whatever its /CA says (observed in `PyMuPDF`
         // 1.28.2 bake: text, choice and button fields alike, /CA 0 or 0.5).
-        let opacity = if **subtype == *b"Widget" {
+        let opacity = if *subtype == *b"Widget" {
             1.0
         } else {
             opacity(annot)

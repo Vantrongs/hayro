@@ -6,7 +6,7 @@
 //! common viewers draw, and clipped as they clip them: to the box of the
 //! quadrilaterals, a line width wider on each side.
 
-use super::entries::{Derived, Entries, Items};
+use super::entries::{Derived, Entries, Items, Numbers};
 use super::index::{Bound, Index};
 use super::out::{
     Color, Extent, MITER_LIMIT, Out, Part, Refused, Region, Rounding, as_written, stroke_reach,
@@ -73,7 +73,9 @@ pub(super) fn shape(annot: &Entries<'_>, circle: bool, out: &mut Out) -> Option<
 pub(super) fn shape_box(annot: &Entries<'_>) -> Option<(Rect, Rect)> {
     let width = border_width(annot);
     let r = rect(annot)?;
-    let rd = annot.numbers(b"RD", 4).unwrap_or_else(|| vec![0.0; 4]);
+    let rd = annot
+        .numbers(b"RD", 4)
+        .unwrap_or_else(|| Numbers::from_elem(0.0, 4));
     let inset = |i: usize| rd[i].max(width / 2.0);
     let (x0, y0) = (r.x0 + inset(0), r.y0 + inset(1));
     let (x1, y1) = (

@@ -426,7 +426,7 @@ pub(super) struct StampText {
 /// name in its own words and size, another name as it is, in 20 pt.
 pub(super) fn stamp_text(annot: &Entries<'_>, fonts: &Fonts) -> Result<StampText, Unsupported> {
     let name = annot.name(b"Name");
-    let name = name.as_deref().map_or(&b"Draft"[..], |n| n.as_ref());
+    let name = name.as_deref().unwrap_or(b"Draft");
     let custom;
     let (lines, size): (&[&str], f32) = match standard(name) {
         Some((lines, size)) => (lines, size),

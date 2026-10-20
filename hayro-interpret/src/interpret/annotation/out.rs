@@ -12,6 +12,7 @@
 use super::{Glyph, Unsupported};
 use hayro_syntax::hash;
 use kurbo::{Affine, Point, Vec2};
+use smallvec::SmallVec;
 use std::fmt::Write;
 use std::rc::Rc;
 
@@ -174,6 +175,11 @@ impl Color {
 /// reach further.
 pub(super) const MITER_LIMIT: f64 = 10.0;
 
+/// The corners of a convex polygon, or points it is the hull of: those of the
+/// regions and parts an appearance's content is tested against, which are mostly
+/// boxes cut by boxes, held without an allocation.
+type Points = SmallVec<[Point; 8]>;
+
 /// What the page shows of the content's current space, and how far beyond its
 /// outline a piece of it paints there: the area the page shows, cut by every clip
 /// in force as it is written (each number as a viewer reads it, in the space the
@@ -187,7 +193,7 @@ pub(super) const MITER_LIMIT: f64 = 10.0;
 pub(super) struct Region {
     /// The part shown, on the page: a convex polygon of some area, counterclockwise,
     /// or none; `None` where no page bounds it.
-    shown: Option<Vec<Point>>,
+    shown: Option<Points>,
     /// Half the side of the square a piece paints beyond its outline, on the page.
     grow: f64,
     /// How far from where it lies a viewer may draw a piece that is drawn, on the
@@ -371,7 +377,7 @@ const AXES: [Vec2; 2] = [Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)];
 impl Region {
     /// Whether nothing shows.
     pub(super) fn is_empty(&self) -> bool {
-        self.shown.as_ref().is_some_and(Vec::is_empty)
+        self.shown.as_ref().is_some_and(|shown| shown.is_empty())
     }
 
     /// The normals of the sides of what shows grown: of its own sides and of the
@@ -390,7 +396,7 @@ impl Region {
     }
 
     /// `points`, of the current space, on the page.
-    fn on_page(&self, points: &[Point]) -> Vec<Point> {
+    fn on_page(&self, points: &[Point]) -> Points {
         points.iter().map(|p| self.ctm * *p).collect()
     }
 
@@ -415,7 +421,7 @@ impl Region {
         then: &[[f32; 6]],
         points: &[Point],
         local: Rounding,
-    ) -> (Vec<Point>, Vec2) {
+    ) -> (Points, Vec2) {
         let (mut ctm, mut abs) = (self.ctm, self.abs);
         for m in then {
             let m = m.map(f64::from);
@@ -667,7 +673,7 @@ impl Region {
         if shown.is_empty() {
             return false;
         }
-        let corners: Vec<Point> = points
+        let corners: Points = points
             .iter()
             .flat_map(|p| {
                 [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
@@ -695,7 +701,7 @@ impl Region {
             return None;
         }
         let page = self.on_page(base);
-        let reach: Vec<Point> = base
+        let reach: Points = base
             .iter()
             .flat_map(|p| [*p + dir * far, *p - dir * far])
             .collect();
@@ -729,24 +735,28 @@ impl Region {
             None => {
                 // No page to cut: what shows stays unbounded, but a clip of no
                 // area leaves nothing.
-                if area(&hull(clip.to_vec())) > 0.0 {
+                if area(&hull(Points::from_slice(clip))) > 0.0 {
                     self.shown = None;
                 } else {
-                    self.shown = Some(vec![]);
+                    self.shown = Some(Points::new());
                 }
                 return;
             }
             Some(shown) => shown,
         };
-        let by = hull(clip.to_vec());
-        let mut left = if area(&by) > 0.0 { shown } else { vec![] };
+        let by = hull(Points::from_slice(clip));
+        let mut left = if area(&by) > 0.0 {
+            shown
+        } else {
+            Points::new()
+        };
         for i in 0..by.len() {
             if left.is_empty() {
                 break;
             }
             let (a, b) = (by[i], by[(i + 1) % by.len()]);
             let inside = |p: Point| (b - a).cross(p - a);
-            let mut kept = Vec::with_capacity(left.len() + 1);
+            let mut kept = Points::with_capacity(left.len() + 1);
             for (j, &p) in left.iter().enumerate() {
                 let q = left[(j + 1) % left.len()];
                 let (dp, dq) = (inside(p), inside(q));
@@ -759,7 +769,11 @@ impl Region {
             }
             left = kept;
         }
-        self.shown = Some(if area(&left) > 0.0 { left } else { vec![] });
+        self.shown = Some(if area(&left) > 0.0 {
+            left
+        } else {
+            Points::new()
+        });
     }
 
     /// A box of the current space that holds what shows grown, wider by a margin
@@ -979,11 +993,11 @@ fn side(k: f64, lo: f64, hi: f64) -> (f64, f64) {
 /// The normals of the sides of the convex hull of `points`, every one finite:
 /// with those of another convex polygon, the axes along which the two are apart
 /// if they are apart at all.
-fn sides(points: &[Point]) -> Vec<Vec2> {
-    let h = hull(points.to_vec());
+fn sides(points: &[Point]) -> SmallVec<[Vec2; 8]> {
+    let h = hull(Points::from_slice(points));
     match h.len() {
-        0 | 1 => vec![],
-        2 => vec![(h[1] - h[0]).turn_90()],
+        0 | 1 => SmallVec::new(),
+        2 => smallvec::smallvec![(h[1] - h[0]).turn_90()],
         n => (0..n).map(|i| (h[(i + 1) % n] - h[i]).turn_90()).collect(),
     }
 }
@@ -1005,9 +1019,9 @@ fn area(p: &[Point]) -> f64 {
 }
 
 /// The convex hull of `points`, counterclockwise.
-fn hull(mut points: Vec<Point>) -> Vec<Point> {
+fn hull(mut points: Points) -> Points {
     if !points.iter().all(|p| p.is_finite()) {
-        return vec![];
+        return Points::new();
     }
     points.sort_by(|p, q| p.x.total_cmp(&q.x).then(p.y.total_cmp(&q.y)));
     points.dedup();
@@ -1015,7 +1029,7 @@ fn hull(mut points: Vec<Point>) -> Vec<Point> {
         return points;
     }
     // Andrew's monotone chain.
-    let mut hull: Vec<Point> = vec![];
+    let mut hull = Points::new();
     for pass in 0..2 {
         let start = hull.len();
         for &p in &points {
@@ -1054,6 +1068,11 @@ struct Held {
 
 impl Held {
     fn push_str(&mut self, text: &str) {
+        // Room for a save, a clip and the state set around it at once, rather than
+        // growing from a few bytes for every annotation.
+        if self.text.capacity() == 0 {
+            self.text.reserve(128);
+        }
         self.text.push_str(text);
     }
 
@@ -1332,6 +1351,8 @@ pub(super) struct Out {
     held: Held,
     held_failed: bool,
     path: Vec<Subpath>,
+    /// Where an operator's line is written ([`Out::take_line`]).
+    line: String,
 }
 
 impl Default for Out {
@@ -1353,16 +1374,16 @@ impl Out {
         const FAR: f64 = 1e300;
         let clamp = |x: f64| x.clamp(-FAR, FAR);
         let shown = if v.x0.is_nan() || v.y0.is_nan() || v.x1.is_nan() || v.y1.is_nan() {
-            vec![]
+            Points::new()
         } else {
             let (x0, y0, x1, y1) = (clamp(v.x0), clamp(v.y0), clamp(v.x1), clamp(v.y1));
-            let p = vec![
+            let p = Points::from_slice(&[
                 Point::new(x0, y0),
                 Point::new(x1, y0),
                 Point::new(x1, y1),
                 Point::new(x0, y1),
-            ];
-            if area(&p) > 0.0 { p } else { vec![] }
+            ]);
+            if area(&p) > 0.0 { p } else { Points::new() }
         };
         let unit = unit.abs();
         let (beyond, tolerance) = if unit > 0.0 && unit.is_finite() {
@@ -1373,7 +1394,7 @@ impl Out {
         Self::with(Some(shown), beyond, tolerance)
     }
 
-    fn with(shown: Option<Vec<Point>>, grow: f64, tolerance: f64) -> Self {
+    fn with(shown: Option<Points>, grow: f64, tolerance: f64) -> Self {
         Self {
             content: String::new(),
             failed: false,
@@ -1397,6 +1418,7 @@ impl Out {
             held: Held::default(),
             held_failed: false,
             path: Vec::new(),
+            line: String::new(),
         }
     }
 
@@ -1543,9 +1565,9 @@ impl Out {
 
     /// `nums`, then operator `op`.
     pub(super) fn nums(&mut self, nums: &[f64], op: &'static str) -> Option<()> {
-        let mut text = String::new();
+        let mut text = self.take_line();
         let mut ok = true;
-        let mut values = Vec::with_capacity(nums.len());
+        let mut values = SmallVec::<[f64; 6]>::with_capacity(nums.len());
         for &v in nums {
             ok &= written(v).is_some();
             let n = v as f32;
@@ -1556,6 +1578,7 @@ impl Out {
         text.push_str(op);
         text.push('\n');
         self.act(op, &text, &values, ok);
+        self.line = text;
         Some(())
     }
 
@@ -1576,8 +1599,27 @@ impl Out {
 
     /// Operator `op`, without operands.
     pub(super) fn op(&mut self, op: &'static str) {
-        let text = format!("{op}\n");
-        self.act(op, &text, &[], true);
+        // An operator's line written in place: operators are a few bytes.
+        let mut line = [0_u8; 8];
+        if let Some(text) = line.get_mut(..op.len() + 1) {
+            let (name, end) = text.split_at_mut(op.len());
+            name.copy_from_slice(op.as_bytes());
+            end[0] = b'\n';
+            if let Ok(text) = std::str::from_utf8(text) {
+                self.act(op, text, &[], true);
+                return;
+            }
+        }
+        self.act(op, &format!("{op}\n"), &[], true);
+    }
+
+    /// The buffer an operator's line is written in, empty: taken, so that writing
+    /// the line can read the rest of `self`, and put back after, so that lines
+    /// reuse one allocation.
+    fn take_line(&mut self) -> String {
+        let mut line = std::mem::take(&mut self.line);
+        line.clear();
+        line
     }
 
     /// Acts on operator `op` written as `text`, its operands `values` as written,
@@ -1802,11 +1844,13 @@ impl Out {
     /// content after a part told in a frame not yet ended ([`Out::refuse`]).
     pub(super) fn clip(&mut self, r: kurbo::Rect) -> Option<()> {
         self.clips_after_decision();
-        let (text, ok, corners) = self.clip_rect(r)?;
+        let mut text = self.take_line();
+        let (ok, corners) = self.clip_rect(r, &mut text)?;
         self.state.region.cut(&corners);
         // The path being built, if any, ends in the clip, unpainted.
         self.path.clear();
         self.held.push_str(&text);
+        self.line = text;
         self.held_failed |= !ok;
         Some(())
     }
@@ -1821,9 +1865,10 @@ impl Out {
         }
     }
 
-    /// The clip to `r` as [`Out::clip`] writes it, whether each of its numbers can
-    /// be written, and its corners as a viewer reads them, on the page.
-    fn clip_rect(&self, r: kurbo::Rect) -> Option<(String, bool, [Point; 4])> {
+    /// The clip to `r` as [`Out::clip`] writes it, written into `text`, whether
+    /// each of its numbers can be written, and its corners as a viewer reads them,
+    /// on the page.
+    fn clip_rect(&self, r: kurbo::Rect, text: &mut String) -> Option<(bool, [Point; 4])> {
         let mut r = r;
         let as_is = [r.x0, r.y0, r.width(), r.height()]
             .iter()
@@ -1840,7 +1885,6 @@ impl Out {
             }
         }
         let nums = [r.x0, r.y0, r.width(), r.height()];
-        let mut text = String::new();
         let mut ok = true;
         let mut v = [0.0; 4];
         for (n, v) in nums.iter().zip(&mut v) {
@@ -1854,7 +1898,7 @@ impl Out {
         let ctm = self.state.region.ctm;
         let corners =
             [(x, y), (x + w, y), (x + w, y + h), (x, y + h)].map(|(x, y)| ctm * Point::new(x, y));
-        Some((text, ok, corners))
+        Some((ok, corners))
     }
 
     /// Clips what follows to the path built (`W n`), and ends it: what shows is
