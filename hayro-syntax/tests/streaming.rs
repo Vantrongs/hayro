@@ -376,3 +376,36 @@ fn a_wide_ccitt_row_is_stopped_before_room_is_made_for_it() {
         assert!(held.peak <= 8 * POLL_BYTES + 4096, "{held:?}");
     }
 }
+
+/// A small CCITT image is decoded into an output allocated once, at its declared
+/// size, with lists of color changes that do not grow line by line, as images drawn
+/// by the thousand are: the allocations of a decode are counted exactly.
+#[test]
+fn a_small_ccitt_image_allocates_its_output_once() {
+    // Sixteen rows of 80 pixels, each 20 white and black runs of 2: the first in
+    // horizontal mode (`001`, `0111`, `11`), the others as vertical codes that follow
+    // the row above; then an EOFB.
+    let bits = format!(
+        "{}{}{}",
+        "001011111".repeat(20),
+        "1".repeat(40 * 15),
+        "000000000001".repeat(2)
+    );
+    let data: Vec<u8> = bits
+        .as_bytes()
+        .chunks(8)
+        .map(|byte| (0..8).fold(0, |acc, i| acc << 1 | u8::from(byte.get(i) == Some(&b'1'))))
+        .collect();
+    let pdf = stream_file(
+        "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 80 /Rows 16 >>",
+        &data,
+    );
+    let stream = object_3(&pdf);
+    let params = ImageDecodeParams::default();
+    let (decoded, used) = measure(|| stream.decoded_image(&params).unwrap().data.into_owned());
+    assert_eq!(decoded, [0xFF, 0xFF, 0x00, 0x00].repeat(20 * 16));
+    // The output, the two lists of changes, and one allocation outside the CCITT
+    // decoder and its output; 13 when the output grew from an eighth of its size and
+    // the lists change by change.
+    assert_eq!(used.count, 4, "{used:?}");
+}

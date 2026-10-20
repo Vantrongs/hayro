@@ -1,6 +1,6 @@
 use crate::bit_reader::BitReader;
 use crate::context::{DecoderContext, decode_2d_line};
-use crate::{Decoder, Result, stop};
+use crate::{Decoder, Result};
 
 pub(crate) fn decode(
     ctx: &mut DecoderContext,
@@ -8,7 +8,7 @@ pub(crate) fn decode(
     decoder: &mut impl Decoder,
 ) -> Result<()> {
     loop {
-        stop(decoder)?;
+        reader.poll(decoder)?;
         // EOLs aren't part of Group 4, but PDF requires decoders to accept them
         // anyway. An EOFB consists of two consecutive EOLs. Data that follows
         // an EOFB (after padding to a byte boundary) can start like another

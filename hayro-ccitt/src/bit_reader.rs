@@ -1,6 +1,6 @@
 //! Bit-level reader for CCITT encoded data streams.
 
-use crate::{DecodeError, Result};
+use crate::{DecodeError, Decoder, POLL_BITS, Result};
 use core::fmt::Debug;
 
 #[derive(Debug, Clone)]
@@ -14,6 +14,9 @@ pub(crate) struct BitReader<'a> {
     /// The bit offset up to which bits can be consumed without refilling the
     /// buffer or reaching the end of the data.
     limit: usize,
+    /// The bit offset from which on the decoder is asked whether to stop:
+    /// [`POLL_BITS`] past the offset at which it was last asked.
+    poll_at: usize,
 }
 
 impl<'a> BitReader<'a> {
@@ -24,6 +27,7 @@ impl<'a> BitReader<'a> {
             bit_offset: 0,
             buffer: 0,
             limit: 0,
+            poll_at: POLL_BITS,
         };
         reader.refill();
         reader
@@ -57,6 +61,32 @@ impl<'a> BitReader<'a> {
         self.buffer <<= num_bits;
 
         Ok(())
+    }
+
+    /// Asks `decoder` whether to stop once [`POLL_BITS`] bits were read since
+    /// it was last asked.
+    #[inline(always)]
+    pub(crate) fn poll(&mut self, decoder: &mut impl Decoder) -> Result<()> {
+        if self.bit_offset >= self.poll_at {
+            self.ask(decoder)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Asks `decoder` whether to stop, telling it the bits read since it was
+    /// last asked.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn ask(&mut self, decoder: &mut impl Decoder) -> Result<()> {
+        let read = self.bit_offset + POLL_BITS - self.poll_at;
+        self.poll_at = self.bit_offset + POLL_BITS;
+
+        if decoder.stop(read) {
+            Err(DecodeError::Stopped)
+        } else {
+            Ok(())
+        }
     }
 
     #[inline(always)]

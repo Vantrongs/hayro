@@ -1,8 +1,10 @@
 use crate::bit_reader::BitReader;
 use crate::codes::Mode;
-use crate::{DecodeError, DecodeSettings, Decoder, Result, stop};
-use alloc::vec;
+use crate::{DecodeError, DecodeSettings, Decoder, Result};
 use alloc::vec::Vec;
+
+/// The most changes per line that room is made for before decoding.
+const MAX_RESERVED_CHANGES: usize = 1 << 8;
 
 /// A reusable context for decoding CCITT images.
 pub struct DecoderContext {
@@ -35,11 +37,15 @@ pub struct DecoderContext {
 impl DecoderContext {
     /// Creates a new decoder context using the provided decode settings.
     pub fn new(settings: DecodeSettings) -> Self {
+        // A line has at most as many changes as columns. Making room for them up to a
+        // bound spares small images growing both lists change by change.
+        let changes = (settings.columns as usize).min(MAX_RESERVED_CHANGES);
+
         Self {
-            ref_changes: vec![],
+            ref_changes: Vec::with_capacity(changes),
             ref_pos: 0,
             b1_idx: 0,
-            coding_changes: Vec::new(),
+            coding_changes: Vec::with_capacity(changes),
             pixels_decoded: 0,
             line_width: settings.columns,
             // Each run starts with an imaginary white pixel on the left.
@@ -170,7 +176,7 @@ pub(crate) fn decode_1d_line(
     decoder: &mut impl Decoder,
 ) -> Result<()> {
     while !ctx.at_eol() {
-        stop(decoder)?;
+        reader.poll(decoder)?;
         let run_length = reader.decode_run(ctx.color, decoder)?;
         ctx.push_pixels(run_length)?;
         ctx.color = ctx.color.opposite();
@@ -187,7 +193,7 @@ pub(crate) fn decode_2d_line(
     decoder: &mut impl Decoder,
 ) -> Result<()> {
     while !ctx.at_eol() {
-        stop(decoder)?;
+        reader.poll(decoder)?;
         let mode = reader.decode_mode()?;
 
         match mode {

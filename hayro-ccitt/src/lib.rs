@@ -67,8 +67,12 @@ pub fn decode(data: &[u8], decoder: &mut impl Decoder, ctx: &mut DecoderContext)
     }
 
     reader.align();
+    reader.ask(decoder)?;
     Ok(reader.byte_pos())
 }
+
+/// The bits read after which [`Decoder::stop`] is asked again.
+pub const POLL_BITS: usize = 1 << 12;
 
 /// A sink for the rows of a CCITT image.
 pub trait Decoder {
@@ -80,22 +84,17 @@ pub trait Decoder {
     /// black, those from `changes[2]` up to `changes[3]` again, and so on. If
     /// the number of changes is odd, the row ends black.
     fn push_row(&mut self, changes: &[u32]);
-    /// Whether to stop decoding, asked before each line and after each code or
-    /// bit of fill read, so that it is asked within a bounded amount of work
-    /// whatever the data; decoding then fails with [`DecodeError::Stopped`].
+    /// Whether to stop decoding, which then fails with [`DecodeError::Stopped`].
+    /// Asked between codes and within runs of fill bits each time [`POLL_BITS`]
+    /// more bits were read, and once more when decoding succeeds, with `bits`,
+    /// the number of bits read since the previous ask. Every code takes at least
+    /// one bit, so the work between two asks is bounded whatever the data, apart
+    /// from the rows pushed meanwhile. Bits read again after a damaged line are
+    /// told again; bits looked at ahead and then not consumed may not be told.
     /// Never by default.
-    fn stop(&mut self) -> bool {
+    fn stop(&mut self, bits: usize) -> bool {
+        let _ = bits;
         false
-    }
-}
-
-/// Fails with [`DecodeError::Stopped`] when `decoder` asks to stop.
-#[inline(always)]
-pub(crate) fn stop(decoder: &mut impl Decoder) -> Result<()> {
-    if decoder.stop() {
-        Err(DecodeError::Stopped)
-    } else {
-        Ok(())
     }
 }
 
