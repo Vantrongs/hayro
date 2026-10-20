@@ -322,3 +322,29 @@ fn a_declared_ccitt_size_is_not_allocated_before_rows_are_decoded() {
         }
     }
 }
+
+/// A CCITT stream that decodes a few rows of many declared holds at most eight
+/// times what it decoded: room is made ahead of the rows, but not for all of them.
+#[test]
+fn a_ccitt_stream_cut_short_holds_a_multiple_of_its_rows() {
+    // Eight white rows, a bit each against the white row above, then the end of data.
+    let data = [0xFF, 0x00, 0x10, 0x01];
+    let columns = 1 << 16;
+    for is_indexed in [false, true] {
+        let row = if is_indexed { columns / 8 } else { columns };
+        let pdf = stream_file(
+            &format!(
+                "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns {columns} /Rows 65535 >>"
+            ),
+            &data,
+        );
+        let stream = object_3(&pdf);
+        let params = ImageDecodeParams {
+            is_indexed,
+            ..Default::default()
+        };
+        let (decoded, held) = measure(|| stream.decoded_image(&params).unwrap().data.len());
+        assert_eq!(decoded, 8 * row);
+        assert!(held.peak <= 8 * 9 * row, "{held:?}");
+    }
+}

@@ -22,9 +22,21 @@ fn push_counted(output: &mut Vec<u8>, byte: u8, count: usize, meter: &Meter<'_>)
 
 /// Grows `output` with white rows up to `end`, the end of the row about to be
 /// written, counted on `meter`; `false`, with the row left out, once its hook asks
-/// to stop. The output grows with the rows decoded: a stream cut short costs what
-/// it holds, not what `Rows` declares.
-fn grow(output: &mut Vec<u8>, end: usize, white: u8, meter: &Meter<'_>) -> bool {
+/// to stop. The output grows with the rows decoded: room is made for the rest of the
+/// `declared` bytes, but at most for seven times what is held with the new row, so a
+/// stream cut short costs at most eight times what it decoded, not what `Rows`
+/// declares, and a long one is reallocated a few times rather than at every doubling.
+fn grow(output: &mut Vec<u8>, end: usize, declared: usize, white: u8, meter: &Meter<'_>) -> bool {
+    if end > output.capacity() {
+        let (held, row) = (output.len(), end - output.len());
+        let rest = declared.saturating_sub(held);
+        let room = if rest >= row {
+            rest.min(held.max(row).saturating_mul(7))
+        } else {
+            held.max(row)
+        };
+        output.reserve_exact(room);
+    }
     push_counted(output, white, end.saturating_sub(output.len()), meter);
     output.len() >= end
 }
@@ -76,6 +88,8 @@ pub(crate) fn decode(
     let (decoded, bpc, decoded_rows) = if image_params.is_indexed {
         struct BitPackDecoder<'m> {
             output: Vec<u8>,
+            /// The bytes `Rows` rows take.
+            declared: usize,
             columns: u32,
             stride: usize,
             white: u8,
@@ -90,7 +104,7 @@ pub(crate) fn decode(
                 let start = self.decoded_rows as usize * self.stride;
                 let end = start + self.stride;
 
-                if !grow(&mut self.output, end, self.white, self.meter) {
+                if !grow(&mut self.output, end, self.declared, self.white, self.meter) {
                     return;
                 }
 
@@ -129,9 +143,9 @@ pub(crate) fn decode(
         }
 
         let stride = (columns as usize).div_ceil(8);
-        stride.checked_mul(rows as usize)?;
         let mut decoder = BitPackDecoder {
             output: Vec::new(),
+            declared: stride.checked_mul(rows as usize)?,
             columns,
             stride,
             white,
@@ -156,6 +170,8 @@ pub(crate) fn decode(
     } else {
         struct Luma8Decoder<'m> {
             output: Vec<u8>,
+            /// The bytes `Rows` rows take.
+            declared: usize,
             columns: u32,
             white: u8,
             decoded_rows: u32,
@@ -167,7 +183,7 @@ pub(crate) fn decode(
                 let start = self.decoded_rows as usize * self.columns as usize;
                 let end = start + self.columns as usize;
 
-                if !grow(&mut self.output, end, self.white, self.meter) {
+                if !grow(&mut self.output, end, self.declared, self.white, self.meter) {
                     return;
                 }
 
@@ -189,6 +205,7 @@ pub(crate) fn decode(
 
         let mut decoder = Luma8Decoder {
             output: Vec::new(),
+            declared: output_len,
             columns,
             white,
             decoded_rows: 0,
