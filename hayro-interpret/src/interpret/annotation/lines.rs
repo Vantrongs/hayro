@@ -636,7 +636,8 @@ impl Layout {
     fn failed_caption(&self, annot: &Entries<'_>, bytes: usize, paint: &Paint) -> Part {
         let mut points = self.caption(annot, bytes).to_vec();
         let place = self.caption_place(annot);
-        if place.inline && paint.stroke.is_some() && self.len > 0.0 {
+        let breaks = place.inline && paint.stroke.is_some() && self.len > 0.0;
+        if breaks {
             let half = bytes as f64 * f64::from(CAPTION_SIZE) + 3.0;
             let to = if paint.dash.is_empty() {
                 place.mid + half
@@ -646,7 +647,16 @@ impl Layout {
             let at = |t: f64| self.frame() * Point::new(t.clamp(0.0, self.len), 0.0);
             points.extend([at(place.mid - half), at(to)]);
         }
-        Part::near(points, stroke_reach(paint.width))
+        // The box holds the caption's ink; the line's strokes reach beyond their
+        // points.
+        Part::near(
+            points,
+            if breaks {
+                stroke_reach(paint.width)
+            } else {
+                0.0
+            },
+        )
     }
 
     /// Of `Line` `annot`, the points of what it strokes and of its caption with
