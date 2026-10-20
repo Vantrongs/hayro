@@ -283,7 +283,7 @@ impl Rounding {
 
     /// The larger of two, coordinate by coordinate: for points each computed as
     /// one of them says.
-    fn either(self, other: Self) -> Self {
+    pub(super) fn either(self, other: Self) -> Self {
         let max = |a: Vec2, b: Vec2| Vec2::new(a.x.max(b.x), a.y.max(b.y));
         Self {
             count: max(self.count, other.count),
@@ -590,19 +590,33 @@ impl Region {
         let axes = match &self.shown {
             Some(shown) if !shown.is_empty() => Self::axes(shown)
                 .chain([Vec2::new(a, b).turn_90(), Vec2::new(c, d).turn_90()])
-                .map(|n| Axis {
+                .enumerate()
+                .map(|(i, n)| Axis {
                     n,
                     along: [n.x * a + n.y * b, n.x * c + n.y * d, n.x * e + n.y * f],
                     shown: self.extent(shown, n),
                     place: AXES.contains(&n),
+                    side: i < shown.len(),
                 })
                 .collect(),
             _ => vec![],
         };
+        // The most over the least the transform stretches a length (its singular
+        // values), a little more for rounding: a box grown by `reach` times this
+        // holds, on the page, a disc `reach` times the norm wide around the box.
+        let norm = a * a + b * b + c * c + d * d;
+        let det = (a * d - b * c).abs();
+        let most = ((norm + (norm * norm - 4.0 * det * det).max(0.0).sqrt()) / 2.0).sqrt();
+        let stretch = norm.sqrt() * most / det * (1.0 + 2_f64.powi(-20));
         Painting {
             region: self,
             local,
             axes,
+            stretch: if stretch.is_nan() {
+                f64::INFINITY
+            } else {
+                stretch
+            },
         }
     }
 
@@ -775,13 +789,16 @@ impl Region {
 /// A direction along which what shows grown and a box on the page may lie apart
 /// ([`Painting`]): its normal `n`; what a point `(x, y)` of the current space
 /// comes to along it on the page, `along[0] x + along[1] y + along[2]`; what shows
-/// grown along it; and whether it is an axis of the page, along which a place no
-/// finite number holds is one that cannot be told.
+/// grown along it; whether it is an axis of the page, along which a place no
+/// finite number holds is one that cannot be told; and whether it is the normal of
+/// a side of what shows.
 struct Axis {
     n: Vec2,
     along: [f64; 3],
     shown: (f64, f64),
     place: bool,
+    /// Whether it is the normal of a side of what shows.
+    side: bool,
 }
 
 /// The test of whether a subpath may paint where the page shows it
@@ -796,9 +813,11 @@ struct Axis {
 /// from its sides: the least and most of `k x` for `x` between the box's sides is
 /// `k` times one side or the other by the sign of `k`, alone.
 ///
-/// Whether it may paint does not fall as the reach grows, to the bit, so that the
-/// least reach at which it does tells it for every reach ([`Painting::least`]):
-/// - the sides move out, each a rounded sum of a side and the reach;
+/// Whether it may paint does not fall as the reach or the box grows, to the bit,
+/// so that a box that holds the boxes of many subpaths, grown by the most reach
+/// of any, that may not paint holds none that may ([`super::index::Index`]):
+/// - the sides move out, each a rounded sum of a side and the reach, or a side
+///   further out and the same reach;
 /// - the most along a direction is a rounded sum of terms each a rounded product
 ///   of a fixed number and a side it does not fall with, and the least likewise
 ///   does not rise; rounding to nearest keeps the order of what it rounds;
@@ -814,6 +833,9 @@ pub(super) struct Painting<'r> {
     region: &'r Region,
     local: Rounding,
     axes: Vec<Axis>,
+    /// How much wider a box is grown in the current space than the disc
+    /// [`Region::may_show`] grows a hull by on the page ([`Painting::may_meet`]).
+    stretch: f64,
 }
 
 impl Painting<'_> {
@@ -849,15 +871,6 @@ impl Painting<'_> {
         }
         // The least and most of the box along an axis.
         let extent = |axis: &Axis| {
-            let side = |k: f64, lo: f64, hi: f64| {
-                if k == 0.0 {
-                    (0.0, 0.0)
-                } else if k > 0.0 {
-                    (k * lo, k * hi)
-                } else {
-                    (k * hi, k * lo)
-                }
-            };
             let [kx, ky, k] = axis.along;
             let ((a0, a1), (b0, b1)) = (side(kx, x0, x1), side(ky, y0, y1));
             (a0 + b0 + k, a1 + b1 + k)
@@ -883,6 +896,7 @@ impl Painting<'_> {
     /// it paints at every reach from there on and at none below. Found by halving
     /// the bit patterns of the reaches from 0 to infinity, which run in their order;
     /// `None` where it paints at none.
+    #[cfg(test)]
     pub(super) fn least(&self, extent: &Extent) -> Option<f64> {
         let paints = |bits: u64| self.paints(extent, f64::from_bits(bits)).is_some();
         let (mut lo, mut hi) = (0.0_f64.to_bits(), f64::INFINITY.to_bits());
@@ -901,6 +915,64 @@ impl Painting<'_> {
             }
         }
         Some(f64::from_bits(hi))
+    }
+
+    /// Whether a piece within `reach` of the convex hull of points whose box is
+    /// `extent`, each computed as `local` says, may meet what shows grown as
+    /// [`Region::may_show`] tells it: true wherever that tells it may, and
+    /// possibly where it does not. For finding, among many such pieces, those
+    /// that test to tell: it does not fall as the box, the reach or the rounding
+    /// grows, so that where it is false for a box that holds the boxes of many,
+    /// grown by the most reach and rounding of any, it is false for each.
+    ///
+    /// The box, grown in the current space by `reach` times how much more the
+    /// transform stretches a length than it stretches the least, holds on the page
+    /// the hull of the points grown by the disc `may_show` grows it by; how far a
+    /// viewer may put it is taken at the box's corners, which are no nearer than
+    /// any point; and both are tested along the sides of what shows, every one of
+    /// which `may_show` tests too, with what computing either in 64-bit numbers
+    /// may move it by, 2^-40 of every magnitude summed, besides. So where it is
+    /// false, `may_show` finds the two apart along the same side.
+    pub(super) fn may_meet(&self, extent: &Extent, reach: f64, local: Rounding) -> bool {
+        let region = self.region;
+        if region.shown.is_none() || extent.lost {
+            return true;
+        }
+        let Extent { lo, hi, .. } = *extent;
+        // Of no point; and what shows is empty where there is no axis.
+        if lo.x.partial_cmp(&hi.x).is_none_or(|o| o.is_gt()) || self.axes.is_empty() {
+            return false;
+        }
+        let grow = reach * self.stretch;
+        let (x0, x1, y0, y1) = (lo.x - grow, hi.x + grow, lo.y - grow, hi.y + grow);
+        let (x, y) = (lo.x.abs().max(hi.x.abs()), lo.y.abs().max(hi.y.abs()));
+        let sum = |m: &Affine| {
+            let [a, b, c, d, e, f] = m.as_coeffs();
+            Vec2::new(times(a, x) + times(c, y) + e, times(b, x) + times(d, y) + f)
+        };
+        let most = sum(&region.abs);
+        let r = region.offset(&region.abs, most, sum(&region.chain), local);
+        let computed = (most.x + most.y + region.page() + grow) * 2_f64.powi(-40);
+        let r = Vec2::new(r.x + computed, r.y + computed);
+        !self.axes.iter().filter(|a| a.side).any(|axis| {
+            let [kx, ky, k] = axis.along;
+            let ((a0, a1), (b0, b1)) = (side(kx, x0, x1), side(ky, y0, y1));
+            let (p0, p1) = (a0 + b0 + k, a1 + b1 + k);
+            let (g0, g1) = axis.shown;
+            let r = times(axis.n.x.abs(), r.x) + times(axis.n.y.abs(), r.y);
+            p1 + r < g0 || p0 - r > g1
+        })
+    }
+}
+
+/// The least and most of `k x` for `x` from `lo` to `hi`.
+fn side(k: f64, lo: f64, hi: f64) -> (f64, f64) {
+    if k == 0.0 {
+        (0.0, 0.0)
+    } else if k > 0.0 {
+        (k * lo, k * hi)
+    } else {
+        (k * hi, k * lo)
     }
 }
 
@@ -1082,6 +1154,38 @@ impl Extent {
             extent.add(Point::new(as_written(p.x), as_written(p.y)));
         }
         extent
+    }
+
+    /// Of the points `points`, as they are: for a test that must hold the hull of
+    /// those very points ([`Painting::may_meet`]).
+    pub(super) fn of(points: impl IntoIterator<Item = Point>) -> Self {
+        let mut extent = Self::NONE;
+        for p in points {
+            extent.add(p);
+        }
+        extent
+    }
+
+    /// Whether it is a box: of some point, every one finite.
+    pub(super) fn is_box(&self) -> bool {
+        !self.lost && self.lo.x <= self.hi.x
+    }
+
+    /// The box that holds both boxes.
+    pub(super) fn union(self, other: Self) -> Self {
+        Self {
+            lo: Point::new(self.lo.x.min(other.lo.x), self.lo.y.min(other.lo.y)),
+            hi: Point::new(self.hi.x.max(other.hi.x), self.hi.y.max(other.hi.y)),
+            lost: self.lost || other.lost,
+        }
+    }
+
+    /// The middle of the box, across and up.
+    pub(super) fn middle(&self) -> Point {
+        Point::new(
+            self.lo.x / 2.0 + self.hi.x / 2.0,
+            self.lo.y / 2.0 + self.hi.y / 2.0,
+        )
     }
 
     /// With `p`, as written.
@@ -1904,43 +2008,73 @@ mod tests {
     /// least the least one found ([`super::Painting::least`]): at that reach and
     /// not at the reach just below it, and at reaches of every size, from 0 and
     /// the least numbers through to infinity, on either side of it.
+    /// Content on a generated view, of a generated unit, under up to three
+    /// generated transforms (turns, shears, flips, scales from 10^-4 to 10^4,
+    /// some of no area) and, sometimes, a clip.
+    fn generated_out(r: &mut u64, case: usize) -> Out {
+        let (x, y) = (next(r) * 400.0 - 100.0, next(r) * 400.0 - 100.0);
+        let view = Rect::new(x, y, x + next(r) * 300.0, y + next(r) * 300.0);
+        let unit = [1.0, 0.5, 2.0, 1e-3][case % 4];
+        let mut out = Out::new(view, unit);
+        for _ in 0..(next(r) * 3.0) as usize {
+            let scale = 10_f64.powf(next(r) * 8.0 - 4.0);
+            let (t, shear) = (next(r) * 6.4, next(r) - 0.5);
+            let flip = if next(r) < 0.3 { -1.0 } else { 1.0 };
+            let mut m = [
+                scale * t.cos(),
+                scale * t.sin(),
+                scale * (shear - t.sin()) * flip,
+                scale * t.cos() * flip,
+                next(r) * 400.0 - 200.0,
+                next(r) * 400.0 - 200.0,
+            ];
+            if next(r) < 0.1 {
+                // Of no area: one column a multiple of the other.
+                (m[2], m[3]) = (m[0] * 2.0, m[1] * 2.0);
+            }
+            out.nums(&m, "cm");
+        }
+        if next(r) < 0.4 {
+            let (cx, cy) = (next(r) * 300.0 - 50.0, next(r) * 300.0 - 50.0);
+            out.clip(Rect::new(
+                cx,
+                cy,
+                cx + next(r) * 200.0,
+                cy + next(r) * 200.0,
+            ));
+        }
+        out
+    }
+
+    /// Up to four generated points, near what a generated view shows or as far
+    /// as 10^38 off, some the same, some between others.
+    fn generated_points(r: &mut u64) -> Vec<Point> {
+        let far = 10_f64.powf(next(r) * 40.0 - 2.0);
+        let at = |r: &mut u64| {
+            let near = next(r) < 0.5;
+            let k = if near { 300.0 } else { far };
+            Point::new(next(r) * k - k / 2.0, next(r) * k - k / 2.0)
+        };
+        let n = 1 + (next(r) * 4.0) as usize;
+        let first = at(r);
+        (0..n)
+            .map(|i| {
+                if i == 0 || next(r) < 0.2 {
+                    first
+                } else {
+                    first + (at(r) - first) * next(r)
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn whether_a_subpath_paints_does_not_fall_as_its_reach_grows() {
         let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
         let (mut painted, mut never, mut at_zero) = (0, 0, 0);
         for case in 0..4_000 {
             let r = &mut seed;
-            let (x, y) = (next(r) * 400.0 - 100.0, next(r) * 400.0 - 100.0);
-            let view = Rect::new(x, y, x + next(r) * 300.0, y + next(r) * 300.0);
-            let unit = [1.0, 0.5, 2.0, 1e-3][case % 4];
-            let mut out = Out::new(view, unit);
-            for _ in 0..(next(r) * 3.0) as usize {
-                let scale = 10_f64.powf(next(r) * 8.0 - 4.0);
-                let (t, shear) = (next(r) * 6.4, next(r) - 0.5);
-                let flip = if next(r) < 0.3 { -1.0 } else { 1.0 };
-                let mut m = [
-                    scale * t.cos(),
-                    scale * t.sin(),
-                    scale * (shear - t.sin()) * flip,
-                    scale * t.cos() * flip,
-                    next(r) * 400.0 - 200.0,
-                    next(r) * 400.0 - 200.0,
-                ];
-                if next(r) < 0.1 {
-                    // Of no area: one column a multiple of the other.
-                    (m[2], m[3]) = (m[0] * 2.0, m[1] * 2.0);
-                }
-                out.nums(&m, "cm");
-            }
-            if next(r) < 0.4 {
-                let (cx, cy) = (next(r) * 300.0 - 50.0, next(r) * 300.0 - 50.0);
-                out.clip(Rect::new(
-                    cx,
-                    cy,
-                    cx + next(r) * 200.0,
-                    cy + next(r) * 200.0,
-                ));
-            }
+            let out = generated_out(r, case);
             let region = out.region();
             let local = if next(r) < 0.5 {
                 Rounding::NONE
@@ -1949,24 +2083,7 @@ mod tests {
             };
             let painting = region.painting(local);
             for _ in 0..8 {
-                let far = 10_f64.powf(next(r) * 40.0 - 2.0);
-                let at = |r: &mut u64| {
-                    let near = next(r) < 0.5;
-                    let k = if near { 300.0 } else { far };
-                    Point::new(next(r) * k - k / 2.0, next(r) * k - k / 2.0)
-                };
-                let n = 1 + (next(r) * 3.0) as usize;
-                let first = at(r);
-                let points: Vec<Point> = (0..n)
-                    .map(|i| {
-                        if i == 0 || next(r) < 0.2 {
-                            first
-                        } else {
-                            first + (at(r) - first) * next(r)
-                        }
-                    })
-                    .collect();
-                let extent = Extent::written(points);
+                let extent = Extent::written(generated_points(r));
                 let paints = |reach: f64| painting.paints(&extent, reach).is_some();
                 let least = painting.least(&extent);
                 // Reaches of every size, and of every bit pattern near the least.
@@ -2003,6 +2120,75 @@ mod tests {
         assert!(
             painted > 4_000 && never > 500 && at_zero > 4_000,
             "{painted} found, {never} never, {at_zero} at 0"
+        );
+    }
+
+    /// What a tree of the parts of shared geometry rests on ([`super::super::index`]):
+    /// whether a box may paint does not fall as the box grows, nor as its reach
+    /// does, and whether it may meet what shows ([`super::Painting::may_meet`])
+    /// does not fall as the box, its reach or its rounding grows; and it holds
+    /// wherever [`super::Region::may_show`] tells the points in the box may show.
+    /// On generated regions (turned, sheared, scaled, of no area, clipped) and
+    /// generated points near and far, boxes holding them grown by generated
+    /// amounts, reaches of all sizes, and roundings.
+    #[test]
+    fn a_box_that_holds_another_may_paint_where_it_may() {
+        let mut seed = 0x1f83_d9ab_fb41_bd6b_u64;
+        let (mut shows, mut met, mut paints) = (0, 0, 0);
+        let rounding = |r: &mut u64| {
+            if next(r) < 0.3 {
+                Rounding::NONE
+            } else {
+                Rounding::of(next(r) * 40.0, 10_f64.powf(next(r) * 12.0 - 2.0))
+            }
+        };
+        let reach = |r: &mut u64| match (next(r) * 6.0) as usize {
+            0 => 0.0,
+            1 => f64::INFINITY,
+            _ => 10_f64.powf(next(r) * 20.0 - 6.0),
+        };
+        for case in 0..4_000 {
+            let r = &mut seed;
+            let out = generated_out(r, case);
+            let region = out.region();
+            let painting = region.painting(Rounding::NONE);
+            for _ in 0..8 {
+                let points = generated_points(r);
+                let (rc, lc) = (reach(r), rounding(r));
+                // The points' box, as they are and as written, and one holding it.
+                let (exact, written) =
+                    (Extent::of(points.clone()), Extent::written(points.clone()));
+                let mut more = generated_points(r);
+                more.truncate(1 + (next(r) * 2.0) as usize);
+                let holding = exact.union(written).union(Extent::of(more));
+                let (rp, lp) = (rc + reach(r) * next(r), lc.either(rounding(r)));
+                if region.may_show(&points, rc, lc).is_some() {
+                    shows += 1;
+                    assert!(
+                        painting.may_meet(&exact, rc, lc),
+                        "{points:?} within {rc:e} of {lc:?} shows in {region:?}"
+                    );
+                }
+                if painting.may_meet(&exact, rc, lc) {
+                    met += 1;
+                    assert!(
+                        painting.may_meet(&holding, rp, lp),
+                        "{exact:?} {rc:e} {lc:?} meets, {holding:?} {rp:e} {lp:?} not, in {region:?}"
+                    );
+                }
+                if painting.paints(&written, rc).is_some() {
+                    paints += 1;
+                    assert!(
+                        painting.paints(&holding, rp).is_some(),
+                        "{written:?} {rc:e} paints, {holding:?} {rp:e} not, in {region:?}"
+                    );
+                }
+            }
+        }
+        // Each is met often.
+        assert!(
+            shows > 4_000 && met > 4_000 && paints > 4_000,
+            "{shows} show, {met} meet, {paints} paint"
         );
     }
 }

@@ -26,6 +26,7 @@
 pub(crate) mod entries;
 mod freetext;
 mod icons;
+mod index;
 mod lines;
 mod markup;
 mod out;

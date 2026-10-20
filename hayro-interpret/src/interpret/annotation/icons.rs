@@ -11,7 +11,8 @@
 //! The symbols are drawn here, each in a 10 pt square.
 
 use super::entries::Entries;
-use super::markup::{Pieces, Quad, painting, quads, shown};
+use super::index::{Bound, Index};
+use super::markup::{Pieces, Quad, painting, quads};
 use super::out::{Color, Extent, Out, Part, Refused, Rounding, corners};
 use super::text::{self, Align, Family, Fonts, Setting, Shaped, Typeface};
 use super::{Appearances, Drew, Unsupported, c_color, color_of, rect};
@@ -350,7 +351,7 @@ pub(super) fn caret_box(annot: &Entries<'_>) -> Option<kurbo::Rect> {
 pub(super) fn redact(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     let clip = redact_clip(annot)?;
     // Without quadrilaterals, as with an empty `/QuadPoints`, the box.
-    let Some((items, quads)) = quads(annot).filter(|(_, q)| !q.all.is_empty()) else {
+    let Some((_, quads)) = quads(annot).filter(|(_, q)| !q.all.is_empty()) else {
         // Clipped to the box, as viewers clip it, so that a box under two points
         // wide shows only the part of the outline within it.
         let inner = clip.inset(-1.0);
@@ -367,14 +368,13 @@ pub(super) fn redact(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     out.clip(clip)?;
     out.op("1 0 0 RG");
     out.stroke_state(1.0, None)?;
-    let (region, reach) = (out.region(), out.reach(true));
-    // Each 1 pt wide.
-    let shown = shown(&items, Pieces::Redact, &region, || {
-        painting(&quads.all, &region, |&Quad([tl, tr, bl, br])| {
-            (Extent::written([bl, br, tr, tl]), reach)
-        })
+    // Each as far as the 1 pt stroke reaches.
+    let index = quads.index(Pieces::Redact, |quads| {
+        let outline = |&Quad([tl, tr, bl, br]): &Quad| Extent::written([bl, br, tr, tl]);
+        Index::new(quads.iter().map(|q| Some(Bound::of(outline(q), 0.0))))
     });
-    for &Quad([tl, tr, bl, br]) in shown.0.iter().map(|&i| &quads.all[i]) {
+    let shown = painting(index, &out.region(), out.reach(true));
+    for &Quad([tl, tr, bl, br]) in shown.iter().map(|&i| &quads.all[i]) {
         out.nums(&[bl.x, bl.y], "m")?;
         for p in [br, tr, tl] {
             out.nums(&[p.x, p.y], "l")?;

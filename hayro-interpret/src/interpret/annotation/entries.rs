@@ -243,14 +243,7 @@ struct Read<'a> {
     /// What is made of arrays ([`Items::derived`]), by the array and what is made,
     /// with whether making it read a number not established ([`noting`]).
     derived: RefCell<hash::Map<(ContentKey<'a>, TypeId), Made>>,
-    /// What is told of the parts of what is made of arrays by numbers besides them
-    /// ([`Items::seen`]), by the array, what is told and those numbers.
-    seen: RefCell<hash::Map<SeenKey<'a>, Rc<dyn Any>>>,
 }
-
-/// What [`Items::seen`] keeps a value by: the array, the value's type, and the
-/// numbers besides the array it is made of.
-type SeenKey<'a> = (ContentKey<'a>, TypeId, Vec<u64>);
 
 /// A value made of an array's entries ([`Derived`]), what making it lost, and whether
 /// it read a number that cannot be read as `MuPDF` reads it.
@@ -383,7 +376,6 @@ impl<'a> Objects<'a> {
                 prefixes: RefCell::default(),
                 places: RefCell::default(),
                 derived: RefCell::default(),
-                seen: RefCell::default(),
             })),
             shared: false,
         }
@@ -782,24 +774,29 @@ impl<'a> Items<'a> {
         made.downcast::<T>().expect("made as T")
     }
 
-    /// `T`, made by `make` of what is made of these entries ([`Self::derived`]) and of
-    /// the numbers whose bits are `by` alone, reading nothing, once for the document
-    /// for each `by`: so that annotations sharing an array, which tell its parts
-    /// alike, such as those that may paint where a page shows them, tell them once
-    /// and each look the answer up.
-    pub(crate) fn seen<T: 'static>(&self, by: Vec<u64>, make: impl FnOnce() -> T) -> Rc<T> {
+    /// `T` made of each entry that is an array, in order: once for the document
+    /// for an array the entry refers to, which other arrays may refer to as well
+    /// ([`Self::derived`]), and for one written in this array, as part of what is
+    /// made of this one. So arrays of their own that share an array they refer
+    /// to, such as `/InkList` arrays sharing a path, walk it once between them.
+    pub(crate) fn each<T: Derived>(&self) -> Vec<Rc<T>> {
         let Some(read) = &self.1.read else {
-            return Rc::new(make());
+            let arrays = self.iter().filter_map(Value::items);
+            return arrays.map(|items| Rc::new(T::derive(&items))).collect();
         };
-        let key = (self.0.content_key(), TypeId::of::<T>(), by);
-        let known = read.seen.borrow().get(&key).cloned();
-        let made = known.unwrap_or_else(|| {
-            let made = Rc::new(make()) as Rc<dyn Any>;
-            read.seen.borrow_mut().insert(key, made.clone());
-            made
-        });
-        // Kept under the type it was made as.
-        made.downcast::<T>().expect("made as T")
+        self.0
+            .raw_iter()
+            .filter_map(|e| {
+                let referred = matches!(e, MaybeRef::Ref(_));
+                let (found, objects) = self.1.found(read, Some(e));
+                let items = Value::of(found, &objects).items()?;
+                Some(if referred {
+                    items.derived::<T>()
+                } else {
+                    Rc::new(T::derive(&items))
+                })
+            })
+            .collect()
     }
 
     /// The first `n` entries, or all when there are fewer; those after them are not

@@ -37,6 +37,11 @@ fn allocated() -> usize {
     ALLOCATED.with(Cell::get)
 }
 
+/// The bytes this thread holds now: allocated by it and not yet freed.
+fn held() -> isize {
+    HELD.with(Cell::get)
+}
+
 // SAFETY: forwards to the system allocator, refusing some requests with null as
 // `GlobalAlloc::alloc` allows.
 unsafe impl GlobalAlloc for Limited {
@@ -1440,6 +1445,8 @@ struct Listed {
     examined: usize,
     secs: f64,
     drew: Drew,
+    /// The bytes held for the document once the annotations are looked at.
+    kept: isize,
 }
 
 /// The bytes the readers of this thread have looked at so far
@@ -1450,11 +1457,12 @@ fn examined() -> usize {
 
 /// The cost of `f`, given the appearances of `pdf`'s annotations, made inside.
 fn listed<'a>(pdf: &'a Pdf, f: impl FnOnce(&Appearances<'a>) -> Drew) -> Listed {
-    let (bytes, work, looked, start) = (
+    let (bytes, work, looked, start, kept) = (
         allocated(),
         work_done(),
         examined(),
         std::time::Instant::now(),
+        held(),
     );
     let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
     let drew = f(&appearances);
@@ -1464,6 +1472,7 @@ fn listed<'a>(pdf: &'a Pdf, f: impl FnOnce(&Appearances<'a>) -> Drew) -> Listed 
         examined: examined() - looked,
         secs: start.elapsed().as_secs_f64(),
         drew,
+        kept: held() - kept,
     }
 }
 
@@ -2087,11 +2096,20 @@ fn a_shared_payload_costs_each_annotation_the_same_however_long() {
     }
 }
 
+/// The most more units of work `n` annotations each finding parts once in a tree
+/// of `long` parts take than in one of `short` ([`hayro_interpret::annotation`]'s
+/// index): a tree twice as large is one level deeper, where a search looks at
+/// two more nodes on the way down to each part found.
+fn deeper(n: usize, short: usize, long: usize) -> u64 {
+    let levels = (long as f64 / short as f64).log2().ceil() as u64;
+    (n as u64) * 2 * levels
+}
+
 /// Annotations that share geometry of which a part may paint on the page and the
 /// rest may not each write the part that may, and walk none of the rest: each
-/// annotation added costs the same, in bytes, work and bytes looked at, whether
-/// the part off the page is short or long, and draws what it draws with that part
-/// one piece long. Cases: an `/InkList` of a short path on the page and a long one
+/// annotation added costs the same, in bytes and bytes looked at, and in work but
+/// for the search through a deeper tree, whether the part off the page is short or
+/// long, and draws what it draws with that part one piece long. Cases: an `/InkList` of a short path on the page and a long one
 /// off it; `/QuadPoints` of a quad on the page between many off it, of each text
 /// markup subtype and of a redaction.
 #[test]
@@ -2137,11 +2155,12 @@ fn shared_geometry_costs_each_annotation_what_it_draws() {
             );
         }
         // At most what drawing a zigzag costs, the same but for the allocator
-        // rounding what it grows the same tables to.
+        // rounding what it grows the same tables to, and for the search through
+        // a deeper tree.
         assert!(
             long.0 < N * (32 << 10)
                 && long.0 <= short.0 + N * 64
-                && long.1 == short.1
+                && long.1 <= short.1 + deeper(N, 2 * many[0], 2 * many[1])
                 && long.2 == short.2,
             "{annot}: {short:?} added at {}, {long:?} at {}",
             many[0],
@@ -2159,9 +2178,9 @@ fn shared_geometry_costs_each_annotation_what_it_draws() {
 
 /// Ink annotations of widths each its own sharing an `/InkList` of many short paths
 /// off the page and one on it find the paths their stroke reaches by a search:
-/// each annotation added costs the same, in bytes, work and bytes looked at,
-/// whether the list holds a thousand paths or forty thousand, and draws the path
-/// on the page alone.
+/// each annotation added costs the same in bytes, and in work but for the search
+/// through a deeper tree, whether the list holds a thousand paths or forty
+/// thousand, and draws the path on the page alone.
 #[test]
 fn ink_of_widths_each_its_own_finds_the_paths_it_reaches() {
     const N: usize = 40;
@@ -2182,7 +2201,9 @@ fn ink_of_widths_each_its_own_finds_the_paths_it_reaches() {
         println!("CASE ink of own widths: +{N}: {short:?} at 1000, {long:?} at 40000");
     }
     assert!(
-        long.0 < N * (32 << 10) && long.0 <= short.0 + N * 64 && long.1 == short.1,
+        long.0 < N * (32 << 10)
+            && long.0 <= short.0 + N * 64
+            && long.1 <= short.1 + deeper(N, 1_000, 40_000),
         "{short:?} added at 1,000, {long:?} at 40,000"
     );
     let content = generated(&annot(7).replace("4 0 R", &ink(1_000)));
@@ -2192,10 +2213,10 @@ fn ink_of_widths_each_its_own_finds_the_paths_it_reaches() {
 /// Ink annotations sharing an `/InkList` of one path on the page and many just
 /// beyond the reach of their stroke, nearer than a search to within a fraction of
 /// the reach tells apart, each take the paths their stroke reaches by one search
-/// and test none of the rest: each annotation added costs the same in bytes, work
-/// and bytes looked at, whether the list holds a thousand such paths or forty
-/// thousand, of one width or of widths each its own a hair apart, and draws the
-/// path on the page alone. The paths lie above the page, whose edge a 1 pt stroke
+/// and test none of the rest: each annotation added costs the same in bytes, and
+/// in work but for the search through a deeper tree, whether the list holds a
+/// thousand such paths or forty thousand, of one width or of widths each its own
+/// a hair apart, and draws the path on the page alone. The paths lie above the page, whose edge a 1 pt stroke
 /// reaches to within 5 pt, and to its right, with a point at the edge of what a
 /// 32-bit number can tell.
 #[test]
@@ -2232,7 +2253,9 @@ fn ink_paths_just_beyond_the_reach_cost_each_annotation_nothing() {
                 );
             }
             assert!(
-                long.0 < N * (32 << 10) && long.0 <= short.0 + N * 64 && long.1 == short.1,
+                long.0 < N * (32 << 10)
+                    && long.0 <= short.0 + N * 64
+                    && long.1 <= short.1 + deeper(N, 1_000, 40_000),
                 "{path} {}: {short:?} added at 1,000, {long:?} at 40,000",
                 width(1)
             );
@@ -2302,11 +2325,12 @@ fn a_shared_dash_costs_nothing_where_nothing_paints() {
     }
 }
 
-/// What is kept of the parts of shared geometry that may paint is told for the
-/// view, the width and the kind of part it was found for: annotations sharing an
-/// `/InkList`, of widths that reach the part off the page or not, and annotations
-/// of each text markup subtype and a redaction sharing `/QuadPoints`, viewed one
-/// view after another by one [`Appearances`], each look as when viewed alone.
+/// The parts of shared geometry that may paint, found in one tree of each kind of
+/// part for every view and width, are those of the view, the width and the kind:
+/// annotations sharing an `/InkList`, of widths that reach the part off the page
+/// or not, and annotations of each text markup subtype and a redaction sharing
+/// `/QuadPoints`, viewed one view after another by one [`Appearances`], each look
+/// as when viewed alone.
 #[test]
 fn the_parts_that_may_paint_are_told_for_each_view_width_and_kind() {
     let ink = "[[20 20 80 80] [1000 1000 1010 1000]]";
@@ -2378,6 +2402,147 @@ fn the_parts_that_may_paint_are_told_for_each_view_width_and_kind() {
         drew += alone.len();
     }
     assert!(drew > 2 * annots.len(), "{drew} looks");
+}
+
+/// Ink annotations each with an `/InkList` of its own that refers to one long
+/// path they share, off the page, walk the path once between them: each
+/// annotation added costs the same, in bytes allocated and held, work and bytes
+/// looked at, whether the path holds a thousand points or forty thousand, both
+/// where the list holds that path alone and nothing is drawn, and where it holds
+/// a short path on the page too, which is drawn alone.
+#[test]
+fn ink_lists_of_their_own_sharing_a_path_walk_it_once() {
+    const N: usize = 40;
+    let path = |n: usize| format!("[{}]", "1000 1000 ".repeat(n));
+    for (list, drawn) in [("[4 0 R]", 0), ("[4 0 R 5 0 R]", 1)] {
+        let annot =
+            format!("/Subtype /Ink /C [1 0 0] /BS << /W 1 >> /InkList {list} /Rect [0 0 200 200]");
+        let added = |n: usize| {
+            let shared = [path(n), String::from("[20 20 80 80]")];
+            let (one, two) = (
+                sharing_cost(N, &shared, &annot),
+                sharing_cost(2 * N, &shared, &annot),
+            );
+            assert_eq!(one.drew.generated, N * drawn, "{list}");
+            assert_eq!(two.drew.generated, 2 * N * drawn, "{list}");
+            (
+                two.bytes.saturating_sub(one.bytes),
+                two.work.saturating_sub(one.work),
+                two.examined.saturating_sub(one.examined),
+                two.kept - one.kept,
+            )
+        };
+        let (short, long) = (added(1_000), added(40_000));
+        if std::env::var_os("COST_REPORT").is_some() {
+            println!(
+                "CASE ink lists of their own {list}: +{N}: {short:?} at 1000, {long:?} at 40000"
+            );
+        }
+        assert!(
+            long.0 < N * (32 << 10)
+                && long.0 <= short.0 + N * 64
+                && long.1 == short.1
+                && long.2 == short.2
+                && long.3 <= short.3 + (N * 64) as isize,
+            "{list}: {short:?} added at 1,000, {long:?} at 40,000"
+        );
+        if drawn == 1 {
+            let own = annot.replace("4 0 R 5 0 R", &format!("{} [20 20 80 80]", path(1_000)));
+            assert_eq!(
+                generated(&own),
+                "1 0 0 RG\n0 J 0 j\n10 M\n1 w\n[] 0 d\n1 J 1 j\n20 20 m\n80 80 l\nS\n"
+            );
+        }
+    }
+}
+
+/// One [`Appearances`] looking at many pages, each showing a box of its own, of
+/// annotations they share, whose geometry is one short piece on the pages and many
+/// off them, finds the pieces each page shows by searching one tree of them made
+/// for the document: each page added costs the same, in bytes allocated and held,
+/// whether the geometry holds a thousand pieces off the pages or forty thousand,
+/// and in work but for the search through a deeper tree. Ink of two widths
+/// sharing an `/InkList`, and an underline and a squiggly sharing `/QuadPoints`.
+#[test]
+fn pages_of_their_own_views_find_shared_pieces_in_one_tree() {
+    const ANNOTS: usize = 4;
+    let file = |pages: usize, n: usize| {
+        let first = 4 + 2 + ANNOTS;
+        let kids: Vec<String> = (0..pages).map(|i| format!("{} 0 R", first + i)).collect();
+        let off = "1000 1010 1010 1010 1000 1000 1010 1000 ".repeat(n);
+        let mut objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            format!(
+                "<< /Type /Pages /Kids [{}] /Count {pages} >>",
+                kids.join(" ")
+            )
+            .into_bytes(),
+            b"null".to_vec(),
+            format!("[[20 20 80 80] {}]", "[1000 1000 1001 1001] ".repeat(n)).into_bytes(),
+            format!("[20 60 120 60 20 40 120 40 {off}]").into_bytes(),
+        ];
+        for annot in [
+            "/Subtype /Ink /C [1 0 0] /BS << /W 1 >> /InkList 4 0 R",
+            "/Subtype /Ink /C [1 0 0] /BS << /W 2 >> /InkList 4 0 R",
+            "/Subtype /Underline /C [0] /QuadPoints 5 0 R",
+            "/Subtype /Squiggly /C [0] /QuadPoints 5 0 R",
+        ] {
+            objects.push(format!("<< /Type /Annot {annot} /Rect [0 0 200 200] >>").into_bytes());
+        }
+        let annots: Vec<String> = (0..ANNOTS).map(|i| format!("{} 0 R", 6 + i)).collect();
+        objects.extend((0..pages).map(|i| {
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                 /CropBox [0 0 {} 200] /Annots [{}] >>",
+                199.0 - i as f64 * 0.01,
+                annots.join(" ")
+            )
+            .into_bytes()
+        }));
+        Pdf::new(common::file(&objects, "")).expect("valid pdf")
+    };
+    let cost = |pages: usize, n: usize| {
+        let pdf = file(pages, n);
+        listed(&pdf, |appearances| {
+            let mut drew = Drew::default();
+            for page in pdf.pages().iter() {
+                for d in appearances
+                    .page(page, AnnotationSelection::View, &View::of(page))
+                    .iter()
+                {
+                    match d.look() {
+                        Look::Generated(_) => drew.generated += 1,
+                        _ => drew.unsupported += 1,
+                    }
+                }
+            }
+            drew
+        })
+    };
+    const PAGES: usize = 20;
+    let added = |n: usize| {
+        let (one, two) = (cost(PAGES, n), cost(2 * PAGES, n));
+        assert_eq!(one.drew.generated, PAGES * ANNOTS, "{n}");
+        assert_eq!(two.drew.generated, 2 * PAGES * ANNOTS, "{n}");
+        assert_eq!(two.drew.unsupported, 0, "{n}");
+        (
+            two.bytes.saturating_sub(one.bytes),
+            two.work.saturating_sub(one.work),
+            two.kept - one.kept,
+        )
+    };
+    let (short, long) = (added(1_000), added(40_000));
+    if std::env::var_os("COST_REPORT").is_some() {
+        println!("CASE pages of their own views: +{PAGES}: {short:?} at 1000, {long:?} at 40000");
+    }
+    let looks = PAGES * ANNOTS;
+    assert!(
+        long.0 < looks * (16 << 10)
+            && long.0 <= short.0 + looks * 64
+            && long.1 <= short.1 + deeper(looks, 1_000, 40_000)
+            && long.2 <= short.2 + (looks * 64) as isize,
+        "{short:?} added at 1,000, {long:?} at 40,000"
+    );
 }
 
 /// Stamps that share a long name read it once for the document, and set it once:

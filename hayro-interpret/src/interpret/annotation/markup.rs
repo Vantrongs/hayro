@@ -6,15 +6,17 @@
 //! common viewers draw, and clipped as they clip them: to the box of the
 //! quadrilaterals, a line width wider on each side.
 
-use super::entries::{Derived, Entries, Items, Value};
+use super::entries::{Derived, Entries, Items};
+use super::index::{Bound, Index};
 use super::out::{
     Color, Extent, MITER_LIMIT, Out, Part, Refused, Region, Rounding, as_written, stroke_reach,
 };
 use super::{Drew, Unsupported, border_width, c_color, color_of, dash, most_pieces, rect};
 use hayro_syntax::object::dict::keys::{C, IC, INKLIST, QUADPOINTS};
 use kurbo::{Point, Rect, Vec2};
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::f64::consts::SQRT_2;
+use std::ops::ControlFlow;
 use std::rc::Rc;
 
 /// Square and Circle: /IC fills the shape, /C strokes it at the border width, inside
@@ -111,7 +113,8 @@ impl Quad {
 /// The quadrilaterals of a `/QuadPoints` array, every number in its place; a last
 /// one cut short has 0 for the coordinates it lacks. Made once for the document
 /// ([`Derived`]), with what text markup draws of them, which annotations sharing
-/// the array each look up rather than walk it.
+/// the array each look up rather than walk it, and for each kind of piece drawn
+/// of them the tree the pieces that may paint are found in ([`Quads::index`]).
 pub(super) struct Quads {
     pub(super) all: Vec<Quad>,
     /// The box of each, a line width wider on each side; `None` when it has no
@@ -124,7 +127,17 @@ pub(super) struct Quads {
     /// The box a redaction is clipped to: of each, a point wider on each side;
     /// `None` for none ([`super::icons::redact`]).
     pub(super) redact: Option<Rect>,
+    /// The tree of each kind of piece, by [`Pieces`], made when an annotation
+    /// first draws it.
+    indices: [OnceCell<Index>; 5],
+    /// The squiggles that may draw where the region last told shows them, by
+    /// its key ([`Quads::squiggles`]).
+    last: RefCell<Option<Found>>,
 }
+
+/// The places of the quads found where the region of a key ([`Region::key`])
+/// shows them.
+type Found = (Vec<u64>, Rc<[usize]>);
 
 impl Derived for Quads {
     fn derive(items: &Items<'_>) -> Self {
@@ -159,7 +172,41 @@ impl Derived for Quads {
             high,
             highlight,
             redact,
+            indices: Default::default(),
+            last: RefCell::default(),
         }
+    }
+}
+
+impl Quads {
+    /// The tree of the pieces of kind `pieces`, one of each of `all` or, for a
+    /// squiggly, of `high`, made by `make` of those quads once for the document
+    /// ([`Index`]): each kind's pieces are found by where they may paint, which
+    /// the quad alone decides.
+    pub(super) fn index(&self, pieces: Pieces, make: impl FnOnce(&[Quad]) -> Index) -> &Index {
+        let quads = match pieces {
+            Pieces::Squiggly => &self.high,
+            _ => &self.all,
+        };
+        self.indices[pieces as usize].get_or_init(|| make(quads))
+    }
+
+    /// The places of the squiggles of `high` that may draw where `region` shows
+    /// them, as `find` tells them; kept for the region last told alone, so that
+    /// the annotations of a page, which are drawn one after another where it
+    /// shows them, tell them once. Whether a squiggle may draw is told of its hull
+    /// ([`Zigzag::may_draw`]), which a tree of boxes finds only within the boxes
+    /// that hold it: turned quads near what shows are tested and draw nothing.
+    fn squiggles(&self, region: &Region, find: impl FnOnce() -> Vec<usize>) -> Rc<[usize]> {
+        let key = region.key();
+        if let Some((last, found)) = &*self.last.borrow()
+            && *last == key
+        {
+            return found.clone();
+        }
+        let found: Rc<[usize]> = find().into();
+        *self.last.borrow_mut() = Some((key, found.clone()));
+        found
     }
 }
 
@@ -181,14 +228,10 @@ fn union(boxes: impl IntoIterator<Item = Rect>) -> Option<Rect> {
     boxes.into_iter().reduce(|a, b| a.union(b))
 }
 
-/// The places of the parts of geometry made of a shared array that may paint where
-/// a page shows them ([`shown`]), in order.
-pub(super) struct Shown(pub(super) Vec<usize>);
-
-/// Which parts of an array [`shown`] tells, each drawn as its generator draws it.
+/// The kinds of piece drawn of quads, each found in a tree of its own
+/// ([`Quads::index`]).
 #[derive(Clone, Copy)]
 pub(super) enum Pieces {
-    Ink,
     Highlight,
     Under,
     Through,
@@ -196,40 +239,19 @@ pub(super) enum Pieces {
     Redact,
 }
 
-/// The places of the parts of what is made of `items` that may paint where
-/// `region` shows them: what `find` tells, once for the document for each array,
-/// kind of part and region ([`super::entries::Items::seen`]), so that annotations
-/// sharing the array each write those alone and walk none of the rest. Each kind
-/// of quad paints as far beyond its points as the kind and the quad alone say (a
-/// highlight's fill nothing, a redaction's outline a 1 pt stroke, a text line its
-/// own width), so that nothing else decides; an ink path as far as each
-/// annotation's stroke reaches ([`Reaches`]). `find` reads nothing: it tells what
-/// is already made of the array.
-pub(super) fn shown<T: 'static>(
-    items: &Items<'_>,
-    pieces: Pieces,
-    region: &Region,
-    find: impl FnOnce() -> T,
-) -> Rc<T> {
-    let mut by = region.key();
-    by.push(pieces as u64);
-    items.seen(by, find)
-}
-
-/// The places of the quads of `quads` whose subpath, its extent and how far beyond
-/// it it paints as `piece` gives them, may paint in `region`, as [`Out`] tells it
-/// where it paints them.
-pub(super) fn painting(
-    quads: &[Quad],
-    region: &Region,
-    piece: impl Fn(&Quad) -> (Extent, f64),
-) -> Shown {
+/// The places, in order, of the parts in `index` whose subpath, of the extent its
+/// bound gives, painting as far beyond it as its bound's reach and `reach` more,
+/// may paint in `region`, as [`Out`] tells it where it paints them: found by the
+/// same test of the boxes that hold them, which does not fall as a box or its
+/// reach grows ([`super::out::Painting`]), so that a box that may not paint holds
+/// no part that may. Each kind of quad paints as far beyond its points as the
+/// kind and the quad alone say (a highlight's fill nothing, a text line its own
+/// width), which its bound holds; an ink path or a redaction's outline as far as
+/// the stroke set reaches, `reach`.
+pub(super) fn painting(index: &Index, region: &Region, reach: f64) -> Vec<usize> {
     let painting = region.painting(Rounding::NONE);
-    let paints = |q: &Quad| {
-        let (extent, reach) = piece(q);
-        painting.paints(&extent, reach).is_some()
-    };
-    Shown((0..quads.len()).filter(|&i| paints(&quads[i])).collect())
+    let paints = |b: &Bound| painting.paints(&b.extent, b.reach + reach).is_some();
+    index.find(paints, |_| true)
 }
 
 /// The quadrilaterals of a text markup annotation and the box viewers clip it to: the
@@ -247,15 +269,18 @@ pub(super) fn marked<'a>(annot: &Entries<'a>) -> Option<(Items<'a>, Rc<Quads>, R
 /// curves' control points at the origin, and so does this.
 pub(super) fn highlight(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     let fill = c_color(annot, Color::Rgb([1.0, 1.0, 0.0]));
-    let (items, quads, clip) = highlights(annot)?;
+    let (_, quads, clip) = highlights(annot)?;
     out.op("q");
     out.clip(clip)?;
     out.fill_color(&fill)?;
-    let (region, reach) = (out.region(), out.reach(false));
-    let shown = shown(&items, Pieces::Highlight, &region, || {
-        painting(&quads.all, &region, |q| (Extent::written(bulge(q)), reach))
+    let index = quads.index(Pieces::Highlight, |quads| {
+        Index::new(
+            quads
+                .iter()
+                .map(|q| Some(Bound::of(Extent::written(bulge(q)), 0.0))),
+        )
     });
-    for &i in &shown.0 {
+    for i in painting(index, &out.region(), out.reach(false)) {
         let [bl, c1, c2, tl, tr, c3, c4, br] = bulge(&quads.all[i]);
         out.nums(&[bl.x, bl.y], "m")?;
         out.nums(&[c1.x, c1.y, c2.x, c2.y, tl.x, tl.y], "c")?;
@@ -315,7 +340,7 @@ pub(super) enum Line {
 /// sevenths of the way up each side.
 pub(super) fn text_lines(annot: &Entries<'_>, line: Line, out: &mut Out) -> Option<()> {
     let stroke = c_color(annot, Color::BLACK);
-    let (items, quads, clip) = marked(annot)?;
+    let (_, quads, clip) = marked(annot)?;
     out.op("q");
     out.clip(clip)?;
     out.stroke_color(&stroke)?;
@@ -323,18 +348,15 @@ pub(super) fn text_lines(annot: &Entries<'_>, line: Line, out: &mut Out) -> Opti
         Line::Under => (1.0 / 7.0, Pieces::Under),
         Line::Through => (3.0 / 7.0, Pieces::Through),
     };
-    let region = out.region();
     // Each stroked as wide as its own line, as written.
-    let shown = shown(&items, pieces, &region, || {
-        painting(&quads.all, &region, |q| {
+    let index = quads.index(pieces, |quads| {
+        Index::new(quads.iter().map(|q| {
             let (a, b) = q.across(f);
-            (
-                Extent::written([a, b]),
-                stroke_reach(as_written(line_width(q))),
-            )
-        })
+            let reach = stroke_reach(as_written(line_width(q)));
+            Some(Bound::of(Extent::written([a, b]), reach))
+        }))
     });
-    for &i in &shown.0 {
+    for i in painting(index, &out.region(), 0.0) {
         let q = &quads.all[i];
         out.stroke_state(line_width(q), None)?;
         let (a, b) = q.across(f);
@@ -352,7 +374,7 @@ pub(super) fn text_lines(annot: &Entries<'_>, line: Line, out: &mut Out) -> Opti
 /// clip.
 pub(super) fn squiggly(annot: &Entries<'_>, out: &mut Out) -> Drew {
     let stroke = c_color(annot, Color::BLACK);
-    let Some((items, quads, clip)) = marked(annot) else {
+    let Some((_, quads, clip)) = marked(annot) else {
         return Ok(None);
     };
     out.op("q");
@@ -368,16 +390,18 @@ pub(super) fn squiggly(annot: &Entries<'_>, out: &mut Out) -> Drew {
             until: None,
         };
         // A quad of no height draws nothing ([`zigzag`]), nor one whose zigzag
-        // stays apart from `region`.
+        // stays apart from `region`: those whose bound may meet it are tested.
         let high = &quads.high;
-        let drawn = shown(&items, Pieces::Squiggly, &region, || {
-            Shown(
-                (0..high.len())
-                    .filter(|&i| Zigzag::may_draw(&high[i], &region))
-                    .collect(),
-            )
+        let index = quads.index(Pieces::Squiggly, |high| {
+            let anywhere = Out::default().region();
+            Index::new(high.iter().map(|q| Zigzag::bound(q, &anywhere)))
         });
-        for &i in &drawn.0 {
+        let painting = region.painting(Rounding::NONE);
+        let near = |b: &Bound| painting.may_meet(&b.extent, b.reach, b.local);
+        let found = quads.squiggles(&region, || {
+            index.find(near, |i| Zigzag::may_draw(&high[i], &region))
+        });
+        for &i in found.iter() {
             zigzag(&high[i], &region, &mut pen, out)?;
         }
     }
@@ -434,7 +458,6 @@ fn zigzag(q: &Quad, region: &Region, pen: &mut Run, out: &mut Out) -> Result<(),
         Start::Unnumbered(part) => return out.refuse(Unsupported::Coordinates, part),
         Start::Steps(z, steps) => (z, steps),
     };
-    out.stroke_state(line_width(q), None);
     // The steps `a..b`, which may paint where the page shows them, drawn as
     // viewers draw them only by steps more than this draws: refused, or left out
     // where they cannot show, the steps after them drawn as given.
@@ -445,53 +468,41 @@ fn zigzag(q: &Quad, region: &Region, pen: &mut Run, out: &mut Out) -> Result<(),
         out.refuse(Unsupported::Coordinates, part)
     };
     pen.until = None;
-    // The ranges of steps left to look at, the first last; step `k` runs from
-    // corner `k` to corner `k + 1`.
-    let mut ranges = vec![(0.0, steps)];
-    while let Some((a, b)) = ranges.pop() {
-        super::work(1);
-        let Some((hull, slack, place)) = z.looked_at(a, b) else {
-            continue;
+    // A zigzag that acts on no range sets nothing ([`Zigzag::may_draw`]).
+    let mut set = false;
+    let searched = z.search(steps, |act| {
+        if !set {
+            set = true;
+            out.stroke_state(line_width(q), None);
+        }
+        let ((a, b), within) = match act {
+            Act::Whole(a, b) => ((a, b), pen.draw(&z, a, b, out)),
+            Act::Unsplit(a, b) => ((a, b), false),
+            Act::Step(a, b) if z.paints(a, steps) => ((a, b), pen.draw(&z, a, b, out)),
+            Act::Step(a, b) => ((a, b), pen.spend()),
         };
-        let near = |reach: f64| region.may_show(&hull, reach, place).is_some();
-        let moved = place.bound();
-        if region.holds(&hull, slack + moved.x.max(moved.y)) {
-            // Every corner as written lies in `region`: every step of some length
-            // paints.
-            if !pen.draw(&z, a, b, out) {
-                refuse(a, b, out)?;
-            }
-            continue;
+        match within {
+            true => ControlFlow::Continue(()),
+            false => refuse(a, b, out).map_or_else(ControlFlow::Break, ControlFlow::Continue),
         }
-        if b - a > 1.0 {
-            // Where the corners' hull meets `region`, a step crosses it but where
-            // `region` lies between two steps; else what the strokes and joins
-            // paint decides.
-            if near(slack * SQRT_2) || z.may_paint(a, b, slack) {
-                let mid = ((a + b) / 2.0).floor();
-                // Past 2^53, neighbouring steps' numbers are no longer apart.
-                if !(a < mid && mid < b) {
-                    refuse(a, b, out)?;
-                    continue;
-                }
-                ranges.push((mid, b));
-                ranges.push((a, mid));
-            }
-            continue;
-        }
-        let within = if z.paints(a, steps) {
-            pen.draw(&z, a, b, out)
-        } else {
-            pen.spend()
-        };
-        if !within {
-            refuse(a, b, out)?;
-        }
+    });
+    if let ControlFlow::Break(refused) = searched {
+        return Err(refused);
     }
     if pen.until.is_some() {
         out.op("S");
     }
     Ok(())
+}
+
+/// What the search of a zigzag's steps ([`Zigzag::search`]) comes to at a range
+/// `a..b` of them: every corner as written lies in what shows, so that the range
+/// is drawn whole; it may paint but cannot be halved, past 2^53 steps; or it is
+/// one step, which paints or not.
+enum Act {
+    Whole(f64, f64),
+    Unsplit(f64, f64),
+    Step(f64, f64),
 }
 
 /// The steps of an annotation's zigzags looked at one by one so far, those drawn
@@ -617,15 +628,86 @@ impl Zigzag {
         Start::Steps(Box::new(z), steps)
     }
 
-    /// Whether the zigzag of quad `q` may draw a step or be refused where `region`
-    /// shows it: whether [`zigzag`] looks at anything past the range of all its
-    /// steps ([`Zigzag::looked_at`]).
+    /// Whether the zigzag of quad `q` may draw a step, be refused, or look at a
+    /// step one by one where `region` shows it: whether the search of its steps
+    /// acts on any range ([`Zigzag::search`]). Of the region and the quad alone:
+    /// one that does not is left out with nothing else changed.
     fn may_draw(q: &Quad, region: &Region) -> bool {
         match Self::start(q, region) {
             Start::Nothing => false,
             Start::Unnumbered(part) => region.shows(&part),
-            Start::Steps(z, steps) => z.looked_at(0.0, steps).is_some(),
+            Start::Steps(z, steps) => z.search(steps, |_| ControlFlow::Break(())).is_break(),
         }
+    }
+
+    /// Looks at the ranges of the `steps` steps, from all of them down to single
+    /// steps, the first first ([`zigzag`]), and tells `act` each that is drawn
+    /// whole, cannot be halved, or is one step: a range is left out where what
+    /// its steps can paint is apart from the region ([`Zigzag::may_paint`]).
+    /// Stops where `act` breaks.
+    fn search<B>(&self, steps: f64, mut act: impl FnMut(Act) -> ControlFlow<B>) -> ControlFlow<B> {
+        let region = &self.region;
+        // The ranges of steps left to look at, the first last; step `k` runs from
+        // corner `k` to corner `k + 1`.
+        let mut ranges = vec![(0.0, steps)];
+        while let Some((a, b)) = ranges.pop() {
+            super::work(1);
+            let Some((hull, slack, place)) = self.looked_at(a, b) else {
+                continue;
+            };
+            let near = |reach: f64| region.may_show(&hull, reach, place).is_some();
+            let moved = place.bound();
+            if region.holds(&hull, slack + moved.x.max(moved.y)) {
+                // Every corner as written lies in `region`: every step of some
+                // length paints.
+                act(Act::Whole(a, b))?;
+                continue;
+            }
+            if b - a > 1.0 {
+                // Where the corners' hull meets `region`, a step crosses it but
+                // where `region` lies between two steps; else what the strokes and
+                // joins paint decides.
+                if near(slack * SQRT_2) || self.may_paint(a, b, slack) {
+                    let mid = ((a + b) / 2.0).floor();
+                    // Past 2^53, neighbouring steps' numbers are no longer apart.
+                    if !(a < mid && mid < b) {
+                        act(Act::Unsplit(a, b))?;
+                        continue;
+                    }
+                    ranges.push((mid, b));
+                    ranges.push((a, mid));
+                }
+                continue;
+            }
+            act(Act::Step(a, b))?;
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Where the zigzag of quad `q` may draw a step or be refused, whatever
+    /// region shows it: within the reach of the hull [`Zigzag::may_draw`] tests
+    /// against the region, wherever a viewer computing its last corner puts it
+    /// ([`super::out::Painting::may_meet`]); `None` where it draws nothing
+    /// anywhere. Told with `anywhere`, a region no page bounds, which decides
+    /// none of it.
+    fn bound(q: &Quad, anywhere: &Region) -> Option<Bound> {
+        let (points, reach, local) = match Self::start(q, anywhere) {
+            Start::Nothing | Start::Unnumbered(Part::Anywhere) => return None,
+            Start::Unnumbered(Part::Near {
+                points,
+                reach,
+                local,
+            }) => (points, reach, local),
+            Start::Steps(z, steps) => {
+                let hull = z.hull(z.t(0.0), z.t(steps));
+                (hull.to_vec(), z.reach(z.slack(&hull)), z.place(steps))
+            }
+        };
+        Some(Bound {
+            extent: Extent::of(points),
+            reach,
+            local,
+        })
     }
 
     /// The hull of the corners of the steps `a..b` ([`Zigzag::hull`]), how far
@@ -1027,9 +1109,8 @@ impl Join {
 pub(super) fn ink(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     let width = border_width(annot);
     let stroke = color_of(annot, C)?;
-    let items = annot.items(INKLIST)?;
-    let paths = items.derived::<Paths>();
-    if paths.0.is_empty() {
+    let paths = annot.items(INKLIST)?.derived::<Paths>();
+    if paths.paths.is_empty() {
         return None;
     }
     out.stroke_color(&stroke)?;
@@ -1039,14 +1120,8 @@ pub(super) fn ink(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     // The paths that may paint, each a subpath of the stroke; those that may not
     // would be left out of it with nothing else changed.
     let (region, reach) = (out.region(), out.reach(true));
-    let reaches = shown(&items, Pieces::Ink, &region, || {
-        Reaches::of(&paths.2, &region, reach)
-    });
-    for p in reaches
-        .paint(&paths.2, &region, reach)
-        .iter()
-        .map(|&i| &paths.0[i])
-    {
+    for i in painting(paths.index(), &region, reach) {
+        let p = &paths.paths[i].numbers;
         out.nums(&p[..2], "m")?;
         // A path of one point is a dot.
         let rest = if p.len() < 4 { &p[..2] } else { &p[2..] };
@@ -1060,96 +1135,75 @@ pub(super) fn ink(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     Some(())
 }
 
-/// Of parts told against a region, each by its extent ([`Extent`]), the places of
-/// those that may paint as far as an annotation's stroke reaches, for any reach,
-/// each found once ([`Reaches::paint`]): for the reach of the first annotation to
-/// look, those that paint at it, each tested; for another, those whose least reach
-/// at which they may paint ([`super::out::Painting::least`]) is at most it, found by
-/// one search of the parts in that order, made when an annotation of another reach
-/// first looks. So an array one annotation draws costs a test of each part, and
-/// one many draw at different widths a search of each part's least reach.
-struct Reaches {
-    first: (f64, Vec<usize>),
-    least: OnceCell<Vec<(Option<f64>, usize)>>,
-}
-
-impl Reaches {
-    /// Of the parts of `extents`, as told against `region`, first for `reach`.
-    fn of(extents: &[Extent], region: &Region, reach: f64) -> Self {
-        let painting = region.painting(Rounding::NONE);
-        let places = (0..extents.len())
-            .filter(|&i| painting.paints(&extents[i], reach).is_some())
-            .collect();
-        Self {
-            first: (reach, places),
-            least: OnceCell::new(),
-        }
-    }
-
-    /// The places, in order, of the parts of `extents` that may paint in `region`
-    /// painted `reach` beyond their points, as [`Out`] tells it: those found for it
-    /// first, or those whose least reach is at most `reach`, and no others, as
-    /// whether a part may paint does not fall as the reach grows. The parts that
-    /// paint at no reach are last.
-    fn paint(&self, extents: &[Extent], region: &Region, reach: f64) -> Vec<usize> {
-        if reach.to_bits() == self.first.0.to_bits() {
-            return self.first.1.clone();
-        }
-        let least = self.least.get_or_init(|| {
-            let painting = region.painting(Rounding::NONE);
-            let mut least: Vec<(Option<f64>, usize)> = (0..extents.len())
-                .map(|i| (painting.least(&extents[i]), i))
-                .collect();
-            least.sort_unstable_by(|a, b| match (a.0, b.0) {
-                (Some(a), Some(b)) => a.total_cmp(&b),
-                (a, b) => a.is_none().cmp(&b.is_none()),
-            });
-            least
-        });
-        let near = least.partition_point(|(least, _)| least.is_some_and(|least| least <= reach));
-        let mut places: Vec<usize> = least[..near].iter().map(|&(_, i)| i).collect();
-        places.sort_unstable();
-        if cfg!(debug_assertions) {
-            let paints = |i: usize| region.paints(&extents[i], reach, Rounding::NONE).is_some();
-            debug_assert!(places.iter().all(|&i| paints(i)), "a part told paints");
-            debug_assert!(
-                least.get(near).is_none_or(|&(_, i)| !paints(i)),
-                "the first part told past the reach does not paint"
-            );
-        }
-        places
-    }
-}
-
 /// The box of the `/InkList` paths that [`ink`] strokes, and how far beyond it the
 /// stroke paints; `None` without a path, which draws nothing.
 pub(super) fn ink_extent(annot: &Entries<'_>) -> Option<(Rect, f64)> {
     let paths = annot.items(INKLIST)?.derived::<Paths>();
-    Some((paths.1?, stroke_reach(border_width(annot))))
+    Some((paths.bounds?, stroke_reach(border_width(annot))))
 }
 
-/// The paths of an `/InkList` that draw, the numbers of each, at least two, the
-/// box of their points, and the extent of each as written ([`Extent`]): made once
-/// for the document ([`Derived`]), so that annotations sharing a list walk what it
-/// holds that draws nothing once.
-struct Paths(Vec<Vec<f64>>, Option<Rect>, Vec<Extent>);
+/// A path of an `/InkList`: its numbers, the box of its points, and its extent as
+/// written ([`Extent`]). Made once for the document of a path array of its own,
+/// which `/InkList` arrays may share ([`Items::each`]).
+struct Path {
+    numbers: Vec<f64>,
+    bounds: Option<Rect>,
+    extent: Extent,
+}
+
+impl Derived for Path {
+    fn derive(items: &Items<'_>) -> Self {
+        let numbers = items.numbers();
+        let points: Vec<Point> = numbers
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[x, y]| Point::new(*x, *y))
+            .collect();
+        let bounds = points.iter().fold(None, |b: Option<Rect>, p| {
+            Some(b.map_or(Rect::from_points(*p, *p), |b| b.union_pt(*p)))
+        });
+        Self {
+            extent: Extent::written(points),
+            numbers,
+            bounds,
+        }
+    }
+}
+
+/// The paths of an `/InkList` that draw, at least two numbers each, the box of
+/// their points, and the tree the paths that may paint are found in ([`Index`]),
+/// made when an annotation first draws them: made once for the document
+/// ([`Derived`]), so that annotations sharing a list walk what it holds that
+/// draws nothing once.
+struct Paths {
+    paths: Vec<Rc<Path>>,
+    bounds: Option<Rect>,
+    index: OnceCell<Index>,
+}
 
 impl Derived for Paths {
     fn derive(items: &Items<'_>) -> Self {
-        let paths = items.iter().filter_map(Value::items).map(|p| p.numbers());
-        let paths: Vec<Vec<f64>> = paths.filter(|p| p.len() >= 2).collect();
-        let points = |p: &[f64]| -> Vec<Point> {
-            let pairs = p.as_chunks::<2>().0;
-            pairs.iter().map(|[x, y]| Point::new(*x, *y)).collect()
-        };
+        let mut paths = items.each::<Path>();
+        paths.retain(|p| p.numbers.len() >= 2);
         let bounds = paths
             .iter()
-            .flat_map(|p| points(p))
-            .fold(None, |b: Option<Rect>, p| {
-                Some(b.map_or(Rect::from_points(p, p), |b| b.union_pt(p)))
-            });
-        let extents = paths.iter().map(|p| Extent::written(points(p))).collect();
-        Self(paths, bounds, extents)
+            .filter_map(|p| p.bounds)
+            .reduce(|a, b| a.union(b));
+        Self {
+            paths,
+            bounds,
+            index: OnceCell::new(),
+        }
+    }
+}
+
+impl Paths {
+    /// The tree of the paths, each by its extent: how far a stroke reaches
+    /// beyond it is each annotation's own ([`painting`]).
+    fn index(&self) -> &Index {
+        self.index
+            .get_or_init(|| Index::new(self.paths.iter().map(|p| Some(Bound::of(p.extent, 0.0)))))
     }
 }
 
@@ -1696,16 +1750,19 @@ mod tests {
     }
 
     /// Text markup, redactions and ink drawn by the parts of their geometry that
-    /// may paint where the page shows them ([`super::shown`]) paint what drawing
-    /// every part paints, or are refused alike: on generated quads and paths,
-    /// turned, of no height or length, on, across and off generated views, and
-    /// of widths of all sizes.
+    /// may paint where the page shows them ([`super::painting`], [`super::Index`])
+    /// paint what drawing every part paints, or are refused alike: on generated
+    /// quads and paths, turned, of no height or length, on, across and off
+    /// generated views, one tree of each kind of part told for several views and,
+    /// for ink, several widths, of all sizes. The tree finds exactly the parts
+    /// that paint, and every quad whose squiggle may draw.
     #[test]
     fn the_parts_that_may_paint_draw_what_all_parts_draw() {
         use super::super::icons::redact;
         use super::super::{Drew, border_width, c_color, color_of, dash};
         use super::{
-            Line, Quad, Run, controls, highlights, ink, line_width, marked, text_lines, zigzag,
+            Bound, Index, Line, Quad, Run, Zigzag, controls, highlights, ink, line_width, marked,
+            text_lines, zigzag,
         };
         use hayro_syntax::object::dict::keys::{C, INKLIST};
         use kurbo::Point;
@@ -1790,13 +1847,13 @@ mod tests {
                 _ => ok((|| {
                     let stroke = color_of(annot, C)?;
                     let paths = annot.items(INKLIST)?.derived::<super::Paths>();
-                    if paths.0.is_empty() {
+                    if paths.paths.is_empty() {
                         return None;
                     }
                     out.stroke_color(&stroke)?;
                     out.stroke_state(border_width(annot), dash(annot).as_ref())?;
                     out.op("1 J 1 j");
-                    for p in &paths.0 {
+                    for p in paths.paths.iter().map(|p| &p.numbers) {
                         out.nums(&p[..2], "m")?;
                         let rest = if p.len() < 4 { &p[..2] } else { &p[2..] };
                         for pt in rest.as_chunks::<2>().0 {
@@ -1820,7 +1877,7 @@ mod tests {
         }
 
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;
-        let mut differ = 0;
+        let (mut differ, mut looks, mut rejected) = (0, 0, 0);
         for case in 0..6_000 {
             let r = &mut seed;
             let kind = [
@@ -1832,7 +1889,18 @@ mod tests {
                 "Ink",
             ][case % 6];
             let (x, y) = (next(r) * 300.0 - 50.0, next(r) * 300.0 - 50.0);
-            let view = Rect::new(x, y, x + 1.0 + next(r) * 150.0, y + 1.0 + next(r) * 150.0);
+            // Views of the same parts: the first, one beside it, and one of
+            // another size elsewhere.
+            let views = [
+                Rect::new(x, y, x + 1.0 + next(r) * 150.0, y + 1.0 + next(r) * 150.0),
+                Rect::new(x + 40.0, y - 30.0, x + 41.0 + next(r) * 150.0, y + 60.0),
+                Rect::new(
+                    x - 90.0,
+                    y + 20.0,
+                    x - 89.0 + next(r) * 300.0,
+                    y + 21.0 + next(r) * 30.0,
+                ),
+            ];
             // A place on, across or off the view, sometimes far off.
             let place = |r: &mut u64| {
                 let far = if next(r) < 0.3 { 3_000.0 } else { 0.0 };
@@ -1842,7 +1910,7 @@ mod tests {
                 )
             };
             let pieces = 1 + (next(r) * 6.0) as usize;
-            let mut width = None;
+            let mut widths = vec![];
             let geometry = if kind == "Ink" {
                 let paths: Vec<String> = (0..pieces)
                     .map(|_| {
@@ -1857,7 +1925,7 @@ mod tests {
                         format!("[{}]", points.join(" "))
                     })
                     .collect();
-                let w = match (next(r) * 8.0) as usize {
+                let width = |r: &mut u64| match (next(r) * 8.0) as usize {
                     0 => String::from("0"),
                     1 => String::from("-3"),
                     // The widest a number is read as (viewers keep the low 32
@@ -1869,8 +1937,11 @@ mod tests {
                     3 => format!("{}", next(r) * 600.0),
                     _ => format!("{}", next(r) * 30.0),
                 };
-                width = Some(w.parse::<f64>().expect("a width"));
-                format!("/C [0 0 1] /BS << /W {w} >> /InkList [{}]", paths.join(" "))
+                widths = vec![width(r), width(r)];
+                format!(
+                    "/C [0 0 1] /BS << /W WIDTH >> /InkList [{}]",
+                    paths.join(" ")
+                )
             } else {
                 let quads: Vec<String> = (0..pieces)
                     .map(|_| {
@@ -1893,38 +1964,93 @@ mod tests {
                     .collect();
                 format!("/C [1 0 0] /QuadPoints [{}]", quads.join(" "))
             };
-            let annot = format!("<< /Subtype /{kind} /Rect [0 0 1 1] {geometry} >>");
-            let dict = Dict::from_bytes(annot.as_bytes()).expect("valid dict");
-            let entries = Entries::detached(dict);
-            if let Some(width) = width.filter(|w| *w > 1e6) {
-                // The widest are read as large as written.
-                assert_eq!(border_width(&entries) as f32, width as f32, "{annot}");
-            }
-            if let Some(paths) = entries.items(INKLIST).map(|i| i.derived::<super::Paths>()) {
-                // The paths found by their least reaches, as when an annotation of
-                // another width looked first, are those that paint.
-                let mut out = Out::new(view, 1.0);
-                out.stroke_state(border_width(&entries), None);
-                let (region, reach) = (out.region(), out.reach(true));
-                let first = if reach == 0.0 { 1.0 } else { 0.0 };
-                let found = super::Reaches::of(&paths.2, &region, first);
-                let paint = |i: &usize| region.paints(&paths.2[*i], reach, super::Rounding::NONE);
-                let all: Vec<usize> = (0..paths.2.len()).filter(|i| paint(i).is_some()).collect();
-                assert_eq!(found.paint(&paths.2, &region, reach), all, "{annot}");
-            }
-            let drawn = |draw: fn(&Entries<'_>, &str, &mut Out) -> Drew| {
-                let mut out = Out::new(view, 1.0);
-                let drew = draw(&entries, kind, &mut out);
-                out.finish(drew)
-                    .map(|(drew, content, _)| drew.map(|()| painted(&content)))
+            let widths = if widths.is_empty() {
+                vec![String::new()]
+            } else {
+                widths
             };
-            let (all, parts) = (drawn(every_quad), drawn(by_parts));
-            assert_eq!(parts, all, "{annot} in {view:?}");
-            if matches!(&all, Ok(Some(p)) if !p.is_empty()) {
-                differ += 1;
+            // One tree for every view and width, as a document keeps it.
+            let annot = |w: &str| {
+                let geometry = geometry.replace("WIDTH", w);
+                format!("<< /Subtype /{kind} /Rect [0 0 1 1] {geometry} >>")
+            };
+            let first = annot(&widths[0]);
+            let dict = Dict::from_bytes(first.as_bytes()).expect("valid dict");
+            let entries = Entries::detached(dict);
+            let paths = entries.items(INKLIST).map(|i| i.derived::<super::Paths>());
+            let quads = super::quads(&entries).map(|(_, q)| q);
+            // A squiggly of quads whose box has no area draws nothing.
+            let squiggles = quads
+                .as_ref()
+                .filter(|q| kind == "Squiggly" && q.clip.is_some());
+            let squiggles = squiggles.map(|q| {
+                let anywhere = Out::default().region();
+                let index = Index::new(q.high.iter().map(|h| Zigzag::bound(h, &anywhere)));
+                (q, index)
+            });
+            for view in views {
+                for w in &widths {
+                    let annot = annot(w);
+                    let dict = Dict::from_bytes(annot.as_bytes()).expect("valid dict");
+                    let entries = Entries::detached(dict);
+                    if let Ok(width) = w.parse::<f64>()
+                        && width > 1e6
+                    {
+                        // The widest are read as large as written.
+                        assert_eq!(border_width(&entries) as f32, width as f32, "{annot}");
+                    }
+                    if let Some(paths) = &paths {
+                        // The paths the tree finds are those that paint.
+                        let mut out = Out::new(view, 1.0);
+                        out.stroke_state(border_width(&entries), None);
+                        let (region, reach) = (out.region(), out.reach(true));
+                        let paint = |p: &super::Path| {
+                            region
+                                .paints(&p.extent, reach, super::Rounding::NONE)
+                                .is_some()
+                        };
+                        let all: Vec<usize> = (0..paths.paths.len())
+                            .filter(|&i| paint(&paths.paths[i]))
+                            .collect();
+                        let found = super::painting(paths.index(), &region, reach);
+                        assert_eq!(found, all, "{annot} in {view:?}");
+                    }
+                    if let Some((quads, index)) = &squiggles {
+                        // Every quad whose squiggle may draw is found, and few
+                        // others are tested.
+                        let mut out = Out::new(view, 1.0);
+                        out.clip(quads.clip.expect("marked"));
+                        let region = out.region();
+                        let draws = |i: usize| Zigzag::may_draw(&quads.high[i], &region);
+                        let all: Vec<usize> = (0..quads.high.len()).filter(|&i| draws(i)).collect();
+                        let painting = region.painting(super::Rounding::NONE);
+                        let near = |b: &Bound| painting.may_meet(&b.extent, b.reach, b.local);
+                        let mut tested = 0;
+                        let found = index.find(near, |i| {
+                            tested += 1;
+                            draws(i)
+                        });
+                        assert_eq!(found, all, "{annot} in {view:?}");
+                        rejected += tested - found.len();
+                    }
+                    let drawn = |draw: fn(&Entries<'_>, &str, &mut Out) -> Drew| {
+                        let mut out = Out::new(view, 1.0);
+                        let drew = draw(&entries, kind, &mut out);
+                        out.finish(drew)
+                            .map(|(drew, content, _)| drew.map(|()| painted(&content)))
+                    };
+                    let (all, parts) = (drawn(every_quad), drawn(by_parts));
+                    assert_eq!(parts, all, "{annot} in {view:?}");
+                    looks += 1;
+                    if matches!(&all, Ok(Some(p)) if !p.is_empty()) {
+                        differ += 1;
+                    }
+                }
             }
         }
-        // Most paint something.
-        assert!(differ > 2_000, "{differ} of 6,000 paint");
+        // Most paint something; few quads tested draw nothing (365 of the
+        // 3,000 views of squiggles).
+        assert!(differ > 6_000, "{differ} of {looks} paint");
+        assert!(rejected < 500, "{rejected} rejected in {looks}");
     }
 }
