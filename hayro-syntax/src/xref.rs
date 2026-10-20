@@ -182,9 +182,9 @@ pub(crate) fn open(data: PdfData, password: &[u8]) -> Result<XRef, XRefError> {
     };
 
     match check(&mut xref_map, data.as_ref()) {
-        Ok(()) => match XRef::new(
+        Ok(layout) => match XRef::new(
             data.clone(),
-            Rebuilt::sound(&xref_map),
+            Rebuilt::sound(layout),
             xref_map,
             XRefInput::TrailerDictData(trailer),
             password,
@@ -252,17 +252,22 @@ fn opened(_bytes: usize) {
 
 // Check that each entry leads to its object before any object is read: a table with
 // an entry that does not is rebuilt, so the table never changes once read, and every
-// value read from the document is read from the one table. Returns the entries, for
-// the rebuilt table, if one does not lead to its own.
+// value read from the document is read from the one table. Returns where the table's
+// objects are, or the entries, for the rebuilt table, if one does not lead to its own.
 //
-// An entry leads to its object where an object whose header names it is at its offset
-// and reading it as the entry's object is read (`body::Shape::read`) reads it before the
-// next offset any entry names: objects of a table do not overlap.
-// So each header and object is read once however many entries name it, and no further
-// than the next offset, its slot (`body::SlotReader`), which reads each byte of the file
-// once. A table is also rebuilt where an entry is past the end of the file or in an
-// object stream the table does not list as an object; an entry at offset 0 is free.
-fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Old> {
+// An entry leads to its object where a header that names it is at its offset and ends
+// before the next offset any entry names, its slot (`body::SlotReader`). A table is
+// also rebuilt where an entry is past the end of the file or in an object stream the
+// table does not list as an object; an entry at offset 0 is free.
+//
+// Bodies are not read here, so opening a file reads none of its objects: a body that
+// does not end in its slot is lost when it is read. MuPDF (PyMuPDF 1.28.2) repairs a
+// table for an entry that leads to another header, not for a body that does not parse,
+// and a rebuild loses such a body as well where an offset whose header it keeps cuts
+// the slot. Only where the table is rebuilt does the check read every body, up to the
+// next offset, to tell the rebuild which entries lead to an object that ends there
+// (`Old`).
+fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<Layout, Old> {
     xref_map.retain(|_, entry| *entry != EntryType::Normal(0));
     let mut entries = vec![];
     let mut streams = vec![];
@@ -275,45 +280,62 @@ fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Old> {
     }
     entries.sort_unstable();
 
-    let mut sound = true;
+    let listed_streams = || {
+        let objects: BTreeSet<i32> = entries.iter().map(|(_, id)| id.obj_number).collect();
+        streams
+            .iter()
+            .all(|(_, stream)| i32::try_from(*stream).is_ok_and(|stream| objects.contains(&stream)))
+    };
+    if slots(&entries, data.len()).all(|(offset, end, ids)| headed(data, offset, end, ids))
+        && (streams.is_empty() || listed_streams())
+    {
+        return Ok(Layout::sorted(entries.iter().map(|(offset, _)| *offset)));
+    }
+
+    warn!("xref table has an entry that does not lead to its object, rebuilding it");
     let mut old = Old {
         held: streams.iter().copied().collect(),
         ..Old::default()
     };
-    // The entries at each offset, and the next offset.
-    let mut rest = entries.as_slice();
-    while let Some(&(offset, _)) = rest.first() {
-        let at = rest.partition_point(|(other, _)| *other == offset);
-        let end = rest.get(at).map_or(data.len(), |(next, _)| *next);
+    for (offset, end, ids) in slots(&entries, data.len()) {
         let checked = object_in(data, offset, end);
-        for &(_, id) in &rest[..at] {
+        for &(_, id) in ids {
             match checked {
-                Checked::Object(header) => {
-                    sound &= header == id;
-                    old.listed.push(Listed { id, offset, header });
-                }
-                Checked::Unfinished(header) => {
-                    sound = false;
-                    old.unread.push(Unfinished { id, offset, header });
-                }
-                Checked::Nothing => sound = false,
+                Checked::Object(header) => old.listed.push(Listed { id, offset, header }),
+                Checked::Unfinished(header) => old.unread.push(Unfinished { id, offset, header }),
+                Checked::Nothing => {}
             }
         }
-        rest = &rest[at..];
     }
-    if !streams.is_empty() {
-        let objects: BTreeSet<i32> = entries.iter().map(|(_, id)| id.obj_number).collect();
-        sound &= streams.iter().all(|(_, stream)| {
-            i32::try_from(*stream).is_ok_and(|stream| objects.contains(&stream))
-        });
-    }
+    Err(old)
+}
 
-    if sound {
-        Ok(())
-    } else {
-        warn!("xref table has an entry that does not lead to its object, rebuilding it");
-        Err(old)
-    }
+/// The entries of `entries`, sorted by offset, at each offset, with the offset and
+/// where its slot ends: at the next offset, or at `len`, the end of the file.
+fn slots(
+    entries: &[(usize, ObjectIdentifier)],
+    len: usize,
+) -> impl Iterator<Item = (usize, usize, &[(usize, ObjectIdentifier)])> {
+    let mut rest = entries;
+    iter::from_fn(move || {
+        let &(offset, _) = rest.first()?;
+        // Most offsets have one entry: count them rather than search.
+        let at = rest
+            .iter()
+            .take_while(|(other, _)| *other == offset)
+            .count();
+        let end = rest.get(at).map_or(len, |(next, _)| *next);
+        let (ids, after) = rest.split_at(at);
+        rest = after;
+        Some((offset, end, ids))
+    })
+}
+
+/// Whether a header that ends in the slot from `at` to `slot` of `data` is at `at`,
+/// naming the object of each entry of `ids`.
+fn headed(data: &[u8], at: usize, slot: usize, ids: &[(usize, ObjectIdentifier)]) -> bool {
+    let header = SlotReader::new(data, at, Slot::to(slot)).map(|mut r| r.header());
+    ids.iter().all(|(_, id)| header == Some(Header::Read(*id)))
 }
 
 /// What checking a table finds where an entry leads, in the entry's slot.
@@ -400,10 +422,11 @@ struct Rebuilt {
 }
 
 impl Rebuilt {
-    /// What a table read from the file finds: its objects are at its entries.
-    fn sound(map: &XrefMap) -> Self {
+    /// What a table read from the file finds: its objects are where `layout` puts
+    /// them, at its entries.
+    fn sound(layout: Layout) -> Self {
         Self {
-            layout: Layout::new(map),
+            layout,
             unreadable: Unreadable::default(),
             headers: Headers::default(),
         }
@@ -1633,21 +1656,15 @@ struct Layout {
 }
 
 impl Layout {
-    /// The layout of the file whose objects `map` puts at its offsets.
-    fn new(map: &XrefMap) -> Self {
-        Self::over(
-            map.values()
-                .filter_map(|entry| match entry {
-                    EntryType::Normal(at) => Some(*at),
-                    EntryType::ObjStream(..) => None,
-                })
-                .collect(),
-        )
-    }
-
     /// The layout of the file whose objects are at `starts`.
     fn over(mut starts: Vec<usize>) -> Self {
         starts.sort_unstable();
+        Self::sorted(starts.into_iter())
+    }
+
+    /// The layout of the file whose objects are at `starts`, in rising order.
+    fn sorted(starts: impl Iterator<Item = usize>) -> Self {
+        let mut starts: Vec<usize> = starts.collect();
         starts.dedup();
         Self {
             starts: starts.into(),
@@ -3208,6 +3225,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    // A table whose entries all lead to headers of their objects is kept where a body
+    // does not parse: here object 4, in whose slot a second page 3 follows, which a
+    // rebuild would take. MuPDF (PyMuPDF 1.28.2) does not repair the table either, and
+    // shows the table's page.
+    #[test]
+    fn a_table_is_kept_where_only_a_body_does_not_parse() {
+        let body = "4 0 obj\n<< /A ] >>\nendobj\n\
+                    3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 700] >>\nendobj\n";
+        let (width, height, _) = one_page(file_with(body.as_bytes(), &[0], false));
+        assert_eq!((width, height), (100.0, 100.0));
+    }
+
+    // Opening a file whose table is kept lexes no body it does not read: the check
+    // reads headers only, so an object nothing reads costs nothing to open, however
+    // large it is.
+    #[test]
+    fn opening_a_file_lexes_no_object_it_does_not_read() {
+        let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>";
+        let opened = |n: usize| {
+            let unread = format!("<< {}>>", "/K [1 (s) <41>] ".repeat(n));
+            let file = file_of(&[CATALOG, TREE, page, &unread], false);
+            crate::work::EXAMINED.set(0);
+            let pdf = crate::Pdf::new(file).unwrap();
+            assert_eq!(pdf.pages().len(), 1);
+            crate::work::EXAMINED.get()
+        };
+        // Sizes whose `startxref` offsets have as many digits, which opening lexes.
+        assert_eq!(opened(1024), opened(4096));
     }
 
     /// A file of `objects`, numbered from 1, the first being the catalog, with a table
