@@ -1,6 +1,6 @@
 use crate::{GlobalState, Renderer, convert_blend_mode, derive_settings};
 use hayro_interpret::{BlendMode, Interpreted, MaskType, SoftMask};
-use kurbo::{Affine, Rect};
+use kurbo::Rect;
 use vello_cpu::color::palette::css::BLACK;
 use vello_cpu::color::{AlphaColor, Srgb};
 use vello_cpu::{Mask, Pixmap, RenderSettings};
@@ -21,22 +21,15 @@ impl Renderer<'_> {
         opacity: f32,
         mask: Option<SoftMask<'_>>,
         blend_mode: BlendMode,
-        bounds: Option<Rect>,
     ) {
         let mask = mask.map(|m| self.soft_mask(&m));
-        let clip = bounds.and_then(|bounds| self.layer_clip(bounds));
-        let (transform, fill_rule) = (*self.ctx.transform(), *self.ctx.fill_rule());
-        self.ctx.set_transform(Affine::IDENTITY);
-        self.ctx.set_fill_rule(vello_cpu::peniko::Fill::NonZero);
         self.ctx.push_layer(
-            clip.as_ref(),
+            None,
             Some(convert_blend_mode(blend_mode)),
             Some(opacity),
             mask,
             None,
         );
-        self.ctx.set_transform(transform);
-        self.ctx.set_fill_rule(fill_rule);
     }
 
     /// The mask `mask` draws on this device's pixels, drawn once for the uses it
