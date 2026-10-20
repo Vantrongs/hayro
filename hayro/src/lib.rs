@@ -95,8 +95,6 @@ pub(crate) struct Renderer<'a> {
     pub(crate) inside_pattern: bool,
     pub(crate) soft_masks: SoftMasks<Mask>,
     pub(crate) in_type3_glyph: bool,
-    /// The clips pushed on the device, each with those outside it, the innermost last.
-    pub(crate) clips: Vec<clip::ClipBounds>,
 }
 
 impl<'r> Renderer<'r> {
@@ -107,7 +105,6 @@ impl<'r> Renderer<'r> {
             inside_pattern: false,
             soft_masks: SoftMasks::default(),
             in_type3_glyph: false,
-            clips: Vec::new(),
         }
     }
 
@@ -153,17 +150,7 @@ impl<'a, 'r> Device<'a> for Renderer<'r> {
         mask: Option<SoftMask<'a>>,
         blend_mode: BlendMode,
     ) {
-        Self::push_transparency_group(self, opacity, mask, blend_mode, None);
-    }
-
-    fn push_knockout_group(
-        &mut self,
-        opacity: f32,
-        mask: Option<SoftMask<'a>>,
-        blend_mode: BlendMode,
-        bounds: Rect,
-    ) {
-        Self::push_transparency_group(self, opacity, mask, blend_mode, Some(bounds));
+        Self::push_transparency_group(self, opacity, mask, blend_mode);
     }
 
     fn pop_clip(&mut self) {
@@ -321,10 +308,7 @@ pub fn render_into<'a>(
     let view = View::of(page);
     let mut clip_path = view.visible().to_path(0.1);
     clip_path.apply_affine(transform);
-    // A transform that keeps the axes keeps the crop box a rectangle.
-    let [a, b, c, d, _, _] = transform.as_coeffs();
-    let rect = ((b == 0.0 && c == 0.0) || (a == 0.0 && d == 0.0)).then(|| clip_path.bounding_box());
-    device.push_clip_path_of(&clip_path, FillRule::NonZero, rect);
+    device.push_clip_path_inner(&clip_path, FillRule::NonZero);
 
     interpret_page(page, &view, &mut state, &mut device);
 

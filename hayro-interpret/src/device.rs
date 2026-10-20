@@ -26,20 +26,6 @@ pub trait Device<'a> {
         mask: Option<SoftMask<'a>>,
         blend_mode: BlendMode,
     );
-    /// Push a transparency group that holds one filled and stroked path, which
-    /// paints only within `bounds`, a rectangle of whole device pixels: nothing the
-    /// group draws lies outside them. Its stroke says how it hides the fill in
-    /// [`DrawProps::knockout`]. It is popped with [`Device::pop_transparency_group`].
-    fn push_knockout_group(
-        &mut self,
-        opacity: f32,
-        mask: Option<SoftMask<'a>>,
-        blend_mode: BlendMode,
-        bounds: Rect,
-    ) {
-        let _ = bounds;
-        self.push_transparency_group(opacity, mask, blend_mode);
-    }
     /// Draw a run of positioned glyphs.
     fn draw_glyph_run(
         &mut self,
