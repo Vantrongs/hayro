@@ -1113,25 +1113,12 @@ mod tests {
             whole.jump(at);
             let header = whole.read_without_context::<ObjectIdentifier>();
             // The header, and whether the object after it is read, or whether the
-            // slot cuts the start of a header: alike whether the check keeps what the
-            // body holds, which it then does where it reads the object.
-            let checked = |next: usize| {
-                let (checked, shape) = object_in(&data, at, next, true);
-                assert_eq!(
-                    (checked, shape.is_some()),
-                    (
-                        object_in(&data, at, next, false).0,
-                        matches!(checked, Checked::Object(_))
-                    ),
-                    "case {case}, check keeping the body at {at} to {next} of {:?}",
-                    shown()
-                );
-                match checked {
-                    Checked::Object(header) => (Some(header), true, false),
-                    Checked::Unfinished(Some((header, _))) => (Some(header), false, false),
-                    Checked::Unfinished(None) => (None, false, true),
-                    Checked::Nothing => (None, false, false),
-                }
+            // slot cuts the start of a header.
+            let checked = |next: usize| match object_in(&data, at, next) {
+                Checked::Object(header) => (Some(header), true, false),
+                Checked::Unfinished(Some((header, _))) => (Some(header), false, false),
+                Checked::Unfinished(None) => (None, false, true),
+                Checked::Nothing => (None, false, false),
             };
             assert_eq!(
                 checked(data.len()),
