@@ -1,32 +1,32 @@
 //! A path filled and stroked by one operator is painted as viewers paint it: where
 //! the stroke covers the fill, only the stroke shows, however translucent both are;
-//! the fill is cleared there before the stroke is drawn.
+//! the stroke replaces the fill there.
 
 use hayro_interpret::font::GlyphRun;
 use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::{
     BlendMode, ClipPath, Device, DrawMode, DrawProps, Image, ImageDrawProps, InterpreterSettings,
-    Paint, SoftMask,
+    Knockout, Paint, SoftMask,
 };
-use kurbo::{Affine, BezPath};
+use kurbo::BezPath;
 
 mod common;
 
 #[derive(Debug, PartialEq)]
 enum Ev {
-    /// A fill or stroke, with the alpha of its colour and its blend mode.
+    /// A fill or stroke, with the alpha of its colour, its blend mode and whether it
+    /// replaces what the group drew beneath it.
     Draw {
         stroke: bool,
         alpha: u8,
         blend: BlendMode,
+        knockout: Knockout,
     },
     Group {
         opacity: f32,
         blend: BlendMode,
     },
     EndGroup,
-    /// A clearing of the group by a stroke.
-    KnockOut,
 }
 
 #[derive(Default)]
@@ -38,17 +38,19 @@ impl<'a> Device<'a> for Rec {
             panic!("solid paint")
         };
         let alpha = c.to_rgba().to_rgba8()[3];
-        let blend = props.blend_mode;
+        let (blend, knockout) = (props.blend_mode, props.knockout);
         match mode {
             DrawMode::Fill(_) => self.0.push(Ev::Draw {
                 stroke: false,
                 alpha,
                 blend,
+                knockout,
             }),
             DrawMode::Stroke(_) => self.0.push(Ev::Draw {
                 stroke: true,
                 alpha,
                 blend,
+                knockout,
             }),
             _ => panic!("{mode:?}"),
         }
@@ -62,10 +64,6 @@ impl<'a> Device<'a> for Rec {
     fn pop_clip(&mut self) {}
     fn pop_transparency_group(&mut self) {
         self.0.push(Ev::EndGroup);
-    }
-    fn knock_out(&mut self, _: &BezPath, _: Affine, mode: &DrawMode) {
-        assert!(matches!(mode, DrawMode::Stroke(_)), "{mode:?}");
-        self.0.push(Ev::KnockOut);
     }
 }
 
@@ -86,27 +84,35 @@ const SQUARE: &str = "/G gs 10 w 0 0 1 RG 1 0 0 rg 25 25 50 50 re b";
 
 #[test]
 fn a_translucent_fill_and_stroke_are_one_group() {
-    let opaque = |stroke| Ev::Draw {
+    let opaque = |stroke, knockout| Ev::Draw {
         stroke,
         alpha: 255,
         blend: BlendMode::Normal,
+        knockout,
     };
-    for (gs, opacity, blend) in [
-        ("/ca 0.5 /CA 0.5", 0.5, BlendMode::Normal),
-        ("/BM /Multiply", 1.0, BlendMode::Multiply),
+    for (gs, opacity, blend, knockout) in [
+        (
+            "/ca 0.5 /CA 0.5",
+            0.5,
+            BlendMode::Normal,
+            Knockout::ClearThenOver,
+        ),
+        ("/BM /Multiply", 1.0, BlendMode::Multiply, Knockout::Replace),
     ] {
         assert_eq!(
             drawn(gs, SQUARE),
             [
                 Ev::Group { opacity, blend },
-                opaque(false),
-                Ev::KnockOut,
-                opaque(true),
+                opaque(false, Knockout::None),
+                opaque(true, knockout),
                 Ev::EndGroup
             ],
             "{gs}"
         );
     }
     // Opaque, they are drawn as they are.
-    assert_eq!(drawn("", SQUARE), [opaque(false), opaque(true)]);
+    assert_eq!(
+        drawn("", SQUARE),
+        [opaque(false, Knockout::None), opaque(true, Knockout::None)]
+    );
 }

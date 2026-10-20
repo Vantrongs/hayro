@@ -10,8 +10,8 @@ use crate::interpret::state::{
 use crate::ocg::OcgState;
 use crate::util::{BezPathExt, Float64Ext};
 use crate::{
-    ClipPath, Device, DrawProps, FillRule, InterpreterSettings, InterpreterWarning, Paint,
-    StrokeProps,
+    ClipPath, Device, DrawProps, FillRule, InterpreterSettings, InterpreterWarning, Knockout,
+    Paint, StrokeProps,
 };
 use hayro_syntax::content::ops::Transform;
 use hayro_syntax::hash;
@@ -240,6 +240,7 @@ impl<'a> Context<'a> {
             paint: self.get_paint(is_stroke),
             soft_mask: self.compositing().soft_mask.clone(),
             blend_mode: self.compositing().blend_mode,
+            knockout: Knockout::None,
         }
     }
 

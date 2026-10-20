@@ -113,5 +113,4 @@ impl Device<'_> for TextExtractor {
     fn pop_transparency_group(&mut self) {}
 
     fn draw_image(&mut self, _: Image<'_, '_>, _: ImageDrawProps<'_>) {}
-    fn knock_out(&mut self, _: &BezPath, _: Affine, _: &DrawMode) {}
 }

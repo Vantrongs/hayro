@@ -4,7 +4,7 @@ use crate::{BlendMode, ClipPath, FillRule, Image};
 use crate::{DrawMode, DrawProps, ImageDrawProps};
 use hayro_syntax::object::dict::keys::{ACTUAL_TEXT, MCID};
 use hayro_syntax::object::{Dict, String};
-use kurbo::{Affine, BezPath, Rect, Shape};
+use kurbo::{BezPath, Rect, Shape};
 
 /// A trait for a device that can be used to process PDF drawing instructions.
 pub trait Device<'a> {
@@ -28,8 +28,8 @@ pub trait Device<'a> {
     );
     /// Push a transparency group that holds one filled and stroked path, which
     /// paints only within `bounds`, a rectangle of whole device pixels: nothing the
-    /// group draws lies outside them. It is popped with
-    /// [`Device::pop_transparency_group`].
+    /// group draws lies outside them. Its stroke says how it hides the fill in
+    /// [`DrawProps::knockout`]. It is popped with [`Device::pop_transparency_group`].
     fn push_knockout_group(
         &mut self,
         opacity: f32,
@@ -53,12 +53,6 @@ pub trait Device<'a> {
     fn pop_clip(&mut self);
     /// Pop the last transparency group from the blend stack.
     fn pop_transparency_group(&mut self);
-    /// Clear what the current transparency group drew where `path`, drawn with
-    /// `draw_mode` in `transform`, covers: the next element of a knockout group
-    /// (PDF 32000-1 11.4.6.2) replaces those before it there, even where its paint is
-    /// translucent. It has no default: a device that clears nothing composites that
-    /// element over the earlier ones, which shows what it should hide.
-    fn knock_out(&mut self, path: &BezPath, transform: Affine, draw_mode: &DrawMode);
     /// Draw a rectangle directly, without going through the general path pipeline.
     fn draw_rect(&mut self, rect: &Rect, props: DrawProps<'a>, draw_mode: &DrawMode) {
         self.draw_path(&rect.to_path(0.1), props, draw_mode);
@@ -82,7 +76,6 @@ impl Device<'_> for DummyDevice {
     fn draw_image(&mut self, _: Image<'_, '_>, _: ImageDrawProps<'_>) {}
     fn pop_clip(&mut self) {}
     fn pop_transparency_group(&mut self) {}
-    fn knock_out(&mut self, _: &BezPath, _: Affine, _: &DrawMode) {}
 }
 
 /// The property list of a marked-content sequence.

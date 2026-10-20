@@ -45,7 +45,7 @@ use hayro_interpret::hayro_syntax::hash;
 use hayro_interpret::hayro_syntax::page::Page;
 use hayro_interpret::util::TransformExt;
 use hayro_interpret::{
-    BlendMode, Context, DrawMode, DrawProps, ImageDrawProps, SoftMask, SoftMasks,
+    BlendMode, Context, DrawMode, DrawProps, ImageDrawProps, Knockout, SoftMask, SoftMasks,
 };
 use hayro_interpret::{ClipPath, interpret_page};
 use kurbo::{Affine, BezPath, Rect, Shape};
@@ -118,8 +118,12 @@ impl<'r> Renderer<'r> {
     fn apply_draw_props(&mut self, props: &DrawProps<'_>) {
         self.ctx.set_transform(props.transform);
         self.apply_soft_mask(props.soft_mask.as_ref());
-        self.ctx
-            .set_blend_mode(convert_blend_mode(props.blend_mode));
+        let mut blend_mode = convert_blend_mode(props.blend_mode);
+        if props.knockout == Knockout::Replace {
+            // `Copy` mixes the destination and the source by the coverage alone.
+            blend_mode.compose = Compose::Copy;
+        }
+        self.ctx.set_blend_mode(blend_mode);
     }
 
     fn apply_image_props(&mut self, props: &ImageDrawProps<'_>) {
@@ -171,15 +175,17 @@ impl<'a, 'r> Device<'a> for Renderer<'r> {
     }
 
     fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        if props.knockout == Knockout::ClearThenOver {
+            self.clear_under(path, props.transform, draw_mode);
+        }
         Self::draw_path(self, path, props, draw_mode);
     }
 
     fn draw_rect(&mut self, rect: &Rect, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        if props.knockout == Knockout::ClearThenOver {
+            self.clear_under(&rect.to_path(0.1), props.transform, draw_mode);
+        }
         Self::draw_rect(self, rect, props, draw_mode);
-    }
-
-    fn knock_out(&mut self, path: &BezPath, transform: Affine, draw_mode: &DrawMode) {
-        Self::knock_out(self, path, transform, draw_mode);
     }
 
     fn draw_glyph_run(

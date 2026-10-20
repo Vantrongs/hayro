@@ -14,7 +14,7 @@ use hayro::{PixmapSettings, RenderCache, RenderSettings, render};
 mod fixtures;
 
 /// `/G` draws at alpha 0.5, `/H` at 1, `/K` strokes at 0.5 and fills at 1, `/M` in a
-/// soft mask of 50 % grey, `/X` at alpha 0.5 with Multiply. `/S` is a red shading,
+/// soft mask of 50 % grey, `/X` at alpha 0.5 with Multiply, `/Y` at 1 with Multiply. `/S` is a red shading,
 /// `/T` a stencil and `/C` a red coloured tiling pattern, 10 pt cells filled whole;
 /// `/O` and `/Q` are the same with cells of two overlapping squares; `/B` is a blue
 /// coloured tiling pattern whose cells paint at alpha 0.5.
@@ -30,7 +30,7 @@ fn page(content: &str) -> Vec<u8> {
     };
     let resources = "/Resources << /ExtGState << /G << /ca 0.5 /CA 0.5 >> /H << /ca 1 /CA 1 >> \
         /K << /ca 1 /CA 0.5 >> /M << /SMask << /S /Luminosity /G 8 0 R >> >> \
-        /X << /ca 0.5 /CA 0.5 /BM /Multiply >> >> \
+        /X << /ca 0.5 /CA 0.5 /BM /Multiply >> /Y << /BM /Multiply >> >> \
         /ColorSpace << /PR [/Pattern /DeviceRGB] >> \
         /Pattern << /S 5 0 R /T 6 0 R /C 7 0 R /O 9 0 R /Q 10 0 R /B 11 0 R >> >>";
     fixtures::one_page(
@@ -119,6 +119,25 @@ fn a_fill_is_drawn_at_its_alpha_once_alone_or_stroked() {
     }
 }
 
+/// Opaque, where a stroke's antialiased edge lies over its own fill, the pair is as
+/// opaque as either: a square filled and stroked in red off the pixel grid, with
+/// Multiply or in a soft mask of 50 %, shows red or red at half on every pixel the
+/// pair covers whole, as a common viewer draws it (`PyMuPDF` 1.28.2), where
+/// translucent its stroke's edge shows lighter (see the test below).
+#[test]
+fn an_opaque_stroke_edge_over_its_fill_is_whole() {
+    for (gs, expected) in [("/Y gs", RED), ("/M gs", HALF_RED)] {
+        for op in ["b", "B"] {
+            let content = format!("{gs} 3 w 1 0 0 RG 1 0 0 rg 25.4 25.4 50 50 re {op}");
+            // The stroke covers x from 23.9 to 26.9 and 73.9 to 76.9, the fill the rest.
+            let row: Vec<_> = (24..76).map(|x| (x, 50)).collect();
+            for (&(x, _), pixel) in row.iter().zip(pixels(&content, &row)) {
+                assert!(near(pixel, expected), "{content} at x {x}: {pixel:?}");
+            }
+        }
+    }
+}
+
 /// A pattern paints at the alpha of the graphics state when it paints, not when it
 /// was selected.
 #[test]
@@ -161,14 +180,17 @@ fn a_tiling_pattern_cell_is_translucent_as_a_whole() {
 
 /// Filled red and stroked 10 pt wide with a pattern whose cells paint blue at alpha
 /// 0.5, by one operator: translucent or blended, where the stroke covers the fill
-/// only the stroke shows; opaque, the stroke is drawn over the fill (the colours a
-/// common viewer renders, at the overlap, the stroke outside the fill, the fill).
+/// only the stroke shows; opaque and unblended, in a soft mask or not, the stroke is
+/// drawn over the fill (the colours a common viewer renders, at the overlap, the
+/// stroke outside the fill, the fill).
 #[test]
 fn a_translucent_stroke_paint_knocks_out_the_fill() {
     let points = [(27, 50), (22, 50), (50, 50)];
     for (gs, expected) in [
         ("/G gs", [[192, 192, 255], [192, 192, 255], HALF_RED]),
         ("/X gs", [[193, 193, 255], [193, 193, 255], [255, 129, 129]]),
+        ("/Y gs", [[129, 129, 255], [129, 129, 255], RED]),
+        ("/M gs", [[192, 128, 191], [192, 192, 255], HALF_RED]),
         ("/H gs", [[129, 0, 126], [129, 129, 255], RED]),
     ] {
         for op in ["b", "B"] {

@@ -9,7 +9,7 @@ use crate::font::{
 use crate::interpret::state::TextState;
 use crate::x_object::soft_mask::SoftMask;
 use crate::{BlendMode, interpret};
-use crate::{CacheKey, ClipPath, DrawMode, DrawProps, ImageDrawProps};
+use crate::{CacheKey, ClipPath, DrawMode, DrawProps, ImageDrawProps, Knockout};
 use crate::{Image, Paint};
 use hayro_cmap::{BfString, CMap};
 use hayro_syntax::content::TypedIter;
@@ -205,8 +205,10 @@ impl<'a, 'b, T: Device<'a>> Type3ShapeGlyphDevice<'a, 'b, T> {
 // Only filling, stroking of paths and stencil masks are allowed.
 impl<'a, T: Device<'a>> Device<'a> for Type3ShapeGlyphDevice<'a, '_, T> {
     fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        // The pair a knockout is for is not grouped here, so the stroke is drawn over.
         let props = DrawProps {
             paint: self.paint.clone(),
+            knockout: Knockout::None,
             ..props
         };
         self.inner.draw_path(path, props, draw_mode);
@@ -236,7 +238,6 @@ impl<'a, T: Device<'a>> Device<'a> for Type3ShapeGlyphDevice<'a, '_, T> {
     // Groups are not drawn here, so the pair's fill lies in no group of its own:
     // clearing in the device drawn into would clear what was drawn before the pair
     // as well.
-    fn knock_out(&mut self, _: &BezPath, _: Affine, _: &DrawMode) {}
 
     fn draw_image(&mut self, image: Image<'a, '_>, props: ImageDrawProps<'a>) {
         if let Image::Stencil(mut s) = image {

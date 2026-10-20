@@ -9,7 +9,7 @@ use hayro_interpret::{
     BlendMode, ClipPath, Device, DrawMode, DrawProps, Image, ImageDrawProps, InterpreterSettings,
     SoftMask, SoftMasks,
 };
-use kurbo::{Affine, BezPath};
+use kurbo::BezPath;
 
 mod common;
 
@@ -36,7 +36,6 @@ impl<'a> Device<'a> for Rec {
     fn draw_image(&mut self, _: Image<'a, '_>, _: ImageDrawProps<'a>) {}
     fn pop_clip(&mut self) {}
     fn pop_transparency_group(&mut self) {}
-    fn knock_out(&mut self, _: &BezPath, _: Affine, _: &DrawMode) {}
 }
 
 /// The number of soft masks drawn for a page that draws two forms, each with

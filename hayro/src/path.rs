@@ -110,7 +110,7 @@ impl Renderer<'_> {
 
     /// Clears the current layer where `path` drawn with `draw_mode` covers it: the
     /// shape drawn opaque into a layer composited with `DestOut`.
-    pub(super) fn knock_out(&mut self, path: &BezPath, transform: Affine, draw_mode: &DrawMode) {
+    pub(super) fn clear_under(&mut self, path: &BezPath, transform: Affine, draw_mode: &DrawMode) {
         let erase = peniko::BlendMode::new(Mix::Normal, Compose::DestOut);
         self.ctx.push_layer(None, Some(erase), None, None, None);
         self.ctx.set_transform(transform);

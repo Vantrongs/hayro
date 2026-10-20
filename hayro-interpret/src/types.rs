@@ -309,6 +309,26 @@ pub struct DrawProps<'a> {
     pub soft_mask: Option<SoftMask<'a>>,
     /// The blend mode.
     pub blend_mode: BlendMode,
+    /// How the drawing combines with what the current transparency group drew
+    /// beneath it.
+    pub knockout: Knockout,
+}
+
+/// How a drawing combines with what the current transparency group drew beneath it:
+/// the stroke of a path filled and stroked by one operator, which viewers paint as a
+/// knockout group (PDF 32000-1 11.4.6.2), hides the fill where it covers it. A device
+/// that composites every drawing over shows what the stroke should hide.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Knockout {
+    /// Composited over it.
+    #[default]
+    None,
+    /// Replaces it in proportion to how much of each pixel the drawing covers, so a
+    /// pixel the drawing covers in part is as opaque as the two together.
+    Replace,
+    /// Clears it in proportion to coverage, then is composited over it, so a pixel
+    /// the drawing covers in part shows less of either.
+    ClearThenOver,
 }
 
 /// Properties for an image drawing operation.

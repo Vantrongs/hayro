@@ -27,7 +27,6 @@ impl<'a> Device<'a> for TextCollector {
     fn draw_image(&mut self, _: Image<'a, '_>, _: ImageDrawProps<'a>) {}
     fn pop_clip(&mut self) {}
     fn pop_transparency_group(&mut self) {}
-    fn knock_out(&mut self, _: &BezPath, _: Affine, _: &DrawMode) {}
     fn begin_marked_content(&mut self, tag: &[u8], properties: &MarkedContentProperties<'_>) {
         write!(self.0, "<{}", String::from_utf8_lossy(tag)).unwrap();
         if let Some(mcid) = properties.mcid() {
