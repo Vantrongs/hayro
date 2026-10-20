@@ -29,6 +29,12 @@ flate2 = { workspace = true, features = ["zlib-rs"] }
 image = { workspace = true, features = ["png"] }
 jpeg-encoder = "0.7"
 
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [features]
 default = ["embed-fonts", "embed-cmaps"]
 # Embed a light-weight set of fonts (around 240KB) that can be used as a substitute for the 14 PDF standard fonts.

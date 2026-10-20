@@ -1437,7 +1437,8 @@ struct Drew {
 }
 
 /// What reading a page's annotations and looking at them costs: bytes allocated,
-/// units of work, bytes the file's readers looked at, and seconds.
+/// units of work, bytes the file's readers looked at, and seconds of processor time
+/// the test's thread spent ([`common::thread_cpu_time`]).
 #[derive(Debug, Clone, Copy)]
 struct Listed {
     bytes: usize,
@@ -1457,22 +1458,56 @@ fn examined() -> usize {
 
 /// The cost of `f`, given the appearances of `pdf`'s annotations, made inside.
 fn listed<'a>(pdf: &'a Pdf, f: impl FnOnce(&Appearances<'a>) -> Drew) -> Listed {
-    let (bytes, work, looked, start, kept) = (
-        allocated(),
-        work_done(),
-        examined(),
-        std::time::Instant::now(),
-        held(),
-    );
+    let mark = Mark::now();
     let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
     let drew = f(&appearances);
-    Listed {
-        bytes: allocated() - bytes,
-        work: work_done() - work,
-        examined: examined() - looked,
-        secs: start.elapsed().as_secs_f64(),
-        drew,
-        kept: held() - kept,
+    mark.listed(drew)
+}
+
+/// The cost of `f`, given the appearances of `pdf`'s annotations once `first` has
+/// been given them; what making them and `first` cost is not counted.
+fn listed_after<'a>(
+    pdf: &'a Pdf,
+    first: impl FnOnce(&Appearances<'a>),
+    f: impl FnOnce(&Appearances<'a>) -> Drew,
+) -> Listed {
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    first(&appearances);
+    let mark = Mark::now();
+    let drew = f(&appearances);
+    mark.listed(drew)
+}
+
+/// What this thread has counted at some point, for [`Listed`] to count from.
+struct Mark {
+    bytes: usize,
+    work: u64,
+    examined: usize,
+    time: std::time::Duration,
+    held: isize,
+}
+
+impl Mark {
+    fn now() -> Self {
+        Self {
+            bytes: allocated(),
+            work: work_done(),
+            examined: examined(),
+            time: common::thread_cpu_time(),
+            held: held(),
+        }
+    }
+
+    /// What has been counted since, for work that drew `drew`.
+    fn listed(self, drew: Drew) -> Listed {
+        Listed {
+            bytes: allocated() - self.bytes,
+            work: work_done() - self.work,
+            examined: examined() - self.examined,
+            secs: (common::thread_cpu_time() - self.time).as_secs_f64(),
+            drew,
+            kept: held() - self.held,
+        }
     }
 }
 
@@ -1808,55 +1843,71 @@ fn streams_sharing_a_long_length_read_it_once() {
 
 /// The cost of a page with `n` annotations that share their state, `/AS 4 0 R`, a
 /// name of `len` bytes, and their appearances, `/AP 5 0 R`, whose `/N` holds that
-/// state as `state`.
+/// state as `state`, looked at once the other page, whose one annotation is one
+/// more of them, has been: what finding the state the first time costs is not
+/// counted.
 fn shared_state_cost(n: usize, len: usize, state: &str) -> Listed {
     let name = format!("/{}", "A".repeat(len));
+    let refs: Vec<String> = (0..n).map(|i| format!("{} 0 R", 8 + i)).collect();
     let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!("<< /Type /Pages /Kids [3 0 R {} 0 R] /Count 2 >>", 8 + n).into_bytes(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [7 0 R] >>".to_vec(),
         name.clone().into_bytes(),
         format!("<< /N << /Off 6 0 R {name} {state} >> >>").into_bytes(),
         common::stream("/Subtype /Form /BBox [0 0 0 0]", b"0 0 m 10 10 l S"),
     ];
-    objects.extend((0..n).map(|_| {
+    objects.extend((0..=n).map(|_| {
         b"<< /Type /Annot /Subtype /Square /C [0] /Rect [10 10 110 40] /AS 4 0 R /AP 5 0 R >>"
             .to_vec()
     }));
-    let refs: Vec<String> = (0..n).map(|i| format!("{} 0 R", 7 + i)).collect();
-    let pdf = Pdf::new(common::one_page(
-        200,
-        &format!("/Annots [{}]", refs.join(" ")),
-        objects,
-    ))
-    .expect("valid pdf");
-    let page = &pdf.pages()[0];
-    listed(&pdf, |appearances| drew(appearances, page, PAGE))
+    objects.push(
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [{}] >>",
+            refs.join(" ")
+        )
+        .into_bytes(),
+    );
+    let pdf = Pdf::new(common::file(&objects, "")).expect("valid pdf");
+    let pages = pdf.pages();
+    listed_after(
+        &pdf,
+        |appearances| {
+            drew(appearances, &pages[0], PAGE);
+        },
+        |appearances| drew(appearances, &pages[1], PAGE),
+    )
 }
 
 /// The cost of a page with `n` annotations whose states, `/AS`, each name a long
 /// name of `len` bytes, object 4, through an entry of the table of its own that
 /// leads to it ([`common::file_with_aliases`]), or, not `aliased`, all through `4 0 R`, and
-/// share their appearances, `/AP 5 0 R`, whose `/N` holds that state as `state`.
+/// share their appearances, `/AP 5 0 R`, whose `/N` holds that state as `state`,
+/// looked at once the other page, whose one annotation is one more of them, has
+/// been: what finding the state the first time costs is not counted.
 fn aliased_state_cost(n: usize, len: usize, state: &str, aliased: bool) -> Listed {
     let name = format!("/{}", "A".repeat(len));
     let states = format!("<< /N << /Off 6 0 R {name} {state} >> >>").into_bytes();
     let mut objects = vec![
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots 7 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 7 0 R] /Count 2 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots 8 0 R >>".to_vec(),
         name.into_bytes(),
         states,
         common::stream("/Subtype /Form /BBox [0 0 10 10]", b"0 0 m 10 10 l S"),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [9 0 R] >>".to_vec(),
     ];
-    let first = 8 + n;
-    let refs: Vec<String> = (0..n).map(|i| format!("{} 0 R", 8 + i)).collect();
+    let first = 10 + n;
+    let refs: Vec<String> = (0..n).map(|i| format!("{} 0 R", 10 + i)).collect();
     objects.push(format!("[{}]", refs.join(" ")).into_bytes());
-    objects.extend((0..n).map(|i| {
+    objects.extend((0..=n).map(|i| {
         let state = if aliased { first + i } else { 4 };
         format!(
             "<< /Type /Annot /Subtype /Square /C [0] /Rect [10 10 110 40] /AS {state} 0 R /AP 5 0 R >>"
         )
         .into_bytes()
     }));
-    let aliases = if aliased { vec![4; n] } else { vec![] };
+    let aliases = if aliased { vec![4; n + 1] } else { vec![] };
     let pdf = Pdf::new(common::file_with_aliases(objects, &aliases)).expect("valid pdf");
     let xref = pdf.xref();
     for i in 0..aliases.len() {
@@ -1867,40 +1918,39 @@ fn aliased_state_cost(n: usize, len: usize, state: &str, aliased: bool) -> Liste
             xref.content_key(ObjectIdentifier::new(4, 0))
         );
     }
-    let page = &pdf.pages()[0];
-    listed(&pdf, |appearances| drew(appearances, page, PAGE))
+    let pages = pdf.pages();
+    listed_after(
+        &pdf,
+        |appearances| {
+            drew(appearances, &pages[1], PAGE);
+        },
+        |appearances| drew(appearances, &pages[0], PAGE),
+    )
 }
 
 /// Annotations whose states are one long name reached through entries of the table
 /// of their own, which a damaged table keeps, draw what those that name it through
 /// one entry draw, and find it once: each costs a lookup, whatever the name's
 /// length, for a state that is a stream that draws and one that is no stream.
-/// Hashing and comparing the name for each, which no counter sees, would take a
-/// quarter of a second or more for 200 more of 8 MB.
+/// No counter sees looking the name up, so the time tells: 1,000 annotations that
+/// each looked up a name of 8 MB take more than a second of the thread's processor
+/// time, where 1,000 that find it by a lookup take a few hundredths.
 #[test]
 fn annotations_whose_states_are_one_name_through_many_entries_find_it_once() {
     for state in ["6 0 R", "1"] {
         let len = 8 << 20;
-        let one = aliased_state_cost(240, len, state, false);
-        let (fewer, more) = (
-            aliased_state_cost(40, len, state, true),
-            aliased_state_cost(240, len, state, true),
-        );
-        assert_eq!(more.drew, one.drew, "{state}");
-        let (bytes, work, looked, secs) = (
-            more.bytes - fewer.bytes,
-            more.work - fewer.work,
-            more.examined - fewer.examined,
-            more.secs - fewer.secs,
-        );
+        let one = aliased_state_cost(1_000, len, state, false);
+        let cost = aliased_state_cost(1_000, len, state, true);
+        assert_eq!(cost.drew, one.drew, "{state}");
         if std::env::var_os("COST_REPORT").is_some() {
-            println!(
-                "CASE aliased {state}: +200: {bytes} bytes, {work} work, {looked} examined, {secs:.4} s"
-            );
+            println!("CASE aliased {state}: 1000: {cost:?}");
         }
         assert!(
-            bytes < 200 * (16 << 10) && work < 200 * 1_000 && looked < 200 * 1_000 && secs < 0.1,
-            "{state}: {fewer:?} {more:?}"
+            cost.bytes < 1_000 * (16 << 10)
+                && cost.work < 1_000 * 1_000
+                && cost.examined < 1_000 * 1_000
+                && cost.secs < 0.25,
+            "{state}: {cost:?}"
         );
     }
 }
@@ -1908,32 +1958,23 @@ fn annotations_whose_states_are_one_name_through_many_entries_find_it_once() {
 /// Annotations that share a state, a long name, and the states it names one of,
 /// find what it draws once: each costs a lookup, whatever the name's length, for a
 /// state that is a stream that draws nothing and one that is no stream. No counter
-/// sees hashing and comparing the name, so the time tells: 200 more annotations
-/// that each hashed and compared a name of 8 MB would take a quarter of a second or
-/// more, where 200 lookups take a few milliseconds.
+/// sees looking the name up, so the time tells: 1,000 annotations that each looked
+/// up a name of 8 MB take more than a second of the thread's processor time, where
+/// 1,000 that find it by a lookup take a few hundredths.
 #[test]
 fn annotations_sharing_a_long_state_find_it_once() {
     for state in ["6 0 R", "1"] {
-        let len = 8 << 20;
-        let (fewer, more) = (
-            shared_state_cost(200, len, state),
-            shared_state_cost(400, len, state),
-        );
-        assert_eq!(more.drew, Drew::default(), "{state}");
-        let (bytes, work, looked, secs) = (
-            more.bytes - fewer.bytes,
-            more.work - fewer.work,
-            more.examined - fewer.examined,
-            more.secs - fewer.secs,
-        );
+        let cost = shared_state_cost(1_000, 8 << 20, state);
+        assert_eq!(cost.drew, Drew::default(), "{state}");
         if std::env::var_os("COST_REPORT").is_some() {
-            println!(
-                "CASE {state}: +200: {bytes} bytes, {work} work, {looked} examined, {secs:.4} s"
-            );
+            println!("CASE {state}: 1000: {cost:?}");
         }
         assert!(
-            bytes < 200 * (16 << 10) && work < 200 * 1_000 && looked < 200 * 1_000 && secs < 0.1,
-            "{state}: {fewer:?} {more:?}"
+            cost.bytes < 1_000 * (16 << 10)
+                && cost.work < 1_000 * 1_000
+                && cost.examined < 1_000 * 1_000
+                && cost.secs < 0.25,
+            "{state}: {cost:?}"
         );
     }
 }

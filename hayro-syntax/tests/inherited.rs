@@ -6,6 +6,7 @@ use hayro_syntax::page::{Inheritable, Inheritance};
 
 mod common;
 use common::allocations::measure;
+use common::cpu_time::thread_cpu_time;
 
 /// `n` pages under a node whose `key` is `value(n)`, a value as large as the file.
 fn file(n: usize, key: &str, value: fn(usize) -> String) -> Vec<u8> {
@@ -67,19 +68,20 @@ fn a_value_pages_inherit_is_held_once() {
     }
 }
 
-/// The least time, of three, loading `file` and reading the box of each of its `n`
-/// pages takes, once it is checked that each is 600 × 700 pt.
+/// The least processor time of this thread, of three runs, loading `file` and
+/// reading the box of each of its `n` pages takes, once it is checked that each is
+/// 600 × 700 pt.
 fn boxed(file: &[u8], n: usize) -> std::time::Duration {
     (0..3)
         .map(|_| {
-            let start = std::time::Instant::now();
+            let start = thread_cpu_time();
             let pdf = Pdf::new(file.to_vec()).unwrap();
             assert_eq!(pdf.pages().len(), n);
             for page in pdf.pages().iter() {
                 let media_box = page.media_box();
                 assert_eq!((media_box.width(), media_box.height()), (600.0, 700.0));
             }
-            start.elapsed()
+            thread_cpu_time() - start
         })
         .min()
         .unwrap()

@@ -606,6 +606,7 @@ dependencies = [
  "image",
  "jpeg-encoder",
  "kurbo",
+ "libc",
  "log",
  "moxcms",
  "phf",
@@ -613,6 +614,7 @@ dependencies = [
  "skrifa 0.46.0",
  "smallvec",
  "unicode-bidi",
+ "windows-sys",
  "yoke",
 ]
 
@@ -664,11 +666,13 @@ dependencies = [
  "hayro-ccitt",
  "hayro-jbig2",
  "hayro-jpeg2000",
+ "libc",
  "log",
  "md5",
  "memchr",
  "sha2",
  "smallvec",
+ "windows-sys",
  "zlib-rs",
  "zune-jpeg",
 ]

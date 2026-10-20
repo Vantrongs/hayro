@@ -12,6 +12,10 @@ use kurbo::{Affine, Rect};
 mod fixtures;
 pub(crate) use fixtures::{file, file_with_aliases, one_page, one_page_objects, stream};
 
+#[path = "../../../hayro-syntax/tests/common/cpu_time.rs"]
+mod cpu_time;
+pub(crate) use cpu_time::thread_cpu_time;
+
 /// Interprets the first page of `pdf` into `device` in PDF user space (y up), so
 /// coordinates read like the numbers in the file.
 pub(crate) fn interpret_first_page<'a>(
