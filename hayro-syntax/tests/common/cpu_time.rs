@@ -44,3 +44,10 @@ pub(crate) fn thread_cpu_time() -> Duration {
     let units = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
     Duration::from_nanos((units(kernel) + units(user)) * 100)
 }
+
+/// No thread clock is read on other targets (such as wasm32-unknown-unknown), so
+/// the tests compile there and a time-bounded one fails when it runs.
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn thread_cpu_time() -> Duration {
+    unimplemented!("no clock of a thread's processor time on this target")
+}
