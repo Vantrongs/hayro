@@ -3918,6 +3918,35 @@ fn a_rich_line_viewers_may_break_refuses_only_where_its_box_shows() {
     assert_eq!(look_of(&rich("-60 20 19.19999 135", "")), "measure");
 }
 
+/// A rich line viewers may break otherwise that fits in its box no way it is broken,
+/// nor any line after it, refuses nothing: whichever way a viewer breaks it, none of
+/// it is drawn. A field 10 high, one-line (whose rich text has room for two lines of
+/// 12 pt) or multiline (room for none past the first), draws its value of a line
+/// and a second paragraph as wide as the box as it draws the first line alone. A
+/// multiline field 30 high has room for the second paragraph, which may break
+/// otherwise.
+#[test]
+fn a_rich_line_that_fits_no_way_it_breaks_refuses_nothing() {
+    let field = |flags: &str, high: f64, rv: &str| {
+        format!(
+            "/Subtype /Widget /FT /Tx {flags} /Rect [0 0 85.2 {high}] /BS << /W 1 >> \
+             /DA (/Cour 12 Tf 0 g) /RV (<p style=\"font-family:Courier;font-size:12pt\">\
+             {rv}</p>)"
+        )
+    };
+    for flags in ["", "/Ff 4096"] {
+        assert_eq!(
+            generated(&field(flags, 10.0, "A<br/>AAAAA AAAAA")),
+            generated(&field(flags, 10.0, "A")),
+            "{flags}"
+        );
+    }
+    assert_eq!(
+        look_of(&field("/Ff 4096", 30.0, "A<br/>AAAAA AAAAA")),
+        "measure"
+    );
+}
+
 /// An annotation that can paint nothing where the page shows it is nothing, told
 /// before its appearance is generated: fully transparent (`/CA 0`), or placed by
 /// its geometry wholly off the page. Neither its measures nor the errors of the

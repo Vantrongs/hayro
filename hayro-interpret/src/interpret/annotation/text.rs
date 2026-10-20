@@ -646,6 +646,11 @@ pub(super) struct LaidLine {
     /// Whether where viewers break it cannot be told ([`Shaped::rich_line_end`]):
     /// they may lay it and the lines after it out otherwise ([`draw_box`]).
     pub(super) uncertain: bool,
+    /// The least size of a line from its first glyph as any viewer may break it:
+    /// `size`, or of an uncertain line, the size of its first word, which every
+    /// break keeps on it, and no more glyphs make a line smaller, as where lines
+    /// break no size is negative ([`Shaped::direction`]).
+    pub(super) least: f32,
 }
 
 /// Where a plain line ends ([`Shaped::walk`]).
@@ -1156,6 +1161,13 @@ impl Shaped {
         }
     }
 
+    /// Where the first word that ends after glyph `start` ends, which a line of rich
+    /// text from `start` holds however it is broken ([`Self::rich_line_end`]).
+    fn first_word_end(&self, start: usize) -> Option<usize> {
+        let first = self.words.partition_point(|w| w.end <= start);
+        self.words.get(first).map(|w| w.end)
+    }
+
     /// Where the line of rich text from glyph `start` of paragraph `par` ends, and
     /// where the next starts, broken to fit `room`: as many words as fit, a word
     /// wider than a line alone on it, the spaces where it breaks on neither.
@@ -1303,6 +1315,10 @@ impl Iterator for Lines<'_> {
         } else {
             text.style_at(sizer).map_or(0.0, |s| s.size.at(self.base))
         };
+        let least = match uncertain.then(|| text.first_word_end(start)).flatten() {
+            Some(first) => text.size_of(start..first, self.base),
+            None => size,
+        };
         let first = if end > start { Some(start) } else { sizer };
         let align = text
             .style_at(first)
@@ -1326,6 +1342,7 @@ impl Iterator for Lines<'_> {
             width: text.width(start..measured, self.base),
             exact,
             uncertain,
+            least,
         })
     }
 }
@@ -2061,6 +2078,11 @@ pub(super) fn draw_box(
             }
         }
         for line in lines {
+            // A line that does not fit in the box however a viewer breaks it draws
+            // nothing, nor do those after it: where it breaks changes nothing.
+            if filled.max(height + 1.2 * line.least) > area.room {
+                return Ok(());
+            }
             if line.uncertain && !gone {
                 // Viewers may break this line otherwise, and lay it and every line
                 // after it out otherwise: anywhere in the box from its top down,
