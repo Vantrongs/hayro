@@ -66,7 +66,7 @@ impl DecryptorTag {
         }
     }
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Decryptor {
     None,
     Rc4 { key: Vec<u8> },
@@ -307,7 +307,7 @@ fn decrypt_rc_aes<T>(
     with_key(final_key)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DecryptorData {
     stream_filter: CryptDictionary,
     string_filter: CryptDictionary,
@@ -357,7 +357,7 @@ impl DecryptorData {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct CryptDictionary {
     cfm: DecryptorTag,
     _length: u16,

@@ -183,9 +183,12 @@ pub(crate) fn open(data: PdfData, password: &[u8]) -> Result<XRef, XRefError> {
 
     match check(&mut xref_map, data.as_ref()) {
         Ok(layout) => match XRef::new(
-            data.clone(),
-            Rebuilt::sound(layout),
-            xref_map,
+            XRef::table(
+                data.clone(),
+                Rebuilt::sound(layout),
+                Arc::new(xref_map),
+                Arc::new(Decryptor::None),
+            ),
             XRefInput::TrailerDictData(trailer),
             password,
         ) {
@@ -387,12 +390,12 @@ fn object_in(data: &[u8], at: usize, slot: usize) -> Checked {
 // it.
 fn fallback(data: PdfData, password: &[u8], old: Old) -> Option<XRef> {
     warn!("xref table was invalid, trying to manually build xref table");
-    let (xref_map, rebuilt, xref_input) = fallback_xref_map(&data, password, old);
+    let (table, xref_input) = fallback_xref_map(&data, password, old);
 
     if let Some(xref_input) = xref_input {
-        warn!("rebuild xref table with {} entries", xref_map.len());
+        warn!("rebuild xref table with {} entries", table.len());
 
-        XRef::new(data.clone(), rebuilt, xref_map, xref_input, password).ok()
+        XRef::new(table, xref_input, password).ok()
     } else {
         warn!("couldn't find trailer dictionary, failed to rebuild xref table");
 
@@ -437,7 +440,7 @@ fn fallback_xref_map<'a>(
     data: &'a PdfData,
     password: &[u8],
     old: Old,
-) -> (XrefMap, Rebuilt, Option<XRefInput<'a>>) {
+) -> (XRef, Option<XRefInput<'a>>) {
     let mut scan = Scan::new(data.as_ref());
     let mut listed = old.listed;
     let (read, unreadable) = read_unread(&mut scan, &old.unread);
@@ -1040,7 +1043,7 @@ fn fallback_xref_map_inner<'a>(
     password: &[u8],
     old: &Old,
     unread: &[ObjectIdentifier],
-) -> (XrefMap, Rebuilt, Option<XRefInput<'a>>) {
+) -> (XRef, Option<XRefInput<'a>>) {
     let Walk {
         found,
         bodies,
@@ -1068,7 +1071,9 @@ fn fallback_xref_map_inner<'a>(
         .unwrap_or_else(|| Arc::new(Decryptor::None));
     if !object_streams.is_empty() {
         // The objects each object stream holds, read through a table of the objects
-        // found, which a stream's /Length may be.
+        // found, which a stream's /Length may be. The rebuilt table reads a stream
+        // again where it reads an object in it: what a stream's dictionary refers to
+        // may be another object there, as the table then holds the streams' objects.
         let probe = XRef::table(
             data.clone(),
             Rebuilt {
@@ -1115,16 +1120,18 @@ fn fallback_xref_map_inner<'a>(
         .filter(|id| !xref_map.contains_key(id))
         .copied()
         .collect();
-    let mut rebuilt = Rebuilt {
+    let rebuilt = Rebuilt {
         layout,
         unreadable,
         headers,
     };
 
     // Try to choose the right trailer dict by doing basic validation: the last whose
-    // /Root is a dictionary with /Pages, read as the rebuilt table reads it.
+    // /Root is a dictionary with /Pages, read as the rebuilt table reads it. The
+    // table is the one the file is read through ([`XRef::new`]): what this reads,
+    // the catalog, is read once.
     let has_pages = |dict: &Dict<'_>| -> bool { dict.contains_key(PAGES) };
-    let table = XRef::table(data.clone(), rebuilt.clone(), Arc::new(xref_map), decrypted);
+    let table = XRef::table(data.clone(), rebuilt, Arc::new(xref_map), decrypted);
     let mut trailer_dict = None;
     for dict in trailer_dicts {
         let valid = match dict.get_raw::<Dict<'_>>(ROOT) {
@@ -1138,38 +1145,26 @@ fn fallback_xref_map_inner<'a>(
             trailer_dict = Some(dict);
         }
     }
-    let mut xref_map = table.into_map();
-
     let has_encryption = trailer_dict
         .as_ref()
         .is_some_and(|t| t.contains_key(ENCRYPT));
-
-    if has_encryption && decryptor.is_none() {
-        // The problem is that in this case, we have used a dummy reader context which does not have
-        // a decryptor. Therefore, we were unable to decrypt any of the object streams and missed
-        // all objects that are inside of such a stream. Therefore, we need to redo the process
-        // using a `ReaderContext` that does have the ability to decrypt.
-        if let Ok(xref) = XRef::new(
-            data.clone(),
-            rebuilt.clone(),
-            xref_map.clone(),
-            XRefInput::TrailerDictData(trailer_dict.as_ref().map(|d| d.data()).unwrap()),
-            password,
-        ) {
-            let decryptor = xref.decryptor();
-            let (patched_map, patched, _) =
-                fallback_xref_map_inner(data, walk, Some(decryptor), password, old, unread);
-            xref_map = patched_map;
-            rebuilt = patched;
-        }
-    }
-
-    let input = if let Some(trailer_dict_data) = trailer_dict.map(|d| d.data()) {
-        Some(XRefInput::TrailerDictData(trailer_dict_data))
-    } else {
-        root_ref.map(XRefInput::RootRef)
+    let input = match trailer_dict {
+        Some(trailer_dict) => Some(XRefInput::TrailerDictData(trailer_dict.data())),
+        None => root_ref.map(XRefInput::RootRef),
     };
-    (xref_map, rebuilt, input)
+
+    if has_encryption
+        && decryptor.is_none()
+        && let Some(input) = input
+        && let Ok(decryptor) = table.read_decryptor(input, password)
+    {
+        // Without the decryptor, the objects of encrypted object streams were not
+        // found: the table is rebuilt with it, for the same trailer.
+        let (table, _) =
+            fallback_xref_map_inner(data, walk, Some(Arc::new(decryptor)), password, old, unread);
+        return (table, Some(input));
+    }
+    (table, input)
 }
 
 /// Of an object's definitions in object streams, `candidates` (each the stream's
@@ -1360,43 +1355,43 @@ impl XRef {
         }
     }
 
-    fn new(
-        data: PdfData,
-        rebuilt: Rebuilt,
-        xref_map: XrefMap,
+    /// What decrypts the document whose trailer is `input`, as its /Encrypt says,
+    /// read through this table, which decrypts nothing ([`Decryptor::None`]).
+    fn read_decryptor(
+        &self,
         input: XRefInput<'_>,
         password: &[u8],
-    ) -> Result<Self, XRefError> {
-        // This is a bit hacky, but the problem is we can't read the resolved trailer dictionary
-        // before we actually created the xref struct. So we first create it using dummy data
-        // and then populate the data.
-        let mut xref = Self::table(data, rebuilt, Arc::new(xref_map), Arc::new(Decryptor::None));
-
-        // We read the trailer twice, once to determine the encryption used and then a second
-        // time to resolve the catalog dictionary, etc. This allows us to support catalog dictionaries
-        // that are stored in an encrypted object stream.
-
-        let decryptor = {
-            match input {
-                XRefInput::TrailerDictData(trailer_dict_data) => {
-                    let mut r = Reader::new(trailer_dict_data);
-
-                    let trailer_dict = r
-                        .read_with_context::<Dict<'_>>(&ReaderContext::new(&xref, false))
-                        .ok_or(XRefError::Unknown)?;
-
-                    get_decryptor(&trailer_dict, password)?
-                }
-                XRefInput::RootRef(_) => Decryptor::None,
+    ) -> Result<Decryptor, XRefError> {
+        match input {
+            XRefInput::TrailerDictData(trailer_dict_data) => {
+                let trailer_dict = Reader::new(trailer_dict_data)
+                    .read_with_context::<Dict<'_>>(&ReaderContext::new(self, false))
+                    .ok_or(XRefError::Unknown)?;
+                get_decryptor(&trailer_dict, password)
             }
-        };
+            XRefInput::RootRef(_) => Ok(Decryptor::None),
+        }
+    }
 
-        match &mut xref.0 {
-            Inner::Dummy => unreachable!(),
-            Inner::Some(r) => {
-                let mutable = Arc::make_mut(r);
-                mutable.decryptor = Arc::new(decryptor.clone());
-            }
+    /// The table `xref` of the file, its trailer read from `input`, decrypted as the
+    /// trailer's /Encrypt, read without decrypting, says. What the table read before
+    /// is kept where it was read with that decryptor, as a rebuilt table reads its
+    /// catalog before (`fallback_xref_map_inner`): the bodies read with another are
+    /// dropped.
+    fn new(mut xref: Self, input: XRefInput<'_>, password: &[u8]) -> Result<Self, XRefError> {
+        // The trailer is read twice, once to determine the encryption used and then a
+        // second time to resolve the catalog dictionary, etc. This allows us to support
+        // catalog dictionaries that are stored in an encrypted object stream.
+        let read_with = xref.decryptor();
+        xref.repr_mut().decryptor = Arc::new(Decryptor::None);
+        let decryptor = xref.read_decryptor(input, password)?;
+        let repr = xref.repr_mut();
+        if *read_with == decryptor {
+            repr.decryptor = read_with;
+        } else {
+            repr.decryptor = Arc::new(decryptor);
+            repr.shapes = Arc::default();
+            repr.data = Arc::new(Data::new(repr.data.get().clone()));
         }
 
         let (trailer_data, has_ocgs, metadata) = match input {
@@ -1439,20 +1434,20 @@ impl XRef {
             }
         };
 
-        match &mut xref.0 {
-            Inner::Dummy => unreachable!(),
-            Inner::Some(r) => {
-                let mutable = Arc::make_mut(r);
-                mutable.trailer_data = trailer_data;
-                mutable.decryptor = Arc::new(decryptor);
-                mutable.has_ocgs = has_ocgs;
-                mutable.metadata = Arc::new(metadata);
-                // What was read before the decryptor was known is not kept.
-                mutable.shapes = Arc::default();
-            }
-        }
+        let repr = xref.repr_mut();
+        repr.trailer_data = trailer_data;
+        repr.has_ocgs = has_ocgs;
+        repr.metadata = Arc::new(metadata);
 
         Ok(xref)
+    }
+
+    /// The table's own copy of what it holds.
+    fn repr_mut(&mut self) -> &mut SomeRepr {
+        match &mut self.0 {
+            Inner::Dummy => unreachable!(),
+            Inner::Some(repr) => Arc::make_mut(repr),
+        }
     }
 
     pub(crate) fn dummy() -> &'static Self {
@@ -4629,6 +4624,41 @@ mod tests {
         body::BODIES
             .with_borrow(most)
             .max(body::DATA_FOUND.with_borrow(most))
+    }
+
+    // Opening a file reads each body once, the catalog too, which the rebuild of a
+    // table reads to choose the trailer, reading the trailer reads, and the page tree
+    // reads: whether the table is read or rebuilt, encrypted or not.
+    #[test]
+    fn opening_a_file_reads_each_body_once() {
+        let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>";
+        let parts = [
+            rc4::Part::Object(CATALOG, b""),
+            rc4::Part::Object(TREE, b""),
+            rc4::Part::Object(page, b""),
+        ];
+        // `file` with its `startxref` leading to no table, which rebuilds it.
+        let broken = |mut file: Vec<u8>| {
+            let tag = b"startxref\n";
+            let at = file.windows(tag.len()).rposition(|w| w == tag).unwrap() + tag.len();
+            let end = at + file[at..].iter().position(|b| *b == b'\n').unwrap();
+            file.splice(at..end, *b"9");
+            file
+        };
+        for encrypted in [false, true] {
+            let file = rc4::file_with(&parts, &[], encrypted);
+            for (rebuilt, file) in [(false, file.clone()), (true, broken(file))] {
+                let most = bodies_read(|| {
+                    let pdf = crate::Pdf::new(file).unwrap();
+                    assert_eq!(pdf.pages().len(), 1);
+                    assert_eq!(pdf.xref().is_encrypted(), encrypted);
+                });
+                assert_eq!(
+                    most, 1,
+                    "encrypted {encrypted}, rebuilt {rebuilt}: a body read {most} times"
+                );
+            }
+        }
     }
 
     // A number many entries of a damaged table lead to is read once for all of them,
