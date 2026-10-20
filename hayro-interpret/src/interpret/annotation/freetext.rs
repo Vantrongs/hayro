@@ -89,7 +89,7 @@ pub(super) fn free_text<'a>(
         && (cl.len() == 2 || cl.len() == 3)
         && Ending::of_callout(annot).lost_at(cl[0], cl[1]);
     if lost {
-        out.refuse(Unsupported::Ending, lost_part(cl[0], w, clip))?;
+        out.refuse(Unsupported::Ending, lost_part(cl[0], w, Some(clip)))?;
     }
     out.op("q");
     out.writes(|out| {
@@ -279,10 +279,12 @@ pub(super) fn boxes(annot: &Entries<'_>) -> Option<Boxes> {
         .collect();
 
     // Viewers clip the appearance to the box, or, with a callout, to the box, the
-    // callout's points and its ending, as [`Ending::callout_box`] says.
+    // callout's points and its ending, as [`Ending::clip_box`] says.
     let drawn = cl.iter().fold(inner.abs(), |b, p| b.union_pt(*p));
     let clip = match cl.as_slice() {
-        [tip, from, ..] if callout => Ending::of_callout(annot).callout_box(*tip, *from, w, drawn),
+        [tip, from, ..] if callout => {
+            Ending::of_callout(annot).clip_box(*tip, *from, w, 0.0, drawn)
+        }
         _ => inner.abs(),
     };
     Some(Boxes {

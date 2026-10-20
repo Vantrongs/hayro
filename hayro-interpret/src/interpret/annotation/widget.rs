@@ -510,12 +510,20 @@ fn draw<'a>(
         // A comb of cells as many as `/MaxLen`; without one, the text from the
         // field's left edge.
         _ if comb => {
+            let max_len = field.get(Inherited::MaxLen).int().filter(|n| *n >= 1);
+            // The dividers before the text, which a border wider than a cell covers;
+            // drawn whether the text is or not.
+            if let Some(max_len) = max_len
+                && let Some(border) = &border
+            {
+                out.writes(|out| out.stroke_color(border))?;
+                comb_dividers(i64::from(max_len), f64::from(fw), f64::from(fh), w, out)?;
+            }
             let Some(value) = value(out)? else {
                 out.op("Q");
                 return Ok(Some(()));
             };
             let all = 0..value.len();
-            let max_len = field.get(Inherited::MaxLen).int().filter(|n| *n >= 1);
             // Automatic: the field's height, or less for the text to fit across.
             let size = size.unwrap_or_else(|| {
                 let em = value.em();
@@ -550,11 +558,6 @@ fn draw<'a>(
             };
             let cells = max_len as f32;
             let cell = fw / cells;
-            // The dividers before the text, which a border wider than a cell covers.
-            if let Some(border) = &border {
-                out.writes(|out| out.stroke_color(border))?;
-                comb_dividers(i64::from(max_len), f64::from(fw), f64::from(fh), w, out)?;
-            }
             // Each glyph centred in its cell: those whose cells the clip can show
             // are drawn.
             let count = value.len().min(max_len as usize);

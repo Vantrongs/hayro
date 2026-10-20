@@ -198,8 +198,12 @@ impl Fonts {
         text.chars().map(|c| self.glyph(typeface, c)).collect()
     }
 
-    /// The glyph of `c` in `typeface`, with its advance in em.
+    /// The glyph of `c` in `typeface`, with its advance in em. Every text drawn is
+    /// set through this, so a character it refuses is refused in all of them.
     fn glyph(&self, typeface: Typeface, c: char) -> Result<Glyph<'_>, Unsupported> {
+        if reordered(c) {
+            return Err(Unsupported::Bidi(c));
+        }
         if typeface.family == Family::Dingbats {
             // Viewers write the text's bytes in the font's own encoding; where
             // PDFDocEncoding and Latin-1 agree, a character is its byte.
@@ -243,6 +247,22 @@ impl Fonts {
                 Unsupported::Kind
             })
     }
+}
+
+/// Whether text with `c` may be drawn by viewers in an order other than the order
+/// it is written in: `c` is of bidirectional class R, AL or AN, or an explicit
+/// direction formatting character (embeddings, overrides, isolates and their ends,
+/// and the left-to-right mark; the right-to-left and Arabic letter marks are R and
+/// AL). Viewers draw such text in visual order (observed in `PyMuPDF` 1.28.2:
+/// Hebrew reversed, runs of it among Latin text reversed in place, and Arabic in
+/// its joining forms), which is not reproduced.
+fn reordered(c: char) -> bool {
+    use unicode_bidi::BidiClass::{AL, AN, FSI, LRE, LRI, LRO, PDF, PDI, R, RLE, RLI, RLO};
+    c == '\u{200E}'
+        || matches!(
+            unicode_bidi::bidi_class(c),
+            R | AL | AN | LRE | RLE | LRO | RLO | PDF | LRI | RLI | FSI | PDI
+        )
 }
 
 /// One glyph of a font.
@@ -3350,6 +3370,41 @@ mod tests {
             }
         }
         assert!(drew > 10, "{drew}");
+    }
+
+    /// Characters viewers may draw out of their order are those of right-to-left
+    /// scripts, Arabic digits and explicit direction marks; Latin, Cyrillic, Greek,
+    /// Han, European digits, punctuation and spaces are drawn in order.
+    #[test]
+    fn only_characters_viewers_may_reorder_are_refused() {
+        for c in [
+            '\u{5D0}',
+            '\u{5EA}',
+            '\u{628}',
+            '\u{661}',
+            '\u{700}',
+            '\u{FB1D}',
+            '\u{FE8F}',
+            '\u{10800}',
+            '\u{200E}',
+            '\u{200F}',
+            '\u{61C}',
+            '\u{202A}',
+            '\u{202B}',
+            '\u{202C}',
+            '\u{202D}',
+            '\u{202E}',
+            '\u{2066}',
+            '\u{2067}',
+            '\u{2068}',
+            '\u{2069}',
+        ] {
+            assert!(super::reordered(c), "{c:?}");
+        }
+        for c in "Az09 .,;!?()-+%$\u{E9}\u{416}\u{44F}\u{3B1}\u{6F22}\u{2014}\u{A0}\t\u{0}".chars()
+        {
+            assert!(!super::reordered(c), "{c:?}");
+        }
     }
 
     /// A font standing in for Helvetica (Liberation Sans here, whose advances are

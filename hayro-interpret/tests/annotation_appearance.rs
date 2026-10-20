@@ -4022,6 +4022,12 @@ fn across(quarters: u8, w: f64, h: f64, overlap: f64) -> String {
     format!("{x0} {y0} {x1} {y1}")
 }
 
+/// `text` as a PDF text string in UTF-16BE with its byte order mark, in hex.
+fn utf16(text: &str) -> String {
+    let hex: String = text.encode_utf16().map(|u| format!("{u:04X}")).collect();
+    format!("<FEFF{hex}>")
+}
+
 /// A point 30 beyond edge `quarters` of the 200 pt page (left, below, right, above),
 /// `onto` nearer, and a point across the page from it, 150 along, both on a line
 /// across the edge whose line from the page's origin crosses the page only where
@@ -4046,8 +4052,11 @@ fn beside(quarters: u8, onto: f64) -> [(f64, f64); 2] {
 /// ending lie beyond the page while their `/Rect` meets it; a polyline and a
 /// callout whose ending, at a point of no direction, lies beyond the page, their
 /// line on it; free text whose text cannot be set (a character no font has, rich
-/// text not reproduced), its fill and border on the page, the text's box beyond
-/// it; a text field whose value is a stream not reproduced, likewise; free text
+/// text not reproduced, right-to-left text), its fill and border on the page, the
+/// text's box beyond it; a text field whose value is a stream not reproduced, or
+/// right-to-left text, likewise; a line whose caption cannot be set, moved by `/CO`
+/// beyond the page, the line across it (bake draws the line, 320 px at 1 px/pt
+/// for the review's fixture: an offset caption breaks no line); free text
 /// whose line may break either way, its border on the page (moved across each edge
 /// rather than turned, which would change the room). A number not read as
 /// viewers read it may change all the annotation draws: it is refused where any of
@@ -4182,6 +4191,53 @@ fn a_part_that_cannot_be_drawn_is_refused_only_where_it_shows() {
             "Measure",
         ),
         (
+            "right-to-left rich text",
+            Box::new(move |q, dx| {
+                alone(format!(
+                    "/Subtype /FreeText /Rect [{}] /DA (/Helv 30 Tf 0 g) /C [0.8 0.8 1] \
+                     /BS << /W 3 >> /RC {}",
+                    turned_box(q, [-50.0 + dx, 40.0, 1.0 + dx, 140.0]),
+                    utf16(
+                        "<p style=\"font-family:Arial;font-size:30pt\">\u{5D0}\u{5D1}\u{5D2}\u{5D3}</p>"
+                    ),
+                ))
+            }),
+            60.0,
+            "generated",
+            "Bidi('\u{5D0}')",
+        ),
+        (
+            "right-to-left field",
+            Box::new(move |q, dx| {
+                alone(format!(
+                    "/Subtype /Widget /FT /Tx /Ff 4096 /T (a) /Rect [{}] /DA (/Helv 12 Tf 0 g) \
+                     /MK << /BC [0 0 1] /BG [0.8 0.8 1] >> /BS << /W 3 >> /V {}",
+                    turned_box(q, [-50.0 + dx, 40.0, 1.0 + dx, 80.0]),
+                    utf16("\u{5D0}\u{5D1}\u{5D2}\u{5D3}"),
+                ))
+            }),
+            60.0,
+            "generated",
+            "Bidi('\u{5D0}')",
+        ),
+        (
+            "caption",
+            Box::new(move |q, dx| {
+                // The caption moved by /CO beyond the edge, the line across the page:
+                // offset, it breaks no line.
+                alone(format!(
+                    "/Subtype /Line /L [{}] /Rect [{}] /C [1 0 0] /BS << /W 1 >> /Cap true \
+                     /CP /Top /CO [0 {}] /Contents <FEFF0000>",
+                    turned_points(q, &[(100.0, 20.0), (100.0, 180.0)]),
+                    turned_box(q, [90.0, 10.0, 110.0, 190.0]),
+                    150.0 + dx,
+                ))
+            }),
+            -150.0,
+            "generated",
+            "Character('\\0')",
+        ),
+        (
             "number",
             Box::new(move |q, dx| {
                 alone(format!(
@@ -4215,6 +4271,119 @@ fn a_part_that_cannot_be_drawn_is_refused_only_where_it_shows() {
             assert_eq!(near, *drawn, "{case} {q}: {annot}");
             assert_eq!(on, *refused, "{case} {q}: {moved}");
         }
+    }
+}
+
+/// An ending left out changes nothing else drawn: the box all of a polyline is
+/// clipped to is laid out from its values as when the ending is drawn. `PyMuPDF`
+/// 1.28.2 bake clips the polyline below, its first ending of no direction, to
+/// `/BBox [-50 80 190 170]` (the vertices' box out by twice the width), cutting the
+/// mitre of the corner at 160 150 at 170, and draws the same with the first segment
+/// 10 long, clipped to `[-50 45 190 170]`; 0 differing pixels from the split's at
+/// 4 px/pt. Of a line of no length whose ending has no direction, the box is the
+/// point out by twice the width, and by 12 more with `/Cap`: the ending drawn from
+/// the page's origin shows on the page under that box at 212 100 with `/Cap` (bake
+/// inks 48 px at 4 px/pt), and not without it, nor at 230 100.
+#[test]
+fn an_ending_left_out_changes_nothing_else() {
+    let polyline = |vertices: &str| {
+        content(
+            &format!(
+                "/Subtype /PolyLine /Rect [-60 40 200 200] /Vertices [{vertices}] /C [1 0 0] \
+                 /BS << /W 10 >> /LE [/OpenArrow /None]"
+            ),
+            vec![],
+        )
+    };
+    let lost = polyline("-30 100 -30 100 150 100 160 150 170 100");
+    assert!(lost.contains("-50 80 240 90 re\nW n"), "{lost}");
+    assert!(!lost.contains("-30 100 l\nS"), "{lost}");
+    let drawn = polyline("-30 100 -20 100 150 100 160 150 170 100");
+    assert!(drawn.contains("-50 45 240 125 re\nW n"), "{drawn}");
+    let line = |x: u32, cap: &str| {
+        look_of(&format!(
+            "/Subtype /Line /Rect [0 0 250 250] /L [{x} 100 {x} 100] /C [1 0 0] \
+             /BS << /W 1 >> /LE [/OpenArrow /None] {cap}"
+        ))
+    };
+    assert_eq!(line(212, "/Cap true /Contents (Hi)"), "Ending");
+    assert_eq!(line(212, ""), "nothing");
+    assert_eq!(line(230, "/Cap true /Contents (Hi)"), "nothing");
+}
+
+/// A caption that cannot be set refuses only what it can change: its own box, and,
+/// inline, the line where its gap may lie, and beyond that to the line's end where
+/// the line is dashed, as the dashes start anew after the gap. A caption at the
+/// middle of a line 500 long, which starts beyond the page's left edge: inline, its
+/// box and gap lie beyond the page, and the rest of the line is drawn as `PyMuPDF`
+/// 1.28.2 bake draws it (0 differing pixels at 4 px/pt); dashed, the dashes on the
+/// page may differ: refused.
+#[test]
+fn a_caption_that_cannot_be_set_refuses_only_what_it_changes() {
+    let line = |bs: &str, contents: &str| {
+        look_of(&format!(
+            "/Subtype /Line /Rect [-330 90 190 110] /L [-320 100 180 100] /C [1 0 0] \
+             /BS << /W 1 {bs} >> /Cap true /Contents {contents}"
+        ))
+    };
+    assert_eq!(line("", "<FEFF0000>"), "generated");
+    assert_eq!(line("/D [3 2]", "<FEFF0000>"), "Character('\\0')");
+    assert_eq!(line("/D [3 2]", "(TEST)"), "generated");
+}
+
+/// Text viewers may draw in an order other than its own is refused, in every kind
+/// of text, where it may show: `PyMuPDF` 1.28.2 bake draws Hebrew right to left,
+/// a run of it among Latin text reversed in place (the review's free text puts
+/// \u{5D0} \u{5D1} \u{5D2} \u{5D3} at x 52.24, 36.07, 24.76 and 10), and Arabic in
+/// its joining forms. Latin text and European digits are drawn.
+#[test]
+fn text_viewers_may_reorder_is_refused() {
+    let hebrew = "\u{5D0}\u{5D1}\u{5D2}\u{5D3}";
+    let free_text = |text: &str| {
+        look_of(&format!(
+            "/Subtype /FreeText /Rect [10 10 190 190] /DA (/Helv 12 Tf 0 g) /Contents {}",
+            utf16(text)
+        ))
+    };
+    let field = |flags: u32, text: &str| {
+        look_of(&format!(
+            "/Subtype /Widget /FT /Tx /Ff {flags} /MaxLen 8 /T (a) /Rect [10 10 190 190] \
+             /DA (/Helv 12 Tf 0 g) /V {}",
+            utf16(text)
+        ))
+    };
+    let line = |text: &str| {
+        look_of(&format!(
+            "/Subtype /Line /Rect [10 10 190 190] /L [20 100 180 100] /C [0] /Cap true \
+             /Contents {}",
+            utf16(text)
+        ))
+    };
+    let refused = "Bidi('\u{5D0}')";
+    for text in [hebrew, "a\u{5D0}\u{5D1}\u{5D2}\u{5D3}b"] {
+        assert_eq!(free_text(text), refused, "{text}");
+        // One line, many lines, a comb.
+        for flags in [0, 1 << 12, 1 << 24] {
+            assert_eq!(field(flags, text), refused, "{flags} {text}");
+        }
+        assert_eq!(line(text), refused, "{text}");
+    }
+    for text in [
+        "\u{628}\u{628}",
+        "\u{661}\u{662}",
+        "a\u{202E}bc\u{202C}d",
+        "a\u{200E}b",
+        "a\u{200F}b",
+        "a\u{2067}b\u{2069}",
+    ] {
+        let c = text.chars().find(|c| !c.is_ascii()).unwrap();
+        assert_eq!(free_text(text), format!("Bidi({c:?})"), "{text}");
+    }
+    // The fonts here have Latin alone; Cyrillic and Greek are classed in text.rs.
+    for text in ["Hello, 123!", "Caf\u{E9} \u{C0} la carte"] {
+        assert_eq!(free_text(text), "generated", "{text}");
+        assert_eq!(field(0, text), "generated", "{text}");
+        assert_eq!(line(text), "generated", "{text}");
     }
 }
 

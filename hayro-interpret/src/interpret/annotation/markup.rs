@@ -382,7 +382,8 @@ fn zigzag(q: &Quad, region: &Region, pen: &mut Run, out: &mut Out) -> Result<(),
         region: region.clone(),
     };
     // The steps `a..b`, which may paint where the page shows them, drawn as
-    // viewers draw them only by steps more than this draws: refused.
+    // viewers draw them only by steps more than this draws: refused, or left out
+    // where they cannot show, the steps after them drawn as given.
     let refuse = |a: f64, b: f64, out: &mut Out| {
         let hull = z.hull(z.t(a), z.t(b));
         let reach = z.reach(z.slack(&hull));
@@ -414,7 +415,7 @@ fn zigzag(q: &Quad, region: &Region, pen: &mut Run, out: &mut Out) -> Result<(),
             // Every corner as written lies in `region`: every step of some length
             // paints.
             if !pen.draw(&z, a, b, out) {
-                return refuse(a, b, out);
+                refuse(a, b, out)?;
             }
             continue;
         }
@@ -426,7 +427,8 @@ fn zigzag(q: &Quad, region: &Region, pen: &mut Run, out: &mut Out) -> Result<(),
                 let mid = ((a + b) / 2.0).floor();
                 // Past 2^53, neighbouring steps' numbers are no longer apart.
                 if !(a < mid && mid < b) {
-                    return refuse(a, b, out);
+                    refuse(a, b, out)?;
+                    continue;
                 }
                 ranges.push((mid, b));
                 ranges.push((a, mid));
@@ -439,7 +441,7 @@ fn zigzag(q: &Quad, region: &Region, pen: &mut Run, out: &mut Out) -> Result<(),
             pen.spend()
         };
         if !within {
-            return refuse(a, b, out);
+            refuse(a, b, out)?;
         }
     }
     if pen.until.is_some() {

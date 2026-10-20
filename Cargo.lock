@@ -756,6 +756,7 @@ dependencies = [
  "siphasher",
  "skrifa 0.46.0",
  "smallvec",
+ "unicode-bidi",
  "yoke",
 ]
 

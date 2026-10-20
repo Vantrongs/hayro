@@ -208,23 +208,26 @@ impl Ending {
         }
     }
 
-    /// The box viewers clip a free text callout to, which ends in this ending at
-    /// `tip`, arriving from `from`, drawn `width` wide, and holds `around` (the
-    /// box and the callout's points): with an arrow, butt or slash, all of it out
-    /// by the width as given; with a square, circle or diamond, `around` and the
-    /// shape out by its stroke (half the width, along a diagonal at the diamond's
-    /// corners); without an ending, `around`.
-    pub(super) fn callout_box(
+    /// The box viewers clip an annotation to that ends in this ending at `tip`,
+    /// arriving from `from`, drawn `width` wide, and holds `around` (what the
+    /// annotation draws before this ending): with an arrow, butt or slash, `around`
+    /// and the ending's shape out by `grow`, all of it then out by the width as
+    /// given; with a square, circle or diamond, `around` and the shape out by `grow`
+    /// and its stroke (half the width, along a diagonal at the diamond's corners);
+    /// without an ending, `around`. Of a free text callout and a polyline, `grow` is
+    /// 0; of a line, the width, at least 1 ([`point_clip`]).
+    pub(super) fn clip_box(
         self,
         tip: Point,
         from: Point,
         width: f64,
+        grow: f64,
         around: kurbo::Rect,
     ) -> kurbo::Rect {
         let Some((path, _)) = self.path(tip, from, width) else {
             return around;
         };
-        let shape = path.control_box();
+        let shape = path.control_box().inflate(grow, grow);
         match self {
             Self::Square | Self::Circle => around.union(shape.inflate(width / 2.0, width / 2.0)),
             Self::Diamond => {
@@ -281,11 +284,8 @@ impl Derived for Vertices {
 }
 
 /// `Polygon` and `PolyLine`: `/Vertices` joined, a polygon closed and filled with /IC,
-/// a polyline with its `/LE` endings at the first and last vertex.
-///
-/// Viewers clip a polygon, and a polyline without endings, to the bounds of its
-/// vertices out by the border width as given, cutting off the tip of a sharp
-/// mitred corner there, or, for a negative width, the shape's edges.
+/// a polyline with its `/LE` endings at the first and last vertex, clipped to
+/// [`poly_clip`].
 pub(super) fn poly(annot: &Entries<'_>, closed: bool, out: &mut Out) -> Drew {
     let derived = annot.items(b"Vertices").map(|i| i.derived::<Vertices>());
     let (vertices, bounds) = derived
@@ -294,84 +294,126 @@ pub(super) fn poly(annot: &Entries<'_>, closed: bool, out: &mut Out) -> Drew {
     let Some(bounds) = bounds.filter(|_| vertices.len() >= 2) else {
         return Ok(None);
     };
-    let endings = if closed {
+    let ends = poly_ends(annot, vertices, closed);
+    let w = border_width(annot);
+    let clip = poly_clip(bounds, w, &ends);
+    // Laid out from the values alone; an ending left out ([`ends_drawable`]) is not
+    // drawn, and changes nothing else.
+    let Some(drawn) = ends_drawable(
+        annot,
+        ends,
+        || corners(bounds).to_vec(),
+        (w >= 0.0).then_some(clip),
+        out,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(draw_poly(annot, vertices, clip, closed, ends, drawn, out))
+}
+
+/// The endings of a polyline with vertices `vertices` (two or more), each at its
+/// tip arriving from a vertex; none of a polygon.
+fn poly_ends(annot: &Entries<'_>, vertices: &[Point], closed: bool) -> [(Ending, Point, Point); 2] {
+    let [first, last] = if closed {
         [Ending::None; 2]
     } else {
         Ending::of(annot)
     };
     let n = vertices.len();
-    let drawn = ends_drawable(
-        annot,
-        [
-            (endings[0], vertices[0], vertices[1]),
-            (endings[1], vertices[n - 1], vertices[n - 2]),
-        ],
-        || corners(bounds).to_vec(),
-        bounds,
-        out,
-    )?;
-    if !drawn {
-        return Ok(None);
-    }
-    Ok(draw_poly(annot, vertices, bounds, closed, endings, out))
+    [
+        (first, vertices[0], vertices[1]),
+        (last, vertices[n - 1], vertices[n - 2]),
+    ]
 }
 
-/// [`Unsupported::Ending`], refused where it may show ([`Out::refuse`]), when a
-/// line or polyline draws an ending, each at its tip arriving from a point, whose
-/// content viewers clip to a box they compute by rules not reproduced:
+/// The box viewers clip a polygon or polyline `w` wide to, of the box of its
+/// vertices `bounds`, with endings `ends`: that box out by the width as given, then
+/// each ending's [`Ending::clip_box`], the first first. This cuts off the tip of a
+/// sharp mitred corner, or, for a negative width, the shape's edges (observed in
+/// `PyMuPDF` 1.28.2: bake's `/BBox` to the bit for 600 polylines of 2 to 4 random
+/// vertices, a third with a first segment of no length, at widths 0 to 7 with each
+/// pair of endings).
+fn poly_clip(bounds: kurbo::Rect, w: f64, ends: &[(Ending, Point, Point); 2]) -> kurbo::Rect {
+    ends.iter()
+        .fold(bounds.inflate(w, w), |b, (ending, tip, from)| {
+            ending.clip_box(*tip, *from, w, 0.0, b)
+        })
+}
+
+/// The box viewers clip a `Line` of no length at `tip`, `w` wide (not negative),
+/// with endings `ends`, to: the point out by the width, at least 1, and by 12 more
+/// with `/Cap` (`cap`), whatever the caption; then each ending's
+/// [`Ending::clip_box`], its shape out by the width, at least 1 (observed in
+/// `PyMuPDF` 1.28.2: bake's `/BBox` to the bit for 500 lines of no length at widths
+/// 0 to 7, with each pair of endings, with and without `/Cap`, `/CO` and `/CP`).
+fn point_clip(tip: Point, w: f64, cap: bool, ends: &[(Ending, Point, Point); 2]) -> kurbo::Rect {
+    let grow = w.max(1.0);
+    let base = grow + if cap { f64::from(CAPTION_SIZE) } else { 0.0 };
+    let around = kurbo::Rect::from_points(tip, tip).inflate(base, base);
+    ends.iter().fold(around, |b, (ending, tip, from)| {
+        ending.clip_box(*tip, *from, w, grow, b)
+    })
+}
+
+/// Which endings of a line or polyline, each at its tip arriving from a point, are
+/// drawn as given ([`Unsupported::Ending`] refused where it may show, [`Out::refuse`],
+/// for the others), when its content is clipped to `clip` where that is known:
 ///
-/// - at a negative border width, where the box shrinks and a closed ending widens
-///   it, showing more of the line anywhere along it: viewers draw all of it within
-///   the box of the points `body` gives and the endings' shapes ([`Ending::ink`]),
-///   and nothing beyond (observed in `PyMuPDF` 1.28.2: at widths -0.5 to -10, a
-///   polyline's ink lies 10 widths inside the box of its vertices without a closed
-///   ending, and beyond it only as far as such an ending's shape). Refused where
-///   that box may show; nothing is drawn where it cannot: `false`;
-/// - for an ending laid along or across a line of no length, whose points they put
-///   at the page's origin: what may differ is where [`lost_part`] says, in the box
-///   [`lost_box`] makes of `points`, the box of the annotation's points; the rest
-///   is drawn as given.
+/// - an ending laid along or across a line of no length, whose points viewers put at
+///   the page's origin, is never drawn: what may differ is where [`lost_part`] says
+///   under `clip`, or, without one, along all its line from the origin; the rest is
+///   drawn as given;
+/// - at a negative border width with an ending, where the box viewers clip to
+///   shrinks and a closed ending widens it, showing more of the line anywhere along
+///   it: viewers draw all of it within the box of the points `body` gives and the
+///   endings' shapes ([`Ending::ink`]), and nothing beyond (observed in `PyMuPDF`
+///   1.28.2: at widths -0.5 to -10, a polyline's ink lies 10 widths inside the box of
+///   its vertices without a closed ending, and beyond it only as far as such an
+///   ending's shape). Refused where that box may show; nothing is drawn where it
+///   cannot: `None`.
 ///
-/// `true` where the rest is drawn as given.
+/// Whether an ending is left out changes nothing else drawn: the clip and the rest
+/// are laid out from the annotation's values alone.
 pub(super) fn ends_drawable(
     annot: &Entries<'_>,
     ends: [(Ending, Point, Point); 2],
     body: impl FnOnce() -> Vec<Point>,
-    points: kurbo::Rect,
+    clip: Option<kurbo::Rect>,
     out: &mut Out,
-) -> Result<bool, Refused> {
-    if color_of(annot, C).is_none() && color_of(annot, IC).is_none() {
-        return Ok(true);
-    }
+) -> Result<Option<[bool; 2]>, Refused> {
+    let painted = color_of(annot, C).is_some() || color_of(annot, IC).is_some();
     let w = border_width(annot);
-    let drawn = ends.iter().filter(|(e, _, _)| *e != Ending::None);
-    for (_, tip, _) in drawn
-        .clone()
-        .filter(|(e, tip, from)| e.lost_at(*tip, *from))
-    {
-        out.refuse(Unsupported::Ending, lost_part(*tip, w, lost_box(points, w)))?;
+    let mut drawn = [false; 2];
+    for (draws, (ending, tip, from)) in drawn.iter_mut().zip(&ends) {
+        let lost = ending.lost_at(*tip, *from);
+        *draws = *ending != Ending::None && !lost;
+        if lost && painted {
+            out.refuse(Unsupported::Ending, lost_part(*tip, w, clip))?;
+        }
     }
-    if w < 0.0 && drawn.clone().next().is_some() {
+    let any = ends.iter().filter(|(e, _, _)| *e != Ending::None);
+    if painted && w < 0.0 && any.clone().next().is_some() {
         let body = body();
-        let all = drawn
+        let all = any
             .filter_map(|(ending, tip, from)| ending.ink(*tip, *from, w))
             .chain(body.iter().map(|p| kurbo::Rect::from_points(*p, *p)))
             .reduce(|a, b| a.union(b));
         if let Some(all) = all {
             out.refuse(Unsupported::Ending, Part::rect(all))?;
         }
-        return Ok(false);
+        return Ok(None);
     }
-    Ok(true)
+    Ok(Some(drawn))
 }
 
 /// Where an ending of no direction at `tip`, of a line `w` wide, may change what
-/// viewers draw, who clip the annotation to `within`: they draw it from the page's
-/// origin to its tip and back (observed: an open arrow at 50 60 is
-/// `0 0 m 50 60 l 0 0 l`), with butt ends, within half its width, at least a half,
-/// of that line (observed in `PyMuPDF` 1.28.2 at widths 0.25 to 10: past the tip by
-/// 0.375 widths along each axis of a line at 45 degrees).
-pub(super) fn lost_part(tip: Point, w: f64, within: kurbo::Rect) -> Part {
+/// viewers draw, who clip the annotation to `within` where that is known: they draw
+/// it from the page's origin to its tip and back (observed: an open arrow at 50 60
+/// is `0 0 m 50 60 l 0 0 l`), with butt ends, within half its width, at least a
+/// half, of that line (observed in `PyMuPDF` 1.28.2 at widths 0.25 to 10: past the
+/// tip by 0.375 widths along each axis of a line at 45 degrees).
+pub(super) fn lost_part(tip: Point, w: f64, within: Option<kurbo::Rect>) -> Part {
     let half = w.abs().max(1.0) / 2.0;
     let across = direction(tip.to_vec2());
     let across = Vec2::new(-across.y, across.x) * half;
@@ -381,39 +423,31 @@ pub(super) fn lost_part(tip: Point, w: f64, within: kurbo::Rect) -> Part {
         tip - across,
         Point::ORIGIN - across,
     ];
-    Part::near(band.to_vec(), 0.0).under(within)
-}
-
-/// The box viewers clip a line or polyline with an ending of no direction to, of
-/// the box of its points `points`, drawn `w` wide: that box out by twice the width,
-/// at least 2 (observed in `PyMuPDF` 1.28.2 at widths 0.25 to 10, of arrows of each
-/// kind: what such an ending changes lies within 2 widths, at least 1.5, of the box
-/// of a polyline's vertices or of a line's point).
-fn lost_box(points: kurbo::Rect, w: f64) -> kurbo::Rect {
-    let c = 2.0 * w.abs().max(1.0);
-    points.inflate(c, c)
+    let part = Part::near(band.to_vec(), 0.0);
+    match within {
+        Some(within) => part.under(within),
+        None => part,
+    }
 }
 
 fn draw_poly(
     annot: &Entries<'_>,
     vertices: &[Point],
-    bounds: kurbo::Rect,
+    clip: kurbo::Rect,
     closed: bool,
-    endings: [Ending; 2],
+    ends: [(Ending, Point, Point); 2],
+    drawn: [bool; 2],
     out: &mut Out,
 ) -> Option<()> {
     let stroke = color_of(annot, C);
     let fill = color_of(annot, IC);
-    let ends = endings.iter().any(|e| *e != Ending::None);
+    let any = ends.iter().any(|(e, _, _)| *e != Ending::None);
     // A polygon draws with either colour; of a polyline, only a stroke draws the
     // line, and a fill only its endings: without them, nothing is drawn.
-    if stroke.is_none() && (if closed { fill.is_none() } else { !ends }) {
+    if stroke.is_none() && (if closed { fill.is_none() } else { !any }) {
         return None;
     }
-    if closed || !ends {
-        let w = border_width(annot);
-        out.clip(bounds.inflate(w, w))?;
-    }
+    out.clip(clip)?;
     if closed {
         if let Some(stroke) = &stroke {
             out.stroke_color(stroke)?;
@@ -436,27 +470,40 @@ fn draw_poly(
         polyline(vertices, out)?;
         out.op("S");
     }
-    let [first, last] = endings;
-    let n = vertices.len();
-    ending(first, vertices[0], vertices[1], &paint, out)?;
-    ending(last, vertices[n - 1], vertices[n - 2], &paint, out)
+    draw_ends(ends, drawn, &paint, out)
+}
+
+/// The endings `ends` of which `drawn` says they are drawn.
+fn draw_ends(
+    ends: [(Ending, Point, Point); 2],
+    drawn: [bool; 2],
+    paint: &Paint,
+    out: &mut Out,
+) -> Option<()> {
+    for ((e, tip, from), draws) in ends.into_iter().zip(drawn) {
+        if draws {
+            ending(e, tip, from, paint, out)?;
+        }
+    }
+    Some(())
 }
 
 /// Where a `Polygon` or `PolyLine` ([`poly`]) may paint: within the reach returned
-/// of the box returned; `None` for fewer than two vertices, which draw nothing.
+/// of the box returned; `None` for fewer than two vertices, which draw nothing. All
+/// it draws is clipped to [`poly_clip`]; at a negative width with an ending, it may
+/// draw as far as an ending reaches ([`ends_drawable`]).
 pub(super) fn poly_extent(annot: &Entries<'_>, closed: bool) -> Option<(kurbo::Rect, f64)> {
     let vertices = annot.items(b"Vertices")?.derived::<Vertices>();
     let bounds = vertices.1.filter(|_| vertices.0.len() >= 2)?;
     let w = border_width(annot);
-    // Viewers clip a polygon, or a polyline without endings, to the bounds of
-    // its vertices out by the border width as given ([`draw_poly`]); a polyline's
-    // endings reach beyond them.
-    let ends = !closed && Ending::of(annot).iter().any(|e| *e != Ending::None);
-    Some(if ends {
-        (bounds, stroke_reach(w).max(ending_reach(w)))
-    } else {
-        (bounds.inflate(w, w), 0.0)
-    })
+    let ends = poly_ends(annot, &vertices.0, closed);
+    Some(
+        if w < 0.0 && ends.iter().any(|(e, _, _)| *e != Ending::None) {
+            (bounds, stroke_reach(w).max(ending_reach(w)))
+        } else {
+            (poly_clip(bounds, w, &ends), 0.0)
+        },
+    )
 }
 
 /// How far from its tip an ending of a line `width` wide may paint, its stroke
@@ -528,40 +575,78 @@ impl Layout {
         drawn
     }
 
-    /// Where the caption of `annot` may lie, `bytes` bytes of `/Contents`: in the
-    /// line's frame, as each byte a glyph at most 2 em wide, at 12 pt, from the
-    /// line's middle moved by `/CO`, between 2 em above the highest baseline viewers
-    /// set it on and 1 em below the lowest; turned any way about the line's start
-    /// where the line has no direction.
-    fn caption(&self, annot: &Entries<'_>, bytes: usize) -> [Point; 4] {
-        const SIZE: f64 = 12.0;
-        let width = bytes as f64 * 2.0 * SIZE;
+    /// Where viewers set the caption of `annot` in the line's frame, from its values
+    /// alone: without an offset (`/CO`, 0 for a number it lacks), inline or on top
+    /// as `/CP` says; with one, moved by it from the line's middle, below the line
+    /// when it moves down, whatever `/CP` says.
+    fn caption_place(&self, annot: &Entries<'_>) -> CaptionPlace {
+        let size = f64::from(CAPTION_SIZE);
         let co = annot.numbers(b"CO", 2).unwrap_or_else(|| vec![0.0; 2]);
         let mid = self.len / 2.0 + co[0];
-        let (x0, x1) = (mid - width / 2.0 - SIZE, mid + width / 2.0 + SIZE);
-        // The baseline: `/CO`'s rise, or a size below it where that is negative;
-        // 0.2 em above the line on top, 0.3 em below it inline.
-        let lowest = (co[1] - SIZE).min(-0.3 * SIZE);
-        let highest = co[1].max(0.2 * SIZE);
-        let (y0, y1) = (lowest - SIZE, highest + 2.0 * SIZE);
+        let (rise, inline) = if co[0] != 0.0 || co[1] != 0.0 {
+            (if co[1] < 0.0 { co[1] - size } else { co[1] }, false)
+        } else if annot.is(b"CP", b"Top") {
+            (0.2 * size, false)
+        } else {
+            (-0.3 * size, true)
+        };
+        CaptionPlace { mid, rise, inline }
+    }
+
+    /// Where the caption of `annot` may lie, `bytes` bytes of `/Contents`: in the
+    /// line's frame, as each byte a glyph at most 2 em wide, centred on where it is
+    /// set ([`Layout::caption_place`]), from 1 em below its baseline to 2 em above;
+    /// turned any way about the line's start where the line has no direction.
+    fn caption(&self, annot: &Entries<'_>, bytes: usize) -> [Point; 4] {
+        let size = f64::from(CAPTION_SIZE);
+        let width = bytes as f64 * 2.0 * size;
+        let CaptionPlace { mid, rise, .. } = self.caption_place(annot);
+        let (x0, x1) = (mid - width / 2.0 - size, mid + width / 2.0 + size);
+        let (y0, y1) = (rise - size, rise + 2.0 * size);
         let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(|(x, y)| Point::new(x, y));
         if self.len > 0.0 {
-            let dir = Vec2::new(self.normal.y, -self.normal.x);
-            let frame = Affine::new([
-                dir.x,
-                dir.y,
-                self.normal.x,
-                self.normal.y,
-                self.la.x,
-                self.la.y,
-            ]);
-            corners.map(|p| frame * p)
+            corners.map(|p| self.frame() * p)
         } else {
             let r = corners
                 .iter()
                 .fold(0.0_f64, |r, p| r.max(p.to_vec2().hypot()));
             [(-r, -r), (r, -r), (r, r), (-r, r)].map(|(x, y)| self.la + Vec2::new(x, y))
         }
+    }
+
+    /// The line's frame: along it from `la`, and across it along `normal`.
+    fn frame(&self) -> Affine {
+        let dir = Vec2::new(self.normal.y, -self.normal.x);
+        Affine::new([
+            dir.x,
+            dir.y,
+            self.normal.x,
+            self.normal.y,
+            self.la.x,
+            self.la.y,
+        ])
+    }
+
+    /// Where a caption of `annot`, `bytes` bytes of `/Contents`, that cannot be set
+    /// may make viewers draw otherwise, as far as `paint` strokes the line: in the
+    /// caption's box ([`Layout::caption`]), and, inline, on the line where its gap
+    /// may lie, and beyond it to the line's end where the line is dashed, as the
+    /// dashes start anew after the gap ([`line`]). With an offset or on top, the
+    /// caption breaks no line.
+    fn failed_caption(&self, annot: &Entries<'_>, bytes: usize, paint: &Paint) -> Part {
+        let mut points = self.caption(annot, bytes).to_vec();
+        let place = self.caption_place(annot);
+        if place.inline && paint.stroke.is_some() && self.len > 0.0 {
+            let half = bytes as f64 * f64::from(CAPTION_SIZE) + 3.0;
+            let to = if paint.dash.is_empty() {
+                place.mid + half
+            } else {
+                self.len
+            };
+            let at = |t: f64| self.frame() * Point::new(t.clamp(0.0, self.len), 0.0);
+            points.extend([at(place.mid - half), at(to)]);
+        }
+        Part::near(points, stroke_reach(paint.width))
     }
 
     /// Of `Line` `annot`, the points of what it strokes and of its caption with
@@ -574,6 +659,18 @@ impl Layout {
         drawn
     }
 }
+
+/// Where viewers set a line's caption ([`Layout::caption_place`]): centred on `mid`
+/// along the line, its baseline `rise` above it, and whether it is inline, breaking
+/// the line.
+struct CaptionPlace {
+    mid: f64,
+    rise: f64,
+    inline: bool,
+}
+
+/// The size viewers set a line's caption in.
+const CAPTION_SIZE: f32 = 12.0;
 
 /// Where a `Line` ([`line`]) may paint: within the reach returned of the points
 /// returned. Those of the line moved by its leader line, at its ends, and of the
@@ -605,7 +702,9 @@ fn polyline(points: &[Point], out: &mut Out) -> Option<()> {
 /// `Line`: `/L` stroked in /C, moved off its points by a leader line (`/LL`, `/LLE`,
 /// `/LLO`), with its `/LE` endings and, with `/Cap`, `/Contents` as a caption in
 /// 12 pt Helvetica on one line, its line breaks as spaces as common viewers set it:
-/// inline, the line broken around it, or on top (`/CP`), moved by `/CO`.
+/// inline, the line broken around it, or on top (`/CP`), moved by `/CO`. A line of
+/// no length is clipped to [`point_clip`]; the box viewers clip others to is not
+/// reproduced.
 pub(super) fn line<'a>(
     annot: &Entries<'a>,
     doc: &Appearances<'a>,
@@ -631,27 +730,26 @@ pub(super) fn line<'a>(
         return Ok(None);
     }
     let [first, last] = Ending::of(annot);
-    let drawn = ends_drawable(
-        annot,
-        [(first, la, lb), (last, lb, la)],
-        || layout.body(annot),
-        kurbo::Rect::from_points(la, lb),
-        out,
-    )?;
-    if !drawn {
+    let ends = [(first, la, lb), (last, lb, la)];
+    let w = border_width(annot);
+    let caption = annot.bool(b"Cap").unwrap_or(false);
+    let clip = (len == 0.0 && w >= 0.0).then(|| point_clip(la, w, caption, &ends));
+    // Laid out from the values alone; an ending or a caption left out changes
+    // nothing else drawn.
+    let Some(drawn) = ends_drawable(annot, ends, || layout.body(annot), clip, out)? else {
         return Ok(None);
-    }
+    };
+    // Read only where the line is drawn.
+    let paint = Paint::of(annot);
 
     // The caption, laid out first: an inline one breaks the line. Its text, on one
     // line, is set once for the document, and only what the page shows of it drawn.
-    let caption = annot.bool(b"Cap").unwrap_or(false);
     let mut gap = None;
     // Where viewers may break the line for the gap or not otherwise than the gap
     // here does: the part of the line between where they may start and end it.
     let mut undecided = None;
     let mut caption_text = None;
     if caption {
-        const SIZE: f32 = 12.0;
         let source = annot.source(Text::Contents.key());
         let text = doc.plain(source, Family::Sans.into(), CAPTION, || {
             Ok(annot
@@ -660,32 +758,23 @@ pub(super) fn line<'a>(
                 .map(|c| c.replace("\r\n", " ").replace(['\r', '\n'], " "))
                 .unwrap_or_default())
         });
-        // Text that cannot be set may lie anywhere in the caption's box and break
-        // the line anywhere along it: left out where neither may show.
+        // Text that cannot be set may lie anywhere in the caption's box and, inline,
+        // break the line anywhere it may: left out where neither may show.
         let text = out.part(text, || {
-            Part::near(layout.body(annot), stroke_reach(border_width(annot)))
+            layout.failed_caption(annot, annot.text_len(Text::Contents), &paint)
         })?;
         if let Some(text) = text.filter(|t| !t.is_blank()) {
-            let width = f64::from(text.width(0..text.len(), SIZE) as f32);
-            let top = annot.is(b"CP", b"Top");
-            // As viewers place it: without an offset (`/CO`, 0 for a number it lacks),
-            // inline or on top as `/CP` says; with one, moved by it from the line's
-            // middle, below the line when it moves down, whatever `/CP` says.
-            let co = annot.numbers(b"CO", 2).unwrap_or_else(|| vec![0.0; 2]);
-            let size = f64::from(SIZE);
-            let mid = len / 2.0 + co[0];
-            let rise = if co[0] != 0.0 || co[1] != 0.0 {
-                if co[1] < 0.0 { co[1] - size } else { co[1] }
-            } else if top {
-                0.2 * size
-            } else {
+            let width = f64::from(text.width(0..text.len(), CAPTION_SIZE) as f32);
+            let CaptionPlace { mid, rise, inline } = layout.caption_place(annot);
+            if inline {
                 let (g0, g1) = (mid - width / 2.0 - 3.0, mid + width / 2.0 + 3.0);
                 // Whether the gap breaks the line, or the line is drawn whole, is
                 // told from the caption's advance, which viewers add up in their
                 // own order: where an end of the gap lies within how far that and
                 // the line's length and middle may round of an end of the line,
                 // which they draw cannot be told.
-                let margin = text::aligned(&text, 0..text.len(), SIZE, mid, len)
+                let co = annot.numbers(b"CO", 2).unwrap_or_else(|| vec![0.0; 2]);
+                let margin = text::aligned(&text, 0..text.len(), CAPTION_SIZE, mid, len)
                     .plus(Rounding::of(8.0, len.abs() + co[0].abs() + 3.0))
                     .bound()
                     .x;
@@ -694,14 +783,11 @@ pub(super) fn line<'a>(
                     undecided = Some((at(g0 - margin), at(g1 + margin)));
                 }
                 gap = Some((g0, g1));
-                -0.3 * size
-            };
+            }
             caption_text = Some((text, mid - width / 2.0, rise));
         }
     }
 
-    // Read only where the line is drawn.
-    let paint = Paint::of(annot);
     if let Some((from, to)) = undecided
         && paint.stroke.is_some()
     {
@@ -716,23 +802,24 @@ pub(super) fn line<'a>(
             Part::near(differ, stroke_reach(paint.width)),
         )?;
     }
-    let drawn = draw_line(
+    let drew = draw_line(
         &paint,
         [a, b],
         [la, lb],
         normal,
         [ll, lle, llo, sign],
         gap,
-        annot,
+        clip,
+        (ends, drawn),
         out,
     );
-    out.wrote(drawn)?;
+    out.wrote(drew)?;
     if let Some((text, x, rise)) = caption_text {
         out.op("0 g");
         let dir = direction(lb - la);
         let frame = Affine::new([dir.x, dir.y, normal.x, normal.y, la.x, la.y]);
         let set = Setting {
-            base: 12.0,
+            base: CAPTION_SIZE,
             color: Color::Gray(0.0),
             align: Align::Left,
         };
@@ -749,7 +836,8 @@ pub(super) fn line<'a>(
     Ok(Some(()))
 }
 
-/// Draws a line from its layout (see [`line`]).
+/// Draws a line from its layout (see [`line`]), clipped to `clip` where known, with
+/// the endings `ends` of which `drawn` says they are drawn.
 #[allow(clippy::too_many_arguments)]
 fn draw_line(
     paint: &Paint,
@@ -758,11 +846,15 @@ fn draw_line(
     normal: Vec2,
     [ll, lle, llo, sign]: [f64; 4],
     gap: Option<(f64, f64)>,
-    annot: &Entries<'_>,
+    clip: Option<kurbo::Rect>,
+    (ends, drawn): ([(Ending, Point, Point); 2], [bool; 2]),
     out: &mut Out,
 ) -> Option<()> {
     let len = (lb - la).hypot();
     let dir = direction(lb - la);
+    if let Some(clip) = clip {
+        out.clip(clip)?;
+    }
     paint.start(out)?;
     if ll != 0.0 {
         for p in [a, b] {
@@ -786,8 +878,5 @@ fn draw_line(
         }
     }
     out.op(paint.stroke_op());
-    let [first, last] = Ending::of(annot);
-    ending(first, la, lb, paint, out)?;
-    ending(last, lb, la, paint, out)?;
-    Some(())
+    draw_ends(ends, drawn, paint, out)
 }

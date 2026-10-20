@@ -52,6 +52,7 @@ foldhash = { version = "0.2", default-features = false, features = ["std"] }
 siphasher = "1"
 skrifa = { version = "0.46.0" }
 smallvec = { version = "1" }
+unicode-bidi = { version = "0.3.18", default-features = false, features = ["hardcoded-data"] }
 yoke = { version = "0.8" }
 pdf-writer = { version = "0.15" }
 xmlwriter = { version = "0.1" }

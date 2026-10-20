@@ -146,6 +146,11 @@ pub enum Unsupported {
     Kind,
     /// Its text has a character none of the fonts has.
     Character(char),
+    /// Its text has a character viewers lay out right to left, or that sets the
+    /// direction text runs in (a right-to-left letter or Arabic digit, or an
+    /// explicit direction mark, embedding, override or isolate), which viewers
+    /// reorder by rules the generator does not reproduce.
+    Bidi(char),
     /// A coordinate it draws at is too large to write: 2^23 or more, where the
     /// 32-bit numbers content streams are read in are a unit or more apart.
     Coordinates,
