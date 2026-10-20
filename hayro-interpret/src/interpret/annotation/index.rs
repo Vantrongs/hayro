@@ -252,7 +252,8 @@ mod tests {
     /// annotation's, and whether it may meet what shows at its reach and
     /// rounding. Of generated parts, clustered, spread, far off, some copies of
     /// others, some of a point no finite number; under generated views, turns
-    /// and clips. Fewer nodes and parts are looked at than all.
+    /// and clips. Fewer nodes and parts are looked at than all, and the tree is
+    /// made only for a second search.
     #[test]
     fn the_tree_finds_the_parts_a_test_of_each_finds() {
         let mut seed = 0x6c07_8965_6e1a_0f3d_u64;
@@ -315,8 +316,11 @@ mod tests {
                         .filter(|&i| parts[i].as_ref().is_some_and(near))
                         .collect();
                     let before = super::super::work_done();
+                    let first = !index.searched.get();
                     let found = index.find(near, |_| true);
                     assert_eq!(found, each, "case {case}");
+                    // A search made once makes no tree.
+                    assert_eq!(index.nodes.get().is_none(), first, "case {case}");
                     looked += super::super::work_done() - before;
                     all += n as u64;
                     found_any += usize::from(!found.is_empty());
