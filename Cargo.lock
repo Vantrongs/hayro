@@ -633,8 +633,7 @@ dependencies = [
 [[package]]
 name = "glifo"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f1218dedd5348c1b166ec3b8b3cbca49d2f527bd43b3fa072ea5123c523ed3f"
+source = "git+https://github.com/Vantrongs/vello?rev=0d81a2f77a52feff246eb8807093cc45cf78496e#0d81a2f77a52feff246eb8807093cc45cf78496e"
 dependencies = [
  "bytemuck",
  "foldhash",
@@ -1141,6 +1140,25 @@ name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
+
+[[package]]
+name = "num-bigint"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93e7820bc0a80a0238e650327316f929ba18d5be054b647490a3a6a339f3e7c0"
+dependencies = [
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
+name = "num-integer"
+version = "0.1.47"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ce2d95d4b3734dc35aa2f45e1aa22cd416814592a4f9d9205e11affd5b8e10b"
+dependencies = [
+ "num-traits",
+]
 
 [[package]]
 name = "num-traits"
@@ -1972,8 +1990,7 @@ dependencies = [
 [[package]]
 name = "vello_common"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73c2fbe53548bcd25c8ff42f75a93770a8611a16b37bee56d7ef7b44e36027f1"
+source = "git+https://github.com/Vantrongs/vello?rev=0d81a2f77a52feff246eb8807093cc45cf78496e#0d81a2f77a52feff246eb8807093cc45cf78496e"
 dependencies = [
  "bytemuck",
  "fearless_simd 0.7.0",
@@ -1988,12 +2005,14 @@ dependencies = [
 [[package]]
 name = "vello_cpu"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed1fec424fbba6acf6cbc78bb526447eb77590d95f40419d598870fe37535212"
+source = "git+https://github.com/Vantrongs/vello?rev=0d81a2f77a52feff246eb8807093cc45cf78496e#0d81a2f77a52feff246eb8807093cc45cf78496e"
 dependencies = [
  "bytemuck",
  "glifo",
  "hashbrown",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
  "png",
  "vello_common",
 ]
@@ -2345,7 +2364,7 @@ dependencies = [
 [[package]]
 name = "zlib-rs"
 version = "0.6.8"
-source = "git+https://github.com/Vantrongs/zlib-rs?rev=7a2aa9db8aaefe950749789b4cb42217744c7b67#7a2aa9db8aaefe950749789b4cb42217744c7b67"
+source = "git+https://github.com/Vantrongs/zlib-rs?rev=124359709a6ed94bda6fe1ff4d413e23bbae34e5#124359709a6ed94bda6fe1ff4d413e23bbae34e5"
 
 [[package]]
 name = "zmij"
@@ -2362,7 +2381,7 @@ checksum = "d56377fd46368984a170bc5aac5567e52ca5da874caa60bea39fcbca78fb658b"
 [[package]]
 name = "zune-jpeg"
 version = "0.5.15"
-source = "git+https://github.com/Vantrongs/zune-image?rev=67bcb66dcd6f027b9f84d9fdf3d404b5c28cfa71#67bcb66dcd6f027b9f84d9fdf3d404b5c28cfa71"
+source = "git+https://github.com/Vantrongs/zune-image?rev=d8686cc29483a83c84ba681d6b7467fd3545e616#d8686cc29483a83c84ba681d6b7467fd3545e616"
 dependencies = [
  "memchr",
  "zune-core",
