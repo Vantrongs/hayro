@@ -54,7 +54,7 @@ pub(super) fn icon(annot: &Entries<'_>, kind: Icon, fonts: &Fonts, out: &mut Out
         out.nums(&place.as_coeffs(), "cm")?;
         out.fill_color(&fill)?;
         out.op("0 G");
-        out.stroke_state(1.25, &[])?;
+        out.stroke_state(1.25, None)?;
         out.nums(&[0.625, 0.625, 18.75, 18.75], "re")?;
         out.op("b");
         Some(())
@@ -357,7 +357,7 @@ pub(super) fn redact(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
         out.op("q");
         out.clip(clip)?;
         out.op("1 0 0 RG");
-        out.stroke_state(1.0, &[])?;
+        out.stroke_state(1.0, None)?;
         out.nums(&[inner.x0, inner.y0, inner.width(), inner.height()], "re")?;
         out.op("S");
         out.op("Q");
@@ -366,7 +366,7 @@ pub(super) fn redact(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     out.op("q");
     out.clip(clip)?;
     out.op("1 0 0 RG");
-    out.stroke_state(1.0, &[])?;
+    out.stroke_state(1.0, None)?;
     let (region, reach) = (out.region(), out.reach(true));
     // Each 1 pt wide.
     let shown = shown(&items, Pieces::Redact, &region, || {
@@ -473,7 +473,7 @@ pub(super) fn stamp<'a>(
         * Affine::scale(scale);
     out.writes(|out| {
         out.stroke_color(&color)?;
-        out.stroke_state(2.0 * scale, &[])?;
+        out.stroke_state(2.0 * scale, None)?;
         let corners = [(-93.0, -22.0), (93.0, -22.0), (93.0, 22.0), (-93.0, 22.0)]
             .map(|(x, y)| at * Point::new(x, y));
         out.nums(&[corners[0].x, corners[0].y], "m")?;

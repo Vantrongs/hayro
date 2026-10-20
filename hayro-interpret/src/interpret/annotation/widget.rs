@@ -679,7 +679,7 @@ fn comb_dividers(cells: i64, fw: f64, fh: f64, w: f64, out: &mut Out) -> Result<
         return out.refuse(Unsupported::Coordinates, Part::Anywhere);
     }
     out.writes(|out| {
-        out.stroke_state(w, &[])?;
+        out.stroke_state(w, None)?;
         for k in 0..(end - first) as u64 {
             let i = first + k as f64;
             let (u, place) = (u(i), place(i));
@@ -732,7 +732,7 @@ fn frame(
     }
     if let Some(bc) = border {
         out.stroke_color(&bc)?;
-        out.stroke_state(w, &[])?;
+        out.stroke_state(w, None)?;
         let b = r.inset(-w / 2.0);
         out.nums(&[b.x0, b.y0, b.width(), b.height()], "re")?;
         out.op("S");
@@ -760,7 +760,7 @@ fn radio(
     }
     if let Some(bc) = border {
         out.stroke_color(&bc)?;
-        out.stroke_state(w, &[])?;
+        out.stroke_state(w, None)?;
         disc(half - w / 2.0, out)?;
         out.op("S");
     }

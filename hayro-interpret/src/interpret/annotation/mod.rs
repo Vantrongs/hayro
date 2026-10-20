@@ -1377,13 +1377,20 @@ fn border_width(annot: &Entries<'_>) -> f64 {
 /// else the fourth `/Border` element, each entry in its place: viewers write it
 /// into the appearance as it is, however long, with 0 for an entry that is not a
 /// number, and draw a pattern that is all zeros or has negative entries as their
-/// renderer draws it.
-fn dash(annot: &Entries<'_>) -> Vec<f64> {
+/// renderer draws it. `None` for none. Made once for the document from each array
+/// ([`out::Dash`]).
+fn dash(annot: &Entries<'_>) -> Option<Rc<out::Dash>> {
     let items = annot
         .dict(BS)
         .and_then(|bs| bs.items(D))
         .or_else(|| annot.items(BORDER).and_then(|b| b.get(3).items()));
-    items.map(|a| a.numbers()).unwrap_or_default()
+    items.map(|a| a.derived::<out::Dash>())
+}
+
+impl entries::Derived for out::Dash {
+    fn derive(items: &Items<'_>) -> Self {
+        Self::of(&items.numbers())
+    }
 }
 
 /// `/Rect`, normalized, read as viewers read a damaged one: a coordinate it lacks

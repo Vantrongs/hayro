@@ -422,12 +422,6 @@ impl Region {
             ctm *= Affine::new(m);
             abs *= Affine::new(m.map(f64::abs));
         }
-        let page = self
-            .shown
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .fold(0.0_f64, |m, p| m.max(p.x.abs()).max(p.y.abs()));
         // Each coordinate on the page sums the magnitudes its row of the transforms
         // takes: a coefficient of 0 is one as a viewer computes it too, so that a
         // magnitude across moves no place up where no transform turns one into
@@ -439,6 +433,18 @@ impl Region {
             most = Vec2::new(most.x.max(s.x), most.y.max(s.y));
             chained = Vec2::new(chained.x.max(c.x), chained.y.max(c.y));
         }
+        let r = self.offset(&abs, most, chained, local);
+        let on_page = points.iter().map(|p| ctm * *p).collect();
+        (on_page, r)
+    }
+
+    /// How far, across and up, a viewer computing in 32-bit numbers may put a point
+    /// on the page from where it lies ([`Self::as_any_viewer_computes`]), whose
+    /// place sums magnitudes `most` through the transforms `abs` and rounds `chained`
+    /// in composing them, computed as `local` says. Not falling as `most` and
+    /// `chained` grow, as each step adds or multiplies what is not negative.
+    fn offset(&self, abs: &Affine, most: Vec2, chained: Vec2, local: Rounding) -> Vec2 {
+        let page = self.page();
         let [a, b, c, d, _, _] = abs.as_coeffs();
         let l = local;
         let row = |own: f64, kx: f64, ky: f64| {
@@ -457,12 +463,20 @@ impl Region {
         };
         let own = Vec2::new(most.x + 2.0 * page, most.y + 2.0 * page) * VIEWER_ROUNDINGS + chained;
         let r = Rounding::point(row(own.x, a, c), row(own.y, b, d)).bound();
-        let r = Vec2::new(
+        Vec2::new(
             if r.x.is_nan() { f64::INFINITY } else { r.x },
             if r.y.is_nan() { f64::INFINITY } else { r.y },
-        );
-        let on_page = points.iter().map(|p| ctm * *p).collect();
-        (on_page, r)
+        )
+    }
+
+    /// The largest magnitude of a coordinate of what shows, on the page; 0 where
+    /// nothing bounds it.
+    fn page(&self) -> f64 {
+        self.shown
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .fold(0.0_f64, |m, p| m.max(p.x.abs()).max(p.y.abs()))
     }
 
     /// Whether the convex hull of `page`, points on the page each within `r.x`
@@ -563,11 +577,33 @@ impl Region {
     }
 
     /// Whether a subpath of `extent`, its points computed as `local` says, painting
-    /// `reach` beyond them, may paint in what shows grown ([`Self::may_show`] of the
-    /// corners of its box grown by `reach`): what [`Out`] tests each subpath it
-    /// paints by.
+    /// `reach` beyond them, may paint in what shows grown ([`Painting::paints`]):
+    /// what [`Out`] tests each subpath it paints by.
     pub(super) fn paints(&self, extent: &Extent, reach: f64, local: Rounding) -> Option<f64> {
-        self.may_show(&extent.corners(reach), 0.0, local)
+        self.painting(local).paints(extent, reach)
+    }
+
+    /// The test [`Self::paints`] makes of subpaths whose points are computed as
+    /// `local` says, made once for testing many.
+    pub(super) fn painting(&self, local: Rounding) -> Painting<'_> {
+        let [a, b, c, d, e, f] = self.ctm.as_coeffs();
+        let axes = match &self.shown {
+            Some(shown) if !shown.is_empty() => Self::axes(shown)
+                .chain([Vec2::new(a, b).turn_90(), Vec2::new(c, d).turn_90()])
+                .map(|n| Axis {
+                    n,
+                    along: [n.x * a + n.y * b, n.x * c + n.y * d, n.x * e + n.y * f],
+                    shown: self.extent(shown, n),
+                    place: AXES.contains(&n),
+                })
+                .collect(),
+            _ => vec![],
+        };
+        Painting {
+            region: self,
+            local,
+            axes,
+        }
     }
 
     /// The bits of every number that decides what may show in it: equal keys tell
@@ -736,6 +772,138 @@ impl Region {
     }
 }
 
+/// A direction along which what shows grown and a box on the page may lie apart
+/// ([`Painting`]): its normal `n`; what a point `(x, y)` of the current space
+/// comes to along it on the page, `along[0] x + along[1] y + along[2]`; what shows
+/// grown along it; and whether it is an axis of the page, along which a place no
+/// finite number holds is one that cannot be told.
+struct Axis {
+    n: Vec2,
+    along: [f64; 3],
+    shown: (f64, f64),
+    place: bool,
+}
+
+/// The test of whether a subpath may paint where the page shows it
+/// ([`Region::paints`]), for subpaths whose points are computed as `local` says.
+///
+/// It tests the box of the subpath's points grown by the reach, transformed to the
+/// page, against what shows grown, wherever a viewer computing in 32-bit numbers
+/// may put it ([`Region::may_show`]): the two are apart where they are apart along
+/// a normal of a side of what shows, an axis of the page, or a normal of a side of
+/// the transformed box, which runs along the transform's columns whatever the
+/// reach. So the directions are fixed, and along each the box's extent is computed
+/// from its sides: the least and most of `k x` for `x` between the box's sides is
+/// `k` times one side or the other by the sign of `k`, alone.
+///
+/// Whether it may paint does not fall as the reach grows, to the bit, so that the
+/// least reach at which it does tells it for every reach ([`Painting::least`]):
+/// - the sides move out, each a rounded sum of a side and the reach;
+/// - the most along a direction is a rounded sum of terms each a rounded product
+///   of a fixed number and a side it does not fall with, and the least likewise
+///   does not rise; rounding to nearest keeps the order of what it rounds;
+/// - how far a viewer may put a point grows with the magnitudes of the farthest
+///   corner, each a rounded sum of products of fixed numbers not negative
+///   ([`Region::offset`]), a product by 0 being 0 even of an infinite magnitude;
+/// - along a direction they are apart only where the most plus that offset is
+///   below what shows, or the least less it above, and NaN keeps them together:
+///   a NaN sum holds an infinite term that a larger reach keeps;
+/// - a place no finite number holds along an axis of the page, the most infinite
+///   upwards or NaN, or the least downwards, may paint anywhere, and stays so.
+pub(super) struct Painting<'r> {
+    region: &'r Region,
+    local: Rounding,
+    axes: Vec<Axis>,
+}
+
+impl Painting<'_> {
+    /// Whether a subpath of `extent`, painting `reach` beyond its points, may paint
+    /// in what shows grown: `None` where no viewer can; else how far on the page,
+    /// across or up, a viewer may put it from where it lies (infinite where a
+    /// point is no finite number, whose place cannot be told). `reach` is a number.
+    pub(super) fn paints(&self, extent: &Extent, reach: f64) -> Option<f64> {
+        let region = self.region;
+        debug_assert!(!reach.is_nan(), "a reach is a number");
+        if extent.lost {
+            return region.may_show(&[Point::new(f64::NAN, f64::NAN)], 0.0, self.local);
+        }
+        let Extent { lo, hi, .. } = *extent;
+        if lo.x.partial_cmp(&hi.x).is_none_or(|o| o.is_gt()) {
+            return region.may_show(&[], 0.0, self.local);
+        }
+        let (x0, x1, y0, y1) = (lo.x - reach, hi.x + reach, lo.y - reach, hi.y + reach);
+        // The magnitudes of its farthest corner, through the transforms.
+        let (x, y) = (x0.abs().max(x1.abs()), y0.abs().max(y1.abs()));
+        let sum = |m: &Affine| {
+            let [a, b, c, d, e, f] = m.as_coeffs();
+            Vec2::new(times(a, x) + times(c, y) + e, times(b, x) + times(d, y) + f)
+        };
+        let r = region.offset(
+            &region.abs,
+            sum(&region.abs),
+            sum(&region.chain),
+            self.local,
+        );
+        if region.shown.is_none() {
+            return Some(r.x.max(r.y));
+        }
+        // The least and most of the box along an axis.
+        let extent = |axis: &Axis| {
+            let side = |k: f64, lo: f64, hi: f64| {
+                if k == 0.0 {
+                    (0.0, 0.0)
+                } else if k > 0.0 {
+                    (k * lo, k * hi)
+                } else {
+                    (k * hi, k * lo)
+                }
+            };
+            let [kx, ky, k] = axis.along;
+            let ((a0, a1), (b0, b1)) = (side(kx, x0, x1), side(ky, y0, y1));
+            (a0 + b0 + k, a1 + b1 + k)
+        };
+        let lost = self.axes.iter().filter(|a| a.place).any(|axis| {
+            let (p0, p1) = extent(axis);
+            p1.is_nan() || p1 == f64::INFINITY || p0.is_nan() || p0 == f64::NEG_INFINITY
+        });
+        if lost {
+            return Some(f64::INFINITY);
+        }
+        let apart = self.axes.iter().any(|axis| {
+            let (p0, p1) = extent(axis);
+            let (g0, g1) = axis.shown;
+            let r = times(axis.n.x.abs(), r.x) + times(axis.n.y.abs(), r.y);
+            p1 + r < g0 || p0 - r > g1
+        });
+        // What shows is empty: no axis, and nothing paints.
+        (!apart && !self.axes.is_empty()).then_some(r.x.max(r.y))
+    }
+
+    /// The least reach at which a subpath of `extent` may paint ([`Self::paints`]):
+    /// it paints at every reach from there on and at none below. Found by halving
+    /// the bit patterns of the reaches from 0 to infinity, which run in their order;
+    /// `None` where it paints at none.
+    pub(super) fn least(&self, extent: &Extent) -> Option<f64> {
+        let paints = |bits: u64| self.paints(extent, f64::from_bits(bits)).is_some();
+        let (mut lo, mut hi) = (0.0_f64.to_bits(), f64::INFINITY.to_bits());
+        if paints(lo) {
+            return Some(0.0);
+        }
+        if !paints(hi) {
+            return None;
+        }
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if paints(mid) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        Some(f64::from_bits(hi))
+    }
+}
+
 /// The normals of the sides of the convex hull of `points`, every one finite:
 /// with those of another convex polygon, the axes along which the two are apart
 /// if they are apart at all.
@@ -803,11 +971,86 @@ struct State {
     width: f64,
 }
 
+/// State set and not yet painted with ([`Out`]): its text, and the dash patterns
+/// among it, each where in the text it goes, held as made for every annotation
+/// that sets it, so that holding one costs the same however long it is.
+#[derive(Default)]
+struct Held {
+    text: String,
+    dashes: Vec<(usize, Rc<Dash>)>,
+}
+
+impl Held {
+    fn push_str(&mut self, text: &str) {
+        self.text.push_str(text);
+    }
+
+    /// Where what is held ends, for [`Self::truncate`].
+    fn mark(&self) -> (usize, usize) {
+        (self.text.len(), self.dashes.len())
+    }
+
+    /// Left as it was at `mark`.
+    fn truncate(&mut self, (text, dashes): (usize, usize)) {
+        self.text.truncate(text);
+        self.dashes.truncate(dashes);
+    }
+
+    fn clear(&mut self) {
+        self.truncate((0, 0));
+    }
+
+    /// Writes what is held into `content`, and holds nothing.
+    fn write_to(&mut self, content: &mut String) {
+        let mut at = 0;
+        for (i, dash) in self.dashes.drain(..) {
+            content.push_str(&self.text[at..i]);
+            content.push_str(&dash.text);
+            at = i;
+        }
+        content.push_str(&self.text[at..]);
+        self.text.clear();
+    }
+}
+
+/// A dash pattern as content sets it, `[…] 0 d`, each entry written as a 32-bit
+/// number, and whether each can be written ([`written`]): made once for the
+/// document from a dash array (`super::dash`), and held as it is
+/// ([`Out::stroke_state`]).
+pub(super) struct Dash {
+    text: String,
+    ok: bool,
+    empty: bool,
+}
+
+impl Dash {
+    /// The pattern of `entries`, however many.
+    pub(super) fn of(entries: &[f64]) -> Self {
+        let mut text = String::from("[");
+        let mut ok = true;
+        for &d in entries {
+            ok &= written(d).is_some();
+            let _ = write!(text, "{} ", d as f32);
+        }
+        text.push_str("] 0 d\n");
+        Self {
+            text,
+            ok,
+            empty: entries.is_empty(),
+        }
+    }
+
+    /// Whether it has no entry: a solid line.
+    pub(super) fn is_solid(&self) -> bool {
+        self.empty
+    }
+}
+
 /// A `q` not yet ended: the state it saves, where its text starts in what is held
 /// back, and whether it has been written.
 struct Frame {
     saved: State,
-    held_at: usize,
+    held_at: (usize, usize),
     held_failed: bool,
     written: bool,
 }
@@ -841,18 +1084,6 @@ impl Extent {
         extent
     }
 
-    /// The largest magnitude of a coordinate of it; 0 for none, infinite where a
-    /// point of it is no finite number.
-    pub(super) fn size(&self) -> f64 {
-        if self.lost {
-            return f64::INFINITY;
-        }
-        [self.lo.x, self.lo.y, self.hi.x, self.hi.y]
-            .iter()
-            .filter(|v| v.is_finite())
-            .fold(0.0, |m: f64, v| m.max(v.abs()))
-    }
-
     /// With `p`, as written.
     fn add(&mut self, p: Point) {
         if p.is_finite() {
@@ -861,22 +1092,6 @@ impl Extent {
         } else {
             self.lost = true;
         }
-    }
-
-    /// The corners of its box grown by `reach`; no number where a point of it is
-    /// none (such a box reaches everywhere), none where it has no point.
-    fn corners(&self, reach: f64) -> Vec<Point> {
-        if self.lost {
-            return vec![Point::new(f64::NAN, f64::NAN)];
-        }
-        if self.lo.x.partial_cmp(&self.hi.x).is_none_or(|o| o.is_gt()) {
-            return vec![];
-        }
-        let (lo, hi) = (
-            self.lo - Vec2::new(reach, reach),
-            self.hi + Vec2::new(reach, reach),
-        );
-        vec![lo, Point::new(hi.x, lo.y), hi, Point::new(lo.x, hi.y)]
     }
 }
 
@@ -1010,7 +1225,7 @@ pub(super) struct Out {
     state: State,
     frames: Vec<Frame>,
     /// The state set since the last thing painted, held back.
-    held: String,
+    held: Held,
     held_failed: bool,
     path: Vec<Subpath>,
 }
@@ -1075,7 +1290,7 @@ impl Out {
                 width: 1.0,
             },
             frames: Vec::new(),
-            held: String::new(),
+            held: Held::default(),
             held_failed: false,
             path: Vec::new(),
         }
@@ -1087,12 +1302,13 @@ impl Out {
     }
 
     /// How far beyond its points a subpath painted now paints: as far as a stroke
-    /// of the line width set reaches ([`stroke_reach`]), or nothing for a fill.
+    /// of the line width set reaches ([`stroke_reach`]), everywhere for a width
+    /// that is no number, or nothing for a fill.
     pub(super) fn reach(&self, stroke: bool) -> f64 {
-        if stroke {
-            stroke_reach(self.state.width)
-        } else {
-            0.0
+        match stroke_reach(self.state.width) {
+            _ if !stroke => 0.0,
+            r if r.is_nan() => f64::INFINITY,
+            r => r,
         }
     }
 
@@ -1187,9 +1403,8 @@ impl Out {
 
     /// Writes what was held back, before something painted.
     fn release(&mut self) {
-        self.content.push_str(&self.held);
+        self.held.write_to(&mut self.content);
         self.failed |= self.held_failed;
-        self.held.clear();
         self.held_failed = false;
         for f in &mut self.frames {
             f.written = true;
@@ -1345,7 +1560,7 @@ impl Out {
             Kind::Save => {
                 self.frames.push(Frame {
                     saved: self.state.clone(),
-                    held_at: self.held.len(),
+                    held_at: self.held.mark(),
                     held_failed: self.held_failed,
                     written: false,
                 });
@@ -1460,19 +1675,20 @@ impl Out {
     }
 
     /// The stroke state every generated appearance starts from: butt caps, mitred
-    /// joins up to [`MITER_LIMIT`].
-    pub(super) fn stroke_state(&mut self, width: f64, dash: &[f64]) -> Option<()> {
+    /// joins up to [`MITER_LIMIT`], `width`, and `dash`, or none. The dash is held
+    /// as it is made for every annotation that sets it ([`Dash`]) and copied into
+    /// the content only where something painted needs it.
+    pub(super) fn stroke_state(&mut self, width: f64, dash: Option<&Rc<Dash>>) -> Option<()> {
         self.op("0 J 0 j");
         self.nums(&[MITER_LIMIT], "M")?;
         self.nums(&[width], "w")?;
-        let mut text = String::from("[");
-        let mut ok = true;
-        for &d in dash {
-            ok &= written(d).is_some();
-            let _ = write!(text, "{} ", d as f32);
+        match dash {
+            None => self.act("d", "[] 0 d\n", &[], true),
+            Some(dash) => {
+                self.held.dashes.push((self.held.text.len(), dash.clone()));
+                self.held_failed |= !dash.ok;
+            }
         }
-        text.push_str("] 0 d\n");
-        self.act("d", &text, &[], ok);
         Some(())
     }
 
@@ -1564,9 +1780,9 @@ impl Out {
 
 #[cfg(test)]
 mod tests {
-    use super::{Out, Part};
+    use super::{Extent, Out, Part, Rounding};
     use crate::interpret::annotation::Unsupported;
-    use kurbo::Rect;
+    use kurbo::{Point, Rect};
 
     const PAGE: Rect = Rect::new(0.0, 0.0, 200.0, 200.0);
 
@@ -1588,7 +1804,7 @@ mod tests {
         // within a quarter of a point of the page; at 4.5 below, it does not.
         for (y, drawn) in [(-3.0, true), (-5.3, false)] {
             let mut out = Out::new(PAGE, 1.0);
-            out.stroke_state(1.0, &[]);
+            out.stroke_state(1.0, None);
             out.nums(&[10.0, y], "m");
             out.nums(&[100.0, y], "l");
             out.op("S");
@@ -1670,5 +1886,123 @@ mod tests {
         out.nums(&[0.0, 0.0, 10.0, 10.0], "re");
         out.op("f");
         assert_eq!(out.finish(Ok(())).unwrap().1, "");
+    }
+
+    /// A number from `seed`, from 0 below 1.
+    fn next(seed: &mut u64) -> f64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        (*seed >> 11) as f64 / (1_u64 << 53) as f64
+    }
+
+    /// Whether a subpath may paint does not fall as its reach grows, to the bit
+    /// ([`super::Painting`]): on generated views, units, transforms (turned,
+    /// sheared, flipped, scaled up and down, of no area) and clips, generated
+    /// boxes on, near and far off the page, of no size and huge, and each way of
+    /// computing their points, it paints at a reach exactly where the reach is at
+    /// least the least one found ([`super::Painting::least`]): at that reach and
+    /// not at the reach just below it, and at reaches of every size, from 0 and
+    /// the least numbers through to infinity, on either side of it.
+    #[test]
+    fn whether_a_subpath_paints_does_not_fall_as_its_reach_grows() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let (mut painted, mut never, mut at_zero) = (0, 0, 0);
+        for case in 0..4_000 {
+            let r = &mut seed;
+            let (x, y) = (next(r) * 400.0 - 100.0, next(r) * 400.0 - 100.0);
+            let view = Rect::new(x, y, x + next(r) * 300.0, y + next(r) * 300.0);
+            let unit = [1.0, 0.5, 2.0, 1e-3][case % 4];
+            let mut out = Out::new(view, unit);
+            for _ in 0..(next(r) * 3.0) as usize {
+                let scale = 10_f64.powf(next(r) * 8.0 - 4.0);
+                let (t, shear) = (next(r) * 6.4, next(r) - 0.5);
+                let flip = if next(r) < 0.3 { -1.0 } else { 1.0 };
+                let mut m = [
+                    scale * t.cos(),
+                    scale * t.sin(),
+                    scale * (shear - t.sin()) * flip,
+                    scale * t.cos() * flip,
+                    next(r) * 400.0 - 200.0,
+                    next(r) * 400.0 - 200.0,
+                ];
+                if next(r) < 0.1 {
+                    // Of no area: one column a multiple of the other.
+                    (m[2], m[3]) = (m[0] * 2.0, m[1] * 2.0);
+                }
+                out.nums(&m, "cm");
+            }
+            if next(r) < 0.4 {
+                let (cx, cy) = (next(r) * 300.0 - 50.0, next(r) * 300.0 - 50.0);
+                out.clip(Rect::new(
+                    cx,
+                    cy,
+                    cx + next(r) * 200.0,
+                    cy + next(r) * 200.0,
+                ));
+            }
+            let region = out.region();
+            let local = if next(r) < 0.5 {
+                Rounding::NONE
+            } else {
+                Rounding::of(next(r) * 20.0, next(r) * 1e4)
+            };
+            let painting = region.painting(local);
+            for _ in 0..8 {
+                let far = 10_f64.powf(next(r) * 40.0 - 2.0);
+                let at = |r: &mut u64| {
+                    let near = next(r) < 0.5;
+                    let k = if near { 300.0 } else { far };
+                    Point::new(next(r) * k - k / 2.0, next(r) * k - k / 2.0)
+                };
+                let n = 1 + (next(r) * 3.0) as usize;
+                let first = at(r);
+                let points: Vec<Point> = (0..n)
+                    .map(|i| {
+                        if i == 0 || next(r) < 0.2 {
+                            first
+                        } else {
+                            first + (at(r) - first) * next(r)
+                        }
+                    })
+                    .collect();
+                let extent = Extent::written(points);
+                let paints = |reach: f64| painting.paints(&extent, reach).is_some();
+                let least = painting.least(&extent);
+                // Reaches of every size, and of every bit pattern near the least.
+                let mut reaches: Vec<f64> = vec![0.0, f64::from_bits(1), 1e-300, f64::INFINITY];
+                reaches.extend((0..24).map(|_| 10_f64.powf(next(r) * 80.0 - 40.0)));
+                reaches
+                    .extend((0..8).map(|_| {
+                        f64::from_bits((next(r) * f64::INFINITY.to_bits() as f64) as u64)
+                    }));
+                match least {
+                    None => never += 1,
+                    Some(0.0) => at_zero += 1,
+                    Some(least) => {
+                        painted += 1;
+                        let bits = least.to_bits();
+                        assert!(!paints(f64::from_bits(bits - 1)), "{extent:?} {least}");
+                        for d in 1..=4 {
+                            reaches.push(f64::from_bits(bits.saturating_sub(d)));
+                            reaches.push(f64::from_bits((bits + d).min(f64::INFINITY.to_bits())));
+                        }
+                    }
+                }
+                for reach in reaches {
+                    let at_least = least.is_some_and(|least| reach >= least);
+                    assert_eq!(
+                        paints(reach),
+                        at_least,
+                        "{extent:?} at {reach:e}, least {least:?}, in {region:?}"
+                    );
+                }
+            }
+        }
+        // Every kind is met often.
+        assert!(
+            painted > 4_000 && never > 500 && at_zero > 4_000,
+            "{painted} found, {never} never, {at_zero} at 0"
+        );
     }
 }

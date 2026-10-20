@@ -110,12 +110,12 @@ pub(super) fn free_text<'a>(
         let paint = Paint {
             stroke: Some(border_color),
             width: w,
-            dash: Vec::new(),
+            dash: None,
             fill: None,
         };
         out.writes(|out| {
             out.stroke_color(&border_color)?;
-            out.stroke_state(w, &[])?;
+            out.stroke_state(w, None)?;
             out.nums(&[cl[0].x, cl[0].y], "m")?;
             for p in &cl[1..] {
                 out.nums(&[p.x, p.y], "l")?;
@@ -131,7 +131,7 @@ pub(super) fn free_text<'a>(
     out.writes(|out| {
         if w > 0.0 {
             out.stroke_color(&border_color)?;
-            out.stroke_state(w, &dash(annot))?;
+            out.stroke_state(w, dash(annot).as_ref())?;
             let b = within(inner, w / 2.0);
             out.nums(&[b.x0, b.y0, b.width(), b.height()], "re")?;
             out.op("S");

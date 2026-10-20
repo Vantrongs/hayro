@@ -2189,6 +2189,119 @@ fn ink_of_widths_each_its_own_finds_the_paths_it_reaches() {
     assert_eq!(content.matches(" m\n").count(), 1, "{content}");
 }
 
+/// Ink annotations sharing an `/InkList` of one path on the page and many just
+/// beyond the reach of their stroke, nearer than a search to within a fraction of
+/// the reach tells apart, each take the paths their stroke reaches by one search
+/// and test none of the rest: each annotation added costs the same in bytes, work
+/// and bytes looked at, whether the list holds a thousand such paths or forty
+/// thousand, of one width or of widths each its own a hair apart, and draws the
+/// path on the page alone. The paths lie above the page, whose edge a 1 pt stroke
+/// reaches to within 5 pt, and to its right, with a point at the edge of what a
+/// 32-bit number can tell.
+#[test]
+fn ink_paths_just_beyond_the_reach_cost_each_annotation_nothing() {
+    const N: usize = 40;
+    let beyond = [
+        "[50 205.2516 51 206.2516]",
+        "[205.25152587890625 20 206.25152587890625 21]",
+    ];
+    let widths: [fn(usize) -> String; 2] = [|_| String::from("1"), |i| format!("1.{i:07}")];
+    for path in beyond {
+        for width in widths {
+            let ink = |n: usize| format!("[[20 20 80 80] {}]", format!("{path} ").repeat(n));
+            let annot = |i: usize| {
+                format!(
+                    "/Subtype /Ink /C [1 0 0] /BS << /W {} >> /InkList 4 0 R \
+                     /Rect [0 0 200 200]",
+                    width(i)
+                )
+            };
+            let added = |n: usize| {
+                let shared = [ink(n)];
+                let (one, two) = (
+                    cost_of(N, "", &shared, &annot),
+                    cost_of(2 * N, "", &shared, &annot),
+                );
+                (two.bytes.saturating_sub(one.bytes), two.work - one.work)
+            };
+            let (short, long) = (added(1_000), added(40_000));
+            if std::env::var_os("COST_REPORT").is_some() {
+                println!(
+                    "CASE ink beyond {path} {}: +{N}: {short:?} at 1000, {long:?} at 40000",
+                    width(1)
+                );
+            }
+            assert!(
+                long.0 < N * (32 << 10) && long.0 <= short.0 + N * 64 && long.1 == short.1,
+                "{path} {}: {short:?} added at 1,000, {long:?} at 40,000",
+                width(1)
+            );
+            for i in [0, 2 * N - 1] {
+                let content = generated(&annot(i).replace("4 0 R", &ink(1_000)));
+                assert_eq!(content.matches(" m\n").count(), 1, "{content}");
+            }
+        }
+    }
+}
+
+/// Ink annotations sharing a long dash array, whose paths cross the page as a
+/// whole but each lie off it, draw nothing, and cost the same, in bytes, work and
+/// bytes looked at, whether the array holds a thousand entries or forty thousand:
+/// the pattern is made once for the document and held as it is until something
+/// paints. Where a path paints, the pattern is written whole.
+#[test]
+fn a_shared_dash_costs_nothing_where_nothing_paints() {
+    const N: usize = 40;
+    let dash = |n: usize| format!("[{}]", "3 ".repeat(n));
+    let annot = |paths: &str| {
+        format!(
+            "/Subtype /Ink /C [1 0 0] /BS << /W 1 /D 4 0 R >> /InkList {paths} \
+             /Rect [0 0 200 200]"
+        )
+    };
+    let off = annot("[[-1000 -1000 -999 -999] [1000 1000 1001 1001]]");
+    let added = |n: usize| {
+        let shared = [dash(n)];
+        let (one, two) = (
+            sharing_cost(N, &shared, &off),
+            sharing_cost(2 * N, &shared, &off),
+        );
+        assert_eq!((one.drew.generated, two.drew.generated), (0, 0));
+        (
+            two.bytes.saturating_sub(one.bytes),
+            two.work.saturating_sub(one.work),
+            two.examined.saturating_sub(one.examined),
+        )
+    };
+    let (short, long) = (added(1_000), added(40_000));
+    if std::env::var_os("COST_REPORT").is_some() {
+        println!("CASE shared dash, nothing painted: +{N}: {short:?} at 1000, {long:?} at 40000");
+    }
+    assert!(
+        long.0 < N * (32 << 10)
+            && long.0 <= short.0 + N * 64
+            && long.1 == short.1
+            && long.2 == short.2,
+        "{short:?} added at 1,000, {long:?} at 40,000"
+    );
+    for n in [1_000, 40_000] {
+        let inline = |paths: &str| annot(paths).replace("4 0 R", &dash(n));
+        let off = inline("[[-1000 -1000 -999 -999] [1000 1000 1001 1001]]");
+        assert!(
+            matches!(first_look(&one_annotation(&off)), Look::Nothing),
+            "{n}"
+        );
+        let content = generated(&inline("[[-1000 -1000 -999 -999] [20 20 80 80]]"));
+        assert_eq!(
+            content,
+            format!(
+                "1 0 0 RG\n0 J 0 j\n10 M\n1 w\n[{}] 0 d\n1 J 1 j\n20 20 m\n80 80 l\nS\n",
+                "3 ".repeat(n)
+            )
+        );
+    }
+}
+
 /// What is kept of the parts of shared geometry that may paint is told for the
 /// view, the width and the kind of part it was found for: annotations sharing an
 /// `/InkList`, of widths that reach the part off the page or not, and annotations

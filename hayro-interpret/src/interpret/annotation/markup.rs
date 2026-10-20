@@ -13,6 +13,7 @@ use super::out::{
 use super::{Drew, Unsupported, border_width, c_color, color_of, dash, most_pieces, rect};
 use hayro_syntax::object::dict::keys::{C, IC, INKLIST, QUADPOINTS};
 use kurbo::{Point, Rect, Vec2};
+use std::cell::OnceCell;
 use std::f64::consts::SQRT_2;
 use std::rc::Rc;
 
@@ -35,7 +36,7 @@ pub(super) fn shape(annot: &Entries<'_>, circle: bool, out: &mut Out) -> Option<
     out.clip(clip)?;
     if let Some(stroke) = &stroke {
         out.stroke_color(stroke)?;
-        out.stroke_state(width, &dash(annot))?;
+        out.stroke_state(width, dash(annot).as_ref())?;
     }
     if let Some(fill) = &fill {
         out.fill_color(fill)?;
@@ -223,9 +224,10 @@ pub(super) fn painting(
     region: &Region,
     piece: impl Fn(&Quad) -> (Extent, f64),
 ) -> Shown {
+    let painting = region.painting(Rounding::NONE);
     let paints = |q: &Quad| {
         let (extent, reach) = piece(q);
-        region.paints(&extent, reach, Rounding::NONE).is_some()
+        painting.paints(&extent, reach).is_some()
     };
     Shown((0..quads.len()).filter(|&i| paints(&quads[i])).collect())
 }
@@ -334,7 +336,7 @@ pub(super) fn text_lines(annot: &Entries<'_>, line: Line, out: &mut Out) -> Opti
     });
     for &i in &shown.0 {
         let q = &quads.all[i];
-        out.stroke_state(line_width(q), &[])?;
+        out.stroke_state(line_width(q), None)?;
         let (a, b) = q.across(f);
         out.nums(&[a.x, a.y], "m")?;
         out.nums(&[b.x, b.y], "l")?;
@@ -432,7 +434,7 @@ fn zigzag(q: &Quad, region: &Region, pen: &mut Run, out: &mut Out) -> Result<(),
         Start::Unnumbered(part) => return out.refuse(Unsupported::Coordinates, part),
         Start::Steps(z, steps) => (z, steps),
     };
-    out.stroke_state(line_width(q), &[]);
+    out.stroke_state(line_width(q), None);
     // The steps `a..b`, which may paint where the page shows them, drawn as
     // viewers draw them only by steps more than this draws: refused, or left out
     // where they cannot show, the steps after them drawn as given.
@@ -1031,16 +1033,20 @@ pub(super) fn ink(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
         return None;
     }
     out.stroke_color(&stroke)?;
-    out.stroke_state(width, &dash(annot))?;
+    out.stroke_state(width, dash(annot).as_ref())?;
     // Round ends and corners, as a pen draws.
     out.op("1 J 1 j");
     // The paths that may paint, each a subpath of the stroke; those that may not
     // would be left out of it with nothing else changed.
     let (region, reach) = (out.region(), out.reach(true));
     let reaches = shown(&items, Pieces::Ink, &region, || {
-        Reaches::of(&paths.2, &region)
+        Reaches::of(&paths.2, &region, reach)
     });
-    for p in reaches.paint(&paths.2, &region, reach).map(|i| &paths.0[i]) {
+    for p in reaches
+        .paint(&paths.2, &region, reach)
+        .iter()
+        .map(|&i| &paths.0[i])
+    {
         out.nums(&p[..2], "m")?;
         // A path of one point is a dot.
         let rest = if p.len() < 4 { &p[..2] } else { &p[2..] };
@@ -1054,70 +1060,64 @@ pub(super) fn ink(annot: &Entries<'_>, out: &mut Out) -> Option<()> {
     Some(())
 }
 
-/// Of parts told against a region, each by its extent ([`Extent`]): how far beyond
-/// its points each must paint, at the least, to paint there, the parts in that
-/// order, so that the parts that may paint as far as an annotation's stroke reaches
-/// are found for any reach by a search and a test of each found
-/// ([`Reaches::paint`]).
-struct Reaches(Vec<(f64, usize)>);
+/// Of parts told against a region, each by its extent ([`Extent`]), the places of
+/// those that may paint as far as an annotation's stroke reaches, for any reach,
+/// each found once ([`Reaches::paint`]): for the reach of the first annotation to
+/// look, those that paint at it, each tested; for another, those whose least reach
+/// at which they may paint ([`super::out::Painting::least`]) is at most it, found by
+/// one search of the parts in that order, made when an annotation of another reach
+/// first looks. So an array one annotation draws costs a test of each part, and
+/// one many draw at different widths a search of each part's least reach.
+struct Reaches {
+    first: (f64, Vec<usize>),
+    least: OnceCell<Vec<(Option<f64>, usize)>>,
+}
 
 impl Reaches {
-    /// Of the parts of `extents`, as told against `region`. Whether a part may paint
-    /// as [`Region::paints`] tells it only grows with the reach: the box it tests
-    /// grows with it, and so do the magnitudes that bound how far a viewer may put
-    /// it from where it lies. The reach is found by halving: the most at which it
-    /// does not paint, within 1/4096 of it, less a margin for what computing in
-    /// 64-bit numbers moves; `-∞` where it paints at no reach, and the most a stroke
-    /// written as a number reaches where it paints at none of those.
-    fn of(extents: &[Extent], region: &Region) -> Self {
-        let below = |e: &Extent| {
-            let paints = |reach: f64| region.paints(e, reach, Rounding::NONE).is_some();
-            if paints(0.0) {
-                return f64::NEG_INFINITY;
-            }
-            // A stroke reaches no farther than this but where it is wider than a
-            // 32-bit number, which is written as none, and reaches everywhere;
-            // up to this, no number told overflows.
-            const MOST: f64 = 1e40;
-            if !paints(MOST) {
-                return MOST;
-            }
-            // Of the bits of the reaches, which run as the reaches do, from one at
-            // which it does not paint to one at which it does.
-            let (mut lo, mut hi) = (0_u64, MOST.to_bits());
-            while hi - lo > 1 << 40 {
-                let mid = lo + (hi - lo) / 2;
-                if paints(f64::from_bits(mid)) {
-                    hi = mid;
-                } else {
-                    lo = mid;
-                }
-            }
-            let reach = f64::from_bits(lo);
-            reach - reach / 65_536.0 - e.size() / (1_u64 << 40) as f64
-        };
-        let mut reaches: Vec<(f64, usize)> = (0..extents.len())
-            .map(|i| (below(&extents[i]), i))
+    /// Of the parts of `extents`, as told against `region`, first for `reach`.
+    fn of(extents: &[Extent], region: &Region, reach: f64) -> Self {
+        let painting = region.painting(Rounding::NONE);
+        let places = (0..extents.len())
+            .filter(|&i| painting.paints(&extents[i], reach).is_some())
             .collect();
-        reaches.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-        Self(reaches)
+        Self {
+            first: (reach, places),
+            least: OnceCell::new(),
+        }
     }
 
     /// The places, in order, of the parts of `extents` that may paint in `region`
-    /// painted `reach` beyond their points, as [`Out`] tells it: each part that
-    /// needs no more than `reach`, tested.
-    fn paint<'e>(
-        &self,
-        extents: &'e [Extent],
-        region: &'e Region,
-        reach: f64,
-    ) -> impl Iterator<Item = usize> + 'e {
-        let near = self.0.partition_point(|(below, _)| *below < reach);
-        let mut places: Vec<usize> = self.0[..near].iter().map(|&(_, i)| i).collect();
+    /// painted `reach` beyond their points, as [`Out`] tells it: those found for it
+    /// first, or those whose least reach is at most `reach`, and no others, as
+    /// whether a part may paint does not fall as the reach grows. The parts that
+    /// paint at no reach are last.
+    fn paint(&self, extents: &[Extent], region: &Region, reach: f64) -> Vec<usize> {
+        if reach.to_bits() == self.first.0.to_bits() {
+            return self.first.1.clone();
+        }
+        let least = self.least.get_or_init(|| {
+            let painting = region.painting(Rounding::NONE);
+            let mut least: Vec<(Option<f64>, usize)> = (0..extents.len())
+                .map(|i| (painting.least(&extents[i]), i))
+                .collect();
+            least.sort_unstable_by(|a, b| match (a.0, b.0) {
+                (Some(a), Some(b)) => a.total_cmp(&b),
+                (a, b) => a.is_none().cmp(&b.is_none()),
+            });
+            least
+        });
+        let near = least.partition_point(|(least, _)| least.is_some_and(|least| least <= reach));
+        let mut places: Vec<usize> = least[..near].iter().map(|&(_, i)| i).collect();
         places.sort_unstable();
+        if cfg!(debug_assertions) {
+            let paints = |i: usize| region.paints(&extents[i], reach, Rounding::NONE).is_some();
+            debug_assert!(places.iter().all(|&i| paints(i)), "a part told paints");
+            debug_assert!(
+                least.get(near).is_none_or(|&(_, i)| !paints(i)),
+                "the first part told past the reach does not paint"
+            );
+        }
         places
-            .into_iter()
-            .filter(move |&i| region.paints(&extents[i], reach, Rounding::NONE).is_some())
     }
 }
 
@@ -1739,7 +1739,7 @@ mod tests {
                     out.clip(clip)?;
                     out.stroke_color(&stroke)?;
                     for q in &quads.all {
-                        out.stroke_state(line_width(q), &[])?;
+                        out.stroke_state(line_width(q), None)?;
                         let f = if kind == "Underline" { 1.0 } else { 3.0 };
                         let (a, b) = q.across(f / 7.0);
                         out.nums(&[a.x, a.y], "m")?;
@@ -1776,7 +1776,7 @@ mod tests {
                     out.op("q");
                     out.clip(quads.redact?)?;
                     out.op("1 0 0 RG");
-                    out.stroke_state(1.0, &[])?;
+                    out.stroke_state(1.0, None)?;
                     for &Quad([tl, tr, bl, br]) in &quads.all {
                         out.nums(&[bl.x, bl.y], "m")?;
                         for p in [br, tr, tl] {
@@ -1794,7 +1794,7 @@ mod tests {
                         return None;
                     }
                     out.stroke_color(&stroke)?;
-                    out.stroke_state(border_width(annot), &dash(annot))?;
+                    out.stroke_state(border_width(annot), dash(annot).as_ref())?;
                     out.op("1 J 1 j");
                     for p in &paths.0 {
                         out.nums(&p[..2], "m")?;
@@ -1842,6 +1842,7 @@ mod tests {
                 )
             };
             let pieces = 1 + (next(r) * 6.0) as usize;
+            let mut width = None;
             let geometry = if kind == "Ink" {
                 let paths: Vec<String> = (0..pieces)
                     .map(|_| {
@@ -1859,12 +1860,16 @@ mod tests {
                 let w = match (next(r) * 8.0) as usize {
                     0 => String::from("0"),
                     1 => String::from("-3"),
-                    6 => String::from("1e20"),
-                    7 => String::from("1e39"),
+                    // The widest a number is read as (viewers keep the low 32
+                    // bits of the digits before the point), and the narrowest
+                    // that cannot be written.
+                    6 => String::from("4294967295.5"),
+                    7 => String::from("8388608"),
                     2 => format!("{}", next(r) * 2.0),
                     3 => format!("{}", next(r) * 600.0),
                     _ => format!("{}", next(r) * 30.0),
                 };
+                width = Some(w.parse::<f64>().expect("a width"));
                 format!("/C [0 0 1] /BS << /W {w} >> /InkList [{}]", paths.join(" "))
             } else {
                 let quads: Vec<String> = (0..pieces)
@@ -1891,6 +1896,22 @@ mod tests {
             let annot = format!("<< /Subtype /{kind} /Rect [0 0 1 1] {geometry} >>");
             let dict = Dict::from_bytes(annot.as_bytes()).expect("valid dict");
             let entries = Entries::detached(dict);
+            if let Some(width) = width.filter(|w| *w > 1e6) {
+                // The widest are read as large as written.
+                assert_eq!(border_width(&entries) as f32, width as f32, "{annot}");
+            }
+            if let Some(paths) = entries.items(INKLIST).map(|i| i.derived::<super::Paths>()) {
+                // The paths found by their least reaches, as when an annotation of
+                // another width looked first, are those that paint.
+                let mut out = Out::new(view, 1.0);
+                out.stroke_state(border_width(&entries), None);
+                let (region, reach) = (out.region(), out.reach(true));
+                let first = if reach == 0.0 { 1.0 } else { 0.0 };
+                let found = super::Reaches::of(&paths.2, &region, first);
+                let paint = |i: &usize| region.paints(&paths.2[*i], reach, super::Rounding::NONE);
+                let all: Vec<usize> = (0..paths.2.len()).filter(|i| paint(i).is_some()).collect();
+                assert_eq!(found.paint(&paths.2, &region, reach), all, "{annot}");
+            }
             let drawn = |draw: fn(&Entries<'_>, &str, &mut Out) -> Drew| {
                 let mut out = Out::new(view, 1.0);
                 let drew = draw(&entries, kind, &mut out);

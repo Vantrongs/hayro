@@ -5,11 +5,12 @@
 //! endings look as common viewers draw them.
 
 use super::entries::{Derived, Entries, Items, Text};
-use super::out::{Color, Out, Part, Refused, Rounding, corners, stroke_reach};
+use super::out::{Color, Dash, Out, Part, Refused, Rounding, corners, stroke_reach};
 use super::text::{self, Align, Family, Setting};
 use super::{Appearances, CAPTION, Drew, Unsupported, border_width, circle, color_of, dash};
 use hayro_syntax::object::dict::keys::{C, IC};
 use kurbo::{Affine, BezPath, Point, Vec2};
+use std::rc::Rc;
 
 /// A line ending style.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -76,7 +77,7 @@ impl Ending {
 pub(super) struct Paint {
     pub(super) stroke: Option<Color>,
     pub(super) width: f64,
-    pub(super) dash: Vec<f64>,
+    pub(super) dash: Option<Rc<Dash>>,
     pub(super) fill: Option<Color>,
 }
 
@@ -85,11 +86,7 @@ impl Paint {
     /// patterns only a stroke: without /C, it is not read.
     fn of(annot: &Entries<'_>) -> Self {
         let stroke = color_of(annot, C);
-        let dash = if stroke.is_some() {
-            dash(annot)
-        } else {
-            Vec::new()
-        };
+        let dash = stroke.as_ref().and_then(|_| dash(annot));
         Self {
             stroke,
             width: border_width(annot),
@@ -105,7 +102,7 @@ impl Paint {
         if let Some(fill) = &self.fill {
             out.fill_color(fill)?;
         }
-        out.stroke_state(self.width, &self.dash)
+        out.stroke_state(self.width, self.dash.as_ref())
     }
 
     /// The operator that strokes an open path, or ends it unpainted.
@@ -450,7 +447,7 @@ fn draw_poly(
         if let Some(fill) = &fill {
             out.fill_color(fill)?;
         }
-        out.stroke_state(border_width(annot), &dash(annot))?;
+        out.stroke_state(border_width(annot), dash(annot).as_ref())?;
         polyline(vertices, out)?;
         out.op(match (&stroke, &fill) {
             (Some(_), Some(_)) => "b",
@@ -634,7 +631,7 @@ impl Layout {
         let breaks = place.inline && paint.stroke.is_some() && self.len > 0.0;
         if breaks {
             let half = bytes as f64 * f64::from(CAPTION_SIZE) + 3.0;
-            let to = if paint.dash.is_empty() {
+            let to = if paint.dash.as_ref().is_none_or(|d| d.is_solid()) {
                 place.mid + half
             } else {
                 self.len
@@ -802,7 +799,11 @@ pub(super) fn line<'a>(
         // The ways differ where one strokes the gap and the other does not, and,
         // where the line is dashed, after it: the dashes start anew where the line
         // starts again.
-        let to = if paint.dash.is_empty() { to } else { len };
+        let to = if paint.dash.as_ref().is_none_or(|d| d.is_solid()) {
+            to
+        } else {
+            len
+        };
         let dir = direction(lb - la);
         let differ = vec![la + dir * from, la + dir * to];
         out.refuse(
