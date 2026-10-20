@@ -1768,7 +1768,7 @@ impl XRef {
         taken: Taken,
     ) -> Option<O> {
         let (repr, entry, entered) = self.entry(id, ctx)?;
-        match self.body(repr, id, entry, ctx, &entered, taken) {
+        match self.body(repr, id, entry, ctx, entered, taken) {
             Ok(object) => Some(object),
             Err(Unread::Rejected) => None,
             Err(Unread::Lost(lost)) => {
@@ -1782,23 +1782,25 @@ impl XRef {
     /// the entry from `ctx` ([`Self::entry`]): the object its body holds, read once
     /// for every entry leading to the same place and every read. A body `ctx`'s chain
     /// is reading already is a cycle, through whichever entry it is reached.
+    ///
+    /// `entered` is taken, not borrowed, so that the link is added to the context
+    /// [`Self::entry`] made rather than to a copy of it.
     fn body<'a, O: Made<'a>>(
         &'a self,
         repr: &'a SomeRepr,
         id: ObjectIdentifier,
         entry: EntryType,
         ctx: &ReaderContext<'a>,
-        entered: &ReaderContext<'a>,
+        mut entered: ReaderContext<'a>,
         taken: Taken,
     ) -> Result<O, Unread> {
-        let (place, data, slot) = self.place(repr, id, entry, entered)?;
+        let (place, data, slot) = self.place(repr, id, entry, &entered)?;
         let link = place.link();
         if ctx.rejects(&link) {
             warn!("cycle detected in indirect object: {id:?}");
 
             return Err(Unread::Rejected);
         }
-        let mut entered = entered.clone();
         entered.parent_chain_push(link);
         self.at_place(repr, id, entry, (place, data, slot), ctx, &entered, taken)
     }
