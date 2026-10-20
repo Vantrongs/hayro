@@ -62,8 +62,10 @@ fn grow(output: &mut Vec<u8>, end: usize, declared: usize, white: u8, meter: &Me
     output.len() >= end
 }
 
-/// Like [`grow`], but fills all the room made with white, so that the rows that
-/// follow are written into it without growing `output` row by row.
+/// Like [`grow`], but fills white [`POLL_BYTES`] ahead of `end` within the room
+/// made, so that the rows that follow are written into it without growing `output`
+/// row by row, while a stream that ends early whitens no more than that past its
+/// last row rather than all the room, up to eight times the rows written.
 #[cold]
 #[inline(never)]
 fn grow_room(
@@ -74,8 +76,8 @@ fn grow_room(
     meter: &Meter<'_>,
 ) -> bool {
     reserve(output, end, declared);
-    let room = output.capacity();
-    grow(output, room, declared, white, meter);
+    let ahead = output.capacity().min(end.saturating_add(POLL_BYTES));
+    grow(output, ahead, declared, white, meter);
     output.len() >= end
 }
 

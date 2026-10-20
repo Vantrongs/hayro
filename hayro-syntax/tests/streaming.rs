@@ -349,6 +349,41 @@ fn a_ccitt_stream_cut_short_holds_a_multiple_of_its_rows() {
     }
 }
 
+/// A CCITT stream that decodes a few rows of many declared whitens and counts at
+/// most [`POLL_BYTES`] past its rows: room is made ahead by steps of up to eight
+/// times what was decoded, but not written until rows come.
+#[cfg(debug_assertions)]
+#[test]
+fn a_ccitt_stream_cut_short_whitens_little_past_its_rows() {
+    use hayro_syntax::work::TOLD;
+    // 200 white rows, a bit each against the white row above, then the end of data.
+    let mut data = vec![0xFF; 25];
+    data.extend([0x00, 0x10, 0x01]);
+    let columns = 1024;
+    for is_indexed in [false, true] {
+        let row = if is_indexed { columns / 8 } else { columns };
+        let pdf = stream_file(
+            &format!(
+                "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns {columns} /Rows 65535 >>"
+            ),
+            &data,
+        );
+        let stream = object_3(&pdf);
+        let params = ImageDecodeParams {
+            is_indexed,
+            ..Default::default()
+        };
+        TOLD.set(0);
+        let decoded = stream.decoded_image(&params).unwrap().data.len();
+        let told = TOLD.get();
+        assert_eq!(decoded, 200 * row);
+        // The white written ahead, each row's bytes once more as it is written, and
+        // a step per bit read.
+        let bound = decoded + POLL_BYTES + decoded + 8 * data.len();
+        assert!(told <= bound, "indexed {is_indexed}: {told} > {bound}");
+    }
+}
+
 /// A CCITT row declared as wide as `Columns` allows is written a counted piece at a
 /// time, with room made for what was written: a stop asked for at the first poll
 /// ends it holding a few pieces, not the row.
