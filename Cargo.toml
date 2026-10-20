@@ -135,7 +135,7 @@ vello_cpu = { git = "https://github.com/Vantrongs/vello", rev = "3144325a81d5857
 # `Inflate::try_clone` and `Inflate::allocation_size`, which Flate checkpoints need.
 zlib-rs = { git = "https://github.com/Vantrongs/zlib-rs", rev = "124359709a6ed94bda6fe1ff4d413e23bbae34e5" }
 # `zune_jpeg::rows`, which grayscale JPEG rows need.
-zune-jpeg = { git = "https://github.com/Vantrongs/zune-image", rev = "d8686cc29483a83c84ba681d6b7467fd3545e616" }
+zune-jpeg = { git = "https://github.com/Vantrongs/zune-image", rev = "7d799c028a898c7ccc091b9fb0af78a612d3588c" }
 # A tag's duplicate attributes found through a set keyed by the names' text, so
 # that rich text with many attributes on one tag is parsed in linear time
 # (servo/html5ever issue 796), and a `meta` Content-Type cut after `charset`

@@ -64,7 +64,18 @@ pub(crate) fn decode(
         out_colorspace = ColorSpace::RGB;
     }
 
-    decoder.set_options(DecoderOptions::default().jpeg_set_out_colorspace(out_colorspace));
+    // A frame of height 0 takes its height from a DNL marker after the scan, and the
+    // decoder sizes its output by its height limit before decoding: the limit is the
+    // rows that fit the image dictionary's area at the frame's width, the area that
+    // bounds the frames patched above.
+    let jpeg_width = decoder.dimensions()?.0.max(1);
+    let max_rows =
+        (image_params.width as usize).saturating_mul(image_params.height as usize) / jpeg_width;
+    decoder.set_options(
+        DecoderOptions::default()
+            .set_max_height(max_rows.clamp(1, u16::MAX as usize))
+            .jpeg_set_out_colorspace(out_colorspace),
+    );
     let mut decoded = decoder.decode_with_progress(meter).ok()?;
 
     if out_colorspace == ColorSpace::YCCK {
@@ -84,6 +95,10 @@ pub(crate) fn decode(
 
     let width = decoder.dimensions().unwrap().0 as u32;
     let height = decoder.dimensions().unwrap().1 as u32;
+    // A DNL frame whose data ended before its marker has no height.
+    if height == 0 {
+        return None;
+    }
 
     let image_data = ImageData {
         alpha: None,
