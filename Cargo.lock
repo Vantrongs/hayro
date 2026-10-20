@@ -141,7 +141,7 @@ checksum = "f9abbd1bc6865053c427f7198e6af43bfdedc55ab791faed4fbd361d789575ff"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -363,15 +363,20 @@ dependencies = [
 
 [[package]]
 name = "fearless_simd"
-version = "0.7.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4beca3cb2444e3304ac30843cc091f44ed58932353cd492ce740067bfce6b12"
+checksum = "3296eb97d869113eaf148a6bdf01884e90b3828ad7ae2340b0f93362fc158611"
 
 [[package]]
-name = "fearless_simd"
-version = "1.0.0"
+name = "fearless_simd_macros"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3772b63c40606beea8fe1f7b06a60de27ceb9bfc2d9dad3427368ca41dc7e62"
+checksum = "3e91d94c6885390b81782d7ee60fd6583b33907333a8b340de25ccf468353315"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
 
 [[package]]
 name = "find-msvc-tools"
@@ -493,7 +498,7 @@ dependencies = [
 [[package]]
 name = "glifo"
 version = "0.4.0"
-source = "git+https://github.com/Vantrongs/vello?rev=0d81a2f77a52feff246eb8807093cc45cf78496e#0d81a2f77a52feff246eb8807093cc45cf78496e"
+source = "git+https://github.com/Vantrongs/vello?rev=3144325a81d585715e87cceb5a90fb89c8f6b94b#3144325a81d585715e87cceb5a90fb89c8f6b94b"
 dependencies = [
  "bytemuck",
  "foldhash",
@@ -529,7 +534,7 @@ name = "hayro"
 version = "0.8.0"
 dependencies = [
  "bytemuck",
- "fearless_simd 1.0.0",
+ "fearless_simd",
  "hayro-interpret",
  "image",
  "kurbo",
@@ -615,7 +620,7 @@ dependencies = [
 name = "hayro-jbig2"
 version = "0.3.1"
 dependencies = [
- "fearless_simd 1.0.0",
+ "fearless_simd",
  "hayro-ccitt",
  "image",
 ]
@@ -624,7 +629,7 @@ dependencies = [
 name = "hayro-jpeg2000"
 version = "0.4.1"
 dependencies = [
- "fearless_simd 1.0.0",
+ "fearless_simd",
  "image",
  "log",
  "moxcms",
@@ -1092,7 +1097,7 @@ dependencies = [
  "phf_shared",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1359,7 +1364,7 @@ checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1502,6 +1507,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "syn"
+version = "3.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d78c8dee4c7bf0e14673097256fed6142ce9d3b85a408189d07482442145823b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "synstructure"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1509,7 +1525,7 @@ checksum = "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1538,7 +1554,7 @@ checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1688,10 +1704,11 @@ dependencies = [
 [[package]]
 name = "vello_common"
 version = "0.3.0"
-source = "git+https://github.com/Vantrongs/vello?rev=0d81a2f77a52feff246eb8807093cc45cf78496e#0d81a2f77a52feff246eb8807093cc45cf78496e"
+source = "git+https://github.com/Vantrongs/vello?rev=3144325a81d585715e87cceb5a90fb89c8f6b94b#3144325a81d585715e87cceb5a90fb89c8f6b94b"
 dependencies = [
  "bytemuck",
- "fearless_simd 0.7.0",
+ "fearless_simd",
+ "fearless_simd_macros",
  "guillotiere",
  "log",
  "peniko",
@@ -1703,9 +1720,11 @@ dependencies = [
 [[package]]
 name = "vello_cpu"
 version = "0.3.0"
-source = "git+https://github.com/Vantrongs/vello?rev=0d81a2f77a52feff246eb8807093cc45cf78496e#0d81a2f77a52feff246eb8807093cc45cf78496e"
+source = "git+https://github.com/Vantrongs/vello?rev=3144325a81d585715e87cceb5a90fb89c8f6b94b#3144325a81d585715e87cceb5a90fb89c8f6b94b"
 dependencies = [
  "bytemuck",
+ "fearless_simd",
+ "fearless_simd_macros",
  "glifo",
  "hashbrown",
  "num-bigint",
@@ -1782,7 +1801,7 @@ dependencies = [
  "bumpalo",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
  "wasm-bindgen-shared",
 ]
 
@@ -1853,7 +1872,7 @@ checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1864,7 +1883,7 @@ checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1931,7 +1950,7 @@ checksum = "de844c262c8848816172cef550288e7dc6c7b7814b4ee56b3e1553f275f1858e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
  "synstructure",
 ]
 
@@ -1952,7 +1971,7 @@ checksum = "11532158c46691caf0f2593ea8358fed6bbf68a0315e80aae9bd41fbade684a1"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
  "synstructure",
 ]
 
