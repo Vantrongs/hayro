@@ -2,6 +2,7 @@
 
 use crate::hash;
 use crate::object::macros::object;
+use crate::object::name::lex_name_like;
 use crate::object::parsed::{DictNode, Node};
 use crate::object::r#ref::{MaybeRef, ObjRef};
 use crate::object::{Name, ObjectIdentifier};
@@ -319,8 +320,8 @@ fn read_inner<'a>(
         start_tag,
         end_tag,
         #[inline]
-        |r, name, offset| {
-            offsets.insert(name, offset);
+        |r, key, offset| {
+            offsets.insert(Name::new(key)?, offset);
             skip_value(r, in_content_stream, depth)
         },
     )?;
@@ -365,10 +366,11 @@ std::thread_local! {
         const { core::cell::Cell::new((0, 0)) };
 }
 
-/// Reads a dictionary, calling `on_entry` with each key and where its value starts,
-/// which reads the value, as an object `depth` deep: the one way a dictionary is
-/// read, whether it is kept, skipped or parsed. A key is a name; another token in
-/// its place is skipped as an object.
+/// Reads a dictionary, calling `on_entry` with each key's bytes as written, after
+/// the solidus and with their escapes ([`Name::new`] decodes them), and where its
+/// value starts, which reads the value, as an object `depth` deep: the one way a
+/// dictionary is read, whether it is kept, skipped or parsed; a skip decodes no key.
+/// A key is a name; another token in its place is skipped as an object.
 pub(crate) fn parse_dict_with<'a, F>(
     r: &mut Reader<'a>,
     in_content_stream: bool,
@@ -378,7 +380,7 @@ pub(crate) fn parse_dict_with<'a, F>(
     mut on_entry: F,
 ) -> Option<&'a [u8]>
 where
-    F: FnMut(&mut Reader<'a>, Name<'a>, usize) -> Option<()>,
+    F: FnMut(&mut Reader<'a>, &'a [u8], usize) -> Option<()>,
 {
     let dict_data = r.tail()?;
     let start_offset = r.offset();
@@ -398,7 +400,7 @@ where
 
             break Some(&dict_data[..end_offset]);
         } else {
-            let Some(name) = r.read_without_context::<Name<'_>>() else {
+            let Some(key) = lex_name_like(r, true) else {
                 if start_tag.is_some() {
                     // In case there is garbage in-between, be lenient and just try to skip it.
                     // But only do this if we are parsing a proper dictionary as opposed to an
@@ -419,7 +421,7 @@ where
             // whether the object is `null` before inserting it, but that caused problems
             // in some test cases where encryption + object streams are involved (as we would
             // attempt to read an object stream before having resolved the encryption dictionary).
-            on_entry(r, name, offset)?;
+            on_entry(r, key, offset)?;
         }
     }
 }

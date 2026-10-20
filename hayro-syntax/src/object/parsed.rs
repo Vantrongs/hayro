@@ -170,6 +170,7 @@ impl<'a> Parse<'_, 'a> {
         let mut keys = Vec::new();
         let mut many: Option<hash::Map<Name<'static>, Node>> = None;
         let bytes = parse_dict_with(r, false, depth + 1, Some(b"<<"), b">>", |r, key, _| {
+            let key = Name::new(key)?;
             let value = self.item(r, from, depth + 1)?;
             match &mut many {
                 Some(many) => {
