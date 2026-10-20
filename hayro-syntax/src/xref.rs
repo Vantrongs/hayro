@@ -630,11 +630,14 @@ fn stream_data_start(data: &[u8], end: usize) -> Option<usize> {
 /// `endstream` that its /Length, if a number, leads to past at most [`NEAR`] bytes of
 /// white space, as reading the stream finds its data; else after the first
 /// `endstream` from `start` on, as reading finds the data of a stream whose /Length
-/// does not lead to one. `None` where no `endstream` follows: the walk reads the data.
+/// does not lead to one, unless /Length leads, so, to another keyword starting with
+/// `end` before it: the walk goes on there, the data's `endstream` being misspelled
+/// or missing. `None` where neither ends the data: the walk reads them.
 ///
-/// So a header or dictionary in a stream's data is not taken for one of the file's,
-/// and the walk does not read the data, most of a file. A /Length that is a reference
-/// is not resolved: the table that would resolve it is the one being rebuilt.
+/// So a header or dictionary in a stream's data, such as an object of a PDF attached
+/// uncompressed, is not taken for one of the file's, and the walk does not read the
+/// data, most of a file. A /Length that is a reference is not resolved: the table
+/// that would resolve it is the one being rebuilt.
 fn after_stream(
     data: &[u8],
     start: usize,
@@ -645,8 +648,12 @@ fn after_stream(
     // stream's data up to where /Length leads, if it is a number leading to
     // `endstream`, else up to the first `endstream`. Where none follows, it finds no
     // object after the stream at all; the walk reads the data then, keeping the
-    // objects after a stream cut short.
-    let by_length = dict.get::<u32>(LENGTH).and_then(|length| {
+    // objects after a stream cut short. Unlike PyMuPDF, an `end` keyword /Length leads
+    // to before the first `endstream` ends the data: in pdf.js's issue18122.pdf it is
+    // `endsteam`, and the first `endstream` a later stream's, the objects up to it
+    // lost. One after the first `endstream` does not: pdf.js's issue2098.pdf has
+    // streams whose /Length runs past their `endstream` to a later object's `endobj`.
+    let led = dict.get::<u32>(LENGTH).and_then(|length| {
         let to = start.checked_add(length as usize)?;
         let near = data.get(to..)?;
         let white = near
@@ -655,13 +662,17 @@ fn after_stream(
             .take_while(|b| is_white_space_character(**b))
             .count();
         opened(white + 1);
-        (white < NEAR && near[white..].starts_with(b"endstream")).then_some(to + white)
+        let end = &near[white..];
+        (white < NEAR && end.starts_with(b"end"))
+            .then_some((to + white, end.starts_with(b"endstream")))
     });
-    let endstream = match by_length {
-        Some(at) => at,
-        None => endstreams.at_or_after(data, start)?,
-    };
-    Some(endstream + b"endstream".len())
+    if let Some((at, true)) = led {
+        return Some(at + b"endstream".len());
+    }
+    match (led, endstreams.at_or_after(data, start)) {
+        (Some((at, _)), first) if first.is_none_or(|first| at < first) => Some(at),
+        (_, first) => Some(first? + b"endstream".len()),
+    }
 }
 
 /// Where the first `endstream` at or after an offset of a file is, for offsets asked
@@ -2692,7 +2703,7 @@ mod tests {
     #[test]
     fn opening_a_file_reads_it_in_linear_time() {
         type Family = (&'static str, fn(usize) -> Vec<u8>);
-        let families: [Family; 26] = [
+        let families: [Family; 27] = [
             // Entries at each `0` of `0…09 0 obj`: each reads a header in its slot of
             // one byte, which the next `0` ends, not on to `obj`.
             ("entries in the zeros of a header", |n| {
@@ -2804,6 +2815,15 @@ mod tests {
                     .replace("0000000000", &format!("{length:010}"))
                     .repeat(n);
                 around(&format!("{units}{}", " ".repeat(length + 100)))
+            }),
+            // Streams whose /Length leads to `endobj`, the data's `endstream` missing,
+            // before one `endstream` after them all: the search for it reads to it
+            // once for them all.
+            ("streams ended by endobj before one endstream", |n| {
+                around(&format!(
+                    "{}endstream",
+                    "5 0 obj << /Length 0 >> stream\nendobj\n".repeat(n)
+                ))
             }),
             // Streams, each holding a header, whose /Length is a reference and whose
             // data end at an `endstream`: each is read past, the header unread.
@@ -3313,11 +3333,13 @@ mod tests {
 
     // A rebuild takes no header in a stream's data for one of the file's, where the
     // data end at the `endstream` /Length leads to, or else at the first one, as
-    // PyMuPDF 1.28.2 does; it finds one after that `endstream`, and one in data that
-    // no `endstream` ends, as the walk reads such data.
+    // PyMuPDF 1.28.2 does, or at another `end` keyword /Length leads to; it finds one
+    // after the data so ended, and one in data that nothing ends, as the walk reads
+    // such data.
     #[test]
     fn a_rebuild_takes_no_header_in_a_streams_data_for_the_files() {
         let header = "9 0 obj\n<< /Type /Font >>\nendobj\n";
+        let later = "10 0 obj\n<< /Length 1 >>\nstream\nx\nendstream";
         let length = header.len();
         let cases = [
             (
@@ -3337,7 +3359,31 @@ mod tests {
                 format!("<< /Length 1 >>\nstream\nx\nendstream\n{header}\nendstream"),
                 true,
             ),
-            (format!("<< /Length {length} >>\nstream\n{header}"), true),
+            // /Length leads to the `endobj` after the data, which hold the header.
+            (format!("<< /Length {length} >>\nstream\n{header}"), false),
+            // /Length leads to no `end` keyword and no `endstream` follows: the data
+            // are read.
+            (format!("<< /Length 1 >>\nstream\nx\n{header}"), true),
+            // /Length leads to the end of the data, where `endstream` is misspelled or
+            // missing: the header after the data is the file's, though a later
+            // stream's `endstream` is the first after the data.
+            (
+                format!("<< /Length 1 >>\nstream\nx\nendsteam\nendobj\n{header}{later}"),
+                true,
+            ),
+            (
+                format!("<< /Length 1 >>\nstream\nx\nendobj\n{header}{later}"),
+                true,
+            ),
+            // /Length runs past the data's `endstream` to the header's `endobj`, as in
+            // pdf.js's issue2098.pdf: the data end at that `endstream`.
+            (
+                format!(
+                    "<< /Length {} >>\nstream\nx\nendstream\nendobj\n{header}",
+                    "x\nendstream\nendobj\n".len() + header.len() - "endobj\n".len()
+                ),
+                true,
+            ),
         ];
         for (object, found) in cases {
             let body = format!("4 0 obj\n{object}\nendobj\n5 0 obj\n{length}\nendobj\n");
