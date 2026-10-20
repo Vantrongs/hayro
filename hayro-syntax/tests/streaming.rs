@@ -2,6 +2,7 @@
 //! with the data read, not with what the dictionary declares or the stream holds.
 
 use hayro_syntax::Pdf;
+use hayro_syntax::object::stream::ImageDecodeParams;
 use hayro_syntax::object::stream::{DecodedReader, ReadError};
 use hayro_syntax::object::{ObjectIdentifier, Stream};
 use hayro_syntax::work::{Cancelled, Meter, POLL_BYTES};
@@ -287,4 +288,37 @@ fn a_checkpoint_belongs_to_the_bytes_it_was_taken_from() {
     let mut other = b.decoded_reader().unwrap();
     assert!(!other.restore(&checkpoint));
     assert_eq!(read_up_to(&mut other, usize::MAX, 997), (data, 0));
+}
+
+/// A CCITT stream that ends at once holds about as much whatever its dictionary
+/// declares: its output grows with the rows decoded, not with `Rows` or `Columns`.
+#[test]
+fn a_declared_ccitt_size_is_not_allocated_before_rows_are_decoded() {
+    // Two EOL codes: the end of the data in Group 4.
+    let eofb = [0x00, 0x10, 0x01];
+    for is_indexed in [false, true] {
+        let peak = |columns: u32, rows: u32| {
+            let pdf = stream_file(
+                &format!(
+                    "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns {columns} /Rows {rows} >>"
+                ),
+                &eofb,
+            );
+            let stream = object_3(&pdf);
+            let params = ImageDecodeParams {
+                is_indexed,
+                ..Default::default()
+            };
+            let (_, decoded) = measure(|| stream.decoded_image(&params));
+            decoded.peak
+        };
+        let small = peak(8, 1);
+        for (columns, rows) in [(8, 65_535), (1 << 20, 65_535), (u32::MAX, 65_535)] {
+            let large = peak(columns, rows);
+            assert!(
+                large < small + 4096,
+                "{columns} x {rows}: {large} vs {small}"
+            );
+        }
+    }
 }

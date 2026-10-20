@@ -6,7 +6,6 @@ use crate::object::stream::{FilterResult, ImageColorSpace, ImageData, ImageDecod
 use crate::work::{Meter, POLL_BYTES};
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
-use core::iter;
 use hayro_ccitt::{DecodeSettings, Decoder, DecoderContext, EncodingMode};
 
 /// Appends `count` copies of `byte` to `output`, a counted piece at a time; stops
@@ -15,7 +14,7 @@ fn push_counted(output: &mut Vec<u8>, byte: u8, count: usize, meter: &Meter<'_>)
     let mut left = count;
     while left > 0 && !meter.cancelled() {
         let n = left.min(POLL_BYTES);
-        output.extend(iter::repeat_n(byte, n));
+        output.resize(output.len() + n, byte);
         left -= n;
         let _ = meter.work(n);
     }
@@ -104,12 +103,16 @@ pub(crate) fn decode(
                     let first_mask = 0xFF_u8 >> (start % 8);
                     let last_mask = 0xFF_u8 << (7 - (end - 1) % 8);
 
-                    if first == last {
+                    let filled = if first == last {
                         row[first] ^= first_mask & last_mask;
+                        self.meter.work(1).is_ok()
                     } else {
                         row[first] ^= first_mask;
-                        fill_counted(&mut row[first + 1..last], !self.white, self.meter);
                         row[last] ^= last_mask;
+                        fill_counted(&mut row[first + 1..last], !self.white, self.meter)
+                    };
+                    if !filled {
+                        return;
                     }
                 }
 
@@ -171,7 +174,9 @@ pub(crate) fn decode(
                 let row = &mut self.output[start..end];
 
                 for (start, end) in black_spans(changes, self.columns) {
-                    fill_counted(&mut row[start..end], !self.white, self.meter);
+                    if !fill_counted(&mut row[start..end], !self.white, self.meter) {
+                        return;
+                    }
                 }
 
                 self.decoded_rows += 1;
@@ -229,23 +234,19 @@ fn black_spans(changes: &[u32], columns: u32) -> impl Iterator<Item = (usize, us
     })
 }
 
-/// Fills `slice` with `value`; a slice longer than [`POLL_BYTES`] a counted piece
-/// at a time, stopping once `meter`'s hook asks to stop. Shorter ones are counted
-/// with the row they are in ([`grow`]).
+/// Fills `slice` with `value`, a counted piece at a time; `false`, with the rest
+/// left out, once `meter`'s hook asks to stop. A span costs a step even when empty.
 #[inline(always)]
-fn fill_counted(slice: &mut [u8], value: u8, meter: &Meter<'_>) {
+fn fill_counted(slice: &mut [u8], value: u8, meter: &Meter<'_>) -> bool {
     if slice.len() <= POLL_BYTES {
         fill_short(slice, value);
-        return;
+        return meter.work(slice.len() + 1).is_ok();
     }
 
-    for piece in slice.chunks_mut(POLL_BYTES) {
-        if meter.cancelled() {
-            return;
-        }
+    slice.chunks_mut(POLL_BYTES).all(|piece| {
         piece.fill(value);
-        let _ = meter.work(piece.len());
-    }
+        meter.work(piece.len()).is_ok()
+    })
 }
 
 #[inline(always)]
@@ -323,5 +324,35 @@ mod tests {
         let decoded = decode(&[0x35, 0x14], &params, &image_params, &Meter::default()).unwrap();
         assert_eq!(decoded.data.as_ref(), &[0]);
         assert_eq!(decoded.image_data.unwrap().height, 1);
+    }
+
+    /// Writing the black spans of a row counts on the meter, however short they are.
+    #[cfg(all(debug_assertions, feature = "std"))]
+    #[test]
+    fn short_spans_count() {
+        use crate::work::TOLD;
+
+        // A row of alternating white and black pixels in horizontal mode: `001`, a
+        // white run of 1 (`000111`) and a black run of 1 (`010`), twice per 3 bytes.
+        let pairs = 100_000;
+        let data = [0x23, 0xA2, 0x3A].repeat(pairs / 2);
+        let dict = format!("<< /K -1 /Columns {} /Rows 1 >>", 2 * pairs);
+        let params = Dict::from_bytes(dict.as_bytes()).unwrap();
+        let told = |is_indexed| {
+            let image_params = ImageDecodeParams {
+                is_indexed,
+                ..Default::default()
+            };
+            TOLD.set(0);
+            let decoded = decode(&data, &params, &image_params, &Meter::default()).unwrap();
+            (TOLD.get(), decoded.data.into_owned())
+        };
+        let (luma, data) = told(false);
+        assert!(data.chunks(2).all(|pair| pair == [0xFF, 0x00]));
+        let (bits, data) = told(true);
+        assert!(data.iter().all(|&byte| byte == 0xAA));
+        // The row's bytes and a step per code count anyway; each black span adds one.
+        assert!(luma >= 2 * pairs + pairs + pairs, "{luma}");
+        assert!(bits >= 2 * pairs / 8 + pairs + pairs, "{bits}");
     }
 }
