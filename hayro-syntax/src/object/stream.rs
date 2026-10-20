@@ -14,7 +14,7 @@ use crate::object::Dict;
 use crate::object::Name;
 use crate::object::dict::InlineImageDict;
 use crate::object::dict::keys::{DECODE_PARMS, DP, F, FILTER, IDENTITY, LENGTH, NAME, TYPE};
-use crate::object::{Array, MaybeRef, ObjectIdentifier};
+use crate::object::{Array, ObjectIdentifier};
 use crate::object::{Object, ObjectLike, ObjectRefLike, Written};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
@@ -43,8 +43,18 @@ pub struct FilterEntries<'a> {
     /// The key the filters are read from: /Filter, or /F, its abbreviation.
     pub key: &'static [u8],
     list: List<'a>,
-    params_key: &'static [u8],
+    /// The entry of the parameters as written, read with the filters: `None` where
+    /// it is missing, or where there are no filters, which take none.
+    params: Option<Written<'a>>,
     dict: Dict<'a>,
+}
+
+/// What an entry of filters holds, its reference resolved.
+enum Kind<'a> {
+    /// A name, the entry as written.
+    Named(Written<'a>),
+    Listed(Array<'a>),
+    Other,
 }
 
 #[derive(Clone, Debug)]
@@ -83,25 +93,44 @@ impl<'a> FilterEntries<'a> {
     /// dictionary for a filter given by name, an array of them, in the filters'
     /// places, for an array of filters, and none where they are of another kind.
     pub fn of(dict: &Dict<'a>) -> Self {
-        let named = |key| dict.get::<Name<'_>>(key).map(|_| key);
-        let listed = |key| dict.get::<Array<'_>>(key).map(|_| key);
-        let params_key = match dict.get_raw::<Object<'_>>(DP) {
-            None | Some(MaybeRef::NotRef(Object::Null(_))) => DECODE_PARMS,
-            Some(_) => DP,
+        // Each entry is read once, as written; a reference is resolved only to tell
+        // whether it leads to a name or an array.
+        let ctx = dict.ctx();
+        let kind = |key: &[u8]| match dict.get_written(key) {
+            Some(written @ Written::Name(_)) => Kind::Named(written),
+            Some(Written::Array(array)) => Kind::Listed(array),
+            Some(Written::Ref(r)) => {
+                if ctx.xref().get_with::<Name<'_>>(r.into(), ctx).is_some() {
+                    Kind::Named(Written::Ref(r))
+                } else {
+                    ctx.xref()
+                        .get_with::<Array<'a>>(r.into(), ctx)
+                        .map_or(Kind::Other, Kind::Listed)
+                }
+            }
+            _ => Kind::Other,
         };
-        let (key, list) = if let Some(key) = named(F).or_else(|| named(FILTER)) {
-            let written = dict.get_written(key);
-            (key, written.map_or(List::None, List::Named))
-        } else if let Some(key) = listed(F).or_else(|| listed(FILTER)) {
-            let array = dict.get::<Array<'a>>(key);
-            (key, array.map_or(List::None, List::Listed))
-        } else {
-            (FILTER, List::None)
+        // A name before an array, /F before /Filter.
+        let (key, list) = match kind(F) {
+            Kind::Named(written) => (F, List::Named(written)),
+            short => match (short, kind(FILTER)) {
+                (_, Kind::Named(written)) => (FILTER, List::Named(written)),
+                (Kind::Listed(array), _) => (F, List::Listed(array)),
+                (_, Kind::Listed(array)) => (FILTER, List::Listed(array)),
+                _ => (FILTER, List::None),
+            },
+        };
+        let params = match list {
+            List::None => None,
+            _ => match dict.get_written(DP) {
+                None | Some(Written::Null) => dict.get_written(DECODE_PARMS),
+                dp => dp,
+            },
         };
         Self {
             key,
             list,
-            params_key,
+            params,
             dict: dict.clone(),
         }
     }
@@ -139,16 +168,22 @@ impl<'a> FilterEntries<'a> {
         let (named, listed) = match &self.list {
             List::None => (None, None),
             List::Named(written) => {
-                let params = dict.get_written(self.params_key);
-                let params = params.map(|p| (p, dict.ctx()));
+                let params = self.params.clone().map(|p| (p, dict.ctx()));
                 (
                     Some(entry(written.clone(), dict.ctx(), params, false)),
                     None,
                 )
             }
             List::Listed(filters) => {
-                let by_reference = dict.get_ref(self.params_key).is_some();
-                let params = dict.get::<Array<'a>>(self.params_key);
+                let by_reference = matches!(self.params, Some(Written::Ref(_)));
+                let params = match &self.params {
+                    Some(Written::Ref(r)) => {
+                        let ctx = dict.ctx();
+                        ctx.xref().get_with::<Array<'a>>((*r).into(), ctx)
+                    }
+                    Some(Written::Array(array)) => Some(array.clone()),
+                    _ => None,
+                };
                 let mut params_written = params.as_ref().map(Array::written);
                 let entries = filters.written().map(move |written| {
                     let params_written = params_written
@@ -809,7 +844,7 @@ impl<'a> ObjectRefLike<'a> for Stream<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::object::Stream;
+    use crate::object::{Dict, Stream, Written};
     use crate::reader::Reader;
     use crate::reader::{ReaderContext, ReaderExt};
 
@@ -843,5 +878,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(stream.data, b"abcdefghij");
+    }
+
+    // Reading a stream's filters with their parameters parses each of the entries it
+    // reads once: the dictionaries and arrays parsed are those of reading each entry,
+    // and each item of an array, once, as written.
+    #[test]
+    fn filter_entries_parse_each_entry_once() {
+        use crate::object::dict::PARSED;
+        let cases: [(&str, &[&[u8]]); 3] = [
+            ("/F /AHx /DP << /K -1 /Columns 16 >>", &[b"F", b"DP"]),
+            (
+                "/Filter [/AHx /Fl] /DecodeParms [null << /Predictor 1 >>]",
+                &[b"Filter", b"DecodeParms"],
+            ),
+            (
+                "/F [/AHx] /DP null /DecodeParms [<< /A 1 >>]",
+                &[b"F", b"DP", b"DecodeParms"],
+            ),
+        ];
+        for (entries, read) in cases {
+            // A dictionary of its own: in a stream object's, /F names a file.
+            let dict = format!("<< {entries} >>");
+            let dict = Reader::new(dict.as_bytes())
+                .read_with_context::<Dict<'_>>(&ReaderContext::dummy())
+                .unwrap();
+            let stream = Stream::new(b"a", dict);
+            PARSED.set((0, 0));
+            for key in read {
+                if let Written::Array(array) = stream.dict.get_written(key).unwrap() {
+                    array.written().for_each(drop);
+                }
+            }
+            let once = PARSED.get();
+            PARSED.set((0, 0));
+            let filters = stream.filter_entries();
+            assert!(filters.entries().all(|e| e.filter.is_some()), "{entries}");
+            assert_eq!(PARSED.get(), once, "{entries}");
+        }
     }
 }
