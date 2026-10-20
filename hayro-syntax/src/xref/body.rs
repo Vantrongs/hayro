@@ -40,6 +40,16 @@ pub(crate) struct Place {
 }
 
 impl Place {
+    /// The place of the object of the file at `at` of a document that is not
+    /// encrypted, whose reads decrypt nothing ([`ReaderContext::decryption`]).
+    pub(super) fn unencrypted(at: usize) -> Self {
+        Self {
+            source: Source::File,
+            at,
+            decryption: None,
+        }
+    }
+
     /// The place as a link of a chain of references ([`Link`]): the same for every
     /// entry leading here, whatever key decrypts what is read.
     pub(crate) fn link(&self) -> Link {
@@ -175,14 +185,34 @@ impl Shape {
     ) -> Self {
         #[cfg(test)]
         BODIES.with_borrow_mut(|bodies| *bodies.entry(place).or_default() += 1);
-        let (read, looked) = Read::in_slot(
+        Self::made(Read::in_slot(
             data,
             place.at,
             slot,
             place.source == Source::File,
             |r| DictNode::read(r, data, ctx),
             |r| Top::read(r, data, ctx),
-        );
+        ))
+    }
+
+    /// What the body `r` is at holds, after its header, decrypting nothing: how the
+    /// table's check reads the body of an object of a document that is not encrypted,
+    /// as [`Self::read`] reads it, so that what it finds is kept for every read of the
+    /// place, [`Place::unencrypted`] ([`super::check`]).
+    pub(super) fn checked(r: SlotReader<'_>) -> Self {
+        #[cfg(test)]
+        BODIES.with_borrow_mut(|bodies| {
+            *bodies.entry(Place::unencrypted(r.at)).or_default() += 1;
+        });
+        let (data, ctx) = (r.data, ReaderContext::dummy());
+        Self::made(r.object(
+            |r| DictNode::read(r, data, &ctx),
+            |r| Top::read(r, data, &ctx),
+        ))
+    }
+
+    /// What a body read in its slot holds, counting the bytes reading it looked at.
+    fn made((read, looked): Looked<Read<Top, DictNode>>) -> Self {
         crate::work::read_bodies(looked);
         match read.map(|(read, _)| read) {
             None => Self::Unreadable,

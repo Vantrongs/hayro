@@ -180,11 +180,16 @@ pub(crate) fn open(data: PdfData, password: &[u8]) -> Result<XRef, XRefError> {
     let Some(trailer) = trailer else {
         return fallback(data, password, Old::default()).ok_or(XRefError::Unknown);
     };
+    // What the check reads of a document that is encrypted would be read again once
+    // its decryptor is known: it reads such a document's objects without keeping them.
+    let keep = Reader::new(trailer)
+        .read_with_context::<Dict<'_>>(&ReaderContext::dummy())
+        .is_some_and(|trailer| !trailer.contains_key(ENCRYPT));
 
-    match check(&mut xref_map, data.as_ref()) {
-        Ok(()) => match XRef::new(
+    match check(&mut xref_map, data.as_ref(), keep) {
+        Ok(shapes) => match XRef::new(
             data.clone(),
-            Rebuilt::sound(&xref_map),
+            Rebuilt::sound(&xref_map, shapes),
             xref_map,
             XRefInput::TrailerDictData(trailer),
             password,
@@ -253,7 +258,10 @@ fn opened(_bytes: usize) {
 // Check that each entry leads to its object before any object is read: a table with
 // an entry that does not is rebuilt, so the table never changes once read, and every
 // value read from the document is read from the one table. Returns the entries, for
-// the rebuilt table, if one does not lead to its own.
+// the rebuilt table, if one does not lead to its own; else, where `keep`, what each
+// object's body holds, read as reading the object reads it, which every read of the
+// table then takes instead of reading the body again (`body::Shape::checked`): a
+// body is read once from opening the file to reading it.
 //
 // An entry leads to its object where an object whose header names it is at its offset
 // and reading it as the entry's object is read (`body::Shape::read`) reads it before the
@@ -262,7 +270,7 @@ fn opened(_bytes: usize) {
 // than the next offset, its slot (`body::SlotReader`), which reads each byte of the file
 // once. A table is also rebuilt where an entry is past the end of the file or in an
 // object stream the table does not list as an object; an entry at offset 0 is free.
-fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Old> {
+fn check(xref_map: &mut XrefMap, data: &[u8], keep: bool) -> Result<Shapes, Old> {
     xref_map.retain(|_, entry| *entry != EntryType::Normal(0));
     let mut entries = vec![];
     let mut streams = vec![];
@@ -280,12 +288,17 @@ fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Old> {
         held: streams.iter().copied().collect(),
         ..Old::default()
     };
+    let mut shapes = Shapes::default();
     // The entries at each offset, and the next offset.
     let mut rest = entries.as_slice();
     while let Some(&(offset, _)) = rest.first() {
         let at = rest.partition_point(|(other, _)| *other == offset);
         let end = rest.get(at).map_or(data.len(), |(next, _)| *next);
-        let checked = object_in(data, offset, end);
+        // What a table that is rebuilt reads is not kept.
+        let (checked, shape) = object_in(data, offset, end, keep && sound);
+        if let Some(shape) = shape {
+            shapes.insert(Place::unencrypted(offset), shape);
+        }
         for &(_, id) in &rest[..at] {
             match checked {
                 Checked::Object(header) => {
@@ -309,7 +322,7 @@ fn check(xref_map: &mut XrefMap, data: &[u8]) -> Result<(), Old> {
     }
 
     if sound {
-        Ok(())
+        Ok(shapes)
     } else {
         warn!("xref table has an entry that does not lead to its object, rebuilding it");
         Err(old)
@@ -332,25 +345,32 @@ enum Checked {
 
 /// What the check of a table finds at `at` of `data`, whose slot ends at `slot`: the
 /// header and the object after it, read as an entry's object is read
-/// ([`body::Read::in_slot`]), all in the slot. A dictionary is skipped, which reads it
-/// as reading it does.
-fn object_in(data: &[u8], at: usize, slot: usize) -> Checked {
+/// ([`body::Read::in_slot`]), all in the slot; and, where `keep`, what the object's
+/// body holds, which reading it finds ([`body::Shape::checked`]). Else a dictionary is
+/// skipped, which reads it as reading it does.
+fn object_in(data: &[u8], at: usize, slot: usize, keep: bool) -> (Checked, Option<body::Shape>) {
     let Some(mut r) = SlotReader::new(data, at, Slot::to(slot)) else {
-        return Checked::Nothing;
+        return (Checked::Nothing, None);
     };
     let header = match r.header() {
         Header::Read(header) => header,
-        Header::Cut => return Checked::Unfinished(None),
-        Header::Absent => return Checked::Nothing,
+        Header::Cut => return (Checked::Unfinished(None), None),
+        Header::Absent => return (Checked::Nothing, None),
     };
-    let start = r.object_start();
+    let unfinished = Checked::Unfinished(Some((header, r.object_start())));
+    if keep {
+        return match body::Shape::checked(r) {
+            body::Shape::Unreadable => (unfinished, None),
+            shape => (Checked::Object(header), Some(shape)),
+        };
+    }
     let (object, _) = r.object(
         |r| r.skip::<Dict<'_>>(false),
         |r| r.read_with_context::<Object<'_>>(&ReaderContext::dummy()),
     );
     match object {
-        Some(_) => Checked::Object(header),
-        None => Checked::Unfinished(Some((header, start))),
+        Some(_) => (Checked::Object(header), None),
+        None => (unfinished, None),
     }
 }
 
@@ -389,21 +409,28 @@ type Unreadable = BTreeSet<ObjectIdentifier>;
 /// another. Found once, where the table is rebuilt, for every entry leading there.
 type Headers = hash::Map<ObjectIdentifier, ObjectIdentifier>;
 
+/// What the body at each place an entry leads to holds ([`body::Shape`]).
+type Shapes = hash::Map<Place, body::Shape>;
+
 /// What reading a table finds besides its entries: where the objects of the file
-/// are, which their slots end at, and, for a rebuilt table, the objects it lists
-/// that cannot be read and the entries whose objects are headed as others.
+/// are, which their slots end at, what the bodies its check read hold, and, for a
+/// rebuilt table, the objects it lists that cannot be read and the entries whose
+/// objects are headed as others.
 #[derive(Debug, Clone)]
 struct Rebuilt {
     layout: Layout,
+    shapes: Shapes,
     unreadable: Unreadable,
     headers: Headers,
 }
 
 impl Rebuilt {
-    /// What a table read from the file finds: its objects are at its entries.
-    fn sound(map: &XrefMap) -> Self {
+    /// What a table read from the file finds: its objects are at its entries, and
+    /// their bodies hold `shapes` ([`check`]).
+    fn sound(map: &XrefMap, shapes: Shapes) -> Self {
         Self {
             layout: Layout::new(map),
+            shapes,
             unreadable: Unreadable::default(),
             headers: Headers::default(),
         }
@@ -626,6 +653,7 @@ fn fallback_xref_map_inner<'a>(
             data.clone(),
             Rebuilt {
                 layout: layout.clone(),
+                shapes: Shapes::default(),
                 unreadable: Unreadable::default(),
                 headers: Headers::default(),
             },
@@ -670,6 +698,7 @@ fn fallback_xref_map_inner<'a>(
         .collect();
     let mut rebuilt = Rebuilt {
         layout,
+        shapes: Shapes::default(),
         unreadable,
         headers,
     };
@@ -889,7 +918,7 @@ impl XRef {
             map,
             unreadable: Arc::new(rebuilt.unreadable),
             headers: Arc::new(rebuilt.headers),
-            shapes: Arc::default(),
+            shapes: Arc::new(Mutex::new(rebuilt.shapes)),
             decryptor,
             has_ocgs: false,
             metadata: Arc::new(Metadata::default()),
@@ -1000,8 +1029,11 @@ impl XRef {
                 mutable.decryptor = Arc::new(decryptor);
                 mutable.has_ocgs = has_ocgs;
                 mutable.metadata = Arc::new(metadata);
-                // What was read before the decryptor was known is not kept.
-                mutable.shapes = Arc::default();
+                // What was read before the decryptor was known is not kept, unless
+                // there is none: then it was read as it is read from now on.
+                if !matches!(mutable.decryptor.as_ref(), Decryptor::None) {
+                    mutable.shapes = Arc::default();
+                }
             }
         }
 
@@ -1923,7 +1955,7 @@ struct SomeRepr {
     headers: Arc<Headers>,
     /// What the body at each place an entry leads to holds, read once for every
     /// read of an entry leading there ([`XRef::get_with`]).
-    shapes: Arc<Mutex<hash::Map<Place, body::Shape>>>,
+    shapes: Arc<Mutex<Shapes>>,
     metadata: Arc<Metadata>,
     decryptor: Arc<Decryptor>,
     has_ocgs: bool,
@@ -3540,7 +3572,8 @@ mod tests {
     }
 
     // An object of another kind than a read asks for is read once to find out it is
-    // not lost, however many references lead to it.
+    // not lost, however many references lead to it: as every body, once from opening
+    // the file on.
     #[test]
     fn an_object_of_another_kind_is_read_once_to_find_it_is_not_lost() {
         let n = 512;
@@ -3549,6 +3582,7 @@ mod tests {
         let string = format!("({})", "\\101".repeat(64 * n));
         let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>";
         let file = file_of(&[CATALOG, TREE, page, &annots, &string], false);
+        body::BODIES.with_borrow_mut(hash::Map::clear);
         let pdf = crate::Pdf::new(file).unwrap();
         let list = pdf
             .xref()
@@ -3556,12 +3590,45 @@ mod tests {
             .unwrap()
             .get::<Array<'_>>(b"List".as_slice())
             .unwrap();
-        body::BODIES.with_borrow_mut(hash::Map::clear);
         let read: Vec<_> = list.iter_checked::<Dict<'_>>().collect();
         assert!(read.is_empty(), "{read:?}");
         let bodies =
             body::BODIES.with_borrow(|bodies| bodies.values().copied().collect::<Vec<_>>());
-        assert_eq!(bodies, [1]);
+        assert_eq!(bodies, [1; 5]);
+    }
+
+    // The check reads each body of a table that is not encrypted as reading its object
+    // does, and every read takes what it read: from opening the file on, no body is
+    // lexed twice, however many objects are read, and of what kind.
+    #[test]
+    fn reading_objects_after_opening_the_file_lexes_nothing() {
+        let n = 64;
+        let refs: String = (4..4 + n).map(|i| format!("/K{i} {i} 0 R ")).collect();
+        let held = format!("<< {refs}/A [1 2.5 (s) /N <41> << /D true >>] /S (t) >>");
+        let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>";
+        let mut objects = vec![CATALOG, TREE, page];
+        objects.extend(iter::repeat_n(held.as_str(), n));
+        let file = file_of(&objects, false);
+        crate::work::EXAMINED.set(0);
+        let pdf = crate::Pdf::new(file).unwrap();
+        let opened = crate::work::EXAMINED.get();
+        assert!(
+            opened > n * refs.len(),
+            "{opened} bytes lexed opening the file"
+        );
+        for number in 1..=objects.len() {
+            let id = ObjectIdentifier::new(i32::try_from(number).unwrap(), 0);
+            assert!(pdf.xref().get::<Object<'_>>(id).is_some());
+            assert!(pdf.xref().get::<Dict<'_>>(id).is_some());
+            assert!(pdf.xref().get::<Array<'_>>(id).is_none());
+        }
+        let dict = pdf
+            .xref()
+            .get::<Dict<'_>>(ObjectIdentifier::new(4, 0))
+            .unwrap();
+        assert_eq!(dict.len(), n + 2);
+        assert!(dict.get::<Array<'_>>(b"A".as_slice()).is_some());
+        assert_eq!(crate::work::EXAMINED.get(), opened);
     }
 
     /// An object stream whose header is `header` and whose objects follow it as
