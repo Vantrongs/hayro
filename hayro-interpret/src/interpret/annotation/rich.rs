@@ -901,6 +901,21 @@ mod tests {
         );
     }
 
+    /// A `meta` whose Content-Type ends in `charset` without a value is not drawn,
+    /// as any `meta`, instead of ending the parse: html5ever releases before 0.40.1
+    /// index past its end (servo/html5ever issue 763).
+    #[test]
+    fn a_content_type_cut_after_charset_is_not_drawn() {
+        for content in [
+            "text/html; charset",
+            "text/html; charset \t",
+            "text/html; charset=",
+        ] {
+            let xhtml = format!("<meta http-equiv=\"Content-Type\" content=\"{content}\"><p>A</p>");
+            assert_eq!(text(&xhtml), "A\n", "{content}");
+        }
+    }
+
     /// Character references as HTML reads them: named ones of HTML, numeric ones,
     /// and an ampersand that starts none as itself.
     #[test]

@@ -138,12 +138,14 @@ zlib-rs = { git = "https://github.com/Vantrongs/zlib-rs", rev = "124359709a6ed94
 zune-jpeg = { git = "https://github.com/Vantrongs/zune-image", rev = "d8686cc29483a83c84ba681d6b7467fd3545e616" }
 # A tag's duplicate attributes found through a set keyed by the names' text, so
 # that rich text with many attributes on one tag is parsed in linear time
-# (servo/html5ever issue 796).
-html5ever = { git = "https://github.com/Vantrongs/html5ever", rev = "7c13a4e871b5ee30d875ec812784de3cb07a06d1" }
+# (servo/html5ever issue 796), and a `meta` Content-Type cut after `charset`
+# read without a panic (servo/html5ever PR 764, released in 0.40.1).
+html5ever = { git = "https://github.com/Vantrongs/html5ever", rev = "16c09dc3dab410bf600c2a721d8a5dfd500c9324" }
 # Atoms longer than 7 bytes placed by a per-process random hash rather than in
 # 4,096 lists by a fixed one, so that attribute names chosen to share a list do
-# not make interning them quadratic.
-string_cache = { git = "https://github.com/Vantrongs/string-cache", rev = "0099c3e9efeb7eb9730da33e21f516caeaf8842a" }
+# not make interning them quadratic; with upstream's fixes for an uninitialized
+# buffer and a reference count overflow (servo/string-cache PRs 300, 301).
+string_cache = { git = "https://github.com/Vantrongs/string-cache", rev = "fa62c6494ca80e41784fb79760ca2e8e0d079ab4" }
 # `NumberToken`, which writes a copied number as its source writes it: an i32 or
 # f32 cannot hold `4294967297`, `5.0` or `--5` as viewers read them.
 pdf-writer = { git = "https://github.com/Vantrongs/pdf-writer", rev = "daf9012abec3d7284d756c48ae9d5e5e01cf18b6" }

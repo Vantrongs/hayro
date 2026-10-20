@@ -706,7 +706,7 @@ dependencies = [
 [[package]]
 name = "html5ever"
 version = "0.39.0"
-source = "git+https://github.com/Vantrongs/html5ever?rev=7c13a4e871b5ee30d875ec812784de3cb07a06d1#7c13a4e871b5ee30d875ec812784de3cb07a06d1"
+source = "git+https://github.com/Vantrongs/html5ever?rev=16c09dc3dab410bf600c2a721d8a5dfd500c9324#16c09dc3dab410bf600c2a721d8a5dfd500c9324"
 dependencies = [
  "log",
  "markup5ever",
@@ -1464,7 +1464,7 @@ dependencies = [
 [[package]]
 name = "string_cache"
 version = "0.9.0"
-source = "git+https://github.com/Vantrongs/string-cache?rev=0099c3e9efeb7eb9730da33e21f516caeaf8842a#0099c3e9efeb7eb9730da33e21f516caeaf8842a"
+source = "git+https://github.com/Vantrongs/string-cache?rev=fa62c6494ca80e41784fb79760ca2e8e0d079ab4#fa62c6494ca80e41784fb79760ca2e8e0d079ab4"
 dependencies = [
  "hashbrown",
  "new_debug_unreachable",
