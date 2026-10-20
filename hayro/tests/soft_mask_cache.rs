@@ -155,8 +155,10 @@ fn differing(group: &Group, group_box: [f64; 4], clips: [&str; 2], scale: f32) -
         let copies = rendered(file(group, group_box, clips, true), scale);
         assert_eq!(shared.len(), copies.len());
         shared
-            .chunks_exact(4)
-            .zip(copies.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(copies.as_chunks::<4>().0)
             .filter(|(a, b)| a != b)
             .count()
     })

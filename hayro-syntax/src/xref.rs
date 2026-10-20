@@ -26,6 +26,7 @@ use crate::trivia::{is_eol_character, is_white_space_character};
 use crate::util::findr_needle;
 use crate::{PdfData, object};
 use alloc::borrow::Cow;
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -2444,22 +2445,22 @@ fn parse_metadata(info_dict: &Dict<'_>) -> Metadata {
             .and_then(|c| DateTime::from_bytes(&c)),
         title: info_dict
             .get::<object::String<'_>>(TITLE)
-            .map(|t| t.to_vec()),
+            .map(|t| Box::from(t.as_bytes())),
         author: info_dict
             .get::<object::String<'_>>(AUTHOR)
-            .map(|t| t.to_vec()),
+            .map(|t| Box::from(t.as_bytes())),
         subject: info_dict
             .get::<object::String<'_>>(SUBJECT)
-            .map(|t| t.to_vec()),
+            .map(|t| Box::from(t.as_bytes())),
         keywords: info_dict
             .get::<object::String<'_>>(KEYWORDS)
-            .map(|t| t.to_vec()),
+            .map(|t| Box::from(t.as_bytes())),
         creator: info_dict
             .get::<object::String<'_>>(CREATOR)
-            .map(|t| t.to_vec()),
+            .map(|t| Box::from(t.as_bytes())),
         producer: info_dict
             .get::<object::String<'_>>(PRODUCER)
-            .map(|t| t.to_vec()),
+            .map(|t| Box::from(t.as_bytes())),
     }
 }
 

@@ -329,10 +329,9 @@ impl<'a> Iterator for ArrayIter<'a> {
                 if reader.at_end() {
                     return None;
                 }
-                // Objects are already guaranteed to be valid.
-                let item = reader
-                    .read_with_context::<MaybeRef<Object<'_>>>(&self.ctx)
-                    .unwrap();
+                // The array was validated by skipping its items, which accepts some
+                // items that can't be read.
+                let item = reader.read_with_context::<MaybeRef<Object<'_>>>(&self.ctx)?;
                 crate::work::lexed(reader.offset() - start);
                 Some(item)
             }
@@ -699,5 +698,10 @@ mod tests {
         let array = Array::from_bytes(b"[  34 % comment\n /Test  [1   2] ]").unwrap();
 
         assert_eq!(format!("{array}"), "[34 /Test [1 2]]");
+    }
+
+    #[test]
+    fn array_with_unreadable_item() {
+        let _ = array_ref_impl(b"[true /#zz false]");
     }
 }

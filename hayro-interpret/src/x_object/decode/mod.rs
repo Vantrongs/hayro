@@ -104,8 +104,8 @@ fn decode_context<'a>(
         bpc: dict_bpc,
         num_components: color_space.as_ref().map(|c| c.num_components()),
         target_dimension,
-        width: obj.width,
-        height: obj.height,
+        width: obj.width(),
+        height: obj.height(),
     };
 
     let decoded = obj
@@ -124,12 +124,12 @@ fn decode_context<'a>(
         .image_data
         .as_ref()
         .map(|d| {
-            scale_x = obj.width as f32 / d.width as f32;
-            scale_y = obj.height as f32 / d.height as f32;
+            scale_x = obj.width() as f32 / d.width as f32;
+            scale_y = obj.height() as f32 / d.height as f32;
 
             (d.width, d.height)
         })
-        .unwrap_or((obj.width, obj.height));
+        .unwrap_or((obj.width(), obj.height()));
 
     let SampleFormat {
         color_space,
@@ -423,7 +423,7 @@ fn for_each_whole_sample(
                 index += 1;
             }
         } else {
-            for value in piece.chunks_exact(2) {
+            for value in piece.as_chunks::<2>().0 {
                 visit(u16::from_be_bytes([value[0], value[1]]) as u32, index)?;
                 index += 1;
             }

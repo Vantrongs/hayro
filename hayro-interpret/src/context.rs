@@ -3,10 +3,16 @@ use crate::color::{Color, ColorSpace};
 use crate::convert::convert_transform;
 use crate::font::{Font, PositionedGlyph, StandardFont};
 use crate::interpret::annotation::Glyph;
-use crate::interpret::state::{ClipType, State, TextStateFont};
+use crate::interpret::stack::StateStack;
+use crate::interpret::state::{
+    ClipType, CompositingState, PaintData, PaintState, State, TextState, TextStateFont,
+};
 use crate::ocg::OcgState;
 use crate::util::{BezPathExt, Float64Ext};
-use crate::{ClipPath, Device, DrawProps, FillRule, InterpreterSettings, Paint, StrokeProps};
+use crate::{
+    ClipPath, Device, DrawProps, FillRule, InterpreterSettings, InterpreterWarning, Paint,
+    StrokeProps,
+};
 use hayro_syntax::content::ops::Transform;
 use hayro_syntax::hash;
 use hayro_syntax::object::Dict;
@@ -52,7 +58,7 @@ impl<'a> InterpreterCache<'a> {
 
 /// A per-page interpretation context that borrows shared data from an [`InterpreterCache`].
 pub struct Context<'a> {
-    states: Vec<State<'a>>,
+    stack: StateStack<'a>,
     path: BezPath,
     sub_path_start: Point,
     last_point: Point,
@@ -104,7 +110,7 @@ impl<'a> Context<'a> {
         };
 
         Self {
-            states: vec![state],
+            stack: StateStack::new(state),
             settings,
             xref,
             root_transforms: vec![initial_transform],
@@ -123,12 +129,7 @@ impl<'a> Context<'a> {
     }
 
     pub(crate) fn save_state(&mut self) {
-        let Some(cur) = self.states.last().cloned() else {
-            warn!("attempted to save state without existing state");
-            return;
-        };
-
-        self.states.push(cur);
+        self.stack.save();
     }
 
     /// The box the context was made with, as the clips in effect leave it. What reads
@@ -176,13 +177,13 @@ impl<'a> Context<'a> {
                 && cur_bbox.max_x().is_nearly_less_or_equal(clip_rect.max_x())
                 && cur_bbox.max_y().is_nearly_less_or_equal(clip_rect.max_y())
             {
-                self.get_mut().clips.push(ClipType::Dummy);
+                self.stack.push_clip(ClipType::Dummy);
                 return;
             }
 
             device.push_clip_rect(&clip_rect);
             self.push_bbox(clip_rect);
-            self.get_mut().clips.push(ClipType::Real);
+            self.stack.push_clip(ClipType::Real);
             return;
         }
 
@@ -192,11 +193,11 @@ impl<'a> Context<'a> {
             fill,
         });
         self.push_bbox(bbox);
-        self.get_mut().clips.push(ClipType::Real);
+        self.stack.push_clip(ClipType::Real);
     }
 
     pub(crate) fn pop_clip(&mut self, device: &mut impl Device<'a>) {
-        if let Some(ClipType::Real) = self.get_mut().clips.pop() {
+        if let Some(ClipType::Real) = self.stack.pop_clip() {
             device.pop_clip();
             self.pop_bbox();
         }
@@ -207,7 +208,7 @@ impl<'a> Context<'a> {
     }
 
     pub(crate) fn push_root_transform(&mut self) {
-        self.root_transforms.push(self.get().ctm);
+        self.root_transforms.push(self.ctm());
     }
 
     pub(crate) fn pop_root_transform(&mut self) {
@@ -222,39 +223,38 @@ impl<'a> Context<'a> {
     }
 
     pub(crate) fn restore_state(&mut self, device: &mut impl Device<'a>) {
-        let Some(target_clips) = self
-            .states
-            .get(self.states.len().saturating_sub(2))
-            .map(|s| s.clips.len())
-        else {
-            warn!("underflowed graphics state");
+        let Some(target_clips) = self.stack.restore_target_clips() else {
             return;
         };
 
-        while self.get().clips.len() > target_clips {
+        while self.stack.num_clips() > target_clips {
             self.pop_clip(device);
         }
 
-        // The first state should never be popped.
-        if self.states.len() > 1 {
-            self.states.pop();
-        }
+        self.stack.restore();
     }
 
     pub(crate) fn draw_props(&self, is_stroke: bool) -> DrawProps<'a> {
         DrawProps {
-            transform: self.get().ctm,
+            transform: self.ctm(),
             paint: self.get_paint(is_stroke),
-            soft_mask: self.get().graphics_state.soft_mask.clone(),
-            blend_mode: self.get().graphics_state.blend_mode,
+            soft_mask: self.compositing().soft_mask.clone(),
+            blend_mode: self.compositing().blend_mode,
         }
     }
 
     pub(crate) fn get_paint(&self, is_stroke: bool) -> Paint<'a> {
-        let data = if is_stroke {
-            self.get().stroke_data()
+        let paint = if is_stroke {
+            self.stroke_paint()
         } else {
-            self.get().non_stroke_data()
+            self.fill_paint()
+        };
+        let data = PaintData {
+            alpha: paint.alpha,
+            color: paint.color.clone(),
+            color_space: paint.color_space.clone(),
+            pattern: paint.pattern.clone(),
+            transfer_function: self.compositing().transfer_function.clone(),
         };
 
         if data.color_space.is_pattern() || data.pattern.is_some() {
@@ -316,20 +316,61 @@ impl<'a> Context<'a> {
         &mut self.last_point
     }
 
-    pub(crate) fn clip(&self) -> &Option<FillRule> {
-        &self.clip
-    }
-
     pub(crate) fn clip_mut(&mut self) -> &mut Option<FillRule> {
         &mut self.clip
     }
 
-    pub(crate) fn get(&self) -> &State<'a> {
-        self.states.last().unwrap()
+    pub(crate) fn ctm(&self) -> Affine {
+        *self.stack.ctm()
     }
 
-    pub(crate) fn get_mut(&mut self) -> &mut State<'a> {
-        self.states.last_mut().unwrap()
+    pub(crate) fn ctm_mut(&mut self) -> &mut Affine {
+        self.stack.ctm_mut()
+    }
+
+    pub(crate) fn stroke_paint(&self) -> &PaintState<'a> {
+        self.stack.stroke()
+    }
+
+    pub(crate) fn stroke_paint_mut(&mut self) -> &mut PaintState<'a> {
+        self.stack.stroke_mut()
+    }
+
+    pub(crate) fn fill_paint(&self) -> &PaintState<'a> {
+        self.stack.fill()
+    }
+
+    pub(crate) fn fill_paint_mut(&mut self) -> &mut PaintState<'a> {
+        self.stack.fill_mut()
+    }
+
+    pub(crate) fn stroke_props(&self) -> &StrokeProps {
+        self.stack.stroke_props()
+    }
+
+    pub(crate) fn stroke_props_mut(&mut self) -> &mut StrokeProps {
+        self.stack.stroke_props_mut()
+    }
+
+    pub(crate) fn text_state(&self) -> &TextState<'a> {
+        self.stack.text()
+    }
+
+    pub(crate) fn text_state_mut(&mut self) -> &mut TextState<'a> {
+        self.stack.text_mut()
+    }
+
+    pub(crate) fn compositing(&self) -> &CompositingState<'a> {
+        self.stack.compositing()
+    }
+
+    pub(crate) fn compositing_mut(&mut self) -> &mut CompositingState<'a> {
+        self.stack.compositing_mut()
+    }
+
+    /// A copy of the current graphics state.
+    pub(crate) fn snapshot(&self) -> State<'a> {
+        self.stack.snapshot()
     }
 
     pub(crate) fn pre_concat_transform(&mut self, transform: Transform) {
@@ -337,7 +378,7 @@ impl<'a> Context<'a> {
     }
 
     pub(crate) fn pre_concat_affine(&mut self, transform: Affine) {
-        self.get_mut().ctm *= transform;
+        *self.ctm_mut() *= transform;
     }
 
     pub(crate) fn get_color_space(
@@ -353,12 +394,8 @@ impl<'a> Context<'a> {
             })
     }
 
-    pub(crate) fn stroke_props(&self) -> StrokeProps {
-        self.get().graphics_state.stroke_props.clone()
-    }
-
     pub(crate) fn num_states(&self) -> usize {
-        self.states.len()
+        self.stack.len()
     }
 
     pub(crate) fn nesting_depth(&self) -> u32 {
@@ -400,6 +437,8 @@ impl<'a> Context<'a> {
         if let Some(resolved) = resolved {
             Some(TextStateFont::Font(resolved))
         } else {
+            (self.settings.warning_sink)(InterpreterWarning::UnsupportedFont);
+
             Font::new_standard(StandardFont::Helvetica, &self.settings.font_resolver)
                 .map(TextStateFont::Fallback)
         }

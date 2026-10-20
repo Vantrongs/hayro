@@ -292,7 +292,7 @@ impl<'a> MaskSource<'a> {
 
     pub(super) fn size(&self) -> (u32, u32) {
         match self {
-            Self::Streamed { obj, height, .. } => (obj.width, *height),
+            Self::Streamed { obj, height, .. } => (obj.width(), *height),
             Self::Decoded(luma) => (luma.width, luma.height),
         }
     }
@@ -308,7 +308,7 @@ impl<'a> MaskSource<'a> {
     pub(super) fn rows(&'a self, meter: &'a Meter<'a>) -> Option<MaskRows<'a>> {
         Some(match self {
             Self::Streamed { obj, path, .. } => {
-                let width = obj.width as usize;
+                let width = obj.width() as usize;
                 MaskRows::Streamed {
                     raw: Box::new(RawRows::new(&obj.stream, path.row_bytes(width), meter)?),
                     path: *path,
@@ -333,7 +333,7 @@ fn rows_held(
     let Some(mut reader) = mask.stream.decoded_reader() else {
         return Ok(None);
     };
-    let width = mask.width as usize;
+    let width = mask.width() as usize;
     let mut buf = vec![0; path.row_bytes(width).clamp(1, PIECE_BYTES)];
     let mut bytes = 0;
     let held = loop {
@@ -346,7 +346,7 @@ fn rows_held(
         }
     };
     work.bytes_inflated += reader.inflated_bytes();
-    Ok(held?.map(|held| rows_present(path.samples(held, width), width, mask.height)))
+    Ok(held?.map(|held| rows_present(path.samples(held, width), width, mask.height())))
 }
 
 /// A mask's rows, as alpha, each read from its start in pieces of columns from left

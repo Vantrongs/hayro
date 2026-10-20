@@ -1,6 +1,6 @@
 use crate::context::{Context, path_as_rect};
 use crate::device::Device;
-use crate::util::{BezPathExt, Float32Ext};
+use crate::util::{BezPathExt, Float32Ext, x_y_advances};
 use crate::{BlendMode, DrawMode, FillRule, StrokeProps};
 use kurbo::{Affine, BezPath, Cap, Join, PathEl, Rect, Shape};
 
@@ -10,14 +10,12 @@ pub(crate) fn fill_path<'a>(
     fill_rule: FillRule,
 ) {
     fill_path_impl(context, device, fill_rule, None);
-
-    context.path_mut().truncate(0);
+    end_path(context, device);
 }
 
 pub(crate) fn stroke_path<'a>(context: &mut Context<'a>, device: &mut impl Device<'a>) {
     stroke_path_impl(context, device, None);
-
-    context.path_mut().truncate(0);
+    end_path(context, device);
 }
 
 /// Fills and then strokes the current path, as one operator does. Viewers paint the
@@ -32,31 +30,47 @@ pub(crate) fn fill_stroke_path<'a>(
     device: &mut impl Device<'a>,
     fill_rule: FillRule,
 ) {
-    let gs = &context.get().graphics_state;
-    let alpha = gs.non_stroke_alpha;
-    let knockout = alpha == gs.stroke_alpha
-        && (alpha < 1.0 || gs.blend_mode != BlendMode::Normal || gs.soft_mask.is_some())
+    let alpha = context.fill_paint().alpha;
+    let compositing = context.compositing();
+    let knockout = alpha == context.stroke_paint().alpha
+        && (alpha < 1.0
+            || compositing.blend_mode != BlendMode::Normal
+            || compositing.soft_mask.is_some())
         && context.ocg_state.is_visible();
     if knockout {
-        let (mask, blend) = (gs.soft_mask.clone(), gs.blend_mode);
-        match painted_bounds(context.path(), context.get().ctm, &context.stroke_props()) {
+        let (mask, blend) = (compositing.soft_mask.clone(), compositing.blend_mode);
+        match painted_bounds(context.path(), context.ctm(), context.stroke_props()) {
             Some(bounds) => device.push_knockout_group(alpha, mask, blend, bounds),
             None => device.push_transparency_group(alpha, mask, blend),
         }
-        let gs = &mut context.get_mut().graphics_state;
-        let saved = (gs.soft_mask.take(), gs.blend_mode);
-        (gs.non_stroke_alpha, gs.stroke_alpha, gs.blend_mode) = (1.0, 1.0, BlendMode::Normal);
+        let compositing = context.compositing_mut();
+        let saved = (compositing.soft_mask.take(), compositing.blend_mode);
+        compositing.blend_mode = BlendMode::Normal;
+        context.fill_paint_mut().alpha = 1.0;
+        context.stroke_paint_mut().alpha = 1.0;
         fill_path_impl(context, device, fill_rule, None);
-        let stroke = DrawMode::Stroke(context.stroke_props());
-        device.knock_out(context.path(), context.get().ctm, &stroke);
+        let stroke = DrawMode::Stroke(context.stroke_props().clone());
+        device.knock_out(context.path(), context.ctm(), &stroke);
         stroke_path_impl(context, device, None);
-        let gs = &mut context.get_mut().graphics_state;
-        (gs.soft_mask, gs.blend_mode) = saved;
-        (gs.non_stroke_alpha, gs.stroke_alpha) = (alpha, alpha);
+        let compositing = context.compositing_mut();
+        (compositing.soft_mask, compositing.blend_mode) = saved;
+        context.fill_paint_mut().alpha = alpha;
+        context.stroke_paint_mut().alpha = alpha;
         device.pop_transparency_group();
     } else {
         fill_path_impl(context, device, fill_rule, None);
         stroke_path_impl(context, device, None);
+    }
+
+    end_path(context, device);
+}
+
+pub(crate) fn end_path<'a>(context: &mut Context<'a>, device: &mut impl Device<'a>) {
+    if let Some(clip) = context.clip_mut().take()
+        && !context.path().elements().is_empty()
+    {
+        let clip_path = context.ctm() * context.path().clone();
+        context.push_clip_path(clip_path, clip, device);
     }
 
     context.path_mut().truncate(0);
@@ -121,10 +135,10 @@ pub(crate) fn fill_path_impl<'a>(
     let mut draw = |path: &BezPath| {
         // pdf.js issue 4260: Replace zero-sized paths with a small stroke instead.
         let bbox = path.fast_bounding_box();
-
+        let (x_advance, y_advance) = x_y_advances(&props.transform);
         match (
-            (bbox.width() as f32).is_nearly_zero(),
-            (bbox.height() as f32).is_nearly_zero(),
+            ((bbox.width() * x_advance.length()) as f32).is_nearly_zero(),
+            ((bbox.height() * y_advance.length()) as f32).is_nearly_zero(),
         ) {
             (false, false) => {
                 let draw_mode = DrawMode::Fill(fill_rule);
@@ -139,9 +153,9 @@ pub(crate) fn fill_path_impl<'a>(
                 path.move_to((bbox.x0, bbox.y0));
                 path.line_to((bbox.x1, bbox.y1));
 
+                let scale = x_advance.length().max(y_advance.length()) as f32;
                 let stroke_props = StrokeProps {
-                    // TODO: Make dependent on transform?
-                    line_width: 0.001,
+                    line_width: if scale > 0.0 { 1.0 / scale } else { 0.001 },
                     line_join: Join::Bevel,
                     line_cap: Cap::Butt,
                     ..Default::default()
@@ -167,7 +181,7 @@ pub(crate) fn stroke_path_impl<'a>(
         return;
     }
 
-    let stroke_props = context.stroke_props();
+    let stroke_props = context.stroke_props().clone();
     let props = context.draw_props(true);
 
     let path = path.unwrap_or(context.path());

@@ -337,7 +337,7 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
             for pixel in piece.chunks_exact(num_components) {
                 let mut value = 0;
 
-                for (component, min_max) in pixel.iter().zip(color_key_mask.chunks_exact(2)) {
+                for (component, min_max) in pixel.iter().zip(color_key_mask.as_chunks::<2>().0) {
                     if *component > min_max[1] || *component < min_max[0] {
                         value = 255;
                     }

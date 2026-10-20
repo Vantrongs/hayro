@@ -23,9 +23,11 @@ fn load_jbig2(file: &[u8]) {
         fn next_line(&mut self) {}
     }
 
-    if let Ok(image) = hayro_jbig2::Image::new(file) {
+    if let Ok(file) = hayro_jbig2::File::new(file, &hayro_jbig2::DecodeSettings::default()) {
         let mut ctx = DecoderContext::default();
-        let _ = image.decode_with(&mut NullDecoder, &mut ctx);
+        for page in file.pages() {
+            let _ = page.decode_with(&mut NullDecoder, &mut ctx);
+        }
     }
 }
 
@@ -668,11 +670,11 @@ fn metadata_in_object_stream() {
             utc_offset_hour: 1,
             utc_offset_minute: 0,
         }),
-        title: Some("Encrypted Metadata".as_bytes().to_vec()),
-        author: Some("Max Mustermann".as_bytes().to_vec()),
+        title: Some(Box::from(b"Encrypted Metadata".as_slice())),
+        author: Some(Box::from(b"Max Mustermann".as_slice())),
         subject: None,
         keywords: None,
-        creator: Some("Typst 0.14.0".as_bytes().to_vec()),
+        creator: Some(Box::from(b"Typst 0.14.0".as_slice())),
         producer: None,
     };
 
@@ -740,6 +742,12 @@ fn issue1321() {
 }
 
 #[test]
+fn issue1392() {
+    let file = include_bytes!("../pdfs/load/issue1392.pdf");
+    load_pdf(file);
+}
+
+#[test]
 fn encrypted_oob_length() {
     let file = include_bytes!("../pdfs/load/encrypted_oob_length.pdf");
     load_pdf(file);
@@ -748,6 +756,12 @@ fn encrypted_oob_length() {
 #[test]
 fn deeply_nested_page_tree() {
     let file = include_bytes!("../pdfs/load/deeply_nested_page_tree.pdf");
+    load_pdf(file);
+}
+
+#[test]
+fn nested_object_streams() {
+    let file = include_bytes!("../pdfs/load/nested_object_streams.pdf");
     load_pdf(file);
 }
 

@@ -90,8 +90,8 @@ impl Colour {
     /// The plane of `obj`'s colour, with alpha or not.
     pub(super) fn plane(&self, obj: &ImageXObject<'_>, alpha: bool) -> PlaneLayout {
         PlaneLayout {
-            width: obj.width,
-            height: obj.height,
+            width: obj.width(),
+            height: obj.height(),
             to_image: (1.0, 1.0),
             interpolate: obj.interpolate,
             format: PixelFormat::colour(self.channels(), alpha),
@@ -164,7 +164,7 @@ impl<'a> Alpha<'a> {
         let Some(mask) = MaskSource::new(&stream, obj, height, work, meter)? else {
             return Ok(Alpha::None);
         };
-        let size = (obj.width, obj.height);
+        let size = (obj.width(), obj.height());
         let matte = match matte {
             Some(m) if mask.size() == size => {
                 let mut rgb = [0; 3];
@@ -223,7 +223,7 @@ impl<'a> Streamed<'a> {
     }
 
     pub(super) fn layout(&self) -> ImageLayout {
-        let (w, h) = (self.obj.width, self.obj.height);
+        let (w, h) = (self.obj.width(), self.obj.height());
         let mask = match &self.alpha {
             Alpha::Mask {
                 mask,
@@ -330,9 +330,9 @@ enum RowEnd {
 
 impl<'s, 'a> ImagePass<'s, 'a> {
     fn new(image: &'s Streamed<'a>, area: &Area<'_>, meter: &'s Meter<'s>) -> Result<Self, Stop> {
-        let h = image.obj.height;
+        let h = image.obj.height();
         let n = image.colour.components();
-        let row_bytes = image.obj.width as usize * n;
+        let row_bytes = image.obj.width() as usize * n;
         let mut raw = RawRows::new(&image.obj.stream, row_bytes, meter).ok_or(Stop::Failed)?;
         let columns = area.columns();
         let piece = piece_texels(columns.len(), n);
@@ -386,7 +386,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
     fn run(&mut self, area: &mut Area<'_>) -> Result<(), Break> {
         let wanted = area.rows();
         let first = std::mem::take(&mut self.start);
-        for y in first..wanted.end.min(self.image.obj.height) {
+        for y in first..wanted.end.min(self.image.obj.height()) {
             let end = if y >= wanted.start {
                 self.read_row(area)?
             } else {

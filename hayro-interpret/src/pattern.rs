@@ -180,24 +180,22 @@ impl<'a> TilingPattern<'a> {
         let is_color = dict.get::<u8>(PAINT_TYPE)? == 1;
         let matrix = Affine::new(entries.matrix(MATRIX));
 
-        let state = ctx.get().clone();
         let ctx_bbox = ctx.bbox();
 
-        let fill_cs = state
-            .graphics_state
-            .none_stroke_cs
+        let fill = ctx.fill_paint();
+        let fill_cs = fill
+            .color_space
             .pattern_cs()
             .unwrap_or(ColorSpace::device_gray());
-        let stroke_cs = state
-            .graphics_state
-            .stroke_cs
-            .pattern_cs()
-            .unwrap_or(ColorSpace::device_gray());
+        let non_stroking_paint = Color::new(fill_cs, fill.color.clone(), 1.0);
 
+        let stroke = ctx.stroke_paint();
+        let stroke_cs = stroke
+            .color_space
+            .pattern_cs()
+            .unwrap_or(ColorSpace::device_gray());
         // Opaque: the cell is painted at the pattern's opacity.
-        let non_stroking_paint =
-            Color::new(fill_cs, state.graphics_state.non_stroke_color.clone(), 1.0);
-        let stroke_paint = Color::new(stroke_cs, state.graphics_state.stroke_color.clone(), 1.0);
+        let stroke_paint = Color::new(stroke_cs, stroke.color.clone(), 1.0);
         let nesting_depth = ctx.nesting_depth() + 1;
         let resources = Resources::new(dict.get(RESOURCES).unwrap_or_default());
 

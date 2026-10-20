@@ -175,7 +175,7 @@ impl<'a> SoftMask<'a> {
         });
         let key = hash128(&(
             dict.content_key(),
-            context.get().ctm.cache_key(),
+            context.ctm().cache_key(),
             nesting_depth,
             fallback,
         ));
@@ -210,7 +210,7 @@ impl<'a> SoftMask<'a> {
             key_in_box,
             group,
             mask_type,
-            root_transform: context.get().ctm,
+            root_transform: context.ctm(),
             transfer_function,
             bbox,
             interpreter_cache: context.interpreter_cache.clone(),

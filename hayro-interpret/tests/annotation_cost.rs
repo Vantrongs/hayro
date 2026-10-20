@@ -2577,7 +2577,7 @@ fn stamps_sharing_a_long_name_read_it_once() {
                     && long.bytes < short.bytes + N * 256
                     && long.work < short.work + (N * 8) as u64,
                 "{} {rect}: {short:?} added at 20,000, {long:?} at 40,000",
-                &name(4)
+                name(4)
             );
         }
     }

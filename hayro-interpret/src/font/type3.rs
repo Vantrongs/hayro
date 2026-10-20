@@ -3,9 +3,10 @@ use crate::context::Context;
 use crate::device::Device;
 use crate::font::glyph_simulator::GlyphSimulator;
 use crate::font::true_type::{Width, read_encoding, read_widths};
-use crate::font::{Encoding, GlyphRun, Type3Glyph, UNITS_PER_EM, read_to_unicode};
+use crate::font::{
+    Encoding, GlyphRun, Type3Glyph, UNITS_PER_EM, glyph_name_to_unicode, read_to_unicode,
+};
 use crate::interpret::state::TextState;
-use crate::util::RectExt;
 use crate::x_object::soft_mask::SoftMask;
 use crate::{BlendMode, interpret};
 use crate::{CacheKey, ClipPath, DrawMode, DrawProps, ImageDrawProps};
@@ -16,9 +17,9 @@ use hayro_syntax::content::ops::TypedInstruction;
 use hayro_syntax::hash;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Stream;
-use hayro_syntax::object::dict::keys::{CHAR_PROCS, FONT_BBOX, FONT_MATRIX, RESOURCES};
+use hayro_syntax::object::dict::keys::{CHAR_PROCS, FONT_MATRIX, RESOURCES};
 use hayro_syntax::page::Resources;
-use kurbo::{Affine, BezPath, Rect};
+use kurbo::{Affine, BezPath};
 use skrifa::GlyphId;
 
 #[derive(Debug)]
@@ -30,7 +31,6 @@ pub(crate) struct Type3<'a> {
     dict: Dict<'a>,
     char_procs: hash::Map<String, Stream<'a>>,
     glyph_simulator: GlyphSimulator,
-    font_bbox: Rect,
     matrix: Affine,
     to_unicode: Option<CMap>,
 }
@@ -39,10 +39,6 @@ impl<'a> Type3<'a> {
     pub(crate) fn new(dict: &Dict<'a>, cmap_resolver: &CMapResolverFn) -> Option<Self> {
         let (encoding, encodings) = read_encoding(dict);
         let (widths, missing_width) = read_widths(dict, dict)?;
-        let font_bbox = dict
-            .get::<hayro_syntax::object::Rect>(FONT_BBOX)
-            .unwrap_or(hayro_syntax::object::Rect::ZERO)
-            .to_kurbo();
 
         let matrix = Affine::new(
             dict.get::<[f64; 6]>(FONT_MATRIX)
@@ -67,7 +63,6 @@ impl<'a> Type3<'a> {
         Some(Self {
             glyph_simulator: GlyphSimulator::new(),
             encoding,
-            font_bbox,
             char_procs,
             widths,
             missing_width,
@@ -79,12 +74,16 @@ impl<'a> Type3<'a> {
     }
 
     pub(crate) fn map_code(&self, code: u8) -> GlyphId {
+        self.code_to_ps_name(code)
+            .map(|g| self.glyph_simulator.string_to_glyph(g))
+            .unwrap_or(GlyphId::NOTDEF)
+    }
+
+    fn code_to_ps_name(&self, code: u8) -> Option<&str> {
         self.encodings
             .get(&code)
             .map(|s| s.as_str())
             .or_else(|| self.encoding.map_code(code))
-            .map(|g| self.glyph_simulator.string_to_glyph(g))
-            .unwrap_or(GlyphId::NOTDEF)
     }
 
     pub(crate) fn glyph_width(&self, code: u8) -> f32 {
@@ -96,10 +95,21 @@ impl<'a> Type3<'a> {
     }
 
     pub(crate) fn char_code_to_unicode(&self, char_code: u32) -> Option<BfString> {
-        // Type3 fonts can only provide Unicode via ToUnicode CMap.
-        self.to_unicode
-            .as_ref()
-            .and_then(|t| t.lookup_bf_string(char_code))
+        if let Some(to_unicode) = &self.to_unicode
+            && let Some(c) = to_unicode.lookup_bf_string(char_code)
+        {
+            // Skip null character mappings and fall back to glyph name
+            // lookup. Some PDFs have incorrect ToUnicode mappings that map
+            // to U+0000.
+            if c != BfString::Char('\0') {
+                return Some(c);
+            }
+        }
+
+        u8::try_from(char_code)
+            .ok()
+            .and_then(|code| self.code_to_ps_name(code))
+            .and_then(|name| glyph_name_to_unicode(name, false))
     }
 
     pub(crate) fn render_glyph(
@@ -146,7 +156,7 @@ impl<'a> Type3<'a> {
 
         let mut context = Context::new_with(
             state.ctm,
-            self.font_bbox,
+            glyph.bbox,
             &glyph.cache,
             glyph.xref,
             glyph.settings.clone(),

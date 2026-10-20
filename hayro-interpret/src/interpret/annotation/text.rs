@@ -18,7 +18,7 @@ use super::out::{Color, Out, Part, Refused, Rounding, corners};
 use super::{Unsupported, work};
 use crate::FontResolverFn;
 use crate::font::blob::{CffFontBlob, OpenTypeFontBlob};
-use crate::font::{FontQuery, StandardFont, glyph_name_to_unicode};
+use crate::font::{FontQuery, StandardFont, glyph_name_to_char};
 use hayro_syntax::hash;
 use kurbo::{Affine, BezPath, Rect};
 use skrifa::GlyphId;
@@ -2368,8 +2368,7 @@ impl Font {
         if let Some(blob) = CffFontBlob::new(data.clone()) {
             let mut glyphs = hash::Map::default();
             for (id, name) in blob.glyph_names() {
-                let (Some(c), Some(width)) =
-                    (glyph_name_to_unicode(&name), standard.get_width(&name))
+                let (Some(c), Some(width)) = (glyph_name_to_char(&name), standard.get_width(&name))
                 else {
                     continue;
                 };

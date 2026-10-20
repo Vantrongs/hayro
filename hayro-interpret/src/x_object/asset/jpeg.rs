@@ -120,7 +120,7 @@ impl<'a> JpegStreamed<'a> {
             drop(locked);
             // Parsing reads all of the data; the index is not locked meanwhile.
             let base = stream
-                .jpeg_rows((obj.width, obj.height), meter)
+                .jpeg_rows((obj.width(), obj.height()), meter)
                 .and_then(|mut rows| rows.checkpoint().ok());
             meter.poll()?;
             let Ok(mut locked) = index.lock() else {
@@ -128,7 +128,7 @@ impl<'a> JpegStreamed<'a> {
             };
             if matches!(*locked, JpegIndex::Unread) {
                 *locked = base.map_or(JpegIndex::Rejected, |base| {
-                    JpegIndex::Read(Box::new(Saved::new(base, obj.width, obj.height)))
+                    JpegIndex::Read(Box::new(Saved::new(base, obj.width(), obj.height())))
                 });
             }
         } else {
@@ -175,7 +175,7 @@ impl<'a> JpegStreamed<'a> {
     fn read(&self, area: &mut Area<'_>, meter: &Meter<'_>, decoded: &mut u32) -> Result<(), Stop> {
         let wanted = area.rows();
         let mut rows = self.resume(wanted.start, meter)?;
-        let (width, columns) = (self.obj.width as usize, area.columns());
+        let (width, columns) = (self.obj.width() as usize, area.columns());
         let mut band = vec![0; rows.output_buffer_size()];
         let mut rgb = Vec::new();
         while (rows.next_row() as u32) < wanted.end {
@@ -352,7 +352,7 @@ mod tests {
         let mut table = vec![0xff, 0xdb, 0, 67, 0];
         table.extend([1; 64]);
         let mut comment = vec![0xff, 0xfe, 0xff, 0xff];
-        comment.extend([b'c'; 65_533]);
+        comment.extend(std::iter::repeat_n(b'c', 65_533));
         for bytes in [
             plain.clone(),
             with_headers(&table, 2048),

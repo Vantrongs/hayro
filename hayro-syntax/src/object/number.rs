@@ -147,6 +147,10 @@ impl Readable<'_> for Number {
     #[inline]
     fn read(r: &mut Reader<'_>, _: &ReaderContext<'_>) -> Option<Self> {
         let old_offset = r.offset();
+        if let Some(number) = Self::read_simple(r) {
+            return Some(number);
+        }
+        r.jump(old_offset);
         match lex::<true>(r) {
             Some(lexed) => Some(lexed.value(r)),
             None => {
@@ -154,6 +158,78 @@ impl Readable<'_> for Number {
                 None
             }
         }
+    }
+}
+
+impl Number {
+    /// The number [`Readable::read`] reads, for the common case it reads without
+    /// [`lex`]'s bookkeeping: up to 18 digits around at most one `.`, after an
+    /// optional sign, not followed by a regular character. `None`, with `r` moved,
+    /// for anything else.
+    #[inline(always)]
+    pub(crate) fn read_simple(r: &mut Reader<'_>) -> Option<Self> {
+        let start = r.offset();
+        let negative = match r.peek_byte() {
+            Some(b'-') => {
+                r.forward();
+                true
+            }
+            Some(b'+') => {
+                r.forward();
+                false
+            }
+            _ => false,
+        };
+
+        let mut mantissa: u64 = 0;
+        let mut read_digits = |r: &mut Reader<'_>| {
+            let start = r.offset();
+            while let Some(d) = r
+                .peek_byte()
+                .map(|b| b.wrapping_sub(b'0'))
+                .filter(|d| *d < 10)
+            {
+                mantissa = mantissa.wrapping_mul(10).wrapping_add(d as u64);
+                r.forward();
+            }
+            r.offset() - start
+        };
+
+        let mut digits = read_digits(r);
+        let mut dot = None;
+        if r.peek_byte() == Some(b'.') {
+            let dot_at = r.offset();
+            r.forward();
+            let fraction_digits = read_digits(r);
+            dot = Some((dot_at, fraction_digits as u32));
+            digits += fraction_digits;
+        }
+
+        if digits == 0 || digits > 18 || r.peek_byte().is_some_and(is_regular_character) {
+            return None;
+        }
+
+        let Some((dot_at, decimal_shift)) = dot else {
+            let value = mantissa as i64;
+            return Some(Self(InternalNumber::Integer(if negative {
+                value.wrapping_neg()
+            } else {
+                value
+            })));
+        };
+        let value = mantissa as f64 / POWERS_OF_10[decimal_shift as usize];
+        let value = if negative { -value } else { value };
+        // As `Lexed::value` reads it.
+        let viewer = if mantissa < 1_000_000_000
+            && decimal_shift <= 13
+            && dot_at - start < 10
+            && !halfway(value)
+        {
+            value as f32
+        } else {
+            viewer_real(r.range(start..r.offset())?)
+        };
+        Some(Self(InternalNumber::Real(value, viewer)))
     }
 }
 
@@ -559,6 +635,54 @@ mod tests {
     use crate::object::Number;
     use crate::reader::Reader;
     use crate::reader::ReaderExt;
+
+    /// `read_simple` reads what `lex` reads wherever it reads something, viewer value
+    /// included.
+    #[test]
+    fn simple_matches_lex() {
+        use super::{InternalNumber, lex};
+        const PARTS: [&str; 14] = [
+            "",
+            "-",
+            "+",
+            "0",
+            "7",
+            "00",
+            "123456789",
+            "1234567890",
+            "999999999999999999",
+            ".",
+            "5",
+            "16777217",
+            "0000000001",
+            "33554431",
+        ];
+        const ENDS: [&str; 4] = ["", " ", "/", "a"];
+        let mut checked = 0;
+        for a in PARTS {
+            for b in PARTS {
+                for c in PARTS {
+                    for end in ENDS {
+                        let token = format!("{a}{b}{c}{end}");
+                        let simple = Number::read_simple(&mut Reader::new(token.as_bytes()));
+                        let Some(simple) = simple else { continue };
+                        let mut r = Reader::new(token.as_bytes());
+                        let lexed = lex::<true>(&mut r).map(|l| l.value(&r)).unwrap();
+                        let same = match (simple.0, lexed.0) {
+                            (InternalNumber::Integer(x), InternalNumber::Integer(y)) => x == y,
+                            (InternalNumber::Real(x, v), InternalNumber::Real(y, w)) => {
+                                x.to_bits() == y.to_bits() && v.to_bits() == w.to_bits()
+                            }
+                            _ => false,
+                        };
+                        assert!(same, "{token:?}: {simple:?} vs {lexed:?}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 1000, "{checked}");
+    }
 
     #[test]
     fn display() {

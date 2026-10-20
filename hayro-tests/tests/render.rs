@@ -6,6 +6,7 @@ use crate::{run_render_test, run_render_test_with_password};
 #[test] fn annotation_checkbox() { run_render_test("annotation_checkbox", "pdfs/custom/annotation_checkbox.pdf", None); }
 #[test] fn clip_path_evenodd() { run_render_test("clip_path_evenodd", "pdfs/custom/clip_path_evenodd.pdf", None); }
 #[test] fn clip_path_nested() { run_render_test("clip_path_nested", "pdfs/custom/clip_path_nested.pdf", None); }
+#[test] fn clip_path_painted() { run_render_test("clip_path_painted", "pdfs/custom/clip_path_painted.pdf", None); }
 #[test] fn color_separation_3() { run_render_test("color_separation_3", "pdfs/custom/color_separation_3.pdf", None); }
 #[test] fn color_space_icc_gray() { run_render_test("color_space_icc_gray", "pdfs/custom/color_space_icc_gray.pdf", None); }
 #[test] fn color_space_icc_invalid_profile() { run_render_test("color_space_icc_invalid_profile", "pdfs/custom/color_space_icc_invalid_profile.pdf", None); }
@@ -14,6 +15,7 @@ use crate::{run_render_test, run_render_test_with_password};
 #[test] fn color_space_lab() { run_render_test("color_space_lab", "pdfs/custom/color_space_lab.pdf", None); }
 #[test] fn color_space_separation_1() { run_render_test("color_space_separation_1", "pdfs/custom/color_space_separation_1.pdf", None); }
 #[test] fn color_space_separation_2() { run_render_test("color_space_separation_2", "pdfs/custom/color_space_separation_2.pdf", None); }
+#[test] fn fill_degenerate() { run_render_test("fill_degenerate", "pdfs/custom/fill_degenerate.pdf", None); }
 #[test] fn filter_flate_1bit() { run_render_test("filter_flate_1bit", "pdfs/custom/filter_flate_1bit.pdf", None); }
 #[test] fn filter_tiff_predictor_gray() { run_render_test("filter_tiff_predictor_gray", "pdfs/custom/filter_tiff_predictor_gray.pdf", None); }
 #[test] fn font_cid_1() { run_render_test("font_cid_1", "pdfs/custom/font_cid_1.pdf", None); }
@@ -61,6 +63,7 @@ use crate::{run_render_test, run_render_test_with_password};
 #[test] fn image_ccit_1() { run_render_test("image_ccit_1", "pdfs/custom/image_ccit_1.pdf", None); }
 #[test] fn image_ccit_3() { run_render_test("image_ccit_3", "pdfs/custom/image_ccit_3.pdf", None); }
 #[test] fn image_ccit_4() { run_render_test("image_ccit_4", "pdfs/custom/image_ccit_4.pdf", None); }
+#[test] fn image_ccitt_rows_above_height() { run_render_test("image_ccitt_rows_above_height", "pdfs/custom/image_ccitt_rows_above_height.pdf", None); }
 #[test] fn image_ccitt_rows_below_height() { run_render_test("image_ccitt_rows_below_height", "pdfs/custom/image_ccitt_rows_below_height.pdf", None); }
 #[test] fn image_cmyk_icc_jpg() { run_render_test("image_cmyk_icc_jpg", "pdfs/custom/image_cmyk_icc_jpg.pdf", None); }
 #[test] fn image_cmyk_jpg() { run_render_test("image_cmyk_jpg", "pdfs/custom/image_cmyk_jpg.pdf", None); }
@@ -92,6 +95,7 @@ use crate::{run_render_test, run_render_test_with_password};
 #[test] fn image_rgba16() { run_render_test("image_rgba16", "pdfs/custom/image_rgba16.pdf", None); }
 #[test] fn image_rgba8() { run_render_test("image_rgba8", "pdfs/custom/image_rgba8.pdf", None); }
 #[test] fn image_rgba8_icc() { run_render_test("image_rgba8_icc", "pdfs/custom/image_rgba8_icc.pdf", None); }
+#[test] fn image_smask_downscale() { run_render_test("image_smask_downscale", "pdfs/custom/image_smask_downscale.pdf", None); }
 #[test] fn integration_coat_of_arms() { run_render_test("integration_coat_of_arms", "pdfs/custom/integration_coat_of_arms.pdf", None); }
 #[test] fn integration_diagram() { run_render_test("integration_diagram", "pdfs/custom/integration_diagram.pdf", None); }
 #[test] fn integration_matplotlib() { run_render_test("integration_matplotlib", "pdfs/custom/integration_matplotlib.pdf", None); }
@@ -158,6 +162,7 @@ use crate::{run_render_test, run_render_test_with_password};
 #[test] fn pattern_shading_type5() { run_render_test("pattern_shading_type5", "downloads/custom/pattern_shading_type5.pdf", None); }
 #[test] fn pattern_shading_type6() { run_render_test("pattern_shading_type6", "downloads/custom/pattern_shading_type6.pdf", None); }
 #[test] fn pattern_shading_type6_2() { run_render_test("pattern_shading_type6_2", "pdfs/custom/pattern_shading_type6_2.pdf", None); }
+#[test] fn pattern_tiling_step() { run_render_test("pattern_tiling_step", "pdfs/custom/pattern_tiling_step.pdf", None); }
 #[test] fn rendering_conflation_artifacts() { run_render_test("rendering_conflation_artifacts", "pdfs/custom/rendering_conflation_artifacts.pdf", Some("2..=2")); }
 #[test] fn shading_operator_1() { run_render_test("shading_operator_1", "pdfs/custom/shading_operator_1.pdf", None); }
 #[test] fn shading_operator_2() { run_render_test("shading_operator_2", "pdfs/custom/shading_operator_2.pdf", None); }
@@ -178,6 +183,7 @@ use crate::{run_render_test, run_render_test_with_password};
 #[test] fn text_rendering_stroking_clipping() { run_render_test("text_rendering_stroking_clipping", "pdfs/custom/text_rendering_stroking_clipping.pdf", None); }
 #[test] fn text_stroked_complex_paint() { run_render_test("text_stroked_complex_paint", "pdfs/custom/text_stroked_complex_paint.pdf", None); }
 #[test] fn text_with_rise() { run_render_test("text_with_rise", "pdfs/custom/text_with_rise.pdf", None); }
+#[test] fn type3_shading_glyph() { run_render_test("type3_shading_glyph", "pdfs/custom/type3_shading_glyph.pdf", None); }
 #[test] fn xobject_1() { run_render_test("xobject_1", "pdfs/custom/xobject_1.pdf", None); }
 #[test] fn xobject_matrix() { run_render_test("xobject_matrix", "pdfs/custom/xobject_matrix.pdf", None); }
 #[test] fn xobject_with_fill_opacity() { run_render_test("xobject_with_fill_opacity", "pdfs/custom/xobject_with_fill_opacity.pdf", None); }
