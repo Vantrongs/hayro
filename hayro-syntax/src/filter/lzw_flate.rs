@@ -71,11 +71,10 @@ pub(crate) mod flate {
     /// counted on `meter`; `None` when the data is corrupt for that format or the hook
     /// asks to stop. Data that ends before its stream does yields what it holds, and
     /// bytes after the stream's end are ignored.
-    /// `Err` once it made more than `limit` bytes. Its room at most doubles what it
-    /// made ([`more_room`]), and while it made less than `expected` grows no further
-    /// than that and a little more, which the end of the stream is read into: the
-    /// room of a large image's data ends at its size, and data of no known size, or
-    /// shorter than told, holds at most twice what it makes.
+    /// `Err` once it made more than `limit` bytes. Its room grows as upstream's does
+    /// ([`room`]), but while it made less than `expected` no further than that and a
+    /// little more, which the end of the stream is read into: the room of a large
+    /// image's data ends at its size, and other data holds no more than upstream.
     #[cfg(feature = "unsafe")]
     fn inflate(
         data: &[u8],
@@ -90,15 +89,8 @@ pub(crate) mod flate {
         let (mut taken, mut offered) = (0, 0);
         loop {
             if out.len() == out.capacity() {
-                let room = more_room(out.len(), taken, data.len());
-                // Not much past the limit, nor past the expected size while short of
-                // it; exactly, as `reserve` would at least double the room.
-                let to = if out.len() < expected {
-                    expected.min(limit)
-                } else {
-                    limit
-                };
-                out.reserve_exact(room.min((to - out.len()).saturating_add(1024)));
+                let made = out.len();
+                out.reserve_exact(room(made, data.len(), expected, limit) - made);
             }
             // Input is offered half of POLL_BYTES at a time and counted before it is
             // taken, and output is made no further than the next poll, so at most
@@ -139,27 +131,30 @@ pub(crate) mod flate {
         }
     }
 
-    /// How much to grow a full output buffer holding the `made` bytes inflated from the
-    /// first `taken` of `len` encoded bytes. The first room is at most half a poll's
-    /// worth, since encoded bytes may hold empty blocks or a tail after the stream's
-    /// end, which make nothing: with it, the decoder holds less than upstream's
-    /// `read_to_end` holds for its decoder and input buffer alone. Later rooms fit what
-    /// the rest would make at the rate so far, with an eighth to spare, but at most
-    /// double the room, as upstream's growth does, so the room never passes twice the
-    /// data however the rate falls along it; and at least a quarter of what was made,
-    /// so that data longer than the rate predicts is reallocated a bounded number of
-    /// times. At least the room zlib's fast loop needs.
+    /// The room a full output buffer holding the `made` bytes inflated from `len`
+    /// encoded bytes grows to. Upstream (036fb21c) inflates with `read_to_end`, whose
+    /// room doubles from 32 bytes when it is full: the smallest power of two above
+    /// what it holds. So does this room, so that it is never larger than upstream's
+    /// at the same point of the same data, however the data inflate along it; it
+    /// only stops short of upstream's at what the data should make, while they make
+    /// less, and at a little past the limit. The first room may be larger than
+    /// upstream's, up to 32 KiB, as this decoder needs that much less than upstream's
+    /// decoder and its input buffer; it is at least what zlib's fast loop needs.
     #[cfg(feature = "unsafe")]
-    fn more_room(made: usize, taken: usize, len: usize) -> usize {
-        let room = match made {
-            0 => len.min(POLL_BYTES / 2),
-            _ => {
-                let rest = (len - taken) as u128 * made as u128 / taken.max(1) as u128;
-                let rest = usize::try_from(rest + rest / 8).unwrap_or(usize::MAX);
-                rest.clamp(made / 4, made)
-            }
+    fn room(made: usize, len: usize, expected: usize, limit: usize) -> usize {
+        let doubled = match made {
+            0 => len.clamp(1024, POLL_BYTES / 2),
+            _ => made
+                .checked_add(1)
+                .and_then(usize::checked_next_power_of_two)
+                .unwrap_or(usize::MAX),
         };
-        room.max(1024)
+        let end = if made < expected {
+            expected.min(limit)
+        } else {
+            limit
+        };
+        doubled.min(end.saturating_add(1024))
     }
 
     /// [`decode`], stopped where the decoder made more than `limit` bytes.
@@ -183,7 +178,7 @@ pub(crate) mod flate {
     /// Ported from <https://github.com/mozilla/pdf.js/blob/master/src/core/flate_stream.js>
     /// TODO: Rewrite this in idiomatic Rust.
     pub(crate) mod fallback {
-        use crate::work::{Cancelled, Meter, POLL_BYTES};
+        use crate::work::{Cancelled, Meter};
         use alloc::vec;
         use alloc::vec::Vec;
 
@@ -199,9 +194,8 @@ pub(crate) mod flate {
             decode_within(data, meter, strict, usize::MAX).map_err(|_| Cancelled)
         }
 
-        /// The most bytes a step makes past the bytes it was asked for: a stored block,
-        /// or a match.
-        const BLOCK_PAST: usize = 65_535 + 258;
+        /// The most bytes a step makes past the bytes it was asked for: a match.
+        const STEP_PAST: usize = 257;
 
         /// Why [`decode_within`] stopped.
         pub(crate) enum Stopped {
@@ -218,21 +212,9 @@ pub(crate) mod flate {
             limit: usize,
         ) -> Result<Option<Vec<u8>>, Stopped> {
             let mut stream = FlateStream::new(Slice::new(data));
-            let stepped = match limit {
-                usize::MAX => stream.step(meter, usize::MAX),
-                // In steps, the output's room grown up to the limit and what one block
-                // makes past it, rather than doubled past it.
-                _ => loop {
-                    let made = stream.output.len();
-                    let target = (2 * made).clamp(POLL_BYTES, limit + 1);
-                    stream.output.reserve_exact(target + BLOCK_PAST - made);
-                    let stepped = stream.step(meter, target);
-                    let ended = stream.done() || stream.made() == made;
-                    if stepped.is_err() || ended || stream.made() > limit {
-                        break stepped;
-                    }
-                },
-            };
+            let pending = limit.saturating_add(1);
+            stream.most = pending.saturating_add(STEP_PAST);
+            let stepped = stream.step(meter, pending);
             #[cfg(test)]
             WORK.set((stream.input.taken(), stream.made()));
             stepped.map_err(|_| Stopped::Cancelled)?;
@@ -308,6 +290,9 @@ pub(crate) mod flate {
             code_size: u8,
             /// The bytes made, from the `dropped`th on.
             output: Vec<u8>,
+            /// The room `output` grows to at most where that holds what is made
+            /// ([`grow`]).
+            most: usize,
             dropped: usize,
             /// The bytes of `output` handed out ([`Self::hand`]).
             handed: usize,
@@ -327,6 +312,18 @@ pub(crate) mod flate {
         /// The farthest a back reference reaches.
         const WINDOW: usize = 32 * 1024;
 
+        /// Makes room in `output` for `n` more bytes where it has none, as pushing
+        /// them grows a `Vec` (as upstream's decoder grows its output), to at least
+        /// twice the room; but no further than `most` where that holds them.
+        #[inline]
+        fn grow(output: &mut Vec<u8>, n: usize, most: usize) {
+            let (len, room) = (output.len(), output.capacity());
+            if len + n > room {
+                let doubled = (2 * room).max(len + n).max(8);
+                output.reserve_exact(doubled.min(most.max(len + n)) - len);
+            }
+        }
+
         impl<I: Input> FlateStream<I> {
             pub(crate) fn new(input: I) -> Self {
                 Self {
@@ -334,6 +331,7 @@ pub(crate) mod flate {
                     code_buf: 0,
                     code_size: 0,
                     output: Vec::new(),
+                    most: usize::MAX,
                     dropped: 0,
                     handed: 0,
                     started: false,
@@ -582,6 +580,7 @@ pub(crate) mod flate {
                         return true;
                     }
                     self.stored -= bytes.len();
+                    grow(&mut self.output, bytes.len(), self.most);
                     self.output.extend_from_slice(bytes);
                 }
                 true
@@ -613,6 +612,7 @@ pub(crate) mod flate {
                     };
 
                     if code1 < 256 {
+                        grow(&mut self.output, 1, self.most);
                         self.output.push(code1 as u8);
                         meter.work(1)?;
                     } else if code1 == 256 {
@@ -673,6 +673,7 @@ pub(crate) mod flate {
                         } else {
                             for _ in 0..length {
                                 let byte = self.output[self.output.len() - distance];
+                                grow(&mut self.output, 1, self.most);
                                 self.output.push(byte);
                             }
                         }

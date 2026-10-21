@@ -8,6 +8,7 @@ pub(crate) mod ceilings;
 pub(crate) mod cpu_time;
 mod fixtures;
 pub(crate) mod rc4;
+pub(crate) mod upstream_flate;
 
 pub(crate) use fixtures::{
     CUT_ROW_CONTENT, cut_row_content_stream, file, file_with_aliases, noise, one_page,

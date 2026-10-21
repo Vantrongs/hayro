@@ -582,7 +582,7 @@ enum Mode<'a> {
         input: Pulled<'a>,
         decoder: zlib_rs::Inflate,
     },
-    Permissive(FlateStream<Pulled<'a>>),
+    Permissive(Box<FlateStream<Pulled<'a>>>),
     /// Between two decoders.
     Switching,
 }
@@ -600,7 +600,7 @@ impl<'a> Mode<'a> {
                 input,
                 decoder: zlib_rs::Inflate::new(false, 15),
             },
-            Which::Permissive => Self::Permissive(FlateStream::new(input)),
+            Which::Permissive => Self::Permissive(Box::new(FlateStream::new(input))),
         }
     }
 
