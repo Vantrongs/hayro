@@ -162,10 +162,11 @@ impl<'a> Dict<'a> {
                 crate::work::lexed(r.offset());
                 value
             }
-            Found::Parsed(node) => Some(
-                node.get(key.as_ref(), self.data())?
-                    .written(self.data(), self.ctx()),
-            ),
+            Found::Parsed(node) => Some(node.get(key.as_ref(), self.data())?.written(
+                node.nodes(),
+                self.data(),
+                self.ctx(),
+            )),
         }
     }
 
@@ -188,9 +189,10 @@ impl<'a> Dict<'a> {
                 crate::work::lexed(r.offset());
                 value
             }
-            Found::Parsed(node) => node
-                .get(key.as_ref(), self.data())?
-                .item_as(self.data(), self.ctx()),
+            Found::Parsed(node) => {
+                node.get(key.as_ref(), self.data())?
+                    .item_as(node.nodes(), self.data(), self.ctx())
+            }
         }
     }
 
@@ -235,7 +237,7 @@ impl<'a> Dict<'a> {
     }
 
     /// The dictionary parsed as `node`, which `data` holds, read in `ctx`.
-    pub(crate) fn parsed(data: &'a [u8], node: Arc<DictNode>, ctx: &ReaderContext<'a>) -> Self {
+    pub(crate) fn parsed(data: &'a [u8], node: DictNode, ctx: &ReaderContext<'a>) -> Self {
         let (from, to) = node.span();
         Self(Inner::Some(Arc::new(Repr {
             data: &data[from..to],
@@ -461,7 +463,7 @@ enum Offsets<'a> {
     /// Those of a dictionary parsed from the same bytes, which owns them.
     Of(Arc<Repr<'a>>),
     /// Each value of the body of an object, parsed once ([`crate::object::parsed`]).
-    Parsed(Arc<DictNode>),
+    Parsed(DictNode),
 }
 
 /// Where each entry's value is, however it is held.
