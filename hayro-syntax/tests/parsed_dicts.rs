@@ -1,6 +1,6 @@
-//! Dictionaries parsed when a file opens, which the file holds while it is open: a
-//! key's value is its last entry's, however many entries the dictionary has, and the
-//! memory a file of many large dictionaries holds stays under a ceiling.
+//! Dictionaries parsed with the bodies that hold them: a key's value is its last
+//! entry's, however many entries the dictionary has, and the memory reading a file
+//! of many large dictionaries holds stays under a ceiling.
 
 use hayro_syntax::Pdf;
 use hayro_syntax::object::{Dict, ObjectIdentifier};
@@ -70,10 +70,11 @@ fn a_parsed_dictionary_keeps_each_keys_last_value() {
 }
 
 /// A file of 300 dictionaries of 9 to 308 keys, as a file whose every page lists the
-/// resources of the pages before it, is opened, which parses each dictionary and
-/// keeps it: the bytes held at most and the allocations stay under their ceilings.
+/// resources of the pages before it, is opened, and every dictionary read and held,
+/// as the resources of pages being drawn are: the bytes held at most and the
+/// allocations stay under their ceilings.
 #[test]
-fn opening_a_file_of_large_dictionaries_stays_under_its_ceilings() {
+fn reading_a_file_of_large_dictionaries_stays_under_its_ceilings() {
     let mut objects = vec![
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
         b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec(),
@@ -95,15 +96,19 @@ fn opening_a_file_of_large_dictionaries_stays_under_its_ceilings() {
         .xref()
         .get::<Dict<'_>>(ObjectIdentifier::new(3, 0))
         .unwrap();
-    let (pdf, used) = measure(move || Pdf::new(data).unwrap());
-    // Every dictionary is read, as the pages' resources are.
-    for i in 0..300 {
-        let dict = pdf
-            .xref()
-            .get::<Dict<'_>>(ObjectIdentifier::new(i + 3, 0))
-            .unwrap();
-        assert_eq!(dict.len(), i as usize + 9);
-    }
+    let ((), used) = measure(move || {
+        let pdf = Pdf::new(data).unwrap();
+        let dicts: Vec<Dict<'_>> = (0..300)
+            .map(|i| {
+                pdf.xref()
+                    .get::<Dict<'_>>(ObjectIdentifier::new(i + 3, 0))
+                    .unwrap()
+            })
+            .collect();
+        for (i, dict) in dicts.iter().enumerate() {
+            assert_eq!(dict.len(), i + 9);
+        }
+    });
     check_ceilings(
         concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -111,8 +116,8 @@ fn opening_a_file_of_large_dictionaries_stays_under_its_ceilings() {
         ),
         "WRITE_CEILINGS=1 cargo test -p hayro-syntax --test parsed_dicts",
         &[
-            ("open_peak_bytes", used.peak),
-            ("open_allocations", used.count),
+            ("read_peak_bytes", used.peak),
+            ("read_allocations", used.count),
         ],
     );
 }
@@ -139,16 +144,19 @@ fn dict_of_long_keys(n: usize, step: usize, times: usize) -> String {
     text
 }
 
-/// The work ([`hayro_syntax::work::TOLD`]) of opening a file holding `dict`, which
-/// `check` reads after, less that of the same file holding an empty dictionary.
+/// The work ([`hayro_syntax::work::TOLD`]) of opening a file holding `dict` and
+/// reading it, which `check` reads after, less that of the same file holding an
+/// empty dictionary. The file has a page, so that opening it does not read every
+/// object looking for pages: the dictionary is parsed once.
 #[cfg(debug_assertions)]
 fn told_opening(dict: &str, check: impl Fn(&Dict<'_>)) -> usize {
     use hayro_syntax::work::TOLD;
     let told = |dict: &str, check: &dyn Fn(&Dict<'_>)| {
         let objects = vec![
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-            b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec(),
+            b"<< /Type /Pages /Kids [4 0 R] /Count 1 >>".to_vec(),
             dict.as_bytes().to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] >>".to_vec(),
         ];
         let data = file(&objects, "");
         TOLD.set(0);
@@ -181,46 +189,56 @@ fn told_for(dict: &str, keys: usize) -> usize {
     })
 }
 
-/// Every comparison of two keys a dictionary is parsed with is counted, in bytes
-/// ([`hayro_syntax::work::TOLD`]), on both sides of the 8 keys past which they are
-/// sorted: a key written again is compared whole with its first entry, a small
-/// dictionary's key with each before it, and a large dictionary's keys at least
-/// with their neighbours in order, each over the prefix they share. And the work
+/// Every comparison and hash of the keys a dictionary is parsed with is counted, in
+/// bytes ([`hayro_syntax::work::TOLD`]), on both sides of the 8 keys past which they
+/// are found otherwise than one by one: a key written again is compared whole with
+/// its first entry, a small dictionary's key with each before it, a large
+/// dictionary's keys at least with their neighbours, each over the prefix they
+/// share, where they come in order, and else each hashed whole. And the work
 /// counted stays within the dictionary's bytes times 8, the keys a key is compared
-/// with while there are few, and the logarithm of its keys sorting them takes.
+/// with while there are few, and a logarithm of keys to sort those of fewer than
+/// 1024 keys that come out of order: those of more are found in the body's key
+/// table, not sorted, so their work grows as their keys do.
 #[cfg(debug_assertions)]
 #[test]
-fn comparing_a_dictionarys_keys_is_counted() {
+fn comparing_and_hashing_a_dictionarys_keys_is_counted() {
     let key = long_key(0).len();
     let mut large = vec![];
-    for (n, step, times) in [2, 7, 8, 9, 10, 16, 1000, 2000]
+    for (n, step, times) in [2, 7, 8, 9, 10, 16, 1024, 2048]
         .into_iter()
         .flat_map(|n| [(n, 1, 1), (n, 1, 2), (n, 7919, 1), (n, 7919, 2)])
     {
         let dict = dict_of_long_keys(n, step, times);
         let told = told_for(&dict, n);
-        // Each distinct pair is compared over the prefix: while there are at most 8,
-        // as each key is compared with each before it; past that, at least once, to
-        // find them in order.
-        let distinct = if n <= 8 { n * (n - 1) / 2 } else { n - 1 };
+        // Each distinct pair is compared over the prefix while there are at most 8,
+        // as each key is compared with each before it; past that, neighbours, to
+        // find they are in order, or else each key is hashed whole.
+        let distinct = match (n <= 8, step == 1 && times == 1) {
+            (true, _) => n * (n - 1) / 2,
+            (false, true) => n - 1,
+            (false, false) => n,
+        };
         let least = distinct * key + (times - 1) * n * key;
         let case = format!("{n} keys × {times} by {step}");
         assert!(told >= least, "{case}: {told} counted, {least} done");
-        // Each key compared with at most 8 others while there are few, then each
-        // with a logarithm of others to sort them.
+        // Each key compared with at most 8 others while there are few, then hashed
+        // twice, to find it written again and to find it once parsed, and compared
+        // with its entry where it is written again; and, out of order and fewer
+        // than 1024, compared with a logarithm of others to sort them.
         let log = (usize::BITS - n.leading_zeros()) as usize;
-        let most = dict.len() * (8 + log);
+        let sorted = n < 1024 && !(step == 1 && times == 1);
+        let most = dict.len() * (8 + if sorted { log } else { 0 });
         assert!(told <= most, "{case}: {told} counted, over {most}");
-        if n >= 1000 {
+        if n >= 1024 {
             large.push(told);
         }
     }
-    // The work of 2000 keys is that of 1000 doubled, and a logarithm's step.
+    // The work of 2048 keys is that of 1024 doubled.
     for at in 0..4 {
         let (small, large) = (large[at], large[at + 4]);
         assert!(
-            large <= small * 25 / 10,
-            "{small} for 1000 keys, {large} for 2000"
+            large <= small * 21 / 10,
+            "{small} for 1024 keys, {large} for 2048"
         );
     }
 }

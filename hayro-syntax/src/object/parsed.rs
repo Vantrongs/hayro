@@ -1,7 +1,8 @@
-//! Objects parsed once, with every array and dictionary in them, which reads of the
-//! body of an object the table lists are made from ([`crate::xref`]): a read of any
-//! type, of the object or of anything in it, walks what was parsed and never lexes
-//! the body's bytes again, however many reads share the body.
+//! Objects parsed with every array and dictionary in them, which reads of the body
+//! of an object the table lists are made from ([`crate::xref`]): a read of any type,
+//! of the object or of anything in it, walks what was parsed and never lexes the
+//! body's bytes again, however many reads share the parse. The table hands a body's
+//! parse to the reads made while one holds it, and keeps it from its third parse on.
 //!
 //! A node holds no bytes: where its strings, names, arrays and dictionaries are is
 //! kept relative to the bytes of what holds it, the body for an object, an array's
@@ -14,12 +15,13 @@ use crate::hash;
 use crate::object::array::parse_array_with;
 use crate::object::dict::parse_dict_with;
 use crate::object::name::{order, same};
+use crate::object::number::starts_number;
 use crate::object::{
     Array, Bytes, Dict, MAX_OBJECT_NESTING_DEPTH, MaybeRef, Name, Null, Number, ObjRef, Object,
     ObjectLike, String, Written, leaf,
 };
 use crate::reader::{Reader, ReaderContext, ReaderExt};
-use crate::sync::Arc;
+use crate::sync::{Arc, Weak};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 #[cfg(not(feature = "std"))]
@@ -87,13 +89,46 @@ pub(crate) enum Node {
     Array(Run),
     /// A dictionary, whose values are its run of the nodes of its body, and whose
     /// keys, one for each value, are those of its body from the one this tells on
-    /// ([`Nodes`]). Those of a small dictionary are in the file's order, those of a
-    /// larger one sorted by key ([`LISTED`]). An entry takes a few dozen bytes,
-    /// where a map takes about twice that and grows by doubling; every dictionary
-    /// of a file is parsed when it opens and kept while it is open, so a file whose
-    /// pages each list all the resources of the pages before them holds tens of
-    /// thousands of entries.
-    Dict(Run, u32),
+    /// ([`Nodes`], [`Keys`]). An entry takes a few dozen bytes, where a map takes
+    /// about twice that and grows by doubling; a dictionary read again is kept
+    /// while its file is open, and a file whose pages each list all the resources
+    /// of the pages before them holds tens of thousands of entries.
+    Dict(Run, Keys),
+}
+
+/// Where the keys of a dictionary start among the keys of its body, and how one is
+/// found among them: those of a small dictionary entry by entry, in the file's
+/// order ([`LISTED`]); those of a larger one by halving, sorted unless they came in
+/// order; and those of [`TABLED`] or more that came out of order by the body's key
+/// table ([`KeyTable`]), in the file's order, so that parsing sorts none of them.
+/// Without `std`, which has no hash keyed at random, those too are sorted.
+#[derive(Clone, Copy)]
+pub(crate) struct Keys(u32);
+
+impl Keys {
+    /// Set where the keys are found by the body's key table.
+    const HASHED: u32 = 1 << 31;
+
+    /// Keys from `at` on, found by the body's key table where `hashed`; none for a body
+    /// of 2 Gi keys or more, which parsing would hold in more than 48 GiB.
+    fn new(at: usize, hashed: bool) -> Option<Self> {
+        let at = u32::try_from(at).ok().filter(|at| *at < Self::HASHED)?;
+        Some(Self(at | if hashed { Self::HASHED } else { 0 }))
+    }
+
+    fn at(self) -> usize {
+        (self.0 & !Self::HASHED) as usize
+    }
+
+    #[cfg(feature = "std")]
+    fn hashed(self) -> bool {
+        self.0 & Self::HASHED != 0
+    }
+
+    /// The same, from `at` on.
+    fn moved(self, at: usize) -> Self {
+        Self(at as u32 | (self.0 & Self::HASHED))
+    }
 }
 
 /// Where an array or a dictionary is in the bytes of what holds it, and where its
@@ -129,21 +164,129 @@ impl Run {
     }
 }
 
-/// The items and values of every array and dictionary of a body, parsed once, and
-/// the keys of its dictionaries, which every read of the body shares; none where it
-/// has none. Held behind one pointer, as the table keeps one for each object
-/// ([`crate::xref`]); keys are held apart from the nodes as they take less room.
+/// The items and values of every array and dictionary of a body, parsed together,
+/// and the keys of its dictionaries, which every read made of the parse shares;
+/// none where it has none. Held behind one pointer, as the table keeps one for each
+/// object ([`crate::xref`]); keys are held apart from the nodes as they take less
+/// room.
 #[derive(Clone, Default)]
 pub(crate) struct Nodes(Option<Arc<Body>>);
 
 struct Body {
     nodes: Box<[Node]>,
     keys: Box<[Text]>,
+    /// Where the keys of its dictionaries of [`TABLED`] keys or more that came out
+    /// of order are, where it has any ([`Keys`]).
+    #[cfg(feature = "std")]
+    table: Option<KeyTable>,
+}
+
+/// Where the keys of the dictionaries of a body of [`TABLED`] keys or more that came
+/// out of order are among its keys ([`Keys`]): slots, each empty or a key's place, a key found
+/// from the slot of a hash, keyed at random, of the key and where its dictionary's
+/// keys start, slot by slot. A third more slots than keys at least, 4 bytes each,
+/// so that at most 3 in 4 are taken and a key is found in a few: a dictionary of
+/// tens of thousands of keys, which a file whose pages each list the resources of
+/// the pages before them holds, is parsed in time linear in its keys, where sorting
+/// them took that time times their logarithm, and each key is found in a step,
+/// where halving took a logarithm of steps.
+#[cfg(feature = "std")]
+struct KeyTable {
+    state: hash::State,
+    slots: Box<[u32]>,
+}
+
+#[cfg(feature = "std")]
+impl KeyTable {
+    const EMPTY: u32 = u32::MAX;
+
+    /// Where `key`, of the dictionary whose keys start at `at`, is first looked for.
+    fn slot(&self, at: usize, key: &[u8]) -> usize {
+        use core::hash::BuildHasher;
+        self.state.hash_one((at, key)) as usize & (self.slots.len() - 1)
+    }
+
+    /// The table of the dictionaries of `nodes`, whose own is the first, held from
+    /// `start` on in `data`, and whose keys are `keys`; none where none of them has
+    /// its keys found by one ([`Keys`]).
+    fn of(nodes: &[Node], keys: &[Text], data: &[u8], start: usize) -> Option<Self> {
+        let hashed: usize = nodes
+            .iter()
+            .map(|node| match node {
+                Node::Dict(run, at) if at.hashed() => run.len as usize,
+                _ => 0,
+            })
+            .sum();
+        if hashed == 0 {
+            return None;
+        }
+        // Fewer than 2^31 keys ([`Keys::new`]), so the room fits a usize, and a
+        // key's place a slot.
+        let room = (hashed + hashed / 3 + 1).next_power_of_two();
+        crate::work::told(room);
+        let mut table = Self {
+            state: hash::State::default(),
+            slots: alloc::vec![Self::EMPTY; room].into_boxed_slice(),
+        };
+        table.add(nodes, keys, &nodes[0], data, start);
+        Some(table)
+    }
+
+    /// Adds the keys of the dictionaries of `node`, all the way down, which is held
+    /// in the bytes of `data` from `start` on.
+    fn add(&mut self, nodes: &[Node], keys: &[Text], node: &Node, data: &[u8], start: usize) {
+        let (run, at) = match node {
+            Node::Array(run) => (run, None),
+            Node::Dict(run, at) => (run, Some(*at)),
+            _ => return,
+        };
+        // Where its own bytes start, which its keys and its items' places are kept
+        // relative to.
+        let from = start + run.span.0;
+        if let Some(at) = at.filter(|at| at.hashed()) {
+            let held = &data[from..];
+            let mask = self.slots.len() - 1;
+            let own = &keys[at.at()..at.at() + run.len as usize];
+            for (place, key) in (at.at()..).zip(own) {
+                let key = key.as_slice(held);
+                crate::work::told(1 + key.len());
+                let mut slot = self.slot(at.at(), key);
+                while self.slots[slot] != Self::EMPTY {
+                    slot = (slot + 1) & mask;
+                }
+                // Fewer than 2^31 keys ([`Keys::new`]).
+                self.slots[slot] = place as u32;
+            }
+        }
+        for item in run.nodes(nodes) {
+            self.add(nodes, keys, item, data, from);
+        }
+    }
+
+    /// Where `key` is among the `len` keys of a dictionary, those from `at` on among
+    /// `keys`, kept relative to `held`.
+    fn find(&self, keys: &[Text], at: usize, len: usize, held: &[u8], key: &[u8]) -> Option<usize> {
+        let mask = self.slots.len() - 1;
+        let mut slot = self.slot(at, key);
+        loop {
+            let place = self.slots[slot];
+            if place == Self::EMPTY {
+                return None;
+            }
+            // The key of another dictionary is passed over.
+            let found = (place as usize).wrapping_sub(at);
+            if found < len && keys[place as usize].as_slice(held) == key {
+                return Some(found);
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
 }
 
 impl Nodes {
-    /// Those `parsed` holds, which this takes, leaving its room.
-    fn of(parsed: &mut Scratch) -> Self {
+    /// Those `parsed` holds, which this takes, leaving its room: the nodes of a body
+    /// held from `start` on in `data`.
+    fn of(parsed: &mut Scratch, _data: &[u8], _start: usize) -> Self {
         /// What `parsed` holds: copied where its room is kept for the next body
         /// ([`Scratch::keep`]), else taken with its room, which the last run parsed
         /// filled exactly ([`Parse::last`]), so that a large body is not held twice.
@@ -159,9 +302,12 @@ impl Nodes {
         if parsed.nodes.is_empty() && parsed.keys.is_empty() {
             return Self(None);
         }
+        let (nodes, keys) = (take(&mut parsed.nodes), take(&mut parsed.keys));
         Self(Some(Arc::new(Body {
-            nodes: take(&mut parsed.nodes),
-            keys: take(&mut parsed.keys),
+            #[cfg(feature = "std")]
+            table: KeyTable::of(&nodes, &keys, _data, _start),
+            nodes,
+            keys,
         })))
     }
 
@@ -171,6 +317,11 @@ impl Nodes {
 
     fn keys(&self) -> &[Text] {
         self.0.as_ref().map_or(&[], |body| &body.keys)
+    }
+
+    #[cfg(feature = "std")]
+    fn table(&self) -> Option<&KeyTable> {
+        self.0.as_ref()?.table.as_ref()
     }
 }
 
@@ -189,7 +340,7 @@ impl TopDict {
         data: &'a [u8],
         ctx: &ReaderContext<'a>,
     ) -> Option<Self> {
-        let ((), nodes) = Parse::body(data, ctx, |parse| {
+        let ((), nodes) = Parse::body(data, ctx, 0, |parse| {
             let (run, keys) = parse.dict(r, 0, 0)?;
             parse.held.nodes[0] = Node::Dict(run, keys);
             Some(())
@@ -225,8 +376,13 @@ pub(crate) struct Part<'a> {
 }
 
 /// At most this many entries are kept in the file's order, which a key is searched
-/// in entry by entry; more are sorted by key and searched by halving.
+/// in entry by entry; more are searched by halving or by the key table ([`Keys`]).
 const LISTED: usize = 8;
+
+/// At least this many keys out of order are found by the body's key table
+/// ([`KeyTable`]), which holds 5 to 11 bytes more for each; fewer are sorted, a
+/// logarithm of comparisons each, 10 at most.
+const TABLED: usize = 1024;
 
 /// How the entry of a key is found among those of a dictionary of more than
 /// [`LISTED`], so that a later entry of a key replaces the value at once, as the map
@@ -299,10 +455,12 @@ impl Index {
         }
     }
 
-    /// What this index finds `key` by.
+    /// What this index finds `key` by, the bytes hashed counted
+    /// ([`crate::work::TOLD`]).
     #[cfg(feature = "std")]
     fn hash(&self, key: &[u8]) -> Hashed {
         use core::hash::BuildHasher;
+        crate::work::told(1 + key.len());
         self.0.hasher().hash_one(key)
     }
 
@@ -365,7 +523,7 @@ struct Scratch {
 fn drop_held(nodes: &mut [Node], keys: &mut [Text], node: &Node) -> (usize, usize) {
     let (run, at) = match *node {
         Node::Array(run) => (run, None),
-        Node::Dict(run, at) => (run, Some(at as usize)),
+        Node::Dict(run, at) => (run, Some(at.at())),
         _ => return (0, 0),
     };
     let len = run.len as usize;
@@ -414,8 +572,8 @@ impl Moving {
             .0
             .extend(items.map(|item| core::mem::replace(item, Node::Null)));
         if let Some(keys) = keys {
-            let at = *keys as usize;
-            *keys = self.to.1.len() as u32;
+            let at = keys.at();
+            *keys = keys.moved(self.to.1.len());
             let names = self.from.1[at..at + len].iter_mut();
             self.to
                 .1
@@ -532,6 +690,7 @@ impl<'r, 'a> Parse<'r, 'a> {
     fn body<T>(
         data: &'a [u8],
         ctx: &'r ReaderContext<'a>,
+        start: usize,
         read: impl FnOnce(&mut Self) -> Option<T>,
     ) -> Option<(T, Nodes)> {
         let mut parse = Self {
@@ -544,7 +703,7 @@ impl<'r, 'a> Parse<'r, 'a> {
         parse.held.nodes.push(Node::Null);
         let read = read(&mut parse).map(|read| {
             debug_assert_eq!(parse.held.garbage, (0, 0), "the object's run dropped it");
-            (read, Nodes::of(&mut parse.held))
+            (read, Nodes::of(&mut parse.held, data, start))
         });
         parse.held.keep();
         read
@@ -553,7 +712,10 @@ impl<'r, 'a> Parse<'r, 'a> {
     /// An item of an array or a value of a dictionary `depth` deep, as
     /// `MaybeRef<Object>` skips it: a reference, or else an object.
     fn item(&mut self, r: &mut Reader<'a>, start: usize, depth: usize) -> Option<Node> {
-        if let Some(reference) = r.read_without_context::<ObjRef>() {
+        // A reference starts with a number, which most items do not.
+        if r.peek_byte().is_some_and(starts_number)
+            && let Some(reference) = r.read_without_context::<ObjRef>()
+        {
             return Some(Node::Ref(reference));
         }
         let at = r.offset();
@@ -595,7 +757,7 @@ impl<'r, 'a> Parse<'r, 'a> {
     /// A dictionary `depth` deep, as `Dict::skip_with_depth` skips it, where it is
     /// in what holds it from `start`: the run of its values, and where its keys
     /// start.
-    fn dict(&mut self, r: &mut Reader<'a>, start: usize, depth: usize) -> Option<(Run, u32)> {
+    fn dict(&mut self, r: &mut Reader<'a>, start: usize, depth: usize) -> Option<(Run, Keys)> {
         if depth >= MAX_OBJECT_NESTING_DEPTH {
             return None;
         }
@@ -646,7 +808,8 @@ impl<'r, 'a> Parse<'r, 'a> {
             }
             Some(())
         });
-        let sort = match large {
+        // Keys that came out of order: found by the body's table, or else sorted.
+        let hashed = match large {
             Some(Large::Indexed(index)) => {
                 index.keep();
                 true
@@ -662,7 +825,8 @@ impl<'r, 'a> Parse<'r, 'a> {
             keys,
             ..
         } = &mut self.held;
-        if sort {
+        let tabled = cfg!(feature = "std") && hashed && more >= TABLED;
+        if hashed && !tabled {
             // Each key once, so any sort orders them alike.
             entries[base..]
                 .sort_unstable_by(|(a, _), (b, _)| order(a.as_slice(held), b.as_slice(held)));
@@ -673,7 +837,7 @@ impl<'r, 'a> Parse<'r, 'a> {
             nodes.push(value);
         }
         let run = Run::of((from - start, from - start + bytes.len()), at, nodes)?;
-        Some((run, u32::try_from(keys_at).ok()?))
+        Some((run, Keys::new(keys_at, tabled)?))
     }
 
     /// An array `depth` deep, as `Array::skip_with_depth` skips it, where its items
@@ -700,6 +864,46 @@ impl<'r, 'a> Parse<'r, 'a> {
     }
 }
 
+/// An array or a dictionary parsed where a body holds it, while a read holds its
+/// nodes ([`Top::once`]).
+#[derive(Clone)]
+pub(crate) struct Once {
+    at: usize,
+    body: Weak<Body>,
+}
+
+impl Once {
+    /// The object, if a read still holds its nodes.
+    pub(crate) fn top(&self) -> Option<Top> {
+        let body = self.body.upgrade()?;
+        Some(Top {
+            at: self.at,
+            node: body.nodes[0].clone(),
+            nodes: Nodes(Some(body)),
+        })
+    }
+
+    /// The dictionary of a stream, if a read still holds its nodes.
+    pub(crate) fn dict(&self) -> Option<TopDict> {
+        Some(TopDict(Nodes(Some(self.body.upgrade()?))))
+    }
+
+    /// Whether no read holds its nodes any more, which are dropped.
+    pub(crate) fn ended(&self) -> bool {
+        self.body.strong_count() == 0
+    }
+}
+
+impl TopDict {
+    /// The dictionary, while a read holds its nodes.
+    pub(crate) fn once(&self) -> Option<Once> {
+        Some(Once {
+            at: 0,
+            body: Arc::downgrade(self.0.0.as_ref()?),
+        })
+    }
+}
+
 /// An object parsed where a body holds it: its node, where it starts in the bytes
 /// it is read from, which where its parts are is kept relative to, and the nodes of
 /// its arrays and dictionaries, of which its own, where it is one, is the first.
@@ -719,7 +923,7 @@ impl Top {
         ctx: &ReaderContext<'a>,
     ) -> Option<Self> {
         let at = r.offset();
-        let (node, nodes) = Parse::body(data, ctx, |parse| {
+        let (node, nodes) = Parse::body(data, ctx, at, |parse| {
             let node = parse.object(r, at, 0)?;
             match node {
                 Node::Array(_) | Node::Dict(..) => parse.held.nodes[0] = node.clone(),
@@ -729,6 +933,15 @@ impl Top {
             Some(node)
         })?;
         Some(Self { at, node, nodes })
+    }
+
+    /// The array or dictionary, while a read holds its nodes; none for another
+    /// object, which holds none.
+    pub(crate) fn once(&self) -> Option<Once> {
+        Some(Once {
+            at: self.at,
+            body: Arc::downgrade(self.nodes.0.as_ref()?),
+        })
     }
 
     /// The dictionary `dict`, parsed where it is kept relative to the start of the
@@ -851,7 +1064,7 @@ impl<'a> Part<'a> {
     fn keys(&self) -> &[Text] {
         match self.node() {
             Node::Dict(run, at) if run.len > 0 => {
-                let at = *at as usize;
+                let at = at.at();
                 &self.held.nodes.keys()[at..at + run.len as usize]
             }
             _ => &[],
@@ -861,6 +1074,13 @@ impl<'a> Part<'a> {
     /// Where the value of `key` is among the dictionary's values.
     pub(crate) fn find(&self, key: &[u8]) -> Option<usize> {
         let (keys, data) = (self.keys(), self.data());
+        #[cfg(feature = "std")]
+        if let Node::Dict(run, at) = self.node()
+            && at.hashed()
+            && let Some(table) = self.held.nodes.table()
+        {
+            return table.find(self.held.nodes.keys(), at.at(), run.len as usize, data, key);
+        }
         if keys.len() > LISTED {
             keys.binary_search_by(|name| name.as_slice(data).cmp(key))
                 .ok()

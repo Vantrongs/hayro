@@ -6,6 +6,12 @@ pub(crate) use std::sync::Arc;
 pub(crate) use alloc::rc::Rc as Arc;
 
 #[cfg(feature = "std")]
+pub(crate) use std::sync::Weak;
+
+#[cfg(not(feature = "std"))]
+pub(crate) use alloc::rc::Weak;
+
+#[cfg(feature = "std")]
 pub(crate) use std::sync::OnceLock;
 
 #[cfg(not(feature = "std"))]

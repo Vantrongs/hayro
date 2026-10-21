@@ -33,3 +33,11 @@ pub type Map<K, V> = alloc::collections::BTreeMap<K, V>;
 /// A set of keys.
 #[cfg(not(feature = "std"))]
 pub type Set<K> = alloc::collections::BTreeSet<K>;
+
+/// An entry of a [`Map`].
+#[cfg(feature = "std")]
+pub(crate) use std::collections::hash_map::Entry;
+
+/// An entry of a [`Map`].
+#[cfg(not(feature = "std"))]
+pub(crate) use alloc::collections::btree_map::Entry;

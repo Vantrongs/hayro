@@ -1,2 +1,2 @@
-open_peak_bytes 2768020
-open_allocations 1577
+read_peak_bytes 2840888
+read_allocations 3393
