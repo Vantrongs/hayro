@@ -439,8 +439,8 @@ fn a_small_ccitt_image_allocates_its_output_once() {
     let params = ImageDecodeParams::default();
     let (decoded, used) = measure(|| stream.decoded_image(&params).unwrap().data.into_owned());
     assert_eq!(decoded, [0xFF, 0xFF, 0x00, 0x00].repeat(20 * 16));
-    // The output, the two lists of changes, and one allocation outside the CCITT
-    // decoder and its output; 13 when the output grew from an eighth of its size and
+    // The output and the two lists of changes, the parameters being read where the
+    // stream's dictionary was; 13 when the output grew from an eighth of its size and
     // the lists change by change.
-    assert_eq!(used.count, 4, "{used:?}");
+    assert_eq!(used.count, 3, "{used:?}");
 }

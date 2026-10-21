@@ -926,15 +926,10 @@ mod tests {
         )
         .0?;
         let dict = match &syntax {
-            Read::Dict(dict) | Read::Stream { dict, .. } => Some(dict.dict()),
+            Read::Dict(dict) | Read::Stream { dict, .. } => Some(dict.dict(data, &ctx)),
             Read::Object(_) => None,
         };
-        let has = |key: &[u8]| {
-            dict.as_ref().is_some_and(|dict| {
-                let (from, to) = dict.span();
-                dict.get(key, &data[from..to]).is_some()
-            })
-        };
+        let has = |key: &[u8]| dict.as_ref().is_some_and(|dict| dict.contains_key(key));
         Some(Found {
             end,
             root: has(ROOT),

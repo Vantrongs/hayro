@@ -88,7 +88,11 @@ pub(crate) enum Node {
     /// A dictionary, whose values are its run of the nodes of its body, and whose
     /// keys, one for each value, are those of its body from the one this tells on
     /// ([`Nodes`]). Those of a small dictionary are in the file's order, those of a
-    /// larger one sorted by key ([`LISTED`]).
+    /// larger one sorted by key ([`LISTED`]). An entry takes a few dozen bytes,
+    /// where a map takes about twice that and grows by doubling; every dictionary
+    /// of a file is parsed when it opens and kept while it is open, so a file whose
+    /// pages each list all the resources of the pages before them holds tens of
+    /// thousands of entries.
     Dict(Run, u32),
 }
 
@@ -106,6 +110,7 @@ pub(crate) struct Run {
 impl Run {
     /// The run of `nodes` from `at` on, of a container at `span`.
     fn of(span: Span, at: usize, nodes: &[Node]) -> Option<Self> {
+        u32::try_from(nodes.len()).ok()?;
         Some(Self {
             span,
             at: u32::try_from(at).ok()?,
@@ -186,8 +191,6 @@ impl TopDict {
         ctx: &ReaderContext<'a>,
     ) -> Option<Self> {
         let ((), nodes) = Parse::body(data, ctx, |parse| {
-            // Its place, first, as the dictionary's values are the last run.
-            parse.held.nodes.push(Node::Null);
             let (run, keys) = parse.dict(r, 0, 0)?;
             parse.held.nodes[0] = Node::Dict(run, keys);
             Some(())
@@ -195,32 +198,31 @@ impl TopDict {
         Some(Self(nodes))
     }
 
-    /// The dictionary.
-    pub(crate) fn dict(&self) -> DictNode {
-        match self.0.nodes().first() {
-            Some(Node::Dict(run, keys)) => self.0.dict(*run, *keys),
-            _ => unreachable!("a parsed dictionary's node is the first of its body"),
-        }
+    /// The dictionary, read from `data`, which it was parsed in, in `ctx`.
+    pub(crate) fn dict<'a>(&self, data: &'a [u8], ctx: &ReaderContext<'a>) -> Dict<'a> {
+        Dict::parsed(Part::root(data, &self.0, ctx))
     }
 }
 
-/// An array parsed, with the nodes of its body.
-#[derive(Clone)]
-pub(crate) struct ArrayNode {
+/// What the reads of the arrays and dictionaries of one read of an object share:
+/// the bytes the object's node is kept relative to, the nodes of its body, and the
+/// context they are read in.
+pub(crate) struct Held<'a> {
+    data: &'a [u8],
     nodes: Nodes,
-    run: Run,
+    ctx: ReaderContext<'a>,
 }
 
-/// A dictionary parsed, with the nodes of its body. A list of entries takes a few
-/// dozen bytes an entry, where a map takes about twice that and grows by doubling;
-/// every dictionary of a file is parsed when it opens and kept while it is open, so
-/// a file whose pages each list all the resources of the pages before them holds
-/// tens of thousands of entries.
+/// An array or a dictionary of an object read from its body: what the read holds,
+/// which reading what it holds shares, its node, the `at`th of the body's, and
+/// where the bytes of what holds it start in the bytes the read holds. In 32 bits
+/// each, so that it takes two words, as an object holds one ([`Object`]): one that
+/// starts 4 GiB or more into those bytes holds what it is read from itself.
 #[derive(Clone)]
-pub(crate) struct DictNode {
-    nodes: Nodes,
-    run: Run,
-    keys: u32,
+pub(crate) struct Part<'a> {
+    held: Arc<Held<'a>>,
+    at: u32,
+    offset: u32,
 }
 
 /// At most this many entries are kept in the file's order, which a key is searched
@@ -486,6 +488,9 @@ impl<'r, 'a> Parse<'r, 'a> {
             ctx,
             held: Scratch::take(),
         };
+        // The place of what is read, first, where it is an array or a dictionary,
+        // its own run being the last.
+        parse.held.nodes.push(Node::Null);
         let read = read(&mut parse).map(|read| (read, Nodes::of(&mut parse.held)));
         parse.held.keep();
         read
@@ -666,7 +671,7 @@ impl<'r, 'a> Parse<'r, 'a> {
 
 /// An object parsed where a body holds it: its node, where it starts in the bytes
 /// it is read from, which where its parts are is kept relative to, and the nodes of
-/// its arrays and dictionaries.
+/// its arrays and dictionaries, of which its own, where it is one, is the first.
 #[derive(Clone)]
 pub(crate) struct Top {
     at: usize,
@@ -683,61 +688,62 @@ impl Top {
         ctx: &ReaderContext<'a>,
     ) -> Option<Self> {
         let at = r.offset();
-        let (node, nodes) = Parse::body(data, ctx, |parse| parse.object(r, at, 0))?;
+        let (node, nodes) = Parse::body(data, ctx, |parse| {
+            let node = parse.object(r, at, 0)?;
+            match node {
+                Node::Array(_) | Node::Dict(..) => parse.held.nodes[0] = node.clone(),
+                // Nothing else was parsed, so the body has no nodes.
+                _ => parse.held.nodes.clear(),
+            }
+            Some(node)
+        })?;
         Some(Self { at, node, nodes })
     }
 
     /// The dictionary `dict`, parsed where it is kept relative to the start of the
     /// bytes it is read from.
     pub(crate) fn dict(dict: TopDict) -> Self {
-        let node = dict.dict();
         Self {
             at: 0,
-            node: Node::Dict(node.run, node.keys),
+            node: dict.0.nodes()[0].clone(),
             nodes: dict.0,
         }
     }
 
     /// The object, read from `data`, which it was parsed in, in `ctx`.
     pub(crate) fn object<'a>(&self, data: &'a [u8], ctx: &ReaderContext<'a>) -> Object<'a> {
-        self.node.object(&self.nodes, &data[self.at..], ctx)
+        let data = &data[self.at..];
+        self.node
+            .object(data, || Part::root(data, &self.nodes, ctx))
     }
 
     /// The object as written ([`Written`]), read from `data`, which it was parsed
     /// in, in `ctx`.
     pub(crate) fn written<'a>(&self, data: &'a [u8], ctx: &ReaderContext<'a>) -> Written<'a> {
-        self.node.written(&self.nodes, &data[self.at..], ctx)
+        let data = &data[self.at..];
+        self.node
+            .written(data, || Part::root(data, &self.nodes, ctx))
     }
 }
 
 impl Node {
-    /// The object, of the body whose nodes are `nodes`, held in `data`, read in
-    /// `ctx`; `null` for a reference, which only [`Self::item`] reads.
-    pub(crate) fn object<'a>(
-        &self,
-        nodes: &Nodes,
-        data: &'a [u8],
-        ctx: &ReaderContext<'a>,
-    ) -> Object<'a> {
+    /// The object, held in `data`, an array or a dictionary as `part` reads it;
+    /// `null` for a reference, which only [`Part::item`] reads.
+    fn object<'a>(&self, data: &'a [u8], part: impl FnOnce() -> Part<'a>) -> Object<'a> {
         match self {
             Self::Null | Self::Ref(_) => Object::Null(Null),
             Self::Boolean(value) => Object::Boolean(*value),
             Self::Number(number, _) => Object::Number(*number),
             Self::String(text) => Object::String(String::from_bytes(text.bytes(data))),
             Self::Name(text) => Object::Name(Name::from_bytes(text.bytes(data))),
-            Self::Array(run) => Object::Array(Array::parsed(data, nodes.array(*run), ctx)),
-            Self::Dict(run, keys) => Object::Dict(Dict::parsed(data, nodes.dict(*run, *keys), ctx)),
+            Self::Array(_) => Object::Array(Array::parsed(part())),
+            Self::Dict(..) => Object::Dict(Dict::parsed(part())),
         }
     }
 
-    /// The item, of the body whose nodes are `nodes`, held in `data`, read in `ctx`,
-    /// as written ([`Written`]).
-    pub(crate) fn written<'a>(
-        &self,
-        nodes: &Nodes,
-        data: &'a [u8],
-        ctx: &ReaderContext<'a>,
-    ) -> Written<'a> {
+    /// The item, held in `data`, an array or a dictionary as `part` reads it, as
+    /// written ([`Written`]).
+    fn written<'a>(&self, data: &'a [u8], part: impl FnOnce() -> Part<'a>) -> Written<'a> {
         match self {
             Self::Ref(reference) => Written::Ref(*reference),
             Self::Number(_, (from, to)) => Written::Number(&data[*from as usize..*to as usize]),
@@ -745,43 +751,11 @@ impl Node {
             Self::Boolean(value) => Written::Boolean(*value),
             Self::String(text) => Written::String(String::from_bytes(text.bytes(data))),
             Self::Name(text) => Written::Name(Name::from_bytes(text.bytes(data))),
-            Self::Array(run) => Written::Array(Array::parsed(data, nodes.array(*run), ctx)),
-            Self::Dict(run, keys) => {
-                Written::Dict(Dict::parsed(data, nodes.dict(*run, *keys), ctx))
-            }
+            Self::Array(_) => Written::Array(Array::parsed(part())),
+            Self::Dict(..) => Written::Dict(Dict::parsed(part())),
         }
     }
 
-    /// The item, of the body whose nodes are `nodes`, held in `data`, read in `ctx`.
-    pub(crate) fn item<'a>(
-        &self,
-        nodes: &Nodes,
-        data: &'a [u8],
-        ctx: &ReaderContext<'a>,
-    ) -> MaybeRef<Object<'a>> {
-        match self {
-            Self::Ref(reference) => MaybeRef::Ref(*reference),
-            node => MaybeRef::NotRef(node.object(nodes, data, ctx)),
-        }
-    }
-
-    /// The item, of the body whose nodes are `nodes`, held in `data`, read in `ctx`,
-    /// as a `T`, as reading a `T` from its bytes reads it, but for the reference it
-    /// may be.
-    pub(crate) fn item_as<'a, T: ObjectLike<'a>>(
-        &self,
-        nodes: &Nodes,
-        data: &'a [u8],
-        ctx: &ReaderContext<'a>,
-    ) -> Option<MaybeRef<T>> {
-        match self.item(nodes, data, ctx) {
-            MaybeRef::Ref(reference) => Some(MaybeRef::Ref(reference)),
-            MaybeRef::NotRef(object) => object.cast::<T>().map(MaybeRef::NotRef),
-        }
-    }
-}
-
-impl Node {
     /// This, its run moved `shift` nodes and keys down, where it is an array or a
     /// dictionary.
     fn shift(&mut self, shift: (usize, usize)) {
@@ -799,108 +773,165 @@ impl Node {
     }
 }
 
-impl Nodes {
-    fn array(&self, run: Run) -> ArrayNode {
-        ArrayNode {
-            nodes: self.clone(),
-            run,
+impl<'a> Part<'a> {
+    /// The object whose node is the first of `nodes`, an array or a dictionary,
+    /// kept relative to `data`, read in `ctx`.
+    fn root(data: &'a [u8], nodes: &Nodes, ctx: &ReaderContext<'a>) -> Self {
+        Self {
+            held: Arc::new(Held {
+                data,
+                nodes: nodes.clone(),
+                ctx: ctx.clone(),
+            }),
+            at: 0,
+            offset: 0,
         }
     }
 
-    fn dict(&self, run: Run, keys: u32) -> DictNode {
-        DictNode {
-            nodes: self.clone(),
-            run,
-            keys,
+    fn node(&self) -> &Node {
+        &self.held.nodes.nodes()[self.at as usize]
+    }
+
+    fn run(&self) -> Run {
+        match self.node() {
+            Node::Array(run) | Node::Dict(run, _) => *run,
+            _ => unreachable!("a part is an array or a dictionary"),
         }
     }
-}
 
-impl ArrayNode {
-    /// Where the items are in what holds the array.
-    pub(crate) fn span(&self) -> Span {
-        self.run.span
+    /// The bytes of the array's items, or of the dictionary.
+    pub(crate) fn data(&self) -> &'a [u8] {
+        let (from, to) = self.run().span;
+        let (offset, data) = (self.offset as usize, self.held.data);
+        &data[offset + from..offset + to]
     }
 
-    /// The items.
+    /// The context it is read in.
+    pub(crate) fn ctx(&self) -> &ReaderContext<'a> {
+        &self.held.ctx
+    }
+
+    /// This, read in `ctx`.
+    pub(crate) fn in_context(&self, ctx: &ReaderContext<'a>) -> Self {
+        Self {
+            held: Arc::new(Held {
+                data: self.held.data,
+                nodes: self.held.nodes.clone(),
+                ctx: ctx.clone(),
+            }),
+            ..*self
+        }
+    }
+
+    /// The array's items, or the dictionary's values.
     pub(crate) fn items(&self) -> &[Node] {
-        self.run.nodes(self.nodes.nodes())
-    }
-
-    /// The nodes of the body, which the items' own arrays and dictionaries are of.
-    pub(crate) fn nodes(&self) -> &Nodes {
-        &self.nodes
-    }
-}
-
-impl DictNode {
-    /// Where the dictionary is in what holds it.
-    pub(crate) fn span(&self) -> Span {
-        self.run.span
-    }
-
-    /// The nodes of the body, which the values' own arrays and dictionaries are of.
-    pub(crate) fn nodes(&self) -> &Nodes {
-        &self.nodes
-    }
-
-    /// The values, and the key of each.
-    fn entries_held(&self) -> (&[Text], &[Node]) {
-        let values = self.run.nodes(self.nodes.nodes());
-        if values.is_empty() {
-            return (&[], values);
-        }
-        let at = self.keys as usize;
-        (&self.nodes.keys()[at..at + values.len()], values)
+        self.run().nodes(self.held.nodes.nodes())
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.run.len as usize
+        self.run().len as usize
     }
 
-    /// The value of `key`, of the dictionary whose bytes are `data`.
-    pub(crate) fn get(&self, key: &[u8], data: &[u8]) -> Option<&Node> {
-        let (keys, values) = self.entries_held();
-        let at = if keys.len() > LISTED {
+    /// The dictionary's keys, one for each value; none for an array.
+    fn keys(&self) -> &[Text] {
+        match self.node() {
+            Node::Dict(run, at) if run.len > 0 => {
+                let at = *at as usize;
+                &self.held.nodes.keys()[at..at + run.len as usize]
+            }
+            _ => &[],
+        }
+    }
+
+    /// Where the value of `key` is among the dictionary's values.
+    pub(crate) fn find(&self, key: &[u8]) -> Option<usize> {
+        let (keys, data) = (self.keys(), self.data());
+        if keys.len() > LISTED {
             keys.binary_search_by(|name| name.as_slice(data).cmp(key))
-                .ok()?
+                .ok()
         } else {
-            keys.iter().position(|name| name.as_slice(data) == key)?
-        };
-        Some(&values[at])
+            keys.iter().position(|name| name.as_slice(data) == key)
+        }
     }
 
-    /// The entries of the dictionary whose bytes are `data`, in no particular order.
-    pub(crate) fn entries<'s, 'a: 's>(
-        &'s self,
-        data: &'a [u8],
-    ) -> impl Iterator<Item = (Name<'a>, &'s Node)> + 's {
-        let (keys, values) = self.entries_held();
-        keys.iter()
-            .zip(values)
-            .map(move |(name, node)| (Name::from_bytes(name.bytes(data)), node))
+    /// The dictionary's keys, in no particular order.
+    pub(crate) fn names(&self) -> impl Iterator<Item = Name<'a>> + '_ {
+        let data = self.data();
+        self.keys()
+            .iter()
+            .map(move |name| Name::from_bytes(name.bytes(data)))
+    }
+
+    /// The `at`th item or value; `null` for a reference, which only [`Self::item`]
+    /// reads.
+    pub(crate) fn object(&self, at: usize) -> Object<'a> {
+        self.items()[at].object(self.data(), || self.part(at))
+    }
+
+    /// The `at`th item or value, as written ([`Written`]).
+    pub(crate) fn written(&self, at: usize) -> Written<'a> {
+        self.items()[at].written(self.data(), || self.part(at))
+    }
+
+    /// The `at`th item or value.
+    pub(crate) fn item(&self, at: usize) -> MaybeRef<Object<'a>> {
+        match &self.items()[at] {
+            Node::Ref(reference) => MaybeRef::Ref(*reference),
+            _ => MaybeRef::NotRef(self.object(at)),
+        }
+    }
+
+    /// The `at`th item or value as a `T`, as reading a `T` from its bytes reads it,
+    /// but for the reference it may be.
+    pub(crate) fn item_as<T: ObjectLike<'a>>(&self, at: usize) -> Option<MaybeRef<T>> {
+        match self.item(at) {
+            MaybeRef::Ref(reference) => Some(MaybeRef::Ref(reference)),
+            MaybeRef::NotRef(object) => object.cast::<T>().map(MaybeRef::NotRef),
+        }
+    }
+
+    /// The `at`th item or value, an array or a dictionary, which shares what this
+    /// read holds.
+    fn part(&self, at: usize) -> Self {
+        let run = self.run();
+        // A run ends where the nodes of its body do, in 32 bits ([`Run::of`]).
+        let node = run.at + at as u32;
+        let offset = self.offset as usize + run.span.0;
+        match u32::try_from(offset) {
+            Ok(offset) => Self {
+                held: self.held.clone(),
+                at: node,
+                offset,
+            },
+            Err(_) => Self {
+                held: Arc::new(Held {
+                    data: &self.held.data[offset..],
+                    nodes: self.held.nodes.clone(),
+                    ctx: self.held.ctx.clone(),
+                }),
+                at: node,
+                offset: 0,
+            },
+        }
     }
 }
 
 /// The items of a parsed array from one on, as reading the array's bytes from an
 /// item reads them ([`ObjectLike::from_items`]).
 pub(crate) struct Items<'r, 'a> {
-    pub(crate) data: &'a [u8],
-    /// The nodes of the body, which the items' own arrays and dictionaries are of.
-    pub(crate) nodes: &'r Nodes,
-    pub(crate) items: &'r [Node],
+    pub(crate) part: &'r Part<'a>,
     pub(crate) at: usize,
 }
 
 impl<'a> Items<'_, 'a> {
     /// The next item, which is no reference, as a `T`, as `T::read` reads it.
-    pub(crate) fn next_as<T: ObjectLike<'a>>(&mut self, ctx: &ReaderContext<'a>) -> Option<T> {
-        let node = self.items.get(self.at)?;
+    pub(crate) fn next_as<T: ObjectLike<'a>>(&mut self) -> Option<T> {
+        let node = self.part.items().get(self.at)?;
         if matches!(node, Node::Ref(_)) {
             return None;
         }
         self.at += 1;
-        node.object(self.nodes, self.data, ctx).cast()
+        self.part.object(self.at - 1).cast()
     }
 
     /// The next item as a `T`, resolved where it is a reference, as reading a
@@ -909,7 +940,7 @@ impl<'a> Items<'_, 'a> {
         &mut self,
         ctx: &ReaderContext<'a>,
     ) -> Option<T> {
-        match self.items.get(self.at)? {
+        match self.part.items().get(self.at)? {
             Node::Ref(reference) => {
                 self.at += 1;
                 ctx.xref().get_with::<T>((*reference).into(), ctx)
@@ -998,7 +1029,7 @@ mod tests {
                     (body.nodes().len() - 1, body.keys().len()),
                     "{text}"
                 );
-                let parsed = Object::Dict(Dict::parsed(data, parsed.dict(), &ctx));
+                let parsed = Object::Dict(parsed.dict(data, &ctx));
                 let read = Reader::new(data)
                     .read_with_context::<Dict<'_>>(&ctx)
                     .unwrap();

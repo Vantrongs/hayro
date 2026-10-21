@@ -455,7 +455,7 @@ pub(super) fn stream_follows(data: &[u8], end: usize, slot: Slot) -> Option<(boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::{Dict, Object};
+    use crate::object::Object;
     use alloc::format;
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -586,10 +586,7 @@ mod tests {
     /// it ends.
     fn shown(read: &Read<Top, TopDict>, end: usize, data: &[u8]) -> String {
         let ctx = ReaderContext::dummy();
-        let dict = |dict: &TopDict| {
-            let dict = Dict::parsed(data, dict.dict(), &ctx);
-            format!("{}", Object::Dict(dict))
-        };
+        let dict = |dict: &TopDict| format!("{}", Object::Dict(dict.dict(data, &ctx)));
         match read {
             Read::Object(node) => format!("object {} to {end}", node.object(data, &ctx)),
             Read::Dict(d) => format!("dict {} to {end}", dict(d)),
