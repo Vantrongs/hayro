@@ -50,6 +50,8 @@ use crate::trivia::{is_eol_character, is_white_space_character};
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
+#[cfg(feature = "unsafe")]
+use fearless_simd::{Simd, SimdBase, u8x64};
 
 /// How deep arrays and dictionaries nest in an object that can be read.
 const MAX_DEPTH: usize = MAX_OBJECT_NESTING_DEPTH;
@@ -85,6 +87,60 @@ fn marked(block: &[u8; BLOCK]) -> u64 {
         marks |= (eight.wrapping_mul(0x0102_0408_1020_4080) >> 56) << (8 * i);
     }
     marks
+}
+
+/// The bytes of a block that the first pass of a scan reads, by kind, as bits: bit
+/// `i` is set where byte `i` of the block is one of the kind. Any other byte only ends
+/// an escape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Kinds {
+    open: u64,
+    close: u64,
+    backslash: u64,
+    percent: u64,
+    eol: u64,
+}
+
+impl Kinds {
+    /// The kinds of `bytes`, at most a block: those of its marks ([`is_mark`]),
+    /// found first.
+    fn of(bytes: &[u8]) -> Self {
+        let mut marks = match <&[u8; BLOCK]>::try_from(bytes) {
+            Ok(block) => marked(block),
+            Err(_) => bytes
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| is_mark(**b))
+                .fold(0, |marks, (i, _)| marks | 1 << i),
+        };
+        let mut kinds = Self::default();
+        while marks != 0 {
+            let i = marks.trailing_zeros();
+            marks &= marks - 1;
+            let (bit, b) = (1 << i, bytes[i as usize]);
+            kinds.open |= bit * u64::from(b == b'(');
+            kinds.close |= bit * u64::from(b == b')');
+            kinds.backslash |= bit * u64::from(b == b'\\');
+            kinds.percent |= bit * u64::from(b == b'%');
+            kinds.eol |= bit * u64::from(is_eol_character(b));
+        }
+        kinds
+    }
+
+    /// The kinds of a whole block, its bytes compared all at once.
+    #[cfg(feature = "unsafe")]
+    #[inline(always)]
+    fn of_block<S: Simd>(simd: S, block: &[u8; BLOCK]) -> Self {
+        let bytes = u8x64::from_slice(simd, block);
+        let of = |b| simd.to_bitmask_mask8x64(simd.simd_eq_u8x64(bytes, simd.splat_u8x64(b)));
+        Self {
+            open: of(b'('),
+            close: of(b')'),
+            backslash: of(b'\\'),
+            percent: of(b'%'),
+            eol: of(b'\r') | of(b'\n'),
+        }
+    }
 }
 
 /// A set of offsets in the file.
@@ -212,6 +268,120 @@ impl Strings {
             }
         }
         Some(i - self.blocks)
+    }
+}
+
+/// What the first pass of a scan has found in the blocks it has read, and the state
+/// it reads the next one in.
+struct FirstPass {
+    /// The depth after the last byte read.
+    depth: i64,
+    /// Whether the next byte is escaped: right after an unescaped backslash.
+    escaped: bool,
+    /// Whether the line of the next byte holds a `%` before it.
+    percent: bool,
+    /// The depths at which strings opened at an escaped `(` have not ended yet, in
+    /// rising order: each ends where the depth falls below it.
+    escaped_opens: Vec<i64>,
+    /// As [`Scan::meets`] and [`Scan::comment_ends`].
+    meets: Bits,
+    comment_ends: Vec<usize>,
+}
+
+impl FirstPass {
+    /// Reads `data` into `strings`, with the kinds of each block from `kinds_of`.
+    #[inline(always)]
+    fn read(&mut self, data: &[u8], strings: &mut Strings, kinds_of: impl Fn(&[u8]) -> Kinds) {
+        for (block, bytes) in data.chunks(BLOCK).enumerate() {
+            strings.starts.push(self.depth);
+            if self.escaped {
+                strings.escaped.set(block);
+            }
+            strings.mins[strings.blocks + block] = self.block(block * BLOCK, kinds_of(bytes));
+        }
+    }
+
+    /// Reads the block of the bytes from `from`, of `kinds`; returns the least depth
+    /// after any of its bytes.
+    ///
+    /// A block is read as bits, not a byte at a time: in a stream, marks are random
+    /// bytes, and branches on them, mispredicted, would cost the most of the pass.
+    /// What is rare in any file, a string opened at an escaped `(` that has not
+    /// ended, is read a mark at a time.
+    #[inline(always)]
+    fn block(&mut self, from: usize, kinds: Kinds) -> i64 {
+        // The escaped bytes: those after an odd run of backslashes. Where a run
+        // starts at an even bit, the run's bits plus its first bit carry past its
+        // end, so the bit after it is flipped from the even bits that mark one after
+        // a run starting at an odd bit (the escape scan of simdjson).
+        const EVEN: u64 = 0x5555_5555_5555_5555;
+        let before = u64::from(self.escaped);
+        let backslash = kinds.backslash & !before;
+        let follows = backslash << 1 | before;
+        let odd_starts = backslash & !EVEN & !follows;
+        let (even_runs, carried) = odd_starts.overflowing_add(backslash);
+        let escaped = (EVEN ^ (even_runs << 1)) & follows;
+        self.escaped = carried;
+
+        let opens = kinds.open & !escaped;
+        let closes = kinds.close & !escaped;
+        let escaped_open = kinds.open & escaped;
+        let start = self.depth;
+        let after_first = start + i64::from(opens & 1 == 1) - i64::from(closes & 1 == 1);
+        let mut least = after_first;
+        if self.escaped_opens.is_empty() && escaped_open == 0 {
+            // Only a `)` lowers the depth: the least is after the first byte or one.
+            // The first `)` is read without a branch, as a block of a stream mostly
+            // has none or one; with none, the bytes up to it are all, after which the
+            // depth is no less than after the first.
+            let depth_upto = |upto: u64| {
+                start + i64::from((opens & upto).count_ones())
+                    - i64::from((closes & upto).count_ones())
+            };
+            least = least.min(depth_upto(closes ^ closes.wrapping_sub(1)));
+            let mut rest = closes & closes.wrapping_sub(1);
+            while rest != 0 {
+                least = least.min(depth_upto(rest ^ (rest - 1)));
+                rest &= rest - 1;
+            }
+            self.depth = start + i64::from(opens.count_ones()) - i64::from(closes.count_ones());
+        } else {
+            let mut marks = opens | closes | escaped_open;
+            while marks != 0 {
+                let i = marks.trailing_zeros() as usize;
+                marks &= marks - 1;
+                let bit = 1 << i;
+                if closes & bit != 0 {
+                    if self.escaped_opens.last() == Some(&self.depth) {
+                        self.escaped_opens.pop();
+                        self.meets.set(from + i + 1);
+                    }
+                    self.depth -= 1;
+                } else if opens & bit != 0 {
+                    self.depth += 1;
+                } else if self.escaped_opens.last() != Some(&self.depth) {
+                    self.escaped_opens.push(self.depth);
+                }
+                least = least.min(self.depth);
+            }
+        }
+
+        // The ends of lines holding a `%`: the first `%` or end of line after each
+        // `%`, where it is an end of line. Adding a bit after each `%` to the bytes
+        // that are neither carries it to the first that is one; a `%` before the
+        // block carries in, and a `%` after the block's last end of line out.
+        let gaps = !(kinds.percent | kinds.eol);
+        let (sum, over) = gaps.overflowing_add(kinds.percent << 1);
+        let (sum, carried) = sum.overflowing_add(u64::from(self.percent));
+        self.percent = over | carried | (kinds.percent >> 63 == 1);
+        let mut ends = sum & kinds.eol;
+        while ends != 0 {
+            let at = from + ends.trailing_zeros() as usize;
+            ends &= ends - 1;
+            self.meets.set(at);
+            self.comment_ends.push(at);
+        }
+        least
     }
 }
 
@@ -374,89 +544,45 @@ pub(crate) struct Scan<'a> {
 impl<'a> Scan<'a> {
     pub(crate) fn new(data: &'a [u8]) -> Self {
         let blocks = data.len().div_ceil(BLOCK).max(1);
-        let mut starts = Vec::with_capacity(blocks);
-        let mut escaped = Bits::new(blocks);
-        let mut mins = vec![0; 2 * blocks];
-        let mut meets = Bits::new(data.len() + 1);
-        let mut comment_ends = vec![];
-
-        let mut depth = 0_i64;
-        // A byte is escaped where it is right after an unescaped backslash: the first
-        // byte after the last one read, if that was one. Any other byte ends an
-        // escape, and changes nothing else, so only the marks are read.
-        let mut escaped_at = usize::MAX;
-        let mut percent = false;
-        // The depths at which strings opened at an escaped `(` have not ended yet, in
-        // rising order: each ends where the depth falls below it.
-        let mut escaped_opens: Vec<i64> = vec![];
-        for (block, bytes) in data.chunks(BLOCK).enumerate() {
-            let from = block * BLOCK;
-            starts.push(depth);
-            if escaped_at == from {
-                escaped.set(block);
-            }
-            let mut marks = match <&[u8; BLOCK]>::try_from(bytes) {
-                Ok(full) => marked(full),
-                Err(_) => bytes
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, b)| is_mark(**b))
-                    .fold(0, |marks, (i, _)| marks | 1 << i),
-            };
-            // The depth after a byte that is no mark is the depth before it: the
-            // depth at the block's start, where the block starts with one.
-            let mut least = if marks & 1 == 0 { depth } else { i64::MAX };
-            // Each mark is read without a branch on what it is: in a stream, marks are
-            // random bytes, and branches on them, mispredicted, cost the most of the
-            // pass. What is rare in any file, strings opened at an escaped `(` and
-            // comments ending, is branched on.
-            while marks != 0 {
-                let i = marks.trailing_zeros() as usize;
-                marks &= marks - 1;
-                let (at, b) = (from + i, bytes[i]);
-                let free = at != escaped_at;
-                let (open, close) = (b == b'(', b == b')');
-                if escaped_opens.last() == Some(&depth) && (free & close) {
-                    escaped_opens.pop();
-                    meets.set(at + 1);
-                }
-                depth += i64::from(free & open) - i64::from(free & close);
-                if (!free & open) && escaped_opens.last() != Some(&depth) {
-                    escaped_opens.push(depth);
-                }
-                escaped_at = if free & (b == b'\\') {
-                    at + 1
-                } else {
-                    escaped_at
-                };
-                least = least.min(depth);
-                let eol = is_eol_character(b);
-                if eol & percent {
-                    meets.set(at);
-                    comment_ends.push(at);
-                }
-                percent = (percent & !eol) | (b == b'%');
-            }
-            mins[blocks + block] = least;
-        }
-        if percent {
-            comment_ends.push(data.len());
+        let mut strings = Strings {
+            starts: Vec::with_capacity(blocks),
+            escaped: Bits::new(blocks),
+            mins: vec![0; 2 * blocks],
+            blocks,
+        };
+        let mut pass = FirstPass {
+            depth: 0,
+            escaped: false,
+            percent: false,
+            escaped_opens: vec![],
+            meets: Bits::new(data.len() + 1),
+            comment_ends: vec![],
+        };
+        #[cfg(feature = "unsafe")]
+        fearless_simd::dispatch!(fearless_simd::Level::new(), simd => pass.read(
+            data,
+            &mut strings,
+            |bytes| match <&[u8; BLOCK]>::try_from(bytes) {
+                Ok(block) => Kinds::of_block(simd, block),
+                Err(_) => Kinds::of(bytes),
+            },
+        ));
+        #[cfg(not(feature = "unsafe"))]
+        pass.read(data, &mut strings, Kinds::of);
+        if pass.percent {
+            pass.comment_ends.push(data.len());
         }
         step(data.len());
+        let mins = &mut strings.mins;
         for i in (1..blocks).rev() {
             mins[i] = mins[2 * i].min(mins[2 * i + 1]);
         }
 
         Self {
             data,
-            strings: Strings {
-                starts,
-                escaped,
-                mins,
-                blocks,
-            },
-            meets,
-            comment_ends,
+            strings,
+            meets: pass.meets,
+            comment_ends: pass.comment_ends,
             fails: Bits::new(data.len()),
             kept: hash::Map::default(),
             met: hash::Map::default(),
@@ -1243,6 +1369,84 @@ mod tests {
                 .filter(|i| is_mark(block[*i]))
                 .fold(0_u64, |marks, i| marks | 1 << i);
             assert_eq!(marked(&block), expected, "{block:?}");
+        }
+    }
+
+    /// What the first pass finds, read a byte at a time: the starts and escapes of
+    /// the blocks, their least depths, the bytes in `meets`, and the comment ends.
+    type Passed = (Vec<i64>, Vec<bool>, Vec<i64>, Vec<usize>, Vec<usize>);
+
+    fn passed_byte_by_byte(data: &[u8]) -> Passed {
+        let (mut starts, mut escapes, mut leasts) = (vec![], vec![], vec![]);
+        let (mut meets, mut comment_ends) = (vec![], vec![]);
+        let (mut depth, mut escaped, mut percent) = (0_i64, false, false);
+        let mut escaped_opens: Vec<i64> = vec![];
+        for (block, bytes) in data.chunks(BLOCK).enumerate() {
+            starts.push(depth);
+            escapes.push(escaped);
+            let mut least = i64::MAX;
+            for (i, &b) in bytes.iter().enumerate() {
+                let at = block * BLOCK + i;
+                if !escaped && b == b')' {
+                    if escaped_opens.last() == Some(&depth) {
+                        escaped_opens.pop();
+                        meets.push(at + 1);
+                    }
+                    depth -= 1;
+                } else if !escaped && b == b'(' {
+                    depth += 1;
+                } else if escaped && b == b'(' && escaped_opens.last() != Some(&depth) {
+                    escaped_opens.push(depth);
+                }
+                least = least.min(depth);
+                if is_eol_character(b) {
+                    if percent {
+                        meets.push(at);
+                        comment_ends.push(at);
+                    }
+                    percent = false;
+                } else if b == b'%' {
+                    percent = true;
+                }
+                escaped = !escaped && b == b'\\';
+            }
+            leasts.push(least);
+        }
+        if percent {
+            comment_ends.push(data.len());
+        }
+        meets.sort_unstable();
+        meets.dedup();
+        (starts, escapes, leasts, meets, comment_ends)
+    }
+
+    #[test]
+    fn the_first_pass_finds_what_reading_a_byte_at_a_time_does() {
+        let mut random = Random(0x9e37_79b9_7f4a_7c15);
+        for case in 0..20_000 {
+            let len = random.below(5 * BLOCK);
+            let bytes: &[u8] = match case % 3 {
+                0 => b"()\\\r\n%a",
+                1 => b"(\\\\\\)a",
+                _ => b"()\\%\n aaaaaaaaaaaaaaaaaaaaaa",
+            };
+            let data: Vec<u8> = (0..len).map(|_| bytes[random.below(bytes.len())]).collect();
+            let scan = Scan::new(&data);
+            let strings = &scan.strings;
+            let blocks = data.len().div_ceil(BLOCK);
+            let passed = (
+                strings.starts.clone(),
+                (0..blocks).map(|b| strings.escaped.get(b)).collect(),
+                strings.mins[strings.blocks..][..blocks].to_vec(),
+                (0..=data.len()).filter(|&at| scan.meets.get(at)).collect(),
+                scan.comment_ends.clone(),
+            );
+            assert_eq!(
+                passed,
+                passed_byte_by_byte(&data),
+                "{:?}",
+                String::from_utf8_lossy(&data)
+            );
         }
     }
 }

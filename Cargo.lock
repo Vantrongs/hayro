@@ -661,6 +661,7 @@ version = "0.8.0"
 dependencies = [
  "aes",
  "cbc",
+ "fearless_simd",
  "flate2",
  "foldhash",
  "hayro-ccitt",

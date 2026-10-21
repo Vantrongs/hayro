@@ -17,6 +17,7 @@ unsafe = [
     "std",
     "dep:zlib-rs",
     "dep:memchr",
+    "dep:fearless_simd",
     "hayro-jbig2?/simd",
     "hayro-jpeg2000?/simd",
     "zune-jpeg?/x86",
@@ -30,6 +31,7 @@ foldhash = { workspace = true, optional = true }
 smallvec = { workspace = true }
 zlib-rs = { workspace = true, optional = true }
 memchr = { workspace = true, optional = true }
+fearless_simd = { workspace = true, optional = true }
 
 zune-jpeg = { workspace = true, optional = true }
 hayro-ccitt = { workspace = true, optional = true }
