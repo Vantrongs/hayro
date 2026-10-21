@@ -122,11 +122,11 @@ impl<'a> UntypedIter<'a> {
     pub fn next(&mut self) -> Option<Instruction<'_, 'a>> {
         self.stack.clear();
 
-        // Read into its place, not unwrapped and rewrapped (see `read_instruction`).
-        self.operator = read_instruction(&mut self.reader, &mut self.stack);
+        let operator = read_instruction(&mut self.reader, &mut self.stack)?;
+        self.operator = Some(operator);
         Some(Instruction {
             operands: &self.stack,
-            operator: self.operator.as_ref()?,
+            operator: self.operator.as_ref().unwrap(),
         })
     }
 }
