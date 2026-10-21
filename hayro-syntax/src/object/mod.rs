@@ -105,8 +105,8 @@ pub(crate) trait ObjectLike<'a>: TryFrom<Object<'a>> + Readable<'a> + Debug + Cl
 
     /// Reads the object the items of a parsed array start with, as [`Readable::read`]
     /// reads it from the array's bytes: one item, which is no reference.
-    fn from_items(items: &mut parsed::Items<'_, 'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
-        items.next_as::<Self>(ctx)
+    fn from_items(items: &mut parsed::Items<'_, 'a>, _: &ReaderContext<'a>) -> Option<Self> {
+        items.next_as::<Self>()
     }
 }
 
@@ -814,11 +814,11 @@ mod tests {
     fn object_sizes() {
         assert_eq!(size_of::<Object<'_>>(), 40);
         assert_eq!(size_of::<Array<'_>>(), 32);
-        assert_eq!(size_of::<Dict<'_>>(), 8);
+        assert_eq!(size_of::<Dict<'_>>(), 16);
         assert_eq!(size_of::<Name<'_>>(), 32);
         assert_eq!(size_of::<Null>(), 0);
         assert_eq!(size_of::<Number>(), 16);
-        assert_eq!(size_of::<Stream<'_>>(), 24);
+        assert_eq!(size_of::<Stream<'_>>(), 32);
         assert_eq!(size_of::<String<'_>>(), 32);
     }
 }

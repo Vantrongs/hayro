@@ -1,2 +1,2 @@
-field_pair_allocations 88
-field_pair_bytes 19053
+field_pair_allocations 65
+field_pair_bytes 16557

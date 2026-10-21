@@ -118,6 +118,7 @@ fn opening_a_file_of_large_dictionaries_stays_under_its_ceilings() {
 }
 
 /// Key `i`: a 64-byte prefix every key shares, then `i` in 5 digits.
+#[cfg(debug_assertions)]
 fn long_key(i: usize) -> String {
     format!("{}{i:05}", "P".repeat(64))
 }
@@ -126,6 +127,7 @@ fn long_key(i: usize) -> String {
 /// with a `step` of 1, shuffled with a prime step none of the `n` is a multiple of,
 /// each written `times` times, the later ones after all the first, valued with the
 /// time it is written.
+#[cfg(debug_assertions)]
 fn dict_of_long_keys(n: usize, step: usize, times: usize) -> String {
     let mut text = String::from("<<");
     for time in 0..times {
@@ -137,12 +139,12 @@ fn dict_of_long_keys(n: usize, step: usize, times: usize) -> String {
     text
 }
 
-/// The work ([`hayro_syntax::work::TOLD`]) of opening a file holding `dict` and
-/// reading its every key, less that of the same file holding an empty dictionary.
+/// The work ([`hayro_syntax::work::TOLD`]) of opening a file holding `dict`, which
+/// `check` reads after, less that of the same file holding an empty dictionary.
 #[cfg(debug_assertions)]
-fn told_for(dict: &str, keys: usize) -> usize {
+fn told_opening(dict: &str, check: impl Fn(&Dict<'_>)) -> usize {
     use hayro_syntax::work::TOLD;
-    let told = |dict: &str, keys: usize| {
+    let told = |dict: &str, check: &dyn Fn(&Dict<'_>)| {
         let objects = vec![
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
             b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec(),
@@ -155,14 +157,28 @@ fn told_for(dict: &str, keys: usize) -> usize {
             .xref()
             .get::<Dict<'_>>(ObjectIdentifier::new(3, 0))
             .unwrap();
-        assert_eq!(dict.len(), keys);
         let told = TOLD.get();
+        check(&dict);
+        told
+    };
+    // Opening reads the trailer into a map keyed at random, which compares its keys
+    // only where their hashes collide: the least of a few opens does not.
+    let least =
+        |dict: &str, check: &dyn Fn(&Dict<'_>)| (0..4).map(|_| told(dict, check)).min().unwrap();
+    least(dict, &check) - least("<< >>", &|dict| assert_eq!(dict.len(), 0))
+}
+
+/// The work ([`hayro_syntax::work::TOLD`]) of opening a file holding `dict`, of
+/// `keys` long keys ([`long_key`]), less that of the same file holding an empty
+/// dictionary.
+#[cfg(debug_assertions)]
+fn told_for(dict: &str, keys: usize) -> usize {
+    told_opening(dict, |dict| {
+        assert_eq!(dict.len(), keys);
         for i in 0..keys {
             assert!(dict.get::<i32>(long_key(i).as_bytes()).is_some());
         }
-        told
-    };
-    told(dict, keys) - told("<< >>", 0)
+    })
 }
 
 /// Every comparison of two keys a dictionary is parsed with is counted, in bytes
@@ -260,6 +276,103 @@ fn a_replaced_value_is_dropped_when_it_is_replaced() {
         assert!(
             often <= twice,
             "{case}: {twice} bytes replacing once, {often} replacing 63 times"
+        );
+    }
+}
+
+/// A dictionary of 2000 keys, each valued its index, then `Z` written `times`
+/// times, each time valued an array of one hex string of 64 KiB whose first byte is
+/// the time it is written.
+fn repeated_large_strings(times: usize) -> String {
+    let mut text = String::from("<<");
+    for i in 0..2000 {
+        text.push_str(&format!(" /K{i:04} {i}"));
+    }
+    let rest = "00".repeat(64 * 1024 - 1);
+    for time in 0..times {
+        text.push_str(&format!(" /Z [<{:02x}{rest}>]", time % 256));
+    }
+    text.push_str(" >>");
+    text
+}
+
+/// What a replaced value holds goes with it, its decoded strings too, however few
+/// nodes it has beside the values kept: replacing an array of one large string 63
+/// times holds less beyond writing it once than two such arrays do.
+#[test]
+fn a_replaced_value_drops_the_strings_it_holds() {
+    let [once, twice, often] = [1, 2, 64].map(|times| {
+        let objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec(),
+            repeated_large_strings(times).into_bytes(),
+        ];
+        let data = file(&objects, "");
+        let (pdf, used) = measure(move || Pdf::new(data).unwrap());
+        let dict = pdf
+            .xref()
+            .get::<Dict<'_>>(ObjectIdentifier::new(3, 0))
+            .unwrap();
+        assert_eq!(dict.len(), 2001);
+        let last = dict.get::<hayro_syntax::object::Array<'_>>(b"Z").unwrap();
+        let string = last
+            .iter::<hayro_syntax::object::String<'_>>()
+            .next()
+            .unwrap();
+        assert_eq!(string.as_bytes().len(), 64 * 1024);
+        assert_eq!(string.as_bytes()[0], (times - 1) as u8);
+        used.peak
+    });
+    assert!(twice > once, "{once} bytes once, {twice} twice");
+    assert!(
+        often - once < 2 * (twice - once),
+        "{once} bytes not replacing, {twice} replacing once, {often} replacing 63 times"
+    );
+}
+
+/// A dictionary of `n` keys `K1999`, `K1998` and on down, each valued its index,
+/// then `Z` written `times` times, each time valued `[0]`; with `around` more than
+/// 0, the `n` keys are in the innermost of `around` dictionaries, each the value of
+/// `X` in the one around it and followed by `Z` written `times` times.
+#[cfg(debug_assertions)]
+fn repeated_small_values(n: usize, times: usize, around: usize) -> String {
+    let repeats = " /Z [0]".repeat(times);
+    let keys: String = (0..n).rev().map(|i| format!(" /K{i:04} {i}")).collect();
+    if around == 0 {
+        return format!("<<{keys}{repeats} >>");
+    }
+    let mut text = format!("<<{keys} >>");
+    for _ in 0..around {
+        text = format!("<< /X {text}{repeats} >>");
+    }
+    text
+}
+
+/// Dropping what the values a key's later entries replace held takes work in
+/// proportion to the dictionary's bytes ([`hayro_syntax::work::TOLD`]), however many
+/// entries come before the key written again, and however many dictionaries around
+/// the one holding them write a key again: the work of a dictionary whose key is
+/// written 2000 times, or twice in each of 60 dictionaries, is that of the same
+/// dictionary whose key is written once, and no more than its bytes besides.
+#[cfg(debug_assertions)]
+#[test]
+fn dropping_replaced_values_takes_work_in_proportion_to_the_dictionary() {
+    for (n, times, around) in [(2000, 2000, 0), (2000, 2, 60)] {
+        let check = |keys: usize| {
+            move |dict: &Dict<'_>| {
+                assert_eq!(dict.len(), keys);
+                assert!(dict.get::<hayro_syntax::object::Array<'_>>(b"Z").is_some());
+            }
+        };
+        let keys = if around == 0 { n + 1 } else { 2 };
+        let often = repeated_small_values(n, times, around);
+        let once = told_opening(&repeated_small_values(n, 1, around), check(keys));
+        let told = told_opening(&often, check(keys));
+        let case = format!("{n} keys, Z {times} times in each of {around} around");
+        assert!(
+            told <= once + often.len(),
+            "{case}: {told} counted, {once} writing Z once, {} bytes",
+            often.len()
         );
     }
 }

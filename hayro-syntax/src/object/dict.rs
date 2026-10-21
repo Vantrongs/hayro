@@ -3,7 +3,7 @@
 use crate::hash;
 use crate::object::macros::object;
 use crate::object::name::lex_name_like;
-use crate::object::parsed::{DictNode, Node};
+use crate::object::parsed::{Node, Part};
 use crate::object::r#ref::{MaybeRef, ObjRef};
 use crate::object::{Name, ObjectIdentifier};
 use crate::object::{Object, ObjectLike, Written};
@@ -23,8 +23,11 @@ pub struct Dict<'a>(Inner<'a>);
 
 #[derive(Clone)]
 enum Inner<'a> {
-    Empty,
-    Some(Arc<Repr<'a>>),
+    /// Read from its bytes; none where it is empty, which, held in one variant
+    /// with this, leaves the other's pointer the only tag, in two words.
+    Read(Option<Arc<Repr<'a>>>),
+    /// Parsed with the body of an object ([`crate::object::parsed`]).
+    Parsed(Part<'a>),
 }
 
 impl Default for Dict<'_> {
@@ -44,14 +47,15 @@ impl PartialEq for Dict<'_> {
 impl<'a> Dict<'a> {
     /// Create a new empty dictionary.
     pub fn empty() -> Self {
-        Self(Inner::Empty)
+        Self(Inner::Read(None))
     }
 
     /// Get the raw bytes underlying to the dictionary.
     pub fn data(&self) -> &'a [u8] {
         match &self.0 {
-            Inner::Empty => &[],
-            Inner::Some(repr) => repr.data,
+            Inner::Read(None) => &[],
+            Inner::Read(Some(repr)) => repr.data,
+            Inner::Parsed(part) => part.data(),
         }
     }
 
@@ -60,7 +64,7 @@ impl<'a> Dict<'a> {
         match self.offsets() {
             None => 0,
             Some(Found::Offsets(offsets)) => offsets.len(),
-            Some(Found::Parsed(node)) => node.len(),
+            Some(Found::Parsed(part)) => part.len(),
         }
     }
 
@@ -74,7 +78,7 @@ impl<'a> Dict<'a> {
         match self.offsets() {
             None => false,
             Some(Found::Offsets(offsets)) => offsets.get(key.as_ref()).is_some(),
-            Some(Found::Parsed(node)) => node.get(key.as_ref(), self.data()).is_some(),
+            Some(Found::Parsed(part)) => part.find(key.as_ref()).is_some(),
         }
     }
 
@@ -118,8 +122,8 @@ impl<'a> Dict<'a> {
                 let offset = *offsets.get(key.as_ref())?;
                 Reader::new(&self.data()[offset..]).read_with_context::<ObjRef>(self.ctx())
             }
-            Found::Parsed(node) => match node.get(key.as_ref(), self.data())? {
-                Node::Ref(reference) => Some(*reference),
+            Found::Parsed(part) => match part.items()[part.find(key.as_ref())?] {
+                Node::Ref(reference) => Some(reference),
                 _ => None,
             },
         }
@@ -132,7 +136,7 @@ impl<'a> Dict<'a> {
         let mut keys: Vec<Name<'a>> = match self.offsets() {
             None => Vec::new(),
             Some(Found::Offsets(offsets)) => offsets.keys().cloned().collect(),
-            Some(Found::Parsed(node)) => node.entries(self.data()).map(|(key, _)| key).collect(),
+            Some(Found::Parsed(part)) => part.names().collect(),
         };
         keys.sort_unstable_by(|n1, n2| n1.as_ref().cmp(n2.as_ref()));
         keys.into_iter()
@@ -162,10 +166,7 @@ impl<'a> Dict<'a> {
                 crate::work::lexed(r.offset());
                 value
             }
-            Found::Parsed(node) => Some(
-                node.get(key.as_ref(), self.data())?
-                    .written(self.data(), self.ctx()),
-            ),
+            Found::Parsed(part) => Some(part.written(part.find(key.as_ref())?)),
         }
     }
 
@@ -188,23 +189,23 @@ impl<'a> Dict<'a> {
                 crate::work::lexed(r.offset());
                 value
             }
-            Found::Parsed(node) => node
-                .get(key.as_ref(), self.data())?
-                .item_as(self.data(), self.ctx()),
+            Found::Parsed(part) => part.item_as(part.find(key.as_ref())?),
         }
     }
 
     pub(crate) fn ctx(&self) -> &ReaderContext<'a> {
         match &self.0 {
-            Inner::Empty => ReaderContext::dummy_ref(),
-            Inner::Some(repr) => &repr.ctx,
+            Inner::Read(None) => ReaderContext::dummy_ref(),
+            Inner::Read(Some(repr)) => &repr.ctx,
+            Inner::Parsed(part) => part.ctx(),
         }
     }
 
     fn offsets(&self) -> Option<Found<'_, 'a>> {
         match &self.0 {
-            Inner::Empty => None,
-            Inner::Some(repr) => Some(repr.offsets()),
+            Inner::Read(None) => None,
+            Inner::Read(Some(repr)) => Some(repr.offsets()),
+            Inner::Parsed(part) => Some(Found::Parsed(part)),
         }
     }
 
@@ -218,30 +219,25 @@ impl<'a> Dict<'a> {
     /// they were for this one, without parsing it again.
     pub(crate) fn in_context(&self, ctx: &ReaderContext<'a>) -> Self {
         match &self.0 {
-            Inner::Empty => Self::empty(),
-            Inner::Some(repr) => {
+            Inner::Read(None) => Self::empty(),
+            Inner::Read(Some(repr)) => {
                 let offsets = match &repr.offsets {
                     Offsets::Own(_) => Offsets::Of(repr.clone()),
                     Offsets::Of(parsed) => Offsets::Of(parsed.clone()),
-                    Offsets::Parsed(node) => Offsets::Parsed(node.clone()),
                 };
-                Self(Inner::Some(Arc::new(Repr {
+                Self(Inner::Read(Some(Arc::new(Repr {
                     data: repr.data,
                     offsets,
                     ctx: ctx.clone(),
-                })))
+                }))))
             }
+            Inner::Parsed(part) => Self(Inner::Parsed(part.in_context(ctx))),
         }
     }
 
-    /// The dictionary parsed as `node`, which `data` holds, read in `ctx`.
-    pub(crate) fn parsed(data: &'a [u8], node: Arc<DictNode>, ctx: &ReaderContext<'a>) -> Self {
-        let (from, to) = node.span();
-        Self(Inner::Some(Arc::new(Repr {
-            data: &data[from..to],
-            offsets: Offsets::Parsed(node),
-            ctx: ctx.clone(),
-        })))
+    /// The dictionary `part` reads.
+    pub(crate) fn parsed(part: Part<'a>) -> Self {
+        Self(Inner::Parsed(part))
     }
 }
 
@@ -330,11 +326,11 @@ fn read_inner<'a>(
     parsed(offsets.len(), data.len());
     crate::work::lexed(data.len());
 
-    Some(Dict(Inner::Some(Arc::new(Repr {
+    Some(Dict(Inner::Read(Some(Arc::new(Repr {
         data,
         offsets: Offsets::Own(offsets),
         ctx: ctx.clone(),
-    }))))
+    })))))
 }
 
 /// A map for where the entries of a dictionary start, or for their values.
@@ -449,7 +445,6 @@ impl<'a> Repr<'a> {
         match &self.offsets {
             Offsets::Own(offsets) => Found::Offsets(offsets),
             Offsets::Of(parsed) => parsed.offsets(),
-            Offsets::Parsed(node) => Found::Parsed(node),
         }
     }
 }
@@ -460,15 +455,13 @@ enum Offsets<'a> {
     Own(hash::Map<Name<'a>, usize>),
     /// Those of a dictionary parsed from the same bytes, which owns them.
     Of(Arc<Repr<'a>>),
-    /// Each value of the body of an object, parsed once ([`crate::object::parsed`]).
-    Parsed(Arc<DictNode>),
 }
 
 /// Where each entry's value is, however it is held.
 #[derive(Clone, Copy)]
 enum Found<'r, 'a> {
     Offsets(&'r hash::Map<Name<'a>, usize>),
-    Parsed(&'r DictNode),
+    Parsed(&'r Part<'a>),
 }
 
 pub(crate) struct InlineImageDict<'a>(Dict<'a>);

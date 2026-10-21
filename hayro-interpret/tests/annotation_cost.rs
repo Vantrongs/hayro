@@ -2326,6 +2326,9 @@ fn a_shared_dash_costs_nothing_where_nothing_paints() {
     let off = annot("[[-1000 -1000 -999 -999] [1000 1000 1001 1001]]");
     let added = |n: usize| {
         let shared = [dash(n)];
+        // Parsing keeps its room on the thread for the next body, which the first
+        // file read on it grows: one read first pays for it.
+        sharing_cost(N, &shared, &off);
         let (one, two) = (
             sharing_cost(N, &shared, &off),
             sharing_cost(2 * N, &shared, &off),

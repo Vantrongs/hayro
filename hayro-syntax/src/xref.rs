@@ -1838,7 +1838,7 @@ impl XRef {
                 end,
                 data: kept,
             } => {
-                let dict = Dict::parsed(data, shape.clone(), entered);
+                let dict = shape.dict(data, entered);
                 if taken == Taken::Dict {
                     return Ok(O::dict(dict));
                 }
@@ -1855,7 +1855,7 @@ impl XRef {
                             self.watch(|| {
                                 let mut entered = Self::entered(ctx, id, repr, entry);
                                 entered.parent_chain_push(place.link());
-                                let dict = Dict::parsed(data, shape, &entered);
+                                let dict = shape.dict(data, &entered);
                                 repr.stream_data(data, place, slot, end, &dict)
                             })
                         });

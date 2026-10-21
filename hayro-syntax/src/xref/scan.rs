@@ -933,7 +933,7 @@ mod tests {
     use crate::object::Dict;
     use crate::object::ObjectIdentifier;
     use crate::object::indirect::IndirectObject;
-    use crate::object::parsed::{DictNode, Top};
+    use crate::object::parsed::{Top, TopDict};
     use alloc::string::String;
 
     /// A generator of pseudo-random numbers, the same in every run.
@@ -1066,20 +1066,15 @@ mod tests {
             at,
             Slot::to(slot),
             false,
-            |r| DictNode::read(r, data, &ctx),
+            |r| TopDict::read(r, data, &ctx),
             |r| Top::read(r, data, &ctx),
         )
         .0?;
         let dict = match &syntax {
-            Read::Dict(dict) | Read::Stream { dict, .. } => Some(dict),
+            Read::Dict(dict) | Read::Stream { dict, .. } => Some(dict.dict(data, &ctx)),
             Read::Object(_) => None,
         };
-        let has = |key: &[u8]| {
-            dict.is_some_and(|dict| {
-                let (from, to) = dict.span();
-                dict.get(key, &data[from..to]).is_some()
-            })
-        };
+        let has = |key: &[u8]| dict.as_ref().is_some_and(|dict| dict.contains_key(key));
         Some(Found {
             end,
             root: has(ROOT),
@@ -1098,7 +1093,7 @@ mod tests {
             at,
             Slot::to(slot),
             true,
-            |r| DictNode::read(r, data, &ctx),
+            |r| TopDict::read(r, data, &ctx),
             |r| Top::read(r, data, &ctx),
         )
         .0;

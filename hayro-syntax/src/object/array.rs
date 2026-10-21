@@ -1,12 +1,11 @@
 //! Arrays.
 
 use crate::object::macros::object;
-use crate::object::parsed::{ArrayNode, Items, Node};
+use crate::object::parsed::{Items, Node, Part};
 use crate::object::r#ref::MaybeRef;
 use crate::object::{FromBytes, Object, ObjectIdentifier, ObjectLike, Written};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
-use crate::sync::Arc;
 use crate::xref::ContentKey;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
@@ -25,13 +24,7 @@ enum Repr<'a> {
         ctx: ReaderContext<'a>,
     },
     /// Items of the body of an object, parsed once ([`crate::object::parsed`]).
-    Parsed(Arc<Parsed<'a>>),
-}
-
-struct Parsed<'a> {
-    data: &'a [u8],
-    ctx: ReaderContext<'a>,
-    node: Arc<ArrayNode>,
+    Parsed(Part<'a>),
 }
 
 // Note that this is not structural equality, i.e. two arrays with the same
@@ -43,24 +36,17 @@ impl PartialEq for Array<'_> {
 }
 
 impl<'a> Array<'a> {
-    /// The array whose items are parsed as `node`, which `data` holds, read in
-    /// `ctx`.
-    pub(crate) fn parsed(data: &'a [u8], node: Arc<ArrayNode>, ctx: &ReaderContext<'a>) -> Self {
-        let (from, to) = node.span();
-        Self(Repr::Parsed(Arc::new(Parsed {
-            data: &data[from..to],
-            ctx: ctx.clone(),
-            node,
-        })))
+    /// The array `part` reads.
+    pub(crate) fn parsed(part: Part<'a>) -> Self {
+        Self(Repr::Parsed(part))
     }
 
     /// Where the items are read from.
     fn cursor(&self) -> Cursor<'a> {
         match &self.0 {
             Repr::Bytes { data, .. } => Cursor::Bytes(Reader::new(data)),
-            Repr::Parsed(parsed) => Cursor::Parsed {
-                data: parsed.data,
-                node: parsed.node.clone(),
+            Repr::Parsed(part) => Cursor::Parsed {
+                part: part.clone(),
                 at: 0,
             },
         }
@@ -91,10 +77,12 @@ impl<'a> Array<'a> {
                 crate::work::lexed(reader.offset() - start);
                 Some(item)
             }
-            Cursor::Parsed { data, node, at } => {
-                let item = node.items().get(*at)?.written(data, &ctx);
+            Cursor::Parsed { part, at } => {
+                if *at >= part.len() {
+                    return None;
+                }
                 *at += 1;
-                Some(item)
+                Some(part.written(*at - 1))
             }
         })
     }
@@ -177,7 +165,7 @@ impl<'a> Array<'a> {
     pub fn data(&self) -> &'a [u8] {
         match &self.0 {
             Repr::Bytes { data, .. } => data,
-            Repr::Parsed(parsed) => parsed.data,
+            Repr::Parsed(part) => part.data(),
         }
     }
 
@@ -191,7 +179,7 @@ impl<'a> Array<'a> {
     pub(crate) fn ctx(&self) -> &ReaderContext<'a> {
         match &self.0 {
             Repr::Bytes { ctx, .. } => ctx,
-            Repr::Parsed(parsed) => &parsed.ctx,
+            Repr::Parsed(part) => part.ctx(),
         }
     }
 
@@ -202,11 +190,7 @@ impl<'a> Array<'a> {
                 data,
                 ctx: ctx.clone(),
             },
-            Repr::Parsed(parsed) => Repr::Parsed(Arc::new(Parsed {
-                data: parsed.data,
-                ctx: ctx.clone(),
-                node: parsed.node.clone(),
-            })),
+            Repr::Parsed(part) => Repr::Parsed(part.in_context(ctx)),
         })
     }
 }
@@ -304,11 +288,7 @@ impl<'a> Readable<'a> for Array<'a> {
 /// Where the next items of an array are read from.
 enum Cursor<'a> {
     Bytes(Reader<'a>),
-    Parsed {
-        data: &'a [u8],
-        node: Arc<ArrayNode>,
-        at: usize,
-    },
+    Parsed { part: Part<'a>, at: usize },
 }
 
 /// An iterator over the items of an array.
@@ -339,10 +319,12 @@ impl<'a> Iterator for ArrayIter<'a> {
                 }
                 item
             }
-            Cursor::Parsed { data, node, at } => {
-                let item = node.items().get(*at)?.item(data, &self.ctx);
+            Cursor::Parsed { part, at } => {
+                if *at >= part.len() {
+                    return None;
+                }
                 *at += 1;
-                Some(item)
+                Some(part.item(*at - 1))
             }
         }
     }
@@ -424,13 +406,9 @@ impl<'a> FlexArrayIter<'a> {
             // As reading the item's bytes as a `MaybeRef<T>` reads them: a reference
             // is taken and resolved, else the item, or items for a tuple, as a `T`,
             // which are not taken where they are none.
-            Cursor::Parsed { data, node, at } => {
-                let mut items = Items {
-                    data,
-                    items: node.items(),
-                    at: *at,
-                };
-                let read = match items.items.get(items.at)? {
+            Cursor::Parsed { part, at } => {
+                let mut items = Items { part, at: *at };
+                let read = match part.items().get(items.at)? {
                     Node::Ref(_) => items.next_resolved::<T>(&self.ctx),
                     _ => Some(T::from_items(&mut items, &self.ctx)?),
                 };
