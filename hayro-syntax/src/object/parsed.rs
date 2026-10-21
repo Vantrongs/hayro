@@ -359,18 +359,31 @@ struct Scratch {
     garbage: (usize, usize),
 }
 
-/// The nodes and keys that `node`'s arrays and dictionaries hold, all the way down,
-/// among `nodes`.
-fn held(nodes: &[Node], node: &Node) -> (usize, usize) {
-    let (run, keys) = match node {
-        Node::Array(run) => (run, 0),
-        Node::Dict(run, _) => (run, run.len as usize),
+/// Drops what `node`'s arrays and dictionaries hold, all the way down, among `nodes`
+/// and `keys`, decoded strings and names included, leaving their places to be
+/// dropped with the garbage; how many nodes and keys those are.
+fn drop_held(nodes: &mut [Node], keys: &mut [Text], node: &Node) -> (usize, usize) {
+    let (run, at) = match *node {
+        Node::Array(run) => (run, None),
+        Node::Dict(run, at) => (run, Some(at as usize)),
         _ => return (0, 0),
     };
-    run.nodes(nodes)
-        .iter()
-        .map(|item| held(nodes, item))
-        .fold((run.len as usize, keys), |(n, k), (a, b)| (n + a, k + b))
+    let len = run.len as usize;
+    if len == 0 {
+        return (0, 0);
+    }
+    let mut held = (len, 0);
+    if let Some(at) = at {
+        keys[at..at + len].fill(Text::At((0, 0)));
+        held.1 = len;
+    }
+    let at = run.at as usize;
+    for item in at..at + len {
+        let item = core::mem::replace(&mut nodes[item], Node::Null);
+        let (n, k) = drop_held(nodes, keys, &item);
+        held = (held.0 + n, held.1 + k);
+    }
+    held
 }
 
 /// The nodes and keys being moved, from where they were to new room.
@@ -451,7 +464,7 @@ impl Scratch {
     /// however often a key is written again, and dropping it takes three times the
     /// work of making it at most ([`Self::compact`]).
     fn replaced(&mut self, old: &Node) {
-        let (nodes, keys) = held(&self.nodes, old);
+        let (nodes, keys) = drop_held(&mut self.nodes, &mut self.keys, old);
         if nodes + keys == 0 {
             return;
         }
@@ -1014,7 +1027,11 @@ mod tests {
                 // The body holds the nodes and keys of the values kept, and no more.
                 let body = &parsed.0;
                 assert_eq!(
-                    held(body.nodes(), &body.nodes()[0]),
+                    drop_held(
+                        &mut body.nodes().to_vec(),
+                        &mut body.keys().to_vec(),
+                        &body.nodes()[0]
+                    ),
                     (body.nodes().len() - 1, body.keys().len()),
                     "{text}"
                 );

@@ -280,6 +280,56 @@ fn a_replaced_value_is_dropped_when_it_is_replaced() {
     }
 }
 
+/// A dictionary of 2000 keys, each valued its index, then `Z` written `times`
+/// times, each time valued an array of one hex string of 64 KiB whose first byte is
+/// the time it is written.
+fn repeated_large_strings(times: usize) -> String {
+    let mut text = String::from("<<");
+    for i in 0..2000 {
+        text.push_str(&format!(" /K{i:04} {i}"));
+    }
+    let rest = "00".repeat(64 * 1024 - 1);
+    for time in 0..times {
+        text.push_str(&format!(" /Z [<{:02x}{rest}>]", time % 256));
+    }
+    text.push_str(" >>");
+    text
+}
+
+/// What a replaced value holds goes with it, its decoded strings too, however few
+/// nodes it has beside the values kept: replacing an array of one large string 63
+/// times holds less beyond writing it once than two such arrays do.
+#[test]
+fn a_replaced_value_drops_the_strings_it_holds() {
+    let [once, twice, often] = [1, 2, 64].map(|times| {
+        let objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec(),
+            repeated_large_strings(times).into_bytes(),
+        ];
+        let data = file(&objects, "");
+        let (pdf, used) = measure(move || Pdf::new(data).unwrap());
+        let dict = pdf
+            .xref()
+            .get::<Dict<'_>>(ObjectIdentifier::new(3, 0))
+            .unwrap();
+        assert_eq!(dict.len(), 2001);
+        let last = dict.get::<hayro_syntax::object::Array<'_>>(b"Z").unwrap();
+        let string = last
+            .iter::<hayro_syntax::object::String<'_>>()
+            .next()
+            .unwrap();
+        assert_eq!(string.as_bytes().len(), 64 * 1024);
+        assert_eq!(string.as_bytes()[0], (times - 1) as u8);
+        used.peak
+    });
+    assert!(twice > once, "{once} bytes once, {twice} twice");
+    assert!(
+        often - once < 2 * (twice - once),
+        "{once} bytes not replacing, {twice} replacing once, {often} replacing 63 times"
+    );
+}
+
 /// A dictionary of `n` keys `K1999`, `K1998` and on down, each valued its index,
 /// then `Z` written `times` times, each time valued `[0]`; with `around` more than
 /// 0, the `n` keys are in the innermost of `around` dictionaries, each the value of
