@@ -8,6 +8,7 @@ use crate::InterpreterWarning;
 use crate::color::ColorSpace;
 use crate::function::interpolate;
 use crate::x_object::image::{ImageKind, ImageXObject};
+use hayro_syntax::Filter;
 use hayro_syntax::bit_reader::BitReader;
 use hayro_syntax::object::Array;
 use hayro_syntax::object::dict::keys::*;
@@ -72,16 +73,10 @@ fn sample_format_with(
         })
         .unwrap_or(ColorSpace::device_gray());
 
-    let fallback_bpc = if obj.kind == ImageKind::StencilMask {
-        1
-    } else {
-        8
-    };
-
     let bits_per_component = image_data
         .map(|i| i.bits_per_component)
         .or(dict_bpc)
-        .unwrap_or(fallback_bpc);
+        .unwrap_or_else(|| fallback_bpc(obj.kind));
 
     let decode_arr = dict
         .get::<Array<'_>>(D)
@@ -99,23 +94,48 @@ fn sample_format_with(
     }
 }
 
+/// The parameters `obj`'s filters decode with: where its dictionary gives no bits
+/// per component or colour space, those its samples are read with when no filter
+/// reports them ([`sample_format_with`]), so that the last filter knows their size.
+/// A JPX image's bits per component stay the dictionary's: its decoder scales its
+/// samples to the depth it is given and keeps their own without one.
+fn decode_params(
+    obj: &ImageXObject<'_>,
+    target_dimension: Option<(u32, u32)>,
+    dict_bpc: Option<u8>,
+) -> ImageDecodeParams {
+    let bpc = dict_bpc.or_else(|| {
+        let filters = obj.stream.filter_entries();
+        let jpx = filters
+            .applied()
+            .any(|(filter, _)| filter == Filter::JpxDecode);
+        (!jpx).then(|| fallback_bpc(obj.kind))
+    });
+    let color_space = obj.color_space.as_ref();
+    ImageDecodeParams {
+        is_indexed: color_space.is_some_and(|cs| cs.is_indexed()),
+        bpc,
+        // Device gray's, as `sample_format_with` reads samples without a colour space.
+        num_components: Some(color_space.map_or(1, |cs| cs.num_components())),
+        target_dimension,
+        width: obj.width(),
+        height: obj.height(),
+    }
+}
+
+/// The bits per component samples of an image of `kind` are read with where neither
+/// its dictionary nor a filter gives them.
+fn fallback_bpc(kind: ImageKind) -> u8 {
+    if kind == ImageKind::StencilMask { 1 } else { 8 }
+}
+
 fn decode_context<'a>(
     obj: &ImageXObject<'a>,
     target_dimension: Option<(u32, u32)>,
     meter: &Meter<'_>,
 ) -> Option<DecodeContext<'a>> {
     let dict_bpc = dict_bpc(obj);
-    let color_space = obj.color_space.clone();
-    let is_indexed = obj.color_space.as_ref().is_some_and(|cs| cs.is_indexed());
-
-    let decode_params = ImageDecodeParams {
-        is_indexed,
-        bpc: dict_bpc,
-        num_components: color_space.as_ref().map(|c| c.num_components()),
-        target_dimension,
-        width: obj.width(),
-        height: obj.height(),
-    };
+    let decode_params = decode_params(obj, target_dimension, dict_bpc);
 
     let decoded = obj
         .stream
@@ -440,4 +460,59 @@ fn for_each_whole_sample(
         meter.work(piece.len()).ok()?;
     }
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::WarningSinkFn;
+    use crate::cache::Cache;
+    use crate::fixtures::{file, stream};
+    use hayro_syntax::Pdf;
+    use hayro_syntax::object::{ObjectIdentifier, Stream};
+    use std::sync::Arc;
+
+    /// The bits per component and components an image of `dict` decodes with.
+    fn decoded_with(dict: &str) -> (Option<u8>, Option<u8>) {
+        let objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec(),
+            stream(
+                &format!("/Type /XObject /Subtype /Image /Width 8 /Height 2 {dict}"),
+                &[0; 2],
+            ),
+        ];
+        let pdf = Pdf::new(file(&objects, "")).unwrap();
+        let stream = pdf
+            .xref()
+            .get::<Stream<'_>>(ObjectIdentifier::new(3, 0))
+            .unwrap();
+        let sink: WarningSinkFn = Arc::new(|_| {});
+        let obj = ImageXObject::new(&stream, |_| None, &sink, &Cache::new(), None).unwrap();
+        let params = decode_params(&obj, None, dict_bpc(&obj));
+        (params.bpc, params.num_components)
+    }
+
+    /// Flate data is told the size of the samples the image code reads, with the
+    /// same defaults; a JPX image's depth is its own where its dictionary sets none.
+    #[test]
+    fn images_decode_with_the_layout_their_samples_are_read_with() {
+        for (dict, expected) in [
+            ("/ImageMask true", (Some(1), Some(1))),
+            ("/ImageMask true /BitsPerComponent 1", (Some(1), Some(1))),
+            ("/ColorSpace /DeviceRGB", (Some(8), Some(3))),
+            ("/BitsPerComponent 4", (Some(4), Some(1))),
+        ] {
+            let dict = format!("{dict} /Filter /FlateDecode");
+            assert_eq!(decoded_with(&dict), expected, "{dict}");
+        }
+        for (dict, expected) in [
+            ("/ColorSpace /DeviceRGB", (None, Some(3))),
+            ("/ImageMask true", (None, Some(1))),
+            ("/BitsPerComponent 16", (Some(16), Some(1))),
+        ] {
+            let dict = format!("{dict} /Filter /JPXDecode");
+            assert_eq!(decoded_with(&dict), expected, "{dict}");
+        }
+    }
 }

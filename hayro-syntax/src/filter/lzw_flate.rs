@@ -71,10 +71,11 @@ pub(crate) mod flate {
     /// counted on `meter`; `None` when the data is corrupt for that format or the hook
     /// asks to stop. Data that ends before its stream does yields what it holds, and
     /// bytes after the stream's end are ignored.
-    /// `Err` once it made more than `limit` bytes. While it made less than
-    /// `expected`, its room grows no further than that and a little more, which the
-    /// end of the stream is read into: the room of a large image's data is reserved
-    /// up to its size, not to what the rate so far predicts.
+    /// `Err` once it made more than `limit` bytes. Its room at most doubles what it
+    /// made ([`more_room`]), and while it made less than `expected` grows no further
+    /// than that and a little more, which the end of the stream is read into: the
+    /// room of a large image's data ends at its size, and data of no known size, or
+    /// shorter than told, holds at most twice what it makes.
     #[cfg(feature = "unsafe")]
     fn inflate(
         data: &[u8],
@@ -139,20 +140,23 @@ pub(crate) mod flate {
     }
 
     /// How much to grow a full output buffer holding the `made` bytes inflated from the
-    /// first `taken` of `len` encoded bytes. The first room is at most a poll's worth,
-    /// since encoded bytes may hold empty blocks or a tail after the stream's end, which
-    /// make nothing. Later rooms fit what the rest would make at the rate so far, with an
-    /// eighth to spare, each at least doubling and at most growing eightfold what was
-    /// made, so a large stream is reallocated a few times rather than at every doubling.
-    /// At least the room zlib's fast loop needs.
+    /// first `taken` of `len` encoded bytes. The first room is at most half a poll's
+    /// worth, since encoded bytes may hold empty blocks or a tail after the stream's
+    /// end, which make nothing: with it, the decoder holds less than upstream's
+    /// `read_to_end` holds for its decoder and input buffer alone. Later rooms fit what
+    /// the rest would make at the rate so far, with an eighth to spare, but at most
+    /// double the room, as upstream's growth does, so the room never passes twice the
+    /// data however the rate falls along it; and at least a quarter of what was made,
+    /// so that data longer than the rate predicts is reallocated a bounded number of
+    /// times. At least the room zlib's fast loop needs.
     #[cfg(feature = "unsafe")]
     fn more_room(made: usize, taken: usize, len: usize) -> usize {
         let room = match made {
-            0 => len.min(POLL_BYTES),
+            0 => len.min(POLL_BYTES / 2),
             _ => {
                 let rest = (len - taken) as u128 * made as u128 / taken.max(1) as u128;
                 let rest = usize::try_from(rest + rest / 8).unwrap_or(usize::MAX);
-                rest.clamp(made, made.saturating_mul(7))
+                rest.clamp(made / 4, made)
             }
         };
         room.max(1024)

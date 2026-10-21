@@ -532,9 +532,10 @@ fn nested_flate_is_read_in_memory_bounded_whatever_it_decodes_to() {
             println!("{name}: {size} bytes: peak {peak}, work {work}");
             peak
         });
-        // Within a decoder's buffer doubling its capacity.
+        // Within a decoder's buffers of what the smaller data held, or of a layer
+        // held whole, up to 1 MiB (`HELD`), which smaller data may not reach.
         assert!(
-            peaks[1] < peaks[0] + 128 * 1024,
+            peaks[1] < peaks[0].max(1 << 20) + 128 * 1024,
             "{name}: peaks {peaks:?} grow with the data"
         );
     }
