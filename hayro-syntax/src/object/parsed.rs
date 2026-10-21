@@ -119,8 +119,7 @@ impl Run {
     }
 
     /// Its nodes, among `nodes`; none, wherever it is, where it is empty, as
-    /// moving the nodes of a dictionary's values leaves an empty one where it was
-    /// ([`Scratch::compact`]).
+    /// dropping the garbage leaves an empty one where it was ([`Scratch::compact`]).
     fn nodes(self, nodes: &[Node]) -> &[Node] {
         if self.len == 0 {
             return &[];
@@ -355,33 +354,59 @@ struct Scratch {
     entries: Vec<(Text, Node)>,
     nodes: Vec<Node>,
     keys: Vec<Text>,
+    /// How many of the nodes and keys are garbage: those of values a key's later
+    /// entry replaced, which nothing holds ([`Scratch::replaced`]).
+    garbage: (usize, usize),
 }
 
-/// Where the nodes and keys of a value's arrays and dictionaries are, from and up
-/// to, each in one piece: parsing places them as it parses the value.
-#[derive(Clone, Copy, Default)]
-struct Extent {
-    nodes: (usize, usize),
-    keys: (usize, usize),
+/// The nodes and keys that `node`'s arrays and dictionaries hold, all the way down,
+/// among `nodes`.
+fn held(nodes: &[Node], node: &Node) -> (usize, usize) {
+    let (run, keys) = match node {
+        Node::Array(run) => (run, 0),
+        Node::Dict(run, _) => (run, run.len as usize),
+        _ => return (0, 0),
+    };
+    run.nodes(nodes)
+        .iter()
+        .map(|item| held(nodes, item))
+        .fold((run.len as usize, keys), |(n, k), (a, b)| (n + a, k + b))
 }
 
-impl Extent {
-    fn len(self) -> usize {
-        self.nodes.1 - self.nodes.0 + self.keys.1 - self.keys.0
-    }
+/// The nodes and keys being moved, from where they were to new room.
+struct Moving {
+    from: (Vec<Node>, Vec<Text>),
+    to: (Vec<Node>, Vec<Text>),
+}
 
-    /// Where this and `other` are, which is in one piece with it.
-    fn and(self, other: Self) -> Self {
-        fn and(a: (usize, usize), b: (usize, usize)) -> (usize, usize) {
-            match (a.0 == a.1, b.0 == b.1) {
-                (true, _) => b,
-                (_, true) => a,
-                _ => (a.0.min(b.0), a.1.max(b.1)),
-            }
+impl Moving {
+    /// Moves the nodes and keys that `node`'s arrays and dictionaries hold to the
+    /// end of the new room, those of each after those of what it holds.
+    fn node(&mut self, node: &mut Node) {
+        let (run, keys) = match node {
+            Node::Array(run) if run.len > 0 => (run, None),
+            Node::Dict(run, keys) if run.len > 0 => (run, Some(keys)),
+            _ => return,
+        };
+        let (at, len) = (run.at as usize, run.len as usize);
+        for item in at..at + len {
+            let mut held = core::mem::replace(&mut self.from.0[item], Node::Null);
+            self.node(&mut held);
+            self.from.0[item] = held;
         }
-        Self {
-            nodes: and(self.nodes, other.nodes),
-            keys: and(self.keys, other.keys),
+        // No more are moved than were there, as many as a run fits ([`Run::of`]).
+        run.at = self.to.0.len() as u32;
+        let items = self.from.0[at..at + len].iter_mut();
+        self.to
+            .0
+            .extend(items.map(|item| core::mem::replace(item, Node::Null)));
+        if let Some(keys) = keys {
+            let at = *keys as usize;
+            *keys = self.to.1.len() as u32;
+            let names = self.from.1[at..at + len].iter_mut();
+            self.to
+                .1
+                .extend(names.map(|name| core::mem::replace(name, Text::At((0, 0)))));
         }
     }
 }
@@ -409,6 +434,7 @@ impl Scratch {
         self.entries.clear();
         self.nodes.clear();
         self.keys.clear();
+        self.garbage = (0, 0);
         #[cfg(feature = "std")]
         if self.items.capacity() <= KEPT
             && self.entries.capacity() <= KEPT
@@ -419,58 +445,70 @@ impl Scratch {
         }
     }
 
-    /// Where the nodes and keys of `node`'s arrays and dictionaries are.
-    fn extent(&self, node: &Node) -> Extent {
-        let (run, keys) = match node {
-            Node::Array(run) => (run, (0, 0)),
-            Node::Dict(run, keys) => {
-                let keys = *keys as usize;
-                (run, (keys, keys + run.len as usize))
-            }
-            _ => return Extent::default(),
-        };
-        let at = run.at as usize;
-        let own = Extent {
-            nodes: (at, at + run.len as usize),
-            keys,
-        };
-        run.nodes(&self.nodes)
-            .iter()
-            .fold(own, |extent, item| extent.and(self.extent(item)))
+    /// Drops `old`, the value of an entry a key's later entry replaced, whose nodes
+    /// and keys are garbage from now on. The garbage is dropped once it is a third
+    /// of all parsing holds, so that parsing holds half again what it keeps at most,
+    /// however often a key is written again, and dropping it takes three times the
+    /// work of making it at most ([`Self::compact`]).
+    fn replaced(&mut self, old: &Node) {
+        let (nodes, keys) = held(&self.nodes, old);
+        if nodes + keys == 0 {
+            return;
+        }
+        crate::work::told(nodes + keys);
+        self.garbage = (self.garbage.0 + nodes, self.garbage.1 + keys);
+        let all = self.nodes.len() + self.keys.len() + self.items.len() + self.entries.len();
+        if 3 * (self.garbage.0 + self.garbage.1) >= all {
+            self.compact((0, 0));
+        }
     }
 
-    /// Moves the nodes and keys of the values of the entries from `base` on down to
-    /// `to`, over those of the values they replaced, which it drops: the nodes and
-    /// keys from `to` on are those of the values of these entries, and of those
-    /// replaced.
-    fn compact(&mut self, base: usize, to: (usize, usize)) {
-        // In the order they were parsed in, which is where each starts.
-        let mut parsed: Vec<(Extent, usize)> = (base..self.entries.len())
-            .map(|at| (self.extent(&self.entries[at].1), at))
-            .filter(|(extent, _)| extent.len() > 0)
-            .collect();
-        parsed.sort_unstable_by_key(|(extent, _)| extent.nodes.0);
-        let (mut node, mut key) = to;
-        for (extent, at) in parsed {
-            let keys = if extent.keys.0 == extent.keys.1 {
-                0
-            } else {
-                extent.keys.0 - key
-            };
-            let shift = (extent.nodes.0 - node, keys);
-            self.entries[at].1.shift(shift);
-            for from in extent.nodes.0..extent.nodes.1 {
-                self.nodes.swap(node, from);
-                self.nodes[node].shift(shift);
-                node += 1;
-            }
-            for from in extent.keys.0..extent.keys.1 {
-                self.keys.swap(key, from);
-                key += 1;
-            }
+    /// Drops the garbage: moves the nodes and keys that the object's own node, the
+    /// first, and the items and entries of the arrays and dictionaries being parsed
+    /// hold to new room, with room for `more` besides, and frees the old.
+    fn compact(&mut self, more: (usize, usize)) {
+        let Self {
+            items,
+            entries,
+            nodes,
+            keys,
+            garbage,
+        } = self;
+        crate::work::told(nodes.len() + keys.len() + items.len() + entries.len());
+        let mut moving = Moving {
+            to: (
+                Vec::with_capacity(nodes.len() - garbage.0 + more.0),
+                Vec::with_capacity(keys.len() - garbage.1 + more.1),
+            ),
+            from: (core::mem::take(nodes), core::mem::take(keys)),
+        };
+        let mut own = core::mem::replace(&mut moving.from.0[0], Node::Null);
+        moving.to.0.push(Node::Null);
+        moving.node(&mut own);
+        moving.to.0[0] = own;
+        for item in items.iter_mut() {
+            moving.node(item);
         }
-        self.nodes.truncate(node);
-        self.keys.truncate(key);
+        for (_, value) in entries.iter_mut() {
+            moving.node(value);
+        }
+        (*nodes, *keys) = moving.to;
+        *garbage = (0, 0);
+    }
+
+    /// Makes room for `more` nodes and keys, of what is `depth` deep, exactly where
+    /// they are the last parsed, those of the object read ([`Nodes::of`]), and drops
+    /// the garbage before them, so that a body holds none.
+    fn last(&mut self, depth: usize, more: (usize, usize)) {
+        if depth > 0 {
+            return;
+        }
+        if self.garbage != (0, 0) {
+            self.compact(more);
+        } else {
+            self.nodes.reserve_exact(more.0);
+            self.keys.reserve_exact(more.1);
+        }
     }
 }
 
@@ -491,17 +529,12 @@ impl<'r, 'a> Parse<'r, 'a> {
         // The place of what is read, first, where it is an array or a dictionary,
         // its own run being the last.
         parse.held.nodes.push(Node::Null);
-        let read = read(&mut parse).map(|read| (read, Nodes::of(&mut parse.held)));
+        let read = read(&mut parse).map(|read| {
+            debug_assert_eq!(parse.held.garbage, (0, 0), "the object's run dropped it");
+            (read, Nodes::of(&mut parse.held))
+        });
         parse.held.keep();
         read
-    }
-
-    /// Makes room in `parsed` for `more`, exactly where they are the last parsed,
-    /// those of what is `depth` deep, the object read ([`Nodes::of`]).
-    fn last<T>(depth: usize, parsed: &mut Vec<T>, more: usize) {
-        if depth == 0 {
-            parsed.reserve_exact(more);
-        }
     }
 
     /// An item of an array or a value of a dictionary `depth` deep, as
@@ -559,13 +592,6 @@ impl<'r, 'a> Parse<'r, 'a> {
         // Its entries are those from here on, a value's own having been moved to
         // the nodes once it is parsed, and so are its values' nodes and keys.
         let base = self.held.entries.len();
-        let region = (self.held.nodes.len(), self.held.keys.len());
-        // The nodes and keys of the values replaced, which are dropped once they
-        // are as many as those of the values kept, so that parsing holds at most
-        // twice those, however often a key is written again, and as the dictionary
-        // ends, so that the nodes of a dictionary parsed are those of what it
-        // holds, which is where [`Scratch::extent`] finds them.
-        let mut replaced = 0;
         // A key's later entry replaces its value at once, as the map of a dictionary
         // read from its bytes keeps the last: the key is found among the entries one
         // by one while they are few, and past `LISTED` as [`Large`] says, the keys
@@ -591,13 +617,7 @@ impl<'r, 'a> Parse<'r, 'a> {
             };
             if let Some(at) = found {
                 let old = core::mem::replace(&mut entries[base + at].1, value);
-                let scratch = &mut self.held;
-                replaced += scratch.extent(&old).len();
-                let all = scratch.nodes.len() - region.0 + scratch.keys.len() - region.1;
-                if replaced > 0 && 2 * replaced >= all {
-                    scratch.compact(base, region);
-                    replaced = 0;
-                }
+                self.held.replaced(&old);
                 return Some(());
             }
             entries.push((Text::of(key.into_bytes(), self.data, from), value));
@@ -621,9 +641,8 @@ impl<'r, 'a> Parse<'r, 'a> {
             _ => false,
         };
         let bytes = bytes?;
-        if replaced > 0 {
-            self.held.compact(base, region);
-        }
+        let more = self.held.entries.len() - base;
+        self.held.last(depth, (more, more));
         let Scratch {
             entries,
             nodes,
@@ -635,8 +654,6 @@ impl<'r, 'a> Parse<'r, 'a> {
             entries[base..]
                 .sort_unstable_by(|(a, _), (b, _)| order(a.as_slice(held), b.as_slice(held)));
         }
-        Self::last(depth, nodes, entries.len() - base);
-        Self::last(depth, keys, entries.len() - base);
         let (at, keys_at) = (nodes.len(), keys.len());
         for (key, value) in entries.drain(base..) {
             keys.push(key);
@@ -661,9 +678,10 @@ impl<'r, 'a> Parse<'r, 'a> {
             self.held.items.push(item);
             Some(())
         })?;
+        let more = self.held.items.len() - base;
+        self.held.last(depth, (more, 0));
         let Scratch { items, nodes, .. } = &mut self.held;
         let at = nodes.len();
-        Self::last(depth, nodes, items.len() - base);
         nodes.extend(items.drain(base..));
         Run::of((from - start, r.offset() - 1 - start), at, nodes)
     }
@@ -753,22 +771,6 @@ impl Node {
             Self::Name(text) => Written::Name(Name::from_bytes(text.bytes(data))),
             Self::Array(_) => Written::Array(Array::parsed(part())),
             Self::Dict(..) => Written::Dict(Dict::parsed(part())),
-        }
-    }
-
-    /// This, its run moved `shift` nodes and keys down, where it is an array or a
-    /// dictionary.
-    fn shift(&mut self, shift: (usize, usize)) {
-        // Each is moved down from where it is, so no shift is more than it; an
-        // empty run is read from nothing wherever it is.
-        let (nodes, keys) = (shift.0 as u32, shift.1 as u32);
-        match self {
-            Self::Array(run) if run.len > 0 => run.at -= nodes,
-            Self::Dict(run, at) if run.len > 0 => {
-                run.at -= nodes;
-                *at -= keys;
-            }
-            _ => {}
         }
     }
 }
@@ -994,19 +996,6 @@ mod tests {
             text.push_str(" >>");
             text
         }
-    }
-
-    /// The nodes and keys of what `node` holds, among `nodes`.
-    fn held(nodes: &[Node], node: &Node) -> (usize, usize) {
-        let (run, own) = match node {
-            Node::Array(run) => (run, 0),
-            Node::Dict(run, _) => (run, run.len as usize),
-            _ => return (0, 0),
-        };
-        run.nodes(nodes)
-            .iter()
-            .map(|item| held(nodes, item))
-            .fold((run.len as usize, own), |(n, k), (a, b)| (n + a, k + b))
     }
 
     /// A dictionary whose keys are written again, valued with arrays and
