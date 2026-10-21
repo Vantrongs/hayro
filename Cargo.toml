@@ -131,8 +131,8 @@ overflow-checks = true
 # Strokes and dashes whose work stays bounded by the view: a dash pattern far finer
 # than a pixel is drawn solid rather than expanded dash by dash. An unclipped layer is
 # composited only where each row drew, which knockout groups rely on.
-vello_common = { git = "https://github.com/Vantrongs/vello", rev = "e508009eeea0b6972ea3ae5dd61e972daa6133cc" }
-vello_cpu = { git = "https://github.com/Vantrongs/vello", rev = "e508009eeea0b6972ea3ae5dd61e972daa6133cc" }
+vello_common = { git = "https://github.com/Vantrongs/vello", rev = "d8b2846ca4a47479727e36cbf55f27fa757b34cd" }
+vello_cpu = { git = "https://github.com/Vantrongs/vello", rev = "d8b2846ca4a47479727e36cbf55f27fa757b34cd" }
 # `Inflate::try_clone` and `Inflate::allocation_size`, which Flate checkpoints need.
 zlib-rs = { git = "https://github.com/Vantrongs/zlib-rs", rev = "124359709a6ed94bda6fe1ff4d413e23bbae34e5" }
 # `zune_jpeg::rows`, which grayscale JPEG rows need.
