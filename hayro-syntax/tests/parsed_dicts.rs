@@ -162,7 +162,10 @@ fn told_for(dict: &str, keys: usize) -> usize {
         }
         told
     };
-    told(dict, keys) - told("<< >>", 0)
+    // Opening reads the trailer into a map keyed at random, which compares its keys
+    // only where their hashes collide: the least of a few opens does not.
+    let least = |dict: &str, keys: usize| (0..4).map(|_| told(dict, keys)).min().unwrap();
+    least(dict, keys) - least("<< >>", 0)
 }
 
 /// Every comparison of two keys a dictionary is parsed with is counted, in bytes
