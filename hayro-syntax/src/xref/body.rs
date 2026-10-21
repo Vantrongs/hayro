@@ -156,7 +156,8 @@ pub(super) enum Shape {
 /// apart are, and keeping them all parsed would hold their nodes while the file is
 /// open, several times the bytes they are written in. A body read again while a
 /// read still holds what it parsed is made of that; else it is parsed again, and
-/// kept: so each body is parsed twice at most, however often it is read.
+/// kept from its [`PARSES`]th parse: so each body is parsed that often at most,
+/// however often it is read, but for reads on several threads that miss at once.
 #[derive(Debug, Default)]
 pub(super) struct Shapes {
     kept: hash::Map<Place, Kept>,
@@ -204,20 +205,25 @@ impl core::fmt::Debug for Kept {
     }
 }
 
+/// The shape a read can be made of `kept`: kept whole, or else made of what a read
+/// still holds.
+fn held(kept: &mut Kept) -> Option<Shape> {
+    Some(match kept {
+        Kept::Whole(shape) => (**shape).clone(),
+        Kept::Value(once, _) => Shape::Value(once.as_ref()?.top()?),
+        Kept::Stream(stream) => Shape::Stream {
+            dict: stream.dict.as_ref()?.dict()?,
+            end: stream.end,
+            data: stream.data,
+        },
+    })
+}
+
 impl Shapes {
     /// The shape kept for `place` that a read can be made of: kept whole, or else
     /// made of what the read before still holds, which is kept whole from now on.
     pub(super) fn whole(&mut self, place: &Place) -> Option<Shape> {
-        let kept = self.kept.get_mut(place)?;
-        Some(match kept {
-            Kept::Whole(shape) => (**shape).clone(),
-            Kept::Value(once, _) => Shape::Value(once.as_ref()?.top()?),
-            Kept::Stream(stream) => Shape::Stream {
-                dict: stream.dict.as_ref()?.dict()?,
-                end: stream.end,
-                data: stream.data,
-            },
-        })
+        held(self.kept.get_mut(place)?)
     }
 
     /// Keeps `read`, what the body at `place` was read as, which reads of the place
@@ -249,8 +255,13 @@ impl Shapes {
                 read
             }
             hash::Entry::Occupied(mut kept) => {
+                // Kept whole by another thread meanwhile, or parsed by one whose read
+                // still holds it: this read shares that, so a read that ends sooner
+                // does not leave the place without the parse another still holds.
+                if let Some(held) = held(kept.get_mut()) {
+                    return held;
+                }
                 let (once, parsed, found) = match kept.get_mut() {
-                    // Read whole by another thread meanwhile.
                     Kept::Whole(shape) => return (**shape).clone(),
                     Kept::Value(once, parsed) => (once, parsed, None),
                     Kept::Stream(stream) => (&mut stream.dict, &mut stream.parsed, stream.data),
@@ -639,6 +650,33 @@ mod tests {
     use alloc::format;
     use alloc::string::String;
     use alloc::vec::Vec;
+
+    /// Two reads that missed at once, as reads on two threads do, and hand in their
+    /// parses one after the other: the later shares the earlier, which its read
+    /// still holds, so a read after the later ends is made of it too.
+    #[test]
+    fn a_parse_handed_in_later_shares_one_a_read_still_holds() {
+        let data = b"4 0 obj\n[1 [2] << /A [3] >>]\nendobj";
+        let slot = Slot {
+            end: data.len(),
+            open: false,
+            next: data.len(),
+        };
+        let place = Place {
+            source: Source::File,
+            at: 0,
+            decryption: None,
+        };
+        let ctx = ReaderContext::dummy();
+        let parse = || Shape::read(data, slot, place, &ctx);
+        let mut shapes = Shapes::default();
+        let first = shapes.read(place, parse());
+        assert!(matches!(first, Shape::Value(_)));
+        let later = shapes.read(place, parse());
+        drop(later);
+        assert!(shapes.whole(&place).is_some());
+        drop(first);
+    }
 
     /// A small deterministic generator.
     struct Random(u64);
