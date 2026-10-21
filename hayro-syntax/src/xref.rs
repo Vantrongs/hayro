@@ -1815,7 +1815,7 @@ impl XRef {
         entered: &ReaderContext<'a>,
         taken: Taken,
     ) -> Result<O, Unread> {
-        let kept = repr.shapes.get().get(&place).cloned();
+        let kept = repr.shapes.get().whole(&place);
         let shape = match kept {
             Some(shape) => shape,
             None => {
@@ -1827,7 +1827,7 @@ impl XRef {
                 });
                 // Reading a body resolves nothing: no lock is held while it reads.
                 let shape = body::Shape::read(data, slot, place, entered);
-                repr.shapes.get().entry(place).or_insert(shape).clone()
+                repr.shapes.get().read(place, shape)
             }
         };
         match shape {
@@ -1859,11 +1859,8 @@ impl XRef {
                                 repr.stream_data(data, place, slot, end, &dict)
                             })
                         });
-                        if shared
-                            && let Some(body::Shape::Stream { data: kept, .. }) =
-                                repr.shapes.get().get_mut(&place)
-                        {
-                            kept.get_or_insert((found, lost));
+                        if shared {
+                            repr.shapes.get().found(&place, (found, lost));
                         }
                         found
                     }
@@ -1914,7 +1911,8 @@ impl XRef {
                 let (kept, objects) = self.object_stream(repr, stream, entered)?;
                 let at = objects.offset(id, index).ok_or(Unread::Lost(id))?;
                 let place = Place {
-                    source: Source::Stream(kept),
+                    // The list keeping object streams holds fewer than 2^32.
+                    source: Source::Stream(kept as u32),
                     at,
                     decryption,
                 };
@@ -2328,8 +2326,9 @@ struct SomeRepr {
     /// The entries of a rebuilt table whose objects are headed as others.
     headers: Arc<Headers>,
     /// What the body at each place an entry leads to holds, read once for every
-    /// read of an entry leading there ([`XRef::get_with`]).
-    shapes: Arc<Mutex<hash::Map<Place, body::Shape>>>,
+    /// read of an entry leading there, its arrays and dictionaries
+    /// [`body::PARSES`] times at most ([`body::Shapes`]).
+    shapes: Arc<Mutex<body::Shapes>>,
     metadata: Arc<Metadata>,
     decryptor: Arc<Decryptor>,
     has_ocgs: bool,
@@ -4626,11 +4625,72 @@ mod tests {
             .max(body::DATA_FOUND.with_borrow(most))
     }
 
-    // Opening a file reads each body once, the catalog too, which the rebuild of a
-    // table reads to choose the trailer, reading the trailer reads, and the page tree
-    // reads: whether the table is read or rebuilt, encrypted or not.
+    // A body read again and again, each read dropped before the next, is parsed
+    // [`body::PARSES`] times, and kept from then on; one read while another holds
+    // what it parsed is made of that, and parses nothing, however often it is read:
+    // an array, a dictionary and a stream's dictionary alike, in the file or an
+    // object stream. An object that holds no array nor dictionary is kept at once.
     #[test]
-    fn opening_a_file_reads_each_body_once() {
+    fn a_body_is_parsed_three_times_at_most_and_not_while_a_read_holds_it() {
+        let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>";
+        let stream = "<< /Length 3 /K [1 2] >>\nstream\nabc\nendstream";
+        let objects = [
+            CATALOG,
+            TREE,
+            page,
+            "[1 /N (s)]",
+            "<< /A [1] >>",
+            stream,
+            "42",
+        ];
+        let packed = [
+            (1, CATALOG.to_string()),
+            (2, TREE.to_string()),
+            (3, page.to_string()),
+            (
+                20,
+                object_stream_headed("4 0 5 11 ", "[1 /N (s)] << /A [1] >>", 2),
+            ),
+        ];
+        let entries = [(4, 20, 0), (5, 20, 1)];
+        for (file, numbers) in [
+            (file_of(&objects, false), &[4, 5, 6, 7][..]),
+            (file_with_stream_table(&packed, &entries), &[4, 5][..]),
+        ] {
+            let pdf = crate::Pdf::new(file).unwrap();
+            for &number in numbers {
+                let read = || pdf.xref().get::<Object<'_>>(id(number)).unwrap();
+                let parsed = bodies_read(|| {
+                    for _ in 0..8 {
+                        drop(read());
+                    }
+                });
+                let most = if number == 7 {
+                    1
+                } else {
+                    usize::from(body::PARSES)
+                };
+                assert_eq!(parsed, most, "object {number}");
+            }
+        }
+        let pdf = crate::Pdf::new(file_of(&objects, false)).unwrap();
+        let read = || pdf.xref().get::<Object<'_>>(id(4)).unwrap();
+        let parsed = bodies_read(|| {
+            let held = read();
+            for _ in 0..8 {
+                assert_eq!(read(), held);
+            }
+        });
+        assert_eq!(parsed, 1);
+    }
+
+    // Opening a file parses each body as often as the table parses one at most
+    // ([`body::PARSES`]), the catalog too, which the rebuild of a table reads to
+    // choose the trailer, reading the trailer reads, and the page tree reads, each
+    // dropping it before the next parses it again: whether the table is read or
+    // rebuilt, encrypted or not.
+    #[test]
+    fn opening_a_file_parses_each_body_a_bounded_number_of_times() {
         let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>";
         let parts = [
             rc4::Part::Object(CATALOG, b""),
@@ -4653,8 +4713,8 @@ mod tests {
                     assert_eq!(pdf.pages().len(), 1);
                     assert_eq!(pdf.xref().is_encrypted(), encrypted);
                 });
-                assert_eq!(
-                    most, 1,
+                assert!(
+                    most <= usize::from(body::PARSES),
                     "encrypted {encrypted}, rebuilt {rebuilt}: a body read {most} times"
                 );
             }
@@ -4800,11 +4860,12 @@ mod tests {
 
     // Every read of an object the table lists, of any kind, through any of the
     // entries that lead to it, in the file or an object stream, whatever index or
-    // offset the entry or the stream's header gives, reads its body at most once, and
-    // a read that finds a body that cannot be read as what it asks for tells the
-    // computation being watched that the object is lost.
+    // offset the entry or the stream's header gives, parses its body as often as the
+    // table parses a body at most ([`body::PARSES`]), and a read that finds a body
+    // that cannot be read as what it asks for tells the computation being watched
+    // that the object is lost.
     #[test]
-    fn every_read_of_an_entry_reads_its_body_once_and_tells_what_it_lost() {
+    fn every_read_of_an_entry_parses_its_body_a_bounded_number_of_times_and_tells_what_it_lost() {
         const KINDS: [Kind; 8] = [
             Kind::Dict,
             Kind::Array,
@@ -4856,7 +4917,10 @@ mod tests {
                     }
                 }
             });
-            assert!(most <= 1, "seed {seed}: a body read {most} times");
+            assert!(
+                most <= usize::from(body::PARSES),
+                "seed {seed}: a body read {most} times"
+            );
             // Entries leading to one object read the same object.
             for (alias, target) in &aliases {
                 let xref = pdf.xref();
@@ -4939,7 +5003,10 @@ mod tests {
                     }
                 }
             });
-            assert!(most <= 1, "seed {seed}: a body read {most} times");
+            assert!(
+                most <= usize::from(body::PARSES),
+                "seed {seed}: a body read {most} times"
+            );
         }
     }
 }

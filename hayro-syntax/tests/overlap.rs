@@ -436,8 +436,8 @@ impl Seed {
 
 // Every typed read of a composite value, an array or a dictionary, direct, indirect,
 // in an array or a dictionary, reads what the body it is in was parsed into: none
-// lexes its bytes, and the body is read once, whatever the reads and however they are
-// spaced.
+// lexes its bytes, and the body is parsed a bounded number of times, whatever the
+// reads and however they are spaced.
 #[test]
 fn typed_reads_of_composite_values_lex_nothing() {
     let mut seed = Seed(7);
@@ -537,9 +537,12 @@ fn typed_reads_of_composite_values_lex_nothing() {
             assert_eq!(vec![a, b, c, d], numbers, "case {case}");
         }
         assert_eq!(LEXED.get(), 0, "case {case}: {holder}");
-        // Objects 4 and 5, each once.
+        // Objects 4 and 5, each twice at most: opening the file, which has no pages,
+        // parsed them a first time, looking for pages among all its objects, and a
+        // body is kept from its third parse on, each read here dropped before the
+        // next.
         assert!(
-            BODIES_READ.get() <= holder.len() + array.len() + 32,
+            BODIES_READ.get() <= 2 * (holder.len() + array.len() + 32),
             "case {case}"
         );
     }

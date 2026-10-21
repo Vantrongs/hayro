@@ -4,17 +4,20 @@
 //!
 //! Every read of an object the table lists goes from its entry to its place, which
 //! takes no reading of the file, then to its shape, which is read the first time any
-//! read reaches the place and kept: a header is read once however many entries lead
-//! to it, and a read of any type is the object the shape holds, cast to that type,
-//! so that a read of another type than the object's costs nothing to repeat.
+//! read reaches the place and kept, its arrays and dictionaries while a read holds
+//! them and from their [`PARSES`]th parse on ([`Shapes`]): a header is read once
+//! however many entries lead to it, a body [`PARSES`] times at most, and a read of
+//! any type is the object the shape holds, cast to that type, so that a read of
+//! another type than the object's costs nothing to repeat.
 
-#[cfg(test)]
 use crate::hash;
 use crate::lost::Lost;
-use crate::object::parsed::{Top, TopDict};
+use crate::object::parsed::{Once, Top, TopDict};
 use crate::object::{Number, ObjectIdentifier};
 use crate::reader::{Link, Reader, ReaderContext, ReaderExt};
 use crate::trivia::{is_eol_character, is_white_space_character};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 /// Where the body of an object is: the bytes it is in and where it starts in them,
 /// its header and all for an object of the file, and the object whose key decrypts
@@ -44,8 +47,7 @@ impl Place {
     pub(crate) fn link(&self) -> Link {
         match self.source {
             Source::File => Link::File(self.at),
-            // The list keeping object streams holds fewer than 2^32.
-            Source::Stream(kept) => Link::Stream(kept as u32, self.at),
+            Source::Stream(kept) => Link::Stream(kept, self.at),
         }
     }
 }
@@ -56,8 +58,10 @@ pub(crate) enum Source {
     /// The file, where an object starts with its header.
     File,
     /// The decoded data of an object stream, by where it is kept
-    /// ([`crate::data::Data::object_stream`]), where an object has no header.
-    Stream(usize),
+    /// ([`crate::data::Data::object_stream`], which keeps fewer than 2^32), where
+    /// an object has no header. In 32 bits, so that a place takes 4 words, as the
+    /// table keeps one for each body read ([`Shapes`]).
+    Stream(u32),
 }
 
 /// Why a read of an object the table lists finds none.
@@ -139,6 +143,182 @@ pub(super) enum Shape {
         end: usize,
         data: Option<(Option<DataAt>, Lost)>,
     },
+}
+
+/// What the bodies at the places reads reached hold ([`Shape`]), each read the first
+/// time a read reaches its place, which the table keeps for every later read of an
+/// entry leading there ([`super::XRef::get_with`]).
+///
+/// The arrays and dictionaries of a body are kept from its second read on: the
+/// first read hands what it parsed to its reader, which drops it with what it made
+/// of it, and the table keeps the rest ([`Kept`]). Most bodies of a file are read
+/// once, as the many objects of a file that writes each colour space or annotation
+/// apart are, and keeping them all parsed would hold their nodes while the file is
+/// open, several times the bytes they are written in. A body read again while a
+/// read still holds what it parsed is made of that; else it is parsed again, and
+/// kept: so each body is parsed twice at most, however often it is read.
+#[derive(Debug, Default)]
+pub(super) struct Shapes {
+    kept: hash::Map<Place, Kept>,
+    /// The places of the bodies kept read once whose reads may still hold what they
+    /// parsed ([`Self::sweep`]), and how many of them did when this last looked.
+    reading: Vec<Place>,
+    held: usize,
+}
+
+/// How many times a body is parsed at most: the table keeps it whole from then on.
+pub(super) const PARSES: u8 = 3;
+
+/// What the table keeps of the body at a place ([`Shapes`]): in three words, as the
+/// table keeps one for each body read, those read once the most of them; the
+/// others are held apart.
+enum Kept {
+    /// All of it: a body parsed [`PARSES`] times, or one that holds no array nor
+    /// dictionary, or none that can be read.
+    Whole(Box<Shape>),
+    /// An object that is no stream, an array or a dictionary, parsed fewer than
+    /// [`PARSES`] times: what its last parse made, while a read holds it, and how
+    /// often it was parsed.
+    Value(Option<Once>, u8),
+    /// A stream read once.
+    Stream(Box<StreamOnce>),
+}
+
+/// A stream whose dictionary was parsed fewer than [`PARSES`] times: the dictionary
+/// while a read holds it, how often it was parsed, and the rest of what
+/// [`Shape::Stream`] holds.
+struct StreamOnce {
+    dict: Option<Once>,
+    parsed: u8,
+    end: usize,
+    data: Option<(Option<DataAt>, Lost)>,
+}
+
+impl core::fmt::Debug for Kept {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Whole(shape) => shape.fmt(f),
+            Self::Value(..) => f.write_str("Value read once"),
+            Self::Stream(_) => f.write_str("Stream read once"),
+        }
+    }
+}
+
+impl Shapes {
+    /// The shape kept for `place` that a read can be made of: kept whole, or else
+    /// made of what the read before still holds, which is kept whole from now on.
+    pub(super) fn whole(&mut self, place: &Place) -> Option<Shape> {
+        let kept = self.kept.get_mut(place)?;
+        Some(match kept {
+            Kept::Whole(shape) => (**shape).clone(),
+            Kept::Value(once, _) => Shape::Value(once.as_ref()?.top()?),
+            Kept::Stream(stream) => Shape::Stream {
+                dict: stream.dict.as_ref()?.dict()?,
+                end: stream.end,
+                data: stream.data,
+            },
+        })
+    }
+
+    /// Keeps `read`, what the body at `place` was read as, which reads of the place
+    /// are made of: the first, all but what the read hands to its reader; a later,
+    /// all of it, with where a stream's data are if they were found before.
+    pub(super) fn read(&mut self, place: Place, read: Shape) -> Shape {
+        match self.kept.entry(place) {
+            hash::Entry::Vacant(first) => {
+                let kept = match &read {
+                    Shape::Value(top) => top.once().map(|once| Kept::Value(Some(once), 1)),
+                    Shape::Stream { dict, end, data } => Some(Kept::Stream(Box::new(StreamOnce {
+                        dict: dict.once(),
+                        parsed: 1,
+                        end: *end,
+                        data: *data,
+                    }))),
+                    Shape::Unreadable => None,
+                };
+                match kept {
+                    Some(kept) => {
+                        first.insert(kept);
+                        self.reading.push(place);
+                        self.sweep();
+                    }
+                    None => {
+                        first.insert(Kept::Whole(Box::new(read.clone())));
+                    }
+                }
+                read
+            }
+            hash::Entry::Occupied(mut kept) => {
+                let (once, parsed, found) = match kept.get_mut() {
+                    // Read whole by another thread meanwhile.
+                    Kept::Whole(shape) => return (**shape).clone(),
+                    Kept::Value(once, parsed) => (once, parsed, None),
+                    Kept::Stream(stream) => (&mut stream.dict, &mut stream.parsed, stream.data),
+                };
+                *parsed += 1;
+                let read = match read {
+                    Shape::Stream { dict, end, data } => Shape::Stream {
+                        dict,
+                        end,
+                        data: found.or(data),
+                    },
+                    read => read,
+                };
+                if *parsed < PARSES {
+                    *once = match &read {
+                        Shape::Value(top) => top.once(),
+                        Shape::Stream { dict, .. } => dict.once(),
+                        Shape::Unreadable => None,
+                    };
+                    self.reading.push(place);
+                    self.sweep();
+                } else {
+                    kept.insert(Kept::Whole(Box::new(read.clone())));
+                }
+                read
+            }
+        }
+    }
+
+    /// Keeps where the data of the stream at `place` are, and what finding them
+    /// lost, found the same way from every chain of references.
+    pub(super) fn found(&mut self, place: &Place, found: (Option<DataAt>, Lost)) {
+        let data = match self.kept.get_mut(place) {
+            Some(Kept::Whole(shape)) => match &mut **shape {
+                Shape::Stream { data, .. } => data,
+                _ => return,
+            },
+            Some(Kept::Stream(stream)) => &mut stream.data,
+            _ => return,
+        };
+        data.get_or_insert(found);
+    }
+
+    /// Lets go of what the reads of the bodies read once held where they ended,
+    /// once twice as many places are listed as reading as were held when this last
+    /// looked, and 64 more: so the table holds the counts' header of as many
+    /// parses ended as are held, and 64 more, at most ([`Once`]), and looks at each
+    /// place listed twice at most over all its sweeps, as a sweep looks at those
+    /// held when the last looked and at at least as many listed since.
+    fn sweep(&mut self) {
+        if self.reading.len() < 2 * self.held + 64 {
+            return;
+        }
+        let Self { kept, reading, .. } = self;
+        reading.retain(|place| {
+            let once = match kept.get_mut(place) {
+                Some(Kept::Value(once, _)) => once,
+                Some(Kept::Stream(stream)) => &mut stream.dict,
+                // Read again, and kept whole.
+                _ => return false,
+            };
+            if once.as_ref().is_some_and(Once::ended) {
+                *once = None;
+            }
+            once.is_some()
+        });
+        self.held = self.reading.len();
+    }
 }
 
 impl core::fmt::Debug for Shape {
