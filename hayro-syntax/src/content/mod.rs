@@ -122,11 +122,11 @@ impl<'a> UntypedIter<'a> {
     pub fn next(&mut self) -> Option<Instruction<'_, 'a>> {
         self.stack.clear();
 
-        let operator = read_instruction(&mut self.reader, &mut self.stack)?;
-        self.operator = Some(operator);
+        // Read into its place, not unwrapped and rewrapped (see `read_instruction`).
+        self.operator = read_instruction(&mut self.reader, &mut self.stack);
         Some(Instruction {
             operands: &self.stack,
-            operator: self.operator.as_ref().unwrap(),
+            operator: self.operator.as_ref()?,
         })
     }
 }
@@ -166,19 +166,24 @@ fn read_instruction<'a>(r: &mut Reader<'a>, stack: &mut Stack<'a>) -> Option<Ope
             }
             _ => {
                 *r = cur;
-                let Some(operator) = r.read_without_context::<Operator<'a>>() else {
-                    warn!("failed to read operator in content stream");
+                // Returned as it is read: unwrapping and rewrapping it copies the
+                // operator field by field, and the wider reloads of those narrow stores
+                // stall store forwarding.
+                let operator = r.read_without_context::<Operator<'a>>();
+                match &operator {
+                    None => {
+                        warn!("failed to read operator in content stream");
 
-                    r.jump_to_end();
-                    return None;
-                };
-
-                // Inline images need special casing...
-                if operator.as_ref() == b"BI" {
-                    read_inline_image(r, stack)?;
+                        r.jump_to_end();
+                    }
+                    // Inline images need special casing...
+                    Some(operator) if operator.as_ref() == b"BI" => {
+                        read_inline_image(r, stack)?;
+                    }
+                    Some(_) => {}
                 }
 
-                return Some(operator);
+                return operator;
             }
         }
     }

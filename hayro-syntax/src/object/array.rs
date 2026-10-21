@@ -330,10 +330,14 @@ impl<'a> Iterator for ArrayIter<'a> {
                     return None;
                 }
                 // The array was validated by skipping its items, which accepts some
-                // items that can't be read.
-                let item = reader.read_with_context::<MaybeRef<Object<'_>>>(&self.ctx)?;
-                crate::work::lexed(reader.offset() - start);
-                Some(item)
+                // items that can't be read. The read is returned as it is: unwrapping
+                // and rewrapping it copies the object field by field, and the wider
+                // reloads of those narrow stores stall store forwarding.
+                let item = reader.read_with_context::<MaybeRef<Object<'_>>>(&self.ctx);
+                if item.is_some() {
+                    crate::work::lexed(reader.offset() - start);
+                }
+                item
             }
             Cursor::Parsed { data, node, at } => {
                 let item = node.items().get(*at)?.item(data, &self.ctx);
@@ -357,7 +361,11 @@ where
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.items.by_ref().flatten().next()
+        loop {
+            if let Some(item) = self.items.next()? {
+                return Some(item);
+            }
+        }
     }
 }
 
