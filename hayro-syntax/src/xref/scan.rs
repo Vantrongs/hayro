@@ -112,13 +112,17 @@ impl Bits {
 /// its `(` being no backslash, so the string whose `(` is at `o` ends after the first
 /// byte past `o` after which the depth is below the depth after `o`.
 struct Strings {
-    /// For each block: the depth before its first byte, and whether that byte is
-    /// escaped.
-    starts: Vec<(i64, bool)>,
+    /// The depth before the first byte of each block.
+    starts: Vec<i64>,
+    /// The blocks whose first byte is escaped.
+    escaped: Bits,
     /// The least depth after any byte of each block, as a tree: node `i` holds the
-    /// least of nodes `2i` and `2i + 1`, the blocks are the leaves from `leaves`.
+    /// least of nodes `2i` and `2i + 1`, the blocks are the leaves from `blocks`.
+    /// Their count is not rounded up to a power of two, so a node whose leaves are
+    /// not all at one level holds no range of blocks; [`Self::first_at_most`] only
+    /// looks at nodes that do.
     mins: Vec<i64>,
-    leaves: usize,
+    blocks: usize,
 }
 
 impl Strings {
@@ -147,10 +151,10 @@ impl Strings {
         if block_end >= data.len() {
             return None;
         }
-        let (start, _) = self.starts[block_end / BLOCK];
-        let target = start - depth - 1;
+        let target = self.starts[block_end / BLOCK] - depth - 1;
         let block = self.first_at_most(block_end / BLOCK, target)?;
-        let (mut depth, mut escaped) = self.starts[block];
+        let mut depth = self.starts[block];
+        let mut escaped = self.escaped.get(block);
         let from = block * BLOCK;
         for (i, &b) in data.iter().enumerate().take(from + BLOCK).skip(from) {
             step(1);
@@ -171,33 +175,43 @@ impl Strings {
 
     /// The first block from `from` with a depth of at most `target`.
     fn first_at_most(&self, from: usize, target: i64) -> Option<usize> {
-        let mut i = from + self.leaves;
-        if *self.mins.get(i)? > target {
-            // Up past the subtrees to the right that hold no such depth...
-            loop {
-                while i & 1 == 1 {
-                    i >>= 1;
-                    step(1);
+        // The nodes that hold the blocks from `from` to the last, in order: those
+        // met on the left edge, then those on the right one, last met first.
+        let (mut left, mut right) = (from + self.blocks, 2 * self.blocks);
+        let mut rights = [0; usize::BITS as usize];
+        let mut met = 0;
+        let mut found = None;
+        while left < right && found.is_none() {
+            step(1);
+            if left & 1 == 1 {
+                if self.mins[left] <= target {
+                    found = Some(left);
                 }
-                if i == 0 {
-                    return None;
-                }
-                i += 1;
-                step(1);
-                if self.mins[i] <= target {
-                    break;
-                }
+                left += 1;
             }
-            // ...and down to the first block of the one that does.
-            while i < self.leaves {
-                i *= 2;
+            if right & 1 == 1 {
+                right -= 1;
+                rights[met] = right;
+                met += 1;
+            }
+            left >>= 1;
+            right >>= 1;
+        }
+        let mut i = found.or_else(|| {
+            rights[..met].iter().rev().copied().find(|&i| {
                 step(1);
-                if self.mins[i] > target {
-                    i += 1;
-                }
+                self.mins[i] <= target
+            })
+        })?;
+        // Down to the first block of it with such a depth.
+        while i < self.blocks {
+            i *= 2;
+            step(1);
+            if self.mins[i] > target {
+                i += 1;
             }
         }
-        Some(i - self.leaves)
+        Some(i - self.blocks)
     }
 }
 
@@ -360,9 +374,9 @@ pub(crate) struct Scan<'a> {
 impl<'a> Scan<'a> {
     pub(crate) fn new(data: &'a [u8]) -> Self {
         let blocks = data.len().div_ceil(BLOCK).max(1);
-        let leaves = blocks.next_power_of_two();
         let mut starts = Vec::with_capacity(blocks);
-        let mut mins = vec![i64::MAX; 2 * leaves];
+        let mut escaped = Bits::new(blocks);
+        let mut mins = vec![0; 2 * blocks];
         let mut meets = Bits::new(data.len() + 1);
         let mut comment_ends = vec![];
 
@@ -377,7 +391,10 @@ impl<'a> Scan<'a> {
         let mut escaped_opens: Vec<i64> = vec![];
         for (block, bytes) in data.chunks(BLOCK).enumerate() {
             let from = block * BLOCK;
-            starts.push((depth, escaped_at == from));
+            starts.push(depth);
+            if escaped_at == from {
+                escaped.set(block);
+            }
             let mut marks = match <&[u8; BLOCK]>::try_from(bytes) {
                 Ok(full) => marked(full),
                 Err(_) => bytes
@@ -389,43 +406,44 @@ impl<'a> Scan<'a> {
             // The depth after a byte that is no mark is the depth before it: the
             // depth at the block's start, where the block starts with one.
             let mut least = if marks & 1 == 0 { depth } else { i64::MAX };
+            // Each mark is read without a branch on what it is: in a stream, marks are
+            // random bytes, and branches on them, mispredicted, cost the most of the
+            // pass. What is rare in any file, strings opened at an escaped `(` and
+            // comments ending, is branched on.
             while marks != 0 {
                 let i = marks.trailing_zeros() as usize;
                 marks &= marks - 1;
                 let (at, b) = (from + i, bytes[i]);
-                if at != escaped_at {
-                    if b == b'(' {
-                        depth += 1;
-                    } else if b == b')' {
-                        if escaped_opens.last() == Some(&depth) {
-                            escaped_opens.pop();
-                            meets.set(at + 1);
-                        }
-                        depth -= 1;
-                    } else if b == b'\\' {
-                        escaped_at = at + 1;
-                    }
-                } else if b == b'(' && escaped_opens.last() != Some(&depth) {
+                let free = at != escaped_at;
+                let (open, close) = (b == b'(', b == b')');
+                if escaped_opens.last() == Some(&depth) && (free & close) {
+                    escaped_opens.pop();
+                    meets.set(at + 1);
+                }
+                depth += i64::from(free & open) - i64::from(free & close);
+                if (!free & open) && escaped_opens.last() != Some(&depth) {
                     escaped_opens.push(depth);
                 }
+                escaped_at = if free & (b == b'\\') {
+                    at + 1
+                } else {
+                    escaped_at
+                };
                 least = least.min(depth);
-                if is_eol_character(b) {
-                    if percent {
-                        meets.set(at);
-                        comment_ends.push(at);
-                    }
-                    percent = false;
-                } else if b == b'%' {
-                    percent = true;
+                let eol = is_eol_character(b);
+                if eol & percent {
+                    meets.set(at);
+                    comment_ends.push(at);
                 }
+                percent = (percent & !eol) | (b == b'%');
             }
-            mins[leaves + block] = least;
+            mins[blocks + block] = least;
         }
         if percent {
             comment_ends.push(data.len());
         }
         step(data.len());
-        for i in (1..leaves).rev() {
+        for i in (1..blocks).rev() {
             mins[i] = mins[2 * i].min(mins[2 * i + 1]);
         }
 
@@ -433,8 +451,9 @@ impl<'a> Scan<'a> {
             data,
             strings: Strings {
                 starts,
+                escaped,
                 mins,
-                leaves,
+                blocks,
             },
             meets,
             comment_ends,
@@ -1025,6 +1044,34 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn the_tree_finds_the_first_block_with_a_depth_of_at_most_a_target() {
+        let mut random = Random(0x2545_f491_4f6c_dd1d);
+        for blocks in 1..=130 {
+            let leaves: Vec<i64> = (0..blocks).map(|_| random.below(9) as i64).collect();
+            let mut mins = vec![0; 2 * blocks];
+            mins[blocks..].copy_from_slice(&leaves);
+            for i in (1..blocks).rev() {
+                mins[i] = mins[2 * i].min(mins[2 * i + 1]);
+            }
+            let strings = Strings {
+                starts: vec![],
+                escaped: Bits::new(0),
+                mins,
+                blocks,
+            };
+            for from in 0..blocks {
+                for target in -1..9 {
+                    assert_eq!(
+                        strings.first_at_most(from, target),
+                        (from..blocks).find(|&b| leaves[b] <= target),
+                        "{blocks} blocks, from {from}, target {target}"
+                    );
+                }
+            }
+        }
     }
 
     /// Compares, for `case`'s file, what the scan and the check find with reading.
