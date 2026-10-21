@@ -10,14 +10,24 @@ pub(crate) mod flate {
 
     /// The data inflated and its predictor reversed, the work counted on `meter`;
     /// `None` once its hook asks to stop, or, if `strict`, where the data is corrupt
-    /// rather than cut short (see [`fallback::decode`]).
+    /// rather than cut short (see [`fallback::decode`]). `expected` is the size the
+    /// inflated data should have, 0 where none is known: room is not reserved past
+    /// it while the data is shorter ([`inflate`]).
     pub(crate) fn decode(
         data: &[u8],
         params: &PredictorParams,
         meter: &Meter<'_>,
         strict: bool,
+        expected: usize,
     ) -> Option<Vec<u8>> {
-        decode_within(data, params, meter, strict, usize::MAX).unwrap_or(None)
+        decode_within(data, params, meter, strict, expected, usize::MAX).unwrap_or(None)
+    }
+
+    /// `decoded` holding no room past its bytes, which a caller may keep while it
+    /// reads them.
+    fn fitted(mut decoded: Vec<u8>) -> Vec<u8> {
+        decoded.shrink_to_fit();
+        decoded
     }
 
     /// A decoder made more than the limit it was given; `tried` decoders before it
@@ -34,13 +44,14 @@ pub(crate) mod flate {
         params: &PredictorParams,
         meter: &Meter<'_>,
         strict: bool,
+        expected: usize,
         limit: usize,
     ) -> Result<Option<Vec<u8>>, Larger> {
         let larger = |tried| move |_| Larger { tried };
-        let decoded = match inflate(data, true, meter, limit).map_err(larger(0))? {
+        let decoded = match inflate(data, true, meter, expected, limit).map_err(larger(0))? {
             Some(decoded) => decoded,
             None if meter.cancelled() => return Ok(None),
-            None => match inflate(data, false, meter, limit).map_err(larger(1))? {
+            None => match inflate(data, false, meter, expected, limit).map_err(larger(1))? {
                 Some(decoded) => decoded,
                 None if meter.cancelled() => return Ok(None),
                 None => {
@@ -53,19 +64,23 @@ pub(crate) mod flate {
                 }
             },
         };
-        Ok(apply_predictor(decoded, params, meter))
+        Ok(apply_predictor(decoded, params, meter).map(fitted))
     }
 
     /// `data` inflated whole, read as zlib if `zlib`, else as raw deflate, the work
     /// counted on `meter`; `None` when the data is corrupt for that format or the hook
     /// asks to stop. Data that ends before its stream does yields what it holds, and
     /// bytes after the stream's end are ignored.
-    /// `Err` once it made more than `limit` bytes.
+    /// `Err` once it made more than `limit` bytes. While it made less than
+    /// `expected`, its room grows no further than that and a little more, which the
+    /// end of the stream is read into: the room of a large image's data is reserved
+    /// up to its size, not to what the rate so far predicts.
     #[cfg(feature = "unsafe")]
     fn inflate(
         data: &[u8],
         zlib: bool,
         meter: &Meter<'_>,
+        expected: usize,
         limit: usize,
     ) -> Result<Option<Vec<u8>>, ()> {
         let mut decoder = zlib_rs::Inflate::new(zlib, 15);
@@ -75,8 +90,14 @@ pub(crate) mod flate {
         loop {
             if out.len() == out.capacity() {
                 let room = more_room(out.len(), taken, data.len());
-                // Not much past the limit.
-                out.reserve(room.min((limit - out.len()).saturating_add(1024)));
+                // Not much past the limit, nor past the expected size while short of
+                // it; exactly, as `reserve` would at least double the room.
+                let to = if out.len() < expected {
+                    expected.min(limit)
+                } else {
+                    limit
+                };
+                out.reserve_exact(room.min((to - out.len()).saturating_add(1024)));
             }
             // Input is offered half of POLL_BYTES at a time and counted before it is
             // taken, and output is made no further than the next poll, so at most
@@ -144,6 +165,7 @@ pub(crate) mod flate {
         params: &PredictorParams,
         meter: &Meter<'_>,
         strict: bool,
+        _expected: usize,
         limit: usize,
     ) -> Result<Option<Vec<u8>>, Larger> {
         let decoded = match fallback::decode_within(data, meter, strict, limit) {
@@ -151,7 +173,7 @@ pub(crate) mod flate {
             Ok(None) | Err(fallback::Stopped::Cancelled) => return Ok(None),
             Err(fallback::Stopped::Larger) => return Err(Larger { tried: 0 }),
         };
-        Ok(apply_predictor(decoded, params, meter))
+        Ok(apply_predictor(decoded, params, meter).map(fitted))
     }
 
     /// Ported from <https://github.com/mozilla/pdf.js/blob/master/src/core/flate_stream.js>
@@ -1492,7 +1514,7 @@ mod tests {
             0x78, 0x9c, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x7, 0x0, 0x5, 0x8c, 0x1, 0xf5,
         ];
 
-        let decoded = flate::decode(&input, &PredictorParams::default(), &Meter::default(), false).unwrap();
+        let decoded = flate::decode(&input, &PredictorParams::default(), &Meter::default(), false, 0).unwrap();
         assert_eq!(decoded, b"Hello");
     }
 
@@ -1500,7 +1522,7 @@ mod tests {
     fn decode_flate() {
         let input = [0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x7, 0x0];
 
-        let decoded = flate::decode(&input, &PredictorParams::default(), &Meter::default(), false).unwrap();
+        let decoded = flate::decode(&input, &PredictorParams::default(), &Meter::default(), false, 0).unwrap();
         assert_eq!(decoded, b"Hello");
     }
 
@@ -1521,11 +1543,11 @@ mod tests {
             .read_to_end(&mut expected)
             .unwrap();
         assert!(expected.len() > POLL_BYTES && data.starts_with(&expected));
-        let decoded = flate::decode(cut, &PredictorParams::default(), &Meter::default(), false);
+        let decoded = flate::decode(cut, &PredictorParams::default(), &Meter::default(), false, 0);
         assert_eq!(decoded, Some(expected));
         let mut followed = encoded.clone();
         followed.extend(b"more");
-        let decoded = flate::decode(&followed, &PredictorParams::default(), &Meter::default(), false);
+        let decoded = flate::decode(&followed, &PredictorParams::default(), &Meter::default(), false, 0);
         assert_eq!(decoded, Some(data));
     }
 

@@ -86,7 +86,9 @@ impl Filter {
 
     /// The filter applied to `data`, its work counted on `meter`;
     /// [`DecodeFailure::Cancelled`] once the meter's hook asks to stop. If `strict`,
-    /// data a lenient decoder would recover part of is a failure.
+    /// data a lenient decoder would recover part of is a failure. `expected` is the
+    /// size the decoded data should have, 0 where none is known, which a decoder
+    /// that grows its output reserves no more than while it made less.
     pub(crate) fn apply(
         &self,
         data: &[u8],
@@ -94,6 +96,7 @@ impl Filter {
         #[cfg_attr(not(feature = "images"), allow(unused))] image_params: &ImageDecodeParams,
         meter: &Meter<'_>,
         strict: bool,
+        expected: usize,
     ) -> Result<FilterResult<'static>, DecodeFailure> {
         // `MuPDF` refuses a stream whose predictor parameters it refuses.
         let predictor =
@@ -115,7 +118,7 @@ impl Filter {
                         .ok_or(DecodeFailure::StreamDecode)
                 }),
                 Self::FlateDecode => predictor().and_then(|p| {
-                    lzw_flate::flate::decode(data, &p, meter, strict)
+                    lzw_flate::flate::decode(data, &p, meter, strict, expected)
                         .map(FilterResult::from_data)
                         .ok_or(DecodeFailure::StreamDecode)
                 }),

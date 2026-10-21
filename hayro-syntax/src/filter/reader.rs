@@ -720,6 +720,7 @@ mod tests {
                 &PredictorParams::default(),
                 &Meter::default(),
                 false,
+                0,
             );
             let mut reader = DecodedReader::flate(
                 DecryptedReader::raw(Cow::Borrowed(&encoded)),
@@ -764,6 +765,7 @@ mod tests {
                 &PredictorParams::default(),
                 &Meter::default(),
                 false,
+                0,
             )
             .and_then(|d| apply_predictor(d, p, &Meter::default()));
             let hook = second_poll();

@@ -236,6 +236,22 @@ pub struct ImageDecodeParams {
     pub height: u32,
 }
 
+impl ImageDecodeParams {
+    /// The bytes of the image's samples, rows padded to whole bytes, with a byte for
+    /// each row besides, which a PNG predictor's data has; 0 where the dictionary
+    /// does not tell them.
+    fn expected_len(&self) -> usize {
+        let (Some(bpc), Some(components)) = (self.bpc, self.num_components) else {
+            return 0;
+        };
+        let row_bits = u64::from(self.width) * u64::from(components) * u64::from(bpc);
+        (row_bits.div_ceil(8) + 1)
+            .checked_mul(u64::from(self.height))
+            .and_then(|len| usize::try_from(len).ok())
+            .unwrap_or(0)
+    }
+}
+
 impl<'a> Stream<'a> {
     pub(crate) fn new(data: &'a [u8], dict: Dict<'a>) -> Self {
         Self { dict, data }
@@ -440,17 +456,24 @@ impl<'a> Stream<'a> {
 
         let mut current: Option<FilterResult<'a>> = None;
 
-        for (filter, entry) in filters.applied() {
-            if filter == Filter::Crypt {
-                // Decrypted with the raw data.
-                continue;
-            }
+        // Decrypted with the raw data.
+        let mut applied = filters
+            .applied()
+            .filter(|(filter, _)| *filter != Filter::Crypt)
+            .peekable();
+        while let Some((filter, entry)) = applied.next() {
+            // The last filter makes the image's samples.
+            let expected = match applied.peek() {
+                None => image_params.expected_len(),
+                Some(_) => 0,
+            };
             let new = filter.apply(
                 current.as_ref().map(|c| c.data.as_ref()).unwrap_or(&data),
                 &entry.params,
                 image_params,
                 meter,
                 strict,
+                expected,
             )?;
             current = Some(new);
         }

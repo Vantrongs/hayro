@@ -79,7 +79,7 @@ impl Layer {
     ) -> Result<Result<Vec<u8>, ReadError>, usize> {
         let decoded = match self {
             Self::Flate(params, _) => {
-                flate::decode_within(data, params, meter, true, limit).map_err(|l| l.tried)?
+                flate::decode_within(data, params, meter, true, 0, limit).map_err(|l| l.tried)?
             }
             Self::Lzw(params, _) => {
                 lzw::decode_within(data, params, meter, limit).map_err(|()| 0_usize)?
