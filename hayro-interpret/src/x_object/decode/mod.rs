@@ -13,6 +13,7 @@ use hayro_syntax::object::Array;
 use hayro_syntax::object::dict::keys::*;
 use hayro_syntax::object::stream::{FilterResult, ImageColorSpace, ImageDecodeParams};
 use smallvec::SmallVec;
+use std::iter;
 
 struct DecodeContext<'a> {
     decoded: FilterResult<'a>,
@@ -118,11 +119,19 @@ fn fix_image_length<T: Copy>(
     filler: T,
     num_components: usize,
 ) -> Option<()> {
-    let row_len = (width as usize).saturating_mul(num_components);
-    // Too much data (or just the right amount) is truncated; too little adapts the
-    // height and pads the last row.
-    *height = rows_present(image.len(), row_len, *height);
-    image.resize(row_len * *height as usize, filler);
+    let row_len = width as usize * num_components;
+
+    if (row_len * *height as usize) <= image.len() {
+        // Too much data (or just the right amount), truncate it.
+        image.truncate(row_len * *height as usize);
+    } else {
+        // Too little data, adapt the height and pad.
+        *height = image.len().div_ceil(row_len) as u32;
+
+        if !image.len().is_multiple_of(row_len) {
+            image.extend(iter::repeat_n(filler, row_len - (image.len() % row_len)));
+        }
+    }
 
     if width == 0 || *height == 0 {
         None
@@ -130,28 +139,6 @@ fn fix_image_length<T: Copy>(
         Some(())
     }
 }
-
-/// The rows of `row_len` samples, at most `height`, that `samples` decoded samples
-/// fill. A last row they fill in part counts, to be padded, unless padding it would
-/// take more than the samples present (and more than `MIN_ROW_PAD`): data cut short
-/// costs memory in proportion to what it holds, never to what the image declares.
-fn rows_present(samples: usize, row_len: usize, height: u32) -> u32 {
-    if row_len == 0 {
-        return 0;
-    }
-    let (full, part) = (samples / row_len, samples % row_len);
-    let pad = row_len - part;
-    let rows = if part > 0 && (pad <= samples || pad <= MIN_ROW_PAD) {
-        full + 1
-    } else {
-        full
-    };
-    rows.min(height as usize) as u32
-}
-
-/// A short last row is padded up to this many samples even when the data before it
-/// holds fewer.
-const MIN_ROW_PAD: usize = 1 << 16;
 
 fn decode_u8_samples(
     data: &[u8],
@@ -265,8 +252,8 @@ fn unpack_samples(
     }
 }
 
-/// The rows of packed samples, at most `height`, that `data` holds (see
-/// `rows_present`); each row starts on a byte.
+/// The rows of packed samples, at most `height`, that `data` reaches; each row
+/// starts on a byte. A last row the data fills in part counts, to be padded.
 fn sample_rows(
     data: &[u8],
     width: u32,
@@ -274,14 +261,12 @@ fn sample_rows(
     num_components: usize,
     bits_per_component: u8,
 ) -> u32 {
-    let row_len = (width as usize).saturating_mul(num_components);
-    let row_bytes = row_len
+    let row_bytes = (width as usize)
+        .saturating_mul(num_components)
         .saturating_mul(bits_per_component as usize)
         .div_ceil(8)
         .max(1);
-    let samples = (data.len() / row_bytes).saturating_mul(row_len)
-        + (data.len() % row_bytes * 8 / bits_per_component.max(1) as usize).min(row_len);
-    rows_present(samples, row_len, height)
+    data.len().div_ceil(row_bytes).min(height as usize) as u32
 }
 
 fn for_each_sample(
@@ -344,6 +329,19 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_last_row_keeps_its_pixels() {
+        // The one row of a 100 000 × 1 image whose data ends after eight samples
+        // keeps them and is padded to its width.
+        let mut samples = unpack_samples(&[0xAA], 100_000, 1, 1, 1).unwrap();
+        let mut height = 1;
+        fix_image_length(&mut samples, 100_000, &mut height, 0, 1).unwrap();
+
+        assert_eq!(height, 1);
+        assert_eq!(samples.len(), 100_000);
+        assert_eq!(samples[..8], [1, 0, 1, 0, 1, 0, 1, 0]);
+    }
+
+    #[test]
     fn a_short_image_keeps_the_rows_its_data_holds() {
         // A 16 × 4 image whose data stops in its second row keeps that row,
         // padded, and drops the rows the data does not reach.
@@ -357,17 +355,5 @@ mod tests {
             &samples[16..],
             [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         );
-    }
-
-    #[test]
-    fn a_wide_row_is_padded_only_up_to_the_data() {
-        // Padding the one row of a 100 000 × 1 image to its width would take
-        // far more than the eight samples present.
-        let samples = unpack_samples(&[0xAA], 100_000, 1, 1, 1).unwrap();
-        assert!(samples.is_empty());
-
-        // A row needing at most `MIN_ROW_PAD` samples of padding is still padded.
-        let samples = unpack_samples(&[0xAA], 60_000, 1, 1, 1).unwrap();
-        assert_eq!(samples.len(), 60_000);
     }
 }

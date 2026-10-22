@@ -396,6 +396,10 @@
     "file": "pdfs/custom/image_short_data.pdf"
   },
   {
+    "id": "image_short_data_mask",
+    "file": "pdfs/custom/image_short_data_mask.pdf"
+  },
+  {
     "id": "image_smask_downscale",
     "file": "pdfs/custom/image_smask_downscale.pdf"
   },

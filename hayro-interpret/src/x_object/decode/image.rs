@@ -1,4 +1,4 @@
-use super::mask::decode_mask;
+use super::mask::{DecodedMask, decode_mask};
 use super::{DecodeContext, decode_context, decode_u8_samples, fix_image_length, unpack_samples};
 use crate::color::{ColorComponents, ToLuma, ToRgb};
 use crate::interpret::state::ActiveTransferFunction;
@@ -23,6 +23,8 @@ pub(crate) fn decode_image(
 struct ImageDecoder<'a, 'b> {
     obj: &'a ImageXObject<'b>,
     ctx: DecodeContext<'b>,
+    /// The rows of the image before data that ends early cut them.
+    full_height: u32,
     target_dimension: Option<(u32, u32)>,
     color_key_mask: Option<SmallVec<[u16; 4]>>,
     decoded_color_key_mask: Option<LumaData>,
@@ -35,6 +37,7 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
 
         Some(Self {
             obj,
+            full_height: ctx.height,
             ctx,
             target_dimension,
             color_key_mask,
@@ -219,9 +222,7 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
             .get::<Stream<'_>>(SMASK)
             .or_else(|| dict.get::<Stream<'_>>(MASK))
         {
-            let obj = ImageXObject::new_mask(&s_mask, &self.obj.warning_sink, &self.obj.cache)?;
-
-            decode_mask(&obj, self.target_dimension).map(|decoded| decoded.luma)
+            self.decode_mask(&s_mask)
         } else if self.color_key_mask.is_some() {
             self.decoded_color_key_mask
                 .take()
@@ -244,10 +245,30 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
         let mut matte_rgb = [0_u8; 3];
         self.ctx.color_space.convert_values(&matte, &mut matte_rgb);
 
-        let mask_obj = ImageXObject::new_mask(&s_mask, &self.obj.warning_sink, &self.obj.cache)?;
-        let alpha = decode_mask(&mask_obj, self.target_dimension)?.luma;
+        let alpha = self.decode_mask(&s_mask)?;
 
         Some((alpha, matte_rgb))
+    }
+
+    /// Decodes the separate mask `stream` and keeps the rows of it that cover the
+    /// rows the image kept. The mask covers the whole declared image, and the
+    /// renderers stretch it over the decoded rows, so the rows of an image whose
+    /// data ends early would otherwise each get more than their own part of it.
+    fn decode_mask(&self, stream: &Stream<'_>) -> Option<LumaData> {
+        let obj = ImageXObject::new_mask(stream, &self.obj.warning_sink, &self.obj.cache)?;
+        let DecodedMask {
+            mut luma,
+            full_height,
+        } = decode_mask(&obj, self.target_dimension)?;
+
+        let rows = (u64::from(full_height) * u64::from(self.ctx.height))
+            .div_ceil(u64::from(self.full_height)) as u32;
+        if rows < luma.height {
+            luma.height = rows;
+            luma.data.truncate(luma.width as usize * rows as usize);
+        }
+
+        Some(luma)
     }
 
     fn decode_color_key_mask(&self) -> Option<LumaData> {

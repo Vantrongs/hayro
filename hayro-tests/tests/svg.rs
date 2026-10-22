@@ -22,6 +22,15 @@ fn image_rgba8() {
 }
 
 #[test]
+fn image_short_data_mask() {
+    run_svg_test(
+        "image_short_data_mask",
+        "pdfs/custom/image_short_data_mask.pdf",
+        None,
+    );
+}
+
+#[test]
 fn clip_path_evenodd() {
     run_svg_test(
         "clip_path_evenodd",

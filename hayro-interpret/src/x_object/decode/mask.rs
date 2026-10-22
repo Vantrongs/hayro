@@ -18,6 +18,8 @@ static BILEVEL_MASK_LUT: LazyLock<Box<[u64; 256]>> = LazyLock::new(|| {
 
 pub(crate) struct DecodedMask {
     pub(crate) luma: LumaData,
+    /// The rows of the mask before data that ends early cut them.
+    pub(crate) full_height: u32,
 }
 
 pub(crate) fn decode_mask(
@@ -26,6 +28,7 @@ pub(crate) fn decode_mask(
 ) -> Option<DecodedMask> {
     let ctx = decode_context(obj, target_dimension)?;
     let width = ctx.width;
+    let full_height = ctx.height;
     let scale_factors = ctx.scale_factors;
 
     // Note: The semantics between "normal" soft masks (i.e. masks defined in
@@ -45,6 +48,7 @@ pub(crate) fn decode_mask(
             interpolate: obj.interpolate,
             scale_factors,
         },
+        full_height,
     })
 }
 
