@@ -392,6 +392,10 @@
     "file": "pdfs/custom/image_rgba8_icc.pdf"
   },
   {
+    "id": "image_short_data",
+    "file": "pdfs/custom/image_short_data.pdf"
+  },
+  {
     "id": "image_smask_downscale",
     "file": "pdfs/custom/image_smask_downscale.pdf"
   },
