@@ -1216,6 +1216,22 @@ mod tests {
     }
 
     #[test]
+    fn dict_with_dict_followed_by_stream() {
+        // Validation skips the dictionary as the value of /A, and each word after it as
+        // garbage between the entries.
+        for input in [
+            "<< /A << >>stream\nx\nendstream /B 5 >>",
+            "<< /A << >> stream /B 5 >>",
+            "<< /A << >>streamR /B 5 >>",
+        ] {
+            let dict = Dict::from_bytes(input.as_bytes()).unwrap();
+            let a = dict.get::<Object<'_>>(b"A");
+            assert!(matches!(a, Some(Object::Dict(_))), "{input}");
+            assert_eq!(dict.get::<i32>(b"B"), Some(5), "{input}");
+        }
+    }
+
+    #[test]
     fn dict_with_unreadable_value() {
         let dict = Dict::from_bytes(b"<< /A <<>>stream /B true >>").unwrap();
         let _ = dict.entries().count();

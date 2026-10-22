@@ -797,6 +797,25 @@ fn page_tree_with_real_generation_number() {
 }
 
 #[test]
+fn page_tree_with_dictionary_followed_by_stream() {
+    // `/Kids` is `[3 0 R << >> stream 4 0 R]`, and the first page is 300 by 300, the second
+    // 200 by 200. Like any kid without a `/Type`, the empty dictionary is read as a page,
+    // which has the default size.
+    let file = include_bytes!("../pdfs/load/page_tree_with_dictionary_followed_by_stream.pdf");
+    let pdf = Pdf::new(file.to_vec()).unwrap();
+
+    let sizes = pdf
+        .pages()
+        .iter()
+        .map(|page| page.base_dimensions())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sizes,
+        [(300.0, 300.0), (595.2756, 841.8898), (200.0, 200.0)]
+    );
+}
+
+#[test]
 fn page_tree_cycle_with_siblings() {
     let file = include_bytes!("../pdfs/load/page_tree_cycle_with_siblings.pdf");
     load_pdf(file);

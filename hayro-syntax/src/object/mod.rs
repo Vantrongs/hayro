@@ -609,8 +609,12 @@ mod tests {
                     b"12345678901234567890123",
                 ])),
                 5 => out.push(b'R'),
-                // No `stream` keyword: `Object::read` reads a dictionary followed by it as
-                // a stream, which skipping doesn't.
+                6 if rng.below(4) == 0 => out.extend_from_slice(rng.pick(&[
+                    b"stream",
+                    b"streamR",
+                    b"stream\nx\nendstream",
+                    b"endstream",
+                ])),
                 6 => out.extend_from_slice(rng.pick(&[
                     b"foo", b"e", b"null", b"nul", b"true", b"false", b"obj", b"/A", b"/Name",
                     b"(s)", b"(a(b)c)", b"(\\))", b"<0a>", b"%c\n",
@@ -666,8 +670,7 @@ mod tests {
         (r.offset(), is_ref)
     }
 
-    // Where the next item starts: reading a dictionary also reads the white space after it,
-    // to look for a stream.
+    // Where the next item starts.
     fn next_item(data: &[u8], end: usize) -> usize {
         let mut r = Reader::new(data);
         r.jump(end);

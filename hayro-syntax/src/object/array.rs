@@ -514,6 +514,21 @@ mod tests {
     }
 
     #[test]
+    fn array_with_dict_followed_by_stream_data() {
+        // Validation skips the dictionary and each word after it as items of their own.
+        let cases = [
+            ("[<< >>stream\nx\nendstream 5]", 5),
+            ("[<< >>streamR 5]", 3),
+        ];
+        for (input, len) in cases {
+            let res = array_impl(input.as_bytes()).unwrap();
+            assert_eq!(res.len(), len, "{input}");
+            assert!(matches!(res[0], Object::Dict(_)));
+            assert!(matches!(res[len - 1], Object::Number(_)));
+        }
+    }
+
+    #[test]
     fn array_repr() {
         let array = Array::from_bytes(b"[34]").unwrap();
 
