@@ -802,7 +802,7 @@ fn rows_cut_short_stream_as_decoded() {
 }
 
 #[test]
-fn data_that_is_not_zlib_restarts_as_raw_deflate() {
+fn data_that_is_not_zlib_reads_as_raw_deflate() {
     let (w, h) = (9_u32, 5_u32);
     assert_streams_as_decoded(&[(
         image(
@@ -814,10 +814,9 @@ fn data_that_is_not_zlib_restarts_as_raw_deflate() {
     )]);
 }
 
-/// Colour and soft mask both raw deflate: each restarts once, and a restart of one
-/// rewinds the other without making it restart again.
+/// Colour and soft mask both raw deflate, read alongside.
 #[test]
-fn colour_and_mask_that_both_restart_finish() {
+fn colour_and_mask_both_raw_deflate_stream_as_decoded() {
     let (w, h) = (9_u32, 5_u32);
     let flate = "/BitsPerComponent 8 /Filter /FlateDecode";
     assert_streams_as_decoded(&[

@@ -79,7 +79,7 @@ fn every_reading(stream: &Stream<'_>) -> Vec<(&'static str, Option<Vec<u8>>)> {
         readings.push(("decoded_strict_reader", read));
     }
     if let Some(mut reader) = stream.decoded_reader() {
-        let read = read_all(|buf| reader.read(buf, &Meter::default()));
+        let read = read_all(|buf| Ok(reader.read(buf, &Meter::default())?));
         readings.push(("decoded_reader", read));
     }
     readings

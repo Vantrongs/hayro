@@ -2,8 +2,8 @@
 //! with the data read, not with what the dictionary declares or the stream holds.
 
 use hayro_syntax::Pdf;
+use hayro_syntax::object::stream::DecodedReader;
 use hayro_syntax::object::stream::{DecodeFailure, ImageDecodeParams};
-use hayro_syntax::object::stream::{DecodedReader, ReadError};
 use hayro_syntax::object::{ObjectIdentifier, Stream};
 use hayro_syntax::work::{Cancelled, Meter, POLL_BYTES};
 use std::cell::Cell;
@@ -31,38 +31,29 @@ fn object_3(pdf: &Pdf) -> Stream<'_> {
 }
 
 /// The next `len` bytes the reader yields (fewer at the end), read `chunk` bytes at a
-/// time; a restart voids what was read before it. Also how often it restarted.
-fn read_up_to(reader: &mut DecodedReader<'_>, len: usize, chunk: usize) -> (Vec<u8>, usize) {
+/// time.
+fn read_up_to(reader: &mut DecodedReader<'_>, len: usize, chunk: usize) -> Vec<u8> {
     let mut buf = vec![0; chunk];
-    let mut restarts = 0;
     let mut out = Vec::new();
     while out.len() < len {
         let wanted = chunk.min(len - out.len());
         match reader.read(&mut buf[..wanted], &Meter::default()) {
             Ok(0) => break,
             Ok(n) => out.extend_from_slice(&buf[..n]),
-            Err(ReadError::Restarted) => {
-                restarts += 1;
-                out.clear();
-            }
             Err(e) => panic!("{e:?}"),
         }
     }
-    (out, restarts)
+    out
 }
 
 /// Everything the reader yields, read `chunk` bytes at a time, read twice with a
-/// rewind between; and how often it restarted.
-fn read_twice(stream: &Stream<'_>, chunk: usize) -> (Vec<u8>, usize) {
+/// rewind between.
+fn read_twice(stream: &Stream<'_>, chunk: usize) -> Vec<u8> {
     let mut reader = stream.decoded_reader().unwrap();
     let first = read_up_to(&mut reader, usize::MAX, chunk);
     reader.rewind();
     let second = read_up_to(&mut reader, usize::MAX, chunk);
-    assert_eq!(
-        second,
-        (first.0.clone(), 0),
-        "a rewound reader reads the same"
-    );
+    assert_eq!(second, first, "a rewound reader reads the same");
     first
 }
 
@@ -93,10 +84,10 @@ fn a_declared_predictor_row_is_not_allocated_before_data_arrives() {
             assert!(probe.largest < 4096, "the probe allocated {probe:?}");
             let ((), read) = measure(|| {
                 let mut reader = stream.decoded_reader().unwrap();
-                let (data, _) = read_up_to(&mut reader, 8, 4);
+                let data = read_up_to(&mut reader, 8, 4);
                 assert_eq!(data, expected);
                 reader.rewind();
-                let (data, _) = read_up_to(&mut reader, 8, 4);
+                let data = read_up_to(&mut reader, 8, 4);
                 assert_eq!(data, expected);
             });
             assert!(read.largest < 128 * 1024, "reading allocated {read:?}");
@@ -112,7 +103,7 @@ fn encrypted_stored_data_is_decrypted_as_it_is_read() {
     let (can, probe) = measure(|| stream.can_read_incrementally());
     assert!(can);
     assert_eq!(probe.largest, 0);
-    assert_eq!(read_twice(&stream, 37), (data.clone(), 0));
+    assert_eq!(read_twice(&stream, 37), data);
     let ((), prefix) = measure(|| {
         let mut reader = stream.decoded_reader().unwrap();
         let mut buf = [0; 37];
@@ -122,37 +113,39 @@ fn encrypted_stored_data_is_decrypted_as_it_is_read() {
     assert!(prefix.peak < 32 * 1024, "a prefix allocated {prefix:?}");
 }
 
-/// Encrypted zlib, and encrypted raw deflate, which restarts once: a rewind does not
-/// repeat the restart.
+/// Encrypted zlib, and encrypted raw deflate, which is read as such once zlib finds
+/// its first bytes corrupt: a rewind reads both again from the stored bytes.
 #[cfg(feature = "unsafe")]
 #[test]
-fn encrypted_flate_restarts_and_rewinds_from_the_stored_bytes() {
+fn encrypted_flate_rewinds_from_the_stored_bytes() {
     let data: Vec<u8> = (0..32_769_u32).map(|i| ((i / 7) % 251) as u8).collect();
     let zlib = zlib(&data);
-    for (encoded, restarts) in [(&zlib[..], 0), (&zlib[2..zlib.len() - 4], 1)] {
+    for encoded in [&zlib[..], &zlib[2..zlib.len() - 4]] {
         let pdf = encrypted_file("/Filter /FlateDecode", encoded);
-        assert_eq!(read_twice(&object_3(&pdf), 397), (data.clone(), restarts));
+        assert_eq!(read_twice(&object_3(&pdf), 397), data);
     }
 }
 
-/// Corrupt encrypted Flate ends with what whole decoding returns, after restarting as
-/// raw deflate and then with the permissive decoder.
+/// Corrupt encrypted Flate ends where zlib found it corrupt, after the bytes it made
+/// before, as whole decoding does.
 #[cfg(feature = "unsafe")]
 #[test]
 fn encrypted_corrupt_flate_ends_as_whole_decoding_does() {
     // One valid, non-final stored block, followed by a reserved block type.
     let mut encoded = vec![0x78, 1, 0, 0x88, 0x13, 0x77, 0xec];
-    encoded.extend((0..5000).map(|i| (i % 251) as u8));
+    let block: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+    encoded.extend(&block);
     encoded.push(7);
     let pdf = encrypted_file("/Filter /FlateDecode", &encoded);
     let stream = object_3(&pdf);
     let expected = stream.decoded().unwrap();
-    assert_eq!(read_twice(&stream, 397), (expected.to_vec(), 2));
+    assert_eq!(expected, block);
+    assert_eq!(read_twice(&stream, 397), expected.to_vec());
 }
 
 /// A checkpoint resumes Flate data after the reader, stream and document that took it
 /// are gone: mid-row for predictors, mid-block for AES, with back references reaching
-/// before it, and after raw deflate restarted. It holds the decoder's state, not the
+/// before it, and in raw deflate. It holds the decoder's state, not the
 /// stored bytes.
 #[cfg(feature = "unsafe")]
 #[test]
@@ -193,7 +186,7 @@ fn resume_at(encrypted: bool, params: &str, encoded: &[u8], offset: usize) {
         let expected = stream.decoded().unwrap().into_owned();
         let owned = stream.to_owned_stream();
         let mut reader = stream.decoded_reader().unwrap();
-        assert_eq!(read_up_to(&mut reader, offset, 4093).0, expected[..offset]);
+        assert_eq!(read_up_to(&mut reader, offset, 4093), expected[..offset]);
         let (checkpoint, taken) = measure(|| reader.checkpoint(&owned).unwrap());
         assert!(checkpoint.heap_bytes() <= reader.checkpoint_heap_bound().unwrap());
         assert!(taken.largest < encoded.len() / 2, "copied {taken:?}");
@@ -204,10 +197,7 @@ fn resume_at(encrypted: bool, params: &str, encoded: &[u8], offset: usize) {
         let mut reader = stream.decoded_reader().unwrap();
         assert!(reader.restore(&checkpoint));
         let rest = read_up_to(&mut reader, usize::MAX, chunk);
-        assert!(
-            rest == (expected[offset..].to_vec(), 0),
-            "{params} at {offset}"
-        );
+        assert!(rest == expected[offset..], "{params} at {offset}");
     }
 }
 
@@ -234,7 +224,7 @@ fn a_stopped_meter_stops_every_later_read() {
             other => break other,
         }
     };
-    assert_eq!(result, Err(ReadError::Cancelled));
+    assert_eq!(result, Err(Cancelled));
     assert!(read < 2 * POLL_BYTES, "{read} bytes read after the stop");
 
     let meter = Meter::new(Some(&hook));
@@ -252,10 +242,7 @@ fn a_stopped_meter_stops_every_later_read() {
     let readers = [reader];
     for mut reader in readers {
         for len in [1, 257, 1, 257] {
-            assert_eq!(
-                reader.read(&mut buf[..len], &meter),
-                Err(ReadError::Cancelled)
-            );
+            assert_eq!(reader.read(&mut buf[..len], &meter), Err(Cancelled));
         }
     }
 }
@@ -287,7 +274,7 @@ fn a_checkpoint_belongs_to_the_bytes_it_was_taken_from() {
     let checkpoint = reader.checkpoint(&a.to_owned_stream()).unwrap();
     let mut other = b.decoded_reader().unwrap();
     assert!(!other.restore(&checkpoint));
-    assert_eq!(read_up_to(&mut other, usize::MAX, 997), (data, 0));
+    assert_eq!(read_up_to(&mut other, usize::MAX, 997), data);
 }
 
 /// A CCITT stream that ends at once holds about as much whatever its dictionary

@@ -1,7 +1,7 @@
 //! Rows of stored samples read incrementally, piece by piece, and masks as rows of
 //! alpha.
 
-use super::{DecodeWork, Stop};
+use super::DecodeWork;
 use crate::LumaData;
 use crate::x_object::decode::{
     BILEVEL_MASK_LUT, MaskPath, SampleFormat, SampleRows, decode_mask, sample_format,
@@ -9,7 +9,7 @@ use crate::x_object::decode::{
 use crate::x_object::image::{ImageKind, ImageXObject};
 use core::ops::Range;
 use hayro_syntax::object::Stream;
-use hayro_syntax::object::stream::{DecodedCheckpoint, DecodedReader, ReadError};
+use hayro_syntax::object::stream::{DecodedCheckpoint, DecodedReader};
 use hayro_syntax::work::{Cancelled, Meter};
 use std::sync::OnceLock;
 
@@ -27,36 +27,6 @@ pub(super) const PIECE_BYTES: usize = 64 * 1024;
 /// multiple of eight, so that pieces of one-bit samples start on a byte.
 pub(super) fn piece_texels(columns: usize, bytes: usize) -> usize {
     columns.min((PIECE_BYTES / bytes).max(8) & !7).max(1)
-}
-
-/// Why reading rows stopped before the last.
-#[derive(Debug)]
-pub(super) enum Break {
-    /// A reader restarted: the pass starts over from the first row.
-    Restart,
-    Stop(Stop),
-}
-
-impl From<ReadError> for Break {
-    fn from(e: ReadError) -> Self {
-        match e {
-            ReadError::Restarted => Self::Restart,
-            ReadError::Failed => Self::Stop(Stop::Failed),
-            ReadError::Cancelled => Self::Stop(Stop::Cancelled),
-        }
-    }
-}
-
-impl From<Stop> for Break {
-    fn from(stop: Stop) -> Self {
-        Self::Stop(stop)
-    }
-}
-
-impl From<Cancelled> for Break {
-    fn from(_: Cancelled) -> Self {
-        Self::Stop(Stop::Cancelled)
-    }
 }
 
 /// Rows of an image's or mask's stored samples, read incrementally, the reading
@@ -94,13 +64,6 @@ impl<'a> RawRows<'a> {
         })
     }
 
-    /// Back to the first row, keeping the decoder a restart chose.
-    pub(super) fn rewind(&mut self) {
-        self.reader.rewind();
-        self.total = 0;
-        self.at = 0;
-    }
-
     /// Continues from `state`, saved at the start of `row`; false if it does not
     /// resume this reader.
     pub(super) fn resume(&mut self, row: u32, state: &DecodedCheckpoint) -> bool {
@@ -124,18 +87,13 @@ impl<'a> RawRows<'a> {
 
     /// Reads the row's next bytes into `out` (at most a piece, no further than the
     /// row's end); returns how many the data held.
-    pub(super) fn read(&mut self, out: &mut [u8]) -> Result<usize, Break> {
+    pub(super) fn read(&mut self, out: &mut [u8]) -> Result<usize, Cancelled> {
         let len = out.len().min(self.row_bytes - self.at);
         let mut filled = 0;
         while filled < len {
-            match self.reader.read(&mut out[filled..len], self.meter) {
-                Ok(0) => break,
-                Ok(n) => filled += n,
-                Err(e) => {
-                    self.total = 0;
-                    self.at = 0;
-                    return Err(e.into());
-                }
+            match self.reader.read(&mut out[filled..len], self.meter)? {
+                0 => break,
+                n => filled += n,
             }
         }
         self.at += filled;
@@ -146,7 +104,7 @@ impl<'a> RawRows<'a> {
     }
 
     /// Reads past the row's next `n` bytes; false if the data ended first.
-    pub(super) fn skip(&mut self, n: usize) -> Result<bool, Break> {
+    pub(super) fn skip(&mut self, n: usize) -> Result<bool, Cancelled> {
         let end = (self.at + n).min(self.row_bytes);
         let mut scratch = std::mem::take(&mut self.scratch);
         if scratch.is_empty() {
@@ -167,7 +125,7 @@ impl<'a> RawRows<'a> {
     }
 
     /// Reads past the rest of the row: what the row held.
-    pub(super) fn finish(&mut self) -> Result<RawRow, Break> {
+    pub(super) fn finish(&mut self) -> Result<RawRow, Cancelled> {
         self.skip(self.row_bytes - self.at)?;
         Ok(match self.at {
             0 => RawRow::End,
@@ -177,7 +135,7 @@ impl<'a> RawRows<'a> {
     }
 
     /// Reads past the next row: what it held.
-    pub(super) fn skip_row(&mut self) -> Result<RawRow, Break> {
+    pub(super) fn skip_row(&mut self) -> Result<RawRow, Cancelled> {
         self.begin();
         self.finish()
     }
@@ -323,15 +281,13 @@ pub(super) fn rows_held(
     let mut bytes = 0;
     let held = loop {
         match reader.read(&mut buf, meter) {
-            Ok(0) => break Ok(Some(bytes)),
+            Ok(0) => break Ok(bytes),
             Ok(n) => bytes += n,
-            Err(ReadError::Restarted) => bytes = 0,
-            Err(ReadError::Failed) => break Ok(None),
-            Err(ReadError::Cancelled) => break Err(Cancelled),
+            Err(Cancelled) => break Err(Cancelled),
         }
     };
     work.bytes_inflated += reader.inflated_bytes();
-    Ok(held?.map(|held| rows.rows_kept(held)))
+    Ok(Some(rows.rows_kept(held?)))
 }
 
 /// A mask's rows, as alpha, each read from its start in pieces of columns from left
@@ -353,20 +309,6 @@ pub(super) enum MaskRows<'a> {
 }
 
 impl MaskRows<'_> {
-    /// Back to the first row; with `reader`, the reader too (after another reader of
-    /// the pass restarted; one that restarted itself is already back at its start).
-    pub(super) fn rewind(&mut self, reader: bool) {
-        match self {
-            MaskRows::Decoded { row, .. } => *row = 0,
-            MaskRows::Streamed { raw, .. } => {
-                if reader {
-                    raw.rewind();
-                }
-                raw.begin();
-            }
-        }
-    }
-
     /// The bytes the mask's incremental Flate decoder produced.
     pub(super) fn inflated_bytes(&self) -> u64 {
         match self {
@@ -385,7 +327,7 @@ impl MaskRows<'_> {
     /// Writes the alpha of columns `cols` of the row into `out` (`cols` long), after
     /// the columns written before; returns how many of them the data holds, the rest
     /// of a last row cut short being transparent.
-    pub(super) fn alpha(&mut self, cols: Range<usize>, out: &mut [u8]) -> Result<usize, Break> {
+    pub(super) fn alpha(&mut self, cols: Range<usize>, out: &mut [u8]) -> Result<usize, Cancelled> {
         match self {
             MaskRows::Decoded { luma, row } => {
                 let at = *row as usize * luma.width as usize;
@@ -416,7 +358,7 @@ impl MaskRows<'_> {
     }
 
     /// Ends the row, reading past the rest of it.
-    pub(super) fn end_row(&mut self) -> Result<(), Break> {
+    pub(super) fn end_row(&mut self) -> Result<(), Cancelled> {
         match self {
             MaskRows::Decoded { row, .. } => *row += 1,
             MaskRows::Streamed { raw, .. } => {
@@ -427,14 +369,14 @@ impl MaskRows<'_> {
     }
 
     /// Reads past the next row.
-    pub(super) fn skip_row(&mut self) -> Result<(), Break> {
+    pub(super) fn skip_row(&mut self) -> Result<(), Cancelled> {
         self.begin_row();
         self.end_row()
     }
 
     /// Moves past the next `n` rows: reads past each of a streamed mask's, and jumps
     /// over those of a mask decoded whole.
-    pub(super) fn skip_rows(&mut self, n: u32) -> Result<(), Break> {
+    pub(super) fn skip_rows(&mut self, n: u32) -> Result<(), Cancelled> {
         match self {
             MaskRows::Decoded { row, .. } => *row += n,
             MaskRows::Streamed { .. } => (0..n).try_for_each(|_| self.skip_row())?,
@@ -454,7 +396,7 @@ fn bilevel_alpha(
     width: usize,
     cols: Range<usize>,
     out: &mut [u8],
-) -> Result<usize, Break> {
+) -> Result<usize, Cancelled> {
     let (first, end) = (cols.start / 8, cols.end.div_ceil(8));
     // A piece starting within the byte the one before ended in has it in `last`.
     if raw.at() <= first {

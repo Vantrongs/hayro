@@ -23,9 +23,6 @@ pub(super) struct Checkpoints {
 /// Flate decoder states, by the row they resume at.
 #[derive(Default)]
 struct FlateIndex {
-    /// Advanced when a reader restarts: readers of earlier generations decode the
-    /// data another way, and their states are not saved.
-    generation: u64,
     /// Sorted by row; its capacity is the plan's slots once a state is saved.
     entries: Vec<Entry>,
 }
@@ -79,7 +76,6 @@ impl Checkpoints {
             index: &self.flate,
             stream,
             plan,
-            generation: index.generation,
         };
         Ok(Some((checkpointer, start)))
     }
@@ -107,13 +103,11 @@ impl Plan {
     }
 }
 
-/// One pass's use of the index: it saves states every so many rows, as long as no
-/// reader restarted since it began.
+/// One pass's use of the index: it saves states every so many rows.
 pub(super) struct Checkpointer<'c> {
     index: &'c Mutex<FlateIndex>,
     stream: &'c OwnedStream,
     plan: Plan,
-    generation: u64,
 }
 
 impl Checkpointer<'_> {
@@ -124,7 +118,7 @@ impl Checkpointer<'_> {
             return Ok(());
         }
         let mut index = self.index.lock().map_err(|_| Stop::Failed)?;
-        if index.generation != self.generation || index.entries.len() == self.plan.slots {
+        if index.entries.len() == self.plan.slots {
             return Ok(());
         }
         let Err(at) = index.entries.binary_search_by_key(&row, |e| e.row) else {
@@ -139,16 +133,6 @@ impl Checkpointer<'_> {
         index.entries.insert(at, Entry { row, state });
         Ok(())
     }
-
-    /// Drops the saved states after a reader restarted: they decode the data the way
-    /// that failed.
-    pub(super) fn restarted(&mut self) -> Result<(), Stop> {
-        let mut index = self.index.lock().map_err(|_| Stop::Failed)?;
-        index.entries.clear();
-        index.generation += 1;
-        self.generation = index.generation;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -158,7 +142,7 @@ mod tests {
     use super::*;
     use crate::fixtures::{noise, stored_deflate};
     use hayro_syntax::Pdf;
-    use hayro_syntax::work::{Meter, POLL_BYTES};
+    use hayro_syntax::work::POLL_BYTES;
     use std::cell::Cell;
     use std::sync::Arc;
 
@@ -190,8 +174,7 @@ mod tests {
     }
 
     /// Reopened, an image resumes from the state nearest before a request's rows, for
-    /// zlib, raw deflate (saved after its restart) and predicted rows, and returns
-    /// what decoding it whole does.
+    /// zlib, raw deflate and predicted rows, and returns what decoding it whole does.
     #[test]
     fn a_request_resumes_from_a_state_an_earlier_request_saved() {
         let data = noise((W * H) as usize, 71);
@@ -313,52 +296,28 @@ mod tests {
         });
     }
 
-    /// After one reader restarted, a reader that began before the restart saves
-    /// nothing; one that began after it does.
+    /// Zlib data whose checksum fails at the end keeps its zlib reading: the states
+    /// saved before the end are kept, and a request returns what decoding the image
+    /// whole does.
     #[test]
-    fn a_reader_of_a_dropped_generation_saves_nothing() {
-        let pdf = gray("", zlib(&noise((W * H) as usize, 71)));
-        let asset = asset(&pdf);
-        let obj = asset.xobject().unwrap();
-        let (checkpoints, stream) = (&asset.0.checkpoints, &asset.0.stream);
-        let meter = Meter::default();
-        let mut raw = RawRows::new(&obj.stream, W as usize, &meter).unwrap();
-        let checkpointer = |raw: &mut RawRows<'_>| {
-            let (c, start) = checkpoints
-                .checkpointer(stream, raw, W as usize, H, 0)
-                .unwrap()
-                .unwrap();
-            assert_eq!(start, 0);
-            c
-        };
-        let earlier = checkpointer(&mut raw);
-        let mut later = checkpointer(&mut raw);
-        later.restarted().unwrap();
-        for _ in 0..INTERVAL {
-            raw.skip_row().unwrap();
-        }
-        earlier.after_row(INTERVAL, &raw.reader).unwrap();
-        assert_eq!(saved(&asset), 0);
-        later.after_row(INTERVAL, &raw.reader).unwrap();
-        assert_eq!(saved(&asset), 1);
-    }
-
-    /// A restart after states were saved (at a checksum that fails at the end) drops
-    /// them, and the request returns what decoding the image whole does.
-    #[test]
-    fn a_late_restart_drops_the_saved_states() {
+    fn a_checksum_that_fails_at_the_end_keeps_the_saved_states() {
         for (params, data) in [("", noise((W * H) as usize, 31)), (PNG, png_rows(31))] {
             let mut encoded = zlib(&data);
             *encoded.last_mut().unwrap() ^= 1;
             let pdf = gray(params, encoded);
             let asset = asset(&pdf);
             let mut source = asset.open(None, None).unwrap();
-            rows(&mut source, 2800..2816);
-            assert!(saved(&asset) > 0);
-            let (actual, _) = rows(&mut source, 4000..H);
+            let (_, cold) = rows(&mut source, 4000..H);
+            let saved_before = saved(&asset);
+            assert!(saved_before > 0);
+            let (actual, warm) = rows(&mut source, 4000..H);
             let (expected, _) = rows(&mut whole(&asset), 4000..H);
             assert_eq!(actual, expected, "{params}");
-            assert_eq!(saved(&asset), 0);
+            if params.is_empty() {
+                assert_eq!(expected, data[4000 * W as usize..]);
+            }
+            assert_eq!(saved(&asset), saved_before);
+            assert!(warm.rows_decoded < cold.rows_decoded, "{warm:?} {cold:?}");
         }
     }
 }

@@ -2,7 +2,8 @@
 //! images of every sample depth whole decoding reads, one to four components,
 //! decode arrays, colour keys, soft masks with and without `/Matte`, mask streams,
 //! stencil masks and CCITT data, raw and Flate, each cut after every byte of its
-//! stored data, and of its data decoded.
+//! stored data, and of its data decoded. Flate data damaged at every byte, which
+//! zlib may find corrupt after making bytes, streams as it decodes whole too.
 
 use super::tests::{asset, image, pdf, request, try_whole};
 use super::{ImageAsset, ImageRequest, ImageSource, Plane, RequestError};
@@ -129,8 +130,8 @@ fn assert_streams_as_whole(asset: &ImageAsset, case: &str) {
 }
 
 /// Requests of every plane of `streamed`, at full size and reduced, of the whole
-/// plane and of a window starting within it, equal those of `whole`, which has the
-/// same layout.
+/// plane, of its first row of bins (which a reader stops early for) and of a window
+/// starting within it, equal those of `whole`, which has the same layout.
 fn assert_requests_equal(streamed: &mut ImageSource<'_>, whole: &mut ImageSource<'_>, case: &str) {
     let layout = *streamed.layout();
     for plane in [Plane::Image, Plane::Mask] {
@@ -143,6 +144,7 @@ fn assert_requests_equal(streamed: &mut ImageSource<'_>, whole: &mut ImageSource
         ] {
             for window in [
                 [0, 0, grid.0, grid.1],
+                [0, 0, grid.0, 1],
                 [grid.0 / 2, grid.1 / 2, grid.0, grid.1],
             ] {
                 let a = request(streamed, plane, grid, window);
@@ -612,4 +614,72 @@ fn ccitt_g3_1d_cut_streams_as_whole() {
 #[test]
 fn ccitt_g3_2d_cut_streams_as_whole() {
     ccitt_cut(CCITT[2].0, CCITT[2].1);
+}
+
+/// Gray images of 1 and 8 bits whose compressed data has a byte changed, at every
+/// byte and in three ways: past a valid zlib header, zlib may find the data corrupt
+/// after making bytes, which whole decoding keeps and a request of the first rows
+/// returns before the rest is read.
+#[test]
+fn damaged_flate_streams_as_whole() {
+    let mut cases = Cases::default();
+    for (bits, w, h) in [(1_usize, 61_usize, 40_usize), (8, 64, 48)] {
+        let data = samples((w * bits).div_ceil(8) * h, 54 + bits as u32);
+        let compressed = deflate(&data);
+        let dict = format!("/ColorSpace /DeviceGray /BitsPerComponent {bits} /Filter /FlateDecode");
+        for at in 0..compressed.len() {
+            for flip in [0xff, 0x01, 0x80] {
+                let mut damaged = compressed.clone();
+                damaged[at] ^= flip;
+                let pdf = pdf(&[(image(&dict, w as u32, h as u32), damaged)]);
+                cases.check(&asset(&pdf), &format!("{dict}, byte {at} ^ {flip:#x}"));
+            }
+        }
+    }
+    cases.finish();
+}
+
+/// Data whose zlib reading breaks after 130,988 bytes, while raw deflate reads all of
+/// it as other bytes (the zlib header starts a stored block): images of it stream
+/// as they decode whole, whose first bytes come from the zlib reading.
+#[test]
+fn a_zlib_reading_that_breaks_late_streams_as_whole() {
+    let mut payload = vec![0x55; 65535];
+    payload[65530..].copy_from_slice(&[0x00, 0xff, 0xff, 0x00, 0x00]);
+    let mut encoded = vec![
+        0x78, 0x01, 0x00, 0xfe, 0xff, 0x01, 0x00, 0xff, 0xff, 0x00, 0x00,
+    ];
+    encoded.extend(payload);
+    encoded.extend([0x00, 0xff, 0xff, 0x00, 0x00]);
+    encoded.extend(std::iter::repeat_n(0x55, 65535));
+    encoded.extend([0x01, 0x00, 0x00, 0xff, 0xff]);
+    let mut cases = Cases::default();
+    for (dict, w, h) in [
+        ("/ColorSpace /DeviceGray /BitsPerComponent 1", 8, 1),
+        ("/ColorSpace /DeviceGray /BitsPerComponent 1", 1024, 1100),
+        ("/ColorSpace /DeviceGray /BitsPerComponent 8", 4, 1),
+        ("/ColorSpace /DeviceGray /BitsPerComponent 8", 256, 600),
+        ("/ImageMask true", 8, 1),
+    ] {
+        let dict = format!("{dict} /Filter /FlateDecode");
+        let pdf = pdf(&[(image(&dict, w, h), encoded.clone())]);
+        cases.check(&asset(&pdf), &format!("{dict} {w}x{h}"));
+    }
+    cases.finish();
+    // The first pixels are white, as the zlib reading starts `ff ff`; raw deflate's
+    // `01` would make seven black ones.
+    let pdf = pdf(&[(
+        image(
+            "/ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /FlateDecode",
+            8,
+            1,
+        ),
+        encoded,
+    )]);
+    let asset = asset(&pdf);
+    let mut source = asset.open(None, None).unwrap();
+    assert_eq!(
+        request(&mut source, Plane::Image, (8, 1), [0, 0, 8, 1]).data,
+        [255; 8]
+    );
 }

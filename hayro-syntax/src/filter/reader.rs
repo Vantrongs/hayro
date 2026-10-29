@@ -44,9 +44,11 @@ impl From<Cancelled> for ReadError {
 /// [`Stream::decoded_reader`](crate::object::Stream::decoded_reader)). It yields the
 /// bytes [`Stream::decoded`](crate::object::Stream::decoded) returns, but holds only
 /// the decoder's state, up to [`POLL_BYTES`] inflated ahead of the reads and a
-/// predictor row, not the whole result, except where a corrupt Flate stream needs the
-/// permissive decoder, which decodes it whole. Every
-/// read counts its work on a [`Meter`], and stops when the meter's hook asks to.
+/// predictor row, not the whole result, except where neither zlib nor raw deflate
+/// makes a byte of Flate data and the permissive decoder decodes it whole. A byte
+/// handed out is never taken back: the decoder is chosen before the first byte, as
+/// lenient whole decoding chooses it ([`flate::decode`]). Every read counts its work
+/// on a [`Meter`], and stops when the meter's hook asks to.
 pub struct DecodedReader<'a> {
     source: Source<'a>,
     predictor: Option<Predicted>,
@@ -60,7 +62,6 @@ enum Source<'a> {
     Inflating(Inflating<'a>),
     /// Flate data for the permissive decoder, which decodes it whole at the next read.
     Fallback(DecryptedReader<'a>),
-    Failed,
 }
 
 /// Flate data inflated as it is read.
@@ -74,8 +75,12 @@ struct Inflating<'a> {
     output: Vec<u8>,
     handed: usize,
     decoder: zlib_rs::Inflate,
-    /// Whether the data is read as zlib; after that fails, as raw deflate.
+    /// Whether the data is read as zlib; after that fails before making a byte, as
+    /// raw deflate.
     zlib: bool,
+    /// Whether the decoder found the data corrupt after making bytes, which end the
+    /// data.
+    broken: bool,
 }
 
 /// A position in a stream's Flate data to resume reading from (see
@@ -138,6 +143,7 @@ impl<'a> DecodedReader<'a> {
             handed: 0,
             decoder: zlib_rs::Inflate::new(true, 15),
             zlib: true,
+            broken: false,
         });
         #[cfg(not(feature = "unsafe"))]
         let source = Source::Fallback(data);
@@ -148,9 +154,8 @@ impl<'a> DecodedReader<'a> {
         })
     }
 
-    /// The bytes this reader's incremental Flate decoder produced, including those a
-    /// restart voided and those not read yet; not those the permissive decoder
-    /// produced.
+    /// The bytes this reader's incremental Flate decoder produced, including those not
+    /// read yet; not those the permissive decoder produced.
     pub fn inflated_bytes(&self) -> u64 {
         self.inflated
     }
@@ -170,8 +175,8 @@ impl<'a> DecodedReader<'a> {
 
     /// The reader's position, to resume from with [`Self::restore`] on a reader of the
     /// same `stream`. `None` unless the reader inflates `stream`'s stored bytes
-    /// incrementally (not as stored, nor after a restart to the permissive decoder),
-    /// or when the decoder state cannot be allocated.
+    /// incrementally (not as stored, nor with the permissive decoder), or when the
+    /// decoder state cannot be allocated.
     #[cfg(feature = "unsafe")]
     pub fn checkpoint(&self, stream: &OwnedStream) -> Option<DecodedCheckpoint> {
         let (inflating, data) = self.checkpointable()?;
@@ -190,9 +195,9 @@ impl<'a> DecodedReader<'a> {
         })
     }
 
-    /// Continues from `checkpoint`, as if the data before it had been read (the
-    /// restarts that preceded it included). False, with the reader unchanged, when the
-    /// checkpoint is of other bytes or its decoder state cannot be allocated.
+    /// Continues from `checkpoint`, as if the data before it had been read (with the
+    /// decoder chosen then). False, with the reader unchanged, when the checkpoint is
+    /// of other bytes or its decoder state cannot be allocated.
     #[cfg(feature = "unsafe")]
     #[must_use]
     pub fn restore(&mut self, checkpoint: &DecodedCheckpoint) -> bool {
@@ -207,6 +212,7 @@ impl<'a> DecodedReader<'a> {
         };
         inflating.decoder = decoder;
         inflating.zlib = checkpoint.zlib;
+        inflating.broken = false;
         inflating.data.restore(&checkpoint.cursor);
         inflating.input.clone_from(&checkpoint.input);
         inflating.consumed = 0;
@@ -232,12 +238,11 @@ impl<'a> DecodedReader<'a> {
             Source::Raw(data) | Source::Fallback(data) => data.position(),
             #[cfg(feature = "unsafe")]
             Source::Inflating(inflating) => inflating.data.position(),
-            Source::Failed => 0,
         }
     }
 
-    /// Back to the start of the data, keeping the decoder a restart chose (so reading
-    /// again does not repeat the restarts).
+    /// Back to the start of the data, keeping the decoder chosen (so reading again
+    /// does not try the others again).
     pub fn rewind(&mut self) {
         if let Some(p) = &mut self.predictor {
             p.reset();
@@ -248,7 +253,7 @@ impl<'a> DecodedReader<'a> {
     /// Fills `buf` with the next decoded bytes and returns how many: at most
     /// [`POLL_BYTES`], 0 only at the end. The work counts on `meter`; once its hook
     /// asked to stop, every read fails.
-    pub fn read(&mut self, buf: &mut [u8], meter: &Meter<'_>) -> Result<usize, ReadError> {
+    pub fn read(&mut self, buf: &mut [u8], meter: &Meter<'_>) -> Result<usize, Cancelled> {
         let len = buf.len().min(POLL_BYTES);
         let buf = &mut buf[..len];
         if buf.is_empty() {
@@ -257,7 +262,7 @@ impl<'a> DecodedReader<'a> {
         // Bytes inflated ahead were counted when they were made, so handing them out
         // counts nothing that would find the stop.
         if meter.cancelled() {
-            return Err(ReadError::Cancelled);
+            return Err(Cancelled);
         }
         let Some(p) = &mut self.predictor else {
             return self.source.read(buf, &mut self.inflated, meter);
@@ -322,7 +327,7 @@ impl Predicted {
         source: &mut Source<'_>,
         inflated: &mut u64,
         meter: &Meter<'_>,
-    ) -> Result<bool, ReadError> {
+    ) -> Result<bool, Cancelled> {
         let mut chunk = [0; 8192];
         let len = self.unpredictor.input_len();
         while self.input.len() < len {
@@ -357,7 +362,7 @@ impl Source<'_> {
             Source::Raw(data) => data.rewind(),
             #[cfg(feature = "unsafe")]
             Source::Inflating(inflating) => inflating.rewind(),
-            Source::Fallback(_) | Source::Failed => {}
+            Source::Fallback(_) => {}
         }
     }
 
@@ -366,7 +371,7 @@ impl Source<'_> {
         buf: &mut [u8],
         inflated: &mut u64,
         meter: &Meter<'_>,
-    ) -> Result<usize, ReadError> {
+    ) -> Result<usize, Cancelled> {
         match self {
             Source::Raw(data) => {
                 let n = data.read(buf);
@@ -378,19 +383,19 @@ impl Source<'_> {
                 Some(n) => Ok(n),
                 None => {
                     self.restart();
-                    Err(ReadError::Restarted)
+                    self.read(buf, inflated, meter)
                 }
             },
             Source::Fallback(data) => {
                 *self = fallback(data, meter)?;
                 self.read(buf, inflated, meter)
             }
-            Source::Failed => Err(ReadError::Failed),
         }
     }
 
-    /// Moves on to the next decoder in the order whole decoding tries them: zlib, raw
-    /// deflate, then the permissive decoder over all of the data.
+    /// Moves on to the next decoder in the order whole decoding tries them, after the
+    /// one in use found the data corrupt before making a byte (so none was handed
+    /// out): zlib, raw deflate, then the permissive decoder over all of the data.
     #[cfg(feature = "unsafe")]
     fn restart(&mut self) {
         if let Source::Inflating(inflating) = self
@@ -400,9 +405,13 @@ impl Source<'_> {
             inflating.rewind();
             return;
         }
-        if let Source::Inflating(inflating) = core::mem::replace(self, Source::Failed) {
+        if let Source::Inflating(inflating) = self {
             warn!("flate stream is broken, decoding with fallback");
-            *self = Source::Fallback(inflating.data);
+            let data = core::mem::replace(
+                &mut inflating.data,
+                DecryptedReader::raw(Cow::Borrowed(&[])),
+            );
+            *self = Source::Fallback(data);
         }
     }
 }
@@ -420,16 +429,15 @@ fn fallback(
             &decrypted
         }
     };
-    Ok(match flate::fallback::decode(bytes, meter, false)? {
-        Some(decoded) => Source::Raw(DecryptedReader::raw(Cow::Owned(decoded))),
-        None => Source::Failed,
-    })
+    let decoded = flate::fallback::decode_lenient(bytes, meter)?;
+    Ok(Source::Raw(DecryptedReader::raw(Cow::Owned(decoded))))
 }
 
 #[cfg(feature = "unsafe")]
 impl Inflating<'_> {
     fn rewind(&mut self) {
         self.decoder.reset(self.zlib);
+        self.broken = false;
         self.data.rewind();
         self.input.clear();
         self.consumed = 0;
@@ -439,7 +447,7 @@ impl Inflating<'_> {
 
     /// Reads inflated bytes into `buf`: those made before and not read yet, else new
     /// ones, made straight into `buf` when it takes a whole chunk; `None` when the data
-    /// is corrupt for this decoder.
+    /// is corrupt for this decoder before it made a byte.
     fn read(
         &mut self,
         buf: &mut [u8],
@@ -469,7 +477,8 @@ impl Inflating<'_> {
         Ok(Some(n))
     }
 
-    /// Inflates into `buf`; `None` when the data is corrupt for this decoder. Each
+    /// Inflates into `buf`; `None` when the data is corrupt for this decoder before it
+    /// made a byte. Data corrupt after that ends where the decoder found it so. Each
     /// step counts the bytes it took and made, so a run of input that inflates to
     /// nothing is counted too.
     fn inflate(
@@ -478,6 +487,9 @@ impl Inflating<'_> {
         inflated: &mut u64,
         meter: &Meter<'_>,
     ) -> Result<Option<usize>, Cancelled> {
+        if self.broken {
+            return Ok(Some(0));
+        }
         loop {
             if self.consumed == self.input.len() {
                 self.input.resize(INPUT_CHUNK, 0);
@@ -502,7 +514,12 @@ impl Inflating<'_> {
                 Ok(zlib_rs::Status::StreamEnd) => return Ok(Some(written)),
                 Ok(_) if written > 0 => return Ok(Some(written)),
                 Ok(_) if taken > 0 => continue,
-                _ => return Ok(None),
+                Ok(_) => return Ok(Some(0)),
+                Err(_) if self.decoder.total_out() == 0 => return Ok(None),
+                Err(_) => {
+                    self.broken = true;
+                    return Ok(Some(written));
+                }
             }
         }
     }
@@ -515,26 +532,23 @@ mod fixtures;
 
 #[cfg(test)]
 mod tests {
+    use super::DecodedReader;
     use super::fixtures::{noise, stored_zlib};
-    use super::{DecodedReader, ReadError};
     use crate::crypto::reader::DecryptedReader;
     use crate::filter::lzw_flate::{PredictorParams, apply_predictor, flate};
-    use crate::work::{Meter, POLL_BYTES};
+    use crate::work::{Cancelled, Meter, POLL_BYTES};
     use alloc::borrow::Cow;
     use alloc::vec::Vec;
 
-    /// Everything `reader` yields, read `chunk` bytes at a time; a restart discards
-    /// what was read before it.
-    pub(crate) fn read_all(mut reader: DecodedReader<'_>, chunk: usize) -> Option<Vec<u8>> {
+    /// Everything `reader` yields, read `chunk` bytes at a time.
+    pub(crate) fn read_all(mut reader: DecodedReader<'_>, chunk: usize) -> Vec<u8> {
         let mut out = Vec::new();
         let mut buf = alloc::vec![0; chunk];
         loop {
             match reader.read(&mut buf, &Meter::default()) {
-                Ok(0) => return Some(out),
+                Ok(0) => return out,
                 Ok(n) => out.extend_from_slice(&buf[..n]),
-                Err(ReadError::Restarted) => out.clear(),
-                Err(ReadError::Failed) => return None,
-                Err(ReadError::Cancelled) => unreachable!(),
+                Err(Cancelled) => unreachable!(),
             }
         }
     }
@@ -552,8 +566,8 @@ mod tests {
     /// The reader's bytes equal the whole-data decoder's for `encoded` under `p`, read
     /// in pieces of every size from 1 to 9 bytes and in one large piece.
     fn same_as_whole(encoded: &[u8], p: &PredictorParams) {
-        let whole = flate::fallback::decode(encoded, &Meter::default(), false)
-            .unwrap()
+        let whole = flate::fallback::decode_lenient(encoded, &Meter::default())
+            .ok()
             .and_then(|d| apply_predictor(d, p, &Meter::default()));
         #[cfg(feature = "unsafe")]
         let whole = {
@@ -568,7 +582,7 @@ mod tests {
         for chunk in (1..10).chain([1 << 16]) {
             let reader = DecodedReader::flate(DecryptedReader::raw(Cow::Borrowed(encoded)), p)
                 .expect("streamable");
-            assert_eq!(read_all(reader, chunk), whole, "chunk {chunk}");
+            assert_eq!(Some(read_all(reader, chunk)), whole, "chunk {chunk}");
         }
     }
 
@@ -666,7 +680,7 @@ mod tests {
                 }
             };
             assert!(read < 2 * POLL_BYTES, "{read} bytes read after the stop");
-            assert_eq!(result, Err(ReadError::Cancelled));
+            assert_eq!(result, Err(Cancelled));
         }
     }
 
@@ -677,7 +691,7 @@ mod tests {
         let mut buf = alloc::vec![0; 1234];
         assert_eq!(reader.read(&mut buf, &Meter::default()), Ok(1234));
         reader.rewind();
-        assert_eq!(read_all(reader, 777).unwrap(), data);
+        assert_eq!(read_all(reader, 777), data);
     }
 
     #[cfg(feature = "unsafe")]
@@ -705,10 +719,10 @@ mod tests {
         }
 
         /// A zlib stream whose second block is invalid, after a first one that decodes:
-        /// the reader restarts with raw deflate, then the permissive decoder, and ends
-        /// with what `flate::decode` returns.
+        /// the reader keeps to zlib and ends where zlib found the data corrupt, with
+        /// what `flate::decode` returns.
         #[test]
-        fn corrupt_data_restarts_as_flate_decode_does() {
+        fn data_corrupt_after_a_decoded_block_ends_there() {
             let data = noise(5000, 7);
             let mut encoded = stored_zlib(&data, 5000);
             // The first block is no longer the last; a block of the reserved type follows.
@@ -722,27 +736,105 @@ mod tests {
                 false,
                 0,
             );
-            let mut reader = DecodedReader::flate(
-                DecryptedReader::raw(Cow::Borrowed(&encoded)),
-                &params(1, 1, 8, 1),
+            assert_eq!(expected.as_ref(), Some(&data));
+            for chunk in [1, 1000, 1 << 16] {
+                let reader = DecodedReader::flate(
+                    DecryptedReader::raw(Cow::Borrowed(&encoded)),
+                    &params(1, 1, 8, 1),
+                )
+                .unwrap();
+                assert_eq!(Some(read_all(reader, chunk)), expected);
+            }
+        }
+
+        /// A valid zlib header, then data whose zlib reading breaks late while raw
+        /// deflate reads all of it (the header's two bytes start a stored block): both
+        /// the reader and whole decoding keep to the zlib reading, whose first bytes the
+        /// reader hands out before the break is found.
+        #[test]
+        fn a_zlib_reading_that_breaks_late_is_kept() {
+            let encoded = zlib_that_raw_deflate_reads_otherwise();
+            let raw = {
+                use std::io::Read;
+                let mut d = Vec::new();
+                flate2::read::DeflateDecoder::new(&encoded[..])
+                    .read_to_end(&mut d)
+                    .unwrap();
+                d
+            };
+            assert_eq!(raw[..4], [0x01, 0x55, 0x55, 0x55]);
+            let whole = flate::decode(
+                &encoded,
+                &PredictorParams::default(),
+                &Meter::default(),
+                false,
+                0,
             )
             .unwrap();
-            let mut restarts = 0;
-            let mut out = Vec::new();
-            let mut buf = alloc::vec![0; 1000];
-            loop {
-                match reader.read(&mut buf, &Meter::default()) {
-                    Ok(0) => break,
-                    Ok(k) => out.extend_from_slice(&buf[..k]),
-                    Err(ReadError::Restarted) => {
-                        restarts += 1;
-                        out.clear();
+            assert_eq!(whole[..4], [0xff, 0xff, 0, 0]);
+            assert_ne!(whole, raw);
+            for chunk in [1, 7, 4096, 1 << 16] {
+                let reader = DecodedReader::flate(
+                    DecryptedReader::raw(Cow::Borrowed(&encoded)),
+                    &params(1, 1, 8, 1),
+                )
+                .unwrap();
+                assert_eq!(read_all(reader, chunk), whole, "chunk {chunk}");
+            }
+        }
+
+        /// Data that zlib reads for 130,988 bytes and then finds corrupt (an invalid
+        /// code lengths set), and that raw deflate reads whole as other bytes.
+        pub(crate) fn zlib_that_raw_deflate_reads_otherwise() -> Vec<u8> {
+            let mut payload = alloc::vec![0x55; 65535];
+            payload[65530..].copy_from_slice(&[0x00, 0xff, 0xff, 0x00, 0x00]);
+            let mut encoded = alloc::vec![
+                0x78, 0x01, 0x00, 0xfe, 0xff, 0x01, 0x00, 0xff, 0xff, 0x00, 0x00
+            ];
+            encoded.extend(payload);
+            encoded.extend([0x00, 0xff, 0xff, 0x00, 0x00]);
+            encoded.extend(core::iter::repeat_n(0x55, 65535));
+            encoded.extend([0x01, 0x00, 0x00, 0xff, 0xff]);
+            encoded
+        }
+
+        /// Valid zlib data with a byte changed at offsets spread over it: the reader,
+        /// in pieces of several sizes, yields what lenient whole decoding returns,
+        /// whichever reading that kept and wherever it found the data corrupt.
+        #[test]
+        fn damaged_zlib_data_reads_as_whole_decoding() {
+            let data: Vec<u8> = (0..200_000_u32)
+                .map(|i| ((i / 3) % 251) as u8 ^ (i % 7) as u8)
+                .collect();
+            let encoded = zlib(&data);
+            let mut damaged_somewhere = 0;
+            for at in (0..encoded.len())
+                .step_by(97)
+                .chain([0, 1, 2, encoded.len() - 1])
+            {
+                for flip in [0xff, 0x10, 0x01] {
+                    let mut damaged = encoded.clone();
+                    damaged[at] ^= flip;
+                    let whole = flate::decode(
+                        &damaged,
+                        &PredictorParams::default(),
+                        &Meter::default(),
+                        false,
+                        0,
+                    )
+                    .unwrap();
+                    damaged_somewhere += usize::from(whole != data);
+                    for chunk in [1000, 1 << 16] {
+                        let reader = DecodedReader::flate(
+                            DecryptedReader::raw(Cow::Borrowed(&damaged)),
+                            &params(1, 1, 8, 1),
+                        )
+                        .unwrap();
+                        assert_eq!(read_all(reader, chunk), whole, "byte {at} ^ {flip:#x}");
                     }
-                    Err(e) => panic!("{e:?}"),
                 }
             }
-            assert_eq!(restarts, 2);
-            assert_eq!(Some(out), expected);
+            assert!(damaged_somewhere > 0);
         }
 
         /// A hook that asks to stop from its second poll on.
@@ -777,11 +869,10 @@ mod tests {
             let result = loop {
                 match reader.read(&mut buf, &meter) {
                     Ok(n) if n > 0 => {}
-                    Err(ReadError::Restarted) => {}
                     other => break other,
                 }
             };
-            assert_eq!(result, Err(ReadError::Cancelled));
+            assert_eq!(result, Err(Cancelled));
             let (fallback_taken, fallback_made) = flate::fallback::WORK.get();
             let taken = reader.stored_read() + fallback_taken;
             let made = reader.inflated_bytes() as usize + fallback_made;
@@ -790,10 +881,10 @@ mod tests {
                 "{taken} bytes taken, {made} made"
             );
             reader.rewind();
-            assert_eq!(read_all(reader, 1 << 16), whole);
+            assert_eq!(Some(read_all(reader, 1 << 16)), whole);
             let fresh =
                 DecodedReader::flate(DecryptedReader::raw(Cow::Borrowed(encoded)), p).unwrap();
-            assert_eq!(read_all(fresh, 1 << 16), whole);
+            assert_eq!(Some(read_all(fresh, 1 << 16)), whole);
         }
 
         /// A predictor row of two million bytes, whole or cut short, a run of empty
@@ -824,10 +915,10 @@ mod tests {
             cancelled_within_bounded_work(&unchecked, &params(1, 1, 8, 1));
         }
 
-        /// Raw deflate (no zlib header) restarts once; a rewind keeps the decoder it
-        /// chose.
+        /// Raw deflate (no zlib header) is read as such from the first read, as zlib
+        /// finds the data corrupt before making a byte; a rewind keeps that decoder.
         #[test]
-        fn a_rewind_after_a_restart_keeps_the_chosen_decoder() {
+        fn raw_deflate_is_read_from_the_first_read_and_after_a_rewind() {
             let data = noise(5000, 3);
             let deflate = stored_deflate(&data, 1000);
             let mut reader = DecodedReader::flate(
@@ -836,11 +927,8 @@ mod tests {
             )
             .unwrap();
             let mut buf = alloc::vec![0; 1234];
-            assert_eq!(
-                reader.read(&mut buf, &Meter::default()),
-                Err(ReadError::Restarted)
-            );
             assert_eq!(reader.read(&mut buf, &Meter::default()), Ok(1234));
+            assert_eq!(buf[..], data[..1234]);
             reader.rewind();
             let mut out = Vec::new();
             loop {

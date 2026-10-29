@@ -1,9 +1,7 @@
 //! Images whose samples are read incrementally for each request.
 
 use super::index::{Checkpointer, Checkpoints};
-use super::rows::{
-    Break, MaskRows, MaskSource, RawRow, RawRows, RowsHeld, piece_texels, rows_held,
-};
+use super::rows::{MaskRows, MaskSource, RawRow, RawRows, RowsHeld, piece_texels, rows_held};
 use super::{
     DecodeWork, ImageLayout, PixelFormat, Plane, PlaneLayout, Stop, interleave, premultiply,
 };
@@ -19,7 +17,7 @@ use core::ops::Range;
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::{MASK, MATTE, SMASK, SMASK_IN_DATA};
 use hayro_syntax::object::stream::OwnedStream;
-use hayro_syntax::work::Meter;
+use hayro_syntax::work::{Cancelled, Meter};
 use smallvec::SmallVec;
 
 /// An image read incrementally.
@@ -496,9 +494,7 @@ impl<'a> Streamed<'a> {
         }
     }
 
-    /// Reads `plane` into `area`. A reader that restarts (its data failed to decode
-    /// and it reads the data again from the start, another way) starts the pass over,
-    /// with the other readers rewound.
+    /// Reads `plane` into `area`.
     pub(super) fn run(
         &self,
         plane: Plane,
@@ -508,7 +504,7 @@ impl<'a> Streamed<'a> {
         match plane {
             Plane::Image => {
                 let mut pass = ImagePass::new(self, area, meter)?;
-                repeat_on_restart(area, |area| pass.run(area))?;
+                pass.run(area)?;
                 Ok(pass.work())
             }
             Plane::Mask => {
@@ -516,24 +512,9 @@ impl<'a> Streamed<'a> {
                     return Err(Stop::Failed);
                 };
                 let mut pass = MaskPass::new(mask, area, meter)?;
-                repeat_on_restart(area, |area| pass.run(area))?;
+                pass.run(area)?;
                 Ok(pass.work())
             }
-        }
-    }
-}
-
-/// Runs `pass` until it ends other than by a restart, with `area` emptied before
-/// each repeat.
-fn repeat_on_restart(
-    area: &mut Area<'_>,
-    mut pass: impl FnMut(&mut Area<'_>) -> Result<(), Break>,
-) -> Result<(), Stop> {
-    loop {
-        match pass(area) {
-            Ok(()) => return Ok(()),
-            Err(Break::Restart) => area.reset()?,
-            Err(Break::Stop(stop)) => return Err(stop),
         }
     }
 }
@@ -647,7 +628,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
     }
 
     /// Reads the rows from the first to the last `area` reads, pushing those it reads.
-    fn run(&mut self, area: &mut Area<'_>) -> Result<(), Break> {
+    fn run(&mut self, area: &mut Area<'_>) -> Result<(), Stop> {
         let wanted = area.rows();
         let first = std::mem::take(&mut self.first_row);
         for y in first..wanted.end.min(self.image.height) {
@@ -659,7 +640,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
             if matches!(end, RowEnd::Missing) {
                 // Data that holds no row fails, as decoding it whole does.
                 if y == 0 {
-                    return Err(Stop::Failed.into());
+                    return Err(Stop::Failed);
                 }
                 break;
             }
@@ -674,45 +655,11 @@ impl<'s, 'a> ImagePass<'s, 'a> {
         Ok(())
     }
 
-    /// Why reading the colour stopped. After its reader restarted, the mask starts
-    /// over too, and the states saved are dropped (they decode the data the way that
-    /// failed).
-    fn colour_failed(&mut self, e: Break) -> Break {
-        if matches!(e, Break::Restart) {
-            if let Some(m) = &mut self.mask {
-                m.rows.rewind(true);
-            }
-            if let Some(c) = &mut self.checkpointer
-                && let Err(stop) = c.restarted()
-            {
-                return stop.into();
-            }
-        }
-        e
-    }
-
-    /// Why reading the mask stopped. After its reader restarted, the colour starts
-    /// over too.
-    fn mask_failed(&mut self, e: Break) -> Break {
-        if matches!(e, Break::Restart) {
-            self.raw.rewind();
-            if let Some(m) = &mut self.mask {
-                m.rows.rewind(false);
-            }
-        }
-        e
-    }
-
     /// Reads past the next row, and the mask's.
-    fn skip_row(&mut self) -> Result<RowEnd, Break> {
-        let row = match self.raw.skip_row() {
-            Ok(row) => row,
-            Err(e) => return Err(self.colour_failed(e)),
-        };
-        if let Some(m) = &mut self.mask
-            && let Err(e) = m.rows.skip_row()
-        {
-            return Err(self.mask_failed(e));
+    fn skip_row(&mut self) -> Result<RowEnd, Cancelled> {
+        let row = self.raw.skip_row()?;
+        if let Some(m) = &mut self.mask {
+            m.rows.skip_row()?;
         }
         Ok(self.row_end(row))
     }
@@ -734,7 +681,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
     /// Reads the next row, converting and pushing the columns `area` reads piece by
     /// piece. A row the data ends within is padded with the samples whole decoding
     /// pads it with, those past the mask's data pushed at once, or dropped.
-    fn read_row(&mut self, area: &mut Area<'_>) -> Result<RowEnd, Break> {
+    fn read_row(&mut self, area: &mut Area<'_>) -> Result<RowEnd, Stop> {
         let columns = area.columns();
         let n = self.image.colour.components();
         let (c0, c1) = (columns.start as usize, columns.end as usize);
@@ -744,10 +691,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
         if let Some(m) = &mut self.mask {
             m.rows.begin_row();
         }
-        let mut held = match self.raw.skip(self.image.colour.bytes(start)) {
-            Ok(held) => held,
-            Err(e) => return Err(self.colour_failed(e)),
-        };
+        let mut held = self.raw.skip(self.image.colour.bytes(start))?;
         if !held && !self.keeps_row() {
             return Ok(RowEnd::Missing);
         }
@@ -763,10 +707,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
                 break;
             }
             let len = piece.min(c1 - col);
-            let (got, wanted) = match self.read_samples(len, held) {
-                Ok(read) => read,
-                Err(e) => return Err(self.colour_failed(e)),
-            };
+            let (got, wanted) = self.read_samples(len, held)?;
             if got < wanted {
                 if held && !self.keeps_row() {
                     // Only the first row of the data can be too short to keep (a later
@@ -778,10 +719,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
                 self.pad_samples(len, got);
             }
             if let Some(m) = &mut self.mask {
-                match m.rows.alpha(col..col + len, &mut m.alpha[..len]) {
-                    Ok(present) => mask_held = present == len,
-                    Err(e) => return Err(self.mask_failed(e)),
-                }
+                mask_held = m.rows.alpha(col..col + len, &mut m.alpha[..len])? == len;
             }
             let texels = self.texels(len)?;
             let skipped = texels.len() / len * (first - col);
@@ -789,17 +727,12 @@ impl<'s, 'a> ImagePass<'s, 'a> {
             col += len;
         }
         let row = if held {
-            match self.raw.finish() {
-                Ok(row) => row,
-                Err(e) => return Err(self.colour_failed(e)),
-            }
+            self.raw.finish()?
         } else {
             RawRow::Partial
         };
-        if let Some(m) = &mut self.mask
-            && let Err(e) = m.rows.end_row()
-        {
-            return Err(self.mask_failed(e));
+        if let Some(m) = &mut self.mask {
+            m.rows.end_row()?;
         }
         let end = self.row_end(row);
         if !matches!(end, RowEnd::Missing) {
@@ -811,7 +744,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
     /// Reads the stored bytes of the next `len` texels, if the data still holds the
     /// row (`held`): the bytes read and those wanted. Samples of whole bytes read are
     /// unpacked.
-    fn read_samples(&mut self, len: usize, held: bool) -> Result<(usize, usize), Break> {
+    fn read_samples(&mut self, len: usize, held: bool) -> Result<(usize, usize), Cancelled> {
         let n = self.image.colour.components();
         let wanted = self.image.colour.bytes(len);
         if !held {
@@ -933,25 +866,21 @@ impl<'a> MaskPass<'a> {
     }
 
     /// Moves past the rows before those `area` reads, then reads and pushes those.
-    fn run(&mut self, area: &mut Area<'_>) -> Result<(), Break> {
+    fn run(&mut self, area: &mut Area<'_>) -> Result<(), Cancelled> {
         let (wanted, columns) = (area.rows(), area.columns());
         let (c0, c1) = (columns.start as usize, columns.end as usize);
         let end = wanted.end.min(self.height);
         let first = wanted.start.min(end);
-        self.rows
-            .skip_rows(first)
-            .and_then(|()| (first..end).try_for_each(|_| self.read_row(area, c0..c1)))
-            .inspect_err(|e| {
-                if matches!(e, Break::Restart) {
-                    self.rows.rewind(false);
-                }
-            })?;
+        self.rows.skip_rows(first)?;
+        for _ in first..end {
+            self.read_row(area, c0..c1)?;
+        }
         self.decoded += end;
         Ok(())
     }
 
     /// Reads the next row, pushing `columns` of it.
-    fn read_row(&mut self, area: &mut Area<'_>, columns: Range<usize>) -> Result<(), Break> {
+    fn read_row(&mut self, area: &mut Area<'_>, columns: Range<usize>) -> Result<(), Cancelled> {
         self.rows.begin_row();
         let mut col = columns.start;
         while col < columns.end {

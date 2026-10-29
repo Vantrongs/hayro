@@ -451,7 +451,7 @@ fn read(stream: &Stream<'_>) -> Result<Vec<u8>, String> {
         }
     }
     if let Some(mut reader) = stream.decoded_reader() {
-        let read = read_all(|buf| reader.read(buf, &Meter::default()));
+        let read = read_all(|buf| Ok(reader.read(buf, &Meter::default())?));
         assert_eq!(read, lenient.ok(), "decoded_reader");
     }
     strict

@@ -326,8 +326,7 @@ pub struct ImageRegion {
 /// The decoding an [`ImageSource`]'s requests have done since it was opened.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DecodeWork {
-    /// Source rows decoded, including those read through to reach a window and those
-    /// a restart of the decoder voided.
+    /// Source rows decoded, including those read through to reach a window.
     pub rows_decoded: u64,
     /// Bytes the incremental Flate decoders produced (see
     /// [`DecodedReader::inflated_bytes`](hayro_syntax::object::stream::DecodedReader::inflated_bytes)).

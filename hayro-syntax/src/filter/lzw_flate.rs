@@ -10,9 +10,17 @@ pub(crate) mod flate {
 
     /// The data inflated and its predictor reversed, the work counted on `meter`;
     /// `None` once its hook asks to stop, or, if `strict`, where the data is corrupt
-    /// rather than cut short (see [`fallback::decode`]). `expected` is the size the
+    /// rather than cut short (see [`fallback::decode_lenient`]). `expected` is the size the
     /// inflated data should have, 0 where none is known: room is not reserved past
     /// it while the data is shorter ([`inflate`]).
+    ///
+    /// The data is read as zlib, else as raw deflate, else by the permissive decoder.
+    /// If `strict`, a reading that finds the data corrupt gives way to the next one.
+    /// Otherwise a reading that made a byte is kept, up to where it found the data
+    /// corrupt: what it made from the data read so far cannot change with the data
+    /// after, so a reader that hands out bytes as they are made
+    /// ([`DecodedReader`](crate::filter::reader::DecodedReader)) yields these bytes.
+    /// `MuPDF` keeps the zlib reading of such data too (observed in `PyMuPDF` 1.28.2).
     pub(crate) fn decode(
         data: &[u8],
         params: &PredictorParams,
@@ -48,29 +56,44 @@ pub(crate) mod flate {
         limit: usize,
     ) -> Result<Option<Vec<u8>>, Larger> {
         let larger = |tried| move |_| Larger { tried };
-        let decoded = match inflate(data, true, meter, expected, limit).map_err(larger(0))? {
+        let mut decoded = None;
+        for (tried, zlib) in [(0, true), (1, false)] {
+            match inflate(data, zlib, meter, expected, limit).map_err(larger(tried))? {
+                Inflated::Whole(made) => decoded = Some(made),
+                Inflated::Broken(made) if !strict && !made.is_empty() => decoded = Some(made),
+                Inflated::Broken(_) => continue,
+                Inflated::Cancelled => return Ok(None),
+            }
+            break;
+        }
+        let decoded = match decoded {
             Some(decoded) => decoded,
-            None if meter.cancelled() => return Ok(None),
-            None => match inflate(data, false, meter, expected, limit).map_err(larger(1))? {
-                Some(decoded) => decoded,
-                None if meter.cancelled() => return Ok(None),
-                None => {
-                    warn!("flate stream is broken, decoding with fallback");
-                    match fallback::decode_within(data, meter, strict, limit) {
-                        Ok(Some(decoded)) => decoded,
-                        Ok(None) | Err(fallback::Stopped::Cancelled) => return Ok(None),
-                        Err(fallback::Stopped::Larger) => return Err(Larger { tried: 2 }),
-                    }
+            None => {
+                warn!("flate stream is broken, decoding with fallback");
+                match fallback::decode_within(data, meter, strict, limit) {
+                    Ok(Some(decoded)) => decoded,
+                    Ok(None) | Err(fallback::Stopped::Cancelled) => return Ok(None),
+                    Err(fallback::Stopped::Larger) => return Err(Larger { tried: 2 }),
                 }
-            },
+            }
         };
         Ok(apply_predictor(decoded, params, meter).map(fitted))
     }
 
+    /// How a reading of the data as zlib or as raw deflate ended.
+    #[cfg(feature = "unsafe")]
+    enum Inflated {
+        /// It read through the stream, or to the end of the data.
+        Whole(Vec<u8>),
+        /// It found the data corrupt for its format after making these bytes.
+        Broken(Vec<u8>),
+        /// The meter's hook asked to stop.
+        Cancelled,
+    }
+
     /// `data` inflated whole, read as zlib if `zlib`, else as raw deflate, the work
-    /// counted on `meter`; `None` when the data is corrupt for that format or the hook
-    /// asks to stop. Data that ends before its stream does yields what it holds, and
-    /// bytes after the stream's end are ignored.
+    /// counted on `meter`. Data that ends before its stream does yields what it holds,
+    /// and bytes after the stream's end are ignored.
     /// `Err` once it made more than `limit` bytes. Its room grows as upstream's does
     /// ([`room`]), but while it made less than `expected` no further than that and a
     /// little more, which the end of the stream is read into: the room of a large
@@ -82,7 +105,7 @@ pub(crate) mod flate {
         meter: &Meter<'_>,
         expected: usize,
         limit: usize,
-    ) -> Result<Option<Vec<u8>>, ()> {
+    ) -> Result<Inflated, ()> {
         let mut decoder = zlib_rs::Inflate::new(zlib, 15);
         let mut out = Vec::new();
         // The input bytes the decoder took, and those it was offered and counted.
@@ -100,7 +123,7 @@ pub(crate) mod flate {
             // there.
             let end = data.len().min(taken + POLL_BYTES / 2);
             if meter.work(end.saturating_sub(offered)).is_err() {
-                return Ok(None);
+                return Ok(Inflated::Cancelled);
             }
             offered = offered.max(end);
             let input = &data[taken..end];
@@ -119,14 +142,14 @@ pub(crate) mod flate {
             out.truncate(len + written);
             taken += took;
             if meter.work(written).is_err() {
-                return Ok(None);
+                return Ok(Inflated::Cancelled);
             }
             match status {
                 Ok(_) if out.len() > limit => return Err(()),
-                Ok(zlib_rs::Status::StreamEnd) => return Ok(Some(out)),
+                Ok(zlib_rs::Status::StreamEnd) => return Ok(Inflated::Whole(out)),
                 Ok(_) if written > 0 || took > 0 => {}
-                Ok(_) if input.is_empty() => return Ok(Some(out)),
-                _ => return Ok(None),
+                Ok(_) if input.is_empty() => return Ok(Inflated::Whole(out)),
+                _ => return Ok(Inflated::Broken(out)),
             }
         }
     }
@@ -183,15 +206,14 @@ pub(crate) mod flate {
         use alloc::vec::Vec;
 
         /// The data decoded, its work counted on `meter`. Decoding stops at the first
-        /// thing that is no valid deflate data and keeps what came before; if `strict`,
-        /// such data is `None` instead. Data that ends early, or with a wrong or missing
-        /// checksum, is not corrupt: what it holds is all decoded.
-        pub(crate) fn decode(
-            data: &[u8],
-            meter: &Meter<'_>,
-            strict: bool,
-        ) -> Result<Option<Vec<u8>>, Cancelled> {
-            decode_within(data, meter, strict, usize::MAX).map_err(|_| Cancelled)
+        /// thing that is no valid deflate data and keeps what came before. Data that
+        /// ends early, or with a wrong or missing checksum, is not corrupt: what it
+        /// holds is all decoded.
+        pub(crate) fn decode_lenient(data: &[u8], meter: &Meter<'_>) -> Result<Vec<u8>, Cancelled> {
+            match run(data, meter, usize::MAX) {
+                Ok((decoded, _)) => Ok(decoded),
+                Err(_) => Err(Cancelled),
+            }
         }
 
         /// The most bytes a step makes past the bytes it was asked for: a match.
@@ -204,13 +226,25 @@ pub(crate) mod flate {
             Larger,
         }
 
-        /// [`decode`], stopped once it made more than `limit` bytes.
+        /// [`decode_lenient`], stopped once it made more than `limit` bytes; if
+        /// `strict`, `None` where the data is corrupt.
         pub(crate) fn decode_within(
             data: &[u8],
             meter: &Meter<'_>,
             strict: bool,
             limit: usize,
         ) -> Result<Option<Vec<u8>>, Stopped> {
+            let (decoded, corrupt) = run(data, meter, limit)?;
+            if corrupt && strict {
+                warn!("flate stream is corrupt");
+                return Ok(None);
+            }
+            Ok(Some(decoded))
+        }
+
+        /// The bytes decoded, stopped once they are more than `limit`, and whether the
+        /// decoder stopped at data that is no valid deflate.
+        fn run(data: &[u8], meter: &Meter<'_>, limit: usize) -> Result<(Vec<u8>, bool), Stopped> {
             let mut stream = FlateStream::new(Slice::new(data));
             let pending = limit.saturating_add(1);
             stream.most = pending.saturating_add(STEP_PAST);
@@ -221,11 +255,7 @@ pub(crate) mod flate {
             if stream.made() > limit {
                 return Err(Stopped::Larger);
             }
-            if stream.corrupt && strict {
-                warn!("flate stream is corrupt");
-                return Ok(None);
-            }
-            Ok(Some(core::mem::take(&mut stream.output)))
+            Ok((core::mem::take(&mut stream.output), stream.corrupt))
         }
 
         /// Where the decoder takes its bytes from, one at a time.
