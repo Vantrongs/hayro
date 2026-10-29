@@ -27,9 +27,8 @@ pub(crate) struct ImageXObject<'a> {
     /// Whether the colour space is a name looked up in the resources (which the spec
     /// allows only for inline images), so it depends on where the image is drawn.
     pub(crate) cs_by_name: bool,
-    /// What its data are read through once it is drawn: a reader apart from the
-    /// table the image was read through (`Context::reader`), or, without one, a
-    /// reader of its own.
+    /// Once it is drawn, what the readers its data are read through share with the
+    /// table the image was read through (`Context::reader`); without it, its own.
     pub(crate) reader: Option<Detached>,
 }
 
@@ -240,11 +239,12 @@ impl<'a> ImageXObject<'a> {
         self.apart(|image| decode_image(image, target_dimension, &Meter::default()))?
     }
 
-    /// `f` of the image read again through its reader ([`Self::reader`]), so that
-    /// decoding it keeps nothing in the table it was read through; `None` where it
-    /// cannot be read again.
+    /// `f` of the image read again through a reader of its own, made from
+    /// [`Self::reader`] and dropped after `f`, so that what decoding it reads is
+    /// kept neither in the table it was read through nor past the decoding; `None`
+    /// where it cannot be read again.
     fn apart<R>(&self, f: impl FnOnce(&ImageXObject<'_>) -> R) -> Option<R> {
-        let owned = self.stream.to_owned_stream(self.reader.as_ref());
+        let reader = self.stream.to_owned_stream(self.reader.as_ref()).reader();
         let image = ImageXObject {
             width: self.width,
             height: self.height,
@@ -252,7 +252,7 @@ impl<'a> ImageXObject<'a> {
             cache: self.cache.clone(),
             interpolate: self.interpolate,
             kind: self.kind,
-            stream: owned.get()?,
+            stream: reader.stream()?,
             transfer_function: self.transfer_function.clone(),
             warning_sink: self.warning_sink.clone(),
             cs_by_name: self.cs_by_name,

@@ -5,7 +5,7 @@ use crate::crypto::reader::Cursor;
 use crate::crypto::reader::DecryptedReader;
 use crate::filter::lzw_flate::{PredictorParams, Unpredictor, flate};
 #[cfg(feature = "unsafe")]
-use crate::object::stream::OwnedStream;
+use crate::object::stream::{OwnedStream, StreamReader};
 use crate::work::{Cancelled, Meter, POLL_BYTES};
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
@@ -173,13 +173,13 @@ impl<'a> DecodedReader<'a> {
     /// incrementally (not as stored, nor after a restart to the permissive decoder),
     /// or when the decoder state cannot be allocated.
     #[cfg(feature = "unsafe")]
-    pub fn checkpoint(&self, stream: &OwnedStream) -> Option<DecodedCheckpoint> {
+    pub fn checkpoint(&self, stream: &StreamReader) -> Option<DecodedCheckpoint> {
         let (inflating, data) = self.checkpointable()?;
         if !stream.holds(data) {
             return None;
         }
         Some(DecodedCheckpoint {
-            _stream: stream.clone(),
+            _stream: stream.owned().clone(),
             data: address(data),
             decoder: inflating.decoder.try_clone().ok()?,
             zlib: inflating.zlib,

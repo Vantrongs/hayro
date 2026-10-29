@@ -15,7 +15,7 @@ use crate::x_object::image::ImageXObject;
 use core::ops::Range;
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::{MASK, MATTE, SMASK, SMASK_IN_DATA};
-use hayro_syntax::object::stream::OwnedStream;
+use hayro_syntax::object::stream::StreamReader;
 use hayro_syntax::work::{Cancelled, Meter};
 use smallvec::SmallVec;
 
@@ -25,7 +25,7 @@ pub(super) struct Streamed<'a> {
     colour: Colour,
     alpha: Alpha<'a>,
     /// `obj`'s stream, owned, which the decoder states saved in `checkpoints` keep.
-    stream: &'a OwnedStream,
+    stream: &'a StreamReader,
     checkpoints: &'a Checkpoints,
     /// The decoding opening the image did.
     pub(super) opened: DecodeWork,
@@ -199,7 +199,7 @@ impl<'a> Streamed<'a> {
     /// into `mask_height` once.
     pub(super) fn new(
         obj: &ImageXObject<'a>,
-        stream: &'a OwnedStream,
+        stream: &'a StreamReader,
         checkpoints: &'a Checkpoints,
         mask_height: &MaskHeight,
         meter: &Meter<'_>,

@@ -86,7 +86,7 @@ pub(super) fn asset(pdf: &Pdf) -> ImageAsset {
 /// The image decoded whole, as images that are not streamed are.
 pub(super) fn whole(asset: &ImageAsset) -> ImageSource<'_> {
     let meter = Meter::default();
-    let decoded = decode_image(&asset.xobject().unwrap(), None, &meter).unwrap();
+    let decoded = decode_image(&asset.reader().xobject().unwrap(), None, &meter).unwrap();
     let decoded = Decoded::new(decoded.image, decoded.alpha, &meter).unwrap();
     ImageSource::new(
         decoded.layout(),
@@ -136,7 +136,8 @@ pub(super) fn assert_streams_as_decoded(objects: &[(String, Vec<u8>)]) {
 }
 
 pub(super) fn assert_asset_streams_as_decoded(asset: &ImageAsset) {
-    let mut streamed = asset.open(None, None).unwrap();
+    let reader = asset.reader();
+    let mut streamed = reader.open(None, None).unwrap();
     assert!(is_streamed(&streamed));
     let mut decoded = whole(asset);
     assert_eq!(streamed.layout(), decoded.layout());
@@ -367,7 +368,8 @@ fn data_that_ends_early_leaves_the_rest_transparent() {
     ] {
         let pdf = pdf(&[(dict, data)]);
         let asset = asset(&pdf);
-        let mut streamed = asset.open(None, None).unwrap();
+        let reader = asset.reader();
+        let mut streamed = reader.open(None, None).unwrap();
         let mut decoded = whole(&asset);
         assert_eq!(decoded.layout().image.height, 4);
         let a = request(&mut streamed, Plane::Image, (w, h), [0, 0, w, h]);
@@ -395,7 +397,8 @@ fn a_huge_declared_image_with_little_data_costs_the_data() {
         vec![7; 100],
     )]);
     let asset = asset(&pdf);
-    let mut source = asset.open(None, None).unwrap();
+    let reader = asset.reader();
+    let mut source = reader.open(None, None).unwrap();
     let region = request(&mut source, Plane::Image, (100, 100), [0, 0, 100, 100]);
     assert_eq!(region.format, PixelFormat::LumaAlpha);
     assert_eq!(source.work().rows_decoded, 1);
@@ -454,7 +457,8 @@ fn a_short_wide_row_is_dropped() {
         noise(70_000, 16),
     )]);
     let asset = asset(&pdf);
-    let mut streamed = asset.open(None, None).unwrap();
+    let reader = asset.reader();
+    let mut streamed = reader.open(None, None).unwrap();
     for grid in [(w, h), (w / 2, 2), (70, 2)] {
         for window in [[0, 0, grid.0, grid.1], [0, 0, grid.0 / 70, 1]] {
             let a = request(&mut streamed, Plane::Image, grid, window);
@@ -478,7 +482,8 @@ fn a_row_cut_short_pushes_the_texels_it_holds() {
     for (w, data, kept) in [(20_000_000, 1, 0), (2_000_000, 1_000_001, 1)] {
         let pdf = pdf(&[(image(gray, w, 2), noise(data, 17))]);
         let asset = asset(&pdf);
-        let mut streamed = asset.open(None, None).unwrap();
+        let reader = asset.reader();
+        let mut streamed = reader.open(None, None).unwrap();
         crate::x_object::area::PUSHED.set(0);
         let a = request(&mut streamed, Plane::Image, (2, 2), [1, 0, 2, 1]);
         let pushed = crate::x_object::area::PUSHED.get();
@@ -626,7 +631,8 @@ fn a_request_is_cancelled_within_two_pieces() {
         ),
     ] {
         let asset = asset(&pdf(&objects));
-        let mut streamed = asset.open(None, None).unwrap();
+        let reader = asset.reader();
+        let mut streamed = reader.open(None, None).unwrap();
         assert!(is_streamed(&streamed));
         for window in windows {
             assert_cancelled(&mut streamed, plane, grid, window);
@@ -710,7 +716,8 @@ fn a_first_open_is_cancelled_within_bounded_work() {
         };
         TOLD.set(0);
         rows::READ.set(0);
-        let opened = asset.open(None, Some(&hook));
+        let reader = asset.reader();
+        let opened = reader.open(None, Some(&hook));
         assert!(matches!(opened, Err(RequestError::Cancelled)), "{name}");
         assert_eq!(polls.get(), 2, "{name}");
         let (told, read) = (TOLD.get(), rows::READ.get());
@@ -718,7 +725,8 @@ fn a_first_open_is_cancelled_within_bounded_work() {
             told < 3 * POLL_BYTES && read < 3 * POLL_BYTES as u64,
             "{name}: {told} bytes of work, {read} bytes read"
         );
-        let mut source = asset.open(None, None).unwrap();
+        let reader = asset.reader();
+        let mut source = reader.open(None, None).unwrap();
         let mut expected = whole(&asset);
         for plane in [Plane::Image, Plane::Mask] {
             let Some(layout) = source.layout().plane(plane).copied() else {
@@ -744,7 +752,8 @@ fn padding_missing_rows_is_cancelled_within_bounded_work() {
         vec![],
     )]);
     let asset = asset(&pdf);
-    let mut source = asset.open(None, None).unwrap();
+    let reader = asset.reader();
+    let mut source = reader.open(None, None).unwrap();
     let request_of = |cancel| ImageRequest {
         plane: Plane::Image,
         grid: (w, 2),
@@ -787,7 +796,8 @@ fn rows_of_a_decoded_mask_are_skipped_without_work() {
         ),
     ]);
     let asset = asset(&pdf);
-    let mut source = asset.open(None, None).unwrap();
+    let reader = asset.reader();
+    let mut source = reader.open(None, None).unwrap();
     assert!(is_streamed(&source));
     let polls = Cell::new(0);
     let hook = || {
@@ -847,7 +857,8 @@ fn requests_are_checked() {
         noise((w * h) as usize, 6),
     )]);
     let asset = asset(&pdf);
-    let mut source = asset.open(None, None).unwrap();
+    let reader = asset.reader();
+    let mut source = reader.open(None, None).unwrap();
     for (plane, grid, window) in [
         (Plane::Mask, (w, h), [0, 0, 1, 1]),
         (Plane::Image, (w + 1, h), [0, 0, 1, 1]),
@@ -891,7 +902,8 @@ fn a_stencil_asset_is_the_alpha_the_paint_is_drawn_through() {
     let expected = obj.decoded_mask(None).unwrap().luma.data;
     assert_eq!(&expected[..10], &[0, 255, 0, 255, 0, 255, 0, 255, 0, 0]);
     let asset = obj.asset(None);
-    let mut source = asset.open(None, None).unwrap();
+    let reader = asset.reader();
+    let mut source = reader.open(None, None).unwrap();
     let layout = *source.layout();
     assert_eq!(layout.mask, None);
     assert_eq!(layout.image.format, PixelFormat::Alpha);

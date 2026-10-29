@@ -21,7 +21,7 @@ use crate::sync::Arc;
 use crate::trivia::is_white_space_character;
 use crate::util::{OptionLog, find_needle};
 use crate::work::Meter;
-use crate::xref::{Detached, StreamId};
+use crate::xref::{Detached, StreamId, XRef};
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -614,21 +614,19 @@ impl<'a> Stream<'a> {
         }
     }
 
-    /// An owned handle to this stream, which [`OwnedStream::get`] turns back into it
+    /// An owned handle to this stream, which [`OwnedStream::reader`] reads again
     /// without borrowing the data it was read from: for an indirect object, its
-    /// identifier and `reader`, a reader of its document apart from the table it was
-    /// read through ([`XRef::detached`](crate::xref::XRef::detached)), so that
-    /// reading it again keeps nothing in that table; without a reader of its
-    /// document, one of its own. For an inline image, a copy of the dictionary and
-    /// data.
-    pub fn to_owned_stream(&self, reader: Option<&Detached>) -> OwnedStream {
+    /// identifier and `apart`, what readers of its document apart from the table it
+    /// was read through share ([`XRef::detached`](crate::xref::XRef::detached)), so
+    /// that reading it again keeps nothing in that table; without them for its
+    /// document, its own. For an inline image, a copy of the dictionary and data.
+    pub fn to_owned_stream(&self, apart: Option<&Detached>) -> OwnedStream {
         OwnedStream(match self.dict.obj_id() {
             Some(id) => OwnedInner::Indirect {
-                xref: match reader {
+                xref: match apart {
                     Some(reader)
-                        if reader.xref().document_id().is_some()
-                            && reader.xref().document_id()
-                                == self.dict.ctx().xref().document_id() =>
+                        if reader.document_id().is_some()
+                            && reader.document_id() == self.dict.ctx().xref().document_id() =>
                     {
                         reader.clone()
                     }
@@ -644,7 +642,8 @@ impl<'a> Stream<'a> {
     }
 }
 
-/// A stream that owns what it needs to read it again (see [`Stream::to_owned_stream`]).
+/// A stream that owns what it needs to read it again (see [`Stream::to_owned_stream`]),
+/// and keeps nothing it read.
 #[derive(Clone)]
 pub struct OwnedStream(OwnedInner);
 
@@ -661,21 +660,62 @@ enum OwnedInner {
 }
 
 impl OwnedStream {
+    /// A reader of the stream of its own ([`StreamReader`]).
+    pub fn reader(&self) -> StreamReader {
+        StreamReader {
+            read: match &self.0 {
+                OwnedInner::Indirect { xref, id } => Read::Indirect {
+                    xref: xref.reader(),
+                    id: *id,
+                },
+                OwnedInner::Inline { dict, data } => Read::Inline {
+                    dict: dict.clone(),
+                    data: data.clone(),
+                },
+            },
+            owned: self.clone(),
+        }
+    }
+}
+
+/// The stream of an [`OwnedStream`] read through a reader of its own: what reading
+/// it and what its dictionary names (its filters' parameters, its masks) keeps, such
+/// as the object streams those are in, it keeps, and frees when it is dropped. So
+/// what holds an [`OwnedStream`] holds nothing it read, however often it is read.
+pub struct StreamReader {
+    owned: OwnedStream,
+    pub(crate) read: Read,
+}
+
+/// What a [`StreamReader`] reads its stream from.
+pub(crate) enum Read {
+    /// An object, through a reader of the document of its own.
+    Indirect { xref: XRef, id: ObjectIdentifier },
+    /// An inline image's dictionary and data.
+    Inline { dict: Arc<[u8]>, data: Arc<[u8]> },
+}
+
+impl StreamReader {
     /// The stream; `None` if it can no longer be read.
-    pub fn get(&self) -> Option<Stream<'_>> {
-        match &self.0 {
-            OwnedInner::Indirect { xref, id } => xref.xref().get::<Stream<'_>>(*id),
-            OwnedInner::Inline { dict, data } => {
+    pub fn stream(&self) -> Option<Stream<'_>> {
+        match &self.read {
+            Read::Indirect { xref, id } => xref.get::<Stream<'_>>(*id),
+            Read::Inline { dict, data } => {
                 let dict = Reader::new(dict).read_without_context::<InlineImageDict<'_>>()?;
                 Some(Stream::new(data, dict.get_dict().clone()))
             }
         }
     }
 
+    /// The handle read.
+    pub fn owned(&self) -> &OwnedStream {
+        &self.owned
+    }
+
     /// Whether `data` are this stream's stored bytes, not merely equal to them.
     #[cfg(feature = "unsafe")]
     pub(crate) fn holds(&self, data: &[u8]) -> bool {
-        self.get()
+        self.stream()
             .is_some_and(|stream| core::ptr::eq(stream.data, data))
     }
 }

@@ -17,7 +17,7 @@ use crate::cache::Cache;
 use crate::color::ColorSpace;
 use crate::interpret::state::ActiveTransferFunction;
 use decoded::Decoded;
-use hayro_syntax::object::stream::OwnedStream;
+use hayro_syntax::object::stream::{OwnedStream, StreamReader};
 use hayro_syntax::work::{Cancelled, Meter};
 use index::Checkpoints;
 use jpeg::JpegStreamed;
@@ -29,13 +29,16 @@ use streamed::Streamed;
 /// A raster image's source, owned: its stream (by object identifier, or a copy of an
 /// inline image's bytes), resolved colour space, transfer function, interpolation
 /// and masks, without the content stream or resources it was drawn from. It holds no
-/// decoded pixels; [`ImageAsset::open`] reads it. Cheap to clone.
+/// decoded pixels, nor anything decoding it read; [`ImageReader::open`] reads it.
+/// Cheap to clone.
 ///
-/// Its stream is read through a reader of the document apart from the table it was
-/// drawn from ([`XRef::detached`](hayro_syntax::xref::XRef::detached)), shared by the
-/// images drawn in one context: what decoding it reads (its filters' parameters, its
-/// masks) is kept with the assets, not in the document, which a renderer may keep
-/// open while it draws other pages.
+/// Its stream is read through a reader of the document of its own, apart from the
+/// table it was drawn from ([`XRef::detached`](hayro_syntax::xref::XRef::detached)),
+/// one for each [`ImageAsset::reader`]: what decoding it reads (its filters'
+/// parameters, its masks, the object streams they are in) is kept while the image
+/// is read, neither in the document, which a renderer may keep open while it draws
+/// other pages, nor with the asset, which a display list may keep while the image
+/// is read again and again.
 #[derive(Clone)]
 pub struct ImageAsset(Arc<AssetData>);
 
@@ -102,8 +105,25 @@ impl ImageAsset {
         Ok(self.0.checkpoints.bytes()?)
     }
 
+    /// A reader of the image of its own, to open it with ([`ImageReader::open`]):
+    /// what reading it keeps, it keeps, and frees when it is dropped.
+    pub fn reader(&self) -> ImageReader {
+        ImageReader {
+            asset: self.clone(),
+            stream: self.0.stream.reader(),
+        }
+    }
+}
+
+/// An [`ImageAsset`] read through a reader of its own ([`ImageAsset::reader`]).
+pub struct ImageReader {
+    asset: ImageAsset,
+    stream: StreamReader,
+}
+
+impl ImageReader {
     fn xobject(&self) -> Option<ImageXObject<'_>> {
-        let a = &*self.0;
+        let a = &*self.asset.0;
         Some(ImageXObject {
             width: a.width,
             height: a.height,
@@ -111,7 +131,7 @@ impl ImageAsset {
             cache: a.cache.clone(),
             interpolate: a.interpolate,
             kind: a.kind,
-            stream: a.stream.get()?,
+            stream: self.stream.stream()?,
             transfer_function: a.transfer_function.clone(),
             warning_sink: a.warning_sink.clone(),
             cs_by_name: a.cs_by_name,
@@ -141,7 +161,7 @@ impl ImageAsset {
         let meter = Meter::new(cancel);
         meter.poll()?;
         let obj = self.xobject().ok_or(RequestError::Failed)?;
-        let a = &*self.0;
+        let a = &*self.asset.0;
         if a.kind == ImageKind::StencilMask {
             let decoded = decode_mask(&obj, hint, &meter);
             meter.poll()?;
@@ -152,7 +172,7 @@ impl ImageAsset {
                 DecodeWork::default(),
             ));
         }
-        let streamed = Streamed::new(&obj, &a.stream, &a.checkpoints, &a.mask_height, &meter)?;
+        let streamed = Streamed::new(&obj, &self.stream, &a.checkpoints, &a.mask_height, &meter)?;
         if let Some(streamed) = streamed {
             let (layout, opened) = (streamed.layout(), streamed.opened);
             return Ok(ImageSource::new(
@@ -161,7 +181,7 @@ impl ImageAsset {
                 opened,
             ));
         }
-        if let Some(jpeg) = JpegStreamed::new(&obj, &a.stream, &a.checkpoints.jpeg, &meter)? {
+        if let Some(jpeg) = JpegStreamed::new(&obj, &self.stream, &a.checkpoints.jpeg, &meter)? {
             let layout = jpeg.layout();
             return Ok(ImageSource::new(
                 layout,

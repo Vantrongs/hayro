@@ -1,6 +1,6 @@
 //! Grayscale JPEG data read in bands of rows, independent of the document's lifetime.
 
-use super::{OwnedInner, OwnedStream};
+use super::{OwnedInner, StreamReader};
 use crate::PdfData;
 use crate::filter::Filter;
 use crate::sync::Arc;
@@ -27,7 +27,7 @@ pub type JpegRows<'m> = GrayscaleRows<'m, JpegInput>;
 /// A position in [`JpegRows`] to resume reading from, which keeps the bytes alive.
 pub type JpegCheckpoint = GrayscaleCheckpoint<JpegInput>;
 
-impl OwnedStream {
+impl StreamReader {
     /// The stream's rows, when its one filter is `DCTDecode`, it is not encrypted, and
     /// its data is a single-scan baseline grayscale JPEG of `dimensions`. `None` for
     /// other data, which is decoded whole, and once `meter`'s hook asks to stop.
@@ -46,14 +46,14 @@ impl OwnedStream {
     }
 
     fn jpeg_input(&self) -> Option<JpegInput> {
-        let stream = self.get()?;
+        let stream = self.stream()?;
         if !matches!(stream.decryption(), Ok(None))
             || !matches!(stream.filters().as_slice(), [Filter::DctDecode])
         {
             return None;
         }
-        let bytes = match &self.0 {
-            OwnedInner::Indirect { xref, .. } => xref.xref().file_data()?.clone(),
+        let bytes = match &self.owned.0 {
+            OwnedInner::Indirect { xref, .. } => xref.file_data()?.clone(),
             OwnedInner::Inline { data, .. } => PdfData::from(Arc::new(data.clone())),
         };
         let all = bytes.as_ref();

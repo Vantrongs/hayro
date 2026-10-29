@@ -5,7 +5,7 @@
 use super::Stop;
 use super::jpeg::JpegIndex;
 use super::rows::RawRows;
-use hayro_syntax::object::stream::{DecodedCheckpoint, DecodedReader, OwnedStream};
+use hayro_syntax::object::stream::{DecodedCheckpoint, DecodedReader, StreamReader};
 use std::sync::Mutex;
 
 /// The most bytes one asset's saved states take, the index's own included.
@@ -56,7 +56,7 @@ impl Checkpoints {
     /// checkpointed or not one state fits the budget.
     pub(super) fn checkpointer<'c>(
         &'c self,
-        stream: &'c OwnedStream,
+        stream: &'c StreamReader,
         raw: &mut RawRows<'_>,
         row_bytes: usize,
         height: u32,
@@ -111,7 +111,7 @@ impl Plan {
 /// reader restarted since it began.
 pub(super) struct Checkpointer<'c> {
     index: &'c Mutex<FlateIndex>,
-    stream: &'c OwnedStream,
+    stream: &'c StreamReader,
     plan: Plan,
     generation: u64,
 }
@@ -202,8 +202,9 @@ mod tests {
         ] {
             let pdf = gray(params, encoded);
             let asset = asset(&pdf);
-            let (_, cold) = rows(&mut asset.open(None, None).unwrap(), 3000..3016);
-            let mut warm = asset.open(None, None).unwrap();
+            let (_, cold) = rows(&mut asset.reader().open(None, None).unwrap(), 3000..3016);
+            let reader = asset.reader();
+            let mut warm = reader.open(None, None).unwrap();
             let (_, resumed) = rows(&mut warm, 2800..2816);
             assert!(
                 resumed.rows_decoded < u64::from(INTERVAL + 16),
@@ -237,6 +238,7 @@ mod tests {
             }
             assert!(asset.checkpoint_bytes().unwrap() <= CHECKPOINT_BUDGET);
             drop((warm, decoded));
+            drop(reader);
             let weak = Arc::downgrade(&asset.0);
             drop(asset);
             assert!(
@@ -260,7 +262,7 @@ mod tests {
             let pdf = pdf(&[(image(&dict, w, h), zlib(&predicted))]);
             let asset = asset(&pdf);
             for pass in 0..2 {
-                let (data, work) = rows(&mut asset.open(None, None).unwrap(), h - 2..h);
+                let (data, work) = rows(&mut asset.reader().open(None, None).unwrap(), h - 2..h);
                 assert_eq!(data, vec![0; 2 * w as usize]);
                 assert_eq!(pass == 1 && fits, work.rows_decoded < u64::from(h / 2));
                 assert!(asset.checkpoint_bytes().unwrap() <= CHECKPOINT_BUDGET);
@@ -281,7 +283,8 @@ mod tests {
         let data = noise((W * H) as usize, 71);
         let pdf = gray("", zlib(&data));
         let asset = asset(&pdf);
-        let mut source = asset.open(None, None).unwrap();
+        let reader = asset.reader();
+        let mut source = reader.open(None, None).unwrap();
         rows(&mut source, 3000..3016);
         // Polled as the request starts, and again as the rows after the saved state
         // it resumed at are read.
@@ -304,7 +307,9 @@ mod tests {
         std::thread::scope(|scope| {
             let read = |at: u32| {
                 let asset = &asset;
-                scope.spawn(move || rows(&mut asset.open(None, None).unwrap(), at..at + 16).0)
+                scope.spawn(move || {
+                    rows(&mut asset.reader().open(None, None).unwrap(), at..at + 16).0
+                })
             };
             let (a, b) = (read(2800), read(3100));
             let at = |row: u32| row as usize * W as usize;
@@ -319,8 +324,9 @@ mod tests {
     fn a_reader_of_a_dropped_generation_saves_nothing() {
         let pdf = gray("", zlib(&noise((W * H) as usize, 71)));
         let asset = asset(&pdf);
-        let obj = asset.xobject().unwrap();
-        let (checkpoints, stream) = (&asset.0.checkpoints, &asset.0.stream);
+        let reader = asset.reader();
+        let obj = reader.xobject().unwrap();
+        let (checkpoints, stream) = (&asset.0.checkpoints, &reader.stream);
         let meter = Meter::default();
         let mut raw = RawRows::new(&obj.stream, W as usize, &meter).unwrap();
         let checkpointer = |raw: &mut RawRows<'_>| {
@@ -352,7 +358,8 @@ mod tests {
             *encoded.last_mut().unwrap() ^= 1;
             let pdf = gray(params, encoded);
             let asset = asset(&pdf);
-            let mut source = asset.open(None, None).unwrap();
+            let reader = asset.reader();
+            let mut source = reader.open(None, None).unwrap();
             rows(&mut source, 2800..2816);
             assert!(saved(&asset) > 0);
             let (actual, _) = rows(&mut source, 4000..H);

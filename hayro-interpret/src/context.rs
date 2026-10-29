@@ -82,7 +82,7 @@ pub struct Context<'a> {
     /// While a generated annotation appearance is drawn, the glyphs it draws as forms
     /// by name.
     pub(crate) generated_glyphs: hash::Map<Rc<str>, Rc<Glyph>>,
-    /// What the images drawn in the context read their data through, once drawn
+    /// What the readers of the images drawn in the context share, once one is drawn
     /// ([`Context::reader`]).
     reader: OnceCell<Detached>,
 }
@@ -144,10 +144,11 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// A reader of the document apart from `xref` ([`XRef::detached`]), one for every
-    /// image drawn in the context: decoding an image reads what its dictionary names
-    /// (its filters' parameters, its masks), which the reader keeps for the images,
-    /// and with them, not `xref` for the document.
+    /// What readers of the document apart from `xref` share with it
+    /// ([`XRef::detached`]), for every image drawn in the context: decoding an image
+    /// reads what its dictionary names (its filters' parameters, its masks) through
+    /// a reader of its own made from it, which keeps what it reads while the image
+    /// is decoded, not `xref` for the document.
     pub(crate) fn reader(&self) -> &Detached {
         self.reader.get_or_init(|| self.xref.detached())
     }

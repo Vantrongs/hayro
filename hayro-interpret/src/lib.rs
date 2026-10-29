@@ -66,7 +66,7 @@ pub use types::*;
 pub use util::{RectExt, TransformExt};
 pub use x_object::area::{area_resample, area_texels};
 pub use x_object::asset::{
-    DecodeWork, ImageAsset, ImageLayout, ImageRegion, ImageRequest, ImageSource, PixelFormat,
-    Plane, PlaneLayout, RequestError,
+    DecodeWork, ImageAsset, ImageLayout, ImageReader, ImageRegion, ImageRequest, ImageSource,
+    PixelFormat, Plane, PlaneLayout, RequestError,
 };
 pub use x_object::soft_mask::*;

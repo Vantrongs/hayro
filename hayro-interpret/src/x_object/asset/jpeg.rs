@@ -9,7 +9,7 @@ use crate::x_object::area::Area;
 use crate::x_object::decode::decode_image;
 use crate::x_object::image::ImageXObject;
 use hayro_syntax::object::dict::keys::{MASK, SMASK, SMASK_IN_DATA};
-use hayro_syntax::object::stream::{JpegCheckpoint, JpegRows, OwnedStream};
+use hayro_syntax::object::stream::{JpegCheckpoint, JpegRows, StreamReader};
 use hayro_syntax::work::{Cancelled, Meter};
 use std::sync::Mutex;
 
@@ -99,7 +99,7 @@ impl<'a> JpegStreamed<'a> {
     /// A stop while parsing leaves the index unread.
     pub(super) fn new(
         obj: &ImageXObject<'a>,
-        stream: &OwnedStream,
+        stream: &StreamReader,
         index: &'a Mutex<JpegIndex>,
         meter: &Meter<'_>,
     ) -> Result<Option<Self>, Cancelled> {
@@ -305,7 +305,7 @@ mod tests {
                     let pdf = jpeg_pdf(&bytes, w.into(), h.into(), decode);
                     let mut asset = asset(&pdf);
                     Arc::get_mut(&mut asset.0).unwrap().transfer_function = four.map(transfer);
-                    assert!(is_jpeg(&asset.open(None, None).unwrap()));
+                    assert!(is_jpeg(&asset.reader().open(None, None).unwrap()));
                     assert_asset_streams_as_decoded(&asset);
                 }
             }
@@ -322,8 +322,9 @@ mod tests {
         drop(pdf);
         let window = [3, 2800, 250, 2820];
         let expected = request(&mut whole(&asset), Plane::Image, (w, h), window);
-        rows(&mut asset.open(None, None).unwrap(), 3000..3020);
-        let mut warm = asset.open(None, None).unwrap();
+        rows(&mut asset.reader().open(None, None).unwrap(), 3000..3020);
+        let reader = asset.reader();
+        let mut warm = reader.open(None, None).unwrap();
         let before = warm.work();
         assert_eq!(
             request(&mut warm, Plane::Image, (w, h), window).data,
@@ -360,7 +361,8 @@ mod tests {
         ] {
             let pdf = jpeg_pdf(&bytes, w, h, "");
             let asset = asset(&pdf);
-            let mut source = asset.open(None, None).unwrap();
+            let reader = asset.reader();
+            let mut source = reader.open(None, None).unwrap();
             assert!(is_jpeg(&source));
             rows(&mut source, 3000..3020);
             let polls = Cell::new(0);
@@ -382,8 +384,10 @@ mod tests {
             assert_eq!(polls.get(), 3);
             let (expected, _) = rows(&mut whole(&asset), 2800..2820);
             std::thread::scope(|scope| {
-                let read =
-                    || scope.spawn(|| rows(&mut asset.open(None, None).unwrap(), 2800..2820).0);
+                let read = || {
+                    scope
+                        .spawn(|| rows(&mut asset.reader().open(None, None).unwrap(), 2800..2820).0)
+                };
                 let (a, b) = (read(), read());
                 assert_eq!(a.join().unwrap(), expected);
                 assert_eq!(b.join().unwrap(), expected);
@@ -401,7 +405,8 @@ mod tests {
         let grid = (71, 113);
         for (window, bands) in [([0, 0, 71, 113], h), ([5, 60, 9, 62], 2248)] {
             let asset = asset(&pdf);
-            let mut source = asset.open(None, None).unwrap();
+            let reader = asset.reader();
+            let mut source = reader.open(None, None).unwrap();
             let polls = Cell::new(0);
             let reject = || {
                 polls.set(polls.get() + 1);
@@ -424,7 +429,7 @@ mod tests {
                 u64::from(bands + h),
                 "{window:?}"
             );
-            assert!(!is_jpeg(&asset.open(None, None).unwrap()));
+            assert!(!is_jpeg(&asset.reader().open(None, None).unwrap()));
         }
     }
 
@@ -438,7 +443,7 @@ mod tests {
         let window = [19, 80, 37, 100];
         let expected = request(&mut whole(&asset), Plane::Image, (w, h), window);
         let actual = request(
-            &mut asset.open(None, None).unwrap(),
+            &mut asset.reader().open(None, None).unwrap(),
             Plane::Image,
             (w, h),
             window,
@@ -461,8 +466,8 @@ mod tests {
         for cut in [bytes.len() - 2, bytes.len() - 31, bytes.len() / 2] {
             let pdf = jpeg_pdf(&bytes[..cut], 33, 41, "");
             let asset = asset(&pdf);
-            if decode_image(&asset.xobject().unwrap(), None, &Meter::default()).is_some() {
-                let (a, _) = rows(&mut asset.open(None, None).unwrap(), 0..41);
+            if decode_image(&asset.reader().xobject().unwrap(), None, &Meter::default()).is_some() {
+                let (a, _) = rows(&mut asset.reader().open(None, None).unwrap(), 0..41);
                 let (b, _) = rows(&mut whole(&asset), 0..41);
                 assert_eq!(a, b, "cut at {cut}");
             }
@@ -483,7 +488,7 @@ mod tests {
             let pdf = jpeg_pdf(bytes, w, h, "");
             let asset = asset(&pdf);
             assert!(
-                !asset.open(None, None).is_ok_and(|s| is_jpeg(&s)),
+                !asset.reader().open(None, None).is_ok_and(|s| is_jpeg(&s)),
                 "{w} × {h}"
             );
             assert!(matches!(*index(&asset), JpegIndex::Rejected));
@@ -520,7 +525,8 @@ mod tests {
                 polls.get() > 1
             };
             TOLD.set(0);
-            let opened = asset.open(None, Some(&hook));
+            let reader = asset.reader();
+            let opened = reader.open(None, Some(&hook));
             assert!(matches!(opened, Err(RequestError::Cancelled)), "{name}");
             assert_eq!(polls.get(), 2, "{name}");
             assert!(
@@ -529,7 +535,8 @@ mod tests {
                 TOLD.get()
             );
             assert!(matches!(*index(&asset), JpegIndex::Unread), "{name}");
-            let mut source = asset.open(None, None).unwrap();
+            let reader = asset.reader();
+            let mut source = reader.open(None, None).unwrap();
             assert_eq!(is_jpeg(&source), banded, "{name}");
             let window = [0, 1000, w.into(), h.into()];
             let grid = (w.into(), h.into());
@@ -547,7 +554,7 @@ mod tests {
         let asset = asset(&pdf);
         let (expected, _) = rows(&mut whole(&asset), 0..41);
         let meter = Meter::default();
-        let mut rows = asset.0.stream.jpeg_rows((33, 41), &meter).unwrap();
+        let mut rows = asset.0.stream.reader().jpeg_rows((33, 41), &meter).unwrap();
         drop((asset, pdf));
         let mut decoded = Vec::new();
         while rows.output_buffer_size() > 0 {
