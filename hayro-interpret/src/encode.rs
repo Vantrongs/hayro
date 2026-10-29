@@ -1132,17 +1132,16 @@ fn pixels(
         return Some((xs, ys, cells));
     }
     // A convex shape of area A and perimeter P holds at most A + P / 2 + 1 points
-    // of the integer grid (Nosarzewska), and P is at most that of its box: here of
-    // the triangle, cut by the region's pixels where it reaches past them.
+    // of any translate of the integer grid (Nosarzewska), such as the pixel centres
+    // `sample` tests, and P is at most that of its box: here of the triangle, cut by
+    // the centres of the region's pixels where it reaches past them, and a little
+    // past them, so rounding in the cut loses none.
     let (area, extent) = if (&xs, &ys) == (&x, &y) {
         (placed.area().abs(), bbox)
     } else {
-        let cut = Rect::new(
-            f64::from(xs.start),
-            f64::from(ys.start),
-            f64::from(xs.end - 1),
-            f64::from(ys.end - 1),
-        );
+        let first = pixel_centre(xs.start, ys.start);
+        let last = pixel_centre(xs.end - 1, ys.end - 1);
+        let cut = Rect::from_points(first, last).inflate(CUT_SLACK, CUT_SLACK);
         cut_by(&[placed.a, placed.b, placed.c], cut)
     };
     let lattice = area + extent.width() + extent.height() + 1.0;
@@ -1153,6 +1152,10 @@ fn pixels(
     };
     Some((xs, ys, covered))
 }
+
+/// How far past the pixel centres a triangle is cut to bound those it covers
+/// (`pixels`): beyond the rounding of a cut point, well within a pixel.
+const CUT_SLACK: f64 = 1.0 / 1024.0;
 
 /// The area and the box of the convex polygon `points` cut by `rect`.
 fn cut_by(points: &[Point], rect: Rect) -> (f64, Rect) {
@@ -1597,8 +1600,9 @@ mod tests {
     use super::span;
     use super::{
         Cost, EncodedSampledShading, EncodedShadingType, Exhausted, Meter, PATCH_TRIANGLES, Region,
-        Samples, TRIANGLE_COST, cut_by, sample_triangles,
+        Samples, TRIANGLE_COST, cut_by, plan, sample_planned, sample_triangles,
     };
+    use crate::color::ColorComponents;
     use crate::shading::{CoonsPatch, ShadingType, Triangle, TriangleVertex};
     use hayro_syntax::hash;
     use kurbo::{Affine, Point, Rect};
@@ -1793,6 +1797,41 @@ mod tests {
         let samples = check_in(&fan, Affine::IDENTITY, &(0..400, 0..300), (0..450, 0..350));
         assert!(matches!(samples, Samples::Grid { .. }));
         assert!(cells(&samples) <= 401 * 301);
+    }
+
+    /// A triangle that the region cuts, thinner than a pixel and lying between
+    /// two rows of pixel corners, covers the centres of a row: its plan counts
+    /// them, alone and as rows of them, and holds the bytes the samples take.
+    #[test]
+    fn a_plan_counts_the_pixel_centres_a_cut_triangle_covers() {
+        let row = |y: f64| triangle([(-1.0, y + 0.1), (2000.0, y + 0.1), (1000.0, y + 0.9)], 0.5);
+        for rows in [1_u16, 8, 64] {
+            let region = (0..1000, 999 - (rows - 1)..1000);
+            let triangles: Vec<_> = (0..rows).map(|k| row(f64::from(999 - k))).collect();
+            let each = |f: &mut dyn FnMut(&Triangle)| triangles.iter().for_each(f);
+            let planned = plan(each, Affine::IDENTITY, &region);
+            let samples = sample_planned(&planned, each, Affine::IDENTITY, &region);
+            let (put, held) = match &samples {
+                Samples::Grid { cells, .. } => {
+                    (cells.iter().flatten().count(), size_of_val(&cells[..]))
+                }
+                Samples::Map(map) => (
+                    map.len(),
+                    map.capacity() * (size_of::<((u16, u16), ColorComponents)>() + 1),
+                ),
+            };
+            assert!(put >= 500 * usize::from(rows), "{rows} rows: {put} put");
+            assert!(
+                planned.most >= put,
+                "{rows} rows: {} planned, {put} put",
+                planned.most
+            );
+            assert!(
+                planned.bytes() >= held,
+                "{rows} rows: {} bytes planned, {held} held",
+                planned.bytes()
+            );
+        }
     }
 
     #[test]
@@ -2379,7 +2418,7 @@ mod tests {
             ]
         );
         assert_eq!(meter.held.len(), 1);
-        assert!(meter.held[0] >= points.len() * size_of::<Option<crate::color::ColorComponents>>());
+        assert!(meter.held[0] >= points.len() * size_of::<Option<ColorComponents>>());
         let all: u64 = meter.asked.iter().sum();
         for left in [0, whole.steps(), all - 1] {
             let mut meter = Recording {
