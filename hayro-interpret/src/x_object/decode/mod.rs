@@ -320,7 +320,7 @@ impl<'a> SampleMap<'a> {
     }
 }
 
-/// For samples of fewer than eight bits, the byte each stored value becomes, per
+/// For samples of at most eight bits, the byte each stored value becomes, per
 /// component: `lut[c][v]` for value `v` of component `c`. `None` when the decode
 /// array lacks a component, as decoding the samples whole then fails.
 pub(crate) fn sample_lut(
@@ -328,7 +328,7 @@ pub(crate) fn sample_lut(
     bits_per_component: u8,
     decode: &[(f32, f32)],
 ) -> Option<Vec<[u8; 256]>> {
-    if !(1..8).contains(&bits_per_component) {
+    if !(1..=8).contains(&bits_per_component) {
         return None;
     }
     let map = SampleMap::new(color_space, bits_per_component, decode);

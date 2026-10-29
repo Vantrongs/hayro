@@ -9,14 +9,14 @@ use crate::color::{ColorComponents, ColorSpace, ToLuma, ToRgb};
 use crate::interpret::state::ActiveTransferFunction;
 use crate::x_object::area::Area;
 use crate::x_object::decode::{
-    MaskPath, SampleFormat, SampleRows, direct_invert, mask_lut, sample_format, sample_lut,
-    unpack_packed, unpremultiply_samples,
+    MaskPath, SampleFormat, SampleRows, direct_invert, image_decode_params, mask_lut,
+    sample_format, sample_lut, unpack_packed, unpremultiply_samples,
 };
 use crate::x_object::image::{ImageKind, ImageXObject};
 use core::ops::Range;
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::{MASK, MATTE, SMASK, SMASK_IN_DATA};
-use hayro_syntax::object::stream::OwnedStream;
+use hayro_syntax::object::stream::{ImageData, OwnedStream};
 use hayro_syntax::work::{Cancelled, Meter};
 use smallvec::SmallVec;
 
@@ -25,6 +25,7 @@ pub(super) struct Streamed<'a> {
     obj: ImageXObject<'a>,
     colour: Colour,
     alpha: Alpha<'a>,
+    grid: Grid,
     /// The rows of the colour: those whole decoding keeps where a mask's grid depends
     /// on them, else those declared.
     height: u32,
@@ -33,6 +34,59 @@ pub(super) struct Streamed<'a> {
     checkpoints: &'a Checkpoints,
     /// The decoding opening the image did.
     pub(super) opened: DecodeWork,
+}
+
+/// How an image's stored samples lie, as whole decoding reads them: in rows of the
+/// width and height the dictionary declares, or of those its filter reports (CCITT
+/// data's `Columns`), mapped onto the declared grid.
+#[derive(Clone, Copy)]
+pub(super) struct Grid {
+    pub(super) width: u32,
+    pub(super) height: u32,
+    /// The size of a sample in the declared grid, per axis.
+    pub(super) to_image: (f64, f64),
+}
+
+impl Grid {
+    /// The grid `obj`'s dictionary declares.
+    pub(super) fn declared(obj: &ImageXObject<'_>) -> Self {
+        Self {
+            width: obj.width(),
+            height: obj.height(),
+            to_image: (1.0, 1.0),
+        }
+    }
+
+    /// `obj`'s grid, where its filter reports `data` of its samples; `None` for a
+    /// grid of no samples.
+    fn of(obj: &ImageXObject<'_>, data: Option<&ImageData>) -> Option<Self> {
+        let Some(d) = data else {
+            return Some(Self::declared(obj));
+        };
+        (d.width > 0 && d.height > 0).then(|| Self {
+            width: d.width,
+            height: d.height,
+            // As whole decoding maps samples of another size than the dictionary
+            // declares onto the image.
+            to_image: (
+                f64::from(obj.width() as f32 / d.width as f32),
+                f64::from(obj.height() as f32 / d.height as f32),
+            ),
+        })
+    }
+}
+
+/// The grid and format of `obj`'s samples, as whole decoding reads them, where its
+/// filters allow reading them incrementally.
+pub(super) fn incremental_samples(obj: &ImageXObject<'_>) -> Option<(Grid, SampleFormat)> {
+    if !obj.stream.image_reads_incrementally() {
+        return None;
+    }
+    let data = obj.stream.ccitt_image_data(&image_decode_params(obj));
+    Some((
+        Grid::of(obj, data.as_ref())?,
+        sample_format(obj, data.as_ref()),
+    ))
 }
 
 /// How stored samples become the texels a request returns: colour, or a stencil
@@ -63,7 +117,7 @@ enum Samples {
 
 impl Samples {
     fn packed(bits: u8, lut: Vec<[u8; 256]>, fill: u8) -> Self {
-        let bytes = (lut.len() == 1 && 8 % bits == 0).then(|| {
+        let bytes = (lut.len() == 1 && bits < 8 && 8 % bits == 0).then(|| {
             let mask = (1_u8 << bits) - 1;
             let mut table = Box::new([[0; 8]; 256]);
             for (byte, samples) in table.iter_mut().enumerate() {
@@ -97,8 +151,9 @@ enum Output {
 
 impl Colour {
     /// The conversion for `obj`'s stored samples, if they are samples of fewer than
-    /// eight bits, 8-bit `DeviceGray`, `DeviceRGB` or `Indexed` samples used as stored
-    /// or inverted, or a stencil mask's samples.
+    /// eight bits, 8-bit samples of one component or `DeviceRGB` samples used as
+    /// stored or inverted, other 8-bit samples of one component, or a stencil mask's
+    /// samples.
     pub(super) fn new(obj: &ImageXObject<'_>) -> Option<Self> {
         Self::of(obj, sample_format(obj, None))
     }
@@ -141,15 +196,16 @@ impl Colour {
         if color_space.num_components() == 0 {
             return None;
         }
-        let samples = match bits_per_component {
-            8 if !(color_space.is_device_gray_or_rgb() || color_space.is_indexed()) => {
-                return None;
-            }
-            8 => Samples::Bytes {
-                invert: direct_invert(&color_space, bits_per_component, &decode_arr)?,
-                fill: 0,
-            },
-            bits => Samples::packed(bits, sample_lut(&color_space, bits, &decode_arr)?, 0),
+        let one = color_space.num_components() == 1;
+        let direct = one || color_space.is_device_gray_or_rgb();
+        let samples = match (
+            bits_per_component,
+            direct_invert(&color_space, 8, &decode_arr),
+        ) {
+            (8, Some(invert)) if direct => Samples::Bytes { invert, fill: 0 },
+            (8, _) if !one => return None,
+            // Through a table of the values a byte holds, as samples of fewer bits.
+            (bits, _) => Samples::packed(bits, sample_lut(&color_space, bits, &decode_arr)?, 0),
         };
         let luma = obj
             .transfer_function
@@ -203,6 +259,18 @@ impl Colour {
         (texels * self.components * self.bits()).div_ceil(8)
     }
 
+    /// The texels whose samples `bytes` stored bytes hold whole.
+    fn texels_in(&self, bytes: usize) -> usize {
+        bytes * 8 / (self.components * self.bits())
+    }
+
+    /// Whether whole decoding pads samples the data does not hold after mapping them
+    /// (8-bit samples through a table), where it also leaves them out of a colour key
+    /// (transparent).
+    fn pads_mapped(&self) -> bool {
+        matches!(self.samples, Samples::Packed { bits: 8, .. })
+    }
+
     /// The texels a read of the samples starts at a multiple of: whole bytes.
     fn align(&self) -> usize {
         match self.samples {
@@ -211,9 +279,9 @@ impl Colour {
         }
     }
 
-    /// How `obj`'s samples lie in rows of `height`.
-    fn rows(&self, obj: &ImageXObject<'_>, height: u32) -> SampleRows {
-        SampleRows::new(obj.width(), self.components, self.bits() as u8, height)
+    /// How samples lie in rows of `width` and `height`.
+    fn rows(&self, width: u32, height: u32) -> SampleRows {
+        SampleRows::new(width, self.components, self.bits() as u8, height)
     }
 
     /// The stored value of samples the data does not hold whole.
@@ -250,7 +318,15 @@ impl Colour {
         }
         unpack_packed(self.bits() as u8, bytes, out, self.fill());
         if !stored {
-            self.map(out);
+            // Whole decoding pads mapped 8-bit samples with zero, where it pads samples
+            // of fewer bits before mapping them.
+            let held = match self.samples {
+                Samples::Packed { bits: 8, .. } => bytes.len().min(out.len()),
+                _ => out.len(),
+            };
+            let (held, rest) = out.split_at_mut(held);
+            self.map(held);
+            rest.fill(0);
         }
     }
 
@@ -270,12 +346,18 @@ impl Colour {
         }
     }
 
-    /// The plane of `obj`'s colour of `height` rows, with alpha or not.
-    pub(super) fn plane(&self, obj: &ImageXObject<'_>, height: u32, alpha: bool) -> PlaneLayout {
+    /// The plane of `obj`'s colour on `grid`, of `height` rows, with alpha or not.
+    pub(super) fn plane(
+        &self,
+        obj: &ImageXObject<'_>,
+        grid: &Grid,
+        height: u32,
+        alpha: bool,
+    ) -> PlaneLayout {
         PlaneLayout {
-            width: obj.width(),
+            width: grid.width,
             height,
-            to_image: (1.0, 1.0),
+            to_image: grid.to_image,
             interpolate: obj.interpolate,
             format: self.format(alpha),
         }
@@ -358,6 +440,7 @@ impl<'a> Alpha<'a> {
     fn new(
         obj: &ImageXObject<'a>,
         colour: &Colour,
+        grid: &Grid,
         rows: &HeldRows,
         work: &mut DecodeWork,
         meter: &Meter<'_>,
@@ -381,12 +464,12 @@ impl<'a> Alpha<'a> {
                 Some(key) if !in_data => Alpha::ColourKey(key),
                 _ => Alpha::None,
             };
-            return Ok((alpha, obj.height()));
+            return Ok((alpha, grid.height));
         };
         let height = match rows.colour.get() {
             Some(&held) => held,
             None => {
-                let held = rows_held(&obj.stream, colour.rows(obj, obj.height()), work, meter)?;
+                let held = rows_held(obj, colour.rows(grid.width, grid.height), work, meter)?;
                 *rows.colour.get_or_init(|| held)
             }
         };
@@ -394,7 +477,7 @@ impl<'a> Alpha<'a> {
         let Some(mask) = MaskSource::new(&stream, obj, &rows.mask, work, meter)? else {
             return Ok((Alpha::None, height));
         };
-        let size = (obj.width(), height);
+        let size = (grid.width, height);
         let matte = match matte {
             Some(m) if mask.size() == size => {
                 let mut rgb = [0; 3];
@@ -445,23 +528,24 @@ impl<'a> Streamed<'a> {
         rows: &HeldRows,
         meter: &Meter<'_>,
     ) -> Result<Option<Self>, Stop> {
-        if !obj.stream.can_read_incrementally() {
+        let Some((grid, format)) = incremental_samples(obj) else {
             return Ok(None);
-        }
-        let Some(colour) = Colour::new(obj) else {
+        };
+        let Some(colour) = Colour::of(obj, format) else {
             return Ok(None);
         };
         let mut opened = DecodeWork::default();
         // A stencil mask is alpha alone, as whole decoding reads it.
         let (alpha, height) = if colour.is_stencil() {
-            (Alpha::None, obj.height())
+            (Alpha::None, grid.height)
         } else {
-            Alpha::new(obj, &colour, rows, &mut opened, meter)?
+            Alpha::new(obj, &colour, &grid, rows, &mut opened, meter)?
         };
         Ok(Some(Self {
             obj: obj.clone(),
             colour,
             alpha,
+            grid,
             height,
             stream,
             checkpoints,
@@ -471,11 +555,12 @@ impl<'a> Streamed<'a> {
 
     /// How the colour's samples lie in its rows.
     fn rows(&self) -> SampleRows {
-        self.colour.rows(&self.obj, self.height)
+        self.colour.rows(self.grid.width, self.height)
     }
 
     pub(super) fn layout(&self) -> ImageLayout {
-        let (w, h) = (self.obj.width(), self.height);
+        let (w, h) = (self.grid.width, self.height);
+        let (sx, sy) = self.grid.to_image;
         let mask = match &self.alpha {
             Alpha::Mask {
                 mask,
@@ -486,7 +571,8 @@ impl<'a> Streamed<'a> {
                 Some(PlaneLayout {
                     width: mw,
                     height: mh,
-                    to_image: (w as f64 / mw as f64, h as f64 / mh as f64),
+                    // As whole decoding maps the mask onto the colour's samples.
+                    to_image: (sx * w as f64 / mw as f64, sy * h as f64 / mh as f64),
                     interpolate: mask.interpolate(),
                     format: PixelFormat::Alpha,
                 })
@@ -494,9 +580,12 @@ impl<'a> Streamed<'a> {
             _ => None,
         };
         ImageLayout {
-            image: self
-                .colour
-                .plane(&self.obj, self.height, self.alpha.on_image_grid()),
+            image: self.colour.plane(
+                &self.obj,
+                &self.grid,
+                self.height,
+                self.alpha.on_image_grid(),
+            ),
             mask,
         }
     }
@@ -576,7 +665,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
         let colour = &image.colour;
         let n = colour.components();
         let row_bytes = image.rows().row_bytes();
-        let mut raw = RawRows::new(&image.obj.stream, row_bytes, meter).ok_or(Stop::Failed)?;
+        let mut raw = RawRows::new(&image.obj, row_bytes, meter).ok_or(Stop::Failed)?;
         let columns = area.columns();
         let start = columns.start as usize / colour.align() * colour.align();
         let piece = piece_texels(columns.end as usize - start, n);
@@ -620,7 +709,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
             packed,
             start,
             rgb: Vec::new(),
-            with_alpha: Vec::with_capacity(piece * 4),
+            with_alpha: Vec::new(),
             key_alpha: Vec::new(),
             decoded: 0,
         })
@@ -715,7 +804,9 @@ impl<'s, 'a> ImagePass<'s, 'a> {
             }
             let len = piece.min(c1 - col);
             let (got, wanted) = self.read_samples(len, held)?;
+            let mut held_texels = len;
             if got < wanted {
+                held_texels = self.image.colour.texels_in(got);
                 if held && !self.keeps_row() {
                     // Only the first row of the data can be too short to keep (a later
                     // row is padded with at most the samples before it), and data
@@ -728,7 +819,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
             if let Some(m) = &mut self.mask {
                 mask_held = m.rows.alpha(col..col + len, &mut m.alpha[..len])? == len;
             }
-            let texels = self.texels(len)?;
+            let texels = self.texels(len, held_texels)?;
             let skipped = texels.len() / len * (first - col);
             area.push_texels(first as u32, &texels[skipped..])?;
             col += len;
@@ -798,15 +889,19 @@ impl<'s, 'a> ImagePass<'s, 'a> {
         if let Some(m) = &mut self.mask {
             m.alpha[0] = 0;
         }
-        self.texels(1)
+        self.texels(1, 0)
     }
 
-    /// The texels to push of the first `len` samples read, with their alpha read.
-    fn texels(&mut self, len: usize) -> Result<&[u8], Stop> {
+    /// The texels to push of the first `len` samples read, of which the data held the
+    /// first `held`, with their alpha read.
+    fn texels(&mut self, len: usize, held: usize) -> Result<&[u8], Stop> {
         let n = self.image.colour.components();
         let samples = &mut self.samples[..len * n];
         if let Alpha::ColourKey(key) = &self.image.alpha {
             colour_key_alpha(samples, n, key, &mut self.key_alpha);
+            if self.image.colour.pads_mapped() {
+                self.key_alpha[held..].fill(0);
+            }
             self.image.colour.map(samples);
         }
         let colour = self.image.colour.convert(samples, &mut self.rgb)?;

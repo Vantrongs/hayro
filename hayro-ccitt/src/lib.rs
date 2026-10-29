@@ -31,6 +31,7 @@
 extern crate alloc;
 
 use crate::bit_reader::{BitReader, Data};
+use alloc::rc::Rc;
 
 mod bit_reader;
 mod codes;
@@ -53,22 +54,21 @@ pub use error::{DecodeError, Result};
 /// of rows were decoded successfully and written into the decoder, so those
 /// can still be used, but the image might be truncated.
 pub fn decode(data: &[u8], decoder: &mut impl Decoder, ctx: &mut DecoderContext) -> Result<usize> {
-    decode_data(Data::Slice(data), decoder, ctx)
+    ctx.reset();
+    let mut reader = BitReader::new(Data::Slice(data));
+
+    if ctx.settings.columns == 0 {
+        return Ok(0);
+    }
+
+    start(ctx, &mut reader, decoder)?;
+    while step(ctx, &mut reader, decoder)? {}
+    finish(&mut reader, decoder)
 }
 
-/// [`decode`], of data that `source` reads a few bytes at a time: data that is not
-/// held in one slice, such as data decrypted as it is read.
-pub fn decode_source(
-    source: &dyn Source,
-    decoder: &mut impl Decoder,
-    ctx: &mut DecoderContext,
-) -> Result<usize> {
-    decode_data(Data::Source(source), decoder, ctx)
-}
-
-/// Encoded data read a few bytes at a time ([`decode_source`]). Decoding reads it
-/// mostly forward, and after a damaged line in Group 3 data again from the line's
-/// start.
+/// Encoded data read a few bytes at a time ([`RowDecoder::from_source`]). Decoding
+/// reads it mostly forward, and after a damaged line in Group 3 data again from the
+/// line's start.
 pub trait Source {
     /// The bytes of the data.
     fn len(&self) -> usize;
@@ -80,24 +80,124 @@ pub trait Source {
     fn read_at(&self, pos: usize, out: &mut [u8]);
 }
 
-fn decode_data(
-    data: Data<'_>,
-    decoder: &mut impl Decoder,
+/// Decodes CCITT data a row at a time, as its reader asks for rows, rather than
+/// pushing them all as [`decode`] does: it pushes the same rows and ends the same.
+pub struct RowDecoder<'a> {
+    reader: BitReader<'a>,
+    ctx: DecoderContext,
+    state: State,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum State {
+    Start,
+    Rows,
+    /// The last row was pushed; the end of the data is still to be read.
+    Last,
+    Done,
+}
+
+impl<'a> RowDecoder<'a> {
+    /// A decoder of `data`, decoded with `settings`.
+    pub fn new(data: &'a [u8], settings: DecodeSettings) -> Self {
+        Self::with(Data::Slice(data), settings)
+    }
+
+    /// A decoder of the data `source` reads.
+    pub fn from_source(source: Rc<dyn Source + 'a>, settings: DecodeSettings) -> Self {
+        Self::with(Data::Source(source), settings)
+    }
+
+    fn with(data: Data<'a>, settings: DecodeSettings) -> Self {
+        Self {
+            reader: BitReader::new(data),
+            ctx: DecoderContext::new(settings),
+            state: State::Start,
+        }
+    }
+
+    /// The settings it decodes with.
+    pub fn settings(&self) -> &DecodeSettings {
+        &self.ctx.settings
+    }
+
+    /// The rows pushed so far.
+    pub fn decoded_rows(&self) -> u32 {
+        self.ctx.decoded_rows
+    }
+
+    /// The colour changes of the last row pushed, as [`Decoder::push_row`] was given
+    /// them; empty before the first.
+    pub fn last_row(&self) -> &[u32] {
+        self.ctx.last_row()
+    }
+
+    /// Decodes the next row and pushes it to `decoder`: `Ok(true)` once it pushed
+    /// one, `Ok(false)` where the data ended, as [`decode`] returns `Ok` (with
+    /// `decoder` asked once more); an error where [`decode`] fails, after the rows
+    /// it pushes before failing. After `Ok(false)` or an error, it pushes no more.
+    pub fn next_row(&mut self, decoder: &mut impl Decoder) -> Result<bool> {
+        let result = self.advance(decoder);
+        if !matches!(result, Ok(true)) {
+            self.state = State::Done;
+        }
+        result
+    }
+
+    fn advance(&mut self, decoder: &mut impl Decoder) -> Result<bool> {
+        let (ctx, reader) = (&mut self.ctx, &mut self.reader);
+        if self.state == State::Start {
+            if ctx.settings.columns == 0 {
+                return Ok(false);
+            }
+            start(ctx, reader, decoder)?;
+            self.state = State::Rows;
+        }
+        if self.state == State::Rows {
+            let rows = ctx.decoded_rows;
+            let more = step(ctx, reader, decoder)?;
+            if !more {
+                self.state = State::Last;
+            }
+            if ctx.decoded_rows > rows {
+                return Ok(true);
+            }
+        }
+        if self.state == State::Last {
+            finish(reader, decoder)?;
+        }
+        Ok(false)
+    }
+}
+
+/// Reads what the data starts with, before its first line.
+fn start(
     ctx: &mut DecoderContext,
-) -> Result<usize> {
-    ctx.reset();
-    let mut reader = BitReader::new(data);
-
-    if ctx.settings.columns == 0 {
-        return Ok(0);
-    }
-
+    reader: &mut BitReader<'_>,
+    decoder: &mut impl Decoder,
+) -> Result<()> {
     match ctx.settings.encoding {
-        EncodingMode::Group4 => group4::decode(ctx, &mut reader, decoder)?,
-        EncodingMode::Group3_1D => group3::decode_1d(ctx, &mut reader, decoder)?,
-        EncodingMode::Group3_2D => group3::decode_2d(ctx, &mut reader, decoder)?,
+        EncodingMode::Group4 => Ok(()),
+        EncodingMode::Group3_1D | EncodingMode::Group3_2D => group3::start(ctx, reader, decoder),
     }
+}
 
+/// Decodes the next line, where the data holds one: false once the data ends.
+fn step(
+    ctx: &mut DecoderContext,
+    reader: &mut BitReader<'_>,
+    decoder: &mut impl Decoder,
+) -> Result<bool> {
+    match ctx.settings.encoding {
+        EncodingMode::Group4 => group4::step(ctx, reader, decoder),
+        EncodingMode::Group3_1D => group3::step_1d(ctx, reader, decoder),
+        EncodingMode::Group3_2D => group3::step_2d(ctx, reader, decoder),
+    }
+}
+
+/// Reads to the end of the data's last byte, and asks `decoder` once more: the
+/// bytes read.
+fn finish(reader: &mut BitReader<'_>, decoder: &mut impl Decoder) -> Result<usize> {
     reader.align();
     reader.ask(decoder)?;
     Ok(reader.byte_pos())

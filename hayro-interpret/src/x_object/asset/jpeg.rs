@@ -3,7 +3,7 @@
 
 use super::decoded::Decoded;
 use super::index::{CHECKPOINT_BUDGET, Checkpoints, MIN_CHECKPOINT_BYTES};
-use super::streamed::Colour;
+use super::streamed::{Colour, Grid};
 use super::{DecodeWork, ImageLayout, Plane, Stop};
 use crate::x_object::area::Area;
 use crate::x_object::decode::decode_image;
@@ -147,7 +147,12 @@ impl<'a> JpegStreamed<'a> {
 
     pub(super) fn layout(&self) -> ImageLayout {
         ImageLayout {
-            image: self.colour.plane(&self.obj, self.obj.height(), false),
+            image: self.colour.plane(
+                &self.obj,
+                &Grid::declared(&self.obj),
+                self.obj.height(),
+                false,
+            ),
             mask: None,
         }
     }

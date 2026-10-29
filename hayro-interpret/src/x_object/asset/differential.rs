@@ -6,7 +6,7 @@
 //! stored data, and of its data decoded. Flate data damaged at every byte, which
 //! zlib may find corrupt after making bytes, streams as it decodes whole too.
 
-use super::tests::{asset, image, pdf, request, try_whole};
+use super::tests::{asset, image, is_streamed, pdf, request, try_whole};
 use super::{ImageAsset, ImageRequest, ImageSource, Plane, RequestError};
 use crate::fixtures::{noise, stored_zlib};
 use flate2::Compression;
@@ -220,6 +220,10 @@ fn spaces(bits: usize) -> Vec<Space> {
     };
     let mut spaces = vec![
         space("/DeviceGray", 1),
+        space(
+            "[/CalGray << /WhitePoint [0.9505 1 1.089] /Gamma 2.2 >>]",
+            1,
+        ),
         space("[/DeviceN [/A /B] /DeviceGray 5 0 R]", 2),
         space("/DeviceRGB", 3),
         space("/DeviceCMYK", 4),
@@ -593,6 +597,136 @@ fn ccitt_cut(k: i32, data: &[u8]) {
             for cut in (0..=data.len()).step_by(step) {
                 let pdf = pdf(&[(image(&dict, 211, 96), data[..cut].to_vec())]);
                 cases.check(&asset(&pdf), &format!("{dict}, cut after {cut}"));
+            }
+        }
+    }
+    cases.finish();
+}
+
+/// A mask: its dictionary, size and data.
+type Mask = (String, u32, u32, Vec<u8>);
+
+/// CCITT images that are indexed or have masks of every kind, and images whose
+/// mask is CCITT data, the CCITT data cut after every eighth byte (the other data
+/// complete), with the declared rows of the page and more than its data holds
+/// (padded white where whole decoding pads, which the mask's grid depends on).
+#[test]
+fn indexed_and_masked_ccitt_cut_streams_as_whole() {
+    let mut cases = Cases::default();
+    let (k, data) = CCITT[0];
+    let (w, h) = (211, 96);
+    let ccitt = |params: &str| {
+        format!("/Filter /CCITTFaxDecode /DecodeParms << /K {k} /Columns {w} {params} >>")
+    };
+    let gray1 = "/ColorSpace /DeviceGray /BitsPerComponent 1";
+    let gray8 = |extra: &str| format!("/ColorSpace /DeviceGray /BitsPerComponent 8 {extra}");
+    let indexed = "/ColorSpace [/Indexed /DeviceRGB 1 <ff0000 0000ff>] /BitsPerComponent 1";
+    let flate_bits =
+        |cw: u32, ch: u32| stored_zlib(&samples((cw as usize).div_ceil(8) * ch as usize, 60), 1000);
+    let (ow, oh) = OTHER_GRID;
+    for rows in [h, 150] {
+        // CCITT colour, its mask complete: (colour dictionary, mask entry and object).
+        let mut colours: Vec<(String, Option<Mask>)> = vec![
+            (format!("{indexed} {}", ccitt("")), None),
+            (
+                format!("{indexed} /Decode [1 0] {}", ccitt("/BlackIs1 true")),
+                None,
+            ),
+            (format!("{gray1} /Mask [0 100] {}", ccitt("")), None),
+            (format!("{gray1} /Decode [0.2 0.8] {}", ccitt("")), None),
+            (
+                format!(
+                    "/ColorSpace [/CalGray << /WhitePoint [0.9505 1 1.089] >>] {}",
+                    ccitt("")
+                ),
+                None,
+            ),
+            (
+                format!("/ImageMask true /Decode [0.2 0.8] {}", ccitt("")),
+                None,
+            ),
+        ];
+        for (key, mask, mw, mh, mask_data) in [
+            ("/SMask", gray8(""), w, rows, noise((w * rows) as usize, 61)),
+            (
+                "/SMask",
+                gray8("/Matte [0.5]"),
+                w,
+                rows,
+                noise((w * rows) as usize, 62),
+            ),
+            ("/SMask", gray8(""), ow, oh, noise((ow * oh) as usize, 63)),
+            (
+                "/Mask",
+                "/ImageMask true".into(),
+                w,
+                rows,
+                flate_bits(w, rows),
+            ),
+        ] {
+            let filter = if key == "/Mask" {
+                "/Filter /FlateDecode"
+            } else {
+                ""
+            };
+            colours.push((
+                format!("{gray1} {key} 4 0 R {}", ccitt("")),
+                Some((format!("{mask} {filter}"), mw, mh, mask_data.clone())),
+            ));
+            colours.push((
+                format!("{indexed} {key} 4 0 R {}", ccitt("")),
+                Some((format!("{mask} {filter}"), mw, mh, mask_data)),
+            ));
+        }
+        for (dict, mask) in &colours {
+            for cut in (0..=data.len()).step_by(8).chain([data.len()]) {
+                let mut objects = vec![(image(dict, w, rows), data[..cut].to_vec())];
+                if let Some((mask, mw, mh, mask_data)) = mask {
+                    objects.push((image(mask, *mw, *mh), mask_data.clone()));
+                }
+                let case = format!("{dict} under {mask:?}, {rows} rows, cut after {cut}");
+                let asset = asset(&pdf(&objects));
+                if cut == data.len() {
+                    assert!(is_streamed(&asset.open(None, None).unwrap()), "{case}");
+                }
+                cases.check(&asset, &case);
+            }
+        }
+        // Colour complete under a CCITT mask cut short.
+        for (key, mask) in [
+            ("/SMask", format!("{gray1} {}", ccitt(""))),
+            ("/SMask", format!("{gray1} {}", ccitt("/BlackIs1 true"))),
+            ("/SMask", format!("{gray1} /Decode [0.2 0.8] {}", ccitt(""))),
+            ("/Mask", format!("/ImageMask true {}", ccitt(""))),
+            (
+                "/Mask",
+                format!("/ImageMask true /Decode [1 0] {}", ccitt("")),
+            ),
+        ] {
+            for colour in [
+                format!("{gray1} /Filter /FlateDecode"),
+                format!("{gray1} {}", ccitt("")),
+            ] {
+                let colour_data = if colour.contains("CCITT") {
+                    data.to_vec()
+                } else {
+                    flate_bits(w, rows)
+                };
+                for cut in (0..=data.len()).step_by(8).chain([data.len()]) {
+                    let objects = [
+                        (
+                            image(&format!("{colour} {key} 4 0 R"), w, rows),
+                            colour_data.clone(),
+                        ),
+                        (image(&mask, w, rows), data[..cut].to_vec()),
+                    ];
+                    let case = format!("{colour} under {mask}, {rows} rows, mask cut after {cut}");
+                    let asset = asset(&pdf(&objects));
+                    if cut == data.len() {
+                        assert!(is_streamed(&asset.open(None, None).unwrap()), "{case}");
+                    }
+                    cases.check(&asset, &case);
+                }
             }
         }
     }

@@ -103,14 +103,14 @@ fn mask_alpha(value: u32, bits: u8, (decode_min, decode_max): (f32, f32), invert
     (value * 255.0 + 0.5) as u8
 }
 
-/// For a one-component mask of fewer than eight bits a sample whose samples go
+/// For a one-component mask of at most eight bits a sample whose samples go
 /// through the decode array ([`MaskPath::Decoded`]), the alpha each stored value
 /// becomes, as decoding the mask whole maps it (a sample the data does not hold whole
 /// as stored zero); `None` without a decode entry, where decoding it whole makes no
 /// alpha.
 pub(crate) fn mask_lut(bits: u8, decode_arr: &[(f32, f32)], invert: bool) -> Option<[u8; 256]> {
     let &decode = decode_arr.first()?;
-    if !(1..8).contains(&bits) {
+    if !(1..=8).contains(&bits) {
         return None;
     }
     let mut lut = [0; 256];

@@ -507,6 +507,94 @@ fn a_small_region_of_each_low_bit_kind_costs_the_region() {
     }
 }
 
+/// A small region of a CCITT image that is indexed or has a mask, or of an image
+/// whose mask is CCITT data, costs memory in proportion to the region, as other
+/// CCITT images do: decoding the larger whole held 64 MiB of samples and as much
+/// again of alpha (three times as much colour for the indexed image). A tile of an
+/// image four times as large holds the same, but for a piece of a mask's row twice
+/// as wide.
+#[test]
+fn a_small_region_of_an_indexed_or_masked_ccitt_image_costs_the_region() {
+    let tile: Bins = |w, h| ((w, h), [w / 2, h - 64, w / 2 + 64, h]);
+    region_cost(
+        "/ColorSpace /DeviceGray /BitsPerComponent 1 /Width 16 /Height 16 /Filter /FlateDecode",
+        &common::stored_zlib(&[0; 32], 1000),
+        |w, h| ((w, h), [0, 0, 1, 1]),
+    );
+    let ccitt = "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns SIDE >>";
+    let gray = "/ColorSpace /DeviceGray /BitsPerComponent 1";
+    // Group 4 rows, each white like the one above (vertical mode, no offset): a
+    // bit each.
+    let white_g4 = |side: u32| vec![0xFF; side as usize / 8];
+    let flate =
+        |side: u32| common::stored_zlib(&common::noise((side / 8 * side) as usize, side), 65_535);
+    /// A kind: its dictionary and data, and its mask's (object 6).
+    type Data = fn(u32) -> Vec<u8>;
+    type Kind = (&'static str, String, Data, Option<(String, Data)>);
+    let kinds: [Kind; 4] = [
+        (
+            "indexed",
+            format!(
+                "/ColorSpace [/Indexed /DeviceRGB 1 <ff0000 0000ff>] /BitsPerComponent 1 {ccitt}"
+            ),
+            white_g4,
+            None,
+        ),
+        (
+            "smask",
+            format!("{gray} /SMask 6 0 R {ccitt}"),
+            white_g4,
+            Some((format!("{gray} /Filter /FlateDecode"), flate)),
+        ),
+        (
+            "ccitt_smask",
+            format!("{gray} /SMask 6 0 R /Filter /FlateDecode"),
+            flate,
+            Some((format!("{gray} {ccitt}"), white_g4)),
+        ),
+        (
+            "ccitt_stencil_mask",
+            format!("{gray} /Mask 6 0 R {ccitt}"),
+            white_g4,
+            Some((format!("/ImageMask true {ccitt}"), white_g4)),
+        ),
+    ];
+    for (name, dict, data, mask) in kinds {
+        let mut working = Vec::new();
+        for side in [4096_u32, 8192] {
+            let size = format!("/Width {side} /Height {side}");
+            let dict = dict.replace("SIDE", &side.to_string());
+            let mut objects = vec![image(&format!("{dict} {size}"), &data(side))];
+            if let Some((mask, mask_data)) = &mask {
+                let mask = mask.replace("SIDE", &side.to_string());
+                objects.push(image(&format!("{mask} {size}"), &mask_data(side)));
+            }
+            let pdf = page(
+                "q 100 0 0 100 0 0 cm /Im Do Q",
+                "/XObject << /Im 5 0 R >>",
+                objects,
+            );
+            let mut requested = Requested::new(Plane::Image, tile);
+            common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+            let [(peak, _)] = requested.regions[..] else {
+                panic!("{name}: one image")
+            };
+            let saved = requested.saved[0];
+            assert!(saved <= 2 << 20, "{name} {side}: {saved} bytes saved");
+            working.push(peak - saved);
+        }
+        // The larger image's rows are 512 bytes wider, which a piece of a bilevel
+        // row read past holds.
+        assert!(
+            working[1] <= working[0] + 512,
+            "{name}: {} bytes besides saved states for 4096, {} for 8192",
+            working[0],
+            working[1]
+        );
+        assert!(working[1] < 1 << 20, "{name}: {} bytes", working[1]);
+    }
+}
+
 /// The last texel of a bilevel mask 40 million samples wide whose data ends halfway
 /// through its row holds a piece of the row, not the bytes between the data's end and
 /// the texel.

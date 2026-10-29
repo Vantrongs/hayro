@@ -1,12 +1,13 @@
 //! Bit-level reader for CCITT encoded data streams.
 
 use crate::{DecodeError, Decoder, POLL_BITS, Result, Source};
+use alloc::rc::Rc;
 
 /// Where the encoded bytes are.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) enum Data<'a> {
     Slice(&'a [u8]),
-    Source(&'a dyn Source),
+    Source(Rc<dyn Source + 'a>),
 }
 
 #[derive(Clone)]
@@ -30,7 +31,7 @@ pub(crate) struct BitReader<'a> {
 impl<'a> BitReader<'a> {
     #[inline(always)]
     pub(crate) fn new(data: Data<'a>) -> Self {
-        let len = match data {
+        let len = match &data {
             Data::Slice(bytes) => bytes.len(),
             Data::Source(source) => source.len(),
         };
@@ -144,7 +145,7 @@ impl<'a> BitReader<'a> {
     fn refill(&mut self) {
         let byte_pos = self.byte_pos();
 
-        let word = match self.data {
+        let word = match &self.data {
             Data::Slice(data) => {
                 if let Some(bytes) = data.get(byte_pos..byte_pos + 8) {
                     u64::from_be_bytes(bytes.try_into().unwrap())

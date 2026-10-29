@@ -94,6 +94,11 @@ impl DecoderContext {
     }
 
     #[inline(always)]
+    /// The colour changes of the last row pushed (until the next is decoded).
+    pub(crate) fn last_row(&self) -> &[u32] {
+        &self.ref_changes
+    }
+
     pub(crate) fn next_line(&mut self, decoder: &mut impl Decoder) {
         decoder.push_row(&self.coding_changes);
         core::mem::swap(&mut self.ref_changes, &mut self.coding_changes);

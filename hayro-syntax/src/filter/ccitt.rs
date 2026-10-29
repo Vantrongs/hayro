@@ -4,11 +4,13 @@ use crate::object::dict::keys::{
     BLACK_IS_1, COLUMNS, ENCODED_BYTE_ALIGN, END_OF_BLOCK, END_OF_LINE, K, ROWS,
 };
 use crate::object::stream::{FilterResult, ImageColorSpace, ImageData, ImageDecodeParams};
-use crate::work::{Meter, POLL_BYTES};
+use crate::work::{Cancelled, Meter, POLL_BYTES};
 use alloc::borrow::Cow;
+use alloc::boxed::Box;
+use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
-use hayro_ccitt::{DecodeSettings, Decoder, DecoderContext, EncodingMode, Source};
+use hayro_ccitt::{DecodeSettings, Decoder, EncodingMode, RowDecoder, Source};
 
 /// Makes room in `output` for `needed` bytes: it grows to the `declared` bytes
 /// divided by eight as often as that leaves room for them, and no further once they
@@ -36,67 +38,8 @@ fn grow_to(output: &mut Vec<u8>, needed: usize, declared: usize) {
     output.reserve_exact(target - output.len());
 }
 
-/// Appends `count` copies of `byte` to `output`, a counted piece at a time, with room
-/// made as in [`reserve`]; stops appending once `meter`'s hook asks to stop.
-fn push_counted(output: &mut Vec<u8>, byte: u8, count: usize, declared: usize, meter: &Meter<'_>) {
-    let mut left = count;
-    while left > 0 && !meter.cancelled() {
-        let n = left.min(POLL_BYTES);
-        let needed = output.len() + n;
-        reserve(output, needed, declared);
-        output.resize(needed, byte);
-        left -= n;
-        let _ = meter.work(n);
-    }
-}
-
-/// Grows `output` with white rows up to `end`, the end of the row about to be
-/// written, counted on `meter` (see [`push_counted`]); `false`, with the row left
-/// out, once its hook asks to stop.
-fn grow(output: &mut Vec<u8>, end: usize, declared: usize, white: u8, meter: &Meter<'_>) -> bool {
-    push_counted(
-        output,
-        white,
-        end.saturating_sub(output.len()),
-        declared,
-        meter,
-    );
-    output.len() >= end
-}
-
-/// Like [`grow`], but fills white [`POLL_BYTES`] ahead of `end` within the room
-/// made, so that the rows that follow are written into it without growing `output`
-/// row by row, while a stream that ends early whitens no more than that past its
-/// last row rather than all the room, up to eight times the rows written.
-#[cold]
-#[inline(never)]
-fn grow_room(
-    output: &mut Vec<u8>,
-    end: usize,
-    declared: usize,
-    white: u8,
-    meter: &Meter<'_>,
-) -> bool {
-    reserve(output, end, declared);
-    let ahead = output.capacity().min(end.saturating_add(POLL_BYTES));
-    grow(output, ahead, declared, white, meter);
-    output.len() >= end
-}
-
 /// White pixels a stream that ends early is padded with whatever it decoded.
 const MIN_WHITE_PAD: usize = 1 << 16;
-
-/// The widest row, in pixels, that is written whole into white room made ahead of
-/// it ([`grow_room`]) and then counted at once ([`row_work`]): at most one and a half
-/// times as much, which stays within [`POLL_BYTES`].
-const WHOLE_ROW: usize = POLL_BYTES / 2;
-
-/// The work of writing the black spans `changes` gives over a white row of `bytes`:
-/// at most the row's bytes, and a step per span, counted without going through them.
-#[inline(always)]
-fn row_work(bytes: usize, changes: &[u32]) -> usize {
-    bytes + changes.len().div_ceil(2)
-}
 
 /// How a stream's CCITT data decodes: its settings, and the byte its white pixels
 /// are written as, black ones being its complement.
@@ -139,6 +82,24 @@ impl Setup {
         Self { settings, white }
     }
 
+    /// What decoding reports of the samples: 8-bit gray, or of a bit for an indexed
+    /// image (`packed`), in rows of the columns, as many as the image declares.
+    fn image_data(&self, packed: bool) -> ImageData {
+        ImageData {
+            alpha: None,
+            color_space: Some(ImageColorSpace::Gray),
+            bits_per_component: if packed { 1 } else { 8 },
+            width: self.settings.columns,
+            height: self.settings.rows,
+        }
+    }
+
+    /// The bytes of a row, of a bit a pixel if `packed`.
+    fn row_len(&self, packed: bool) -> usize {
+        let columns = self.settings.columns as usize;
+        if packed { columns.div_ceil(8) } else { columns }
+    }
+
     /// Whether 8-bit rows left out after the `decoded` rows of data that decoded
     /// through (`complete`) are padded white: while padding them takes no more than
     /// the rows decoded (or a small image); otherwise the image ends with the rows
@@ -151,129 +112,293 @@ impl Setup {
     }
 }
 
-/// An image's CCITT data, read as 8-bit rows (gray, not indexed) that are handed
-/// over one at a time as they decode and not kept, so that reading it holds a row's
-/// colour changes rather than the image, and of encrypted data a window of it
-/// decrypted ([`Stream::ccitt_rows`]).
-///
-/// [`Stream::ccitt_rows`]: crate::object::Stream::ccitt_rows
-pub struct CcittRows<'a> {
-    data: DecryptedReader<'a>,
+/// An image's CCITT data, read as the bytes [`decode`] makes of it, a piece at a time
+/// as rows decode: 8-bit gray rows, or rows of a bit a pixel for an indexed image,
+/// those of 8-bit data that ends early padded white as `decode` pads them. It holds
+/// the decoder's state and a row's colour changes, not the rows, and of encrypted data
+/// a window of it decrypted.
+pub(crate) struct CcittBytes<'a> {
+    data: Encoded<'a>,
     setup: Setup,
+    /// Whether the rows are of a bit a pixel.
+    packed: bool,
+    /// Made at the first read, and again after a rewind.
+    decoder: Option<Decoding<'a>>,
+    /// The bytes of the row being read (the decoder's last row, or a white one) that
+    /// were read, and those left.
+    at: usize,
+    left: usize,
+    state: State,
+    /// Whether the data broke off before its end.
+    broken: bool,
+    /// Whether a meter's hook asked to stop, after which reads fail until a rewind.
+    stopped: bool,
 }
 
-/// How a pass over [`CcittRows`] ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CcittEnd {
-    /// The data decoded through, or up to the rows the image has.
-    Complete,
-    /// The data failed to decode after the rows handed over.
-    Broken,
-    /// The reader of the rows asked to stop.
-    Stopped,
-    /// The meter's hook asked to stop.
-    Cancelled,
+/// The encoded data.
+enum Encoded<'a> {
+    Plain(&'a [u8]),
+    /// Decrypted as it is read (boxed: a cipher's state is large).
+    Encrypted(Box<DecryptedReader<'a>>),
 }
 
-impl<'a> CcittRows<'a> {
+/// The decoder, and the window encrypted data is read through.
+struct Decoding<'a> {
+    rows: RowDecoder<'a>,
+    window: Option<Rc<Window<'a>>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum State {
+    /// A decoded row is being read, or none before the first.
+    Row,
+    /// The data ended, and white rows are read after it, this many more.
+    Padding(u32),
+    /// The data ended, and the bytes with it.
+    Done,
+}
+
+impl<'a> CcittBytes<'a> {
+    /// The bytes `data` decodes to with filter parameters `params`.
     pub(crate) fn new(
         data: DecryptedReader<'a>,
         params: &Dict<'_>,
         image_params: &ImageDecodeParams,
     ) -> Self {
+        let data = match data.plain_borrowed() {
+            Some(plain) => Encoded::Plain(plain),
+            None => Encoded::Encrypted(Box::new(data)),
+        };
+        Self::of(
+            data,
+            Setup::new(params, image_params),
+            image_params.is_indexed,
+        )
+    }
+
+    fn of(data: Encoded<'a>, setup: Setup, packed: bool) -> Self {
         Self {
             data,
-            setup: Setup::new(params, image_params),
-        }
-    }
-
-    /// The pixels of a row.
-    pub fn columns(&self) -> u32 {
-        self.setup.settings.columns
-    }
-
-    /// The byte a white pixel decodes to (`0xFF`, or `0x00` with `BlackIs1`); a black
-    /// one decodes to its complement.
-    pub fn white(&self) -> u8 {
-        self.setup.white
-    }
-
-    /// The rows the image decoded whole ([`Stream::decoded_image`]) has when a pass
-    /// over all of the data hands over `decoded` rows and ends with `end`: those rows,
-    /// and white ones up to the rows the image declares where the data decoded
-    /// through and padding them takes little. `None` where decoding whole fails: data
-    /// that breaks off before a row, or no row at all.
-    ///
-    /// [`Stream::decoded_image`]: crate::object::Stream::decoded_image
-    pub fn rows_kept(&self, decoded: u32, end: CcittEnd) -> Option<u32> {
-        let complete = end == CcittEnd::Complete;
-        if !complete && decoded == 0 {
-            return None;
-        }
-        let rows = if self.setup.pads(decoded, complete) {
-            self.setup.settings.rows
-        } else {
-            decoded
-        };
-        (rows > 0).then_some(rows)
-    }
-
-    /// Decodes the rows from the first, handing each to `row` as the columns where
-    /// its colour changes, in ascending order: black from the first, white from the
-    /// second, and so on (as `hayro_ccitt::Decoder::push_row`), until `row` returns
-    /// `false`. The decoding counts on `meter` a step per bit read, and a step per
-    /// byte decrypted.
-    pub fn decode(&self, row: impl FnMut(&[u32]) -> bool, meter: &Meter<'_>) -> CcittEnd {
-        struct Rows<'m, F> {
-            row: F,
-            stopped: bool,
-            meter: &'m Meter<'m>,
-        }
-
-        impl<F: FnMut(&[u32]) -> bool> Decoder for Rows<'_, F> {
-            fn push_row(&mut self, changes: &[u32]) {
-                if !self.stopped {
-                    self.stopped = !(self.row)(changes);
-                }
-            }
-
-            fn stop(&mut self, bits: usize) -> bool {
-                self.stopped || self.meter.work(bits).is_err()
-            }
-        }
-
-        let mut rows = Rows {
-            row,
+            setup,
+            packed,
+            decoder: None,
+            at: 0,
+            left: 0,
+            state: State::Row,
+            broken: false,
             stopped: false,
+        }
+    }
+
+    /// The bytes of a row.
+    fn row_len(&self) -> usize {
+        self.setup.row_len(self.packed)
+    }
+
+    /// Back to the start of the data.
+    pub(crate) fn rewind(&mut self) {
+        self.decoder = None;
+        self.at = 0;
+        self.left = 0;
+        self.state = State::Row;
+        self.broken = false;
+        self.stopped = false;
+    }
+
+    /// Fills `out` with the next bytes and returns how many, 0 only at the end. The
+    /// decoding counts on `meter` a step per bit read and per byte decrypted, and
+    /// the bytes made; once its hook asked to stop, reads fail until a rewind.
+    pub(crate) fn read(&mut self, out: &mut [u8], meter: &Meter<'_>) -> Result<usize, Cancelled> {
+        let mut filled = 0;
+        while filled < out.len() {
+            let n = (out.len() - filled).min(self.left);
+            if n > 0 {
+                let piece = &mut out[filled..filled + n];
+                piece.fill(self.setup.white);
+                let spans = self.write_row(piece);
+                self.taken(n);
+                meter.work(n + spans)?;
+                filled += n;
+                continue;
+            }
+            if !self.next_row(meter)? {
+                break;
+            }
+        }
+        Ok(filled)
+    }
+
+    /// Moves past the next `n` bytes as [`Self::read`] reads them, without making
+    /// them; returns how many the data held. Only the decoding counts on `meter`.
+    pub(crate) fn skip(&mut self, n: usize, meter: &Meter<'_>) -> Result<usize, Cancelled> {
+        let mut skipped = 0;
+        while skipped < n {
+            let k = (n - skipped).min(self.left);
+            if k > 0 {
+                self.taken(k);
+                skipped += k;
+                continue;
+            }
+            if !self.next_row(meter)? {
+                break;
+            }
+        }
+        Ok(skipped)
+    }
+
+    /// Notes `n` more bytes of the row read.
+    fn taken(&mut self, n: usize) {
+        self.at += n;
+        self.left -= n;
+    }
+
+    /// The bytes [`decode`] makes, appended to `output`, room made for each piece as
+    /// [`reserve`] makes it towards `declared` bytes: the decoding counted on `meter`,
+    /// `None` once its hook asks to stop.
+    fn read_to_end(
+        &mut self,
+        output: &mut Vec<u8>,
+        declared: usize,
+        meter: &Meter<'_>,
+    ) -> Option<()> {
+        loop {
+            let n = self.left.min(POLL_BYTES);
+            if n > 0 {
+                let len = output.len();
+                reserve(output, len + n, declared);
+                output.resize(len + n, self.setup.white);
+                let spans = self.write_row(&mut output[len..]);
+                self.taken(n);
+                meter.work(n + spans).ok()?;
+                continue;
+            }
+            if !self.next_row(meter).ok()? {
+                return Some(());
+            }
+        }
+    }
+
+    /// Writes the next bytes of the row being read over `out`, which is white; returns
+    /// the black spans written.
+    fn write_row(&self, out: &mut [u8]) -> usize {
+        let (State::Row, Some(decoding)) = (self.state, &self.decoder) else {
+            return 0;
+        };
+        let changes = decoding.rows.last_row();
+        let columns = self.setup.settings.columns as usize;
+        if self.packed {
+            black_bits(changes, columns, self.at, out)
+        } else {
+            black_bytes(changes, columns, self.at, !self.setup.white, out)
+        }
+    }
+
+    /// Moves to the next row: one decoded, or a white one past the end of the data
+    /// where `decode` pads it; false at the end.
+    fn next_row(&mut self, meter: &Meter<'_>) -> Result<bool, Cancelled> {
+        if self.stopped {
+            return Err(Cancelled);
+        }
+        let row_len = self.row_len();
+        (self.at, self.left) = (0, 0);
+        match self.state {
+            // A row of no bytes ends the data as it is read.
+            _ if row_len == 0 => {
+                self.state = State::Done;
+                return Ok(false);
+            }
+            State::Done => return Ok(false),
+            State::Padding(0) => {
+                self.state = State::Done;
+                return Ok(false);
+            }
+            State::Padding(rows) => {
+                self.state = State::Padding(rows - 1);
+                self.left = row_len;
+                return Ok(true);
+            }
+            State::Row => {}
+        }
+        let (data, settings) = (&self.data, self.setup.settings);
+        let decoding = self.decoder.get_or_insert_with(|| start(data, settings));
+        let mut sink = Sink {
+            window: decoding.window.as_deref(),
             meter,
         };
-        let mut context = DecoderContext::new(self.setup.settings);
-        let result = match self.data.plain() {
-            Some(data) => hayro_ccitt::decode(data, &mut rows, &mut context),
-            None => {
-                let reader = Seekable::new(self.data.clone());
-                let window = Window {
-                    len: reader.len(),
-                    state: RefCell::new(WindowState {
-                        reader,
-                        bytes: Vec::new(),
-                        start: 0,
-                    }),
-                    meter,
-                    cancelled: Cell::new(false),
-                };
-                hayro_ccitt::decode_source(&window, &mut rows, &mut context)
-            }
-        };
-        if meter.cancelled() {
-            CcittEnd::Cancelled
-        } else if rows.stopped {
-            CcittEnd::Stopped
-        } else if result.is_ok() {
-            CcittEnd::Complete
-        } else {
-            CcittEnd::Broken
+        let result = decoding.rows.next_row(&mut sink);
+        let decrypted = sink.decrypted();
+        if meter.work(decrypted).is_err() || meter.cancelled() {
+            self.stopped = true;
+            return Err(Cancelled);
         }
+        let complete = match result {
+            Ok(true) => {
+                self.left = row_len;
+                return Ok(true);
+            }
+            Ok(false) => true,
+            Err(_) => false,
+        };
+        self.broken = !complete;
+        let decoded = decoding.rows.decoded_rows();
+        let rows = self.setup.settings.rows;
+        // `decode` fails where the data breaks off before a row, and pads 8-bit rows.
+        self.state =
+            if (complete || decoded > 0) && !self.packed && self.setup.pads(decoded, complete) {
+                State::Padding(rows - decoded)
+            } else {
+                State::Done
+            };
+        self.next_row(meter)
+    }
+}
+
+/// Starts decoding `data`: plain data from its bytes, encrypted data through a window.
+fn start<'a>(data: &Encoded<'a>, settings: DecodeSettings) -> Decoding<'a> {
+    match data {
+        Encoded::Plain(bytes) => Decoding {
+            rows: RowDecoder::new(bytes, settings),
+            window: None,
+        },
+        Encoded::Encrypted(reader) => {
+            let reader = Seekable::new(DecryptedReader::clone(reader));
+            let window = Rc::new(Window {
+                len: reader.len(),
+                state: RefCell::new(WindowState {
+                    reader,
+                    bytes: Vec::new(),
+                    start: 0,
+                }),
+                decrypted: Cell::new(0),
+            });
+            Decoding {
+                rows: RowDecoder::from_source(window.clone(), settings),
+                window: Some(window),
+            }
+        }
+    }
+}
+
+/// Counts the bits the decoder reads and the bytes decrypted on a meter; the rows it
+/// pushes are read from it ([`RowDecoder::last_row`]).
+struct Sink<'s, 'a, 'm> {
+    window: Option<&'s Window<'a>>,
+    meter: &'m Meter<'m>,
+}
+
+impl Sink<'_, '_, '_> {
+    /// The bytes decrypted since this was last asked.
+    fn decrypted(&self) -> usize {
+        self.window.map_or(0, |w| w.decrypted.take())
+    }
+}
+
+impl Decoder for Sink<'_, '_, '_> {
+    fn push_row(&mut self, _: &[u32]) {}
+
+    /// A bit read counts a step, as a code takes at least one.
+    fn stop(&mut self, bits: usize) -> bool {
+        self.meter.work(bits + self.decrypted()).is_err()
     }
 }
 
@@ -288,14 +413,12 @@ const DECRYPT_CHUNK: usize = 8 * 1024;
 
 /// Encrypted CCITT data, decrypted as the decoder reads it, holding at most twice
 /// [`WINDOW`] bytes of it and a chunk.
-struct Window<'r, 'a> {
+struct Window<'a> {
     /// The bytes the data decrypts to.
     len: usize,
     state: RefCell<WindowState<'a>>,
-    meter: &'r Meter<'r>,
-    /// Whether the meter's hook asked to stop while decrypting: the bytes not
-    /// decrypted then read as zero, and the decoder stops at its next ask.
-    cancelled: Cell<bool>,
+    /// The bytes decrypted, not yet counted on a meter.
+    decrypted: Cell<usize>,
 }
 
 struct WindowState<'a> {
@@ -305,7 +428,7 @@ struct WindowState<'a> {
     start: usize,
 }
 
-impl Source for Window<'_, '_> {
+impl Source for Window<'_> {
     fn len(&self) -> usize {
         self.len
     }
@@ -317,7 +440,7 @@ impl Source for Window<'_, '_> {
             state.start = state.reader.back_to(pos);
             state.bytes.clear();
         }
-        while state.start + state.bytes.len() < end && !self.cancelled.get() {
+        while state.start + state.bytes.len() < end {
             if state.bytes.len() >= 2 * WINDOW {
                 let drop = state.bytes.len() - WINDOW;
                 state.bytes.drain(..drop);
@@ -331,13 +454,19 @@ impl Source for Window<'_, '_> {
             if n == 0 {
                 break;
             }
-            self.cancelled.set(self.meter.work(n).is_err());
+            self.decrypted.set(self.decrypted.get() + n);
         }
         let held = &state.bytes[(pos - state.start).min(state.bytes.len())..];
         let n = held.len().min(out.len());
         out[..n].copy_from_slice(&held[..n]);
         out[n..].fill(0);
     }
+}
+
+/// What [`decode`] reports of the samples it decodes with filter parameters `params`,
+/// from the parameters alone.
+pub(crate) fn image_data(params: &Dict<'_>, image_params: &ImageDecodeParams) -> ImageData {
+    Setup::new(params, image_params).image_data(image_params.is_indexed)
 }
 
 /// The data decoded, its work counted on `meter`; `None` once its hook asks to stop.
@@ -348,264 +477,83 @@ pub(crate) fn decode(
     meter: &Meter<'_>,
 ) -> Option<FilterResult<'static>> {
     let setup = Setup::new(params, image_params);
-    let (settings, white) = (setup.settings, setup.white);
-    let (columns, rows) = (settings.columns, settings.rows);
-    let output_len = (columns as usize).checked_mul(rows as usize)?;
-
-    // Whenever possible (if we don't have an indexed color space), we convert
-    // the data as 8-bit instead of 1-bit, so that it can be easier converted
-    // into an RGBA8 image.
-
-    let (decoded, bpc, decoded_rows) = if image_params.is_indexed {
-        struct BitPackDecoder<'m> {
-            output: Vec<u8>,
-            /// The bytes `Rows` rows take.
-            declared: usize,
-            columns: u32,
-            stride: usize,
-            white: u8,
-            /// The bits of the last byte in a row that belong to the image.
-            last_byte_mask: u8,
-            decoded_rows: u32,
-            meter: &'m Meter<'m>,
-        }
-
-        impl Decoder for BitPackDecoder<'_> {
-            fn push_row(&mut self, changes: &[u32]) {
-                let start = self.decoded_rows as usize * self.stride;
-                let end = start + self.stride;
-
-                if self.columns as usize <= WHOLE_ROW {
-                    // Rows pushed after a stop, until the decoder asks again, cost nothing.
-                    if self.meter.cancelled()
-                        || end > self.output.len()
-                            && !grow_room(
-                                &mut self.output,
-                                end,
-                                self.declared,
-                                self.white,
-                                self.meter,
-                            )
-                    {
-                        return;
-                    }
-
-                    let row = &mut self.output[start..end];
-
-                    for (start, end) in black_spans(changes, self.columns) {
-                        let (first, last) = (start / 8, (end - 1) / 8);
-                        let first_mask = 0xFF_u8 >> (start % 8);
-                        let last_mask = 0xFF_u8 << (7 - (end - 1) % 8);
-
-                        if first == last {
-                            row[first] ^= first_mask & last_mask;
-                        } else {
-                            row[first] ^= first_mask;
-                            row[last] ^= last_mask;
-                            fill_short(&mut row[first + 1..last], !self.white);
-                        }
-                    }
-
-                    if let Some(last) = row.last_mut() {
-                        *last &= self.last_byte_mask;
-                    }
-
-                    if self.meter.work(row_work(self.stride, changes)).is_ok() {
-                        self.decoded_rows += 1;
-                    }
-                    return;
-                }
-
-                if !grow(&mut self.output, end, self.declared, self.white, self.meter) {
-                    return;
-                }
-
-                let row = &mut self.output[start..end];
-
-                // The row is prefilled with white, so flipping the bits of a
-                // span turns it black.
-                for (start, end) in black_spans(changes, self.columns) {
-                    let (first, last) = (start / 8, (end - 1) / 8);
-                    let first_mask = 0xFF_u8 >> (start % 8);
-                    let last_mask = 0xFF_u8 << (7 - (end - 1) % 8);
-
-                    let filled = if first == last {
-                        row[first] ^= first_mask & last_mask;
-                        self.meter.work(1).is_ok()
-                    } else {
-                        row[first] ^= first_mask;
-                        row[last] ^= last_mask;
-                        fill_counted(&mut row[first + 1..last], !self.white, self.meter)
-                    };
-                    if !filled {
-                        return;
-                    }
-                }
-
-                if let Some(last) = row.last_mut() {
-                    *last &= self.last_byte_mask;
-                }
-
-                self.decoded_rows += 1;
-            }
-
-            /// A bit read counts a step, as a code takes at least one.
-            fn stop(&mut self, bits: usize) -> bool {
-                self.meter.work(bits).is_err()
-            }
-        }
-
-        let stride = (columns as usize).div_ceil(8);
-        let mut decoder = BitPackDecoder {
-            output: Vec::new(),
-            declared: stride.checked_mul(rows as usize)?,
-            columns,
-            stride,
-            white,
-            last_byte_mask: 0xFF_u8 << ((8 - columns % 8) % 8),
-            decoded_rows: 0,
-            meter,
-        };
-        let mut context = DecoderContext::new(settings);
-        let result = hayro_ccitt::decode(data, &mut decoder, &mut context);
-
-        // If we decoded at least one row, let's be lenient and return what we got.
-        // See also 0001763.pdf.
-        if result.is_err() && decoder.decoded_rows == 0 || meter.cancelled() {
-            return None;
-        }
-
-        decoder
-            .output
-            .truncate(decoder.decoded_rows as usize * stride);
-
-        (decoder.output, 1, decoder.decoded_rows)
-    } else {
-        struct Luma8Decoder<'m> {
-            output: Vec<u8>,
-            /// The bytes `Rows` rows take.
-            declared: usize,
-            columns: u32,
-            white: u8,
-            decoded_rows: u32,
-            meter: &'m Meter<'m>,
-        }
-
-        impl Decoder for Luma8Decoder<'_> {
-            fn push_row(&mut self, changes: &[u32]) {
-                let start = self.decoded_rows as usize * self.columns as usize;
-                let end = start + self.columns as usize;
-
-                if self.columns as usize <= WHOLE_ROW {
-                    // Rows pushed after a stop, until the decoder asks again, cost nothing.
-                    if self.meter.cancelled()
-                        || end > self.output.len()
-                            && !grow_room(
-                                &mut self.output,
-                                end,
-                                self.declared,
-                                self.white,
-                                self.meter,
-                            )
-                    {
-                        return;
-                    }
-
-                    let row = &mut self.output[start..end];
-
-                    for (start, end) in black_spans(changes, self.columns) {
-                        fill_short(&mut row[start..end], !self.white);
-                    }
-
-                    if self.meter.work(row_work(row.len(), changes)).is_ok() {
-                        self.decoded_rows += 1;
-                    }
-                    return;
-                }
-
-                if !grow(&mut self.output, end, self.declared, self.white, self.meter) {
-                    return;
-                }
-
-                let row = &mut self.output[start..end];
-
-                for (start, end) in black_spans(changes, self.columns) {
-                    if !fill_counted(&mut row[start..end], !self.white, self.meter) {
-                        return;
-                    }
-                }
-
-                self.decoded_rows += 1;
-            }
-
-            /// A bit read counts a step, as a code takes at least one.
-            fn stop(&mut self, bits: usize) -> bool {
-                self.meter.work(bits).is_err()
-            }
-        }
-
-        let mut decoder = Luma8Decoder {
-            output: Vec::new(),
-            declared: output_len,
-            columns,
-            white,
-            decoded_rows: 0,
-            meter,
-        };
-        let mut context = DecoderContext::new(settings);
-        let result = hayro_ccitt::decode(data, &mut decoder, &mut context);
-
-        if result.is_err() && decoder.decoded_rows == 0 || meter.cancelled() {
-            return None;
-        }
-
-        decoder
-            .output
-            .truncate(decoder.decoded_rows as usize * columns as usize);
-
-        if setup.pads(decoder.decoded_rows, result.is_ok()) {
-            let missing = output_len - decoder.output.len();
-            push_counted(&mut decoder.output, white, missing, output_len, meter);
-            if meter.cancelled() {
-                return None;
-            }
-        }
-
-        (decoder.output, 8, decoder.decoded_rows)
-    };
-
+    let mut bytes = CcittBytes::of(Encoded::Plain(data), setup, image_params.is_indexed);
+    let mut image_data = setup.image_data(bytes.packed);
+    let declared = bytes.row_len().checked_mul(setup.settings.rows as usize)?;
+    let mut decoded = Vec::new();
+    bytes.read_to_end(&mut decoded, declared, meter)?;
+    // If we decoded at least one row, let's be lenient and return what we got.
+    // See also 0001763.pdf.
+    if bytes.broken && decoded.is_empty() {
+        return None;
+    }
+    if image_data.height == 0 {
+        image_data.height = decoded.len().checked_div(bytes.row_len()).unwrap_or(0) as u32;
+    }
     Some(FilterResult {
         data: Cow::Owned(decoded),
-        image_data: Some(ImageData {
-            alpha: None,
-            color_space: Some(ImageColorSpace::Gray),
-            bits_per_component: bpc,
-            width: settings.columns,
-            height: if rows == 0 { decoded_rows } else { rows },
-        }),
+        image_data: Some(image_data),
     })
 }
 
-fn black_spans(changes: &[u32], columns: u32) -> impl Iterator<Item = (usize, usize)> + '_ {
-    changes.chunks(2).map(move |span| {
-        let end = span.get(1).copied().unwrap_or(columns);
-        (span[0] as usize, end as usize)
-    })
+/// The black spans of a row of `columns` pixels whose colour changes at `changes`
+/// (black from the first, white from the second, and so on), clipped to pixels
+/// `from..to`.
+fn black_spans(
+    changes: &[u32],
+    columns: usize,
+    from: usize,
+    to: usize,
+) -> impl Iterator<Item = (usize, usize)> + '_ {
+    // The changes at or before `from`: past a black one, `from` lies in its span.
+    let first = changes.partition_point(|&c| c as usize <= from) / 2;
+    changes[2 * first..]
+        .chunks(2)
+        .map(move |span| {
+            (
+                span[0] as usize,
+                span.get(1).map_or(columns, |&e| e as usize),
+            )
+        })
+        .take_while(move |&(start, _)| start < to)
+        .map(move |(start, end)| (start.max(from), end.min(to)))
 }
 
-/// Fills `slice` with `value`, a counted piece at a time; `false`, with the rest
-/// left out, once `meter`'s hook asks to stop. A span costs a step even when empty.
-#[inline(always)]
-fn fill_counted(slice: &mut [u8], value: u8, meter: &Meter<'_>) -> bool {
-    if slice.len() <= POLL_BYTES {
-        fill_short(slice, value);
-        return meter.work(slice.len() + 1).is_ok();
+/// Writes `black` over the black pixels among bytes `from..` of an 8-bit row, into
+/// `out`; returns the spans written.
+fn black_bytes(changes: &[u32], columns: usize, from: usize, black: u8, out: &mut [u8]) -> usize {
+    let mut spans = 0;
+    for (start, end) in black_spans(changes, columns, from, from + out.len()) {
+        fill_short(&mut out[start - from..end - from], black);
+        spans += 1;
     }
+    spans
+}
 
-    slice.chunks_mut(POLL_BYTES).all(|piece| {
-        piece.fill(value);
-        meter.work(piece.len()).is_ok()
-    })
+/// Flips the bits of the black pixels among bytes `from..` of a row of a bit a pixel,
+/// into `out`, and clears those after the row's last pixel; returns the spans written.
+fn black_bits(changes: &[u32], columns: usize, from: usize, out: &mut [u8]) -> usize {
+    let to = (8 * (from + out.len())).min(columns);
+    let mut spans = 0;
+    for (start, end) in black_spans(changes, columns, 8 * from, to) {
+        let (first, last) = (start / 8 - from, (end - 1) / 8 - from);
+        let first_mask = 0xFF_u8 >> (start % 8);
+        let last_mask = 0xFF_u8 << (7 - (end - 1) % 8);
+        if first == last {
+            out[first] ^= first_mask & last_mask;
+        } else {
+            out[first] ^= first_mask;
+            out[last] ^= last_mask;
+            out[first + 1..last].iter_mut().for_each(|b| *b = !*b);
+        }
+        spans += 1;
+    }
+    if from + out.len() == columns.div_ceil(8)
+        && let Some(last) = out.last_mut()
+    {
+        *last &= 0xFF_u8 << ((8 - columns % 8) % 8);
+    }
+    spans
 }
 
 #[inline(always)]
@@ -737,7 +685,6 @@ mod tests {
                     .reader(id, &data, DecryptionTarget::Stream)
                     .unwrap(),
             );
-            let meter = Meter::default();
             let window = Window {
                 len: reader.len(),
                 state: core::cell::RefCell::new(WindowState {
@@ -745,8 +692,7 @@ mod tests {
                     bytes: Vec::new(),
                     start: 0,
                 }),
-                meter: &meter,
-                cancelled: core::cell::Cell::new(false),
+                decrypted: core::cell::Cell::new(0),
             };
             assert_eq!(window.len(), plain.len());
             let len = plain.len();

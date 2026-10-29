@@ -2,6 +2,7 @@
 //! density, so a renderer keeps a handle instead of decoded pixels and asks for what a
 //! view shows.
 
+#[cfg(test)]
 mod ccitt;
 mod decoded;
 mod index;
@@ -17,7 +18,6 @@ use crate::WarningSinkFn;
 use crate::cache::Cache;
 use crate::color::ColorSpace;
 use crate::interpret::state::ActiveTransferFunction;
-use ccitt::CcittStreamed;
 use decoded::Decoded;
 use hayro_syntax::object::stream::OwnedStream;
 use hayro_syntax::work::{Cancelled, Meter};
@@ -114,31 +114,30 @@ impl ImageAsset {
         })
     }
 
-    /// Opens the image for requests. Images with no filter or Flate (with any
-    /// predictor but TIFF prediction of 16 bits) whose samples have fewer than eight
-    /// bits, in any colour space, or are 8-bit `DeviceGray`, `DeviceRGB` or `Indexed`
-    /// samples used as stored or inverted, with masks of one component of fewer than
-    /// eight bits or of eight used as stored or inverted, or decoded whole, and
-    /// stencil masks with no filter or Flate, only read their dictionaries here (and, the first time, read the
-    /// data of an image with a mask stream and of its mask through, to count the
-    /// rows decoding them whole keeps, on which the mask's grid depends); requests
-    /// read their data and keep a piece of a row and a few sums per bin, the rows the
-    /// data does not reach being transparent, and fail where the data holds no row,
-    /// as decoding it whole does. A request of such a Flate image without a mask read alongside
+    /// Opens the image for requests. Images whose data has no filter, Flate (with any
+    /// predictor but TIFF prediction of 16 bits) or `CCITTFaxDecode` as its one
+    /// filter, and whose samples (as the filter makes them: CCITT data's are 8-bit
+    /// gray, or of one bit for an `Indexed` image) have fewer than eight bits, in any
+    /// colour space, or are 8-bit samples of one component, or 8-bit `DeviceRGB`
+    /// samples used as stored or inverted, with masks of one component of the same
+    /// kinds, or
+    /// decoded whole, and stencil masks of the same kinds, only read their
+    /// dictionaries here (and, the first time, read the data of an image with a mask
+    /// stream and of its mask through the rows they declare, to count the rows
+    /// decoding them whole keeps, on which the mask's grid depends); requests read
+    /// their data from the start and keep a piece of a row and a few sums per bin (and
+    /// a CCITT decoder's state and a row's colour changes), the rows the data does not
+    /// reach being transparent, and fail where the data holds no row, as decoding it
+    /// whole does. A request of such a Flate image without a mask read alongside
     /// resumes from the nearest decoder state an earlier request of the asset saved,
     /// instead of from the start. So does a request of a single-scan baseline
     /// grayscale JPEG of its declared size without masks, read in bands of eight
     /// rows; once its data fails to decode, it is decoded whole like other images.
-    /// A gray image or stencil mask without masks whose one filter is
-    /// `CCITTFaxDecode` only reads its dictionary here; each request decodes the
-    /// data from the start through its last row, keeping a row's colour changes, and
-    /// where the data ends before the declared height, the rows decoding it whole
-    /// keeps past the last decoded one are white, the rest transparent, and a
-    /// request fails where the data holds no row. Other images are decoded whole here (with
-    /// `hint`, the size they are wanted at, for decoders that can reduce), and
-    /// requests read the decoded planes, which the source holds until it is dropped.
-    /// `cancel` is polled as [`ImageRequest::cancel`] is; a cancelled open leaves the
-    /// asset as it was, to be opened again.
+    /// Other images are decoded whole here (with `hint`, the size they are wanted at,
+    /// for decoders that can reduce), and requests read the decoded planes, which the
+    /// source holds until it is dropped. `cancel` is polled as
+    /// [`ImageRequest::cancel`] is; a cancelled open leaves the asset as it was, to be
+    /// opened again.
     pub fn open(
         &self,
         hint: Option<(u32, u32)>,
@@ -155,14 +154,6 @@ impl ImageAsset {
                 layout,
                 Inner::Streamed(Box::new(streamed)),
                 opened,
-            ));
-        }
-        if let Some(ccitt) = CcittStreamed::new(&obj) {
-            let layout = ccitt.layout();
-            return Ok(ImageSource::new(
-                layout,
-                Inner::Ccitt(Box::new(ccitt)),
-                DecodeWork::default(),
             ));
         }
         if a.kind == ImageKind::StencilMask {
@@ -368,7 +359,6 @@ pub struct ImageSource<'a> {
 enum Inner<'a> {
     Streamed(Box<Streamed<'a>>),
     Jpeg(Box<JpegStreamed<'a>>),
-    Ccitt(Box<CcittStreamed<'a>>),
     Decoded(Decoded),
 }
 
@@ -420,8 +410,6 @@ impl<'a> ImageSource<'a> {
             Inner::Streamed(s) => s.run(request.plane, &mut area, &meter),
             // Its layout has no mask plane.
             Inner::Jpeg(j) => j.run(&mut area, &meter),
-            // Its layout has no mask plane.
-            Inner::Ccitt(c) => c.run(&mut area, &meter),
             Inner::Decoded(d) => d.run(request.plane, &mut area).map(|rows| DecodeWork {
                 rows_decoded: u64::from(rows),
                 bytes_inflated: 0,

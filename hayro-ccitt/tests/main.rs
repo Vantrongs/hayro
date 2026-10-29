@@ -12,7 +12,7 @@ mod recovery;
 mod settings;
 mod stop;
 
-use hayro_ccitt::{DecodeSettings, Decoder, DecoderContext, EncodingMode, decode};
+use hayro_ccitt::{DecodeSettings, Decoder, DecoderContext, EncodingMode, RowDecoder, decode};
 use std::path::PathBuf;
 
 const G3_1D: EncodingMode = EncodingMode::Group3_1D;
@@ -90,6 +90,7 @@ fn check_consumed(
     let mut ctx = DecoderContext::new(settings);
     let read = decode(&data, &mut collector, &mut ctx)
         .unwrap_or_else(|e| panic!("{stream}: decoding failed: {e}"));
+    decodes_the_same_by_rows(stream, &data, settings);
 
     let expected_rows = if settings.rows == 0 {
         reference.len()
@@ -137,4 +138,36 @@ fn check_malformed(
 
     let mut ctx = DecoderContext::new(settings);
     let _ = decode(&data, &mut Collector::new(columns), &mut ctx);
+    decodes_the_same_by_rows(stream, &data, settings);
+}
+
+/// A [`RowDecoder`] asked for rows one at a time pushes the rows [`decode`] pushes,
+/// and ends as it does.
+fn decodes_the_same_by_rows(stream: &str, data: &[u8], settings: DecodeSettings) {
+    let mut whole = Collector::new(settings.columns);
+    let ended = decode(data, &mut whole, &mut DecoderContext::new(settings)).map(|_| ());
+    let mut rows = RowDecoder::new(data, settings);
+    let mut by_rows = Collector::new(settings.columns);
+    let ended_by_rows = loop {
+        match rows.next_row(&mut by_rows) {
+            Ok(true) => {
+                assert_eq!(rows.decoded_rows() as usize, by_rows.rows.len());
+                let mut last = Collector::new(settings.columns);
+                last.push_row(rows.last_row());
+                assert!(
+                    last.rows.last() == by_rows.rows.last(),
+                    "{stream}: last row"
+                );
+            }
+            Ok(false) => break Ok(()),
+            Err(e) => break Err(e),
+        }
+    };
+    assert_eq!(
+        rows.next_row(&mut by_rows),
+        Ok(false),
+        "{stream}: rows after the end"
+    );
+    assert_eq!(ended_by_rows, ended, "{stream}: ends otherwise");
+    assert!(by_rows.rows == whole.rows, "{stream}: other rows");
 }

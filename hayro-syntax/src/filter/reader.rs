@@ -3,11 +3,15 @@
 #[cfg(feature = "unsafe")]
 use crate::crypto::reader::Cursor;
 use crate::crypto::reader::DecryptedReader;
+#[cfg(feature = "images")]
+use crate::filter::ccitt::CcittBytes;
 use crate::filter::lzw_flate::{PredictorParams, Unpredictor, flate};
 #[cfg(feature = "unsafe")]
 use crate::object::stream::OwnedStream;
 use crate::work::{Cancelled, Meter, POLL_BYTES};
 use alloc::borrow::Cow;
+#[cfg(feature = "images")]
+use alloc::boxed::Box;
 #[cfg(feature = "unsafe")]
 use alloc::vec::Vec;
 
@@ -63,6 +67,9 @@ enum Source<'a> {
     Inflating(Inflating<'a>),
     /// Flate data for the permissive decoder, which decodes it whole at the next read.
     Fallback(DecryptedReader<'a>),
+    /// An image's CCITT data, decoded a row at a time.
+    #[cfg(feature = "images")]
+    Ccitt(Box<CcittBytes<'a>>),
 }
 
 /// Flate data inflated as it is read.
@@ -163,6 +170,16 @@ impl<'a> DecodedReader<'a> {
         }
     }
 
+    /// An image's CCITT data, read as the bytes whole decoding makes of it.
+    #[cfg(feature = "images")]
+    pub(crate) fn ccitt(bytes: CcittBytes<'a>) -> Self {
+        Self {
+            source: Source::Ccitt(Box::new(bytes)),
+            predictor: None,
+            inflated: 0,
+        }
+    }
+
     /// The bytes this reader's incremental Flate decoder produced, including those not
     /// read yet; not those the permissive decoder produced.
     pub fn inflated_bytes(&self) -> u64 {
@@ -245,6 +262,8 @@ impl<'a> DecodedReader<'a> {
     fn stored_read(&self) -> usize {
         match &self.source {
             Source::Raw(data) | Source::Fallback(data) => data.position(),
+            #[cfg(feature = "images")]
+            Source::Ccitt(_) => 0,
             #[cfg(feature = "unsafe")]
             Source::Inflating(inflating) => inflating.data.position(),
         }
@@ -257,6 +276,26 @@ impl<'a> DecodedReader<'a> {
             p.reset();
         }
         self.source.rewind();
+    }
+
+    /// Moves past the next `n` decoded bytes, as [`Self::read`] reads them; returns how
+    /// many the data held, fewer only at the end. CCITT rows are moved past without
+    /// making their bytes; other data is read through.
+    pub fn skip(&mut self, n: usize, meter: &Meter<'_>) -> Result<usize, Cancelled> {
+        #[cfg(feature = "images")]
+        if let Source::Ccitt(bytes) = &mut self.source {
+            return bytes.skip(n, meter);
+        }
+        let mut scratch = [0; SKIP_CHUNK];
+        let mut skipped = 0;
+        while skipped < n {
+            let len = (n - skipped).min(SKIP_CHUNK);
+            match self.read(&mut scratch[..len], meter)? {
+                0 => break,
+                got => skipped += got,
+            }
+        }
+        Ok(skipped)
     }
 
     /// Fills `buf` with the next decoded bytes and returns how many: at most
@@ -345,6 +384,8 @@ impl Source<'_> {
             #[cfg(feature = "unsafe")]
             Source::Inflating(inflating) => inflating.rewind(),
             Source::Fallback(_) => {}
+            #[cfg(feature = "images")]
+            Source::Ccitt(bytes) => bytes.rewind(),
         }
     }
 
@@ -367,6 +408,8 @@ impl Source<'_> {
                     None => self.restart(),
                 },
                 Source::Fallback(data) => *self = fallback(data, meter)?,
+                #[cfg(feature = "images")]
+                Source::Ccitt(bytes) => return bytes.read(buf, meter),
             }
         }
     }
@@ -394,11 +437,14 @@ impl Source<'_> {
     }
 }
 
+/// The bytes [`DecodedReader::skip`] reads at a time, on the stack.
+const SKIP_CHUNK: usize = 8 * 1024;
+
 /// Everything the permissive decoder makes of `data`, as stored bytes.
-fn fallback(
+fn fallback<'a>(
     data: &mut DecryptedReader<'_>,
     meter: &Meter<'_>,
-) -> Result<Source<'static>, Cancelled> {
+) -> Result<Source<'a>, Cancelled> {
     let decrypted;
     let bytes = match data.plain() {
         Some(bytes) => bytes,

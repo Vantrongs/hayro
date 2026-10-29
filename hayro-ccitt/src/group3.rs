@@ -2,8 +2,8 @@ use crate::bit_reader::BitReader;
 use crate::context::{Color, DecoderContext, decode_1d_line, decode_2d_line};
 use crate::{DecodeError, Decoder, EncodingMode, Result};
 
-/// Group 3 1D decoding (T.4 Section 4.1).
-pub(crate) fn decode_1d(
+/// Reads the EOL Group 3 data may start with, before its first line.
+pub(crate) fn start(
     ctx: &mut DecoderContext,
     reader: &mut BitReader<'_>,
     decoder: &mut impl Decoder,
@@ -11,59 +11,53 @@ pub(crate) fn decode_1d(
     // It seems like PDF producers are a bit sloppy with the `end_of_line` flag,
     // so we just always try to read one.
     ctx.has_eols = reader.read_eol_if_available(decoder)? > 0 || ctx.settings.end_of_line;
-
-    loop {
-        reader.poll(decoder)?;
-        let line_start = reader.clone();
-
-        if let Err(e) = decode_1d_line(ctx, reader, decoder) {
-            recover(ctx, reader, line_start, e)?;
-        }
-
-        ctx.next_line(decoder);
-
-        if check_eob(ctx, reader, decoder)? {
-            break;
-        }
-    }
-
     Ok(())
 }
 
-/// Group 3 2D decoding (T.4 Section 4.2).
-pub(crate) fn decode_2d(
+/// Decodes the next line of Group 3 1D data (T.4 Section 4.1), after [`start`]:
+/// false once the data ends after it.
+pub(crate) fn step_1d(
     ctx: &mut DecoderContext,
     reader: &mut BitReader<'_>,
     decoder: &mut impl Decoder,
-) -> Result<()> {
-    // It seems like PDF producers are a bit sloppy with the `end_of_line` flag,
-    // so we just always try to read one.
-    ctx.has_eols = reader.read_eol_if_available(decoder)? > 0 || ctx.settings.end_of_line;
+) -> Result<bool> {
+    reader.poll(decoder)?;
+    let line_start = reader.clone();
 
-    loop {
-        reader.poll(decoder)?;
-        let line_start = reader.clone();
-
-        let result = reader.read_bit().and_then(|tag_bit| {
-            if tag_bit == 1 {
-                decode_1d_line(ctx, reader, decoder)
-            } else {
-                decode_2d_line(ctx, reader, decoder)
-            }
-        });
-
-        if let Err(e) = result {
-            recover(ctx, reader, line_start, e)?;
-        }
-
-        ctx.next_line(decoder);
-
-        if check_eob(ctx, reader, decoder)? {
-            break;
-        }
+    if let Err(e) = decode_1d_line(ctx, reader, decoder) {
+        recover(ctx, reader, line_start, e)?;
     }
 
-    Ok(())
+    ctx.next_line(decoder);
+
+    Ok(!check_eob(ctx, reader, decoder)?)
+}
+
+/// Decodes the next line of Group 3 2D data (T.4 Section 4.2), after [`start`]:
+/// false once the data ends after it.
+pub(crate) fn step_2d(
+    ctx: &mut DecoderContext,
+    reader: &mut BitReader<'_>,
+    decoder: &mut impl Decoder,
+) -> Result<bool> {
+    reader.poll(decoder)?;
+    let line_start = reader.clone();
+
+    let result = reader.read_bit().and_then(|tag_bit| {
+        if tag_bit == 1 {
+            decode_1d_line(ctx, reader, decoder)
+        } else {
+            decode_2d_line(ctx, reader, decoder)
+        }
+    });
+
+    if let Err(e) = result {
+        recover(ctx, reader, line_start, e)?;
+    }
+
+    ctx.next_line(decoder);
+
+    Ok(!check_eob(ctx, reader, decoder)?)
 }
 
 /// Recover from a damaged line by continuing at the next EOL.

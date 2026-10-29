@@ -2,9 +2,11 @@
 //! alpha.
 
 use super::DecodeWork;
+use super::streamed::incremental_samples;
 use crate::LumaData;
 use crate::x_object::decode::{
-    BILEVEL_MASK_LUT, MaskPath, SampleFormat, SampleRows, decode_mask, mask_lut, sample_format,
+    BILEVEL_MASK_LUT, MaskPath, SampleFormat, SampleRows, decode_mask, image_decode_params,
+    mask_lut,
 };
 use crate::x_object::image::{ImageKind, ImageXObject};
 use core::ops::Range;
@@ -40,8 +42,6 @@ pub(super) struct RawRows<'a> {
     pub(super) total: usize,
     /// Bytes read of the row being read.
     at: usize,
-    /// Holds the bytes read past.
-    scratch: Vec<u8>,
 }
 
 /// What reading a row found.
@@ -53,14 +53,18 @@ pub(super) enum RawRow {
 }
 
 impl<'a> RawRows<'a> {
-    pub(super) fn new(stream: &Stream<'a>, row_bytes: usize, meter: &'a Meter<'a>) -> Option<Self> {
+    /// The rows of `obj`'s samples, `row_bytes` each, read on `meter`.
+    pub(super) fn new(
+        obj: &ImageXObject<'a>,
+        row_bytes: usize,
+        meter: &'a Meter<'a>,
+    ) -> Option<Self> {
         Some(Self {
-            reader: stream.decoded_reader()?,
+            reader: image_reader(obj)?,
             meter,
             row_bytes,
             total: 0,
             at: 0,
-            scratch: Vec::new(),
         })
     }
 
@@ -103,25 +107,15 @@ impl<'a> RawRows<'a> {
         Ok(filled)
     }
 
-    /// Reads past the row's next `n` bytes; false if the data ended first.
+    /// Moves past the row's next `n` bytes; false if the data ended first.
     pub(super) fn skip(&mut self, n: usize) -> Result<bool, Cancelled> {
-        let end = (self.at + n).min(self.row_bytes);
-        let mut scratch = std::mem::take(&mut self.scratch);
-        if scratch.is_empty() {
-            scratch = vec![0; self.row_bytes.min(PIECE_BYTES)];
-        }
-        let mut ended = false;
-        while self.at < end && !ended {
-            let len = (end - self.at).min(scratch.len());
-            let read = self.read(&mut scratch[..len]);
-            ended = read.as_ref().is_ok_and(|&got| got < len);
-            if let Err(e) = read {
-                self.scratch = scratch;
-                return Err(e);
-            }
-        }
-        self.scratch = scratch;
-        Ok(!ended)
+        let wanted = n.min(self.row_bytes - self.at);
+        let got = self.reader.skip(wanted, self.meter)?;
+        self.at += got;
+        self.total += got;
+        #[cfg(test)]
+        READ.set(READ.get() + got as u64);
+        Ok(got == wanted)
     }
 
     /// Reads past the rest of the row: what the row held.
@@ -147,6 +141,8 @@ pub(super) enum MaskSource<'a> {
     Streamed {
         obj: ImageXObject<'a>,
         path: RowPath,
+        /// The columns of its samples (the dictionary's width, or CCITT data's).
+        width: u32,
         height: u32,
     },
     Decoded(LumaData),
@@ -182,14 +178,14 @@ impl RowPath {
         }
     }
 
-    /// How the samples of `mask` lie in its rows.
-    fn rows(&self, mask: &ImageXObject<'_>) -> SampleRows {
+    /// How the samples of a mask lie in rows of `width` and `height`.
+    fn rows(&self, width: u32, height: u32) -> SampleRows {
         let bits = match self {
             Self::Bilevel { .. } => 1,
             Self::Bytes { .. } => 8,
             Self::Mapped { bits, .. } => *bits,
         };
-        SampleRows::new(mask.width(), 1, bits, mask.height())
+        SampleRows::new(width, 1, bits, height)
     }
 }
 
@@ -212,29 +208,30 @@ impl<'a> MaskSource<'a> {
         let Some(mask) = ImageXObject::new_mask(stream, &image.warning_sink, &image.cache) else {
             return Ok(None);
         };
-        let format = sample_format(&mask, None);
         let stencil = mask.kind == ImageKind::StencilMask;
-        let path = MaskPath::new(
-            &format.color_space,
-            format.bits_per_component,
-            &format.decode_arr,
-            stencil,
-        );
-        if let Some(path) = RowPath::of(path, &format, stencil)
-            && mask.stream.can_read_incrementally()
-        {
-            let held = match height.get() {
-                Some(&held) => held,
-                None => {
-                    let held = rows_held(&mask.stream, path.rows(&mask), work, meter)?;
-                    *height.get_or_init(|| held)
-                }
-            };
-            return Ok(held.filter(|&h| h > 0).map(|height| Self::Streamed {
-                obj: mask,
-                path,
-                height,
-            }));
+        if let Some((grid, format)) = incremental_samples(&mask) {
+            let path = MaskPath::new(
+                &format.color_space,
+                format.bits_per_component,
+                &format.decode_arr,
+                stencil,
+            );
+            if let Some(path) = RowPath::of(path, &format, stencil) {
+                let held = match height.get() {
+                    Some(&held) => held,
+                    None => {
+                        let rows = path.rows(grid.width, grid.height);
+                        let held = rows_held(&mask, rows, work, meter)?;
+                        *height.get_or_init(|| held)
+                    }
+                };
+                return Ok(held.filter(|&h| h > 0).map(|height| Self::Streamed {
+                    obj: mask,
+                    path,
+                    width: grid.width,
+                    height,
+                }));
+            }
         }
         let decoded = decode_mask(&mask, None, meter);
         meter.poll()?;
@@ -243,7 +240,7 @@ impl<'a> MaskSource<'a> {
 
     pub(super) fn size(&self) -> (u32, u32) {
         match self {
-            Self::Streamed { obj, height, .. } => (obj.width(), *height),
+            Self::Streamed { width, height, .. } => (*width, *height),
             Self::Decoded(luma) => (luma.width, luma.height),
         }
     }
@@ -258,13 +255,17 @@ impl<'a> MaskSource<'a> {
     /// The mask's rows, read on `meter`.
     pub(super) fn rows(&'a self, meter: &'a Meter<'a>) -> Option<MaskRows<'a>> {
         Some(match self {
-            Self::Streamed { obj, path, .. } => {
-                let width = obj.width() as usize;
-                let row_bytes = path.rows(obj).row_bytes();
+            Self::Streamed {
+                obj,
+                path,
+                width,
+                height,
+            } => {
+                let row_bytes = path.rows(*width, *height).row_bytes();
                 MaskRows::Streamed {
-                    raw: Box::new(RawRows::new(&obj.stream, row_bytes, meter)?),
+                    raw: Box::new(RawRows::new(obj, row_bytes, meter)?),
                     path: path.clone(),
-                    width,
+                    width: *width as usize,
                     bytes: Vec::new(),
                     last: 0,
                 }
@@ -274,36 +275,29 @@ impl<'a> MaskSource<'a> {
     }
 }
 
-/// The rows whole decoding keeps of `stream`'s data, of samples lying in `rows`: the
-/// length of data stored without a filter, else its data read, as whole decoding
-/// reads it, until it ends or holds the rows declared (data after them changes
-/// nothing), adding the bytes inflated to `work`.
+/// The reader of `obj`'s samples, as whole decoding decodes them.
+fn image_reader<'a>(obj: &ImageXObject<'a>) -> Option<DecodedReader<'a>> {
+    obj.stream.image_reader(&image_decode_params(obj))
+}
+
+/// The rows whole decoding keeps of `obj`'s data, of samples lying in `rows`: the
+/// length of data stored without a filter, else its data moved through, as whole
+/// decoding decodes it, until it ends or holds the rows declared (data after them
+/// changes nothing), adding the bytes inflated to `work`.
 pub(super) fn rows_held(
-    stream: &Stream<'_>,
+    obj: &ImageXObject<'_>,
     rows: SampleRows,
     work: &mut DecodeWork,
     meter: &Meter<'_>,
 ) -> Result<Option<u32>, Cancelled> {
-    let Some(mut reader) = stream.decoded_reader() else {
+    let Some(mut reader) = image_reader(obj) else {
         return Ok(None);
     };
     if let Some(len) = reader.stored_len() {
         return Ok(Some(rows.rows_kept(len)));
     }
     let declared = rows.row_bytes().saturating_mul(rows.height as usize);
-    let mut buf = vec![0; rows.row_bytes().min(PIECE_BYTES)];
-    let mut bytes = 0;
-    let held = loop {
-        let wanted = buf.len().min(declared - bytes);
-        if wanted == 0 {
-            break Ok(bytes);
-        }
-        match reader.read(&mut buf[..wanted], meter) {
-            Ok(0) => break Ok(bytes),
-            Ok(n) => bytes += n,
-            Err(Cancelled) => break Err(Cancelled),
-        }
-    };
+    let held = reader.skip(declared, meter);
     work.bytes_inflated += reader.inflated_bytes();
     Ok(Some(rows.rows_kept(held?)))
 }
@@ -443,13 +437,15 @@ fn mapped_alpha(
     let offset = cols.start * bits - first * 8;
     for (i, alpha) in out.iter_mut().enumerate() {
         let at = offset + i * bits;
-        let value = if at + bits <= held_bits {
+        *alpha = if at + bits <= held_bits {
             let pair = [bytes[at / 8], bytes.get(at / 8 + 1).copied().unwrap_or(0)];
-            (u16::from_be_bytes(pair) >> (16 - bits - at % 8)) & mask
-        } else {
+            lut[usize::from((u16::from_be_bytes(pair) >> (16 - bits - at % 8)) & mask)]
+        } else if bits == 8 {
+            // Decoding the mask whole pads its mapped 8-bit samples with zero.
             0
+        } else {
+            lut[0]
         };
-        *alpha = lut[usize::from(value)];
     }
     Ok(())
 }

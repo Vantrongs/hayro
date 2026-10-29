@@ -153,8 +153,16 @@ impl<'a> DecryptedReader<'a> {
         }
     }
 
+    /// The stored bytes, when they need no decryption and are borrowed from the
+    /// document rather than owned.
+    #[cfg(feature = "images")]
+    pub(crate) fn plain_borrowed(&self) -> Option<&'a [u8]> {
+        self.plain()?;
+        self.borrowed_data()
+    }
+
     /// The stored bytes, when they are borrowed from the document rather than owned.
-    #[cfg(feature = "unsafe")]
+    #[cfg(any(feature = "unsafe", feature = "images"))]
     pub(crate) fn borrowed_data(&self) -> Option<&'a [u8]> {
         match &self.data {
             Cow::Borrowed(data) => Some(data),
