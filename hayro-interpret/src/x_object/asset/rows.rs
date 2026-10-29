@@ -122,14 +122,26 @@ impl<'a> RawRows<'a> {
     }
 
     /// Continues from `state`, saved at the start of `row`; false if it does not
-    /// resume this reader.
-    pub(super) fn resume(&mut self, row: u32, state: &DecodedCheckpoint) -> bool {
-        if !self.reader.restore(state) {
-            return false;
+    /// resume this reader. Copying the state counts on the meter.
+    pub(super) fn resume(
+        &mut self,
+        row: u32,
+        state: &DecodedCheckpoint,
+    ) -> Result<bool, Cancelled> {
+        if !self.reader.restore(state, self.meter)? {
+            return Ok(false);
         }
         self.total = row as usize * self.row_bytes;
         self.at = 0;
-        true
+        Ok(true)
+    }
+
+    /// Its reader's state ([`DecodedReader::checkpoint`]), copied on the meter.
+    pub(super) fn checkpoint(
+        &self,
+        stream: &OwnedStream,
+    ) -> Result<Option<DecodedCheckpoint>, Cancelled> {
+        self.reader.checkpoint(stream, self.meter)
     }
 
     /// Starts reading the next row.
@@ -441,27 +453,31 @@ impl<'a> MaskRows<'a> {
         &self,
         at: u32,
         stream: Option<&OwnedStream>,
-    ) -> Option<Option<DecodedCheckpoint>> {
+    ) -> Result<Option<Option<DecodedCheckpoint>>, Cancelled> {
         if self.row() != at {
-            return None;
+            return Ok(None);
         }
         match self {
             MaskRows::Streamed { raw, row, .. } => {
                 let whole = raw.total == *row as usize * raw.row_bytes;
-                whole
-                    .then(|| raw.reader.checkpoint(stream?))
-                    .flatten()
-                    .map(Some)
+                match stream {
+                    Some(stream) if whole => Ok(raw.checkpoint(stream)?.map(Some)),
+                    _ => Ok(None),
+                }
             }
-            MaskRows::Decoded { .. } => Some(None),
+            MaskRows::Decoded { .. } => Ok(Some(None)),
         }
     }
 
     /// Continues at `at` from `state`, saved by [`Self::checkpoint`]; false if it
-    /// does not resume this mask.
-    pub(super) fn resume(&mut self, at: u32, state: Option<&DecodedCheckpoint>) -> bool {
+    /// does not resume this mask. Copying the state counts on the meter.
+    pub(super) fn resume(
+        &mut self,
+        at: u32,
+        state: Option<&DecodedCheckpoint>,
+    ) -> Result<bool, Cancelled> {
         let resumed = match (&mut *self, state) {
-            (MaskRows::Streamed { raw, .. }, Some(state)) => raw.resume(at, state),
+            (MaskRows::Streamed { raw, .. }, Some(state)) => raw.resume(at, state)?,
             (MaskRows::Decoded { .. }, None) => true,
             _ => false,
         };
@@ -470,7 +486,7 @@ impl<'a> MaskRows<'a> {
                 MaskRows::Streamed { row, .. } | MaskRows::Decoded { row, .. } => *row = at,
             }
         }
-        resumed
+        Ok(resumed)
     }
 
     /// The bytes the mask's incremental decoders produced.

@@ -325,7 +325,6 @@ pub(crate) mod flate {
         /// history back references reach into, then the bytes not handed out yet. It
         /// also stops before a block or a code where its input is [`Input::low`]: the
         /// longest, a block's header and tables, reads fewer than 600 bytes.
-        #[derive(Clone)]
         pub(crate) struct FlateStream<I: Input> {
             pub(crate) input: I,
             code_buf: u32,
@@ -396,6 +395,38 @@ pub(crate) mod flate {
             /// The bytes made in all.
             fn made(&self) -> usize {
                 self.dropped + self.output.len()
+            }
+
+            /// A copy reading `input`, its output and tables copied on `meter`
+            /// ([`Meter::copied`]).
+            #[cfg(any(feature = "unsafe", feature = "images"))]
+            pub(crate) fn copy(&self, input: I, meter: &Meter<'_>) -> Result<Self, Cancelled> {
+                let table = |table: &HuffmanTable| {
+                    Ok::<_, Cancelled>(HuffmanTable {
+                        codes: meter.copied(&table.codes)?,
+                        max_len: table.max_len,
+                    })
+                };
+                let block = match &self.block {
+                    Some((lengths, distances, at)) => {
+                        Some((table(lengths)?, table(distances)?, *at))
+                    }
+                    None => None,
+                };
+                Ok(Self {
+                    input,
+                    code_buf: self.code_buf,
+                    code_size: self.code_size,
+                    output: meter.copied(&self.output)?,
+                    most: self.most,
+                    dropped: self.dropped,
+                    handed: self.handed,
+                    started: self.started,
+                    block,
+                    stored: self.stored,
+                    eof: self.eof,
+                    corrupt: self.corrupt,
+                })
             }
 
             /// The bytes made and not handed out yet.
@@ -1043,7 +1074,7 @@ pub(crate) mod lzw {
         }
 
         /// The heap bytes it holds.
-        #[cfg(feature = "unsafe")]
+        #[cfg(any(feature = "unsafe", feature = "images"))]
         pub(crate) fn heap_bytes(&self) -> usize {
             self.table.entries.capacity() * size_of::<Entry>()
         }
@@ -1606,6 +1637,30 @@ impl Unpredictor {
             Self::Png(rows) => rows.prev.get(1..).unwrap_or_default(),
             Self::Tiff(pieces) => &pieces.piece,
         }
+    }
+
+    /// A copy, its rows copied on `meter` ([`Meter::copied`]): a PNG row is as wide as
+    /// the data declares.
+    #[cfg(any(feature = "unsafe", feature = "images"))]
+    pub(crate) fn copy(&self, meter: &Meter<'_>) -> Result<Self, Cancelled> {
+        Ok(match self {
+            Self::Png(rows) => Self::Png(PngRows {
+                bpp: rows.bpp,
+                row_len: rows.row_len,
+                input: meter.copied(&rows.input)?,
+                done: rows.done,
+                prev: meter.copied(&rows.prev)?,
+            }),
+            Self::Tiff(pieces) => Self::Tiff(TiffPieces {
+                bpc: pieces.bpc,
+                colors: pieces.colors,
+                components: pieces.components,
+                row_len: pieces.row_len,
+                at: pieces.at,
+                piece: meter.copied(&pieces.piece)?,
+                last: pieces.last,
+            }),
+        })
     }
 
     /// The heap bytes it holds.

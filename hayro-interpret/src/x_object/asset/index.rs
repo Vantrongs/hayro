@@ -3,9 +3,10 @@
 //! row from the start.
 
 use super::jpeg::JpegIndex;
-use super::rows::MaskRows;
+use super::rows::{MaskRows, RawRows};
 use super::{Plane, Stop};
-use hayro_syntax::object::stream::{DecodedCheckpoint, DecodedReader, OwnedStream};
+use hayro_syntax::object::stream::{DecodedCheckpoint, OwnedStream};
+use hayro_syntax::work::Cancelled;
 use std::sync::Mutex;
 
 /// The most bytes one asset's saved states take, the index's own included.
@@ -78,7 +79,7 @@ impl Checkpoints {
         bound: Option<usize>,
         (row_bytes, height, budget): (usize, u32, usize),
         before: u32,
-        resume: impl FnOnce(u32, &DecodedCheckpoint, Option<&DecodedCheckpoint>) -> bool,
+        resume: impl FnOnce(u32, &DecodedCheckpoint, Option<&DecodedCheckpoint>) -> Result<bool, Stop>,
     ) -> Result<Option<(Checkpointer<'c>, u32)>, Stop> {
         let Some(plan) = bound.and_then(|bound| Plan::new(bound, row_bytes, height, budget)) else {
             return Ok(None);
@@ -89,7 +90,7 @@ impl Checkpoints {
         };
         let entries = index.lock().map_err(|_| Stop::Failed)?;
         let start = match entries.entries.iter().rev().find(|e| e.row <= before) {
-            Some(e) if resume(e.row, &e.state, e.mask.as_deref()) => e.row,
+            Some(e) if resume(e.row, &e.state, e.mask.as_deref())? => e.row,
             Some(_) => return Err(Stop::Failed),
             None => 0,
         };
@@ -146,21 +147,26 @@ impl Checkpointer<'_> {
         (row / self.plan.interval + 1).saturating_mul(self.plan.interval)
     }
 
-    /// Saves `reader`'s state, and that of a `mask` read alongside, as resuming at
+    /// Saves `raw`'s state, and that of a `mask` read alongside, as resuming at
     /// `row`, if `row` is due for one, the index has room for it and both can be saved.
     pub(super) fn after_row(
         &self,
         row: u32,
-        reader: &DecodedReader<'_>,
+        raw: &RawRows<'_>,
         mask: Option<&MaskRows<'_>>,
     ) -> Result<(), Stop> {
         self.save(row, || {
-            let state = reader.checkpoint(&self.stream)?;
+            let Some(state) = raw.checkpoint(&self.stream)? else {
+                return Ok(None);
+            };
             let mask = match mask {
-                Some(m) => m.checkpoint(row, self.mask_stream.as_ref())?.map(Box::new),
+                Some(m) => match m.checkpoint(row, self.mask_stream.as_ref())? {
+                    Some(mask) => mask.map(Box::new),
+                    None => return Ok(None),
+                },
                 None => None,
             };
-            Some((state, mask))
+            Ok(Some((state, mask)))
         })
     }
 
@@ -170,14 +176,20 @@ impl Checkpointer<'_> {
     pub(super) fn after_mask_row(&self, rows: &MaskRows<'_>) -> Result<(), Stop> {
         let row = rows.row();
         self.save(row, || {
-            Some((rows.checkpoint(row, Some(&self.stream))??, None))
+            Ok(match rows.checkpoint(row, Some(&self.stream))? {
+                Some(Some(state)) => Some((state, None)),
+                _ => None,
+            })
         })
     }
 
     fn save(
         &self,
         row: u32,
-        state: impl FnOnce() -> Option<(DecodedCheckpoint, Option<Box<DecodedCheckpoint>>)>,
+        state: impl FnOnce() -> Result<
+            Option<(DecodedCheckpoint, Option<Box<DecodedCheckpoint>>)>,
+            Cancelled,
+        >,
     ) -> Result<(), Stop> {
         if !self.plan.due(row) {
             return Ok(());
@@ -189,7 +201,7 @@ impl Checkpointer<'_> {
         let Err(at) = index.entries.binary_search_by_key(&row, |e| e.row) else {
             return Ok(());
         };
-        let Some((state, mask)) = state() else {
+        let Some((state, mask)) = state()? else {
             return Ok(());
         };
         if index.entries.capacity() == 0 {

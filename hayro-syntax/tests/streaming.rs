@@ -290,7 +290,12 @@ fn resume_at(encrypted: bool, params: &str, encoded: &[u8], offset: usize) {
         let owned = stream.to_owned_stream();
         let mut reader = stream.decoded_reader().unwrap();
         assert_eq!(read_up_to(&mut reader, offset, 4093), expected[..offset]);
-        let (checkpoint, taken) = measure(|| reader.checkpoint(&owned).unwrap());
+        let (checkpoint, taken) = measure(|| {
+            reader
+                .checkpoint(&owned, &Meter::default())
+                .unwrap()
+                .unwrap()
+        });
         assert!(checkpoint.heap_bytes() <= reader.checkpoint_heap_bound().unwrap());
         assert!(taken.largest < encoded.len() / 2, "copied {taken:?}");
         (owned, checkpoint, expected)
@@ -298,7 +303,7 @@ fn resume_at(encrypted: bool, params: &str, encoded: &[u8], offset: usize) {
     for chunk in [7, 4093] {
         let stream = stream.get().unwrap();
         let mut reader = stream.decoded_reader().unwrap();
-        assert!(reader.restore(&checkpoint));
+        assert!(reader.restore(&checkpoint, &Meter::default()).unwrap());
         let rest = read_up_to(&mut reader, usize::MAX, chunk);
         assert!(rest == expected[offset..], "{params} at {offset}");
     }
@@ -336,9 +341,12 @@ fn a_stopped_meter_stops_every_later_read() {
     assert_eq!(reader.read(&mut buf[..1], &Meter::default()), Ok(1));
     #[cfg(feature = "unsafe")]
     let readers = {
-        let checkpoint = reader.checkpoint(&stream.to_owned_stream()).unwrap();
+        let checkpoint = reader
+            .checkpoint(&stream.to_owned_stream(), &Meter::default())
+            .unwrap()
+            .unwrap();
         let mut resumed = stream.decoded_reader().unwrap();
-        assert!(resumed.restore(&checkpoint));
+        assert!(resumed.restore(&checkpoint, &Meter::default()).unwrap());
         [reader, resumed]
     };
     #[cfg(not(feature = "unsafe"))]
@@ -361,7 +369,8 @@ fn a_checkpoint_belongs_to_the_bytes_it_was_taken_from() {
     assert!(reader.checkpoint_heap_bound().is_none());
     assert!(
         reader
-            .checkpoint(&object_3(&stored).to_owned_stream())
+            .checkpoint(&object_3(&stored).to_owned_stream(), &Meter::default())
+            .unwrap()
             .is_none()
     );
 
@@ -373,10 +382,18 @@ fn a_checkpoint_belongs_to_the_bytes_it_was_taken_from() {
     let (a, b) = (object_3(&a), object_3(&b));
     let mut reader = a.decoded_reader().unwrap();
     read_up_to(&mut reader, 100, 100);
-    assert!(reader.checkpoint(&b.to_owned_stream()).is_none());
-    let checkpoint = reader.checkpoint(&a.to_owned_stream()).unwrap();
+    assert!(
+        reader
+            .checkpoint(&b.to_owned_stream(), &Meter::default())
+            .unwrap()
+            .is_none()
+    );
+    let checkpoint = reader
+        .checkpoint(&a.to_owned_stream(), &Meter::default())
+        .unwrap()
+        .unwrap();
     let mut other = b.decoded_reader().unwrap();
-    assert!(!other.restore(&checkpoint));
+    assert!(!other.restore(&checkpoint, &Meter::default()).unwrap());
     assert_eq!(read_up_to(&mut other, usize::MAX, 997), data);
 }
 
@@ -1093,10 +1110,16 @@ fn deep_chains_are_read_on_a_small_stack() {
                 let start = whole.len().min(37);
                 assert_eq!(read_up_to(&mut reader, start, 7), whole[..start]);
                 let owned = stream.to_owned_stream();
-                let checkpoint = reader.checkpoint(&owned).expect("a checkpoint");
+                let checkpoint = reader
+                    .checkpoint(&owned, &Meter::default())
+                    .unwrap()
+                    .expect("a checkpoint");
                 assert!(reader.checkpoint_heap_bound().is_some());
                 let mut resumed = stream.decoded_reader().unwrap();
-                assert!(resumed.restore(&checkpoint), "{n} {filter}");
+                assert!(
+                    resumed.restore(&checkpoint, &Meter::default()).unwrap(),
+                    "{n} {filter}"
+                );
                 let rest = read_in_pieces(&mut resumed, &mut rng, &Meter::default());
                 assert_eq!(rest, Ok(whole[start..].to_vec()), "{n} {filter}: resumed");
                 drop((checkpoint, resumed));

@@ -1189,6 +1189,114 @@ fn ccitt_codes_writing_nothing_after_a_filter_take_bounded_room_and_linear_work(
     assert_eq!(cancelled.results, [Err(RequestError::Cancelled)]);
 }
 
+/// Group 3 data after a Flate filter and a PNG predictor whose one row, 2 MiB wide,
+/// holds an EOL and then white lines of 8 pixels, `10011` each, without EOLs: after
+/// the first line the decoder looks through the rest of the row for the EOL that
+/// should end it, and finding none goes back to decode the next lines. The CCITT
+/// feed saves the filters' state, the predictor's whole row among it, once it drops
+/// the bytes from where that line's decoding started, and goes back to that state.
+/// Saving and going back count the bytes they copy on the request's meter a poll's
+/// worth at a time, so that a hook asking to stop while either copies stops it
+/// within a piece or two, not after the whole row; and the pixels are those of whole
+/// decoding.
+#[cfg(debug_assertions)]
+#[test]
+fn ccitt_feed_states_behind_a_wide_predictor_are_copied_on_the_meter() {
+    use hayro_interpret::hayro_syntax::work::{POLL_BYTES, STATE_COPIED};
+    const ROW: usize = 2 << 20;
+    // A filter byte (none), then the bits.
+    let mut row = vec![0; 1 + ROW];
+    for i in 0..8 * ROW {
+        let bit = match i.checked_sub(12) {
+            None => i == 11,
+            Some(i) => b"10011"[i % 5] == b'1',
+        };
+        row[1 + i / 8] |= u8::from(bit) << (7 - i % 8);
+    }
+    let dict = format!(
+        "/Width 8 /Height 64 /ColorSpace /DeviceGray /BitsPerComponent 1 \
+         /Filter [/FlateDecode /CCITTFaxDecode] \
+         /DecodeParms [<< /Predictor 10 /Columns {ROW} >> << /K 0 /Columns 8 >>]"
+    );
+    let pdf = page(
+        "q 100 0 0 100 0 0 cm /Im Do Q",
+        "/XObject << /Im 5 0 R >>",
+        vec![image(&dict, &common::chains::zlib(&row, 6))],
+    );
+    let mut whole = Pixels::default();
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut whole);
+    let [(_, whole)] = &whole.0[..] else {
+        panic!("one image")
+    };
+    // Stopping once `stop_after` bytes of states were copied.
+    let request = |stop_after: usize| {
+        STATE_COPIED.set(0);
+        let mut hooked = Hooked::new(move || STATE_COPIED.get() > stop_after);
+        common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut hooked);
+        let [result] = hooked.results.try_into().expect("one image");
+        (result, STATE_COPIED.get())
+    };
+    let (pixels, copied) = request(usize::MAX);
+    assert_eq!(pixels.as_ref(), Ok(whole));
+    // The row saved, and copied back.
+    assert!(copied >= 2 * ROW, "{copied} bytes copied");
+    // A stop as the state starts to be saved, and halfway through the row as it is
+    // copied back, the last copy.
+    for stop_after in [0, copied - ROW / 2] {
+        let (result, copied) = request(stop_after);
+        println!("stop after {stop_after}: {copied} bytes copied");
+        assert_eq!(
+            result,
+            Err(RequestError::Cancelled),
+            "stop after {stop_after}"
+        );
+        assert!(
+            copied <= stop_after + 2 * POLL_BYTES,
+            "{copied} bytes copied, stop after {stop_after}"
+        );
+    }
+}
+
+/// Requests each image's plane whole with `cancel` as its hook, and keeps what each
+/// request returns.
+struct Hooked<F> {
+    cancel: F,
+    results: Vec<Result<Vec<u8>, RequestError>>,
+}
+
+impl<F: Fn() -> bool> Hooked<F> {
+    fn new(cancel: F) -> Self {
+        Self {
+            cancel,
+            results: Vec::new(),
+        }
+    }
+}
+
+impl<'a, F: Fn() -> bool> Device<'a> for Hooked<F> {
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
+    fn draw_glyph_run(&mut self, _: &GlyphRun<'_, 'a>, _: DrawProps<'a>, _: &DrawMode) {}
+    fn draw_image(&mut self, image: Image<'a, '_>, _: ImageDrawProps<'a>) {
+        let asset = match image {
+            Image::Raster(r) => r.asset(),
+            Image::Stencil(s) => s.asset(),
+        };
+        let mut source = asset.open(None, None).expect("streamed");
+        let plane = source.layout().image;
+        let request = ImageRequest {
+            plane: Plane::Image,
+            grid: (plane.width, plane.height),
+            window: [0, 0, plane.width, plane.height],
+            cancel: Some(&self.cancel),
+        };
+        self.results.push(source.request(&request).map(|r| r.data));
+    }
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
+}
+
 /// Requests each image's plane whole with a hook that asks to stop at its third poll.
 #[derive(Default)]
 struct Cancelled {

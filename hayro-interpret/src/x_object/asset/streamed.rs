@@ -671,11 +671,11 @@ impl<'s, 'a> ImagePass<'s, 'a> {
             (row_bytes, image.grid.height, image.budget()),
             area.rows().start,
             |row, state, mask_state| {
-                raw.resume(row, state)
+                Ok(raw.resume(row, state)?
                     && match &mut mask {
-                        Some(m) => m.rows.resume(row, mask_state),
+                        Some(m) => m.rows.resume(row, mask_state)?,
                         None => mask_state.is_none(),
-                    }
+                    })
             },
         )?;
         let (checkpointer, first_row) =
@@ -754,7 +754,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
                     self.decoded += 1;
                     if let Some(c) = &self.checkpointer {
                         let mask = self.mask.as_ref().map(|m| &m.rows);
-                        c.after_row(y + 1, &self.raw.reader, mask)?;
+                        c.after_row(y + 1, &self.raw, mask)?;
                     }
                 }
                 RowEnd::Cut => self.decoded += 1,
@@ -783,7 +783,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
         self.raw.seek_rows(n)?;
         if let Some(c) = &self.checkpointer {
             let mask = self.mask.as_ref().map(|m| &m.rows);
-            c.after_row(y + n, &self.raw.reader, mask)?;
+            c.after_row(y + n, &self.raw, mask)?;
         }
         Ok(y + n)
     }
@@ -1049,7 +1049,7 @@ impl<'a> MaskPass<'a> {
                         bound,
                         (row_bytes, h, budget),
                         area.rows().start,
-                        |row, state, _| rows.resume(row, Some(state)),
+                        |row, state, _| Ok(rows.resume(row, Some(state))?),
                     )?
                     .map(|(c, _)| c)
             }

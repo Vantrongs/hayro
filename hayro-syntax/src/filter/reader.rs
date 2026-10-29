@@ -184,7 +184,6 @@ struct Stepping {
 }
 
 /// A predictor reversed after a decoder.
-#[derive(Clone)]
 struct Predicted {
     /// Holds the bytes decoded last, of which `taken` were handed out.
     unpredictor: Unpredictor,
@@ -345,63 +344,78 @@ impl<'a> DecodedReader<'a> {
     /// alone over data not encrypted) over `stream`'s stored bytes, or the reader
     /// reads them stored without a filter and decrypted with RC4 (which
     /// [`Self::skip`] otherwise moves past from the start of its keystream), or when a
-    /// decoder's state cannot be allocated.
+    /// decoder's state cannot be allocated. Copying the decoders' state counts on
+    /// `meter`, and fails once its hook asks to stop.
     #[cfg(feature = "unsafe")]
-    pub fn checkpoint(&self, stream: &OwnedStream) -> Option<DecodedCheckpoint> {
-        let data = self.checkpointable()?;
-        if !stream.holds(data) {
-            return None;
-        }
-        let saved = match &self.source {
-            Source::Chain(chain) => Saved::Chain(chain.save()?),
-            #[cfg(feature = "images")]
-            Source::Ccitt(bytes) => Saved::Ccitt(bytes.save()?),
+    pub fn checkpoint(
+        &self,
+        stream: &OwnedStream,
+        meter: &Meter<'_>,
+    ) -> Result<Option<DecodedCheckpoint>, Cancelled> {
+        let Some(data) = self.checkpointable().filter(|data| stream.holds(data)) else {
+            return Ok(None);
         };
-        Some(DecodedCheckpoint {
+        let saved = match &self.source {
+            Source::Chain(chain) => chain.save(meter)?.map(Saved::Chain),
+            #[cfg(feature = "images")]
+            Source::Ccitt(bytes) => bytes.save(meter)?.map(Saved::Ccitt),
+        };
+        Ok(saved.map(|saved| DecodedCheckpoint {
             _stream: stream.clone(),
             data: address(data),
             saved,
-        })
+        }))
     }
 
     /// Continues from `checkpoint`, as if the data before it had been read (with the
     /// decoders chosen then). False, with the reader unchanged, when the checkpoint is
-    /// of other bytes or filters, or a decoder's state cannot be allocated.
+    /// of other bytes or filters, or a decoder's state cannot be allocated. Copying
+    /// the decoders' state counts on `meter`; once its hook asks to stop, it fails,
+    /// with the reader unchanged.
     #[cfg(feature = "unsafe")]
-    #[must_use]
-    pub fn restore(&mut self, checkpoint: &DecodedCheckpoint) -> bool {
+    pub fn restore(
+        &mut self,
+        checkpoint: &DecodedCheckpoint,
+        meter: &Meter<'_>,
+    ) -> Result<bool, Cancelled> {
         if self.checkpointable().map(address) != Some(checkpoint.data) {
-            return false;
+            return Ok(false);
         }
         match (&mut self.source, &checkpoint.saved) {
-            (Source::Chain(chain), Saved::Chain(state)) => chain.fits(state) && chain.load(state),
+            (Source::Chain(chain), Saved::Chain(state)) => chain.load(state, meter),
             #[cfg(feature = "images")]
             (Source::Ccitt(bytes), Saved::Ccitt(state)) => {
-                bytes.restore(state);
-                true
+                bytes.restore(state, meter)?;
+                Ok(true)
             }
             #[cfg(feature = "images")]
-            _ => false,
+            _ => Ok(false),
         }
     }
 
     /// Where the reader is, to go back to with [`Self::load`]: for a chain of
     /// filters, `None` for CCITT data or where a decoder's state cannot be allocated.
+    /// Copying the decoders' state counts on `meter`.
     #[cfg(feature = "images")]
-    pub(crate) fn save(&self) -> Option<ChainState> {
+    pub(crate) fn save(&self, meter: &Meter<'_>) -> Result<Option<ChainState>, Cancelled> {
         match &self.source {
-            Source::Chain(chain) => chain.save(),
-            Source::Ccitt(_) => None,
+            Source::Chain(chain) => chain.save(meter),
+            Source::Ccitt(_) => Ok(None),
         }
     }
 
     /// Goes back to `state`, saved of this reader; false, with the reader unchanged,
-    /// where a decoder's state cannot be allocated.
+    /// where a decoder's state cannot be allocated. Copying the state counts on
+    /// `meter`; once its hook asks to stop, it fails, with the reader unchanged.
     #[cfg(feature = "images")]
-    pub(crate) fn load(&mut self, state: &ChainState) -> bool {
+    pub(crate) fn load(
+        &mut self,
+        state: &ChainState,
+        meter: &Meter<'_>,
+    ) -> Result<bool, Cancelled> {
         match &mut self.source {
-            Source::Chain(chain) => chain.fits(state) && chain.load(state),
-            Source::Ccitt(_) => false,
+            Source::Chain(chain) => chain.load(state, meter),
+            Source::Ccitt(_) => Ok(false),
         }
     }
 
@@ -528,15 +542,18 @@ impl ChainState {
 }
 
 /// A copy of each of `layers`, allocated at its length, which collecting an
-/// iterator of options would not; `None` where a decoder's state cannot be
-/// allocated.
+/// iterator of options would not, counted on `meter` ([`Layer::copy`]); `None`
+/// where a decoder's state cannot be allocated.
 #[cfg(any(feature = "unsafe", feature = "images"))]
-fn copies(layers: &[Layer]) -> Option<Vec<Layer>> {
+fn copies(layers: &[Layer], meter: &Meter<'_>) -> Result<Option<Vec<Layer>>, Cancelled> {
     let mut copies = Vec::with_capacity(layers.len());
     for layer in layers {
-        copies.push(layer.copy()?);
+        match layer.copy(meter)? {
+            Some(copy) => copies.push(copy),
+            None => return Ok(None),
+        }
     }
-    Some(copies)
+    Ok(Some(copies))
 }
 
 /// Identifies stored bytes by where they are.
@@ -666,17 +683,19 @@ impl Chain<'_> {
             })
     }
 
+    /// A copy of its state, counted on `meter`; `None` where a decoder's state cannot
+    /// be allocated.
     #[cfg(any(feature = "unsafe", feature = "images"))]
-    fn save(&self) -> Option<ChainState> {
+    fn save(&self, meter: &Meter<'_>) -> Result<Option<ChainState>, Cancelled> {
         let pending = match self.stored.data.plain_rest() {
             Some(_) => Vec::new(),
-            None => self.stored.buf[self.stored.at..].to_vec(),
+            None => meter.copied(&self.stored.buf[self.stored.at..])?,
         };
-        Some(ChainState {
+        Ok(copies(&self.layers, meter)?.map(|layers| ChainState {
             cursor: self.stored.data.cursor(),
             pending,
-            layers: copies(&self.layers)?.into_boxed_slice(),
-        })
+            layers: layers.into_boxed_slice(),
+        }))
     }
 
     /// Whether `state` was saved of a chain of the same filters.
@@ -690,20 +709,26 @@ impl Chain<'_> {
                 .all(|(layer, saved)| layer.same_filter(saved))
     }
 
-    /// Takes the state of `state`, saved of a chain that [`Self::fits`] it; false,
-    /// with the chain unchanged, where a decoder's state cannot be allocated.
+    /// Takes the state of `state`, saved of this chain, the copying counted on
+    /// `meter`; false, with the chain unchanged, where `state` is of a chain that
+    /// does not [`Self::fits`] it or a decoder's state cannot be allocated, and
+    /// unchanged too where the meter's hook asks to stop.
     #[cfg(any(feature = "unsafe", feature = "images"))]
-    fn load(&mut self, state: &ChainState) -> bool {
-        let Some(copies) = copies(&state.layers) else {
-            return false;
+    fn load(&mut self, state: &ChainState, meter: &Meter<'_>) -> Result<bool, Cancelled> {
+        if !self.fits(state) {
+            return Ok(false);
+        }
+        let Some(copies) = copies(&state.layers, meter)? else {
+            return Ok(false);
         };
+        let pending = meter.copied(&state.pending)?;
         for (layer, copy) in self.layers.iter_mut().zip(copies) {
             *layer = copy;
         }
         self.stored.data.restore(&state.cursor);
-        self.stored.buf.clone_from(&state.pending);
+        self.stored.buf = pending;
         self.stored.at = 0;
-        true
+        Ok(true)
     }
 }
 
@@ -862,14 +887,25 @@ impl Layer {
         }
     }
 
-    /// A copy holding only the bytes it has not handed on; `None` where a decoder's
-    /// state cannot be allocated.
+    /// A copy holding only the bytes it has not handed on, and the predictor's rows,
+    /// each piece counted on `meter` before it is copied, the layer itself too, so
+    /// that copying any number of layers polls the hook ([`Meter::copied`]); `None`
+    /// where a decoder's state cannot be allocated.
     #[cfg(any(feature = "unsafe", feature = "images"))]
-    fn copy(&self) -> Option<Self> {
-        Some(Self {
-            stage: self.stage.copy()?,
-            predictor: self.predictor.clone(),
-        })
+    fn copy(&self, meter: &Meter<'_>) -> Result<Option<Self>, Cancelled> {
+        meter.copying(size_of::<Self>())?;
+        let Some(stage) = self.stage.copy(meter)? else {
+            return Ok(None);
+        };
+        let predictor = match &self.predictor {
+            Some(p) => Some(Predicted {
+                unpredictor: p.unpredictor.copy(meter)?,
+                taken: p.taken,
+                done: p.done,
+            }),
+            None => None,
+        };
+        Ok(Some(Self { stage, predictor }))
     }
 
     /// Whether `other` decodes the same filter.
@@ -1019,16 +1055,24 @@ impl Stage {
         }
     }
 
+    /// A copy, counted on `meter` ([`Layer::copy`]); `None` where a decoder's state
+    /// cannot be allocated.
     #[cfg(any(feature = "unsafe", feature = "images"))]
-    fn copy(&self) -> Option<Self> {
-        Some(match self {
+    fn copy(&self, meter: &Meter<'_>) -> Result<Option<Self>, Cancelled> {
+        Ok(Some(match self {
             #[cfg(feature = "unsafe")]
             Self::Inflating(inflating) => {
                 let decoder = match &inflating.decoder {
-                    Some(decoder) => Some(decoder.try_clone().ok()?),
+                    Some(decoder) => {
+                        meter.copying(decoder.allocation_size())?;
+                        match decoder.try_clone() {
+                            Ok(decoder) => Some(decoder),
+                            Err(_) => return Ok(None),
+                        }
+                    }
                     None => None,
                 };
-                let output = inflating.output[inflating.handed..inflating.end].to_vec();
+                let output = meter.copied(&inflating.output[inflating.handed..inflating.end])?;
                 Self::Inflating(Inflating {
                     decoder,
                     zlib: inflating.zlib,
@@ -1038,18 +1082,24 @@ impl Stage {
                     handed: 0,
                 })
             }
-            Self::Permissive(permissive) => Self::Permissive(Box::new(Permissive {
-                stream: permissive.stream.clone(),
-                done: permissive.done,
-            })),
-            Self::Bytewise(stepping) => Self::Bytewise(Stepping {
-                fed: stepping.fed.rest(),
-                decoder: stepping.decoder.clone(),
-                made: stepping.made[stepping.handed..].to_vec(),
-                handed: 0,
-                done: stepping.done,
-            }),
-        })
+            Self::Permissive(permissive) => {
+                let input = permissive.stream.input.rest(meter)?;
+                Self::Permissive(Box::new(Permissive {
+                    stream: permissive.stream.copy(input, meter)?,
+                    done: permissive.done,
+                }))
+            }
+            Self::Bytewise(stepping) => {
+                meter.copying(stepping.decoder.heap_bytes())?;
+                Self::Bytewise(Stepping {
+                    fed: stepping.fed.rest(meter)?,
+                    decoder: stepping.decoder.clone(),
+                    made: meter.copied(&stepping.made[stepping.handed..])?,
+                    handed: 0,
+                    done: stepping.done,
+                })
+            }
+        }))
     }
 }
 
@@ -1225,15 +1275,15 @@ impl Fed {
         self.ended = under.ended();
     }
 
-    /// A copy of the bytes not taken.
+    /// A copy of the bytes not taken, counted on `meter`.
     #[cfg(any(feature = "unsafe", feature = "images"))]
-    fn rest(&self) -> Self {
-        Self {
-            buf: self.buf[self.at..].to_vec(),
+    fn rest(&self, meter: &Meter<'_>) -> Result<Self, Cancelled> {
+        Ok(Self {
+            buf: meter.copied(&self.buf[self.at..])?,
             at: 0,
             taken: self.taken,
             ended: self.ended,
-        }
+        })
     }
 
     /// Whether the decoder ran out of bytes before their end, which a decoder

@@ -63,6 +63,18 @@ impl DecoderContext {
         (self.ref_changes.len() + self.coding_changes.len()) * size_of::<u32>()
     }
 
+    /// A copy, its two lines' colour changes copied by `copy`.
+    pub(crate) fn copy_with<E>(
+        &self,
+        copy: &mut impl FnMut(&[u32]) -> core::result::Result<Vec<u32>, E>,
+    ) -> core::result::Result<Self, E> {
+        Ok(Self {
+            ref_changes: copy(&self.ref_changes)?,
+            coding_changes: copy(&self.coding_changes)?,
+            ..*self
+        })
+    }
+
     pub(crate) fn reset(&mut self) {
         self.ref_changes.clear();
         self.ref_pos = 0;

@@ -223,32 +223,48 @@ impl<'a> CcittBytes<'a> {
     }
 
     /// Where it is in plain data, to go on from with [`Self::restore`]; `None` for
-    /// other data, or once a meter's hook stopped it.
+    /// other data, or once a meter's hook stopped it. Copying the decoder's state
+    /// counts on `meter` ([`Meter::copied`]).
     #[cfg(feature = "unsafe")]
-    pub(crate) fn save(&self) -> Option<CcittState> {
-        self.plain()?;
-        (!self.stopped).then(|| CcittState {
-            rows: self.decoder.as_ref().map(|d| d.rows.state()),
+    pub(crate) fn save(&self, meter: &Meter<'_>) -> Result<Option<CcittState>, Cancelled> {
+        if self.plain().is_none() || self.stopped {
+            return Ok(None);
+        }
+        let rows = match &self.decoder {
+            Some(d) => Some(d.rows.state_with(|changes| meter.copied(changes))?),
+            None => None,
+        };
+        Ok(Some(CcittState {
+            rows,
             at: self.at,
             left: self.left,
             done: self.state == State::Done,
-        })
+        }))
     }
 
-    /// Goes on from `state`, saved of a reader of the same data.
+    /// Goes on from `state`, saved of a reader of the same data, copying it on
+    /// `meter`; once its hook asks to stop, it fails, with the reader unchanged.
     #[cfg(feature = "unsafe")]
-    pub(crate) fn restore(&mut self, state: &CcittState) {
+    pub(crate) fn restore(
+        &mut self,
+        state: &CcittState,
+        meter: &Meter<'_>,
+    ) -> Result<(), Cancelled> {
         let Encoded::Plain(data) = self.data else {
-            return;
+            return Ok(());
         };
-        self.decoder = state.rows.as_ref().map(|saved| {
-            let mut rows = RowDecoder::new(data, self.setup.settings);
-            rows.resume(saved);
-            Decoding { rows, window: None }
-        });
+        self.decoder = match &state.rows {
+            Some(saved) => {
+                let mut rows = RowDecoder::new(data, self.setup.settings);
+                rows.resume_with(saved, |changes| meter.copied(changes))?;
+                Some(Decoding { rows, window: None })
+            }
+            None => None,
+        };
         (self.at, self.left) = (state.at, state.left);
         self.state = if state.done { State::Done } else { State::Row };
         self.stopped = false;
+        Ok(())
     }
 
     /// The most heap bytes a saved state holds.
@@ -619,7 +635,7 @@ impl FeedState<'_> {
         let chunk = DECRYPT_CHUNK.min(self.hold);
         while !self.ended && self.start + self.bytes.len() < end {
             if self.bytes.len() + chunk > self.hold {
-                self.drop_before(pos.saturating_sub(self.hold / 2));
+                self.drop_before(pos.saturating_sub(self.hold / 2), meter)?;
             }
             let held = self.bytes.len();
             self.bytes.resize(held + chunk, 0);
@@ -634,31 +650,38 @@ impl FeedState<'_> {
     }
 
     /// Drops the bytes before `to`, marking where the filters are first where they
-    /// include bytes of the row being decoded.
-    fn drop_before(&mut self, to: usize) {
+    /// include bytes of the row being decoded. The mark's copying counts on `meter`
+    /// ([`Meter::copied`]): the filters' state holds a predictor's row, as wide as the
+    /// data declares. A stop drops nothing.
+    fn drop_before(&mut self, to: usize, meter: &Meter<'_>) -> Result<(), Cancelled> {
         let to = to.clamp(self.start, self.start + self.bytes.len());
         if to > self.row && self.mark.is_none() && self.start <= self.row {
-            self.mark = self.reader.save().map(|state| Mark {
+            let bytes = meter.copied(&self.bytes[self.row - self.start..])?;
+            self.mark = self.reader.save(meter)?.map(|state| Mark {
                 state,
-                bytes: self.bytes[self.row - self.start..].to_vec(),
+                bytes,
                 start: self.row,
                 ended: self.ended,
             });
         }
         self.bytes.drain(..to - self.start);
         self.start = to;
+        Ok(())
     }
 
     /// Goes back to hold byte `pos` next: to the mark where it holds it, else to the
-    /// start of the data, decoding the filters again up to `pos`.
+    /// start of the data, decoding the filters again up to `pos`. Copying the mark
+    /// counts on `meter`, as saving it did.
     fn back(&mut self, pos: usize, meter: &Meter<'_>) -> Result<(), Cancelled> {
         if let Some(mark) = &self.mark
             && mark.start <= pos
-            && self.reader.load(&mark.state)
         {
-            self.bytes.clone_from(&mark.bytes);
-            (self.start, self.ended) = (mark.start, mark.ended);
-            return Ok(());
+            let bytes = meter.copied(&mark.bytes)?;
+            if self.reader.load(&mark.state, meter)? {
+                self.bytes = bytes;
+                (self.start, self.ended) = (mark.start, mark.ended);
+                return Ok(());
+            }
         }
         self.reader.rewind();
         self.bytes.clear();

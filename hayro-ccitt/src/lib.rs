@@ -32,6 +32,8 @@ extern crate alloc;
 
 use crate::bit_reader::{BitReader, Data, Position};
 use alloc::rc::Rc;
+use alloc::vec::Vec;
+use core::convert::Infallible;
 
 mod bit_reader;
 mod codes;
@@ -154,19 +156,42 @@ impl<'a> RowDecoder<'a> {
 
     /// Where it is, to go on from later with [`Self::resume`].
     pub fn state(&self) -> RowState {
-        RowState {
+        self.state_with(|changes| Ok::<_, Infallible>(changes.to_vec()))
+            .unwrap_or_else(|never| match never {})
+    }
+
+    /// [`Self::state`], each list of colour changes, as many as a line's columns,
+    /// copied by `copy`, which may fail, so that the caller can count the copying
+    /// and stop it.
+    pub fn state_with<E>(
+        &self,
+        mut copy: impl FnMut(&[u32]) -> core::result::Result<Vec<u32>, E>,
+    ) -> core::result::Result<RowState, E> {
+        Ok(RowState {
             position: self.reader.position(),
-            ctx: self.ctx.clone(),
+            ctx: self.ctx.copy_with(&mut copy)?,
             state: self.state,
-        }
+        })
     }
 
     /// Goes on from `state`, taken of a decoder of the same data and settings, as
     /// that decoder would have.
     pub fn resume(&mut self, state: &RowState) {
+        self.resume_with(state, |changes| Ok::<_, Infallible>(changes.to_vec()))
+            .unwrap_or_else(|never| match never {});
+    }
+
+    /// [`Self::resume`], its lists of colour changes copied by `copy` (see
+    /// [`Self::state_with`]); where `copy` fails, the decoder is unchanged.
+    pub fn resume_with<E>(
+        &mut self,
+        state: &RowState,
+        mut copy: impl FnMut(&[u32]) -> core::result::Result<Vec<u32>, E>,
+    ) -> core::result::Result<(), E> {
+        self.ctx = state.ctx.copy_with(&mut copy)?;
         self.reader.seek(&state.position);
-        self.ctx.clone_from(&state.ctx);
         self.state = state.state;
+        Ok(())
     }
 
     /// The rows pushed so far.

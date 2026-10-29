@@ -71,7 +71,7 @@ impl Decoder {
     }
 
     /// The heap bytes a copy of it holds.
-    #[cfg(feature = "unsafe")]
+    #[cfg(any(feature = "unsafe", feature = "images"))]
     pub(crate) fn heap_bytes(&self) -> usize {
         match self {
             Self::Lzw(decoder) => decoder.heap_bytes(),

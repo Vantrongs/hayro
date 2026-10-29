@@ -1,5 +1,7 @@
 //! Work counted as it is done, so that whoever asked for it can stop it.
 
+#[cfg(any(feature = "unsafe", feature = "images"))]
+use alloc::vec::Vec;
 use core::cell::Cell;
 
 /// The work, in bytes, after which a [`Meter`] polls its hook again.
@@ -67,6 +69,15 @@ std::thread_local! {
     /// Debug builds only.
     #[doc(hidden)]
     pub static EXAMINED: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(all(debug_assertions, feature = "std"))]
+std::thread_local! {
+    /// The bytes of decoders' states copied on this thread to save where a reader is
+    /// or to go back there ([`Meter::copying`]): what tests find a copy's polls by.
+    /// Debug builds only.
+    #[doc(hidden)]
+    pub static STATE_COPIED: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Counts a byte a reader looked at ([`EXAMINED`]).
@@ -146,6 +157,32 @@ impl<'a> Meter<'a> {
         } else {
             self.poll()
         }
+    }
+
+    /// Counts the copy of a decoder's state of `bytes`, copied whole, at most
+    /// [`POLL_BYTES`] so that the copy stays within the work between two polls; to
+    /// be called before the copy, which a stop then saves.
+    #[cfg(any(feature = "unsafe", feature = "images"))]
+    pub(crate) fn copying(&self, bytes: usize) -> Result<(), Cancelled> {
+        debug_assert!(bytes <= POLL_BYTES, "a state of {bytes} bytes copied whole");
+        self.work(bytes)?;
+        #[cfg(all(debug_assertions, feature = "std"))]
+        STATE_COPIED.set(STATE_COPIED.get() + bytes);
+        Ok(())
+    }
+
+    /// A copy of `from`, with no more room than it needs, made a piece of at most
+    /// [`POLL_BYTES`] at a time, each counted ([`Self::copying`]) before it is
+    /// copied: so a decoder's state of any size is copied within the work between two
+    /// polls a piece, and a stop leaves the rest uncopied.
+    #[cfg(any(feature = "unsafe", feature = "images"))]
+    pub(crate) fn copied<T: Copy>(&self, from: &[T]) -> Result<Vec<T>, Cancelled> {
+        let mut to = Vec::with_capacity(from.len());
+        for piece in from.chunks((POLL_BYTES / size_of::<T>().max(1)).max(1)) {
+            self.copying(size_of_val(piece))?;
+            to.extend_from_slice(piece);
+        }
+        Ok(to)
     }
 
     /// The work that can be done before the hook is polled again; 0 once it asked to
