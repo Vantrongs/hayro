@@ -11,13 +11,59 @@ use smallvec::{SmallVec, ToSmallVec, smallvec};
 use std::ops::Range;
 use std::sync::Arc;
 
+/// Steps of work: an operator of a function run, a value read, computed or
+/// written, a pixel visited. Its arithmetic saturates, so a cost made of others
+/// is never less than any of them: work too large to count is never given.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Cost(u64);
+
+impl Cost {
+    /// No work.
+    pub const ZERO: Self = Self(0);
+
+    /// `steps` steps.
+    pub const fn new(steps: u64) -> Self {
+        Self(steps)
+    }
+
+    /// A step for each of `n` things.
+    pub fn of(n: usize) -> Self {
+        Self(u64::try_from(n).unwrap_or(u64::MAX))
+    }
+
+    /// The steps, `u64::MAX` for any number of them that does not fit.
+    pub const fn steps(self) -> u64 {
+        self.0
+    }
+
+    /// The cost of doing this `n` times.
+    #[must_use]
+    pub const fn times(self, n: u64) -> Self {
+        Self(self.0.saturating_mul(n))
+    }
+}
+
+impl std::ops::Add for Cost {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self(self.0.saturating_add(other.0))
+    }
+}
+
+impl std::iter::Sum for Cost {
+    fn sum<I: Iterator<Item = Self>>(costs: I) -> Self {
+        costs.fold(Self::ZERO, |sum, cost| sum + cost)
+    }
+}
+
 /// What a caller lets sampling a shading take, asked before the work is done: the
-/// steps of work (an operator of a function run, a value read, computed or written,
-/// a pixel visited) and the bytes held while it runs. A sampling it refuses stops
-/// unfinished, with [`Exhausted`], having done no more than it was given.
+/// steps of work ([`Cost`]) and the bytes held while it runs. A sampling it
+/// refuses stops unfinished, with [`Exhausted`], having done no more than it was
+/// given.
 pub trait Meter {
     /// Takes `steps`: `false`, and the work stops, when fewer are left.
-    fn work(&mut self, steps: u64) -> bool;
+    fn work(&mut self, steps: Cost) -> bool;
 
     /// Takes `bytes` held until the call that takes them returns: `false`, and the
     /// work stops, when they do not fit.
@@ -28,7 +74,7 @@ pub trait Meter {
 pub struct Unmetered;
 
 impl Meter for Unmetered {
-    fn work(&mut self, _: u64) -> bool {
+    fn work(&mut self, _: Cost) -> bool {
         true
     }
 
@@ -42,22 +88,22 @@ impl Meter for Unmetered {
 pub struct Exhausted;
 
 /// Takes `steps` of `meter`, or stops with [`Exhausted`].
-pub(crate) fn take(meter: &mut dyn Meter, steps: u64) -> Result<(), Exhausted> {
+pub(crate) fn take(meter: &mut dyn Meter, steps: Cost) -> Result<(), Exhausted> {
     meter.work(steps).then_some(()).ok_or(Exhausted)
 }
 
 /// The steps sampling a point takes besides its function and its color: finding the
 /// value it is evaluated at, adding it to the reach a mesh is sampled over, and
 /// putting the result out.
-const POINT_COST: u64 = 8;
+const POINT_COST: Cost = Cost::new(8);
 
 /// The steps placing a triangle of a mesh takes, its box found and cut by the
 /// region sampled, or a patch's cut out of it (`PATCH_TRIANGLES` of them a patch).
-const TRIANGLE_COST: u64 = 64;
+const TRIANGLE_COST: Cost = Cost::new(64);
 
 /// The steps visiting a pixel of a triangle's box takes, besides one for each
 /// color component it interpolates there.
-const VISIT_COST: u64 = 4;
+const VISIT_COST: Cost = Cost::new(4);
 
 /// Why an [`Unmetered`] sampling cannot stop.
 const UNMETERED: &str = "an unmetered sampling is never refused";
@@ -157,7 +203,7 @@ impl EncodedSampledShading {
     /// The colors of the pixels in `region` the mesh covers, the work and memory
     /// taken of `meter` before each pass over the triangles.
     fn sample(&self, region: &Region, meter: &mut dyn Meter) -> Result<Samples, Exhausted> {
-        let placing = self.triangles().saturating_mul(TRIANGLE_COST);
+        let placing = TRIANGLE_COST.times(self.triangles());
         take(meter, placing)?;
         let plan = plan(|f| self.each_triangle(f), self.transform, region);
         if !meter.hold(plan.bytes()) {
@@ -165,10 +211,7 @@ impl EncodedSampledShading {
         }
         take(
             meter,
-            placing.saturating_add(
-                plan.visits
-                    .saturating_mul(VISIT_COST + plan.components as u64),
-            ),
+            placing + (VISIT_COST + Cost::of(plan.components)).times(plan.visits),
         )?;
         Ok(sample_planned(
             &plan,
@@ -284,31 +327,32 @@ impl EncodedShadingPattern {
     /// ([`Function::cost`](crate::Function::cost)), its color's
     /// ([`ColorSpace::cost`](crate::color::ColorSpace::cost)) and the transfer
     /// function's. A mesh's triangles are placed besides, once for all points.
-    pub fn point_cost(&self) -> u64 {
+    pub fn point_cost(&self) -> Cost {
         let function = match &self.shading_type {
             EncodedShadingType::FunctionBased(shading) => shading.function.cost(),
             EncodedShadingType::RadialAxial(shading) => shading.function.cost(),
-            EncodedShadingType::Sampled(mesh) => mesh.function.as_ref().map_or(0, |f| f.cost()),
-            EncodedShadingType::Dummy(_) => 0,
+            EncodedShadingType::Sampled(mesh) => {
+                mesh.function.as_ref().map_or(Cost::ZERO, |f| f.cost())
+            }
+            EncodedShadingType::Dummy(_) => Cost::ZERO,
         };
+        // A step a channel mapped.
         let transfer = if self.transfer_function.is_some() {
-            3
+            Cost::new(3)
         } else {
-            0
+            Cost::ZERO
         };
-        (POINT_COST + transfer)
-            .saturating_add(function)
-            .saturating_add(self.color_space.cost())
+        POINT_COST + transfer + function + self.color_space.cost()
     }
 
     /// The steps building the tables sampling looks colors up in takes, until they
     /// are built: the color space's and the transfer function's.
-    pub fn setup_cost(&self) -> u64 {
+    pub fn setup_cost(&self) -> Cost {
         let transfer = self
             .transfer_function
             .as_ref()
-            .map_or(0, ActiveTransferFunction::setup_cost);
-        self.color_space.setup_cost().saturating_add(transfer)
+            .map_or(Cost::ZERO, ActiveTransferFunction::setup_cost);
+        self.color_space.setup_cost() + transfer
     }
 
     /// For a mesh shading, its samples at every pixel `walk` adds a point in, the
@@ -382,11 +426,7 @@ impl EncodedShadingPattern {
     ) -> Result<(u32, u32, Affine), Exhausted> {
         let (width, height) = texture_dimensions(bbox, scale);
         let points = u64::from(width) * u64::from(height);
-        take(
-            meter,
-            self.setup_cost()
-                .saturating_add(points.saturating_mul(self.point_cost())),
-        )?;
+        take(meter, self.setup_cost() + self.point_cost().times(points))?;
         // A mesh is sampled only at the pixels the texture reads.
         let samples = self.samples_at(meter, |reach| {
             let (start, x_advance, y_advance, width, height) = self.texture_grid(bbox, scale);
@@ -491,10 +531,7 @@ impl ShadingPattern {
     ) -> Result<EncodedShadingPattern, Exhausted> {
         let color_space = &self.shading.color_space;
         if self.shading.background.is_some() {
-            take(
-                meter,
-                color_space.setup_cost().saturating_add(color_space.cost()),
-            )?;
+            take(meter, color_space.setup_cost() + color_space.cost())?;
         }
         Ok(self.encode())
     }
@@ -1050,8 +1087,8 @@ fn radial_pos(
 mod tests {
     use super::span;
     use super::{
-        EncodedSampledShading, Exhausted, Meter, PATCH_TRIANGLES, Region, Samples, TRIANGLE_COST,
-        cut_by, sample_triangles,
+        Cost, EncodedSampledShading, EncodedShadingType, Exhausted, Meter, PATCH_TRIANGLES, Region,
+        Samples, TRIANGLE_COST, cut_by, sample_triangles,
     };
     use crate::shading::{CoonsPatch, ShadingType, Triangle, TriangleVertex};
     use hayro_syntax::hash;
@@ -1228,7 +1265,8 @@ mod tests {
     }
 
     impl Meter for Recording {
-        fn work(&mut self, steps: u64) -> bool {
+        fn work(&mut self, steps: Cost) -> bool {
+            let steps = steps.steps();
             self.asked.push(steps);
             let Some(left) = self.left.checked_sub(steps) else {
                 return false;
@@ -1240,6 +1278,126 @@ mod tests {
         fn hold(&mut self, bytes: usize) -> bool {
             self.held.push(bytes);
             true
+        }
+    }
+
+    /// The pattern object 4 of a one-page file of `objects`, numbered from 4.
+    fn shading_pattern(objects: &[String]) -> crate::pattern::ShadingPattern {
+        use hayro_syntax::object::{Dict, ObjectIdentifier};
+        let mut all = crate::fixtures::one_page_objects(10, "");
+        all.extend(objects.iter().map(|o| o.clone().into_bytes()));
+        let pdf = hayro_syntax::Pdf::new(crate::fixtures::file_with_aliases(all, &[]))
+            .expect("valid pdf");
+        let dict = pdf
+            .xref()
+            .get::<Dict<'_>>(ObjectIdentifier::new(4, 0))
+            .expect("a pattern");
+        crate::pattern::ShadingPattern::new(&dict, &crate::cache::Cache::new()).expect("a shading")
+    }
+
+    /// A tint transform whose evaluation takes more steps than a `u64` counts
+    /// costs as much as one can: a `DeviceN` space of 64 colorants whose Type 0
+    /// tint reads 2^16 samples around each point (its sizes sixteen 2s and
+    /// forty-eight 1s, its table 2^16 bytes) costs `u64::MAX`, not that plus the
+    /// colorants wrapped round to 65, so sampling it with a small allowance is
+    /// refused before any color is evaluated, in a debug build and a release one.
+    #[test]
+    fn a_cost_past_counting_is_refused_before_any_evaluation() {
+        use crate::function::TYPE0_EVALS;
+        let n = 64;
+        let names: Vec<String> = (0..n).map(|i| format!("/C{i}")).collect();
+        let sizes: Vec<&str> = (0..n).map(|i| if i < 16 { "2" } else { "1" }).collect();
+        let pairs = vec!["0 1"; n].join(" ");
+        let samples = "A".repeat(1 << 16);
+        let tint = format!(
+            "<< /FunctionType 0 /Domain [{pairs}] /Range [0 1] /Size [{}] /BitsPerSample 8 \
+             /Length {} >>\nstream\n{samples}\nendstream",
+            sizes.join(" "),
+            samples.len(),
+        );
+        let program = format!("{{ pop pop {}}}", "0.3 ".repeat(n));
+        let components = format!(
+            "<< /FunctionType 4 /Domain [0 1 0 1] /Range [{pairs}] /Length {} >>\nstream\n{program}\nendstream",
+            program.len()
+        );
+        let pattern = shading_pattern(&[
+            "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+            format!(
+                "<< /ShadingType 1 /ColorSpace [/DeviceN [{}] /DeviceGray 6 0 R] \
+                 /Function 7 0 R >>",
+                names.join(" ")
+            ),
+            tint,
+            components,
+        ]);
+        assert_eq!(pattern.shading.color_space.cost(), Cost::new(u64::MAX));
+        let encoded = pattern.encode();
+        assert_eq!(encoded.point_cost(), Cost::new(u64::MAX));
+        TYPE0_EVALS.set(0);
+        let mut meter = Recording {
+            left: 1 << 20,
+            asked: vec![],
+            held: vec![],
+        };
+        let mut sampled = 0;
+        let refused = encoded.sample_texture_metered(
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            1.0,
+            &mut meter,
+            |_| sampled += 1,
+        );
+        assert_eq!(refused, Err(Exhausted));
+        assert_eq!((sampled, TYPE0_EVALS.get()), (0, 0));
+        // The tint does run when it is given the work, so the count above
+        // shows it was refused, not that it never would have run.
+        let _ = encoded.sample(Point::new(0.5, 0.5));
+        assert!(TYPE0_EVALS.get() > 0);
+    }
+
+    /// Gathering a stitching function's bounds, as each fill drawn as a native
+    /// gradient does, walks no function past the last of its bounds and
+    /// encodings, which evaluating never reaches: with 1 to 10⁴ functions
+    /// stitched over an empty `/Bounds`, 100 fills visit one function each and
+    /// take the same steps, whatever the length of `/Functions`.
+    #[test]
+    fn a_stitching_walks_only_the_functions_it_evaluates() {
+        use crate::function::TYPE3_VISITED;
+        let mut taken = None;
+        for n in [1, 100, 10_000] {
+            let child = "<< /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >> ";
+            let pattern = shading_pattern(&[
+                "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+                format!(
+                    "<< /ShadingType 2 /ColorSpace /DeviceGray /Coords [0 0 10 0] \
+                     /Extend [true true] /Function << /FunctionType 3 /Domain [0 1] \
+                     /Functions [{}] /Bounds [] /Encode [0 1] >> >>",
+                    child.repeat(n)
+                ),
+            ]);
+            let encoded = pattern.encode();
+            let EncodedShadingType::RadialAxial(gradient) = &encoded.shading_type else {
+                panic!("an axial shading");
+            };
+            TYPE3_VISITED.set(0);
+            let mut meter = Recording {
+                left: u64::MAX,
+                asked: vec![],
+                held: vec![],
+            };
+            for _ in 0..100 {
+                gradient
+                    .as_svg_gradient_metered(
+                        &encoded,
+                        Rect::new(0.0, 0.0, 10.0, 10.0),
+                        0.01,
+                        &mut meter,
+                    )
+                    .expect("given all it asks")
+                    .expect("a native gradient");
+            }
+            assert_eq!(TYPE3_VISITED.get(), 100, "{n} functions");
+            let asked: u64 = meter.asked.iter().sum();
+            assert_eq!(*taken.get_or_insert(asked), asked, "{n} functions");
         }
     }
 
@@ -1280,7 +1438,7 @@ mod tests {
         };
         let region: Region = (20..380, 10..360);
         let expected = sample_triangles(&triangles, Affine::IDENTITY, &region);
-        let placing = 30 * PATCH_TRIANGLES as u64 * TRIANGLE_COST;
+        let placing = TRIANGLE_COST.times(30 * PATCH_TRIANGLES as u64).steps();
         let mut meter = Recording {
             left: u64::MAX,
             asked: vec![],

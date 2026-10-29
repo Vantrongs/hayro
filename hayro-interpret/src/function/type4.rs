@@ -1,3 +1,4 @@
+use crate::encode::Cost;
 use crate::function::{Clamper, Values};
 use hayro_syntax::content;
 use hayro_syntax::object::Number;
@@ -29,19 +30,19 @@ impl Type4 {
 
     /// The most steps `eval` takes: the program has no loops, so it runs each of
     /// its operators at most once, and moves at most the whole stack for one.
-    pub(crate) fn cost(&self) -> u64 {
-        fn ops(procedure: &[PostScriptOp]) -> u64 {
+    pub(crate) fn cost(&self) -> Cost {
+        fn ops(procedure: &[PostScriptOp]) -> Cost {
             procedure
                 .iter()
                 .map(|op| match op {
-                    PostScriptOp::If(p) => 1 + ops(p),
-                    PostScriptOp::IfElse(p1, p2) => 1 + ops(p1).max(ops(p2)),
-                    PostScriptOp::Copy | PostScriptOp::Roll => 1 + STACK as u64,
-                    _ => 1,
+                    PostScriptOp::If(p) => Cost::new(1) + ops(p),
+                    PostScriptOp::IfElse(p1, p2) => Cost::new(1) + ops(p1).max(ops(p2)),
+                    PostScriptOp::Copy | PostScriptOp::Roll => Cost::new(1) + Cost::of(STACK),
+                    _ => Cost::new(1),
                 })
                 .sum()
         }
-        ops(&self.program) + 2 * STACK as u64 + self.clamper.cost()
+        ops(&self.program) + Cost::of(STACK).times(2) + self.clamper.cost()
     }
 
     /// Evaluate the function with the given input.
@@ -619,10 +620,10 @@ mod tests {
                 RUN.set(0);
                 function.eval(smallvec![input, 1.0 - input]);
                 assert!(
-                    RUN.get() <= function.cost(),
+                    RUN.get() <= function.cost().steps(),
                     "{program} at {input}: ran {}, costs {}",
                     RUN.get(),
-                    function.cost()
+                    function.cost().steps()
                 );
             }
         }
@@ -637,7 +638,7 @@ mod tests {
             }))
             .cost()
         };
-        assert_eq!(cost(100_000) - cost(1000), 2 * 99_000);
+        assert_eq!(cost(100_000).steps() - cost(1000).steps(), 2 * 99_000);
     }
 
     #[test]

@@ -2,6 +2,7 @@ use crate::StrokeProps;
 use crate::color::{AlphaColor, ColorComponents, ColorSpace};
 use crate::context::Context;
 use crate::convert::{convert_line_cap, convert_line_join};
+use crate::encode::Cost;
 use crate::font::{Font, UNITS_PER_EM};
 use crate::function::{Function, TransferFunction};
 use crate::interpret::text::TextRenderingMode;
@@ -43,13 +44,10 @@ impl crate::CacheKey for ActiveTransferFunction {
 impl ActiveTransferFunction {
     /// The steps building the tables the functions map by takes, until they are
     /// built.
-    pub fn setup_cost(&self) -> u64 {
+    pub fn setup_cost(&self) -> Cost {
         match self {
             Self::Single(f) => f.setup_cost(),
-            Self::Four(functions) => functions
-                .iter()
-                .map(TransferFunction::setup_cost)
-                .fold(0, u64::saturating_add),
+            Self::Four(functions) => functions.iter().map(TransferFunction::setup_cost).sum(),
         }
     }
 

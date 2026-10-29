@@ -1,5 +1,6 @@
 use super::{ColorSpace, ToRgb, U8Lookup};
 use crate::cache::Cache;
+use crate::encode::Cost;
 use crate::function::Function;
 use hayro_syntax::object::{Array, Name, Object};
 
@@ -57,20 +58,21 @@ impl DeviceN {
 
     /// The steps converting a color of several components takes: its tint
     /// transform's, and the alternate space's.
-    pub(super) fn cost(&self) -> u64 {
-        (u64::from(self.num_components) + self.tint_transform.cost())
-            .saturating_add(self.alternate_space.cost())
+    pub(super) fn cost(&self) -> Cost {
+        Cost::of(usize::from(self.num_components))
+            + self.tint_transform.cost()
+            + self.alternate_space.cost()
     }
 
     /// The steps building the table a tint of one component is looked up in takes,
     /// until it is built.
-    pub(super) fn setup_cost(&self) -> u64 {
+    pub(super) fn setup_cost(&self) -> Cost {
         let table = if self.num_components == 1 {
             self.lookup.setup_cost(self.cost())
         } else {
-            0
+            Cost::ZERO
         };
-        table.saturating_add(self.alternate_space.setup_cost())
+        table + self.alternate_space.setup_cost()
     }
 
     fn convert_inner(&self, input: &[u8], output: &mut [u8]) -> Option<()> {

@@ -1,9 +1,18 @@
-use crate::function::{Clamper, Cost, Function, StitchingBounds, TupleVec, Values, interpolate};
+use crate::encode::Cost;
+use crate::function::{
+    Clamper, Costs, Function, StitchingBounds, TupleVec, Values, interpolate, sorting,
+};
 use hayro_syntax::object::Array;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Object;
 use hayro_syntax::object::dict::keys::{BOUNDS, ENCODE, FUNCTIONS};
 use smallvec::smallvec;
+
+#[cfg(test)]
+thread_local! {
+    /// The functions `stitching_bounds` has visited.
+    pub(crate) static VISITED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// A type 3 function (stitching function).
 #[derive(Debug)]
@@ -19,7 +28,7 @@ impl Type3 {
     pub(crate) fn new(dict: &Dict<'_>) -> Option<Self> {
         let clamper = Clamper::new(dict)?;
 
-        let functions = dict.get::<Array<'_>>(FUNCTIONS).and_then(|d| {
+        let mut functions: Vec<Function> = dict.get::<Array<'_>>(FUNCTIONS).and_then(|d| {
             d.items::<Object<'_>>()
                 .map_while(|o| o)
                 .map(|o| Function::new(&o))
@@ -34,6 +43,9 @@ impl Type3 {
         bounds.push(domain.1 + 0.0001);
 
         let encode = dict.get::<TupleVec>(ENCODE)?;
+        // A function past the last interval the bounds make, or past the last
+        // encoding, is never evaluated: kept, it would only be walked over.
+        functions.truncate((bounds.len() - 1).min(encode.len()));
 
         Some(Self {
             functions,
@@ -46,23 +58,27 @@ impl Type3 {
     /// The most steps `eval` takes, finding the one function the input falls to
     /// and evaluating it, and those `stitching_bounds` takes, gathering the bounds
     /// of every function under this one and sorting them.
-    pub(super) fn cost(&self) -> Cost {
-        let search = u64::from(usize::BITS - self.bounds.len().leading_zeros());
+    pub(super) fn cost(&self) -> Costs {
+        let search = Cost::new(u64::from(usize::BITS - self.bounds.len().leading_zeros()));
         let eval = self
             .functions
             .iter()
             .map(Function::cost)
             .max()
-            .unwrap_or(0)
-            .saturating_add(search + 2 + self.clamper.cost());
-        let bounds = self
-            .functions
-            .iter()
-            .map(Function::bounds_cost)
-            .fold(self.bounds.len() as u64, u64::saturating_add);
-        // Sorting them.
-        let bounds = bounds.saturating_mul(u64::from(64 - bounds.leading_zeros()).max(1));
-        Cost { eval, bounds }
+            .unwrap_or(Cost::ZERO)
+            + search
+            + Cost::new(2)
+            + self.clamper.cost();
+        let bounds = Cost::of(self.bounds.len())
+            + self
+                .functions
+                .iter()
+                .map(Function::bounds_cost)
+                .sum::<Cost>();
+        Costs {
+            eval,
+            bounds: sorting(bounds),
+        }
     }
 
     /// Evaluate the function with the given input.
@@ -94,6 +110,8 @@ impl Type3 {
         }
 
         for (index, function) in self.functions.iter().enumerate() {
+            #[cfg(test)]
+            VISITED.set(VISITED.get() + 1);
             let Some(bounds_i_minus_1) = self.bounds.get(index).copied() else {
                 continue;
             };
@@ -170,9 +188,11 @@ mod tests {
             );
             Function::new(&Object::from_bytes(data.as_bytes()).unwrap()).unwrap()
         };
-        let small = function(&[exponential(1)]).cost();
-        let large = function(&[exponential(1000)]).cost();
-        let both = function(&[exponential(1), exponential(1000)]).cost();
+        let small = function(&[exponential(1)]).cost().steps();
+        let large = function(&[exponential(1000)]).cost().steps();
+        let both = function(&[exponential(1), exponential(1000)])
+            .cost()
+            .steps();
         assert!(large >= 2000, "{large}");
         assert!(
             both >= large && both < large + small,

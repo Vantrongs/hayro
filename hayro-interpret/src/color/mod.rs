@@ -24,6 +24,7 @@ use self::lab::Lab;
 use self::pattern::Pattern;
 use self::separation::Separation;
 use crate::cache::{Cache, CacheKey};
+use crate::encode::Cost;
 use crate::util::hash128;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
@@ -54,7 +55,7 @@ impl<T> std::fmt::Debug for U8Lookup<T> {
 
 /// The steps converting a color with a profile's transform takes, besides one a
 /// component.
-const ICC_COST: u64 = 16;
+const ICC_COST: Cost = Cost::new(16);
 
 impl<T> U8Lookup<T> {
     /// Whether the table is built.
@@ -64,11 +65,12 @@ impl<T> U8Lookup<T> {
 
     /// The steps building the table takes until it is built, a value's taking
     /// `each`.
-    pub(super) fn setup_cost(&self, each: u64) -> u64 {
+    pub(super) fn setup_cost(&self, each: Cost) -> Cost {
         if self.is_built() {
-            0
+            Cost::ZERO
         } else {
-            each.saturating_add(1).saturating_mul(256)
+            // And a step to put each value.
+            (each + Cost::new(1)).times(256)
         }
     }
 
@@ -477,8 +479,8 @@ impl ColorSpace {
     /// of several components the tint transform's ([`Function::cost`]).
     ///
     /// [`Function::cost`]: crate::Function::cost
-    pub fn cost(&self) -> u64 {
-        let components = u64::from(self.num_components());
+    pub fn cost(&self) -> Cost {
+        let components = Cost::of(usize::from(self.num_components()));
         match self.0.as_ref() {
             ColorSpaceType::DeviceN(d) if d.num_components > 1 => d.cost(),
             // A profile's transform, or the table a component looks up.
@@ -487,19 +489,19 @@ impl ColorSpace {
             | ColorSpaceType::CalGray(_)
             | ColorSpaceType::CalRgb(_)
             | ColorSpaceType::Lab(_) => ICC_COST + components,
-            _ => 1 + components,
+            _ => Cost::new(1) + components,
         }
     }
 
     /// The steps building the tables [`to_rgba`](Self::to_rgba) looks colors up in
     /// takes, those of a separation's tint transform and an indexed space's palette,
     /// until they are built.
-    pub fn setup_cost(&self) -> u64 {
+    pub fn setup_cost(&self) -> Cost {
         match self.0.as_ref() {
             ColorSpaceType::Separation(s) => s.setup_cost(),
             ColorSpaceType::DeviceN(d) => d.setup_cost(),
             ColorSpaceType::Indexed(i) => i.setup_cost(),
-            _ => 0,
+            _ => Cost::ZERO,
         }
     }
 

@@ -6,7 +6,7 @@
 
 use crate::color::AlphaColor;
 use crate::encode::{
-    EncodedRadialAxialShading, EncodedShadingPattern, Exhausted, Meter, RadialAxialParams,
+    Cost, EncodedRadialAxialShading, EncodedShadingPattern, Exhausted, Meter, RadialAxialParams,
     Unmetered, take,
 };
 use crate::function::StitchingBounds;
@@ -97,12 +97,7 @@ impl EncodedRadialAxialShading {
             }
         }
 
-        take(
-            meter,
-            pattern
-                .setup_cost()
-                .saturating_add(self.function.bounds_cost()),
-        )?;
+        take(meter, pattern.setup_cost() + self.function.bounds_cost())?;
         let stops = approximate_gradient_stops(
             &mut Stops {
                 meter,
@@ -256,14 +251,14 @@ fn circle_outside_bbox(circle: Circle, bbox: Rect) -> bool {
 struct Stops<'m> {
     meter: &'m mut dyn Meter,
     /// The steps a sample takes.
-    sample_cost: u64,
+    sample_cost: Cost,
     stops: Vec<SvgGradientStop>,
 }
 
 impl Stops<'_> {
     /// Pays for `samples` samples.
     fn pay(&mut self, samples: u64) -> Result<(), Exhausted> {
-        take(self.meter, self.sample_cost.saturating_mul(samples))
+        take(self.meter, self.sample_cost.times(samples))
     }
 
     fn push(&mut self, offset: f32, color: [f32; 4]) -> Result<(), Exhausted> {
@@ -385,7 +380,7 @@ fn color_error(c0: [f32; 4], c1: [f32; 4]) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Exhausted, Meter, Stops, SvgGradientStop, approximate_gradient_stops};
+    use super::{Cost, Exhausted, Meter, Stops, SvgGradientStop, approximate_gradient_stops};
 
     /// Gives `left` steps, and records the most bytes asked to be held.
     struct Giving {
@@ -394,8 +389,8 @@ mod tests {
     }
 
     impl Meter for Giving {
-        fn work(&mut self, steps: u64) -> bool {
-            let Some(left) = self.left.checked_sub(steps) else {
+        fn work(&mut self, steps: Cost) -> bool {
+            let Some(left) = self.left.checked_sub(steps.steps()) else {
                 return false;
             };
             self.left = left;
@@ -421,7 +416,7 @@ mod tests {
             let found = approximate_gradient_stops(
                 &mut Stops {
                     meter: &mut meter,
-                    sample_cost: 1,
+                    sample_cost: Cost::new(1),
                     stops: Vec::new(),
                 },
                 |t| {

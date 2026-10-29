@@ -1,5 +1,6 @@
 use super::{ColorSpace, ToLuma, ToRgb, U8Lookup};
 use crate::cache::Cache;
+use crate::encode::Cost;
 use hayro_syntax::object::{self, Array, Name, Object, Stream};
 use std::borrow::Cow;
 
@@ -76,10 +77,8 @@ impl Indexed {
 
     /// The steps building the table a palette entry is looked up in takes, until it
     /// is built.
-    pub(super) fn setup_cost(&self) -> u64 {
-        self.lookup
-            .setup_cost(self.base.cost())
-            .saturating_add(self.base.setup_cost())
+    pub(super) fn setup_cost(&self) -> Cost {
+        self.lookup.setup_cost(self.base.cost()) + self.base.setup_cost()
     }
 
     fn u8_lookup(&self) -> Option<&[[u8; 3]; 256]> {

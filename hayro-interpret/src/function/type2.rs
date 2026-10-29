@@ -1,3 +1,4 @@
+use crate::encode::Cost;
 use crate::function::{Clamper, Values};
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Number;
@@ -31,8 +32,8 @@ impl Type2 {
     }
 
     /// The most steps `eval` takes: the power, and a step an output.
-    pub(crate) fn cost(&self) -> u64 {
-        2 + 2 * self.c0.len() as u64 + self.clamper.cost()
+    pub(crate) fn cost(&self) -> Cost {
+        Cost::new(2) + Cost::of(self.c0.len()).times(2) + self.clamper.cost()
     }
 
     /// Evaluate the function with the given input.
