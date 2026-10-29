@@ -15,13 +15,16 @@ pub(crate) fn start(
 }
 
 /// Decodes the next line of Group 3 1D data (T.4 Section 4.1), after [`start`]:
-/// false once the data ends after it.
+/// false, with no line decoded, once the data ended after the line before.
 pub(crate) fn step_1d(
     ctx: &mut DecoderContext,
     reader: &mut BitReader<'_>,
     decoder: &mut impl Decoder,
 ) -> Result<bool> {
     reader.poll(decoder)?;
+    if ended(ctx, reader, decoder)? {
+        return Ok(false);
+    }
     let line_start = reader.clone();
 
     if let Err(e) = decode_1d_line(ctx, reader, decoder) {
@@ -33,17 +36,20 @@ pub(crate) fn step_1d(
 
     ctx.next_line(decoder);
 
-    Ok(!check_eob(ctx, reader, decoder)?)
+    Ok(true)
 }
 
 /// Decodes the next line of Group 3 2D data (T.4 Section 4.2), after [`start`]:
-/// false once the data ends after it.
+/// false, with no line decoded, once the data ended after the line before.
 pub(crate) fn step_2d(
     ctx: &mut DecoderContext,
     reader: &mut BitReader<'_>,
     decoder: &mut impl Decoder,
 ) -> Result<bool> {
     reader.poll(decoder)?;
+    if ended(ctx, reader, decoder)? {
+        return Ok(false);
+    }
     let line_start = reader.clone();
 
     let result = reader.read_bit().and_then(|tag_bit| {
@@ -63,7 +69,18 @@ pub(crate) fn step_2d(
 
     ctx.next_line(decoder);
 
-    Ok(!check_eob(ctx, reader, decoder)?)
+    Ok(true)
+}
+
+/// Whether the data ended after the line decoded last, if any: what follows a line
+/// is read before the next one, not after it, so that a line is pushed without
+/// waiting on the EOLs and data after it.
+fn ended(
+    ctx: &mut DecoderContext,
+    reader: &mut BitReader<'_>,
+    decoder: &mut impl Decoder,
+) -> Result<bool> {
+    Ok(ctx.decoded_rows > 0 && check_eob(ctx, reader, decoder)?)
 }
 
 /// Recover from a damaged line by continuing at the next EOL.
@@ -80,7 +97,8 @@ fn recover<'a>(
 
     // Valid data never contains an EOL, so the first EOL after the start of
     // the line must be the one terminating it. Since the line won't be
-    // followed by an EOL from its start, `check_eob` will skip to it.
+    // followed by an EOL from its start, `check_eob` will skip to it before
+    // the next line.
     *reader = line_start;
 
     ctx.color = Color::White;

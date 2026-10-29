@@ -12,13 +12,13 @@ const MAX_BETWEEN_CHECKS: usize = 32;
 
 /// Bits written most significant first, as CCITT packs them.
 #[derive(Default)]
-struct Bits {
-    out: Vec<u8>,
+pub(crate) struct Bits {
+    pub(crate) out: Vec<u8>,
     len: usize,
 }
 
 impl Bits {
-    fn put(&mut self, code: &str) -> &mut Self {
+    pub(crate) fn put(&mut self, code: &str) -> &mut Self {
         for bit in code.bytes() {
             if self.len.is_multiple_of(8) {
                 self.out.push(0);
@@ -46,11 +46,11 @@ impl Bits {
     }
 }
 
-const EOL: &str = "000000000001";
+pub(crate) const EOL: &str = "000000000001";
 /// Horizontal mode with a white and a black run of 0: codes that write nothing.
 const EMPTY_HORIZONTAL: &str = "001_00110101_0000110111";
 const V0: &str = "1";
-const WHITE_8: &str = "10011";
+pub(crate) const WHITE_8: &str = "10011";
 
 /// Streams whose bits are all read once, with the settings they decode with:
 /// codes that write nothing, a long fill before an EOL, a line followed by bits

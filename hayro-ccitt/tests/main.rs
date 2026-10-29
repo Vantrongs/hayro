@@ -11,6 +11,7 @@ mod modes;
 mod recovery;
 mod settings;
 mod stop;
+mod trailing;
 
 use hayro_ccitt::{DecodeSettings, Decoder, DecoderContext, EncodingMode, RowDecoder, decode};
 use std::path::PathBuf;

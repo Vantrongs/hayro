@@ -665,6 +665,59 @@ fn going_back_in_encrypted_ccitt_data_decrypts_a_bounded_amount() {
     }
 }
 
+/// A Group 3 row followed by EOLs is read before them, plain or encrypted: reading
+/// the first row of a line of eight white pixels followed by 256 KiB to 4 MiB of EOLs
+/// counts the same few bytes of work (bits read, bytes decrypted), whether the image
+/// declares that row alone or two, and gives the row.
+#[test]
+#[cfg(debug_assertions)]
+fn a_ccitt_row_is_read_before_the_eols_after_it() {
+    use hayro_syntax::work::TOLD;
+    // A white run of eight, then a pair of EOLs each three bytes.
+    const LINE: u8 = 0x98;
+    const EOLS: [u8; 3] = [0x00, 0x10, 0x01];
+    let dict = "/Filter /CCITTFaxDecode /DecodeParms << /K 0 /Columns 8 >>";
+    for height in [1, 2] {
+        let params = ImageDecodeParams {
+            width: 8,
+            height,
+            ..Default::default()
+        };
+        let mut works = Vec::new();
+        for len in [1 << 18, 1 << 20, 4 << 20] {
+            let mut data = vec![LINE];
+            for _ in 0..len / 3 {
+                data.extend(EOLS);
+            }
+            for (cipher, pdf) in [
+                ("plain", stream_file(dict, &data)),
+                ("AES", encrypted_file(dict, &data)),
+            ] {
+                let stream = object_3(&pdf);
+                let mut reader = stream.image_reader(&params).unwrap();
+                TOLD.set(0);
+                let row = read_up_to(&mut reader, 8, 8);
+                let work = TOLD.get();
+                assert_eq!(
+                    row,
+                    [0xFF; 8],
+                    "{cipher}, {height} rows, {} bytes",
+                    data.len()
+                );
+                println!("{cipher}, {height} rows, {} bytes: {work} work", data.len());
+                works.push((cipher, data.len(), work));
+            }
+        }
+        for cipher in ["plain", "AES"] {
+            let works: Vec<_> = works.iter().filter(|w| w.0 == cipher).collect();
+            assert!(
+                works.iter().all(|w| w.2 == works[0].2 && w.2 < 64 * 1024),
+                "{cipher}, {height} rows: {works:?}"
+            );
+        }
+    }
+}
+
 /// A CCITT stream that decodes a few rows of many declared holds at most eight
 /// times what it decoded: room is made ahead of the rows, but not for all of them.
 #[test]
