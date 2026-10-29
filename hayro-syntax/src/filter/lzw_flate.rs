@@ -3,6 +3,7 @@ use crate::object::dict::keys::{BITS_PER_COMPONENT, COLORS, COLUMNS, EARLY_CHANG
 use crate::object::{Dict, Object};
 use crate::work::{Meter, POLL_BYTES};
 use alloc::vec::Vec;
+use core::ops::Range;
 
 pub(crate) mod flate {
     use super::*;
@@ -1392,36 +1393,59 @@ fn unpredict_tiff_bits(
     components: usize,
     meter: &Meter<'_>,
 ) -> Option<()> {
-    let bpc = usize::from(bpc);
-    let n = components.min(row.len() * 8 / bpc);
-    let mask = (1_u8 << bpc) - 1;
-    let shift = |s: usize| 8 - bpc - s * bpc % 8;
-    let part = part_len(1) * 8 / bpc;
+    let n = tiff_bits_held(row, bpc, components);
+    let part = part_len(1) * 8 / usize::from(bpc);
     for start in (colors..n).step_by(part) {
         let end = (start + part).min(n);
-        for s in start..end {
-            let left = (row[(s - colors) * bpc / 8] >> shift(s - colors)) & mask;
-            let byte = &mut row[s * bpc / 8];
-            let v = ((*byte >> shift(s)) & mask).wrapping_add(left) & mask;
-            *byte = (*byte & !(mask << shift(s))) | (v << shift(s));
-        }
-        meter.work((end - start) * bpc / 8 + 1).ok()?;
+        unpredict_tiff_bits_part(row, colors, bpc, start..end);
+        meter.work((end - start) * usize::from(bpc) / 8 + 1).ok()?;
     }
-    let used = n * bpc % 8;
-    if used != 0 {
-        row[n * bpc / 8] &= !(0xFF >> used);
-    }
+    clear_tiff_bits_tail(row, bpc, n);
     Some(())
 }
 
+/// The components of `bpc` bits a row of TIFF prediction holds: `components`, a
+/// last row cut short as many as its bytes do.
+fn tiff_bits_held(row: &[u8], bpc: u8, components: usize) -> usize {
+    components.min(row.len() * 8 / usize::from(bpc))
+}
+
+/// Reverses TIFF prediction of `bpc`-bit components `range` of `row` (from `colors`
+/// on), the components before them reversed.
+fn unpredict_tiff_bits_part(row: &mut [u8], colors: usize, bpc: u8, range: Range<usize>) {
+    let bpc = usize::from(bpc);
+    let mask = (1_u8 << bpc) - 1;
+    let shift = |s: usize| 8 - bpc - s * bpc % 8;
+    for s in range {
+        let left = (row[(s - colors) * bpc / 8] >> shift(s - colors)) & mask;
+        let byte = &mut row[s * bpc / 8];
+        let v = ((*byte >> shift(s)) & mask).wrapping_add(left) & mask;
+        *byte = (*byte & !(mask << shift(s))) | (v << shift(s));
+    }
+}
+
+/// Clears the bits after the `n` components of `bpc` bits a row holds.
+fn clear_tiff_bits_tail(row: &mut [u8], bpc: u8, n: usize) {
+    let used = n * usize::from(bpc) % 8;
+    if used != 0 {
+        row[n * usize::from(bpc) / 8] &= !(0xFF >> used);
+    }
+}
+
 /// Reverses a predictor row by row, as `apply_predictor` does for the whole data at
-/// once: for PNG prediction and TIFF prediction of 8-bit components, the predictors
-/// that unfilter a byte at a time. A row is reversed in parts, as its bytes arrive.
+/// once: for PNG prediction and TIFF prediction of components of 1, 2, 4 or 8 bits.
+/// A row of a predictor that unfilters a byte at a time is reversed in parts, as its
+/// bytes arrive; a row of TIFF prediction of fewer bits once it is read.
 #[derive(Clone)]
 pub(crate) struct Unpredictor {
     is_png_predictor: bool,
     /// The bytes of a pixel for PNG prediction, of the components of one for TIFF.
     bpp: usize,
+    /// For TIFF prediction of components of fewer than eight bits, their bits, else
+    /// zero; with `components`, those of a row (which fit the padding after
+    /// `is_png_predictor`, so a saved state grows by nothing).
+    tiff_bpc: u8,
+    components: u32,
     /// The previous row, decoded after its predictor byte for PNG predictors; empty
     /// before the first, as `apply_predictor` passes it.
     prev: Vec<u8>,
@@ -1432,17 +1456,23 @@ pub(crate) struct Unpredictor {
 
 impl Unpredictor {
     /// `None` for predictor 1 (no prediction) and for the TIFF prediction of
-    /// components of other than 8 bits, which only `apply_predictor` reverses.
+    /// 16-bit components, which only `apply_predictor` reverses.
     pub(crate) fn new(params: &PredictorParams) -> Option<Self> {
         let rows = Rows::of(params)?;
-        let (is_png_predictor, bpp) = match rows.kind {
-            Kind::Png { bpp } => (true, bpp),
-            Kind::Tiff8 { colors } => (false, colors),
-            Kind::Tiff { .. } => return None,
+        let (is_png_predictor, bpp, tiff_bpc, components) = match rows.kind {
+            Kind::Png { bpp } => (true, bpp, 0, 0),
+            Kind::Tiff8 { colors } => (false, colors, 0, 0),
+            Kind::Tiff { bpc: 16, .. } => return None,
+            Kind::Tiff { colors, bpc } => {
+                let components = colors.checked_mul(params.columns)?.try_into().ok()?;
+                (false, colors, bpc, components)
+            }
         };
         Some(Self {
             is_png_predictor,
             bpp,
+            tiff_bpc,
+            components,
             prev: Vec::new(),
             row_len: rows.len,
             done: 0,
@@ -1469,6 +1499,9 @@ impl Unpredictor {
     /// `min` of them.
     pub(crate) fn advance(&mut self, input: &mut [u8], min: usize) {
         let (bpp, done) = (self.bpp, self.done);
+        if self.tiff_bpc != 0 {
+            return;
+        }
         let Some((filter, row)) = self.split(input) else {
             return;
         };
@@ -1487,7 +1520,12 @@ impl Unpredictor {
     /// `input` empty.
     pub(crate) fn finish_row(&mut self, input: &mut Vec<u8>) {
         let (bpp, done) = (self.bpp, self.done);
-        if let Some((Some(filter), row)) = self.split(input) {
+        if self.tiff_bpc != 0 {
+            let bpc = self.tiff_bpc;
+            let n = tiff_bits_held(input, bpc, self.components as usize);
+            unpredict_tiff_bits_part(input, bpp, bpc, bpp.min(n)..n);
+            clear_tiff_bits_tail(input, bpc, n);
+        } else if let Some((Some(filter), row)) = self.split(input) {
             let end = row.len();
             png::unfilter_part(filter, bpp, self.row(), row, done.min(end)..end);
         }

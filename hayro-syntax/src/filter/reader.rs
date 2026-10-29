@@ -633,17 +633,38 @@ mod tests {
         same_as_whole(&encoded[..50_000], &params(1, 1, 8, 1));
     }
 
-    /// TIFF prediction of components of other than 8 bits, which only the
-    /// whole-data decoder reverses, is not read incrementally.
+    /// TIFF prediction of 16-bit components, which only the whole-data decoder
+    /// reverses, is not read incrementally.
     #[test]
-    fn other_predictors_are_left_to_the_whole_data_decoder() {
-        for p in [
-            params(2, 1, 4, 3),
-            params(2, 3, 16, 3),
-            params(2, 2, 1, 7),
-            params(2, 1, 2, 5),
-        ] {
+    fn tiff_prediction_of_16_bits_is_left_to_the_whole_data_decoder() {
+        for p in [params(2, 3, 16, 3), params(2, 1, 16, 5)] {
             assert!(DecodedReader::flate(DecryptedReader::raw(Cow::Borrowed(&[])), &p).is_none());
+        }
+    }
+
+    /// TIFF prediction of components of 1, 2 and 4 bits reads as the whole-data
+    /// decoder reverses it, rows whole and a last row cut short at every length, in
+    /// reads of any size.
+    #[test]
+    fn tiff_prediction_of_fewer_bits_reads_as_whole_decoding() {
+        for (colors, bpc, columns) in [(1, 4, 3), (2, 1, 7), (1, 2, 5), (3, 2, 3), (1, 1, 45)] {
+            let p = params(2, colors, bpc, columns);
+            let row = (usize::from(colors) * usize::from(bpc) * columns).div_ceil(8);
+            for len in 0..=4 * row {
+                let data = noise(len, len as u32 + 1);
+                let encoded = stored_zlib(&data, 65_535);
+                let whole = apply_predictor(data.clone(), &p, &Meter::default()).unwrap();
+                for chunk in [1, 3, 4096] {
+                    let reader =
+                        DecodedReader::flate(DecryptedReader::raw(Cow::Borrowed(&encoded)), &p)
+                            .unwrap();
+                    assert_eq!(
+                        read_all(reader, chunk),
+                        whole,
+                        "{colors} {bpc} {columns} {len}"
+                    );
+                }
+            }
         }
     }
 

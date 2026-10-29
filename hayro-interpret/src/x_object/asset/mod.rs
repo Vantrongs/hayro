@@ -114,11 +114,12 @@ impl ImageAsset {
         })
     }
 
-    /// Opens the image for requests. Images with no filter or Flate whose samples
-    /// are `DeviceGray`, `DeviceRGB` or `Indexed`, of at most eight bits (of eight,
-    /// used as stored or inverted), with masks of the same kinds or decoded whole,
-    /// and stencil masks with no filter or Flate whose samples are used as stored or
-    /// inverted, only read their dictionaries here (and, the first time, read the
+    /// Opens the image for requests. Images with no filter or Flate (with any
+    /// predictor but TIFF prediction of 16 bits) whose samples have fewer than eight
+    /// bits, in any colour space, or are 8-bit `DeviceGray`, `DeviceRGB` or `Indexed`
+    /// samples used as stored or inverted, with masks of one component of fewer than
+    /// eight bits or of eight used as stored or inverted, or decoded whole, and
+    /// stencil masks with no filter or Flate, only read their dictionaries here (and, the first time, read the
     /// data of an image with a mask stream and of its mask through, to count the
     /// rows decoding them whole keeps, on which the mask's grid depends); requests
     /// read their data and keep a piece of a row and a few sums per bin, the rows the

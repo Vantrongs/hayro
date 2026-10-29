@@ -94,6 +94,32 @@ impl MaskPath {
     }
 }
 
+/// The alpha a mask's stored sample `value` of `bits` becomes through the
+/// component's `decode` entry; `invert` for a stencil mask.
+fn mask_alpha(value: u32, bits: u8, (decode_min, decode_max): (f32, f32), invert: bool) -> u8 {
+    let source_max = 2.0_f32.powi(i32::from(bits)) - 1.0;
+    let value = interpolate(value as f32, 0.0, source_max, decode_min, decode_max);
+    let value = if invert { 1.0 - value } else { value };
+    (value * 255.0 + 0.5) as u8
+}
+
+/// For a one-component mask of fewer than eight bits a sample whose samples go
+/// through the decode array ([`MaskPath::Decoded`]), the alpha each stored value
+/// becomes, as decoding the mask whole maps it (a sample the data does not hold whole
+/// as stored zero); `None` without a decode entry, where decoding it whole makes no
+/// alpha.
+pub(crate) fn mask_lut(bits: u8, decode_arr: &[(f32, f32)], invert: bool) -> Option<[u8; 256]> {
+    let &decode = decode_arr.first()?;
+    if !(1..8).contains(&bits) {
+        return None;
+    }
+    let mut lut = [0; 256];
+    for (v, alpha) in lut.iter_mut().enumerate().take(1 << bits) {
+        *alpha = mask_alpha(v as u32, bits, decode, invert);
+    }
+    Some(lut)
+}
+
 fn decode_mask_data(
     mut ctx: DecodeContext<'_>,
     invert: bool,
@@ -127,23 +153,19 @@ fn decode_mask_data(
                 meter,
             )?;
 
-            let source_max = 2.0_f32.powi(ctx.bits_per_component as i32) - 1.0;
             let mut decoded = Vec::with_capacity(components.len());
 
             // Whole pixels a piece, as `chunks` splits them.
             let piece_len = pixel_piece(num_components) * num_components.max(1);
             for piece in components.chunks(piece_len) {
                 for pixel in piece.chunks(num_components) {
-                    for (component, (decode_min, decode_max)) in pixel.iter().zip(&ctx.decode_arr) {
-                        let value = interpolate(
-                            *component as f32,
-                            0.0,
-                            source_max,
-                            *decode_min,
-                            *decode_max,
-                        );
-                        let value = if invert { 1.0 - value } else { value };
-                        decoded.push((value * 255.0 + 0.5) as u8);
+                    for (component, &decode) in pixel.iter().zip(&ctx.decode_arr) {
+                        decoded.push(mask_alpha(
+                            u32::from(*component),
+                            ctx.bits_per_component,
+                            decode,
+                            invert,
+                        ));
                     }
                 }
                 meter.work(piece.len()).ok()?;

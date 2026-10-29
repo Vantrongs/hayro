@@ -386,16 +386,16 @@ fn stencil_masks_stream_as_decoded() {
 }
 
 /// A stencil mask whose `/Decode` maps its bits through other values than 0 and 1
-/// is decoded whole, as before.
+/// streams, as it decodes whole.
 #[test]
-fn a_stencil_with_another_decode_is_decoded_whole() {
+fn a_stencil_with_another_decode_streams_as_decoded() {
     let pdf = pdf(&[(
         image("/ImageMask true /Decode [0.2 0.8]", 13, 9),
         noise(18, 45),
     )]);
     let asset = asset(&pdf);
-    let source = asset.open(None, None).unwrap();
-    assert!(!is_streamed(&source));
+    assert!(is_streamed(&asset.open(None, None).unwrap()));
+    differential::assert_streams_as_whole(&asset, "stencil /Decode [0.2 0.8]");
 }
 
 /// Rows of packed samples the data ends within stream as they decode whole: padded

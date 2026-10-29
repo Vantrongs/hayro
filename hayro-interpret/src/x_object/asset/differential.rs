@@ -1,6 +1,7 @@
 //! Images whose data ends at every byte stream as they decode whole: generated
 //! images of every sample depth whole decoding reads, one to four components,
-//! decode arrays, colour keys, soft masks with and without `/Matte`, mask streams,
+//! decode arrays, colour keys, soft masks of every depth with and without `/Matte`
+//! and decode arrays, on the image's grid and their own, mask streams,
 //! stencil masks and CCITT data, raw and Flate, each cut after every byte of its
 //! stored data, and of its data decoded. Flate data damaged at every byte, which
 //! zlib may find corrupt after making bytes, streams as it decodes whole too.
@@ -367,54 +368,39 @@ fn colour_of_16_bits_cut_streams_as_whole() {
     colour_cut(16);
 }
 
-/// Images under every kind of mask stream, their mask's data cut short.
+/// Images under every kind of mask stream, their mask's data cut short: soft masks
+/// of every depth through their decode arrays, on the image's grid and on their own.
 #[test]
 fn masks_cut_stream_as_whole() {
     let mut cases = Cases::default();
     let (ow, oh) = OTHER_GRID;
-    let masks = [
-        (
-            "/SMask",
-            "/ColorSpace /DeviceGray /BitsPerComponent 8",
-            W,
-            H,
-        ),
-        (
-            "/SMask",
-            "/ColorSpace /DeviceGray /BitsPerComponent 8 /Matte [0.5]",
-            W,
-            H,
-        ),
-        (
-            "/SMask",
-            "/ColorSpace /DeviceGray /BitsPerComponent 8",
-            ow,
-            oh,
-        ),
-        (
-            "/SMask",
-            "/ColorSpace /DeviceGray /BitsPerComponent 4",
-            W,
-            H,
-        ),
-        ("/Mask", "/ImageMask true", W, H),
-        ("/Mask", "/ImageMask true /Decode [1 0]", W, H),
+    let gray = |bits: usize, extra: &str| {
+        format!("/ColorSpace /DeviceGray /BitsPerComponent {bits} {extra}")
+    };
+    let mut masks = vec![
+        ("/SMask", gray(8, ""), W, H, 8),
+        ("/SMask", gray(8, "/Matte [0.5]"), W, H, 8),
+        ("/SMask", gray(8, ""), ow, oh, 8),
+        ("/SMask", gray(8, "/Decode [0.2 0.7]"), W, H, 8),
+        ("/SMask", gray(1, "/Decode [0.2 0.7]"), W, H, 1),
+        ("/SMask", gray(4, "/Matte [0.5]"), W, H, 4),
+        ("/Mask", "/ImageMask true".into(), W, H, 1),
+        ("/Mask", "/ImageMask true /Decode [1 0]".into(), W, H, 1),
+        ("/Mask", "/ImageMask true /Decode [0.2 0.8]".into(), W, H, 1),
     ];
+    for bits in 2..8 {
+        masks.push(("/SMask", gray(bits, ""), W, H, bits));
+        masks.push(("/SMask", gray(bits, "/Decode [1 0.3]"), ow, oh, bits));
+    }
     for bits in [1_usize, 3, 8] {
         let row = (W as usize * bits).div_ceil(8);
         let colour = (
             format!("/ColorSpace /DeviceGray /BitsPerComponent {bits}"),
             samples(row * H as usize, 50),
         );
-        for (key, dict, mw, mh) in masks {
-            let mask_row = if dict.contains("ImageMask") {
-                mw.div_ceil(8)
-            } else if dict.contains("BitsPerComponent 4") {
-                mw.div_ceil(2)
-            } else {
-                mw
-            };
-            let data = samples((mask_row * mh) as usize, 51);
+        for (key, dict, mw, mh, mask_bits) in &masks {
+            let mask_row = (*mw as usize * mask_bits).div_ceil(8);
+            let data = samples(mask_row * *mh as usize, 51);
             for (filter, stored) in cuts(&data) {
                 for (k, stored) in stored {
                     let pdf = pdf(&[
@@ -422,7 +408,7 @@ fn masks_cut_stream_as_whole() {
                             image(&format!("{} {key} 4 0 R", colour.0), W, H),
                             colour.1.clone(),
                         ),
-                        (image(&format!("{dict} {filter}"), mw, mh), stored),
+                        (image(&format!("{dict} {filter}"), *mw, *mh), stored),
                     ]);
                     let case = format!("{} under {dict} {filter}, mask cut after {k}", colour.0);
                     cases.check(&asset(&pdf), &case);
@@ -550,6 +536,18 @@ fn wide_rows_under_matte_cut_stream_as_whole() {
 fn wide_rgb_rows_cut_stream_as_whole() {
     let rgb = "/ColorSpace /DeviceRGB /BitsPerComponent 8 /Decode [1 0 1 0 1 0]";
     wide_cut(rgb, 50_001, 3, 8, None);
+}
+
+#[test]
+fn wide_rows_under_a_soft_mask_of_5_bits_cut_stream_as_whole() {
+    let mask = wide_gray(WIDE, 5, "/Decode [1 0.3]");
+    wide_cut(&format!("{GRAY_3} /SMask 4 0 R"), WIDE, 1, 3, Some(mask));
+}
+
+#[test]
+fn wide_cmyk_rows_of_2_bits_cut_stream_as_whole() {
+    let cmyk = "/ColorSpace /DeviceCMYK /BitsPerComponent 2";
+    wide_cut(cmyk, 50_001, 4, 2, None);
 }
 
 #[test]

@@ -381,6 +381,132 @@ fn a_small_region_of_a_large_bilevel_image_costs_the_region() {
     );
 }
 
+/// A small region of each kind of low-bit image that streams costs memory in
+/// proportion to the region, not to the image: colour of fewer than eight bits in
+/// colour spaces other than `DeviceGray` and `RGB`, soft masks of fewer than eight
+/// bits or through a decode array, read alongside the colour or on their own grid,
+/// stencil masks through a decode array, and TIFF prediction of fewer than eight
+/// bits. Decoding any of them whole held a byte or more per pixel (4 MiB and more
+/// for the smaller); a tile of an image four times as large holds the same, but for
+/// the pieces of rows twice as wide that are read past.
+#[test]
+fn a_small_region_of_each_low_bit_kind_costs_the_region() {
+    let tile: Bins = |w, h| ((w, h), [w / 2, h - 64, w / 2 + 64, h]);
+    region_cost(
+        "/ColorSpace /DeviceGray /BitsPerComponent 1 /Width 16 /Height 16 /Filter /FlateDecode",
+        &common::stored_zlib(&[0; 32], 1000),
+        |w, h| ((w, h), [0, 0, 1, 1]),
+    );
+    let flate = |side: u32, bits: u32| {
+        let packed = common::noise((side * bits / 8 * side) as usize, side + bits);
+        common::stored_zlib(&packed, 65_535)
+    };
+    let gray = |bits: u32, extra: &str| {
+        format!("/ColorSpace /DeviceGray /BitsPerComponent {bits} {extra} /Filter /FlateDecode")
+    };
+    /// A kind: its dictionary, its colour's bits per pixel, the plane requested, and
+    /// its mask (object 6): dictionary and bits per pixel.
+    type Kind = (&'static str, String, u32, Plane, Option<(String, u32)>);
+    let kinds: [Kind; 7] = [
+        (
+            "cmyk_2",
+            "/ColorSpace /DeviceCMYK /BitsPerComponent 2 /Filter /FlateDecode".into(),
+            8,
+            Plane::Image,
+            None,
+        ),
+        (
+            "lab_4",
+            "/ColorSpace [/Lab << /WhitePoint [0.95 1 1.09] >>] /BitsPerComponent 4 \
+             /Filter /FlateDecode"
+                .into(),
+            12,
+            Plane::Image,
+            None,
+        ),
+        (
+            "smask_5",
+            gray(1, "/SMask 6 0 R"),
+            1,
+            Plane::Image,
+            Some((gray(5, ""), 5)),
+        ),
+        (
+            "smask_1_decoded",
+            gray(2, "/SMask 6 0 R"),
+            2,
+            Plane::Image,
+            Some((gray(1, "/Decode [0.2 0.7]"), 1)),
+        ),
+        (
+            "smask_3_own_grid",
+            gray(1, "/SMask 6 0 R"),
+            1,
+            Plane::Mask,
+            Some((gray(3, "/Decode [1 0]"), 3)),
+        ),
+        (
+            "stencil_decoded",
+            "/ImageMask true /Decode [0.2 0.8] /Filter /FlateDecode".into(),
+            1,
+            Plane::Image,
+            None,
+        ),
+        (
+            "tiff_2",
+            gray(
+                2,
+                "/DecodeParms << /Predictor 2 /BitsPerComponent 2 /Columns COLUMNS >>",
+            ),
+            2,
+            Plane::Image,
+            None,
+        ),
+    ];
+    for (name, dict, bits, plane, mask) in kinds {
+        let mut working = Vec::new();
+        for side in [1024_u32, 2048] {
+            let dict = dict.replace("COLUMNS", &side.to_string());
+            let mut objects = vec![image(
+                &format!("{dict} /Width {side} /Height {side}"),
+                &flate(side, bits),
+            )];
+            // A mask on its own grid is half the image's size.
+            let mask_side = if plane == Plane::Mask { side / 2 } else { side };
+            if let Some((mask, mask_bits)) = &mask {
+                objects.push(image(
+                    &format!("{mask} /Width {mask_side} /Height {mask_side}"),
+                    &flate(mask_side, *mask_bits),
+                ));
+            }
+            let pdf = page(
+                "q 100 0 0 100 0 0 cm /Im Do Q",
+                "/XObject << /Im 5 0 R >>",
+                objects,
+            );
+            let mut requested = Requested::new(plane, tile);
+            common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+            let [(peak, _)] = requested.regions[..] else {
+                panic!("{name}: one image")
+            };
+            let saved = requested.saved[0];
+            assert!(saved <= 2 << 20, "{name} {side}: {saved} bytes saved");
+            working.push(peak - saved);
+        }
+        // The larger image's rows, and its mask's, are wider by as much again, which a
+        // piece read past holds, and for TIFF prediction the encoded and decoded rows.
+        let rows = if name.starts_with("tiff") { 3 } else { 1 };
+        let wider = rows * 1024 * (bits + mask.as_ref().map_or(0, |m| m.1)) as usize / 8;
+        assert!(
+            working[1] <= working[0] + wider,
+            "{name}: {} bytes besides saved states for 1024, {} for 2048",
+            working[0],
+            working[1]
+        );
+        assert!(working[1] < 1 << 20, "{name}: {} bytes", working[1]);
+    }
+}
+
 /// The last texel of a bilevel mask 40 million samples wide whose data ends halfway
 /// through its row holds a piece of the row, not the bytes between the data's end and
 /// the texel.

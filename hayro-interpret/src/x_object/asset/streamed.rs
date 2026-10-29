@@ -9,8 +9,8 @@ use crate::color::{ColorComponents, ColorSpace, ToLuma, ToRgb};
 use crate::interpret::state::ActiveTransferFunction;
 use crate::x_object::area::Area;
 use crate::x_object::decode::{
-    MaskPath, SampleFormat, SampleRows, direct_invert, sample_format, sample_lut, unpack_packed,
-    unpremultiply_samples,
+    MaskPath, SampleFormat, SampleRows, direct_invert, mask_lut, sample_format, sample_lut,
+    unpack_packed, unpremultiply_samples,
 };
 use crate::x_object::image::{ImageKind, ImageXObject};
 use core::ops::Range;
@@ -96,10 +96,9 @@ enum Output {
 }
 
 impl Colour {
-    /// The conversion for `obj`'s stored samples, if they are `DeviceGray`,
-    /// `DeviceRGB` or `Indexed` samples of at most eight bits (of eight, used as
-    /// stored or inverted), or a stencil mask's bits or bytes used as stored or
-    /// inverted.
+    /// The conversion for `obj`'s stored samples, if they are samples of fewer than
+    /// eight bits, 8-bit `DeviceGray`, `DeviceRGB` or `Indexed` samples used as stored
+    /// or inverted, or a stencil mask's samples.
     pub(super) fn new(obj: &ImageXObject<'_>) -> Option<Self> {
         Self::of(obj, sample_format(obj, None))
     }
@@ -126,7 +125,12 @@ impl Colour {
                     invert,
                     fill: if invert { 255 } else { 0 },
                 },
-                MaskPath::Decoded => return None,
+                // Through the decode array, samples past the data as stored zero.
+                MaskPath::Decoded => Samples::packed(
+                    bits_per_component,
+                    vec![mask_lut(bits_per_component, &decode_arr, true)?],
+                    0,
+                ),
             };
             return Some(Self {
                 samples,
@@ -134,10 +138,13 @@ impl Colour {
                 components: 1,
             });
         }
-        if !(color_space.is_device_gray_or_rgb() || color_space.is_indexed()) {
+        if color_space.num_components() == 0 {
             return None;
         }
         let samples = match bits_per_component {
+            8 if !(color_space.is_device_gray_or_rgb() || color_space.is_indexed()) => {
+                return None;
+            }
             8 => Samples::Bytes {
                 invert: direct_invert(&color_space, bits_per_component, &decode_arr)?,
                 fill: 0,

@@ -4,7 +4,7 @@
 use super::DecodeWork;
 use crate::LumaData;
 use crate::x_object::decode::{
-    BILEVEL_MASK_LUT, MaskPath, SampleFormat, SampleRows, decode_mask, sample_format,
+    BILEVEL_MASK_LUT, MaskPath, SampleFormat, SampleRows, decode_mask, mask_lut, sample_format,
 };
 use crate::x_object::image::{ImageKind, ImageXObject};
 use core::ops::Range;
@@ -152,30 +152,42 @@ pub(super) enum MaskSource<'a> {
     Decoded(LumaData),
 }
 
-/// How the samples of a mask read as rows become alpha: the `MaskPath`s other than
-/// through the decode array.
-#[derive(Clone, Copy)]
+/// How the samples of a mask read as rows become alpha (`MaskPath`).
+#[derive(Clone)]
 pub(super) enum RowPath {
     /// One bit per sample, each 0 or 255.
     Bilevel { invert: bool },
     /// One byte per sample.
     Bytes { invert: bool },
+    /// One component of `bits` (fewer than eight) per sample, through the decode
+    /// array: `lut[v]` is the alpha of stored value `v`.
+    /// Boxed, so that the other paths' images stay as small.
+    Mapped { bits: u8, lut: Box<[u8; 256]> },
 }
 
 impl RowPath {
-    fn of(path: MaskPath) -> Option<Self> {
+    /// The path of a mask's samples of `format`, if they are read as rows.
+    fn of(path: MaskPath, format: &SampleFormat, stencil: bool) -> Option<Self> {
         match path {
             MaskPath::Bilevel { invert } => Some(Self::Bilevel { invert }),
             MaskPath::Bytes { invert } => Some(Self::Bytes { invert }),
+            MaskPath::Decoded if format.color_space.num_components() == 1 => {
+                let bits = format.bits_per_component;
+                Some(Self::Mapped {
+                    bits,
+                    lut: Box::new(mask_lut(bits, &format.decode_arr, stencil)?),
+                })
+            }
             MaskPath::Decoded => None,
         }
     }
 
     /// How the samples of `mask` lie in its rows.
-    fn rows(self, mask: &ImageXObject<'_>) -> SampleRows {
+    fn rows(&self, mask: &ImageXObject<'_>) -> SampleRows {
         let bits = match self {
             Self::Bilevel { .. } => 1,
             Self::Bytes { .. } => 8,
+            Self::Mapped { bits, .. } => *bits,
         };
         SampleRows::new(mask.width(), 1, bits, mask.height())
     }
@@ -200,18 +212,15 @@ impl<'a> MaskSource<'a> {
         let Some(mask) = ImageXObject::new_mask(stream, &image.warning_sink, &image.cache) else {
             return Ok(None);
         };
-        let SampleFormat {
-            color_space,
-            bits_per_component,
-            decode_arr,
-        } = sample_format(&mask, None);
+        let format = sample_format(&mask, None);
+        let stencil = mask.kind == ImageKind::StencilMask;
         let path = MaskPath::new(
-            &color_space,
-            bits_per_component,
-            &decode_arr,
-            mask.kind == ImageKind::StencilMask,
+            &format.color_space,
+            format.bits_per_component,
+            &format.decode_arr,
+            stencil,
         );
-        if let Some(path) = RowPath::of(path)
+        if let Some(path) = RowPath::of(path, &format, stencil)
             && mask.stream.can_read_incrementally()
         {
             let held = match height.get() {
@@ -254,7 +263,7 @@ impl<'a> MaskSource<'a> {
                 let row_bytes = path.rows(obj).row_bytes();
                 MaskRows::Streamed {
                     raw: Box::new(RawRows::new(&obj.stream, row_bytes, meter)?),
-                    path: *path,
+                    path: path.clone(),
                     width,
                     bytes: Vec::new(),
                     last: 0,
@@ -340,18 +349,22 @@ impl MaskRows<'_> {
                 width,
                 bytes,
                 last,
-            } => match *path {
+            } => match path {
                 RowPath::Bytes { invert } => {
                     raw.skip(cols.start - raw.at())?;
                     let got = raw.read(out)?;
-                    if invert {
+                    if *invert {
                         out[..got].iter_mut().for_each(|a| *a = 255 - *a);
                     }
                     out[got..].fill(0);
                     Ok(got)
                 }
                 RowPath::Bilevel { invert } => {
-                    bilevel_alpha(raw, bytes, last, invert, *width, cols, out)
+                    bilevel_alpha(raw, bytes, last, *invert, *width, cols, out)
+                }
+                RowPath::Mapped { bits, lut } => {
+                    mapped_alpha(raw, bytes, last, *bits, lut, cols, out)?;
+                    Ok(out.len())
                 }
             },
         }
@@ -383,6 +396,53 @@ impl MaskRows<'_> {
         }
         Ok(())
     }
+}
+
+/// The alpha of columns `cols` of a row of samples of `bits` through `lut`, into
+/// `out`, its bytes read into `bytes`; `last` is the last byte read of the row. A
+/// sample the data does not hold whole is stored zero, as decoding the mask whole
+/// unpacks it, so every column has alpha.
+fn mapped_alpha(
+    raw: &mut RawRows<'_>,
+    bytes: &mut Vec<u8>,
+    last: &mut u8,
+    bits: u8,
+    lut: &[u8; 256],
+    cols: Range<usize>,
+    out: &mut [u8],
+) -> Result<(), Cancelled> {
+    let bits = usize::from(bits);
+    let (first, end) = (cols.start * bits / 8, (cols.end * bits).div_ceil(8));
+    if raw.at() <= first {
+        raw.skip(first - raw.at())?;
+    }
+    // Past `first` only by the byte the piece before ended in, which is `last`; short
+    // of it when the data ended before it.
+    let from = raw.at();
+    bytes.clear();
+    bytes.resize(end - first, 0);
+    if from > first {
+        bytes[0] = *last;
+    }
+    let start = from.max(first);
+    let got = raw.read(&mut bytes[start - first..])?;
+    if got > 0 {
+        *last = bytes[start - first + got - 1];
+    }
+    let held_bits = (start + got).saturating_sub(first) * 8;
+    let mask = (1_u16 << bits) - 1;
+    let offset = cols.start * bits - first * 8;
+    for (i, alpha) in out.iter_mut().enumerate() {
+        let at = offset + i * bits;
+        let value = if at + bits <= held_bits {
+            let pair = [bytes[at / 8], bytes.get(at / 8 + 1).copied().unwrap_or(0)];
+            (u16::from_be_bytes(pair) >> (16 - bits - at % 8)) & mask
+        } else {
+            0
+        };
+        *alpha = lut[usize::from(value)];
+    }
+    Ok(())
 }
 
 /// The alpha of columns `cols` of a bilevel row from `raw`, into `out`, its bytes

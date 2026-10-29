@@ -2,7 +2,7 @@ mod image;
 mod mask;
 
 pub(crate) use image::{DecodedImage, decode_image, direct_invert, unpremultiply_samples};
-pub(crate) use mask::{BILEVEL_MASK_LUT, DecodedMask, MaskPath, decode_mask};
+pub(crate) use mask::{BILEVEL_MASK_LUT, DecodedMask, MaskPath, decode_mask, mask_lut};
 
 use crate::InterpreterWarning;
 use crate::color::ColorSpace;
