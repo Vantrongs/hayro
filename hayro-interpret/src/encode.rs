@@ -456,6 +456,10 @@ impl EncodedShadingPattern {
     /// shape in the shading's space is read from it, in steps that do not grow
     /// with the shape. Without one, it is built for this test where one is needed.
     ///
+    /// Each test holds with a margin for the rounding of the shape's coordinates
+    /// and of the test's arithmetic ([`rounding`]), so a shape too far from the
+    /// origin for its position to be known extends nothing.
+    ///
     /// The work is taken of `meter` before it is done: reading the hull, and for a
     /// radial shading the lines of the shape's outline near the window
     /// ([`flatten_metered`](crate::flatten::flatten_metered)), each element paid for
@@ -499,15 +503,17 @@ impl EncodedShadingPattern {
                 }
             };
             take(meter, hull.bounds_cost())?;
-            Ok(hull.bounds(to_shading))
+            Ok(hull
+                .bounds(to_shading)
+                .map(|bounds| (bounds, rounding(base, to_device, reach(bounds)))))
         };
         match &mut self.shading_type {
             EncodedShadingType::FunctionBased(shading) => {
-                let Some(bounds) = bounds()? else {
+                let Some((bounds, error)) = bounds()? else {
                     return Ok(());
                 };
                 let domain = shading.domain;
-                let (x, y) = (tolerance * per_x, tolerance * per_y);
+                let (x, y) = (tolerance * per_x - error, tolerance * per_y - error);
                 shading.extended[0] |= bounds.x0 >= domain.x0 - x;
                 shading.extended[1] |= bounds.x1 <= domain.x1 + x;
                 shading.extended[2] |= bounds.y0 >= domain.y0 - y;
@@ -515,10 +521,10 @@ impl EncodedShadingPattern {
             }
             EncodedShadingType::RadialAxial(shading) => match shading.params {
                 RadialAxialParams::Axial => {
-                    let Some(bounds) = bounds()? else {
+                    let Some((bounds, error)) = bounds()? else {
                         return Ok(());
                     };
-                    let t = tolerance * per_x;
+                    let t = tolerance * per_x - error;
                     shading.extend[0] |= bounds.x0 >= -t;
                     shading.extend[1] |= bounds.x1 <= 1.0 + t;
                 }
@@ -537,20 +543,30 @@ impl EncodedShadingPattern {
                     } else {
                         ((Point::ZERO, r0), (p1, r1))
                     };
+                    // The rounding of the shape's lines grows with its control
+                    // points, which a curve's lines are evaluated from.
+                    let Some((bounds, _)) = bounds()? else {
+                        return Ok(());
+                    };
+                    let window = base.transform_rect_bbox(window);
+                    let error = rounding(base, to_device, reach(bounds).max(reach(window)));
                     // The tolerance in the shading's units, which reach it along
                     // every direction.
                     let near = tolerance * fewest;
                     let chord = large.1 * CHORD_SLACK + near / 2.0;
                     let mut test = Nesting::new(
-                        base.transform_rect_bbox(window),
+                        window,
                         (
                             large.0,
                             large.1 * (1.0 + CIRCLE_SLACK - CHORD_SLACK) + near / 2.0,
                         ),
                         (small.0, small.1 * (1.0 - CIRCLE_SLACK) - near),
+                        error,
                     );
-                    // Lines past the window only wind around points in it.
-                    let cull = test.window.inflate(chord, chord);
+                    // Lines past the window only wind around points in it; those
+                    // that may reach it as painted are tested.
+                    let past = chord + 3.0 * error;
+                    let cull = test.window.inflate(past, past);
                     crate::flatten::flatten_metered(
                         shape.iter(),
                         to_shading,
@@ -1455,24 +1471,32 @@ fn radial_pos(
 /// window, the shape holds all of the hole's part there or none of it, as it holds
 /// the point of it nearest the hole's centre. Holding is winding around a point:
 /// what either fill rule fills, it winds around.
+///
+/// The lines are as rounded, the shape as painted lies within `error` of them
+/// along each axis ([`rounding`]), and each test holds by a margin of that: a line
+/// that may reach past `large` or into `hole` does, and a probe a line may pass on
+/// either side of has no winding known.
 struct Nesting {
     window: Rect,
     large: (Point, f64),
     hole: (Point, f64),
-    /// Whether a line's part within the window reaches past `large`.
+    error: f64,
+    /// Whether a line's part within the window may reach past `large`.
     leaves: bool,
-    /// Whether a line's part within the window reaches into `hole`.
+    /// Whether a line's part within the window may reach into `hole`.
     enters: bool,
     /// Points just inside the window's corners, and the window's point nearest the
-    /// hole's centre, and the lines' winding around each.
+    /// hole's centre, the lines' winding around each, and whether a line passes
+    /// too near it for that winding to be known.
     probes: [Point; 5],
     winding: [i32; 5],
+    unsure: [bool; 5],
     start: Point,
     last: Point,
 }
 
 impl Nesting {
-    fn new(window: Rect, large: (Point, f64), hole: (Point, f64)) -> Self {
+    fn new(window: Rect, large: (Point, f64), hole: (Point, f64), error: f64) -> Self {
         // A corner's probe lies inside it, off the window's sides, which a shape
         // ending at them passes along.
         let inset = 1e-9 * window.width().max(window.height()).max(f64::MIN_POSITIVE);
@@ -1485,6 +1509,7 @@ impl Nesting {
             window,
             large,
             hole,
+            error,
             leaves: false,
             enters: false,
             probes: [
@@ -1495,6 +1520,7 @@ impl Nesting {
                 nearest,
             ],
             winding: [0; 5],
+            unsure: [false; 5],
             start: Point::ZERO,
             last: Point::ZERO,
         }
@@ -1522,26 +1548,34 @@ impl Nesting {
         if a == b {
             return;
         }
-        for (probe, winding) in self.probes.iter().zip(&mut self.winding) {
-            if (a.y <= probe.y) != (b.y <= probe.y)
+        // Each test holds only where it is proven: not where a distance is not a
+        // number.
+        let (margin, near) = (2.0 * self.error, 3.0 * self.error);
+        for ((probe, winding), unsure) in self
+            .probes
+            .iter()
+            .zip(&mut self.winding)
+            .zip(&mut self.unsure)
+        {
+            let clear = nearest_on(a, b, *probe).distance(*probe) > near;
+            if !clear {
+                *unsure = true;
+            } else if (a.y <= probe.y) != (b.y <= probe.y)
                 && a.x + (probe.y - a.y) * (b.x - a.x) / (b.y - a.y) > probe.x
             {
                 *winding += if b.y > a.y { 1 } else { -1 };
             }
         }
-        let Some((p, q)) = clip_to(a, b, self.window) else {
+        let Some((p, q)) = clip_to(a, b, self.window.inflate(near, near)) else {
             return;
         };
         let (center, radius) = self.large;
-        self.leaves |= p.distance(center) > radius || q.distance(center) > radius;
+        let within = radius - margin;
+        let held = p.distance(center) <= within && q.distance(center) <= within;
+        self.leaves |= !held;
         let (center, radius) = self.hole;
-        let side = q - p;
-        let along = if side.hypot2() > 0.0 {
-            ((center - p).dot(side) / side.hypot2()).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        self.enters |= center.distance(p + side * along) < radius;
+        let misses = nearest_on(p, q, center).distance(center) >= radius + margin;
+        self.enters |= !misses;
     }
 
     /// Whether `large` holds the shape's part within the window, and whether that
@@ -1555,18 +1589,69 @@ impl Nesting {
             Point::new(window.x0, window.y1),
             Point::new(window.x1, window.y1),
         ];
+        let margin = 2.0 * self.error;
+        let known_zero = |i: usize| self.winding[i] == 0 && !self.unsure[i];
         let (center, radius) = self.large;
         let inside = !self.leaves
             && corners
                 .iter()
-                .zip(self.winding)
-                .all(|(corner, winding)| winding == 0 || corner.distance(center) <= radius);
+                .enumerate()
+                .all(|(i, corner)| known_zero(i) || corner.distance(center) <= radius - margin);
         let (center, radius) = self.hole;
         let nearest = self.probes[4];
         let outside = radius <= 0.0
-            || !self.enters && (nearest.distance(center) >= radius || self.winding[4] == 0);
+            || !self.enters && (nearest.distance(center) >= radius + margin || known_zero(4));
         (inside, outside)
     }
+}
+
+/// The point of the line from `a` to `b` nearest `p`.
+fn nearest_on(a: Point, b: Point, p: Point) -> Point {
+    let side = b - a;
+    let along = if side.hypot2() > 0.0 {
+        ((p - a).dot(side) / side.hypot2()).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    a + side * along
+}
+
+/// The largest magnitude of a coordinate of `rect`.
+fn reach(rect: Rect) -> f64 {
+    rect.x0
+        .abs()
+        .max(rect.x1.abs())
+        .max(rect.y0.abs())
+        .max(rect.y1.abs())
+}
+
+/// How far, along either axis in a shading's space, a point of a shape placed
+/// there through `to_device` and then `base`, as a test computes it, may lie from
+/// the same point as painted, where vello places it in device space through
+/// `to_device` alone, for a shape and window within `reach` of the origin there;
+/// with the error of a test's own arithmetic on lines so placed besides. A margin
+/// smaller than this proves nothing: infinite where it is not known.
+///
+/// Each step, a product or sum of terms reaching `m`, rounds by at most
+/// `f64::EPSILON * m`. A point `s = B T p` lies within `‖B‖‖T‖‖p‖` of the
+/// origin's image, and `‖p‖ ≤ ‖(B T)⁻¹‖ (‖s‖ + ‖t‖)` for `t` the translation of
+/// `B T`: placing it in each way, making `B T`, flattening a curve and clipping a
+/// line to the window each takes a few steps over terms within
+/// `cond(B) cond(T) (reach + ‖t‖)` of the origin, besides the translations.
+fn rounding(base: Affine, to_device: Affine, reach: f64) -> f64 {
+    /// More than the steps of rounding all of these take together.
+    const STEPS: f64 = 64.0;
+    // The largest sum of a row's magnitudes, of the matrix and of its inverse.
+    let norm = |[a, b, c, d, _, _]: [f64; 6]| (a.abs() + c.abs()).max(b.abs() + d.abs());
+    let inverse_norm = |[a, b, c, d, _, _]: [f64; 6]| {
+        (d.abs() + c.abs()).max(b.abs() + a.abs()) / (a * d - b * c).abs()
+    };
+    let shift = |[_, _, _, _, e, f]: [f64; 6]| e.abs().max(f.abs());
+    let (base, to_device) = (base.as_coeffs(), to_device.as_coeffs());
+    let spread = norm(base) * inverse_norm(base) * norm(to_device) * inverse_norm(to_device);
+    let offset = norm(base) * shift(to_device) + shift(base);
+    let error = STEPS * f64::EPSILON * (spread * (reach + offset) + offset);
+    if error.is_nan() { f64::INFINITY } else { error }
 }
 
 /// The part of the line from `a` to `b` within `rect`, `None` where it misses it.
@@ -2222,6 +2307,80 @@ mod tests {
             )
             .expect("nothing to do");
         assert!(meter.asked.is_empty());
+    }
+
+    /// A radial shading is not extended past a circle that a shape's lines may
+    /// cross as painted, though rounded they do not: a triangle reaching 10^20 and
+    /// 10^24 units out and a strip 10^20 wide, each over half a window far past
+    /// the circle, extended the shading's outer end, their lines through the
+    /// window, clipped to it, moved onto one point each and the windings around
+    /// its corners rounded to zero. A disc 10^6 units out, whose place is known to
+    /// far less than its circle's slack, is still extended, under a transform
+    /// that turns and scales it as well.
+    #[test]
+    fn a_radial_shading_is_extended_only_where_rounding_cannot_cross_its_circle() {
+        use kurbo::{BezPath, Shape};
+        let extended = |coords: &str, shape: &BezPath, to_device: Affine, window: Rect| {
+            let mut encoded = shading_pattern(&[
+                "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+                format!(
+                    "<< /ShadingType 3 /ColorSpace /DeviceRGB /Coords [{coords}] \
+                     /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] \
+                     /N 1 >> >>"
+                ),
+            ]);
+            encoded.matrix = to_device;
+            let mut encoded = encoded.encode();
+            encoded
+                .extend_within_metered(
+                    shape,
+                    None,
+                    to_device,
+                    window,
+                    1.0 / 32.0,
+                    &mut super::Unmetered,
+                )
+                .expect("unmetered");
+            encoded.extended_edges()
+        };
+        let polygon = |points: &[(f64, f64)]| {
+            let mut path = BezPath::new();
+            path.move_to(points[0]);
+            for &p in &points[1..] {
+                path.line_to(p);
+            }
+            path.close_path();
+            path
+        };
+        let page = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let id = Affine::IDENTITY;
+        for h in [1e20, f64::from(1e24_f32)] {
+            let triangle = polygon(&[(-h, -h), (h, h), (-h, h)]);
+            for coords in ["0 0 0 0 0 1", "0 0 0 0 0 10"] {
+                assert_eq!(
+                    extended(coords, &triangle, id, page) & 0b10,
+                    0,
+                    "{h} {coords}"
+                );
+            }
+        }
+        let mut strip = polygon(&[(-1e20, 40.0), (1e20, 40.0), (1e20, 60.0), (-1e20, 60.0)]);
+        strip.extend(polygon(&[(1e6, 0.0), (1e6, 100.0)]));
+        assert_eq!(extended("0 50 0 0 50 30", &strip, id, page) & 0b10, 0);
+
+        let (c, r) = (1e6, 30.0);
+        let disc = Rect::new(c - r, c - r, c + r, c + r)
+            .to_ellipse()
+            .to_path(1e-3);
+        let coords = format!("{c} {c} 0 {c} {c} {r}");
+        for to_device in [id, Affine::rotate(0.3).then_scale(2.0)] {
+            let window = to_device.transform_rect_bbox(disc.bounding_box());
+            assert_eq!(
+                extended(&coords, &disc, to_device, window),
+                0b11,
+                "{to_device:?}"
+            );
+        }
     }
 
     /// A radial shading is extended where the shape ends at its circle within
