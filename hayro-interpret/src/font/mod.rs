@@ -154,16 +154,19 @@ impl<'run, 'a> GlyphRun<'run, 'a> {
     }
 }
 
-/// An identifier that uniquely identifies a glyph, for caching purposes.
+/// An identifier that uniquely identifies a glyph, for caching purposes: its font,
+/// its ID and the code that selected it, whose width a font standing in for one not
+/// embedded stretches the glyph to.
 #[derive(Clone, Debug)]
 pub struct GlyphIdentifier {
     id: GlyphId,
+    char_code: u32,
     font: OutlineFont,
 }
 
 impl CacheKey for GlyphIdentifier {
     fn cache_key(&self) -> u128 {
-        hash128(&(self.id, self.font.cache_key()))
+        hash128(&(self.id, self.char_code, self.font.cache_key()))
     }
 }
 
@@ -185,10 +188,11 @@ impl OutlineGlyph {
     /// for the glyph.
     ///
     /// Note that the `glyph_transform` attribute is not considered in the cache key of
-    /// the identifier, only the glyph ID and the font.
+    /// the identifier, only the glyph ID, the code that selected it, and the font.
     pub fn identifier(&self) -> GlyphIdentifier {
         GlyphIdentifier {
             id: self.id,
+            char_code: self.char_code,
             font: self.font.clone(),
         }
     }

@@ -127,3 +127,70 @@ fn a_text_array_is_read_once() {
 }
 
 const TJ_EXAMINED: usize = 5_300;
+
+/// Each glyph's cache key and the width of its outline.
+#[derive(Default)]
+struct Shapes(Vec<(u128, f64)>);
+
+impl<'a> Device<'a> for Shapes {
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
+    fn draw_glyph_run(&mut self, run: &GlyphRun<'_, 'a>, _: DrawProps<'a>, _: &DrawMode) {
+        use hayro_interpret::CacheKey;
+        use hayro_interpret::font::Glyph;
+        use kurbo::Shape;
+        for g in run.glyphs() {
+            if let Glyph::Outline(outline) = &**g {
+                let width = outline.outline().bounding_box().width();
+                self.0
+                    .push((outline.identifier().cache_key(), (width * 10.0).round()));
+            }
+        }
+    }
+    fn draw_image(&mut self, _: Image<'a, '_>, _: ImageDrawProps<'a>) {}
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
+}
+
+/// The glyphs the text operators `ops` draw in a non-embedded /Arial, drawn by
+/// Liberation Sans, whose codes 65 and 66 are both `A`, 500 and 1000 thousandths
+/// of an em wide: each one's cache key and outline width.
+fn arial_shapes(ops: &str) -> Vec<(u128, f64)> {
+    let file = common::one_page(
+        100,
+        "/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >>",
+        vec![
+            common::stream("", format!("BT /F1 10 Tf 0 50 Td {ops} ET").as_bytes()),
+            b"<< /Type /Font /Subtype /TrueType /BaseFont /Arial /FirstChar 65 /LastChar 66 \
+              /Widths [500 1000] /Encoding << /Differences [65 /A /A] >> >>"
+                .to_vec(),
+        ],
+    );
+    let pdf = Pdf::new(file).expect("valid pdf");
+    let liberation: &'static [u8] =
+        include_bytes!("../../hayro-tests/assets/LiberationSans-Regular.ttf");
+    let settings = InterpreterSettings {
+        font_resolver: Arc::new(move |_| Some((Arc::new(liberation), 0))),
+        ..Default::default()
+    };
+    let mut shapes = Shapes::default();
+    common::interpret_first_page(&pdf, settings, &mut shapes);
+    shapes.0
+}
+
+/// A font standing in for one not embedded stretches a glyph to the width the code
+/// that selected it has, whatever code selected the glyph before, and keys its
+/// outline by that code: here code 65 drawn again after code 66, which selects the
+/// same glyph, was stretched to code 66's width, that of the last code to select the
+/// glyph anew (and a renderer caching outlines by glyph drew code 66 as wide as
+/// whichever code came first).
+#[test]
+fn a_stand_in_glyph_is_as_wide_as_its_code_whatever_came_before() {
+    let alone = arial_shapes("<41> Tj");
+    let after = arial_shapes("<41> Tj <42> Tj <41> Tj");
+    assert_eq!(after[2].1, alone[0].1, "code 65 after code 66: {after:?}");
+    assert_eq!(after[2], after[0]);
+    assert_ne!(after[0].0, after[1].0, "one key for both codes");
+    assert!(after[1].1 > 1.5 * after[0].1, "{after:?}");
+}

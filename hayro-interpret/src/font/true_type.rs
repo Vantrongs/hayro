@@ -89,10 +89,10 @@ impl TrueTypeFont {
         }
     }
 
-    pub(crate) fn outline_glyph(&self, glyph: GlyphId) -> BezPath {
+    pub(crate) fn outline_glyph(&self, glyph: GlyphId, code: u8) -> BezPath {
         match &self.kind {
             Kind::Embedded(e) => e.outline_glyph(glyph),
-            Kind::Standard(s) => s.outline_glyph(glyph),
+            Kind::Standard(s) => s.outline_glyph(glyph, code),
         }
     }
 

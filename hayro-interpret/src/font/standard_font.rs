@@ -357,7 +357,6 @@ pub(crate) struct StandardKind {
     missing_width: f32,
     fallback: bool,
     code_to_glyph: RefCell<hash::Map<u8, GlyphId>>,
-    glyph_to_code: RefCell<hash::Map<GlyphId, u8>>,
     encodings: hash::Map<u8, String>,
 }
 
@@ -394,7 +393,6 @@ impl StandardKind {
             missing_width,
             encodings: encoding_map,
             code_to_glyph: RefCell::new(hash::Map::default()),
-            glyph_to_code: RefCell::new(hash::Map::default()),
             fallback,
             encoding,
         })
@@ -432,23 +430,23 @@ impl StandardKind {
             })
             .unwrap_or(GlyphId::NOTDEF);
         code_to_glyph.insert(code, result);
-        self.glyph_to_code.borrow_mut().insert(result, code);
 
         result
     }
 
-    pub(crate) fn outline_glyph(&self, glyph: GlyphId) -> BezPath {
+    /// The outline of `glyph`, which `code` selected ([`Self::map_code`]): stretched
+    /// to the width the font gives `code`, which another code selecting the same
+    /// glyph may not have.
+    pub(crate) fn outline_glyph(&self, glyph: GlyphId, code: u8) -> BezPath {
         let path = self.base_font_blob.outline_glyph(glyph);
 
         // If the font is not embedded, we might need to stretch it so that
         // it matches the metrics of the actual underlying font blob.
 
-        if let Some(code) = self.glyph_to_code.borrow().get(&glyph).copied()
-            && let Some(actual_width) = self.base_font_blob.advance_width(glyph).or_else(|| {
-                self.code_to_ps_name(code)
-                    .and_then(|name| self.base_font.get_width(name))
-            })
-        {
+        if let Some(actual_width) = self.base_font_blob.advance_width(glyph).or_else(|| {
+            self.code_to_ps_name(code)
+                .and_then(|name| self.base_font.get_width(name))
+        }) {
             // From my experiments: Most PDF viewers, if they detect a font is a
             // standard font, they completely ignore the widths array, even if
             // different widths are indicated there. So only if it's an unknown
