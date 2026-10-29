@@ -689,6 +689,13 @@ impl<'s, 'a> ImagePass<'s, 'a> {
                 y = wanted.start;
                 continue;
             }
+            if y >= wanted.start && self.past_data(y) {
+                // Every row from `y` on is stored zero, and the mask's too: added at
+                // once, in time the bins bound.
+                let end = wanted.end.min(self.image.grid.height);
+                area.push_rows(end - y, self.padding()?)?;
+                break;
+            }
             let end = if y >= wanted.start {
                 self.read_row(y, area)?
             } else {
@@ -726,6 +733,14 @@ impl<'s, 'a> ImagePass<'s, 'a> {
             self.raw.holds_row(y)
         };
         known.unwrap_or(true)
+    }
+
+    /// Whether row `y` and every row after it read as stored zero, as the rows of a
+    /// mask read alongside do: the data and the mask's are known to end before them.
+    fn past_data(&self, y: u32) -> bool {
+        !self.reads(y)
+            && !self.image.transparent
+            && self.mask.as_ref().is_none_or(|m| m.rows.fills_rest())
     }
 
     /// How a row the data does not hold whole and that keeps no byte ends.
@@ -974,7 +989,13 @@ impl<'a> MaskPass<'a> {
         let end = wanted.end.min(self.height);
         let first = wanted.start.min(end);
         self.rows.skip_rows(first)?;
-        for _ in first..end {
+        for y in first..end {
+            if self.rows.fills_rest() {
+                // Every row from `y` on is stored zero's alpha: added at once, in time
+                // the bins bound.
+                area.push_rows(end - y, &[self.rows.fill()])?;
+                break;
+            }
             self.read_row(area, c0..c1)?;
         }
         self.decoded += end;

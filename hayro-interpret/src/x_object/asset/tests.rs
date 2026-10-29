@@ -1116,17 +1116,21 @@ fn rows_of_a_decoded_mask_are_skipped_without_work() {
     assert!(TOLD.get() < 1024, "{} bytes of work", TOLD.get());
 }
 
-/// Rows past the data's end are jumped over, not stepped through: the last row of an
-/// image two billion rows high whose data holds its first row, alone or under a
-/// soft mask whose data holds as much, read alongside or on its own grid, raw or
-/// Flate, counts next to nothing and equals that row of the same image three rows
-/// high decoded whole. A request of the whole plane in one bin pushes every row,
-/// each counted, and is cancelled within three polls' work.
+/// Rows past the data's end are jumped over, not stepped through, and added to their
+/// bins at once: of an image declaring `tall` rows whose data holds its first row,
+/// alone or under a soft mask whose data holds as much, read alongside or on its own
+/// grid, streamed or decoded whole (16-bit samples), raw or Flate, the last row counts
+/// next to nothing and equals that row of the same image three rows high, and a
+/// request of the whole plane in one bin, or in a few, completes counting about as
+/// much as for an image of a few thousand rows, and gives the bins that resampling
+/// the plane row by row gives.
 #[test]
 #[cfg(debug_assertions)]
 fn rows_past_the_data_are_jumped_over() {
     let tall = 2_000_000_000_u32;
-    let gray1 = "/ColorSpace /DeviceGray /BitsPerComponent 1";
+    // Tall enough for every request below to cover runs of rows past the data, small
+    // enough to resample row by row.
+    let small = 3_001_u32;
     for flate in [false, true] {
         let filter = if flate { "/Filter /FlateDecode" } else { "" };
         let stored = |data: &[u8]| {
@@ -1136,73 +1140,137 @@ fn rows_past_the_data_are_jumped_over() {
                 data.to_vec()
             }
         };
-        // The mask's width, if any (another than the colour's puts it on its own
-        // grid), and the plane requested.
-        for (mask, plane) in [
-            (None, Plane::Image),
-            (Some(8_u32), Plane::Image),
-            (Some(16), Plane::Image),
-            (Some(16), Plane::Mask),
+        // The colour's bits, the mask's (if any) and width (another than the colour's
+        // puts it on its own grid), and the plane requested: 1-bit samples stream,
+        // 16-bit ones decode whole.
+        for (bits, mask, plane) in [
+            (1, None, Plane::Image),
+            (1, Some((1, 8_u32)), Plane::Image),
+            (1, Some((1, 16)), Plane::Image),
+            (1, Some((1, 16)), Plane::Mask),
+            (1, Some((16, 8)), Plane::Image),
+            (1, Some((16, 16)), Plane::Mask),
+            (16, None, Plane::Image),
+            (16, Some((1, 8)), Plane::Image),
+            (16, Some((1, 16)), Plane::Mask),
         ] {
+            let gray = |bits: u32| format!("/ColorSpace /DeviceGray /BitsPerComponent {bits}");
+            // A first row of `width` samples of `bits`, the rest of the data missing.
+            let row = |bits: u32, width: u32, seed: u32| {
+                // Inverted, so that stored zero is no black.
+                let row = noise((width * bits / 8) as usize, seed);
+                (
+                    format!("{} /Decode [1 0] {filter}", gray(bits)),
+                    stored(&row),
+                )
+            };
             let objects = |h: u32| {
+                let (dict, data) = row(bits, 8, 1);
                 let entry = if mask.is_some() { "/SMask 4 0 R" } else { "" };
-                let mut objects = vec![(
-                    image(&format!("{gray1} {entry} {filter}"), 8, h),
-                    stored(&[0xA5]),
-                )];
-                if let Some(mw) = mask {
-                    let row = vec![0x5A; mw as usize / 8];
-                    objects.push((image(&format!("{gray1} {filter}"), mw, h), stored(&row)));
+                let mut objects = vec![(image(&format!("{dict} {entry}"), 8, h), data)];
+                if let Some((bits, w)) = mask {
+                    let (dict, data) = row(bits, w, 2);
+                    objects.push((image(&dict, w, h), data));
                 }
                 objects
             };
-            let case = format!("flate {flate}, mask {mask:?}, {plane:?}");
-            let small = pdf(&objects(3));
-            let small = asset(&small);
-            let mut whole = whole(&small);
-            let p = *whole.layout().plane(plane).unwrap();
-            let expected = request(&mut whole, plane, (p.width, 3), [0, 2, p.width, 3]);
+            let case = format!("flate {flate}, {bits}-bit, mask {mask:?}, {plane:?}");
+            let three = pdf(&objects(3));
+            let three = asset(&three);
+            let mut three_whole = whole(&three);
+            let p = *three_whole.layout().plane(plane).unwrap();
+            let expected = request(&mut three_whole, plane, (p.width, 3), [0, 2, p.width, 3]);
             let huge = pdf(&objects(tall));
             let huge = asset(&huge);
             let mut source = huge.open(None, None).unwrap();
-            assert!(is_streamed(&source), "{case}");
+            assert_eq!(is_streamed(&source), bits == 1, "{case}");
             let polls = Cell::new(0);
             let hook = || {
                 polls.set(polls.get() + 1);
                 false
             };
-            TOLD.set(0);
-            rows::STEPPED.set(0);
-            let last = source
-                .request(&ImageRequest {
-                    plane,
-                    grid: (p.width, tall),
-                    window: [0, tall - 1, p.width, tall],
-                    cancel: Some(&hook),
-                })
-                .unwrap();
-            assert_eq!(last.data, expected.data, "{case}");
-            let (told, stepped) = (TOLD.get(), rows::STEPPED.get());
-            assert!(
-                told < 1024 && stepped <= 4 && polls.get() <= 1,
-                "{case}: {told} bytes of work, {stepped} rows stepped, {} polls",
-                polls.get()
-            );
-            let polls = Cell::new(0);
-            let hook = || {
-                polls.set(polls.get() + 1);
-                polls.get() > 1
+            let run = |source: &mut ImageSource<'_>, h: u32, grid, window| {
+                TOLD.set(0);
+                rows::STEPPED.set(0);
+                polls.set(0);
+                let region = source
+                    .request(&ImageRequest {
+                        plane,
+                        grid,
+                        window,
+                        cancel: Some(&hook),
+                    })
+                    .unwrap_or_else(|e| panic!("{case}, {h} rows high: {e:?}"));
+                (region.data, TOLD.get(), rows::STEPPED.get(), polls.get())
             };
-            TOLD.set(0);
-            let result = source.request(&ImageRequest {
+            let (last, told, stepped, polls_made) = run(
+                &mut source,
+                tall,
+                (p.width, tall),
+                [0, tall - 1, p.width, tall],
+            );
+            assert_eq!(last, expected.data, "{case}");
+            assert!(
+                told < 1024 && stepped <= 4 && polls_made <= 1,
+                "{case}: {told} bytes of work, {stepped} rows stepped, {polls_made} polls"
+            );
+            let modest = pdf(&objects(small));
+            let modest = asset(&modest);
+            let mut modest_source = modest.open(None, None).unwrap();
+            // The plane at full size, resampled row by row.
+            let plane_rows = request(
+                &mut whole(&modest),
                 plane,
-                grid: (1, 1),
-                window: [0, 0, 1, 1],
-                cancel: Some(&hook),
-            });
-            assert!(matches!(result, Err(RequestError::Cancelled)), "{case}");
-            let told = TOLD.get();
-            assert!(told < 3 * POLL_BYTES, "{case}: {told} bytes of work");
+                (p.width, small),
+                [0, 0, p.width, small],
+            );
+            let channels = plane_rows.format.channels();
+            for (grid, window) in [
+                ((1, 1), [0, 0, 1, 1]),
+                ((p.width, 7), [0, 0, p.width, 7]),
+                ((3, 5), [1, 2, 3, 5]),
+            ] {
+                let reference = crate::x_object::area::area_resample(
+                    &plane_rows.data,
+                    [0, 0, p.width, small],
+                    (p.width, small),
+                    channels,
+                    grid,
+                    window,
+                );
+                let (got, told_small, ..) = run(&mut modest_source, small, grid, window);
+                assert_eq!(got, reference, "{case}, {grid:?} {window:?}");
+                // As many bins of the image `tall` rows high count about as much.
+                let (_, told_tall, stepped, _) = run(&mut source, tall, grid, window);
+                println!(
+                    "{case}, {grid:?}: {told_small} bytes of work, {told_tall} {tall} rows high"
+                );
+                assert!(
+                    told_tall <= told_small + 1024 && stepped <= 4,
+                    "{case}, {grid:?} {window:?}: {told_tall} bytes of work {tall} rows \
+                     high, {told_small} {small} rows high, {stepped} rows stepped"
+                );
+            }
+            // One bin of the image `tall` rows high: its first row and the rest, each
+            // weighed by its rows.
+            let (bin, ..) = run(&mut source, tall, (1, 1), [0, 0, 1, 1]);
+            let first = request(&mut three_whole, plane, (p.width, 3), [0, 0, p.width, 1]);
+            let rest = request(&mut three_whole, plane, (p.width, 3), [0, 2, p.width, 3]);
+            let (w, h) = (u128::from(p.width), u128::from(tall));
+            let expected: Vec<u8> = (0..channels)
+                .map(|c| {
+                    let sum = |data: &[u8]| -> u128 {
+                        data.iter()
+                            .skip(c)
+                            .step_by(channels)
+                            .map(|&v| u128::from(v))
+                            .sum()
+                    };
+                    let total = sum(&first.data) + sum(&rest.data) * (h - 1);
+                    ((2 * total + w * h) / (2 * w * h)) as u8
+                })
+                .collect();
+            assert_eq!(bin, expected, "{case}");
         }
     }
 }

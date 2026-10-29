@@ -401,6 +401,15 @@ impl MaskRows<'_> {
         }
     }
 
+    /// Whether the next row and every one after it are all stored zero's alpha
+    /// ([`Self::fill`]): the data is known to end before them.
+    pub(super) fn fills_rest(&self) -> bool {
+        match self {
+            MaskRows::Streamed { raw, path, row, .. } => !reads_row(raw, path.bits(), *row),
+            MaskRows::Decoded { mask, row } => *row >= mask.luma().height,
+        }
+    }
+
     /// Starts the next row.
     pub(super) fn begin_row(&mut self) {
         if let MaskRows::Streamed {

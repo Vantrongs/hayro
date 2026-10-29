@@ -130,15 +130,15 @@ impl Decoded {
         let mut texels_with_alpha = Vec::with_capacity(piece * (c + 1));
         for y in rows.clone() {
             if y >= held {
-                // The rows past those held repeat the last, all stored zero.
+                // The rows past those held repeat the last, all stored zero: added at
+                // once, in time the bins bound.
                 let at = (held - 1) as usize * w;
                 let mut texel = data[at * c..(at + 1) * c].to_vec();
                 if let Some(a) = alpha {
                     texel.push(a.data[at]);
                 }
-                area.push_rest(c0 as u32, &texel)?;
-                area.end_row()?;
-                continue;
+                area.push_rows(rows.end - y, &texel)?;
+                break;
             }
             let at = y as usize * w;
             for col in (c0..c1).step_by(piece) {

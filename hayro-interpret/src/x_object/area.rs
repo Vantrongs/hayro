@@ -649,6 +649,67 @@ impl<'m> Area<'m> {
         Ok(())
     }
 
+    /// Adds the next `count` source rows, every texel of each `texel`, as pushing each
+    /// with [`Self::push_rest`] from the first column and ending it would, in time the
+    /// bin rows they fall in bound, not `count`: a run of rows that lies within one bin
+    /// row and the next adds to their sums at once, weighted by how much of each it
+    /// covers. At the plane's size every row is a bin row of its own.
+    pub(crate) fn push_rows(&mut self, count: u32, texel: &[u8]) -> Result<(), Cancelled> {
+        let end = self.next_row + u64::from(count);
+        if let Sums::None = self.sums {
+            for _ in 0..count {
+                self.push_rest(self.cols.start, texel)?;
+                self.end_row()?;
+            }
+            return Ok(());
+        }
+        let (x, y, meter) = (self.x, self.y, self.meter);
+        let (w0, last_bin) = (u64::from(self.window[0]), u64::from(self.window[3]));
+        let zero = texel.iter().all(|&v| v == 0);
+        while self.next_row < end {
+            meter.work(1)?;
+            // The run up to the row that ends the bin row being summed, which a row
+            // later than it does not add to.
+            let run_end = if self.bin_row < last_bin {
+                ((self.bin_row + 1) * y.n).div_ceil(y.g).min(end)
+            } else {
+                end
+            };
+            let run = self.next_row * y.g..run_end * y.g;
+            if !zero {
+                let first = u64::from(self.cols.start);
+                with_bins!(&mut self.sums, bins => bins.push_rest(x, w0, first, texel, meter)?);
+            }
+            for slot in 0..2 {
+                let bin = self.bin_row + slot as u64;
+                if bin >= last_bin {
+                    break;
+                }
+                let covered = run.end.min((bin + 1) * y.n);
+                let w = covered.saturating_sub(run.start.max(bin * y.n));
+                if w == 0 {
+                    continue;
+                }
+                self.present[slot] += w;
+                if zero {
+                    continue;
+                }
+                match &mut self.sums {
+                    Sums::Columns(columns) => columns.push_rest(slot, w, 0, texel, meter)?,
+                    sums => with_bins!(sums, bins => bins.add(slot, w, meter)?),
+                }
+            }
+            if !zero {
+                with_bins!(&mut self.sums, bins => bins.clear_row(meter)?);
+            }
+            self.next_row = run_end;
+            while self.bin_row < last_bin && run_end * y.g >= (self.bin_row + 1) * y.n {
+                self.emit()?;
+            }
+        }
+        Ok(())
+    }
+
     /// Ends the source row being pushed, all of whose texels are pushed.
     pub(crate) fn end_row(&mut self) -> Result<(), Cancelled> {
         // A row whose texels added nothing (zero summed down the columns) still
@@ -1249,6 +1310,80 @@ mod tests {
                     every.finish().unwrap(),
                     "{grid:?} {window:?} {texel:?} across {across}"
                 );
+            }
+        }
+    }
+
+    /// A run of rows of one texel added at once gives the bins and coverage that
+    /// pushing each of its rows gives, wherever it starts and ends among rows pushed
+    /// and rows missing, at the plane's size and summed in either order, also over
+    /// planes so large that a bin's sum needs 64 or 128 bits.
+    #[test]
+    fn a_run_of_one_texel_rows_adds_as_its_rows() {
+        let meter = Meter::default();
+        let mut cases = Vec::new();
+        for size in [(5, 9), (3, 7), (2, 12)] {
+            for gy in 1..=size.1 {
+                for gx in [1, size.0] {
+                    for y0 in 0..gy {
+                        for y1 in y0 + 1..=gy {
+                            cases.push((size, (gx, gy), [0, y0, gx, y1]));
+                        }
+                    }
+                }
+            }
+        }
+        cases.extend([
+            ((100_003, 100_019), (100_002, 100_018), [7, 5, 12, 8]),
+            ((7, 1_000_000_009), (7, 999_999_999), [0, 4, 7, 7]),
+            (
+                (1_000_000_007, 1_000_000_009),
+                (1_000_000_000, 999_999_999),
+                [9, 4, 15, 7],
+            ),
+        ]);
+        for (size, grid, window) in cases {
+            for (across, texel) in [false, true]
+                .into_iter()
+                .flat_map(|a| [[0, 0], [255, 7]].map(|t| (a, t)))
+            {
+                let new = || Area::summed(size, grid, window, 2, across, &meter).unwrap();
+                let (rows, cols) = (new().rows(), new().columns());
+                let len = (rows.end - rows.start) as usize;
+                let src = noise((cols.end - cols.start) as usize * 2, len as u32);
+                // Rows pushed before the run, in it, and pushed after it.
+                for (before, run, after) in [
+                    (0, len, 0),
+                    (0, len.min(2), 0),
+                    (1.min(len - 1), len - 1.min(len - 1), 0),
+                    (len / 3, len / 3, 1.min(len - 2 * (len / 3))),
+                    (len / 2, 0, 0),
+                ] {
+                    let case = format!(
+                        "{size:?} -> {grid:?} {window:?} {texel:?} across {across}, \
+                         {before} + {run} + {after}"
+                    );
+                    let push = |area: &mut Area<'_>, batched: bool| {
+                        for _ in 0..before {
+                            area.push(&src).unwrap();
+                        }
+                        if batched {
+                            area.push_rows(run as u32, &texel).unwrap();
+                        } else {
+                            for _ in 0..run {
+                                area.push_rest(cols.start, &texel).unwrap();
+                                area.end_row().unwrap();
+                            }
+                        }
+                        for _ in 0..after {
+                            area.push(&src).unwrap();
+                        }
+                    };
+                    let (mut batched, mut each) = (new(), new());
+                    push(&mut batched, true);
+                    push(&mut each, false);
+                    assert_eq!(batched.finish().unwrap(), each.finish().unwrap(), "{case}");
+                }
             }
         }
     }
