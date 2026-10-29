@@ -152,6 +152,17 @@ impl<'a> DecodedReader<'a> {
         })
     }
 
+    /// The bytes the reader yields from its start, where it knows them without
+    /// reading: for data stored without a filter, or decoded whole by the permissive
+    /// Flate decoder.
+    #[cfg(feature = "images")]
+    pub fn stored_len(&self) -> Option<usize> {
+        match (&self.source, &self.predictor) {
+            (Source::Raw(data), None) => Some(data.len()),
+            _ => None,
+        }
+    }
+
     /// The bytes this reader's incremental Flate decoder produced, including those not
     /// read yet; not those the permissive decoder produced.
     pub fn inflated_bytes(&self) -> u64 {

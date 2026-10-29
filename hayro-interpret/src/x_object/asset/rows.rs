@@ -274,9 +274,10 @@ impl<'a> MaskSource<'a> {
     }
 }
 
-/// The rows whole decoding keeps of `stream`'s data, of samples lying in `rows`: its
-/// data read through, as whole decoding reads it, adding the bytes inflated to
-/// `work`.
+/// The rows whole decoding keeps of `stream`'s data, of samples lying in `rows`: the
+/// length of data stored without a filter, else its data read, as whole decoding
+/// reads it, until it ends or holds the rows declared (data after them changes
+/// nothing), adding the bytes inflated to `work`.
 pub(super) fn rows_held(
     stream: &Stream<'_>,
     rows: SampleRows,
@@ -286,10 +287,18 @@ pub(super) fn rows_held(
     let Some(mut reader) = stream.decoded_reader() else {
         return Ok(None);
     };
+    if let Some(len) = reader.stored_len() {
+        return Ok(Some(rows.rows_kept(len)));
+    }
+    let declared = rows.row_bytes().saturating_mul(rows.height as usize);
     let mut buf = vec![0; rows.row_bytes().min(PIECE_BYTES)];
     let mut bytes = 0;
     let held = loop {
-        match reader.read(&mut buf, meter) {
+        let wanted = buf.len().min(declared - bytes);
+        if wanted == 0 {
+            break Ok(bytes);
+        }
+        match reader.read(&mut buf[..wanted], meter) {
             Ok(0) => break Ok(bytes),
             Ok(n) => bytes += n,
             Err(Cancelled) => break Err(Cancelled),

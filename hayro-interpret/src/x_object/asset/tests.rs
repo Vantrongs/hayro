@@ -913,6 +913,70 @@ fn a_request_is_cancelled_within_two_pieces() {
     assert!(a.data == expected.data);
 }
 
+/// The first open of an image with a soft mask counts the rows whole decoding keeps
+/// of its data and the mask's: data stored without a filter by its length, reading
+/// none of it, and Flate data only up to the rows it declares, whatever follows
+/// them. Its requests still equal those of the image decoded whole.
+#[test]
+#[cfg(debug_assertions)]
+fn a_first_open_reads_no_data_past_the_rows_declared() {
+    const EXTRA: usize = 1 << 20;
+    let w = 512_u32;
+    for flate in [false, true] {
+        for h in [256_u32, 1024] {
+            let colour = (w / 8 * h) as usize;
+            let mask = (w * h) as usize;
+            let stored = |declared: usize, seed: u32| {
+                let data = noise(declared + EXTRA, seed);
+                if flate {
+                    stored_zlib(&data, 65_535)
+                } else {
+                    data
+                }
+            };
+            let filter = if flate { "/Filter /FlateDecode" } else { "" };
+            let pdf = pdf(&[
+                (
+                    image(
+                        &format!(
+                            "/ColorSpace /DeviceGray /BitsPerComponent 1 /SMask 4 0 R {filter}"
+                        ),
+                        w,
+                        h,
+                    ),
+                    stored(colour, h),
+                ),
+                (
+                    image(
+                        &format!("/ColorSpace /DeviceGray /BitsPerComponent 8 {filter}"),
+                        w,
+                        h,
+                    ),
+                    stored(mask, h + 1),
+                ),
+            ]);
+            let asset = asset(&pdf);
+            TOLD.set(0);
+            let source = asset.open(None, None).unwrap();
+            let (told, inflated) = (TOLD.get(), source.work().bytes_inflated);
+            assert!(is_streamed(&source));
+            println!(
+                "flate {flate}, height {h}: first open {told} bytes of work, {inflated} inflated"
+            );
+            if flate {
+                // Each reader inflates at most a poll's worth ahead of its reads.
+                let bound = (colour + mask + 2 * POLL_BYTES) as u64;
+                assert!(inflated <= bound, "height {h}: {inflated} bytes inflated");
+            } else {
+                assert!(told < POLL_BYTES, "height {h}: {told} bytes of work");
+            }
+            if h == 256 {
+                assert_asset_streams_as_decoded(&asset);
+            }
+        }
+    }
+}
+
 /// A first open stopped by its hook returns within three polls' worth of work, wherever
 /// the work is: counting a Flate soft mask's rows, decoding a mask whole, or decoding
 /// an image that is not streamed whole (through a filter, or converting 16-bit
