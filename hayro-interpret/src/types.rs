@@ -392,6 +392,9 @@ pub struct StrokeProps {
     pub dash_array: Arc<[f32]>,
     /// The dash offset.
     pub dash_offset: f32,
+    /// Whether the dash pattern hides the stroke (`set_dash`): the interpreter
+    /// draws no stroke while it does.
+    pub(crate) dash_hides: bool,
 }
 
 impl Default for StrokeProps {
@@ -403,7 +406,16 @@ impl Default for StrokeProps {
             miter_limit: 10.0,
             dash_array: Arc::default(),
             dash_offset: 0.0,
+            dash_hides: false,
         }
+    }
+}
+
+impl StrokeProps {
+    /// Whether a stroke in these properties is drawn: not when its dash pattern
+    /// hides it.
+    pub(crate) fn drawn(&self) -> bool {
+        !self.dash_hides
     }
 }
 

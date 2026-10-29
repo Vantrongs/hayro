@@ -6,7 +6,7 @@ use crate::font::{Font, FontData, FontQuery, StandardFont};
 use crate::interpret::path::{
     close_path, end_path, fill_path, fill_path_impl, fill_stroke_path, stroke_path,
 };
-use crate::interpret::state::{TextStateFont, convert_dash_array, handle_gs};
+use crate::interpret::state::{TextStateFont, handle_gs, set_dash};
 use crate::interpret::text::TextRenderingMode;
 use crate::ocg::Kept;
 use crate::pattern::{Pattern, ShadingPattern};
@@ -467,8 +467,7 @@ pub fn interpret<'a>(
                 context.fill_paint_mut().color_space = cs;
             }
             TypedInstruction::DashPattern(p) => {
-                context.stroke_props_mut().dash_offset = p.1.as_f32();
-                context.stroke_props_mut().dash_array = convert_dash_array(p.0);
+                set_dash(context.stroke_props_mut(), p.0, p.1.as_f32());
             }
             TypedInstruction::RenderingIntent(_) => {
                 // Ignore for now.

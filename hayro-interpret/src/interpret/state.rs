@@ -401,8 +401,7 @@ pub(crate) fn handle_gs_single<'a>(
             let dash_array = iter.next()??.into_array()?;
             let dash_phase = iter.next()??.into_number()?.as_f32();
 
-            context.stroke_props_mut().dash_offset = dash_phase;
-            context.stroke_props_mut().dash_array = convert_dash_array(&dash_array);
+            set_dash(context.stroke_props_mut(), &dash_array, dash_phase);
         }
         "Type" => {}
         _ => {}
@@ -411,20 +410,30 @@ pub(crate) fn handle_gs_single<'a>(
     Some(())
 }
 
-/// The dash array of the `d` operator or the `D` entry of a graphics state.
-pub(crate) fn convert_dash_array(array: &Array<'_>) -> Arc<[f32]> {
-    let dashes: SmallVec<[f32; 4]> = array
-        .items::<f32>()
-        .map_while(|n| n)
-        // kurbo apparently cannot properly deal with offsets that are exactly 0.
-        .map(|n| if n == 0.0 { 0.01 } else { n })
-        .collect();
-    // An empty array shares one allocation for all; another is copied once.
-    if dashes.is_empty() {
+/// Sets the dash pattern of the `d` operator or the `D` entry of a graphics state.
+///
+/// A pattern the PDF specification does not allow, with an entry negative or not
+/// finite or with every entry zero, is drawn as `MuPDF` draws it (observed in
+/// `PyMuPDF` 1.28.2): not at all if its entries sum to zero (`[1 -1]`, `[0 0]`), and
+/// otherwise solid (`[-1 -1]`, `[2 -1]`). Dashing never ends on a pattern whose
+/// entries sum to less than zero, and walks one with negative entries backwards.
+pub(crate) fn set_dash(props: &mut StrokeProps, array: &Array<'_>, phase: f32) {
+    let dashes: SmallVec<[f32; 4]> = array.items::<f32>().map_while(|n| n).collect();
+    let valid =
+        dashes.iter().all(|n| n.is_finite() && *n >= 0.0) && dashes.iter().any(|n| *n > 0.0);
+    props.dash_offset = phase;
+    props.dash_hides = false;
+    props.dash_array = if dashes.is_empty() {
+        // An empty array shares one allocation for all.
         Arc::default()
+    } else if valid {
+        // kurbo apparently cannot properly deal with offsets that are exactly 0.
+        let dashes = dashes.iter().map(|&n| if n == 0.0 { 0.01 } else { n });
+        Arc::from_iter(dashes)
     } else {
-        Arc::from(dashes.as_slice())
-    }
+        props.dash_hides = dashes.iter().map(|&n| f64::from(n)).sum::<f64>() == 0.0;
+        Arc::default()
+    };
 }
 
 fn convert_blend_mode(name: &str) -> Option<BlendMode> {

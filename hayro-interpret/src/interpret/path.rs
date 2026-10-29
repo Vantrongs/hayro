@@ -149,7 +149,7 @@ pub(crate) fn stroke_path_impl<'a>(
     path: Option<&BezPath>,
     knockout: Knockout,
 ) {
-    if !context.ocg_state.is_visible() {
+    if !context.ocg_state.is_visible() || !context.stroke_props().drawn() {
         return;
     }
 

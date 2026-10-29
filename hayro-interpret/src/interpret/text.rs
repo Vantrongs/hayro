@@ -79,6 +79,7 @@ pub(crate) fn show_glyph_run<'a>(ctx: &mut Context<'a>, device: &mut impl Device
 
     let render_mode = ctx.text_state().render_mode;
     let stroke_props = ctx.stroke_props().clone();
+    let stroked = stroke_props.drawn();
     let fill_props = ctx.draw_props(false);
     let stroke_draw_props = ctx.draw_props(true);
 
@@ -103,11 +104,15 @@ pub(crate) fn show_glyph_run<'a>(ctx: &mut Context<'a>, device: &mut impl Device
                 device.draw_glyph_run(&run, fill_props, &DrawMode::Fill(FillRule::NonZero));
             }
             TextRenderingMode::Stroke => {
-                device.draw_glyph_run(&run, stroke_draw_props, &DrawMode::Stroke(stroke_props));
+                if stroked {
+                    device.draw_glyph_run(&run, stroke_draw_props, &DrawMode::Stroke(stroke_props));
+                }
             }
             TextRenderingMode::FillStroke => {
                 device.draw_glyph_run(&run, fill_props, &DrawMode::Fill(FillRule::NonZero));
-                device.draw_glyph_run(&run, stroke_draw_props, &DrawMode::Stroke(stroke_props));
+                if stroked {
+                    device.draw_glyph_run(&run, stroke_draw_props, &DrawMode::Stroke(stroke_props));
+                }
             }
             TextRenderingMode::Invisible => {
                 // Still call draw_glyph_run for invisible text, so that it can
@@ -118,11 +123,15 @@ pub(crate) fn show_glyph_run<'a>(ctx: &mut Context<'a>, device: &mut impl Device
                 device.draw_glyph_run(&run, fill_props, &DrawMode::Fill(FillRule::NonZero));
             }
             TextRenderingMode::StrokeAndClip => {
-                device.draw_glyph_run(&run, stroke_draw_props, &DrawMode::Stroke(stroke_props));
+                if stroked {
+                    device.draw_glyph_run(&run, stroke_draw_props, &DrawMode::Stroke(stroke_props));
+                }
             }
             TextRenderingMode::FillAndStrokeAndClip => {
                 device.draw_glyph_run(&run, fill_props, &DrawMode::Fill(FillRule::NonZero));
-                device.draw_glyph_run(&run, stroke_draw_props, &DrawMode::Stroke(stroke_props));
+                if stroked {
+                    device.draw_glyph_run(&run, stroke_draw_props, &DrawMode::Stroke(stroke_props));
+                }
             }
             TextRenderingMode::Clip => {}
         }
