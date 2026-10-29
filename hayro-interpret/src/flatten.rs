@@ -9,7 +9,7 @@
 //! becomes its chord, so the lines made follow the part of the path in the window.
 
 use crate::encode::{Cost, Exhausted, Meter, take};
-use kurbo::{Affine, CubicBez, Line, ParamCurve, PathEl, PathSeg, Point, QuadBez, Rect};
+use kurbo::{Affine, BezPath, CubicBez, Line, ParamCurve, PathEl, PathSeg, Point, QuadBez, Rect};
 
 /// The steps making a line takes: placing its end and passing it on. Each element
 /// passed on takes as much.
@@ -30,6 +30,8 @@ const MAX_DEPTH: usize = 1100;
 thread_local! {
     /// The elements this thread's flattening passed on.
     static PASSED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The elements of paths this thread read (`elements_read`).
+    pub(crate) static READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// The elements [`flatten_metered`] has passed on on this thread, each paid for
@@ -37,6 +39,22 @@ thread_local! {
 #[cfg(feature = "count-operators")]
 pub fn elements_flattened() -> u64 {
     PASSED.get()
+}
+
+/// The elements of paths [`flatten_metered`] and [`ControlHull::new_metered`] have
+/// read on this thread: a count for a caller's tests to find whether work on a path
+/// is repeated.
+#[cfg(feature = "count-operators")]
+pub fn elements_read() -> u64 {
+    READ.get()
+}
+
+/// Counts `n` elements of a path read (`elements_read`).
+fn read(n: usize) {
+    #[cfg(any(test, feature = "count-operators"))]
+    READ.set(READ.get() + n as u64);
+    #[cfg(not(any(test, feature = "count-operators")))]
+    let _ = n;
 }
 
 /// `path`, placed by `transform`, as its moves, lines and closes: a curve as lines
@@ -71,6 +89,7 @@ pub fn flatten_metered(
     let mut start = Point::ZERO;
     let mut pieces: Vec<(PathSeg, usize)> = Vec::new();
     for el in path {
+        read(1);
         let seg = match transform * el {
             PathEl::MoveTo(p) => {
                 take(meter, LINE_COST)?;
@@ -186,6 +205,172 @@ pub fn lines_for(seg: &PathSeg, tolerance: f64) -> u64 {
     }
 }
 
+/// The steps placing a point of a hull, or testing one, takes besides sorting.
+const HULL_POINT_COST: Cost = Cost::new(4);
+
+/// Corners of a hull past which [`ControlHull::bounds`] finds the farthest one by
+/// bisection rather than by looking at each.
+const SCANNED_CORNERS: usize = 8;
+
+/// The convex hull of a path's control points, which holds the path: its box under
+/// an affine transform is the box of the control points so placed, found in steps
+/// that grow with the logarithm of the hull's corners ([`bounds`](Self::bounds)).
+/// It is built once for a path that many paints test against, such as a clip open
+/// over them, so that each test reads it rather than the path.
+#[derive(Clone, Debug, Default)]
+pub struct ControlHull {
+    /// The corners, counterclockwise as the x axis turns towards the y.
+    corners: Vec<Point>,
+    /// The direction of each side, from its corner to the next, as an angle from the
+    /// x axis, increasing along the sides from the first's.
+    angles: Vec<f64>,
+    /// Whether a control point is infinite: the path's box is then unbounded.
+    unbounded: bool,
+}
+
+impl ControlHull {
+    /// The hull of `path`'s control points, those that are not a number left out.
+    /// The work and the bytes it takes are taken of `meter` first, from the number
+    /// of its elements: sorting as many as three points an element. `Exhausted`,
+    /// none of the path read, when `meter` refuses.
+    pub fn new_metered(path: &BezPath, meter: &mut dyn Meter) -> Result<Self, Exhausted> {
+        let most = path.elements().len().saturating_mul(3);
+        let sorting = u64::from(usize::BITS - most.leading_zeros()) + 1;
+        take(meter, HULL_POINT_COST.times(sorting).times(most as u64))?;
+        // The points, and the hull and its angles, at most as many.
+        if !meter.hold(most.saturating_mul(2 * size_of::<Point>() + size_of::<f64>())) {
+            return Err(Exhausted);
+        }
+        read(path.elements().len());
+        let mut points = Vec::with_capacity(most);
+        let mut unbounded = false;
+        for el in path.elements() {
+            let (array, n) = match *el {
+                PathEl::MoveTo(p) | PathEl::LineTo(p) => ([p, p, p], 1),
+                PathEl::QuadTo(p1, p2) => ([p1, p2, p2], 2),
+                PathEl::CurveTo(p1, p2, p3) => ([p1, p2, p3], 3),
+                PathEl::ClosePath => continue,
+            };
+            for p in &array[..n] {
+                if p.x.is_infinite() || p.y.is_infinite() {
+                    unbounded = true;
+                } else if p.is_finite() {
+                    points.push(*p);
+                }
+            }
+        }
+        if unbounded {
+            return Ok(Self {
+                unbounded,
+                ..Self::default()
+            });
+        }
+        points.sort_unstable_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+        points.dedup();
+        // Andrew's monotone chain: the lower side left to right, then the upper one
+        // back, each keeping only left turns.
+        let turns_left = |a: Point, b: Point, c: Point| (b - a).cross(c - b) > 0.0;
+        let mut corners: Vec<Point> = Vec::with_capacity(points.len() + 1);
+        for upper in [false, true] {
+            let floor = corners.len();
+            let mut add = |p: Point| {
+                while corners.len() >= floor + 2
+                    && !turns_left(corners[corners.len() - 2], corners[corners.len() - 1], p)
+                {
+                    corners.pop();
+                }
+                corners.push(p);
+            };
+            if upper {
+                points.iter().rev().for_each(|&p| add(p));
+            } else {
+                points.iter().for_each(|&p| add(p));
+            }
+            // Each side's last point is the other's first.
+            corners.pop();
+        }
+        if points.len() == 1 {
+            corners = points;
+        }
+        let mut angles: Vec<f64> = Vec::with_capacity(corners.len());
+        for (i, &a) in corners.iter().enumerate() {
+            let side = corners[(i + 1) % corners.len()] - a;
+            let mut angle = side.y.atan2(side.x);
+            if let Some(&first) = angles.first() {
+                while angle < first {
+                    angle += std::f64::consts::TAU;
+                }
+            }
+            angles.push(angle);
+        }
+        corners.shrink_to_fit();
+        Ok(Self {
+            corners,
+            angles,
+            unbounded: false,
+        })
+    }
+
+    /// The bytes the hull keeps.
+    pub fn bytes(&self) -> usize {
+        self.corners.capacity() * size_of::<Point>() + self.angles.capacity() * size_of::<f64>()
+    }
+
+    /// The steps [`bounds`](Self::bounds) takes.
+    pub fn bounds_cost(&self) -> Cost {
+        let corners = self.corners.len().min(SCANNED_CORNERS)
+            + (usize::BITS - self.corners.len().leading_zeros()) as usize;
+        HULL_POINT_COST.times(4).times(corners as u64)
+    }
+
+    /// The box of the path's control points placed by `transform`, which holds the
+    /// path so placed; `None` for a path without a point, unbounded for one with an
+    /// infinite point.
+    pub fn bounds(&self, transform: Affine) -> Option<Rect> {
+        if self.unbounded {
+            return Some(Rect::new(
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                f64::INFINITY,
+            ));
+        }
+        if self.corners.is_empty() {
+            return None;
+        }
+        let [a, b, c, d, e, f] = transform.as_coeffs();
+        let (along_x, along_y) = (kurbo::Vec2::new(a, c), kurbo::Vec2::new(b, d));
+        Some(Rect::new(
+            e - self.farthest(-along_x),
+            f - self.farthest(-along_y),
+            e + self.farthest(along_x),
+            f + self.farthest(along_y),
+        ))
+    }
+
+    /// The most a corner reaches along `u`: `u`'s dot product with it.
+    fn farthest(&self, u: kurbo::Vec2) -> f64 {
+        let reach = |i: usize| u.dot(self.corners[i % self.corners.len()].to_vec2());
+        let n = self.corners.len();
+        if n <= SCANNED_CORNERS {
+            return (0..n).map(reach).fold(f64::NEG_INFINITY, f64::max);
+        }
+        // Going counterclockwise, the corners reach farther along `u` while a side
+        // turns less than a right angle from it: the farthest is where the first
+        // side turned at least that far starts.
+        let first = self.angles[0];
+        let turned = first
+            + (u.y.atan2(u.x) + std::f64::consts::FRAC_PI_2 - first)
+                .rem_euclid(std::f64::consts::TAU);
+        let i = self.angles.partition_point(|&angle| angle < turned);
+        // Its neighbours too, for an angle rounded across the turn.
+        [i + n - 1, i, i + 1]
+            .into_iter()
+            .map(reach)
+            .fold(f64::NEG_INFINITY, f64::max)
+    }
+}
+
 /// A curve's halves, split at the middle of its parameter.
 fn halves(seg: &PathSeg) -> (PathSeg, PathSeg) {
     match *seg {
@@ -209,7 +394,7 @@ fn halves(seg: &PathSeg) -> (PathSeg, PathSeg) {
 
 #[cfg(test)]
 mod tests {
-    use super::{LINE_COST, flatten_metered};
+    use super::{ControlHull, LINE_COST, READ, flatten_metered};
     use crate::encode::{Cost, Exhausted, Meter, Unmetered};
     use kurbo::{Affine, BezPath, Line, ParamCurveNearest, PathEl, Point, Rect, Shape};
 
@@ -374,5 +559,119 @@ mod tests {
             lines(&infinite, Some(window), &mut Unmetered),
             Err(Exhausted)
         );
+    }
+
+    /// The box a hull gives under a transform is the box of the path's control
+    /// points so placed, exactly, whatever the transform turns, stretches or
+    /// mirrors, for hulls of every size, points on their sides, curves, a lone
+    /// point, a segment, points that are not a number (left out) and an
+    /// infinite one (unbounded); and building one is refused before any element
+    /// is read.
+    #[test]
+    fn a_hulls_box_is_its_control_points_box() {
+        use kurbo::BezPath;
+        let mut paths: Vec<BezPath> = Vec::new();
+        for n in [3_u32, 7, 8, 9, 50, 1000] {
+            let mut path = BezPath::new();
+            for i in 0..n {
+                let t = f64::from(i) / f64::from(n) * std::f64::consts::TAU;
+                let p = (30.0 * t.cos() + 0.37, 20.0 * t.sin() - 1.5);
+                if i == 0 {
+                    path.move_to(p);
+                } else {
+                    path.line_to(p);
+                }
+            }
+            path.close_path();
+            paths.push(path);
+        }
+        let mut scattered = BezPath::new();
+        let mut seed = 0x9e37_79b9_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 20_000) as f64 / 100.0 - 100.0
+        };
+        scattered.move_to((next(), next()));
+        for _ in 0..300 {
+            scattered.curve_to((next(), next()), (next(), next()), (next(), next()));
+            scattered.quad_to((next(), next()), (next(), next()));
+        }
+        paths.push(scattered);
+        let mut square = BezPath::new();
+        square.move_to((0.0, 0.0));
+        for p in [(1.0, 0.0), (2.0, 0.0), (2.0, 1.0), (2.0, 2.0), (0.0, 2.0)] {
+            square.line_to(p);
+        }
+        square.close_path();
+        paths.push(square);
+        let mut point = BezPath::new();
+        point.move_to((4.0, 5.0));
+        paths.push(point);
+        let mut segment = BezPath::new();
+        segment.move_to((4.0, 5.0));
+        segment.line_to((-3.0, 1.0));
+        segment.line_to((4.0, 5.0));
+        paths.push(segment);
+        let mut nan = BezPath::new();
+        nan.move_to((4.0, 5.0));
+        nan.line_to((f64::NAN, 1.0));
+        nan.line_to((-3.0, 1.0));
+        paths.push(nan);
+        let mut transforms = vec![
+            Affine::IDENTITY,
+            Affine::new([1.0, 0.0, 0.0, -1.0, 3.0, 100.0]),
+            Affine::new([0.3, 1.7, -2.1, 0.4, -5.0, 7.0]),
+            Affine::new([0.0, 0.0, 0.0, 0.0, 1.0, 2.0]),
+        ];
+        for i in 0..64 {
+            transforms
+                .push(Affine::rotate(f64::from(i) * 0.1) * Affine::scale_non_uniform(2.5, 0.75));
+        }
+        for path in &paths {
+            let hull = ControlHull::new_metered(path, &mut Unmetered).unwrap();
+            for &t in &transforms {
+                let mut want: Option<Rect> = None;
+                for el in path.elements() {
+                    for p in match *el {
+                        PathEl::MoveTo(p) | PathEl::LineTo(p) => vec![p],
+                        PathEl::QuadTo(a, b) => vec![a, b],
+                        PathEl::CurveTo(a, b, c) => vec![a, b, c],
+                        PathEl::ClosePath => vec![],
+                    } {
+                        if p.is_finite() {
+                            let p = t * p;
+                            want = Some(want.map_or(Rect::from_points(p, p), |r| r.union_pt(p)));
+                        }
+                    }
+                }
+                assert_eq!(hull.bounds(t), want, "{t:?}");
+            }
+        }
+        let mut infinite = BezPath::new();
+        infinite.move_to((4.0, 5.0));
+        infinite.line_to((f64::INFINITY, 1.0));
+        let hull = ControlHull::new_metered(&infinite, &mut Unmetered).unwrap();
+        assert_eq!(
+            hull.bounds(Affine::IDENTITY).map(|b| b.x1),
+            Some(f64::INFINITY)
+        );
+        assert_eq!(
+            ControlHull::new_metered(&BezPath::new(), &mut Unmetered)
+                .unwrap()
+                .bounds(Affine::IDENTITY),
+            None
+        );
+
+        READ.set(0);
+        let mut meter = Recording {
+            left: 0,
+            asked: vec![],
+            held: vec![],
+        };
+        assert!(ControlHull::new_metered(&paths[5], &mut meter).is_err());
+        assert_eq!(READ.get(), 0);
+        assert!(meter.asked[0] >= 3000);
     }
 }

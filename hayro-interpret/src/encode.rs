@@ -1,6 +1,7 @@
 //! Encoding shading patterns for easy sampling.
 
 use crate::color::{AlphaColor, ColorComponents, ColorSpace};
+use crate::flatten::ControlHull;
 use crate::interpret::state::ActiveTransferFunction;
 use crate::pattern::ShadingPattern;
 use crate::shading::{PATCH_TRIANGLES, ShadingFunction, ShadingType, Triangle};
@@ -432,10 +433,6 @@ const CIRCLE_SLACK: f64 = 5e-4;
 /// The share of `CIRCLE_SLACK` the chords a path is tested along may stray from it.
 const CHORD_SLACK: f64 = 2e-4;
 
-/// The steps testing a point of a path against an edge of a shading takes:
-/// placing it and comparing.
-const EDGE_POINT_COST: Cost = Cost::new(8);
-
 impl EncodedShadingPattern {
     /// Extends the shading past each edge of the part it paints itself in that
     /// `shape`, placed in device space by `to_device`, lies within, reaching at
@@ -454,13 +451,19 @@ impl EncodedShadingPattern {
     /// radial shading: past them it paints nothing, so an end may be extended
     /// there.
     ///
-    /// The work is taken of `meter` before it is done: a step for each point of
-    /// the shape's elements, and for a radial shading the lines of its outline
-    /// near the window ([`flatten_metered`](crate::flatten::flatten_metered)).
-    /// `Exhausted`, the shading unchanged, when `meter` refuses.
+    /// `hull` is the hull of `shape`'s control points, built once for a shape
+    /// tested many times, such as a clip open over many paints: the box of the
+    /// shape in the shading's space is read from it, in steps that do not grow
+    /// with the shape. Without one, it is built for this test where one is needed.
+    ///
+    /// The work is taken of `meter` before it is done: reading the hull, and for a
+    /// radial shading the lines of the shape's outline near the window
+    /// ([`flatten_metered`](crate::flatten::flatten_metered)), each element paid for
+    /// before it is read. `Exhausted`, the shading unchanged, when `meter` refuses.
     pub fn extend_within_metered(
         &mut self,
         shape: &BezPath,
+        hull: Option<&ControlHull>,
         to_device: Affine,
         window: Rect,
         tolerance: f64,
@@ -484,20 +487,23 @@ impl EncodedShadingPattern {
         if !edges {
             return Ok(());
         }
-        take(meter, EDGE_POINT_COST.times(control_points(shape) as u64))?;
         // The box of the shape's control points in the shading's space, which
         // holds the shape: a side of the box within a half-plane holds it there.
-        let bounds = || {
-            let mut bounds: Option<Rect> = None;
-            each_control_point(shape, |p| {
-                let p = to_shading * p;
-                bounds = Some(bounds.map_or(Rect::from_points(p, p), |r| r.union_pt(p)));
-            });
-            bounds
+        let mut bounds = || {
+            let built;
+            let hull = match hull {
+                Some(hull) => hull,
+                None => {
+                    built = ControlHull::new_metered(shape, meter)?;
+                    &built
+                }
+            };
+            take(meter, hull.bounds_cost())?;
+            Ok(hull.bounds(to_shading))
         };
         match &mut self.shading_type {
             EncodedShadingType::FunctionBased(shading) => {
-                let Some(bounds) = bounds() else {
+                let Some(bounds) = bounds()? else {
                     return Ok(());
                 };
                 let domain = shading.domain;
@@ -509,7 +515,7 @@ impl EncodedShadingPattern {
             }
             EncodedShadingType::RadialAxial(shading) => match shading.params {
                 RadialAxialParams::Axial => {
-                    let Some(bounds) = bounds() else {
+                    let Some(bounds) = bounds()? else {
                         return Ok(());
                     };
                     let t = tolerance * per_x;
@@ -1437,32 +1443,6 @@ fn radial_pos(
     }
 }
 
-/// The points of `shape`'s elements, each element's after its start.
-fn each_control_point(shape: &BezPath, mut f: impl FnMut(Point)) {
-    for el in shape.elements() {
-        match *el {
-            PathEl::MoveTo(p) | PathEl::LineTo(p) => f(p),
-            PathEl::QuadTo(p1, p2) => [p1, p2].into_iter().for_each(&mut f),
-            PathEl::CurveTo(p1, p2, p3) => [p1, p2, p3].into_iter().for_each(&mut f),
-            PathEl::ClosePath => {}
-        }
-    }
-}
-
-/// How many points `each_control_point` passes on.
-fn control_points(shape: &BezPath) -> usize {
-    shape
-        .elements()
-        .iter()
-        .map(|el| match el {
-            PathEl::MoveTo(_) | PathEl::LineTo(_) => 1,
-            PathEl::QuadTo(..) => 2,
-            PathEl::CurveTo(..) => 3,
-            PathEl::ClosePath => 0,
-        })
-        .sum()
-}
-
 /// What the outline of a shape, its lines passed on by
 /// [`flatten_metered`](crate::flatten::flatten_metered), shows of its part within
 /// `window`: whether a disc, `large`, holds that part, and whether it misses
@@ -1624,6 +1604,79 @@ mod tests {
     use kurbo::{Affine, Point, Rect};
     use smallvec::smallvec;
     use std::sync::Arc;
+
+    /// The hull of `shape`'s control points.
+    fn hull(shape: &kurbo::BezPath) -> crate::flatten::ControlHull {
+        crate::flatten::ControlHull::new_metered(shape, &mut super::Unmetered).expect("unmetered")
+    }
+
+    /// A shading extended within a shape many times, as within a clip open over
+    /// many paints, reads the shape's elements once, to build its hull: each
+    /// extension reads the hull alone, and one refused reads nothing.
+    #[test]
+    fn extending_within_a_shape_again_reads_only_its_hull() {
+        use crate::flatten::READ;
+        let mut shape = kurbo::BezPath::new();
+        shape.move_to((10.3, 15.7));
+        for i in 0..10_000 {
+            let t = f64::from(i) / 10_000.0 * std::f64::consts::TAU;
+            shape.line_to((50.45 + 40.15 * t.cos(), 45.45 + 29.75 * t.sin()));
+        }
+        shape.close_path();
+        let pattern = shading_pattern(&[
+            "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+            "<< /ShadingType 1 /ColorSpace /DeviceRGB /Domain [0 1 0 1] \
+             /Matrix [80.3 0 0 59.5 10.3 15.7] /Function 6 0 R >>"
+                .to_string(),
+            "<< /FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1] /Length 22 >>\n\
+             stream\n{ pop dup 1 exch sub 0 }\nendstream"
+                .to_string(),
+        ]);
+        READ.set(0);
+        let hull = hull(&shape);
+        assert_eq!(READ.get(), 10_002);
+        let window = Rect::new(0.0, 0.0, 100.0, 100.0);
+        for _ in 0..100 {
+            let mut encoded = pattern.encode();
+            encoded
+                .extend_within_metered(
+                    &shape,
+                    Some(&hull),
+                    Affine::IDENTITY,
+                    window,
+                    0.01,
+                    &mut super::Unmetered,
+                )
+                .expect("unmetered");
+            assert_eq!(encoded.extended_edges(), 0b1111);
+            let mut refused = pattern.encode();
+            assert_eq!(
+                refused.extend_within_metered(
+                    &shape,
+                    Some(&hull),
+                    Affine::IDENTITY,
+                    window,
+                    0.01,
+                    &mut Refusing
+                ),
+                Err(Exhausted)
+            );
+        }
+        assert_eq!(READ.get(), 10_002);
+    }
+
+    /// A meter that refuses everything.
+    struct Refusing;
+
+    impl Meter for Refusing {
+        fn work(&mut self, _: Cost) -> bool {
+            false
+        }
+
+        fn hold(&mut self, _: usize) -> bool {
+            false
+        }
+    }
 
     struct Random(u64);
 
@@ -1971,6 +2024,7 @@ mod tests {
             encoded
                 .extend_within_metered(
                     shape,
+                    None,
                     matrix,
                     seen(shape, matrix),
                     TOLERANCE,
@@ -1997,6 +2051,7 @@ mod tests {
         start
             .extend_within_metered(
                 &rect(90.6),
+                Some(&hull(&rect(90.6))),
                 Affine::IDENTITY,
                 seen(&rect(90.6), Affine::IDENTITY),
                 TOLERANCE,
@@ -2018,6 +2073,7 @@ mod tests {
         domain
             .extend_within_metered(
                 &rect(90.6),
+                Some(&hull(&rect(90.6))),
                 Affine::IDENTITY,
                 seen(&rect(90.6), Affine::IDENTITY),
                 TOLERANCE,
@@ -2098,6 +2154,7 @@ mod tests {
             let shape = arcs(center, 300.0, false);
             let result = refused.extend_within_metered(
                 &shape,
+                Some(&hull(&shape)),
                 Affine::IDENTITY,
                 seen(&shape, Affine::IDENTITY),
                 TOLERANCE,
@@ -2118,6 +2175,7 @@ mod tests {
         encoded(&both, Affine::IDENTITY)
             .extend_within_metered(
                 &rect(90.6),
+                Some(&hull(&rect(90.6))),
                 Affine::IDENTITY,
                 seen(&rect(90.6), Affine::IDENTITY),
                 TOLERANCE,
@@ -2149,7 +2207,14 @@ mod tests {
         let extended = |coords: &str, shape: &BezPath, window: Rect, meter: &mut dyn Meter| {
             let mut encoded = encoded(coords);
             encoded
-                .extend_within_metered(shape, Affine::IDENTITY, window, 1.0 / 32.0, meter)
+                .extend_within_metered(
+                    shape,
+                    Some(&hull(shape)),
+                    Affine::IDENTITY,
+                    window,
+                    1.0 / 32.0,
+                    meter,
+                )
                 .map(|()| encoded.extended_edges())
         };
         // It leaves the disc of radius 30 about (50, 40) at x 80 alone; the
