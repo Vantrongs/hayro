@@ -137,7 +137,7 @@ vello_cpu = { git = "https://github.com/Vantrongs/vello", rev = "d8b2846ca4a4747
 zlib-rs = { git = "https://github.com/Vantrongs/zlib-rs", rev = "124359709a6ed94bda6fe1ff4d413e23bbae34e5" }
 # `zune_jpeg::rows`, which grayscale JPEG rows need, and tables kept in the
 # decoder, so that a page of many small JPEGs allocates little per image.
-zune-jpeg = { git = "https://github.com/Vantrongs/zune-image", rev = "7bdce7146cecfbde19a9fe735459471610f80cf8" }
+zune-jpeg = { git = "https://github.com/Vantrongs/zune-image", rev = "b06abc4f241748e1d4bc15e3feb5101faa3ba853" }
 # A tag's duplicate attributes found through a set keyed by the names' text, so
 # that rich text with many attributes on one tag is parsed in linear time
 # (servo/html5ever issue 796), and a `meta` Content-Type cut after `charset`
