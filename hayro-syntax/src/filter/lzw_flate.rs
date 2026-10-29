@@ -605,9 +605,12 @@ pub(crate) mod flate {
                     0 => self.read_uncompressed_block(meter),
                     1 | 2 => {
                         let (lit, dist) = if hdr == 1 {
+                            let entries = FIXED_LIT_CODE_TAB.len() + FIXED_DIST_CODE_TAB.len();
+                            meter.work(entries)?;
+                            crate::work::operation(entries);
                             (get_fixed_lit_table(), get_fixed_dist_table())
                         } else {
-                            match self.read_dynamic_tables(meter) {
+                            match self.read_dynamic_tables(meter)? {
                                 Some(tables) => tables,
                                 None => {
                                     self.eof = true;
@@ -615,7 +618,6 @@ pub(crate) mod flate {
                                 }
                             }
                         };
-                        meter.work(lit.codes.len() + dist.codes.len())?;
                         if !self.read_codes(lit, dist, from, meter, pending)? {
                             return Ok(());
                         }
@@ -785,30 +787,58 @@ pub(crate) mod flate {
                 }
             }
 
+            /// The tables of a dynamic block, each counted on `meter` as it is built
+            /// ([`generate_huffman_table`]); `None` where the data ends or is corrupt
+            /// before them.
             fn read_dynamic_tables(
                 &mut self,
                 meter: &Meter<'_>,
-            ) -> Option<(HuffmanTable, HuffmanTable)> {
+            ) -> Result<Option<(HuffmanTable, HuffmanTable)>, Cancelled> {
+                let Some((num_lit_codes, num_dist_codes, code_len_code_lengths)) =
+                    self.read_table_header(meter)
+                else {
+                    return Ok(None);
+                };
+                let code_len_table = generate_huffman_table(&code_len_code_lengths, meter)?;
+                let total_codes = num_lit_codes + num_dist_codes;
+                let Some(code_lengths) =
+                    self.read_code_lengths(&code_len_table, total_codes, meter)
+                else {
+                    return Ok(None);
+                };
+                let lit_table = generate_huffman_table(&code_lengths[..num_lit_codes], meter)?;
+                let dist_table = generate_huffman_table(&code_lengths[num_lit_codes..], meter)?;
+                Ok(Some((lit_table, dist_table)))
+            }
+
+            /// The number of literal and of distance codes of a dynamic block, and the
+            /// code lengths of its code length code.
+            fn read_table_header(&mut self, meter: &Meter<'_>) -> Option<(usize, usize, [u8; 19])> {
                 let num_lit_codes = self.get_bits(5, meter)? as usize + 257;
                 let num_dist_codes = self.get_bits(5, meter)? as usize + 1;
                 let num_code_len_codes = self.get_bits(4, meter)? as usize + 4;
 
-                // Build code length code table
-                let mut code_len_code_lengths = vec![0_u8; 19];
+                let mut code_len_code_lengths = [0_u8; 19];
                 for i in 0..num_code_len_codes {
                     code_len_code_lengths[CODE_LEN_CODE_MAP[i] as usize] =
                         self.get_bits(3, meter)? as u8;
                 }
+                Some((num_lit_codes, num_dist_codes, code_len_code_lengths))
+            }
 
-                let code_len_table = generate_huffman_table(&code_len_code_lengths);
-
-                // Read code lengths
-                let total_codes = num_lit_codes + num_dist_codes;
+            /// The code lengths of a dynamic block's `total_codes` literal and distance
+            /// codes, coded with `code_len_table`.
+            fn read_code_lengths(
+                &mut self,
+                code_len_table: &HuffmanTable,
+                total_codes: usize,
+                meter: &Meter<'_>,
+            ) -> Option<Vec<u8>> {
                 let mut code_lengths = vec![0_u8; total_codes];
                 let mut i = 0;
 
                 while i < total_codes {
-                    let code = self.get_code(&code_len_table, meter)?;
+                    let code = self.get_code(code_len_table, meter)?;
 
                     match code {
                         0..=15 => {
@@ -853,10 +883,7 @@ pub(crate) mod flate {
                     }
                 }
 
-                let lit_table = generate_huffman_table(&code_lengths[..num_lit_codes]);
-                let dist_table = generate_huffman_table(&code_lengths[num_lit_codes..]);
-
-                Some((lit_table, dist_table))
+                Some(code_lengths)
             }
         }
 
@@ -866,49 +893,74 @@ pub(crate) mod flate {
             max_len: u8,
         }
 
-        fn generate_huffman_table(lengths: &[u8]) -> HuffmanTable {
-            let _n = lengths.len();
+        /// The longest code of a deflate code.
+        const MAX_CODE_LEN: usize = 15;
 
-            // Find max code length
-            let max_len = lengths.iter().cloned().max().unwrap_or(0);
+        /// The most codes a table holds: literals and lengths.
+        const MAX_CODES: usize = 288;
 
-            if max_len == 0 {
-                return HuffmanTable {
+        /// The table of the code whose code lengths are `lengths`, as pdf.js fills it:
+        /// codes are given in order of length, then of symbol, and each is written at
+        /// every entry whose low bits are its bits reversed, over what a code given
+        /// before wrote there, which an oversubscribed code makes happen. Filled a
+        /// code at a time, an oversubscribed table takes millions of writes; built
+        /// instead a length at a time, the table of the shorter codes doubled and the
+        /// codes of the next length written over it, the same table takes as many
+        /// writes as it has entries and codes. They are counted on `meter` before
+        /// they are made.
+        fn generate_huffman_table(
+            lengths: &[u8],
+            meter: &Meter<'_>,
+        ) -> Result<HuffmanTable, Cancelled> {
+            // The symbols of each length, by length then symbol.
+            let mut starts = [0_usize; MAX_CODE_LEN + 2];
+            for &len in lengths {
+                starts[usize::from(len) + 1] += 1;
+            }
+            let max_len = (1..=MAX_CODE_LEN).rfind(|&len| starts[len + 1] > 0);
+            let Some(max_len) = max_len else {
+                meter.work(1)?;
+                crate::work::operation(lengths.len() + 1);
+                return Ok(HuffmanTable {
                     codes: vec![0; 1],
                     max_len: 1,
-                };
+                });
+            };
+            for len in 1..starts.len() {
+                starts[len] += starts[len - 1];
+            }
+            let size = 1 << max_len;
+            let coded = lengths.len() - starts[1];
+            let work = 2 * lengths.len() + size + coded;
+            meter.work(work)?;
+            crate::work::operation(work);
+            let mut symbols = [0_u16; MAX_CODES];
+            let mut next = starts;
+            for (symbol, &len) in lengths.iter().enumerate() {
+                if len > 0 {
+                    let at = &mut next[usize::from(len)];
+                    symbols[*at - starts[1]] = symbol as u16;
+                    *at += 1;
+                }
             }
 
-            // Build the table
-            let size = 1 << max_len;
-            let mut codes = vec![0_u32; size];
-
+            let mut codes = meter.room(size);
+            codes.push(0_u32);
             let mut code = 0_u32;
             for len in 1..=max_len {
-                for (val, &length) in lengths.iter().enumerate() {
-                    if length == len {
-                        // Bit-reverse the code
-                        let mut code2 = 0_u32;
-                        let mut t = code;
-                        for _ in 0..len {
-                            code2 = (code2 << 1) | (t & 1);
-                            t >>= 1;
-                        }
-
-                        // Fill the table entries
-                        let skip = 1 << len;
-                        let mut i = code2 as usize;
-                        while i < size {
-                            codes[i] = ((len as u32) << 16) | (val as u32);
-                            i += skip;
-                        }
-                        code += 1;
-                    }
+                codes.extend_from_within(..);
+                for &symbol in &symbols[starts[len] - starts[1]..starts[len + 1] - starts[1]] {
+                    let reversed = code.reverse_bits() >> (32 - len);
+                    codes[reversed as usize] = (len as u32) << 16 | u32::from(symbol);
+                    code += 1;
                 }
                 code <<= 1;
             }
 
-            HuffmanTable { codes, max_len }
+            Ok(HuffmanTable {
+                codes,
+                max_len: max_len as u8,
+            })
         }
 
         fn get_fixed_lit_table() -> HuffmanTable {
@@ -1009,6 +1061,92 @@ pub(crate) mod flate {
             0x50009, 0x50019, 0x50005, 0x50015, 0x5000d, 0x5001d, 0x50003, 0x50013, 0x5000b,
             0x5001b, 0x50007, 0x50017, 0x5000f, 0x00000,
         ];
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            /// The table pdf.js fills a code at a time, each code written at every
+            /// entry it reaches.
+            fn code_by_code(lengths: &[u8]) -> Vec<u32> {
+                let max_len = lengths.iter().copied().max().unwrap_or(0);
+                if max_len == 0 {
+                    return vec![0];
+                }
+                let size = 1 << max_len;
+                let mut codes = vec![0_u32; size];
+                let mut code = 0_u32;
+                for len in 1..=max_len {
+                    for (val, &length) in lengths.iter().enumerate() {
+                        if length == len {
+                            let mut reversed = 0_u32;
+                            let mut t = code;
+                            for _ in 0..len {
+                                reversed = (reversed << 1) | (t & 1);
+                                t >>= 1;
+                            }
+                            let mut i = reversed as usize;
+                            while i < size {
+                                codes[i] = (u32::from(len) << 16) | val as u32;
+                                i += 1 << len;
+                            }
+                            code += 1;
+                        }
+                    }
+                    code <<= 1;
+                }
+                codes
+            }
+
+            /// Code lengths of every count a block holds, complete, incomplete and
+            /// oversubscribed, give the table filled a code at a time, and count as
+            /// work the writes they take.
+            #[test]
+            fn tables_are_those_filled_a_code_at_a_time() {
+                let mut state = 0x9e37_79b9_u32;
+                let mut random = move || {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state
+                };
+                let mut cases: Vec<Vec<u8>> = vec![
+                    [&[1; 256][..], &[15]].concat(),
+                    vec![0; 288],
+                    vec![15; 288],
+                    vec![8; 19],
+                    [&[0; 30][..], &[1]].concat(),
+                ];
+                for _ in 0..2000 {
+                    let len = [19, 30, 32, 257, 288][random() as usize % 5];
+                    let most = 1 + random() % 15;
+                    let zeros = random() % 4;
+                    cases.push(
+                        (0..len)
+                            .map(|_| match random() % 4 < zeros {
+                                true => 0,
+                                false => (1 + random() % most) as u8,
+                            })
+                            .collect(),
+                    );
+                }
+                for lengths in cases {
+                    let told = crate::work::TOLD.get();
+                    let table = generate_huffman_table(&lengths, &Meter::default()).unwrap();
+                    let charged = crate::work::TOLD.get() - told;
+                    assert_eq!(table.codes, code_by_code(&lengths), "{lengths:?}");
+                    assert_eq!(
+                        table.max_len,
+                        lengths.iter().copied().max().unwrap_or(0).max(1)
+                    );
+                    assert!(charged >= table.codes.len(), "{lengths:?}");
+                    assert!(
+                        charged <= table.codes.len() + 3 * lengths.len(),
+                        "{lengths:?}"
+                    );
+                }
+            }
+        }
     }
 }
 

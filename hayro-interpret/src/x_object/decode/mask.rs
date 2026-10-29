@@ -75,7 +75,7 @@ pub(crate) fn decode_mask(
     target_dimension: Option<(u32, u32)>,
     meter: &Meter<'_>,
 ) -> Option<DecodedMask> {
-    let ctx = decode_context(obj, target_dimension, meter)?;
+    let (ctx, _) = decode_context(obj, target_dimension, meter)?;
     let width = ctx.width;
     let scale_factors = ctx.scale_factors;
 

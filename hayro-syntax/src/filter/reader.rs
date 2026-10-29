@@ -1289,6 +1289,7 @@ impl Input for Fed {
 /// marks the layers to be rewound as they are next reached, and whether the layers
 /// can be checkpointed, and the heap a checkpoint of them holds, are kept as they
 /// are made and changed: so no work over any number of layers goes uncounted.
+/// Their drop goes uncounted: per layer, it frees what making or running it charged.
 mod layers {
     #[cfg(feature = "unsafe")]
     use super::Stage;

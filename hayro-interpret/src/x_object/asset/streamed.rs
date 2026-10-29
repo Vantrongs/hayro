@@ -9,8 +9,9 @@ use crate::color::{ColorComponents, ColorSpace, ToLuma, ToRgb};
 use crate::interpret::state::ActiveTransferFunction;
 use crate::x_object::area::Area;
 use crate::x_object::decode::{
-    MaskPath, SampleFormat, SampleRows, colour_key, direct_invert, image_decode_params, mask_lut,
-    sample_format, sample_lut, short_rows_transparent, unpack_packed, unpremultiply_samples,
+    ColourKey, MaskPath, SampleFormat, SampleRows, colour_key, direct_invert, image_decode_params,
+    mask_lut, sample_format, sample_lut, short_rows_transparent, unpack_packed,
+    unpremultiply_samples,
 };
 use crate::x_object::image::{ImageKind, ImageXObject};
 use core::ops::Range;
@@ -18,7 +19,6 @@ use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::{MASK, MATTE, SMASK, SMASK_IN_DATA};
 use hayro_syntax::object::stream::{ImageData, OwnedStream};
 use hayro_syntax::work::{Cancelled, Meter};
-use smallvec::SmallVec;
 use std::sync::OnceLock;
 
 /// An image read incrementally.
@@ -382,7 +382,7 @@ enum Alpha<'a> {
         same_grid: bool,
     },
     /// A colour-key mask: samples within these ranges are transparent.
-    ColourKey(SmallVec<[u16; 4]>),
+    ColourKey(ColourKey),
 }
 
 impl<'a> Alpha<'a> {
@@ -391,6 +391,7 @@ impl<'a> Alpha<'a> {
     fn new(
         obj: &ImageXObject<'a>,
         colour: &Colour,
+        key: Option<ColourKey>,
         grid: &Grid,
         meter: &Meter<'_>,
     ) -> Result<Self, Stop> {
@@ -409,7 +410,7 @@ impl<'a> Alpha<'a> {
             None
         };
         let Some(stream) = stream else {
-            return Ok(match colour_key(obj, colour.components) {
+            return Ok(match key {
                 Some(key) if !in_data => Alpha::ColourKey(key),
                 _ => Alpha::None,
             });
@@ -465,13 +466,14 @@ impl<'a> Streamed<'a> {
         let Some(colour) = Colour::of(obj, format) else {
             return Ok(None);
         };
+        let key = colour_key(obj, colour.components);
+        let transparent = short_rows_transparent(obj, key.is_some());
         // A stencil mask is alpha alone, as whole decoding reads it.
         let alpha = if colour.is_stencil() {
             Alpha::None
         } else {
-            Alpha::new(obj, &colour, &grid, meter)?
+            Alpha::new(obj, &colour, key, &grid, meter)?
         };
-        let transparent = short_rows_transparent(obj, colour.components);
         Ok(Some(Self {
             obj: obj.clone(),
             colour,

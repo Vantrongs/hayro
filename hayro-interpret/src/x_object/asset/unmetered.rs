@@ -14,7 +14,7 @@
 //! Each poll also reads the asset's statistics, which no lock held across a poll
 //! may block.
 
-use super::tests::{asset, image, is_streamed, pdf, zlib};
+use super::tests::{asset, image, is_streamed, pdf, request, whole, zlib};
 use super::*;
 use crate::chains::{self, Rng};
 use crate::fixtures::noise;
@@ -135,11 +135,13 @@ struct Stretches {
     /// The [`operations`] at the last poll.
     steps: Cell<usize>,
     worst: RefCell<Vec<(String, Stretch)>>,
+    /// The work of all stretches.
+    total: Cell<Stretch>,
     operation: RefCell<&'static str>,
 }
 
 /// The most bytes allocated and steps taken between two polls.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct Stretch {
     bytes: usize,
     steps: usize,
@@ -152,6 +154,11 @@ impl Stretches {
         let bytes = usize::try_from(now - self.last.replace(now)).unwrap_or(0);
         let now = operations();
         let steps = now - self.steps.replace(now);
+        let total = self.total.get();
+        self.total.set(Stretch {
+            bytes: total.bytes + bytes,
+            steps: total.steps + steps,
+        });
         let operation = *self.operation.borrow();
         let mut worst = self.worst.borrow_mut();
         let w = match worst.iter_mut().find(|(o, _)| o == operation) {
@@ -180,6 +187,11 @@ impl Stretches {
 /// that ends a stretch at each poll and reads the asset's statistics; returns each
 /// operation's largest stretch.
 fn stretches(pdf: &Pdf) -> Vec<(String, Stretch)> {
+    measure(pdf).0
+}
+
+/// [`stretches`], and the work of all of them.
+fn measure(pdf: &Pdf) -> (Vec<(String, Stretch)>, Stretch) {
     let asset = asset(pdf);
     // The process makes its CMYK profile once, on first use.
     ColorSpace::device_cmyk().to_rgba(&[0.0; 4], 1.0);
@@ -239,7 +251,7 @@ fn stretches(pdf: &Pdf) -> Vec<(String, Stretch)> {
     }
     drop(asset);
     COUNTS.with(|c| c.set(None));
-    s.worst.into_inner()
+    (s.worst.into_inner(), s.total.get())
 }
 
 /// Every shape in `shapes`, a name and a file, does no more work between two polls
@@ -573,6 +585,135 @@ fn ccitt_reference_searches_are_metered() {
             format!("ccitt {width} columns"),
             pdf(&[(image(&dict, width, 2), wide_reference(width))]),
         ));
+    }
+    assert_metered(shapes);
+}
+
+/// A colour-keyed image whose `/Mask` array runs on past its ranges, by a growing
+/// number of entries a key ignores: opening, requesting and decoding it does the
+/// same work, and gives the same pixels, however many there are.
+#[test]
+fn ignored_colour_key_entries_are_not_read() {
+    let (w, h) = (64_u32, 64_u32);
+    let gray = noise((w * h) as usize, 21);
+    let mut first = None;
+    for ignored in [0, 10_000, 1_000_000] {
+        let dict = format!(
+            "/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode \
+             /Mask [0 120{}]",
+            " 7".repeat(ignored)
+        );
+        let pdf = pdf(&[(image(&dict, w, h), zlib(&gray))]);
+        let pixels = {
+            let asset = asset(&pdf);
+            let mut streamed = asset.open(None, None).unwrap();
+            assert!(is_streamed(&streamed));
+            let all = [0, 0, w, h];
+            let a = request(&mut streamed, Plane::Image, (w, h), all);
+            let b = request(&mut whole(&asset), Plane::Image, (w, h), all);
+            assert_eq!((a.format, &a.data), (b.format, &b.data));
+            let alpha: Vec<_> = a
+                .data
+                .chunks(a.format.channels())
+                .map(|p| p[p.len() - 1])
+                .collect();
+            assert!(alpha.contains(&0) && alpha.contains(&255), "{:?}", a.format);
+            a.data
+        };
+        let work = (pixels, measure(&pdf));
+        println!("{ignored} ignored entries: {:?}", work.1.1);
+        match &first {
+            None => first = Some(work),
+            Some(first) => assert_eq!(&work, first, "{ignored} ignored entries"),
+        }
+    }
+}
+
+/// Raw deflate data: `blocks` dynamic blocks that make nothing, each with a literal
+/// code oversubscribed as far as one goes (256 codes of one bit, then the end of the
+/// block of 15), which only a permissive decoder reads; then a final stored block of
+/// `data`. Filling the table of such a code a code at a time writes each one-bit
+/// code over half of its 32,768 entries.
+fn oversubscribed(blocks: usize, data: &[u8]) -> Vec<u8> {
+    const CODE_LENGTH_ORDER: [u32; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
+    let mut bits = Vec::new();
+    let mut put = |value: u32, n: u32| bits.extend((0..n).map(|i| value >> i & 1 == 1));
+    for _ in 0..blocks {
+        // Not final, dynamic; 257 literal codes, one distance code, 19 code length codes.
+        put(0, 1);
+        put(2, 2);
+        put(0, 5);
+        put(0, 5);
+        put(15, 4);
+        // Code lengths 1 and 15 are coded in one bit each, 0 and 1.
+        for symbol in CODE_LENGTH_ORDER {
+            put(u32::from(symbol == 1 || symbol == 15), 3);
+        }
+        // Literals 0 to 255 of one bit, the end of the block of 15, the distance of one.
+        for _ in 0..256 {
+            put(0, 1);
+        }
+        put(1, 1);
+        put(0, 1);
+        // The end of the block: 15 zero bits.
+        put(0, 15);
+    }
+    // Final, stored, then the rest of the byte.
+    put(1, 1);
+    put(0, 2);
+    let mut out: Vec<u8> = bits
+        .chunks(8)
+        .map(|byte| {
+            byte.iter()
+                .rev()
+                .fold(0, |acc, &bit| acc << 1 | u8::from(bit))
+        })
+        .collect();
+    let len = u16::try_from(data.len()).unwrap();
+    out.extend(len.to_le_bytes());
+    out.extend((!len).to_le_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+/// Flate data of a growing number of blocks whose literal code is oversubscribed:
+/// building their tables counts as work before it is done, as much as the steps it
+/// takes, and no stretch between two polls takes more than [`STEPS`].
+#[test]
+fn oversubscribed_flate_tables_are_metered() {
+    use hayro_syntax::work::TOLD;
+    let (w, h) = (8_u32, 8_u32);
+    let gray = noise((w * h) as usize, 13);
+    let dict = "/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode";
+    let mut shapes = Vec::new();
+    let mut per_count = Vec::new();
+    for blocks in [1, 4, 16] {
+        let pdf = pdf(&[(image(dict, w, h), oversubscribed(blocks, &gray))]);
+        let asset = asset(&pdf);
+        let (told, steps) = (TOLD.with(Cell::get), operations());
+        let mut source = asset.open(None, None).unwrap();
+        assert!(is_streamed(&source));
+        let region = request(&mut source, Plane::Image, (w, h), [0, 0, w, h]);
+        let work = (TOLD.with(Cell::get) - told, operations() - steps);
+        assert_eq!(region.data, gray, "{blocks} blocks");
+        drop(source);
+        let whole = request(&mut whole(&asset), Plane::Image, (w, h), [0, 0, w, h]);
+        assert_eq!(whole.data, gray, "{blocks} blocks decoded whole");
+        println!("{blocks} blocks: {} charged, {} steps", work.0, work.1);
+        per_count.push((blocks, work));
+        shapes.push((format!("{blocks} oversubscribed blocks"), pdf));
+    }
+    for pair in per_count.windows(2) {
+        let [(fewer, (told_a, steps_a)), (more, (told_b, steps_b))] = pair else {
+            unreachable!()
+        };
+        let (charged, taken) = (told_b - told_a, steps_b - steps_a);
+        assert!(
+            charged >= taken,
+            "{fewer} to {more} blocks: {charged} charged for {taken} steps"
+        );
     }
     assert_metered(shapes);
 }

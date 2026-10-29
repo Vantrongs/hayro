@@ -278,12 +278,12 @@ fn fallback_bpc(kind: ImageKind) -> u8 {
 }
 
 /// The context `obj` decodes in, the rows its data does not hold transparent where
-/// [`short_rows_transparent`] says.
+/// [`short_rows_transparent`] says, and its [`colour_key`].
 fn decode_context<'a>(
     obj: &ImageXObject<'a>,
     target_dimension: Option<(u32, u32)>,
     meter: &Meter<'_>,
-) -> Option<DecodeContext<'a>> {
+) -> Option<(DecodeContext<'a>, Option<ColourKey>)> {
     let dict_bpc = dict_bpc(obj);
     let decode_params = decode_params(obj, target_dimension, dict_bpc, meter).ok()?;
 
@@ -318,7 +318,8 @@ fn decode_context<'a>(
 
     let components = color_space.num_components() as usize;
     let rows = SampleRows::new(width, components, bits_per_component, height);
-    let transparent = short_rows_transparent(obj, components);
+    let key = colour_key(obj, components);
+    let transparent = short_rows_transparent(obj, key.is_some());
     let (data, held) = fit_rows(
         core::mem::take(&mut decoded.data),
         rows,
@@ -332,7 +333,7 @@ fn decode_context<'a>(
         return None;
     }
 
-    Some(DecodeContext {
+    let ctx = DecodeContext {
         decoded,
         width,
         height: held,
@@ -342,7 +343,8 @@ fn decode_context<'a>(
         color_space,
         bits_per_component,
         decode_arr,
-    })
+    };
+    Some((ctx, key))
 }
 
 /// `data`, the stored samples of an image of `components` lying in `rows`, as
@@ -393,8 +395,9 @@ fn fit_rows<'d>(
 /// Whether the rows of `obj`'s colour that its data does not hold are transparent,
 /// not stored zero ([`fit_rows`]): as `MuPDF` draws them (observed through `PyMuPDF`
 /// 1.28.2) where the image has a colour-key mask, or its mask stream (`/SMask`, else
-/// a stream `/Mask`) has a `/Matte` array; its samples are of `components`.
-pub(crate) fn short_rows_transparent(obj: &ImageXObject<'_>, components: usize) -> bool {
+/// a stream `/Mask`) has a `/Matte` array; `keyed` says whether it has a
+/// [`colour_key`].
+pub(crate) fn short_rows_transparent(obj: &ImageXObject<'_>, keyed: bool) -> bool {
     if obj.kind != ImageKind::Image {
         return false;
     }
@@ -404,20 +407,21 @@ pub(crate) fn short_rows_transparent(obj: &ImageXObject<'_>, components: usize) 
         .or_else(|| dict.get::<Stream<'_>>(MASK))
     {
         Some(mask) => mask.dict().get::<Array<'_>>(MATTE).is_some(),
-        None => colour_key(obj, components).is_some(),
+        None => keyed,
     }
 }
 
 /// The colour-key mask of `obj`, whose samples are of `components`: its `/Mask`
 /// array, where it gives a range for each component, as `MuPDF` reads it (observed
 /// through `PyMuPDF` 1.28.2): with fewer entries it is no mask, and entries past
-/// those ranges are ignored.
-pub(crate) fn colour_key(obj: &ImageXObject<'_>, components: usize) -> Option<SmallVec<[u16; 4]>> {
-    obj.stream
-        .dict()
-        .get::<SmallVec<[u16; 4]>>(MASK)
-        .filter(|key| key.len() >= 2 * components)
+/// those ranges are ignored, and not read: a file may add any number of them.
+pub(crate) fn colour_key(obj: &ImageXObject<'_>, components: usize) -> Option<ColourKey> {
+    let mut entries = obj.stream.dict().get::<Array<'_>>(MASK)?.flex_iter();
+    (0..2 * components).map(|_| entries.next::<u16>()).collect()
 }
+
+/// A colour-key mask: a range of stored values for each component, low then high.
+pub(crate) type ColourKey = SmallVec<[u16; 4]>;
 
 /// The pixels of `channels` bytes a piece of work takes: whole groups of 64, so that
 /// a conversion that works on groups of pixels splits pieces as it splits the whole.

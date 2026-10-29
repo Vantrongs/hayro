@@ -1,6 +1,6 @@
 use super::mask::{DecodedMask, decode_mask};
 use super::{
-    DecodeContext, Rows, Texel, colour_key, complete, decode_context, decode_u8_samples, in_pieces,
+    ColourKey, DecodeContext, Rows, Texel, complete, decode_context, decode_u8_samples, in_pieces,
     into_owned, pixel_piece, unpack_samples,
 };
 use crate::color::{ColorComponents, ColorSpace, ToLuma, ToRgb};
@@ -124,7 +124,7 @@ struct ImageDecoder<'a, 'b, 'm> {
     obj: &'a ImageXObject<'b>,
     ctx: DecodeContext<'b>,
     target_dimension: Option<(u32, u32)>,
-    color_key_mask: Option<SmallVec<[u16; 4]>>,
+    color_key_mask: Option<ColourKey>,
     decoded_color_key_mask: Option<LumaData>,
     meter: &'m Meter<'m>,
 }
@@ -135,8 +135,7 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
         target_dimension: Option<(u32, u32)>,
         meter: &'m Meter<'m>,
     ) -> Option<Self> {
-        let ctx = decode_context(obj, target_dimension, meter)?;
-        let color_key_mask = colour_key(obj, ctx.color_space.num_components() as usize);
+        let (ctx, color_key_mask) = decode_context(obj, target_dimension, meter)?;
 
         Some(Self {
             obj,
