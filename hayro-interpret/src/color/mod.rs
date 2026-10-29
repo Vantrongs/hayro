@@ -173,11 +173,11 @@ impl ColorSpaceType {
                     let dict = icc_stream.dict();
                     let num_components = dict.get::<usize>(N)?;
 
-                    let decoded = icc_stream.decoded().ok()?;
                     // A profile is what its bytes hold: documents embed one profile as
-                    // many objects, each of which would build it.
+                    // many objects, each of which would build it; and one object,
+                    // which many colour spaces (palettes on it) read, is decoded once.
                     return cache
-                        .of_bytes(&decoded, num_components, ICCProfile::new)
+                        .of_stream(&icc_stream, num_components, ICCProfile::new)?
                         .map(|icc| {
                             // TODO: For SVG and PNG we can assume that the output color space is
                             // sRGB. If we ever implement PDF-to-PDF, we probably want to

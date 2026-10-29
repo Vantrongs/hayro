@@ -13,7 +13,8 @@ type CacheMap = hash::Map<u128, Option<Box<dyn Any + Send + Sync>>>;
 /// same whichever page, and whichever chain of references, read it first: a value
 /// read from objects is built from the object it is kept for alone, read as where a
 /// resolution starts ([`Self::rooted`]), and what its build keeps besides is made
-/// from bytes alone ([`Building::of_bytes`]).
+/// from bytes alone ([`Building::of_bytes`]), or from a stream alone
+/// ([`Building::of_stream`]).
 #[derive(Clone)]
 pub(crate) struct Cache(Arc<Mutex<CacheMap>>);
 
@@ -91,6 +92,24 @@ impl Building<'_> {
     ) -> Option<T> {
         self.0
             .get_or_insert_with::<T>(hash128(&(bytes, with)), || build(bytes, with))
+    }
+
+    /// [`Self::of_bytes`] of the decoded data of `stream`, kept for the stream's own
+    /// object, which names it whatever chain of references reached it, so that its
+    /// data are decoded once for the document whichever values are built on it:
+    /// `None` where they do not decode. The stream is decoded as where a resolution
+    /// starts ([`Stream::as_root`]).
+    pub(crate) fn of_stream<W: Hash + Copy, T: Clone + Send + Sync + 'static>(
+        &self,
+        stream: &Stream<'_>,
+        with: W,
+        build: fn(&[u8], W) -> Option<T>,
+    ) -> Option<Option<T>> {
+        self.0
+            .get_or_insert_with::<Option<T>>(hash128(&(stream.cache_key(), with)), || {
+                let decoded = stream.as_root().decoded().ok()?;
+                Some(self.of_bytes(&decoded, with, build))
+            })
     }
 }
 
