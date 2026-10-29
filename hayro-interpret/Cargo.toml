@@ -42,7 +42,8 @@ embed-fonts = []
 # Embed the 61 predefined cmaps into the binary. Adds about ~250KB of brotli-encoded data.
 embed-cmaps = ["hayro-cmap/embed-cmaps"]
 logging = ["dep:log", "hayro-syntax/logging"]
-# Count the operators type 4 functions run (`operators_run`), for tests that bound them.
+# Count the operators type 4 functions run (`operators_run`) and the elements paths are
+# flattened into (`elements_flattened`), for tests that bound them.
 count-operators = []
 
 [lints]

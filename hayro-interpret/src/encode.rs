@@ -223,12 +223,19 @@ impl EncodedSampledShading {
         }
     }
 
-    /// The colors of the pixels in `region` the mesh covers, the work and memory
-    /// taken of `meter` before each pass over the triangles.
-    fn sample(&self, region: &Region, meter: &mut dyn Meter) -> Result<Samples, Exhausted> {
+    /// The colors of the pixels in `region` the mesh covers, placed `shift`
+    /// further, the work and memory taken of `meter` before each pass over the
+    /// triangles.
+    fn sample(
+        &self,
+        region: &Region,
+        shift: Vec2,
+        meter: &mut dyn Meter,
+    ) -> Result<Samples, Exhausted> {
         let placing = TRIANGLE_COST.times(self.triangles());
         take(meter, placing)?;
-        let plan = plan(|f| self.each_triangle(f), self.transform, region);
+        let transform = Affine::translate(shift) * self.transform;
+        let plan = plan(|f| self.each_triangle(f), transform, region);
         if !meter.hold(plan.bytes()) {
             return Err(Exhausted);
         }
@@ -239,7 +246,7 @@ impl EncodedSampledShading {
         Ok(sample_planned(
             &plan,
             |f| self.each_triangle(f),
-            self.transform,
+            transform,
             region,
         ))
     }
@@ -316,16 +323,31 @@ const SEARCH_COST: Cost = Cost::new(32);
 /// Device pixels, `xs` by `ys`.
 type Region = (Range<u16>, Range<u16>);
 
-/// The box of the device pixels points lie in, `x0`, `x1`, `y0`, `y1`, each
-/// inclusive.
-struct Reach(Option<(u16, u16, u16, u16)>);
+/// The box points lie in, `x0`, `x1`, `y0`, `y1`, each inclusive.
+struct Reach(Option<(f64, f64, f64, f64)>);
 
 impl Reach {
     #[inline]
     fn add(&mut self, pos: Point) {
-        let (x, y) = pixel(pos);
+        let (x, y) = (pos.x, pos.y);
         let (x0, x1, y0, y1) = self.0.unwrap_or((x, x, y, y));
         self.0 = Some((x0.min(x), x1.max(x), y0.min(y), y1.max(y)));
+    }
+}
+
+/// A mesh's samples at the device pixels of a region, placed `shift` further, so
+/// that the region's pixels left of or above the origin, which a pixel's place in
+/// `Samples` cannot name, are sampled where they lie.
+pub(crate) struct Located {
+    samples: Samples,
+    shift: Vec2,
+}
+
+impl Located {
+    /// The samples of the pixel `pos` lies in.
+    #[inline]
+    fn get(&self, pos: Point) -> Option<&ColorComponents> {
+        self.samples.get(pixel(pos + self.shift))
     }
 }
 
@@ -428,13 +450,19 @@ impl EncodedShadingPattern {
     /// a point it painted lies on; a path may reach `CIRCLE_SLACK` of a circle's
     /// radius past it besides, as cubic arcs do. A mesh has no such edges here.
     ///
+    /// Only the part of `shape` within `window`, device pixels, is tested for a
+    /// radial shading: past them it paints nothing, so an end may be extended
+    /// there.
+    ///
     /// The work is taken of `meter` before it is done: a step for each point of
-    /// the shape's elements, and for a radial shading each point of the chords it
-    /// is tested along. `Exhausted`, the shading unchanged, when `meter` refuses.
+    /// the shape's elements, and for a radial shading the lines of its outline
+    /// near the window ([`flatten_metered`](crate::flatten::flatten_metered)).
+    /// `Exhausted`, the shading unchanged, when `meter` refuses.
     pub fn extend_within_metered(
         &mut self,
         shape: &BezPath,
         to_device: Affine,
+        window: Rect,
         tolerance: f64,
         meter: &mut dyn Meter,
     ) -> Result<(), Exhausted> {
@@ -507,15 +535,28 @@ impl EncodedShadingPattern {
                     // every direction.
                     let near = tolerance * fewest;
                     let chord = large.1 * CHORD_SLACK + near / 2.0;
-                    let steps = chord_steps(shape, to_shading, chord);
-                    take(meter, EDGE_POINT_COST.times(steps))?;
-                    let polyline = chords(shape, to_shading, chord);
-                    let inside = polyline.iter().all(|&(_, q)| {
-                        q.distance(large.0)
-                            <= large.1 * (1.0 + CIRCLE_SLACK - CHORD_SLACK) + near / 2.0
-                    });
-                    let hole = small.1 * (1.0 - CIRCLE_SLACK) - near;
-                    let outside = hole <= 0.0 || avoids_disc(&polyline, small.0, hole);
+                    let mut test = Nesting::new(
+                        base.transform_rect_bbox(window),
+                        (
+                            large.0,
+                            large.1 * (1.0 + CIRCLE_SLACK - CHORD_SLACK) + near / 2.0,
+                        ),
+                        (small.0, small.1 * (1.0 - CIRCLE_SLACK) - near),
+                    );
+                    // Lines past the window only wind around points in it.
+                    let cull = test.window.inflate(chord, chord);
+                    crate::flatten::flatten_metered(
+                        shape.iter(),
+                        to_shading,
+                        chord,
+                        Some(cull),
+                        meter,
+                        |el, _| {
+                            test.add(el);
+                            Ok(())
+                        },
+                    )?;
+                    let (inside, outside) = test.finish();
                     let (outer_end, inner_end) = if grows { (1, 0) } else { (0, 1) };
                     shading.extend[outer_end] |= inside;
                     shading.extend[inner_end] |= outside;
@@ -593,22 +634,37 @@ impl EncodedShadingPattern {
         &self,
         meter: &mut dyn Meter,
         walk: impl FnOnce(&mut Reach),
-    ) -> Result<Option<Samples>, Exhausted> {
+    ) -> Result<Option<Located>, Exhausted> {
         let EncodedShadingType::Sampled(mesh) = &self.shading_type else {
             return Ok(None);
         };
         let mut reach = Reach(None);
         walk(&mut reach);
+        let Some((x0, x1, y0, y1)) = reach.0 else {
+            return mesh
+                .sample(&(0..0, 0..0), Vec2::ZERO, meter)
+                .map(|samples| {
+                    Some(Located {
+                        samples,
+                        shift: Vec2::ZERO,
+                    })
+                });
+        };
+        // Whole pixels, so each is sampled at its centre as before.
+        let shift = Vec2::new((-x0.floor()).max(0.0), (-y0.floor()).max(0.0));
+        let ((x0, y0), (x1, y1)) = (
+            pixel(Point::new(x0, y0) + shift),
+            pixel(Point::new(x1, y1) + shift),
+        );
         // The last pixel of a row or column, 65535, is never a triangle's.
-        let region = reach.0.map_or((0..0, 0..0), |(x0, x1, y0, y1)| {
-            (x0..x1.saturating_add(1), y0..y1.saturating_add(1))
-        });
-        mesh.sample(&region, meter).map(Some)
+        let region = (x0..x1.saturating_add(1), y0..y1.saturating_add(1));
+        mesh.sample(&region, shift, meter)
+            .map(|samples| Some(Located { samples, shift }))
     }
 
     /// The shading at `pos`, a mesh's looked up in `samples`.
     #[inline]
-    fn sample_in(&self, pos: Point, samples: Option<&Samples>) -> [f32; 4] {
+    fn sample_in(&self, pos: Point, samples: Option<&Located>) -> [f32; 4] {
         self.finish(
             self.shading_type
                 .eval(pos, self.background_color, &self.color_space, samples),
@@ -1211,7 +1267,7 @@ impl EncodedShadingType {
         pos: Point,
         bg_color: AlphaColor,
         color_space: &ColorSpace,
-        samples: Option<&Samples>,
+        samples: Option<&Located>,
     ) -> Option<AlphaColor> {
         match self {
             Self::FunctionBased(EncodedFunctionBasedShading {
@@ -1283,7 +1339,7 @@ impl EncodedShadingType {
                 Some(color_space.to_rgba(&val, 1.0))
             }
             Self::Sampled(mesh) => mesh.color(
-                samples.and_then(|samples| samples.get(pixel(pos))),
+                samples.and_then(|samples| samples.get(pos)),
                 bg_color,
                 color_space,
             ),
@@ -1407,116 +1463,153 @@ fn control_points(shape: &BezPath) -> usize {
         .sum()
 }
 
-/// The equal steps of a curve's parameter whose chords stray at most
-/// `tolerance` from it, its second derivative at most `bend`: a chord over a
-/// step `h` strays at most `bend * h² / 8`.
-fn steps_for(bend: f64, tolerance: f64) -> u64 {
-    let steps = (bend / (8.0 * tolerance)).sqrt().ceil();
-    if steps.is_finite() {
-        (steps as u64).max(1)
-    } else {
-        u64::MAX
-    }
+/// What the outline of a shape, its lines passed on by
+/// [`flatten_metered`](crate::flatten::flatten_metered), shows of its part within
+/// `window`: whether a disc, `large`, holds that part, and whether it misses
+/// another, `hole`. A part bounded by lines within a convex disc lies within it; so
+/// does the part of the window's sides the shape holds, which ends at its corners
+/// or where its lines cross them. Where no line reaches into the hole within the
+/// window, the shape holds all of the hole's part there or none of it, as it holds
+/// the point of it nearest the hole's centre. Holding is winding around a point:
+/// what either fill rule fills, it winds around.
+struct Nesting {
+    window: Rect,
+    large: (Point, f64),
+    hole: (Point, f64),
+    /// Whether a line's part within the window reaches past `large`.
+    leaves: bool,
+    /// Whether a line's part within the window reaches into `hole`.
+    enters: bool,
+    /// Points just inside the window's corners, and the window's point nearest the
+    /// hole's centre, and the lines' winding around each.
+    probes: [Point; 5],
+    winding: [i32; 5],
+    start: Point,
+    last: Point,
 }
 
-/// The steps `chords` cuts `shape`'s curves in, placed by `to_shading`, so its
-/// chords stray at most `tolerance` from them, a step a line.
-fn chord_steps(shape: &BezPath, to_shading: Affine, tolerance: f64) -> u64 {
-    let mut last = Point::ZERO;
-    let mut steps = 0_u64;
-    for el in shape.elements() {
-        let el = to_shading * *el;
-        let (count, end) = match el {
-            PathEl::MoveTo(p) => (1, p),
-            PathEl::LineTo(p) => (1, p),
-            PathEl::QuadTo(p1, p2) => {
-                let bend = 2.0 * (last - 2.0 * p1.to_vec2() + p2.to_vec2()).to_vec2().hypot();
-                (steps_for(bend, tolerance), p2)
-            }
-            PathEl::CurveTo(p1, p2, p3) => {
-                let a = (last - 2.0 * p1.to_vec2() + p2.to_vec2()).to_vec2().hypot();
-                let b = (p1 - 2.0 * p2.to_vec2() + p3.to_vec2()).to_vec2().hypot();
-                (steps_for(6.0 * a.max(b), tolerance), p3)
-            }
-            PathEl::ClosePath => (0, last),
-        };
-        steps = steps.saturating_add(count);
-        last = end;
-    }
-    steps
-}
-
-/// `shape` placed by `to_shading` as closed polylines whose chords stray at most
-/// `tolerance` from it (`chord_steps`), each point with whether it starts one.
-fn chords(shape: &BezPath, to_shading: Affine, tolerance: f64) -> Vec<(bool, Point)> {
-    use kurbo::{CubicBez, ParamCurve, QuadBez};
-    let mut points = Vec::new();
-    let mut last = Point::ZERO;
-    for el in shape.elements() {
-        match to_shading * *el {
-            PathEl::MoveTo(p) => {
-                points.push((true, p));
-                last = p;
-            }
-            PathEl::LineTo(p) => {
-                points.push((false, p));
-                last = p;
-            }
-            PathEl::QuadTo(p1, p2) => {
-                let curve = QuadBez::new(last, p1, p2);
-                let bend = 2.0 * (last - 2.0 * p1.to_vec2() + p2.to_vec2()).to_vec2().hypot();
-                let n = steps_for(bend, tolerance);
-                points.extend((1..=n).map(|i| (false, curve.eval(i as f64 / n as f64))));
-                last = p2;
-            }
-            PathEl::CurveTo(p1, p2, p3) => {
-                let curve = CubicBez::new(last, p1, p2, p3);
-                let a = (last - 2.0 * p1.to_vec2() + p2.to_vec2()).to_vec2().hypot();
-                let b = (p1 - 2.0 * p2.to_vec2() + p3.to_vec2()).to_vec2().hypot();
-                let n = steps_for(6.0 * a.max(b), tolerance);
-                points.extend((1..=n).map(|i| (false, curve.eval(i as f64 / n as f64))));
-                last = p3;
-            }
-            PathEl::ClosePath => {}
+impl Nesting {
+    fn new(window: Rect, large: (Point, f64), hole: (Point, f64)) -> Self {
+        // A corner's probe lies inside it, off the window's sides, which a shape
+        // ending at them passes along.
+        let inset = 1e-9 * window.width().max(window.height()).max(f64::MIN_POSITIVE);
+        let inner = window.inset(-inset);
+        let nearest = Point::new(
+            hole.0.x.clamp(window.x0, window.x1),
+            hole.0.y.clamp(window.y0, window.y1),
+        );
+        Self {
+            window,
+            large,
+            hole,
+            leaves: false,
+            enters: false,
+            probes: [
+                Point::new(inner.x0, inner.y0),
+                Point::new(inner.x1, inner.y0),
+                Point::new(inner.x0, inner.y1),
+                Point::new(inner.x1, inner.y1),
+                nearest,
+            ],
+            winding: [0; 5],
+            start: Point::ZERO,
+            last: Point::ZERO,
         }
     }
-    points
-}
 
-/// Whether the inside of the closed polylines `polyline` (each starting where a
-/// point is marked) misses the disc at `center` of `radius`: no side reaches into
-/// it, and the polylines do not wind around its centre.
-fn avoids_disc(polyline: &[(bool, Point)], center: Point, radius: f64) -> bool {
-    let mut winding = 0;
-    let mut start = 0;
-    for i in 0..polyline.len() {
-        let next = match polyline.get(i + 1) {
-            Some(&(false, _)) => i + 1,
-            // The last point of a subpath closes it.
-            _ => start,
+    fn add(&mut self, el: PathEl) {
+        match el {
+            PathEl::MoveTo(p) => {
+                self.line(self.last, self.start);
+                (self.start, self.last) = (p, p);
+            }
+            PathEl::LineTo(p) => {
+                self.line(self.last, p);
+                self.last = p;
+            }
+            PathEl::ClosePath => {
+                self.line(self.last, self.start);
+                self.last = self.start;
+            }
+            PathEl::QuadTo(..) | PathEl::CurveTo(..) => {}
+        }
+    }
+
+    fn line(&mut self, a: Point, b: Point) {
+        if a == b {
+            return;
+        }
+        for (probe, winding) in self.probes.iter().zip(&mut self.winding) {
+            if (a.y <= probe.y) != (b.y <= probe.y)
+                && a.x + (probe.y - a.y) * (b.x - a.x) / (b.y - a.y) > probe.x
+            {
+                *winding += if b.y > a.y { 1 } else { -1 };
+            }
+        }
+        let Some((p, q)) = clip_to(a, b, self.window) else {
+            return;
         };
-        let (p, q) = (polyline[i].1, polyline[next].1);
+        let (center, radius) = self.large;
+        self.leaves |= p.distance(center) > radius || q.distance(center) > radius;
+        let (center, radius) = self.hole;
         let side = q - p;
         let along = if side.hypot2() > 0.0 {
             ((center - p).dot(side) / side.hypot2()).clamp(0.0, 1.0)
         } else {
             0.0
         };
-        if center.distance(p + side * along) < radius {
-            return false;
-        }
-        // A side crossing the ray from the centre to the right.
-        if (p.y <= center.y) != (q.y <= center.y) {
-            let x = p.x + (center.y - p.y) / (q.y - p.y) * (q.x - p.x);
-            if x > center.x {
-                winding += if q.y > p.y { 1 } else { -1 };
+        self.enters |= center.distance(p + side * along) < radius;
+    }
+
+    /// Whether `large` holds the shape's part within the window, and whether that
+    /// part misses `hole`.
+    fn finish(mut self) -> (bool, bool) {
+        self.line(self.last, self.start);
+        let window = self.window;
+        let corners = [
+            Point::new(window.x0, window.y0),
+            Point::new(window.x1, window.y0),
+            Point::new(window.x0, window.y1),
+            Point::new(window.x1, window.y1),
+        ];
+        let (center, radius) = self.large;
+        let inside = !self.leaves
+            && corners
+                .iter()
+                .zip(self.winding)
+                .all(|(corner, winding)| winding == 0 || corner.distance(center) <= radius);
+        let (center, radius) = self.hole;
+        let nearest = self.probes[4];
+        let outside = radius <= 0.0
+            || !self.enters && (nearest.distance(center) >= radius || self.winding[4] == 0);
+        (inside, outside)
+    }
+}
+
+/// The part of the line from `a` to `b` within `rect`, `None` where it misses it.
+fn clip_to(a: Point, b: Point, rect: Rect) -> Option<(Point, Point)> {
+    let d = b - a;
+    let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+    for (q, r) in [
+        (-d.x, a.x - rect.x0),
+        (d.x, rect.x1 - a.x),
+        (-d.y, a.y - rect.y0),
+        (d.y, rect.y1 - a.y),
+    ] {
+        if q == 0.0 {
+            if r < 0.0 {
+                return None;
+            }
+        } else {
+            let t = r / q;
+            if q < 0.0 {
+                t0 = t0.max(t);
+            } else {
+                t1 = t1.min(t);
             }
         }
-        if next == start {
-            start = i + 1;
-        }
     }
-    winding == 0
+    (t0 <= t1).then(|| (a + d * t0, a + d * t1))
 }
 
 #[cfg(test)]
@@ -1862,6 +1955,9 @@ mod tests {
             pattern.matrix = matrix;
             pattern.encode()
         };
+        // The device pixels a shape covers, all of which are seen.
+        let seen =
+            |shape: &BezPath, matrix: Affine| matrix.transform_rect_bbox(shape.bounding_box());
         // The colour at a device point.
         let at = |encoded: &super::EncodedShadingPattern, point: Point| {
             let mut color = [0.0; 4];
@@ -1873,7 +1969,13 @@ mod tests {
         let extended = |shading: &str, matrix: Affine, shape: &BezPath| {
             let mut encoded = encoded(shading, matrix);
             encoded
-                .extend_within_metered(shape, matrix, TOLERANCE, &mut super::Unmetered)
+                .extend_within_metered(
+                    shape,
+                    matrix,
+                    seen(shape, matrix),
+                    TOLERANCE,
+                    &mut super::Unmetered,
+                )
                 .expect("unmetered");
             encoded.extended_edges()
         };
@@ -1896,6 +1998,7 @@ mod tests {
             .extend_within_metered(
                 &rect(90.6),
                 Affine::IDENTITY,
+                seen(&rect(90.6), Affine::IDENTITY),
                 TOLERANCE,
                 &mut super::Unmetered,
             )
@@ -1916,6 +2019,7 @@ mod tests {
             .extend_within_metered(
                 &rect(90.6),
                 Affine::IDENTITY,
+                seen(&rect(90.6), Affine::IDENTITY),
                 TOLERANCE,
                 &mut super::Unmetered,
             )
@@ -1992,8 +2096,13 @@ mod tests {
                 held: vec![],
             };
             let shape = arcs(center, 300.0, false);
-            let result =
-                refused.extend_within_metered(&shape, Affine::IDENTITY, TOLERANCE, &mut meter);
+            let result = refused.extend_within_metered(
+                &shape,
+                Affine::IDENTITY,
+                seen(&shape, Affine::IDENTITY),
+                TOLERANCE,
+                &mut meter,
+            );
             assert_eq!((result, refused.extended_edges()), (Err(Exhausted), 0));
             assert!(meter.asked[0] > 0);
         }
@@ -2007,9 +2116,72 @@ mod tests {
             held: vec![],
         };
         encoded(&both, Affine::IDENTITY)
-            .extend_within_metered(&rect(90.6), Affine::IDENTITY, TOLERANCE, &mut meter)
+            .extend_within_metered(
+                &rect(90.6),
+                Affine::IDENTITY,
+                seen(&rect(90.6), Affine::IDENTITY),
+                TOLERANCE,
+                &mut meter,
+            )
             .expect("nothing to do");
         assert!(meter.asked.is_empty());
+    }
+
+    /// A radial shading is extended where the shape ends at its circle within
+    /// the window it is seen in, whatever the shape does past it, and the shape
+    /// is tested near that window alone: a curve reaching 10¹⁵ units out, which
+    /// tested whole asked for gigabytes of lines, asks fewer than 10⁵ steps
+    /// and bytes.
+    #[test]
+    fn a_radial_shading_is_tested_within_the_window_it_is_seen_in() {
+        use kurbo::{BezPath, Shape};
+        let red_to_blue =
+            "/Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >>";
+        let encoded = |coords: &str| {
+            shading_pattern(&[
+                "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+                format!(
+                    "<< /ShadingType 3 /ColorSpace /DeviceRGB /Coords [{coords}] {red_to_blue} >>"
+                ),
+            ])
+            .encode()
+        };
+        let extended = |coords: &str, shape: &BezPath, window: Rect, meter: &mut dyn Meter| {
+            let mut encoded = encoded(coords);
+            encoded
+                .extend_within_metered(shape, Affine::IDENTITY, window, 1.0 / 32.0, meter)
+                .map(|()| encoded.extended_edges())
+        };
+        // It leaves the disc of radius 30 about (50, 40) at x 80 alone; the
+        // disc's centre, its other end, it misses everywhere.
+        let shape = Rect::new(35.0, 35.0, 120.0, 45.0).to_path(0.1);
+        let within = Rect::new(30.0, 30.0, 70.0, 50.0);
+        let disc = "50 40 0 50 40 30";
+        assert_eq!(
+            extended(disc, &shape, within, &mut super::Unmetered),
+            Ok(0b11)
+        );
+        assert_eq!(
+            extended(disc, &shape, shape.bounding_box(), &mut super::Unmetered),
+            Ok(0b01)
+        );
+
+        let mut huge = BezPath::new();
+        huge.move_to((0.0, 0.0));
+        huge.curve_to((1e15, 0.0), (-1e15, 1.0), (1.0, 1.0));
+        huge.close_path();
+        let mut meter = Recording {
+            left: u64::MAX,
+            asked: vec![],
+            held: vec![],
+        };
+        let page = Rect::new(0.0, 0.0, 100.0, 100.0);
+        assert_eq!(extended("0 0 0 0 0 1", &huge, page, &mut meter), Ok(0b01));
+        let (asked, held) = (
+            meter.asked.iter().sum::<u64>(),
+            meter.held.iter().sum::<usize>(),
+        );
+        assert!(asked < 100_000 && held < 100_000, "{asked} {held}");
     }
 
     /// Points sampled one by one are the colours a texture samples at the same
@@ -2156,6 +2328,45 @@ mod tests {
         }
     }
 
+    /// A texture reaching left of and above the origin samples a mesh there
+    /// where its pixels lie, as one that starts at the origin does: past the
+    /// mesh, nothing, not the colour of the pixel at the origin.
+    #[test]
+    fn a_mesh_is_sampled_where_it_lies_left_of_the_origin() {
+        let vertex = |x: f64, y: f64| {
+            let at = |v: f64| format!("{:04X}", (v / 100.0 * 65535.0).round() as u32);
+            format!("00{}{}000000", at(x), at(y))
+        };
+        let data = [vertex(0.0, 0.0), vertex(50.0, 0.0), vertex(0.0, 50.0)].concat();
+        let pattern = shading_pattern(&[
+            "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+            format!(
+                "<< /ShadingType 4 /ColorSpace /DeviceRGB /BitsPerCoordinate 16 \
+                 /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 100 0 100 0 1 0 1 0 1] \
+                 /Filter /ASCIIHexDecode /Length {} >>\nstream\n{data}>\nendstream",
+                data.len() + 1
+            ),
+        ]);
+        let encoded = pattern.encode();
+        let texture = |bbox: Rect| {
+            let mut texture = vec![];
+            let (width, _, _) = encoded.sample_texture(bbox, 1.0, |c| texture.push(c));
+            (width as usize, texture)
+        };
+        let (whole_width, whole) = texture(Rect::new(0.0, 0.0, 60.0, 60.0));
+        let (width, shifted) = texture(Rect::new(-2.0, -3.0, 60.0, 60.0));
+        for (i, color) in shifted.iter().enumerate() {
+            let (x, y) = ((i % width) as i64 - 2, (i / width) as i64 - 3);
+            let expected = if x < 0 || y < 0 {
+                [0.0; 4]
+            } else {
+                whole[y as usize * whole_width + x as usize]
+            };
+            assert_eq!(*color, expected, "({x}, {y})");
+        }
+        assert_eq!(whole[0], [0.0, 0.0, 0.0, 1.0]);
+    }
+
     /// A patch mesh is sampled as the triangles it is cut into are, one patch
     /// cut at a time, its triangles paid for before each pass over them and the
     /// pixels of their boxes before they are visited, with what its samples hold
@@ -2199,7 +2410,7 @@ mod tests {
             asked: vec![],
             held: vec![],
         };
-        let samples = mesh.sample(&region, &mut meter).unwrap();
+        let samples = mesh.sample(&region, kurbo::Vec2::ZERO, &mut meter).unwrap();
         for y in region.1.clone() {
             for x in region.0.clone() {
                 assert_eq!(samples.get((x, y)), expected.get((x, y)), "({x}, {y})");
@@ -2222,7 +2433,10 @@ mod tests {
                 asked: vec![],
                 held: vec![],
             };
-            assert_eq!(mesh.sample(&region, &mut meter).err(), Some(Exhausted));
+            assert_eq!(
+                mesh.sample(&region, kurbo::Vec2::ZERO, &mut meter).err(),
+                Some(Exhausted)
+            );
         }
     }
 
