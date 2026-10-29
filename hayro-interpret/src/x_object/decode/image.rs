@@ -1,7 +1,7 @@
 use super::mask::decode_mask;
 use super::{
-    DecodeContext, Rows, decode_context, decode_u8_samples, in_pieces, into_owned, pixel_piece,
-    repeat_last_row, short_rows_transparent, unpack_samples,
+    DecodeContext, Rows, colour_key, decode_context, decode_u8_samples, in_pieces, into_owned,
+    pixel_piece, repeat_last_row, unpack_samples,
 };
 use crate::color::{ColorComponents, ColorSpace, ToLuma, ToRgb};
 use crate::interpret::state::ActiveTransferFunction;
@@ -104,8 +104,8 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
         target_dimension: Option<(u32, u32)>,
         meter: &'m Meter<'m>,
     ) -> Option<Self> {
-        let ctx = decode_context(obj, target_dimension, short_rows_transparent(obj), meter)?;
-        let color_key_mask = obj.stream.dict().get::<SmallVec<[u16; 4]>>(MASK);
+        let ctx = decode_context(obj, target_dimension, meter)?;
+        let color_key_mask = colour_key(obj, ctx.color_space.num_components() as usize);
 
         Some(Self {
             obj,

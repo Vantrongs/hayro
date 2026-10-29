@@ -156,6 +156,141 @@ fn assert_requests_equal(streamed: &mut ImageSource<'_>, whole: &mut ImageSource
     }
 }
 
+/// The first request of each plane of a fresh asset of `pdf`, for each of a column at
+/// either edge and of the whole plane at full size and in one bin, equals that request
+/// of the image decoded whole: a first request does not know yet where the colour's
+/// or the mask's data ends, and a narrow one pushes part of a row before finding it.
+fn assert_first_requests_equal(pdf: &hayro_syntax::Pdf, case: &str) {
+    let reference = asset(pdf);
+    let Some(mut whole) = try_whole(&reference) else {
+        return;
+    };
+    let layout = *whole.layout();
+    for plane in [Plane::Image, Plane::Mask] {
+        let Some(p) = layout.plane(plane) else {
+            continue;
+        };
+        let (w, h) = (p.width, p.height);
+        for (grid, window) in [
+            ((w, h), [0, 0, 1, h]),
+            ((w, h), [w - 1, 0, w, h]),
+            ((w, h), [0, 0, w, h]),
+            ((1, 1), [0, 0, 1, 1]),
+        ] {
+            let fresh = asset(pdf);
+            let mut streamed = fresh.open(None, None).expect(case);
+            let a = streamed.request(&ImageRequest {
+                plane,
+                grid,
+                window,
+                cancel: None,
+            });
+            let a = a.unwrap_or_else(|e| panic!("{case}: {plane:?} {window:?} ends {e:?}"));
+            let b = request(&mut whole, plane, grid, window);
+            assert_eq!(
+                (a.format, &a.data, a.to_image),
+                (b.format, &b.data, b.to_image),
+                "{case}: first request, {plane:?} grid {grid:?} window {window:?}"
+            );
+        }
+    }
+}
+
+/// [`Cases::check`] and [`assert_first_requests_equal`] of `pdf`'s image.
+fn check_first_requests(cases: &mut Cases, pdf: &hayro_syntax::Pdf, case: &str) {
+    cases.check(&asset(pdf), case);
+    cases.count += 1;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_first_requests_equal(pdf, case);
+    }));
+    if let Err(e) = result {
+        let message = e
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        cases.failed.push(message);
+    }
+}
+
+/// Colour and a mask on its grid whose data each end within a row, which a first
+/// request finds on separate passes, each after pushing part of a row: 3-bit colour
+/// 13 × 4 holding two rows and a byte under a 4-bit soft mask holding one row and a
+/// byte, and a row of 131,073 bits holding 8,193 bytes under a 1-bit soft mask
+/// holding as many.
+#[test]
+fn colour_and_mask_found_short_on_separate_passes_stream_as_whole() {
+    let mut cases = Cases::default();
+    let gray = |bits: u32| format!("/ColorSpace /DeviceGray /BitsPerComponent {bits}");
+    let flate = "/Filter /FlateDecode";
+    for (w, h, bits, colour_bytes, mask_bits, mask_bytes) in
+        [(W, H, 3, 11, 4, 8), (131_073, 1, 1, 8193, 1, 8193)]
+    {
+        let objects = [
+            (
+                image(&format!("{} /SMask 4 0 R {flate}", gray(bits)), w, h),
+                deflate(&samples(colour_bytes, 70)),
+            ),
+            (
+                image(&format!("{} {flate}", gray(mask_bits)), w, h),
+                deflate(&samples(mask_bytes, 71)),
+            ),
+        ];
+        let case = format!(
+            "{w}x{h} {bits}-bit, {colour_bytes} bytes, under {mask_bits}-bit soft mask, {mask_bytes} bytes"
+        );
+        check_first_requests(&mut cases, &pdf(&objects), &case);
+    }
+    cases.finish();
+}
+
+/// Colour under a mask on its grid, each Flate data cut after every byte of its
+/// samples independently of the other: the first requests find the two ends in
+/// either order, on one pass or on two.
+#[test]
+fn colour_and_mask_cut_independently_stream_as_whole() {
+    let mut cases = Cases::default();
+    let gray = |bits: usize| format!("/ColorSpace /DeviceGray /BitsPerComponent {bits}");
+    let masks = [
+        ("/SMask", gray(4), 4),
+        ("/SMask", format!("{} /Decode [1 0]", gray(1)), 1),
+        ("/SMask", gray(8), 8),
+        ("/Mask", "/ImageMask true".to_string(), 1),
+    ];
+    for bits in [1_usize, 3] {
+        let row = (W as usize * bits).div_ceil(8);
+        let colour = samples(row * H as usize, 72);
+        for (key, dict, mask_bits) in &masks {
+            let mask_row = (W as usize * mask_bits).div_ceil(8);
+            let mask = samples(mask_row * H as usize, 73);
+            for k in 0..=colour.len() {
+                for m in 0..=mask.len() {
+                    let objects = [
+                        (
+                            image(
+                                &format!("{} {key} 4 0 R /Filter /FlateDecode", gray(bits)),
+                                W,
+                                H,
+                            ),
+                            stored_zlib(&colour[..k], 1000),
+                        ),
+                        (
+                            image(&format!("{dict} /Filter /FlateDecode"), W, H),
+                            stored_zlib(&mask[..m], 1000),
+                        ),
+                    ];
+                    let case = format!(
+                        "{} under {dict}, colour cut after {k}, mask after {m}",
+                        gray(bits)
+                    );
+                    check_first_requests(&mut cases, &pdf(&objects), &case);
+                }
+            }
+        }
+    }
+    cases.finish();
+}
+
 /// A colour space of `n` components: its entry, and whether it is `Indexed`.
 struct Space {
     entry: String,
@@ -711,6 +846,47 @@ fn damaged_flate_streams_as_whole() {
                 let pdf = pdf(&[(image(&dict, w as u32, h as u32), damaged)]);
                 cases.check(&asset(&pdf), &format!("{dict}, byte {at} ^ {flip:#x}"));
             }
+        }
+    }
+    cases.finish();
+}
+
+/// Flate data of which neither zlib nor raw deflate reads a byte (stored blocks whose
+/// lengths do not check), which the permissive decoder reads as a request reads it,
+/// whole and cut after a sample of bytes: images of it stream as they decode whole.
+#[test]
+fn flate_only_the_permissive_decoder_reads_streams_as_whole() {
+    let mut cases = Cases::default();
+    for (dict, w, h, bits) in [
+        (
+            "/ColorSpace /DeviceGray /BitsPerComponent 1",
+            61_u32,
+            40_u32,
+            1_usize,
+        ),
+        (
+            "/ColorSpace /DeviceGray /BitsPerComponent 3 /SMask 4 0 R",
+            W,
+            H,
+            3,
+        ),
+        ("/ColorSpace /DeviceGray /BitsPerComponent 8", 64, 48, 8),
+        ("/ImageMask true", 61, 40, 1),
+    ] {
+        let data = samples((w as usize * bits).div_ceil(8) * h as usize, 74);
+        let mut encoded = stored_zlib(&data, 100);
+        for block in (2..encoded.len() - 4).step_by(100 + 5) {
+            encoded[block + 3..block + 5].fill(1);
+        }
+        let mask = (
+            image("/ColorSpace /DeviceGray /BitsPerComponent 4", w, h),
+            samples((w as usize * 4).div_ceil(8) * h as usize, 75),
+        );
+        for cut in (0..=encoded.len()).step_by(7).chain([encoded.len()]) {
+            let dict = format!("{dict} /Filter /FlateDecode");
+            let objects = [(image(&dict, w, h), encoded[..cut].to_vec()), mask.clone()];
+            let case = format!("{dict}, stored lengths that do not check, cut after {cut}");
+            check_first_requests(&mut cases, &pdf(&objects), &case);
         }
     }
     cases.finish();

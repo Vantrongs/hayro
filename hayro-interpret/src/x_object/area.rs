@@ -651,6 +651,9 @@ impl<'m> Area<'m> {
 
     /// Ends the source row being pushed, all of whose texels are pushed.
     pub(crate) fn end_row(&mut self) -> Result<(), Cancelled> {
+        // A row whose texels added nothing (zero summed down the columns) still
+        // counts, so that a run of such rows polls the meter.
+        self.meter.work(1)?;
         let k = self.next_row;
         self.next_row += 1;
         if let Sums::None = self.sums {

@@ -1,7 +1,7 @@
 //! Images whose samples are read incrementally for each request.
 
 use super::index::{Checkpointer, Checkpoints};
-use super::rows::{DataEnds, MaskRows, MaskSource, RawRow, RawRows, piece_texels};
+use super::rows::{DataEnds, MaskRows, MaskSource, RawRow, RawRows, piece_texels, stepped};
 use super::{
     DecodeWork, ImageLayout, PixelFormat, Plane, PlaneLayout, Stop, interleave, premultiply,
 };
@@ -9,7 +9,7 @@ use crate::color::{ColorComponents, ColorSpace, ToLuma, ToRgb};
 use crate::interpret::state::ActiveTransferFunction;
 use crate::x_object::area::Area;
 use crate::x_object::decode::{
-    MaskPath, SampleFormat, SampleRows, direct_invert, image_decode_params, mask_lut,
+    MaskPath, SampleFormat, SampleRows, colour_key, direct_invert, image_decode_params, mask_lut,
     sample_format, sample_lut, short_rows_transparent, unpack_packed, unpremultiply_samples,
 };
 use crate::x_object::image::{ImageKind, ImageXObject};
@@ -407,7 +407,7 @@ impl<'a> Alpha<'a> {
             None
         };
         let Some(stream) = stream else {
-            return Ok(match dict.get::<SmallVec<[u16; 4]>>(MASK) {
+            return Ok(match colour_key(obj, colour.components) {
                 Some(key) if !in_data => Alpha::ColourKey(key),
                 _ => Alpha::None,
             });
@@ -469,12 +469,13 @@ impl<'a> Streamed<'a> {
         } else {
             Alpha::new(obj, &colour, &grid, meter)?
         };
+        let transparent = short_rows_transparent(obj, colour.components);
         Ok(Some(Self {
             obj: obj.clone(),
             colour,
             alpha,
             grid,
-            transparent: short_rows_transparent(obj),
+            transparent,
             stream,
             checkpoints,
             ends,
@@ -529,9 +530,11 @@ impl<'a> Streamed<'a> {
         meter: &Meter<'_>,
     ) -> Result<DecodeWork, Stop> {
         let mut work = DecodeWork::default();
-        // A pass that stops to be read again knows where the data ends, and does not
-        // stop so again.
-        for retry in [true, false] {
+        // A pass stops to be read again only on finding where the colour's or the
+        // mask's data ends (`Stop::Retry`), and the next pass knows it: each pass
+        // read again knows one end more, so there are at most three.
+        loop {
+            let known = self.ends.known();
             let result = match plane {
                 Plane::Image => {
                     let mut pass = ImagePass::new(self, area, meter)?;
@@ -550,11 +553,11 @@ impl<'a> Streamed<'a> {
                 }
             };
             match result {
-                Err(Stop::Retry) if retry => area.reset()?,
+                Err(Stop::Retry) if self.ends.known() > known => area.reset()?,
+                Err(Stop::Retry) => return Err(Stop::Failed),
                 result => return result.map(|()| work),
             }
         }
-        Err(Stop::Failed)
     }
 }
 
@@ -675,8 +678,17 @@ impl<'s, 'a> ImagePass<'s, 'a> {
     /// Reads the rows from the first to the last `area` reads, pushing those it reads.
     fn run(&mut self, area: &mut Area<'_>) -> Result<(), Stop> {
         let wanted = area.rows();
-        let first = std::mem::take(&mut self.first_row);
-        for y in first..wanted.end.min(self.image.grid.height) {
+        let mut y = std::mem::take(&mut self.first_row);
+        while y < wanted.end.min(self.image.grid.height) {
+            if y < wanted.start && !self.reads(y) && !self.image.transparent {
+                // The data ends before row `y`, so it and every row up to those read
+                // are stored zero: only the mask is read past, up to there.
+                if let Some(m) = &mut self.mask {
+                    m.rows.skip_rows(wanted.start - y)?;
+                }
+                y = wanted.start;
+                continue;
+            }
             let end = if y >= wanted.start {
                 self.read_row(y, area)?
             } else {
@@ -699,6 +711,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
                 RowEnd::Cut => self.decoded += 1,
                 RowEnd::Zero => {}
             }
+            y += 1;
         }
         Ok(())
     }
@@ -726,6 +739,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
 
     /// Reads past row `y`, and the mask's.
     fn skip_row(&mut self, y: u32) -> Result<RowEnd, Stop> {
+        stepped();
         if let Some(m) = &mut self.mask {
             m.rows.skip_row()?;
         }

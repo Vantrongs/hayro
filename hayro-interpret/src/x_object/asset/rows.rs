@@ -18,6 +18,15 @@ use std::sync::OnceLock;
 std::thread_local! {
     /// The bytes rows read on this thread, which tests bound.
     pub(super) static READ: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    /// The rows of colour and of masks moved past one at a time on this thread, which
+    /// tests bound.
+    pub(super) static STEPPED: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Counts a row moved past one at a time ([`STEPPED`]).
+pub(super) fn stepped() {
+    #[cfg(test)]
+    STEPPED.set(STEPPED.get() + 1);
 }
 
 /// The most bytes of a row read at once: wider rows are read, and their texels
@@ -40,6 +49,13 @@ pub(super) fn piece_texels(columns: usize, bytes: usize) -> usize {
 pub(super) struct DataEnds {
     pub(super) colour: OnceLock<usize>,
     pub(super) mask: OnceLock<usize>,
+}
+
+impl DataEnds {
+    /// How many of the two ends are known: it only grows, to two at most.
+    pub(super) fn known(&self) -> usize {
+        usize::from(self.colour.get().is_some()) + usize::from(self.mask.get().is_some())
+    }
 }
 
 /// Rows of an image's or mask's stored samples, read incrementally, the reading
@@ -490,16 +506,26 @@ impl MaskRows<'_> {
 
     /// Reads past the next row.
     pub(super) fn skip_row(&mut self) -> Result<(), Stop> {
+        stepped();
         self.begin_row();
         self.end_row()
     }
 
-    /// Moves past the next `n` rows: reads past each of a streamed mask's, and jumps
-    /// over those of a mask decoded whole.
+    /// Moves past the next `n` rows: reads past each of a streamed mask's its data
+    /// holds, and jumps over the rest, and over those of a mask decoded whole.
     pub(super) fn skip_rows(&mut self, n: u32) -> Result<(), Stop> {
-        match self {
-            MaskRows::Decoded { row, .. } => *row += n,
-            MaskRows::Streamed { .. } => (0..n).try_for_each(|_| self.skip_row())?,
+        for left in (1..=n).rev() {
+            match self {
+                MaskRows::Streamed { raw, path, row, .. } if !reads_row(raw, path.bits(), *row) => {
+                    *row += left;
+                    return Ok(());
+                }
+                MaskRows::Streamed { .. } => self.skip_row()?,
+                MaskRows::Decoded { row, .. } => {
+                    *row += left;
+                    return Ok(());
+                }
+            }
         }
         Ok(())
     }

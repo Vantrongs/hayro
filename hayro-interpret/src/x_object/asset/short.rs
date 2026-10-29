@@ -4,7 +4,9 @@
 //! over the image. The image keeps its declared grid and a mask lies on it; a sample
 //! the data does not hold reads as stored zero, past every byte held of 8-bit samples
 //! and past the whole rows held of other depths; under a colour key or `/Matte`, the
-//! rows not held whole are transparent.
+//! rows not held whole are transparent. A colour key with fewer entries than two per
+//! component is no mask. CCITT data that breaks off within a row keeps the pixels
+//! decoded of it, the rest white.
 
 use super::differential::assert_streams_as_whole;
 use super::tests::{asset, pdf};
@@ -20,6 +22,8 @@ const PAINT: [f64; 3] = [0.0, 0.0, 255.0];
 struct Case {
     name: String,
     grid: (u32, u32),
+    /// The first grid row `expected` holds.
+    first_row: usize,
     /// The image's dictionary and stored data, then its mask's, if any.
     objects: Vec<(String, Vec<u8>)>,
     expected: Vec<Vec<String>>,
@@ -38,12 +42,17 @@ fn cases() -> Vec<Case> {
             "case" => cases.push(Case {
                 name: value.to_string(),
                 grid: (0, 0),
+                first_row: 0,
                 objects: Vec::new(),
                 expected: Vec::new(),
             }),
             "grid" => {
                 let (w, h) = value.split_once(' ').unwrap();
                 case.unwrap().grid = (w.parse().unwrap(), h.parse().unwrap());
+            }
+            "rows" => {
+                let (first, _) = value.split_once(' ').unwrap();
+                case.unwrap().first_row = first.parse().unwrap();
             }
             "image" | "mask" => dict = format!("/Type /XObject /Subtype /Image {value}"),
             "data" => {
@@ -161,14 +170,14 @@ const TOLERANCE: u8 = 3;
 #[test]
 fn images_whose_data_ends_early_draw_as_mupdf_draws_them() {
     let cases = cases();
-    assert_eq!(cases.len(), 80);
+    assert_eq!(cases.len(), 92);
     let mut failed = Vec::new();
     for case in &cases {
         let pdf = pdf(&case.objects);
         let asset = asset(&pdf);
         assert_streams_as_whole(&asset, &case.name);
-        let drawn = drawn(&asset, case.grid);
-        let differs = case.expected.iter().zip(&drawn).any(|(expected, drawn)| {
+        let drawn = &drawn(&asset, case.grid)[case.first_row..];
+        let differs = case.expected.iter().zip(drawn).any(|(expected, drawn)| {
             expected.iter().zip(drawn).any(|(token, got)| {
                 colour(token).is_some_and(|want| {
                     want.iter()

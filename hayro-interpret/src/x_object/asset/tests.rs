@@ -1116,6 +1116,97 @@ fn rows_of_a_decoded_mask_are_skipped_without_work() {
     assert!(TOLD.get() < 1024, "{} bytes of work", TOLD.get());
 }
 
+/// Rows past the data's end are jumped over, not stepped through: the last row of an
+/// image two billion rows high whose data holds its first row, alone or under a
+/// soft mask whose data holds as much, read alongside or on its own grid, raw or
+/// Flate, counts next to nothing and equals that row of the same image three rows
+/// high decoded whole. A request of the whole plane in one bin pushes every row,
+/// each counted, and is cancelled within three polls' work.
+#[test]
+#[cfg(debug_assertions)]
+fn rows_past_the_data_are_jumped_over() {
+    let tall = 2_000_000_000_u32;
+    let gray1 = "/ColorSpace /DeviceGray /BitsPerComponent 1";
+    for flate in [false, true] {
+        let filter = if flate { "/Filter /FlateDecode" } else { "" };
+        let stored = |data: &[u8]| {
+            if flate {
+                stored_zlib(data, 1000)
+            } else {
+                data.to_vec()
+            }
+        };
+        // The mask's width, if any (another than the colour's puts it on its own
+        // grid), and the plane requested.
+        for (mask, plane) in [
+            (None, Plane::Image),
+            (Some(8_u32), Plane::Image),
+            (Some(16), Plane::Image),
+            (Some(16), Plane::Mask),
+        ] {
+            let objects = |h: u32| {
+                let entry = if mask.is_some() { "/SMask 4 0 R" } else { "" };
+                let mut objects = vec![(
+                    image(&format!("{gray1} {entry} {filter}"), 8, h),
+                    stored(&[0xA5]),
+                )];
+                if let Some(mw) = mask {
+                    let row = vec![0x5A; mw as usize / 8];
+                    objects.push((image(&format!("{gray1} {filter}"), mw, h), stored(&row)));
+                }
+                objects
+            };
+            let case = format!("flate {flate}, mask {mask:?}, {plane:?}");
+            let small = pdf(&objects(3));
+            let small = asset(&small);
+            let mut whole = whole(&small);
+            let p = *whole.layout().plane(plane).unwrap();
+            let expected = request(&mut whole, plane, (p.width, 3), [0, 2, p.width, 3]);
+            let huge = pdf(&objects(tall));
+            let huge = asset(&huge);
+            let mut source = huge.open(None, None).unwrap();
+            assert!(is_streamed(&source), "{case}");
+            let polls = Cell::new(0);
+            let hook = || {
+                polls.set(polls.get() + 1);
+                false
+            };
+            TOLD.set(0);
+            rows::STEPPED.set(0);
+            let last = source
+                .request(&ImageRequest {
+                    plane,
+                    grid: (p.width, tall),
+                    window: [0, tall - 1, p.width, tall],
+                    cancel: Some(&hook),
+                })
+                .unwrap();
+            assert_eq!(last.data, expected.data, "{case}");
+            let (told, stepped) = (TOLD.get(), rows::STEPPED.get());
+            assert!(
+                told < 1024 && stepped <= 4 && polls.get() <= 1,
+                "{case}: {told} bytes of work, {stepped} rows stepped, {} polls",
+                polls.get()
+            );
+            let polls = Cell::new(0);
+            let hook = || {
+                polls.set(polls.get() + 1);
+                polls.get() > 1
+            };
+            TOLD.set(0);
+            let result = source.request(&ImageRequest {
+                plane,
+                grid: (1, 1),
+                window: [0, 0, 1, 1],
+                cancel: Some(&hook),
+            });
+            assert!(matches!(result, Err(RequestError::Cancelled)), "{case}");
+            let told = TOLD.get();
+            assert!(told < 3 * POLL_BYTES, "{case}: {told} bytes of work");
+        }
+    }
+}
+
 /// `source`'s request of `window` with a hook that asks to stop from its second poll
 /// on is cancelled, the hook polled twice, having read and pushed less than two
 /// pieces.
