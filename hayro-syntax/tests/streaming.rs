@@ -426,6 +426,107 @@ fn encrypted_ccitt_rows_hold_a_window_whatever_the_data_size() {
     assert!(peaks.iter().all(|&p| p <= peaks[0] + 4096), "{peaks:?}");
 }
 
+/// Bits written most significant first.
+#[derive(Default)]
+struct Bits {
+    bytes: Vec<u8>,
+    len: usize,
+}
+
+impl Bits {
+    fn push(&mut self, code: &str) {
+        for bit in code.bytes() {
+            if self.len.is_multiple_of(8) {
+                self.bytes.push(0);
+            }
+            if bit == b'1' {
+                *self.bytes.last_mut().unwrap() |= 0x80 >> (self.len % 8);
+            }
+            self.len += 1;
+        }
+    }
+}
+
+/// Encrypted Group 3 data whose damaged lines are each longer than the window of
+/// decrypted bytes the CCITT decoder reads in: going back to the start of each, to
+/// find the EOL after it, decrypts a bounded amount, not the data before it again,
+/// so the bytes decrypted grow with the data, under AES and RC4 alike, and the rows
+/// are those of the same data stored plain.
+#[test]
+#[cfg(debug_assertions)]
+fn going_back_in_encrypted_ccitt_data_decrypts_a_bounded_amount() {
+    use common::rc4::{self, Part};
+    use hayro_syntax::work::TOLD;
+    const EOL: &str = "000000000001";
+    // Runs of no white and no black pixels: a line that never ends, to its EOL.
+    const NOTHING: &str = "001101010000110111";
+    let line_bytes = 160 * 1024;
+    let dict = "/Filter /CCITTFaxDecode /DecodeParms << /K 0 /Columns 8 >>";
+    for lines in [3, 12] {
+        let mut bits = Bits::default();
+        bits.push(EOL);
+        for _ in 0..lines {
+            for _ in 0..line_bytes * 8 / NOTHING.len() {
+                bits.push(NOTHING);
+            }
+            bits.push(EOL);
+        }
+        for _ in 0..5 {
+            bits.push(EOL);
+        }
+        let data = bits.bytes;
+        let params = ImageDecodeParams {
+            width: 8,
+            height: lines,
+            ..Default::default()
+        };
+        // The rows decoded and the work counted reading them.
+        let read = |stream: &Stream<'_>| {
+            let rows = stream.ccitt_rows(&params).unwrap();
+            let before = TOLD.get();
+            let mut decoded = Vec::new();
+            let end = rows.decode(
+                |c| {
+                    decoded.push(c.to_vec());
+                    true
+                },
+                &Meter::default(),
+            );
+            ((decoded, end), TOLD.get() - before)
+        };
+        let plain = stream_file(dict, &data);
+        let (expected, plain_work) = read(&object_3(&plain));
+        assert_eq!(expected.0.len(), lines as usize);
+        let aes = encrypted_file(dict, &data);
+        let rc4 = Pdf::new(rc4::file(
+            &[
+                Part::Object("<< /Type /Catalog /Pages 2 0 R >>", b""),
+                Part::Object("<< /Type /Pages /Kids [] /Count 0 >>", b""),
+                Part::StreamWith(dict, &data),
+            ],
+            &[],
+        ))
+        .unwrap();
+        for (cipher, pdf) in [("AES", aes), ("RC4", rc4)] {
+            let (rows, work) = read(&object_3(&pdf));
+            assert!(rows == expected, "{cipher}, {lines} lines: other rows");
+            let decrypted = work - plain_work;
+            // Each byte decrypted once going forward and once going back, and a
+            // bounded amount for each line gone back to.
+            let bound = 2 * data.len() + lines as usize * 128 * 1024;
+            println!(
+                "{cipher}, {lines} lines, {} bytes: {decrypted} decrypted",
+                data.len()
+            );
+            assert!(
+                decrypted <= bound,
+                "{cipher}, {lines} lines of {line_bytes} bytes: {decrypted} bytes \
+                 decrypted, over {bound}"
+            );
+        }
+    }
+}
+
 /// A CCITT stream that decodes a few rows of many declared holds at most eight
 /// times what it decoded: room is made ahead of the rows, but not for all of them.
 #[test]

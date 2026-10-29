@@ -258,6 +258,89 @@ impl<'a> DecryptedReader<'a> {
     }
 }
 
+/// The decrypted bytes between two RC4 states a [`Seekable`] keeps.
+#[cfg(feature = "images")]
+const RC4_MARK: usize = 64 * 1024;
+
+/// A [`DecryptedReader`] that also goes back, at a cost that does not grow with how
+/// far into the data it goes back to: AES in CBC mode decrypts any block from the
+/// stored block before it, and RC4 resumes from the state it had at the last multiple
+/// of [`RC4_MARK`] decrypted bytes before, which it keeps for each it reached (258
+/// bytes each, about 0.4% of the bytes read).
+#[cfg(feature = "images")]
+#[derive(Clone)]
+pub(crate) struct Seekable<'a> {
+    reader: DecryptedReader<'a>,
+    /// The decrypted bytes before the next read.
+    at: usize,
+    /// For RC4, its state at each multiple of [`RC4_MARK`] decrypted bytes reached.
+    marks: Vec<Rc4>,
+}
+
+#[cfg(feature = "images")]
+impl<'a> Seekable<'a> {
+    pub(crate) fn new(mut reader: DecryptedReader<'a>) -> Self {
+        reader.rewind();
+        let marks = match &reader.cursor.cipher {
+            Cipher::Rc4 { current, .. } => alloc::vec![current.clone()],
+            _ => Vec::new(),
+        };
+        Self {
+            reader,
+            at: 0,
+            marks,
+        }
+    }
+
+    /// The bytes the data decrypts to (see [`DecryptedReader::len`]).
+    pub(crate) fn len(&self) -> usize {
+        self.reader.len()
+    }
+
+    /// Fills `out` with the next decrypted bytes, or as many as reach the next
+    /// multiple of [`RC4_MARK`] for RC4, and returns how many; 0 only at the end.
+    pub(crate) fn read(&mut self, out: &mut [u8]) -> usize {
+        let rc4 = matches!(self.reader.cursor.cipher, Cipher::Rc4 { .. });
+        let len = match rc4 {
+            true => out.len().min(RC4_MARK - self.at % RC4_MARK),
+            false => out.len(),
+        };
+        let n = self.reader.read(&mut out[..len]);
+        self.at += n;
+        if let Cipher::Rc4 { current, .. } = &self.reader.cursor.cipher
+            && self.at.is_multiple_of(RC4_MARK)
+            && self.marks.len() == self.at / RC4_MARK
+        {
+            self.marks.push(current.clone());
+        }
+        n
+    }
+
+    /// Goes back to decrypted byte `to`, at most where the next read starts, or to
+    /// fewer than [`RC4_MARK`] bytes before it; returns where the next read starts.
+    pub(crate) fn back_to(&mut self, to: usize) -> usize {
+        let to = to.min(self.at);
+        let cursor = &mut self.reader.cursor;
+        self.at = match &mut cursor.cipher {
+            Cipher::None => to,
+            Cipher::Rc4 { current, .. } => {
+                // Each multiple reached has its state, the start's included.
+                let mark = to / RC4_MARK;
+                current.clone_from(&self.marks[mark]);
+                mark * RC4_MARK
+            }
+            Cipher::Aes(blocks) => {
+                blocks.taken = 0;
+                blocks.end = 0;
+                to / 16 * 16
+            }
+        };
+        // The stored bytes before the decrypted ones: an AES IV.
+        cursor.pos = self.at + usize::from(matches!(cursor.cipher, Cipher::Aes(_))) * 16;
+        self.at
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +427,67 @@ mod tests {
             for len in (0..66).chain([8193]) {
                 let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
                 check(&decryptor, &bytes);
+            }
+        }
+    }
+
+    /// Gone back to any position read before, a [`Seekable`] reads on as whole
+    /// decryption returns the data, having gone back fewer than [`RC4_MARK`] bytes
+    /// before that position for RC4, and fewer than an AES block for AES.
+    #[cfg(feature = "images")]
+    #[test]
+    fn going_back_reads_as_whole_decryption_from_near_the_position() {
+        use super::{RC4_MARK, Seekable};
+        let id = ObjectIdentifier::new(1234, 17);
+        let data: Vec<u8> = (0..3 * RC4_MARK + 1000).map(|i| (i % 253) as u8).collect();
+        for (decryptor, near) in [
+            (Decryptor::None, 1),
+            (
+                Decryptor::Rc4 {
+                    key: alloc::vec![13; 5],
+                },
+                RC4_MARK,
+            ),
+            (decryptor(DecryptorTag::Rc4), RC4_MARK),
+            (decryptor(DecryptorTag::Aes128), 16),
+            (decryptor(DecryptorTag::Aes256), 16),
+        ] {
+            let expected = decryptor
+                .decrypt(id, &data, DecryptionTarget::Stream)
+                .unwrap();
+            let mut reader = Seekable::new(
+                decryptor
+                    .reader(id, &data, DecryptionTarget::Stream)
+                    .unwrap(),
+            );
+            assert_eq!(reader.len(), expected.len());
+            let mut buf = alloc::vec![0; 7000];
+            // Read through the data first, so that RC4 marks every multiple of it.
+            while reader.read(&mut buf) > 0 {}
+            let len = expected.len();
+            for to in [
+                len,
+                len - 1,
+                0,
+                1,
+                RC4_MARK,
+                RC4_MARK - 1,
+                2 * RC4_MARK + 17,
+                16,
+                15,
+                33,
+            ] {
+                let at = reader.back_to(to);
+                assert!(at <= to && to - at < near, "back to {to}: at {at}");
+                let mut read = Vec::new();
+                loop {
+                    let n = reader.read(&mut buf);
+                    if n == 0 {
+                        break;
+                    }
+                    read.extend_from_slice(&buf[..n]);
+                }
+                assert_eq!(read, expected[at..], "back to {to}");
             }
         }
     }

@@ -1,4 +1,4 @@
-use crate::crypto::reader::DecryptedReader;
+use crate::crypto::reader::{DecryptedReader, Seekable};
 use crate::object::Dict;
 use crate::object::dict::keys::{
     BLACK_IS_1, COLUMNS, ENCODED_BYTE_ALIGN, END_OF_BLOCK, END_OF_LINE, K, ROWS,
@@ -251,10 +251,11 @@ impl<'a> CcittRows<'a> {
         let result = match self.data.plain() {
             Some(data) => hayro_ccitt::decode(data, &mut rows, &mut context),
             None => {
+                let reader = Seekable::new(self.data.clone());
                 let window = Window {
-                    len: self.data.len(),
+                    len: reader.len(),
                     state: RefCell::new(WindowState {
-                        reader: self.data.clone(),
+                        reader,
                         bytes: Vec::new(),
                         start: 0,
                     }),
@@ -278,7 +279,8 @@ impl<'a> CcittRows<'a> {
 
 /// Decrypted bytes the CCITT decoder reads behind where it reads: it goes back to the
 /// start of a damaged line, which this holds for lines of up to this many encoded
-/// bytes; a line longer than that is decrypted again from the start of the data.
+/// bytes; for a line longer than that, decryption goes back to its start
+/// ([`Seekable::back_to`]).
 const WINDOW: usize = 64 * 1024;
 
 /// The bytes decrypted at a time.
@@ -297,7 +299,7 @@ struct Window<'r, 'a> {
 }
 
 struct WindowState<'a> {
-    reader: DecryptedReader<'a>,
+    reader: Seekable<'a>,
     /// Decrypted bytes, the first at `start` in the data.
     bytes: Vec<u8>,
     start: usize,
@@ -312,9 +314,8 @@ impl Source for Window<'_, '_> {
         let mut state = self.state.borrow_mut();
         let end = pos + out.len();
         if pos < state.start {
-            state.reader.rewind();
+            state.start = state.reader.back_to(pos);
             state.bytes.clear();
-            state.start = 0;
         }
         while state.start + state.bytes.len() < end && !self.cancelled.get() {
             if state.bytes.len() >= 2 * WINDOW {
@@ -639,7 +640,7 @@ fn fill_short<T: Copy>(slice: &mut [T], value: T) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Source, WINDOW, Window, WindowState, decode};
+    use super::{Seekable, Source, WINDOW, Window, WindowState, decode};
     use crate::crypto::{DecryptionTarget, Decryptor};
     use crate::object::FromBytes;
     use crate::object::ObjectIdentifier;
@@ -718,9 +719,8 @@ mod tests {
     }
 
     /// RC4 data read through a window reads as the data decrypted whole, read
-    /// forward, back within the window, and back past it (decrypted again from the
-    /// start), holding no more than the window allows. (AES data is read through one
-    /// in `tests/streaming.rs`.)
+    /// forward, back within the window, and back past it, holding no more than the
+    /// window allows. (AES data is read through one in `tests/streaming.rs`.)
     #[test]
     fn a_window_reads_as_whole_decryption() {
         let data: Vec<u8> = (0..300_000_u32).map(|i| (i * 7 % 251) as u8).collect();
@@ -732,9 +732,11 @@ mod tests {
             let plain = decryptor
                 .decrypt(id, &data, DecryptionTarget::Stream)
                 .unwrap();
-            let reader = decryptor
-                .reader(id, &data, DecryptionTarget::Stream)
-                .unwrap();
+            let reader = Seekable::new(
+                decryptor
+                    .reader(id, &data, DecryptionTarget::Stream)
+                    .unwrap(),
+            );
             let meter = Meter::default();
             let window = Window {
                 len: reader.len(),
