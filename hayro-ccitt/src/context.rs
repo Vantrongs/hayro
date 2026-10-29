@@ -57,6 +57,12 @@ impl DecoderContext {
         }
     }
 
+    /// The heap bytes a copy of it holds: its two lines' colour changes, at most a
+    /// change per column each.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        (self.ref_changes.len() + self.coding_changes.len()) * size_of::<u32>()
+    }
+
     pub(crate) fn reset(&mut self) {
         self.ref_changes.clear();
         self.ref_pos = 0;

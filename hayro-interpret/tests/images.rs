@@ -430,8 +430,8 @@ fn region_cost(dict: &str, data: &[u8], bins: Bins) -> (usize, usize) {
 /// CCITT image, costs memory in proportion to the region, not to the image (whose
 /// decoding whole held a byte per pixel, 64 MiB for the larger): opening it and
 /// requesting a tile at full size or a thumbnail holds pieces of rows (a CCITT row's
-/// colour changes) and the bins, besides the Flate decoder states a request saves
-/// for later ones (at most 2 MiB); a tile of an image four times as large holds the
+/// colour changes) and the bins, besides the Flate and CCITT decoder states a request
+/// saves for later ones (at most 2 MiB); a tile of an image four times as large holds the
 /// same, but for a piece of a row twice as wide. Each peak stays under its ceiling.
 #[test]
 fn a_small_region_of_a_large_bilevel_image_costs_the_region() {

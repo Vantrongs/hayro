@@ -2,9 +2,9 @@
 //! image resumes from the nearest one before its first row instead of decoding every
 //! row from the start.
 
-use super::Stop;
 use super::jpeg::JpegIndex;
-use super::rows::RawRows;
+use super::rows::MaskRows;
+use super::{Plane, Stop};
 use hayro_syntax::object::stream::{DecodedCheckpoint, DecodedReader, OwnedStream};
 use std::sync::Mutex;
 
@@ -16,13 +16,16 @@ pub(super) const MIN_CHECKPOINT_BYTES: usize = 256 * 1024;
 /// An asset's saved decoder states.
 #[derive(Default)]
 pub(super) struct Checkpoints {
-    flate: Mutex<FlateIndex>,
+    /// Of the colour (or a stencil mask's alpha), with a mask read alongside it.
+    rows: Mutex<RowIndex>,
+    /// Of a mask on its own grid.
+    mask: Mutex<RowIndex>,
     pub(super) jpeg: Mutex<JpegIndex>,
 }
 
-/// Flate decoder states, by the row they resume at.
+/// Decoder states of a plane's rows, by the row they resume at.
 #[derive(Default)]
-struct FlateIndex {
+struct RowIndex {
     /// Sorted by row; its capacity is the plan's slots once a state is saved.
     entries: Vec<Entry>,
 }
@@ -30,51 +33,70 @@ struct FlateIndex {
 struct Entry {
     row: u32,
     state: DecodedCheckpoint,
+    /// The state of a mask read alongside, where its reader needs one; boxed, as most
+    /// entries have none.
+    mask: Option<Box<DecodedCheckpoint>>,
+}
+
+impl RowIndex {
+    fn bytes(&self) -> usize {
+        self.entries.capacity() * size_of::<Entry>()
+            + self
+                .entries
+                .iter()
+                .map(|e| {
+                    let mask = e
+                        .mask
+                        .as_ref()
+                        .map_or(0, |m| size_of::<DecodedCheckpoint>() + m.heap_bytes());
+                    e.state.heap_bytes() + mask
+                })
+                .sum::<usize>()
+    }
 }
 
 impl Checkpoints {
     /// The bytes the saved states take: the index, its slots, and each state's heap.
     pub(super) fn bytes(&self) -> Result<usize, Stop> {
-        let flate = self.flate.lock().map_err(|_| Stop::Failed)?;
+        let rows = self.rows.lock().map_err(|_| Stop::Failed)?;
+        let mask = self.mask.lock().map_err(|_| Stop::Failed)?;
         let jpeg = self.jpeg.lock().map_err(|_| Stop::Failed)?;
-        Ok(size_of::<Self>()
-            + flate.entries.capacity() * size_of::<Entry>()
-            + flate
-                .entries
-                .iter()
-                .map(|e| e.state.heap_bytes())
-                .sum::<usize>()
-            + jpeg.heap_bytes())
+        Ok(size_of::<Self>() + rows.bytes() + mask.bytes() + jpeg.heap_bytes())
     }
 
-    /// A checkpointer for a pass whose stored rows `raw` reads, `height` rows of
-    /// `row_bytes`, from `stream`; and the row `raw` continues at, resumed from the
-    /// state nearest at or before row `before`. `None` when the reader cannot be
-    /// checkpointed or not one state fits the budget.
+    /// A checkpointer for a pass over `plane`, whose readers' states hold `bound` heap
+    /// bytes at most, in `budget` bytes, `height` rows of `row_bytes` stored bytes, read
+    /// from `stream` and a mask's `mask_stream` read alongside; and the row the pass
+    /// continues at, `resume`d from the state nearest at or before row `before`.
+    /// `None` when the readers cannot be checkpointed or not one state fits the budget.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn checkpointer<'c>(
         &'c self,
-        stream: &'c OwnedStream,
-        raw: &mut RawRows<'_>,
-        row_bytes: usize,
-        height: u32,
+        plane: Plane,
+        stream: OwnedStream,
+        mask_stream: Option<OwnedStream>,
+        bound: Option<usize>,
+        (row_bytes, height, budget): (usize, u32, usize),
         before: u32,
+        resume: impl FnOnce(u32, &DecodedCheckpoint, Option<&DecodedCheckpoint>) -> bool,
     ) -> Result<Option<(Checkpointer<'c>, u32)>, Stop> {
-        let Some(plan) = raw
-            .reader
-            .checkpoint_heap_bound()
-            .and_then(|bound| Plan::new(bound, row_bytes, height))
-        else {
+        let Some(plan) = bound.and_then(|bound| Plan::new(bound, row_bytes, height, budget)) else {
             return Ok(None);
         };
-        let index = self.flate.lock().map_err(|_| Stop::Failed)?;
-        let start = match index.entries.iter().rev().find(|e| e.row <= before) {
-            Some(e) if raw.resume(e.row, &e.state) => e.row,
+        let index = match plane {
+            Plane::Image => &self.rows,
+            Plane::Mask => &self.mask,
+        };
+        let entries = index.lock().map_err(|_| Stop::Failed)?;
+        let start = match entries.entries.iter().rev().find(|e| e.row <= before) {
+            Some(e) if resume(e.row, &e.state, e.mask.as_deref()) => e.row,
             Some(_) => return Err(Stop::Failed),
             None => 0,
         };
         let checkpointer = Checkpointer {
-            index: &self.flate,
+            index,
             stream,
+            mask_stream,
             plan,
         };
         Ok(Some((checkpointer, start)))
@@ -90,10 +112,10 @@ struct Plan {
 
 impl Plan {
     /// The spacing for `height` rows of `row_bytes` stored bytes whose states hold
-    /// `heap_bound` heap bytes at most: as many states as the budget holds, spread over
+    /// `heap_bound` heap bytes at most: as many states as `budget` holds, spread over
     /// the rows; `None` when not one fits.
-    fn new(heap_bound: usize, row_bytes: usize, height: u32) -> Option<Self> {
-        let count = (CHECKPOINT_BUDGET - size_of::<Checkpoints>())
+    fn new(heap_bound: usize, row_bytes: usize, height: u32, budget: usize) -> Option<Self> {
+        let count = budget.checked_sub(size_of::<Checkpoints>())?
             / size_of::<Entry>().checked_add(heap_bound)?;
         let interval = height
             .div_ceil(u32::try_from(count).ok().filter(|&c| c > 0)?)
@@ -105,8 +127,9 @@ impl Plan {
 
 /// One pass's use of the index: it saves states every so many rows.
 pub(super) struct Checkpointer<'c> {
-    index: &'c Mutex<FlateIndex>,
-    stream: &'c OwnedStream,
+    index: &'c Mutex<RowIndex>,
+    stream: OwnedStream,
+    mask_stream: Option<OwnedStream>,
     plan: Plan,
 }
 
@@ -116,9 +139,39 @@ impl Checkpointer<'_> {
         (row / self.plan.interval + 1).saturating_mul(self.plan.interval)
     }
 
-    /// Saves `reader`'s state as resuming at `row`, if `row` is due for one and the
-    /// index has room for it.
-    pub(super) fn after_row(&self, row: u32, reader: &DecodedReader<'_>) -> Result<(), Stop> {
+    /// Saves `reader`'s state, and that of a `mask` read alongside, as resuming at
+    /// `row`, if `row` is due for one, the index has room for it and both can be saved.
+    pub(super) fn after_row(
+        &self,
+        row: u32,
+        reader: &DecodedReader<'_>,
+        mask: Option<&MaskRows<'_>>,
+    ) -> Result<(), Stop> {
+        self.save(row, || {
+            let state = reader.checkpoint(&self.stream)?;
+            let mask = match mask {
+                Some(m) => m.checkpoint(row, self.mask_stream.as_ref())?.map(Box::new),
+                None => None,
+            };
+            Some((state, mask))
+        })
+    }
+
+    /// Saves the state of `rows`, a mask on its own grid, as resuming at the row it
+    /// reads next, if that is due for one, the index has room for it and the mask read
+    /// every row before it whole.
+    pub(super) fn after_mask_row(&self, rows: &MaskRows<'_>) -> Result<(), Stop> {
+        let row = rows.row();
+        self.save(row, || {
+            Some((rows.checkpoint(row, Some(&self.stream))??, None))
+        })
+    }
+
+    fn save(
+        &self,
+        row: u32,
+        state: impl FnOnce() -> Option<(DecodedCheckpoint, Option<Box<DecodedCheckpoint>>)>,
+    ) -> Result<(), Stop> {
         if !row.is_multiple_of(self.plan.interval) {
             return Ok(());
         }
@@ -129,13 +182,13 @@ impl Checkpointer<'_> {
         let Err(at) = index.entries.binary_search_by_key(&row, |e| e.row) else {
             return Ok(());
         };
-        let Some(state) = reader.checkpoint(self.stream) else {
+        let Some((state, mask)) = state() else {
             return Ok(());
         };
         if index.entries.capacity() == 0 {
             index.entries.reserve_exact(self.plan.slots);
         }
-        index.entries.insert(at, Entry { row, state });
+        index.entries.insert(at, Entry { row, state, mask });
         Ok(())
     }
 }
@@ -175,7 +228,7 @@ mod tests {
     }
 
     fn saved(asset: &ImageAsset) -> usize {
-        asset.0.checkpoints.flate.lock().unwrap().entries.len()
+        asset.0.checkpoints.rows.lock().unwrap().entries.len()
     }
 
     /// Reopened, an image resumes from the state nearest before a request's rows, for
@@ -253,7 +306,7 @@ mod tests {
                 assert_eq!(pass == 1 && fits, work.rows_decoded < u64::from(h / 2));
                 assert!(asset.checkpoint_bytes().unwrap() <= CHECKPOINT_BUDGET);
             }
-            let index = asset.0.checkpoints.flate.lock().unwrap();
+            let index = asset.0.checkpoints.rows.lock().unwrap();
             let full = index.entries.len() == index.entries.capacity();
             assert!(
                 full && index.entries.is_empty() != fits,

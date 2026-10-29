@@ -10,7 +10,7 @@ use crate::x_object::decode::{
 use crate::x_object::image::{ImageKind, ImageXObject};
 use core::ops::Range;
 use hayro_syntax::object::Stream;
-use hayro_syntax::object::stream::{DecodedCheckpoint, DecodedReader};
+use hayro_syntax::object::stream::{DecodedCheckpoint, DecodedReader, OwnedStream};
 use hayro_syntax::work::{Cancelled, Meter};
 use std::sync::OnceLock;
 
@@ -323,6 +323,15 @@ impl<'a> MaskSource<'a> {
         Ok(decoded.map(Self::Decoded))
     }
 
+    /// The mask's stream, owned, which the states saved of its reader keep; `None`
+    /// for a mask decoded whole, whose rows need none.
+    pub(super) fn owned_stream(&self) -> Option<OwnedStream> {
+        match self {
+            Self::Streamed { obj, .. } => Some(obj.stream.to_owned_stream()),
+            Self::Decoded(_) => None,
+        }
+    }
+
     pub(super) fn size(&self) -> (u32, u32) {
         match self {
             Self::Streamed { width, height, .. } => (*width, *height),
@@ -396,7 +405,74 @@ pub(super) enum MaskRows<'a> {
     },
 }
 
-impl MaskRows<'_> {
+impl<'a> MaskRows<'a> {
+    /// The row read next.
+    pub(super) fn row(&self) -> u32 {
+        match self {
+            MaskRows::Streamed { row, .. } | MaskRows::Decoded { row, .. } => *row,
+        }
+    }
+
+    /// The reader of a streamed mask's rows.
+    pub(super) fn raw(&mut self) -> Option<&mut RawRows<'a>> {
+        match self {
+            MaskRows::Streamed { raw, .. } => Some(raw),
+            MaskRows::Decoded { .. } => None,
+        }
+    }
+
+    /// The most heap bytes a state saved of it alongside the colour holds, boxed: none
+    /// for a mask decoded whole, which moves to any row at once; `None` where its
+    /// reader cannot be saved.
+    pub(super) fn checkpoint_heap_bound(&self) -> Option<usize> {
+        match self {
+            MaskRows::Streamed { raw, .. } => raw
+                .reader
+                .checkpoint_heap_bound()?
+                .checked_add(size_of::<DecodedCheckpoint>()),
+            MaskRows::Decoded { .. } => Some(0),
+        }
+    }
+
+    /// Its state to resume at row `at` with [`Self::resume`], where `at` is the row it
+    /// reads next and it read every row before it whole: `Some(None)` for a mask
+    /// decoded whole.
+    pub(super) fn checkpoint(
+        &self,
+        at: u32,
+        stream: Option<&OwnedStream>,
+    ) -> Option<Option<DecodedCheckpoint>> {
+        if self.row() != at {
+            return None;
+        }
+        match self {
+            MaskRows::Streamed { raw, row, .. } => {
+                let whole = raw.total == *row as usize * raw.row_bytes;
+                whole
+                    .then(|| raw.reader.checkpoint(stream?))
+                    .flatten()
+                    .map(Some)
+            }
+            MaskRows::Decoded { .. } => Some(None),
+        }
+    }
+
+    /// Continues at `at` from `state`, saved by [`Self::checkpoint`]; false if it
+    /// does not resume this mask.
+    pub(super) fn resume(&mut self, at: u32, state: Option<&DecodedCheckpoint>) -> bool {
+        let resumed = match (&mut *self, state) {
+            (MaskRows::Streamed { raw, .. }, Some(state)) => raw.resume(at, state),
+            (MaskRows::Decoded { .. }, None) => true,
+            _ => false,
+        };
+        if resumed {
+            match self {
+                MaskRows::Streamed { row, .. } | MaskRows::Decoded { row, .. } => *row = at,
+            }
+        }
+        resumed
+    }
+
     /// The bytes the mask's incremental decoders produced.
     pub(super) fn inflated_bytes(&self) -> u64 {
         match self {

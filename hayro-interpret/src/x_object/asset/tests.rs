@@ -1657,6 +1657,145 @@ fn chained_rows_before_a_request_resume_from_a_saved_state() {
     }
 }
 
+/// Later requests of a mask on its own grid, of the colour with a mask read alongside
+/// (on its grid, and with `/Matte`), and of a CCITT image resume from the state an
+/// earlier request saved nearest before their rows, decoding at most the rows between
+/// two states, and give what decoding the image whole gives.
+#[test]
+fn masks_and_ccitt_rows_before_a_request_resume_from_a_saved_state() {
+    let gray = |bits: u32| format!("/ColorSpace /DeviceGray /BitsPerComponent {bits}");
+    let (n, m) = (4096, 1024);
+    let flate = |bits: u32| format!("{} /Filter /FlateDecode", gray(bits));
+    let packed = |w: u32, h: u32, seed: u32| zlib(&noise((w / 8 * h) as usize, seed));
+    let bytes = |w: u32, h: u32, seed: u32| zlib(&noise((w * h) as usize, seed));
+    let a85 = |seed: u32| {
+        let data = stored_zlib(&noise((n / 8 * n) as usize, seed), 65_535);
+        crate::chains::ascii_85(&data, &mut crate::chains::Rng(u64::from(seed)))
+    };
+    let page = include_bytes!("../../../../hayro-ccitt/tests/streams/g3_1d_byte_align_eol.bin");
+    let pages = 1100;
+    for (case, plane, objects) in [
+        (
+            "own grid",
+            Plane::Mask,
+            vec![
+                (
+                    image(&format!("{} /SMask 4 0 R", flate(1)), n, n),
+                    packed(n, n, 1),
+                ),
+                (image(&flate(8), m, n), bytes(m, n, 2)),
+            ],
+        ),
+        (
+            "alongside",
+            Plane::Image,
+            vec![
+                (
+                    image(&format!("{} /SMask 4 0 R", flate(1)), n, n),
+                    packed(n, n, 3),
+                ),
+                (image(&flate(1), n, n), packed(n, n, 4)),
+            ],
+        ),
+        (
+            "a85 flate own grid",
+            Plane::Mask,
+            vec![
+                (
+                    image(&format!("{} /SMask 4 0 R", flate(1)), m, m),
+                    packed(m, m, 7),
+                ),
+                (
+                    image(&format!("{} /Filter [/A85 /FlateDecode]", gray(1)), n, n),
+                    a85(8),
+                ),
+            ],
+        ),
+        (
+            "a85 flate alongside",
+            Plane::Image,
+            vec![
+                (
+                    image(&format!("{} /SMask 4 0 R", flate(1)), n, n),
+                    packed(n, n, 9),
+                ),
+                (
+                    image(&format!("{} /Filter [/A85 /FlateDecode]", gray(1)), n, n),
+                    a85(10),
+                ),
+            ],
+        ),
+        (
+            "matte",
+            Plane::Image,
+            vec![
+                (
+                    image(&format!("{} /SMask 4 0 R", flate(8)), m, m),
+                    bytes(m, m, 5),
+                ),
+                (
+                    image(&format!("{} /Matte [0.5]", flate(8)), m, m),
+                    bytes(m, m, 6),
+                ),
+            ],
+        ),
+        (
+            "ccitt",
+            Plane::Image,
+            vec![(
+                image(
+                    &format!(
+                        "{} /Filter /CCITTFaxDecode /DecodeParms \
+                         << /K 0 /Columns 211 /EncodedByteAlign true >>",
+                        gray(1)
+                    ),
+                    211,
+                    96 * pages,
+                ),
+                page.repeat(pages as usize),
+            )],
+        ),
+    ] {
+        let pdf = pdf(&objects);
+        let asset = asset(&pdf);
+        let mut source = asset.open(None, None).unwrap();
+        assert!(is_streamed(&source), "{case}");
+        let mut decoded = whole(&asset);
+        let p = *source.layout().plane(plane).unwrap();
+        let (w, h) = (p.width, p.height);
+        let mut work = Vec::new();
+        for y in [h - 1, h - 2, h * 3 / 4, h / 2 + 7, h - 1] {
+            let window = [w - 9, y, w, y + 1];
+            let expected = request(&mut decoded, plane, (w, h), window);
+            let before = source.work().rows_decoded;
+            let got = request(&mut source, plane, (w, h), window);
+            assert_eq!(got.data, expected.data, "{case}: row {y}");
+            work.push(source.work().rows_decoded - before);
+        }
+        assert!(work[0] >= u64::from(h - 1), "{case}: {work:?}");
+        for &later in &work[1..] {
+            assert!(later < u64::from(h / 3), "{case}: {work:?}");
+        }
+        assert!(asset.checkpoint_bytes().unwrap() <= index::CHECKPOINT_BUDGET);
+    }
+    // The pages read as many copies of the page.
+    let dict = format!(
+        "{} /Filter /CCITTFaxDecode /DecodeParms << /K 0 /Columns 211 /EncodedByteAlign true >>",
+        gray(1)
+    );
+    let one = asset(&pdf(&[(image(&dict, 211, 96), page.to_vec())]));
+    let two = asset(&pdf(&[(image(&dict, 211, 192), page.repeat(2))]));
+    let a = request(&mut whole(&one), Plane::Image, (211, 96), [0, 0, 211, 96]).data;
+    let b = request(
+        &mut whole(&two),
+        Plane::Image,
+        (211, 192),
+        [0, 96, 211, 192],
+    )
+    .data;
+    assert_eq!(a, b);
+}
+
 /// An image whose data pass through 100,000 filters over no data is opened,
 /// requested and dropped on a 256 KiB stack, reading as decoding it whole does; one
 /// through 20 Flate filters, more than a reader decodes as it reads, streams as it

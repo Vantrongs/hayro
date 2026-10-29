@@ -1,6 +1,6 @@
 //! Images whose samples are read incrementally for each request.
 
-use super::index::{Checkpointer, Checkpoints};
+use super::index::{CHECKPOINT_BUDGET, Checkpointer, Checkpoints};
 use super::rows::{DataEnds, MaskRows, MaskSource, RawRow, RawRows, piece_texels, stepped};
 use super::{
     DecodeWork, ImageLayout, PixelFormat, Plane, PlaneLayout, Stop, interleave, premultiply,
@@ -482,6 +482,19 @@ impl<'a> Streamed<'a> {
         }))
     }
 
+    /// The bytes the states saved of a plane's rows take at most: the budget, shared
+    /// with the states of a mask read incrementally, which a request for the mask
+    /// plane saves.
+    fn budget(&self) -> usize {
+        match &self.alpha {
+            Alpha::Mask {
+                mask: MaskSource::Streamed { .. },
+                ..
+            } => CHECKPOINT_BUDGET / 2,
+            _ => CHECKPOINT_BUDGET,
+        }
+    }
+
     /// How the colour's samples lie in its rows.
     fn rows(&self) -> SampleRows {
         self.colour.rows(self.grid.width, self.grid.height)
@@ -546,7 +559,13 @@ impl<'a> Streamed<'a> {
                     let Alpha::Mask { mask, .. } = &self.alpha else {
                         return Err(Stop::Failed);
                     };
-                    let mut pass = MaskPass::new(mask, &self.ends.mask, area, meter)?;
+                    let mut pass = MaskPass::new(
+                        mask,
+                        &self.ends.mask,
+                        (self.checkpoints, self.budget()),
+                        area,
+                        meter,
+                    )?;
                     let result = pass.run(area);
                     work.add(pass.work());
                     result
@@ -576,8 +595,7 @@ struct ImagePass<'s, 'a> {
     image: &'s Streamed<'a>,
     raw: RawRows<'s>,
     mask: Option<Lockstep<'s>>,
-    /// Saves decoder states along the rows; only without a mask read alongside, whose
-    /// reader would need its own.
+    /// Saves decoder states along the rows, a mask's read alongside with them.
     checkpointer: Option<Checkpointer<'s>>,
     /// The row `raw` continues at in the first pass, resumed from a saved state.
     first_row: u32,
@@ -621,29 +639,45 @@ impl<'s, 'a> ImagePass<'s, 'a> {
         let columns = area.columns();
         let start = columns.start as usize / colour.align() * colour.align();
         let piece = piece_texels(columns.end as usize - start, n);
-        let mask = match &image.alpha {
+        let (mut mask, mask_stream) = match &image.alpha {
             Alpha::Mask {
                 mask,
                 matte,
                 same_grid,
-            } if *same_grid || matte.is_some() => Some(Lockstep {
-                rows: mask.rows(&image.ends.mask, meter).ok_or(Stop::Failed)?,
-                matte: *matte,
-                same_grid: *same_grid,
-                alpha: vec![0; piece],
-            }),
-            _ => None,
+            } if *same_grid || matte.is_some() => (
+                Some(Lockstep {
+                    rows: mask.rows(&image.ends.mask, meter).ok_or(Stop::Failed)?,
+                    matte: *matte,
+                    same_grid: *same_grid,
+                    alpha: vec![0; piece],
+                }),
+                mask.owned_stream(),
+            ),
+            _ => (None, None),
         };
-        let resumed = match mask {
-            Some(_) => None,
-            None => image.checkpoints.checkpointer(
-                image.stream,
-                &mut raw,
-                row_bytes,
-                image.grid.height,
-                area.rows().start,
-            )?,
+        let bound = match &mask {
+            Some(m) => raw
+                .reader
+                .checkpoint_heap_bound()
+                .zip(m.rows.checkpoint_heap_bound())
+                .and_then(|(a, b)| a.checked_add(b)),
+            None => raw.reader.checkpoint_heap_bound(),
         };
+        let resumed = image.checkpoints.checkpointer(
+            Plane::Image,
+            image.stream.clone(),
+            mask_stream,
+            bound,
+            (row_bytes, image.grid.height, image.budget()),
+            area.rows().start,
+            |row, state, mask_state| {
+                raw.resume(row, state)
+                    && match &mut mask {
+                        Some(m) => m.rows.resume(row, mask_state),
+                        None => mask_state.is_none(),
+                    }
+            },
+        )?;
         let (checkpointer, first_row) =
             resumed.map_or((None, 0), |(c, first_row)| (Some(c), first_row));
         let packed = if colour.align() > 1 {
@@ -719,7 +753,8 @@ impl<'s, 'a> ImagePass<'s, 'a> {
                 RowEnd::Whole => {
                     self.decoded += 1;
                     if let Some(c) = &self.checkpointer {
-                        c.after_row(y + 1, &self.raw.reader)?;
+                        let mask = self.mask.as_ref().map(|m| &m.rows);
+                        c.after_row(y + 1, &self.raw.reader, mask)?;
                     }
                 }
                 RowEnd::Cut => self.decoded += 1,
@@ -747,7 +782,8 @@ impl<'s, 'a> ImagePass<'s, 'a> {
         }
         self.raw.seek_rows(n)?;
         if let Some(c) = &self.checkpointer {
-            c.after_row(y + n, &self.raw.reader)?;
+            let mask = self.mask.as_ref().map(|m| &m.rows);
+            c.after_row(y + n, &self.raw.reader, mask)?;
         }
         Ok(y + n)
     }
@@ -982,6 +1018,8 @@ fn colour_key_alpha(samples: &[u8], components: usize, key: &[u16], out: &mut Ve
 /// One request's reading of a mask on its own grid.
 struct MaskPass<'a> {
     rows: MaskRows<'a>,
+    /// Saves the states of a streamed mask's reader along its rows.
+    checkpointer: Option<Checkpointer<'a>>,
     /// The alpha of the piece being read.
     alpha: Vec<u8>,
     height: u32,
@@ -989,19 +1027,49 @@ struct MaskPass<'a> {
 }
 
 impl<'a> MaskPass<'a> {
+    /// The pass over `mask`, resumed from the state saved in `checkpoints` nearest
+    /// before the rows `area` reads, saving others in its share of the budget.
     fn new(
         mask: &'a MaskSource<'a>,
         end: &'a OnceLock<usize>,
+        (checkpoints, budget): (&'a Checkpoints, usize),
         area: &Area<'_>,
         meter: &'a Meter<'a>,
     ) -> Result<Self, Stop> {
         let (_, h) = mask.size();
+        let mut rows = mask.rows(end, meter).ok_or(Stop::Failed)?;
+        let checkpointer = match (rows.raw(), mask.owned_stream()) {
+            (Some(raw), Some(stream)) => {
+                let (bound, row_bytes) = (raw.reader.checkpoint_heap_bound(), raw.row_bytes);
+                checkpoints
+                    .checkpointer(
+                        Plane::Mask,
+                        stream,
+                        None,
+                        bound,
+                        (row_bytes, h, budget),
+                        area.rows().start,
+                        |row, state, _| rows.resume(row, Some(state)),
+                    )?
+                    .map(|(c, _)| c)
+            }
+            _ => None,
+        };
         Ok(Self {
-            rows: mask.rows(end, meter).ok_or(Stop::Failed)?,
+            rows,
+            checkpointer,
             alpha: vec![0; piece_texels(area.columns().len(), 1)],
             height: h,
             decoded: 0,
         })
+    }
+
+    /// Saves the mask's state at the row it reads next, where one is due.
+    fn save(&self) -> Result<(), Stop> {
+        match &self.checkpointer {
+            Some(c) => c.after_mask_row(&self.rows),
+            None => Ok(()),
+        }
     }
 
     fn work(&self) -> DecodeWork {
@@ -1017,7 +1085,14 @@ impl<'a> MaskPass<'a> {
         let (c0, c1) = (columns.start as usize, columns.end as usize);
         let end = wanted.end.min(self.height);
         let first = wanted.start.min(end);
-        self.rows.skip_rows(first)?;
+        let start = self.rows.row();
+        // Up to each row due a saved state, which it saves.
+        while self.rows.row() < first {
+            let y = self.rows.row();
+            let due = self.checkpointer.as_ref().map_or(first, |c| c.next_due(y));
+            self.rows.skip_rows(due.min(first) - y)?;
+            self.save()?;
+        }
         for y in first..end {
             if self.rows.fills_rest() {
                 // Every row from `y` on is stored zero's alpha: added at once, in time
@@ -1026,8 +1101,9 @@ impl<'a> MaskPass<'a> {
                 break;
             }
             self.read_row(area, c0..c1)?;
+            self.save()?;
         }
-        self.decoded += end;
+        self.decoded += end.saturating_sub(start);
         Ok(())
     }
 

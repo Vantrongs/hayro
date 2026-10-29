@@ -11,6 +11,8 @@ use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
+#[cfg(feature = "unsafe")]
+use hayro_ccitt::RowState;
 use hayro_ccitt::{DecodeSettings, Decoder, EncodingMode, RowDecoder, Source};
 
 /// Makes room in `output` for `needed` bytes: it grows to the `declared` bytes
@@ -165,6 +167,24 @@ impl<'a> Through<'a> {
     }
 }
 
+/// Where a reader of plain CCITT data was ([`CcittBytes::save`]): the decoder's
+/// state, `None` before it started, and the bytes of its last row read.
+#[cfg(feature = "unsafe")]
+#[derive(Clone)]
+pub(crate) struct CcittState {
+    rows: Option<RowState>,
+    at: usize,
+    left: usize,
+    done: bool,
+}
+
+#[cfg(feature = "unsafe")]
+impl CcittState {
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.rows.as_ref().map_or(0, RowState::heap_bytes)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
     /// A decoded row is being read, or none before the first.
@@ -232,6 +252,54 @@ impl<'a> CcittBytes<'a> {
     /// The bytes of a row.
     fn row_len(&self) -> usize {
         self.setup.row_len(self.packed)
+    }
+
+    /// The data, where it is neither encrypted nor what other filters make: a reader
+    /// of it goes on from a saved state ([`Self::save`]).
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn plain(&self) -> Option<&'a [u8]> {
+        match &self.data {
+            Encoded::Plain(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    /// Where it is in plain data, to go on from with [`Self::restore`]; `None` for
+    /// other data, or once a meter's hook stopped it.
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn save(&self) -> Option<CcittState> {
+        self.plain()?;
+        (!self.stopped).then(|| CcittState {
+            rows: self.decoder.as_ref().map(|d| d.rows.state()),
+            at: self.at,
+            left: self.left,
+            done: self.state == State::Done,
+        })
+    }
+
+    /// Goes on from `state`, saved of a reader of the same data.
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn restore(&mut self, state: &CcittState) {
+        let Encoded::Plain(data) = self.data else {
+            return;
+        };
+        self.decoder = state.rows.as_ref().map(|saved| {
+            let mut rows = RowDecoder::new(data, self.setup.settings);
+            rows.resume(saved);
+            Decoding {
+                rows,
+                through: None,
+            }
+        });
+        (self.at, self.left) = (state.at, state.left);
+        self.state = if state.done { State::Done } else { State::Row };
+        self.stopped = false;
+    }
+
+    /// The most heap bytes a saved state holds.
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn heap_bound(&self) -> usize {
+        RowState::heap_bound(&self.setup.settings)
     }
 
     /// Back to the start of the data.

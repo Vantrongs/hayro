@@ -153,8 +153,12 @@ fn decodes_the_same_by_rows(stream: &str, data: &[u8], settings: DecodeSettings)
     let ended = decode(data, &mut whole, &mut DecoderContext::new(settings)).map(|_| ());
     let mut rows = RowDecoder::new(data, settings);
     let mut by_rows = Collector::new(settings.columns);
+    // Where the decoder was before each row, and the rows pushed before it.
+    let mut states = vec![(rows.state(), 0)];
     let ended_by_rows = loop {
-        match rows.next_row(&mut by_rows) {
+        let result = rows.next_row(&mut by_rows);
+        states.push((rows.state(), by_rows.rows.len()));
+        match result {
             Ok(true) => {
                 assert_eq!(rows.decoded_rows() as usize, by_rows.rows.len());
                 let mut last = Collector::new(settings.columns);
@@ -175,6 +179,29 @@ fn decodes_the_same_by_rows(stream: &str, data: &[u8], settings: DecodeSettings)
     );
     assert_eq!(ended_by_rows, ended, "{stream}: ends otherwise");
     assert!(by_rows.rows == whole.rows, "{stream}: other rows");
+
+    // A decoder resumed from where one was goes on as that one did.
+    let picked = [0, 1, states.len() / 2, states.len().saturating_sub(2)];
+    for &(ref state, pushed) in picked.iter().filter_map(|&i| states.get(i)) {
+        let mut resumed = RowDecoder::new(data, settings);
+        resumed.resume(state);
+        let mut rest = Collector::new(settings.columns);
+        let ended_resumed = loop {
+            match resumed.next_row(&mut rest) {
+                Ok(true) => {}
+                Ok(false) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        };
+        assert_eq!(
+            ended_resumed, ended,
+            "{stream}: ends otherwise after {pushed} rows"
+        );
+        assert!(
+            rest.rows == whole.rows[pushed.min(whole.rows.len())..],
+            "{stream}: other rows after {pushed} rows"
+        );
+    }
 
     // Read through a source, which tells its end only as it is read there, no row's
     // decoding reads before where it started.

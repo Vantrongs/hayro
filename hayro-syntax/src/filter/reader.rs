@@ -6,6 +6,8 @@ use crate::crypto::reader::DecryptedReader;
 use crate::filter::bytewise::{self, Decoder, State};
 #[cfg(feature = "images")]
 use crate::filter::ccitt::CcittBytes;
+#[cfg(all(feature = "images", feature = "unsafe"))]
+use crate::filter::ccitt::CcittState;
 use crate::filter::lzw_flate::flate::fallback::{FlateStream, Input};
 use crate::filter::lzw_flate::{PredictorParams, Unpredictor, flate, lzw};
 #[cfg(feature = "unsafe")]
@@ -181,6 +183,8 @@ enum SourceState {
         /// Decoded bytes not read yet.
         made: Vec<u8>,
     },
+    #[cfg(feature = "images")]
+    Ccitt(CcittState),
 }
 
 /// A predictor reversed on top of the source.
@@ -297,6 +301,8 @@ impl<'a> DecodedReader<'a> {
     fn heap_bound(&self) -> Option<usize> {
         let (own, lower) = match &self.source {
             Source::Raw(_) => return Some(0),
+            #[cfg(feature = "images")]
+            Source::Ccitt(bytes) => return bytes.plain().map(|_| bytes.heap_bound()),
             Source::Inflating(inflating) => (
                 inflating.decoder.allocation_size() + INPUT_CHUNK + OUTPUT_CHUNK,
                 &inflating.data,
@@ -321,10 +327,11 @@ impl<'a> DecodedReader<'a> {
 
     /// The reader's position, to resume from with [`Self::restore`] on a reader of the
     /// same `stream`. `None` unless every filter is decoded incrementally (Flate by
-    /// zlib-rs, not by the permissive decoder; no image filter) over `stream`'s stored
-    /// bytes, or the reader reads them stored without a filter and decrypted with RC4
-    /// (which [`Self::skip`] otherwise moves past from the start of its keystream), or
-    /// when a decoder's state cannot be allocated.
+    /// zlib-rs, not by the permissive decoder; no image filter but `CCITTFaxDecode`
+    /// alone over data not encrypted) over `stream`'s stored bytes, or the reader
+    /// reads them stored without a filter and decrypted with RC4 (which
+    /// [`Self::skip`] otherwise moves past from the start of its keystream), or when a
+    /// decoder's state cannot be allocated.
     #[cfg(feature = "unsafe")]
     pub fn checkpoint(&self, stream: &OwnedStream) -> Option<DecodedCheckpoint> {
         let data = self.checkpointable()?;
@@ -347,6 +354,15 @@ impl<'a> DecodedReader<'a> {
     fn save(&self, layers: &mut SmallVec<[LayerState; 1]>) -> Option<Cursor> {
         let (source, lower) = match &self.source {
             Source::Raw(data) => return Some(data.cursor()),
+            #[cfg(feature = "images")]
+            Source::Ccitt(bytes) => {
+                layers.push(LayerState {
+                    source: SourceState::Ccitt(bytes.save()?),
+                    predictor: None,
+                });
+                // Plain data, read from the decoder's state alone.
+                return Some(DecryptedReader::raw(Cow::Borrowed(&[])).cursor());
+            }
             Source::Inflating(inflating) => (
                 SourceState::Inflating {
                     decoder: inflating.decoder.try_clone().ok()?,
@@ -429,6 +445,17 @@ impl<'a> DecodedReader<'a> {
                     rest,
                 )),
             ) => (&stepping.input.data, rest),
+            #[cfg(feature = "images")]
+            (
+                Source::Ccitt(_),
+                Some((
+                    LayerState {
+                        source: SourceState::Ccitt(_),
+                        ..
+                    },
+                    rest,
+                )),
+            ) => return rest.is_empty(),
             _ => return false,
         };
         match lower {
@@ -492,6 +519,11 @@ impl<'a> DecodedReader<'a> {
                 stepping.handed = 0;
                 &mut stepping.input.data
             }
+            #[cfg(feature = "images")]
+            (Source::Ccitt(bytes), SourceState::Ccitt(state)) => {
+                bytes.restore(state);
+                return;
+            }
             _ => return,
         };
         self.predictor.clone_from(&layer.predictor);
@@ -509,6 +541,8 @@ impl<'a> DecodedReader<'a> {
     fn checkpointable(&self) -> Option<&'a [u8]> {
         let lower = match &self.source {
             Source::Raw(data) if data.is_rc4() => return data.borrowed_data(),
+            #[cfg(feature = "images")]
+            Source::Ccitt(bytes) => return bytes.plain(),
             Source::Inflating(inflating) => &inflating.data,
             Source::Bytewise(stepping) => &stepping.input.data,
             _ => return None,
@@ -628,6 +662,8 @@ impl DecodedCheckpoint {
                             made,
                             ..
                         } => decoder.heap_bytes() + input.capacity() + made.capacity(),
+                        #[cfg(feature = "images")]
+                        SourceState::Ccitt(state) => state.heap_bytes(),
                     };
                     source + layer.predictor.as_ref().map_or(0, Predicted::heap_bytes)
                 })

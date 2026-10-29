@@ -30,7 +30,7 @@
 
 extern crate alloc;
 
-use crate::bit_reader::{BitReader, Data};
+use crate::bit_reader::{BitReader, Data, Position};
 use alloc::rc::Rc;
 
 mod bit_reader;
@@ -89,6 +89,29 @@ pub struct RowDecoder<'a> {
     state: State,
 }
 
+/// Where a [`RowDecoder`] is, without its data, to go on from with
+/// [`RowDecoder::resume`] on a decoder of the same data and settings: the reader's
+/// position and the decoder's state, the colour changes of the last line among it.
+#[derive(Clone)]
+pub struct RowState {
+    position: Position,
+    ctx: DecoderContext,
+    state: State,
+}
+
+impl RowState {
+    /// The bytes it holds on the heap: at most [`Self::heap_bound`].
+    pub fn heap_bytes(&self) -> usize {
+        self.ctx.heap_bytes()
+    }
+
+    /// The most bytes a state of a decoder with `settings` holds on the heap, at any
+    /// row.
+    pub fn heap_bound(settings: &DecodeSettings) -> usize {
+        2 * (settings.columns as usize + 1) * size_of::<u32>()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
     Start,
@@ -120,6 +143,23 @@ impl<'a> RowDecoder<'a> {
     /// The settings it decodes with.
     pub fn settings(&self) -> &DecodeSettings {
         &self.ctx.settings
+    }
+
+    /// Where it is, to go on from later with [`Self::resume`].
+    pub fn state(&self) -> RowState {
+        RowState {
+            position: self.reader.position(),
+            ctx: self.ctx.clone(),
+            state: self.state,
+        }
+    }
+
+    /// Goes on from `state`, taken of a decoder of the same data and settings, as
+    /// that decoder would have.
+    pub fn resume(&mut self, state: &RowState) {
+        self.reader.seek(&state.position);
+        self.ctx.clone_from(&state.ctx);
+        self.state = state.state;
     }
 
     /// The rows pushed so far.

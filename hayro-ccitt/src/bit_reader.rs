@@ -32,7 +32,44 @@ pub(crate) struct BitReader<'a> {
     overrun: bool,
 }
 
+/// Where a [`BitReader`] is, without its data.
+#[derive(Clone)]
+pub(crate) struct Position {
+    len: usize,
+    bit_offset: usize,
+    buffer: u64,
+    limit: usize,
+    poll_at: usize,
+    overrun: bool,
+}
+
 impl<'a> BitReader<'a> {
+    /// Where it is in its data.
+    pub(crate) fn position(&self) -> Position {
+        Position {
+            len: self.len,
+            bit_offset: self.bit_offset,
+            buffer: self.buffer,
+            limit: self.limit,
+            poll_at: self.poll_at,
+            overrun: self.overrun,
+        }
+    }
+
+    /// Goes on from `position`, taken of a reader of the same data.
+    pub(crate) fn seek(&mut self, position: &Position) {
+        let Position {
+            len,
+            bit_offset,
+            buffer,
+            limit,
+            poll_at,
+            overrun,
+        } = *position;
+        (self.len, self.bit_offset, self.buffer) = (len, bit_offset, buffer);
+        (self.limit, self.poll_at, self.overrun) = (limit, poll_at, overrun);
+    }
+
     #[inline(always)]
     pub(crate) fn new(data: Data<'a>) -> Self {
         let len = match &data {
