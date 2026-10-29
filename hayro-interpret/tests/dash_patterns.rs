@@ -3,7 +3,7 @@
 //! not at all if its entries sum to zero, otherwise solid. A renderer given such a
 //! pattern walks it backwards, or never ends on one whose entries sum below zero.
 
-use hayro_interpret::font::GlyphRun;
+use hayro_interpret::font::{Glyph, GlyphRun};
 use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::{
     BlendMode, ClipPath, Device, DrawMode, DrawProps, Image, ImageDrawProps, InterpreterSettings,
@@ -18,6 +18,7 @@ enum Ev {
     Fill,
     /// A stroke, with its dash array and offset.
     Stroke(Vec<f32>, f32),
+    Clip,
 }
 
 #[derive(Default)]
@@ -39,26 +40,49 @@ impl<'a> Device<'a> for Rec {
     fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, mode: &DrawMode) {
         self.push(mode);
     }
-    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_clip_path(&mut self, _: &ClipPath) {
+        self.0.push(Ev::Clip);
+    }
     fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
-    fn draw_glyph_run(&mut self, _: &GlyphRun<'_, 'a>, _: DrawProps<'a>, mode: &DrawMode) {
-        self.push(mode);
+    fn draw_glyph_run(&mut self, run: &GlyphRun<'_, 'a>, props: DrawProps<'a>, mode: &DrawMode) {
+        // Invisible text is passed on for text extraction alone.
+        if matches!(mode, DrawMode::Invisible) {
+            return;
+        }
+        for glyph in run.glyphs() {
+            match &**glyph {
+                Glyph::Outline(_) => self.push(mode),
+                // Its own program draws a Type 3 glyph, as the renderers do.
+                Glyph::Type3(t3) => {
+                    t3.interpret(self, props.transform, glyph.transform(), &props.paint);
+                }
+            }
+        }
     }
     fn draw_image(&mut self, _: Image<'a, '_>, _: ImageDrawProps<'a>) {}
     fn pop_clip(&mut self) {}
     fn pop_transparency_group(&mut self) {}
 }
 
-/// What `content` draws on a page whose `/G` graphics state is `gs` and whose `/F`
-/// is Helvetica.
+/// What `content` draws on a page whose `/G` graphics state is `gs`, whose `/F` is
+/// Helvetica, and whose `/T` is a Type 3 font: its `a` fills its square, its `b`
+/// strokes a square inside it.
 fn drawn(gs: &str, content: &str) -> Vec<Ev> {
     let file = common::one_page(
         100,
         &format!(
             "/Contents 4 0 R /Resources << /ExtGState << /G << {gs} >> >> \
-             /Font << /F << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >>"
+             /Font << /F << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> \
+             /T << /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+             /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /a 5 0 R /b 6 0 R >> \
+             /Encoding << /Type /Encoding /Differences [97 /a /b] >> \
+             /FirstChar 97 /LastChar 98 /Widths [1000 1000] /Resources << >> >> >> >>"
         ),
-        vec![common::stream("", content.as_bytes())],
+        vec![
+            common::stream("", content.as_bytes()),
+            common::stream("", b"1000 0 0 0 1000 1000 d1 0 0 1000 1000 re f"),
+            common::stream("", b"1000 0 0 0 1000 1000 d1 100 w 200 200 600 600 re S"),
+        ],
     );
     let pdf = Pdf::new(file).expect("valid pdf");
     let mut rec = Rec::default();
@@ -135,4 +159,50 @@ fn a_valid_pattern_is_kept() {
     assert_eq!(line("[4 4] -2 d"), [Ev::Stroke(vec![4.0, 4.0], -2.0)]);
     // A dash of no length is lengthened a little, as before.
     assert_eq!(line("[0 5] 0 d"), [Ev::Stroke(vec![0.01, 5.0], 0.0)]);
+}
+
+/// A pattern that hides strokes hides a glyph's strokes alone, under every text
+/// render mode, as `PyMuPDF` 1.28.2 draws each of these (a page of red fill, blue
+/// stroke, and a green rectangle after the text that a text clip cuts): an
+/// outline glyph's fill and its clip stay; a Type 3 glyph's program runs, its
+/// fills drawn and its own strokes hidden. `MuPDF` draws a Type 3 glyph under
+/// every mode but 3 and 7, and adds none to the clip.
+#[test]
+fn a_hidden_stroke_keeps_a_glyphs_fills_and_clip() {
+    for mode in 0..8 {
+        for dash in ["", "[0 0] 0 d", "[1 -1] 0 d"] {
+            let solid = dash.is_empty();
+            let shown = !matches!(mode, 3 | 7);
+            for (font, text, fill, stroke, clip) in [
+                (
+                    "/F 60",
+                    "(I)",
+                    matches!(mode, 0 | 2 | 4 | 6),
+                    solid && matches!(mode, 1 | 2 | 5 | 6),
+                    mode >= 4,
+                ),
+                ("/T 50", "(a)", shown, false, false),
+                ("/T 50", "(b)", false, solid && shown, false),
+            ] {
+                let events = drawn(
+                    "",
+                    &format!(
+                        "4 w {dash} BT {font} Tf {mode} Tr 25 25 Td {text} Tj ET 0 0 20 100 re f"
+                    ),
+                );
+                // The rectangle after the text is the last fill.
+                let glyph = &events[..events.len() - 1];
+                let has = |ev: fn(&Ev) -> bool| glyph.iter().any(ev);
+                assert_eq!(
+                    (
+                        has(|e| *e == Ev::Fill),
+                        has(|e| matches!(e, Ev::Stroke(..))),
+                        has(|e| *e == Ev::Clip)
+                    ),
+                    (fill, stroke, clip),
+                    "{font} {text} {mode} Tr {dash:?}: {events:?}"
+                );
+            }
+        }
+    }
 }

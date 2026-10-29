@@ -79,7 +79,15 @@ pub(crate) fn show_glyph_run<'a>(ctx: &mut Context<'a>, device: &mut impl Device
 
     let render_mode = ctx.text_state().render_mode;
     let stroke_props = ctx.stroke_props().clone();
-    let stroked = stroke_props.drawn();
+    // A run's glyphs come from one font.
+    let type3 = ctx
+        .glyph_scratch
+        .iter()
+        .any(|glyph| matches!(**glyph, Glyph::Type3(_)));
+    // A dash pattern that hides strokes hides an outline glyph's stroke, but a
+    // Type 3 glyph is drawn by its own program, whose fills stay and whose strokes
+    // the interpreter hides there, as `MuPDF` draws it (`PyMuPDF` 1.28.2).
+    let stroked = stroke_props.drawn() || type3;
     let fill_props = ctx.draw_props(false);
     let stroke_draw_props = ctx.draw_props(true);
 
@@ -88,7 +96,10 @@ pub(crate) fn show_glyph_run<'a>(ctx: &mut Context<'a>, device: &mut impl Device
             glyphs: &ctx.glyph_scratch,
         };
 
-        let clip_path = if render_mode.clips() {
+        // A Type 3 glyph has no outline to clip to: `MuPDF` adds nothing to the
+        // clip for it, where an outline glyph with no outline, a space, leaves
+        // nothing visible.
+        let clip_path = if render_mode.clips() && !type3 {
             let mut clip_path = BezPath::new();
             for glyph in run.glyphs() {
                 clip_glyph(&mut clip_path, glyph);
@@ -157,9 +168,7 @@ fn clip_glyph(clip_path: &mut BezPath, glyph: &PositionedGlyph<'_>) {
                 clip_path.extend(outline);
             }
         }
-        Glyph::Type3(_) => {
-            warn!("text rendering mode clip not implemented for shape glyphs");
-        }
+        Glyph::Type3(_) => {}
     }
 }
 
