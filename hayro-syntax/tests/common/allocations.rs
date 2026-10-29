@@ -19,6 +19,8 @@ pub(crate) struct Allocations {
     pub(crate) count: usize,
     /// The bytes requested in all, which grows with the work that makes values.
     pub(crate) allocated: usize,
+    /// Bytes it allocated and had not freed when it returned: what it left held.
+    pub(crate) held: usize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -49,7 +51,14 @@ pub(crate) fn measure<T>(f: impl FnOnce() -> T) -> (T, Allocations) {
     TALLY.with(|slot| slot.set(Some(Tally::default())));
     let result = f();
     let tally = TALLY.with(|slot| slot.replace(None)).expect("measuring");
-    (result, tally.total)
+    let held = tally.live.max(0) as usize;
+    (
+        result,
+        Allocations {
+            held,
+            ..tally.total
+        },
+    )
 }
 
 const REFUSED: usize = 1 << 30;

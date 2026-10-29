@@ -162,7 +162,10 @@ pub fn interpret_page<'a>(
     device: &mut impl Device<'a>,
 ) {
     let resources = page.resources();
-    interpret(page.typed_operations(), resources, context, device);
+    // Decoded for this call alone, so that a document kept open while page after
+    // page is drawn does not hold every page's content.
+    let content = page.read_page_stream().unwrap_or_default();
+    interpret(TypedIter::new(&content), resources, context, device);
 
     if context.settings.render_annotations && page.raw().contains_key(ANNOTS) {
         // The fields of the document's forms are read once for all its pages.

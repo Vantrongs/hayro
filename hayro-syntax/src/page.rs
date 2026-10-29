@@ -439,50 +439,54 @@ impl<'a> Page<'a> {
         Some(iter)
     }
 
-    /// Return the decoded content stream of the page; what reading it lost is told
-    /// to the computation being watched each time ([`crate::lost`]). A stream an
-    /// array of contents names more than once is decoded once.
+    /// Return the decoded content stream of the page, kept with the page for later
+    /// calls; what reading it lost is told to the computation being watched each
+    /// time ([`crate::lost`]). A stream an array of contents names more than once is
+    /// decoded once.
     pub fn page_stream(&self) -> Option<&[u8]> {
-        let (data, lost) = self.page_streams.get_or_init(|| {
-            self.xref().watch(|| {
-                if let Some(stream) = self.inner.get::<Stream<'_>>(CONTENTS) {
-                    Some(stream.decoded().ok()?.into_owned())
-                } else if let Some(array) = self.inner.get::<Array<'_>>(CONTENTS) {
-                    let mut decoded = Decoded::default();
-                    let mut collected = vec![];
-                    // A part that is no stream is passed over, as `MuPDF` passes it
-                    // over (`PyMuPDF` 1.28.2, observed): a null, a number, a dictionary,
-                    // a reference to none.
-                    for item in array.raw_iter() {
-                        let key = self.body_key(&item);
-                        let stream = match item {
-                            MaybeRef::Ref(r) => {
-                                self.xref().get_with::<Stream<'_>>(r.into(), array.ctx())
-                            }
-                            MaybeRef::NotRef(object) => object.into_stream(),
-                        };
-                        let Some(stream) = stream else {
-                            continue;
-                        };
-                        if let Some(data) =
-                            decoded.get(key, || Some(stream.decoded().ok()?.into_owned()))
-                        {
-                            collected.extend_from_slice(data);
-                            // Streams must have at least one whitespace in-between.
-                            collected.push(b' ');
-                        }
-                    }
-
-                    Some(collected)
-                } else {
-                    warn!("contents entry of page was neither stream nor array of streams");
-
-                    None
-                }
-            })
-        });
+        let (data, lost) = self
+            .page_streams
+            .get_or_init(|| self.xref().watch(|| self.read_page_stream()));
         self.xref().note(*lost);
         data.as_deref()
+    }
+
+    /// The content [`Self::page_stream`] returns, decoded anew at each call and not
+    /// kept: for a reader that keeps the document open while it draws page after
+    /// page, which would otherwise hold every page's decoded content for as long as
+    /// the document is open. What reading it lost is told to the computation being
+    /// watched.
+    pub fn read_page_stream(&self) -> Option<Vec<u8>> {
+        if let Some(stream) = self.inner.get::<Stream<'_>>(CONTENTS) {
+            Some(stream.decoded().ok()?.into_owned())
+        } else if let Some(array) = self.inner.get::<Array<'_>>(CONTENTS) {
+            let mut decoded = Decoded::default();
+            let mut collected = vec![];
+            // A part that is no stream is passed over, as `MuPDF` passes it
+            // over (`PyMuPDF` 1.28.2, observed): a null, a number, a dictionary,
+            // a reference to none.
+            for item in array.raw_iter() {
+                let key = self.body_key(&item);
+                let stream = match item {
+                    MaybeRef::Ref(r) => self.xref().get_with::<Stream<'_>>(r.into(), array.ctx()),
+                    MaybeRef::NotRef(object) => object.into_stream(),
+                };
+                let Some(stream) = stream else {
+                    continue;
+                };
+                if let Some(data) = decoded.get(key, || Some(stream.decoded().ok()?.into_owned())) {
+                    collected.extend_from_slice(data);
+                    // Streams must have at least one whitespace in-between.
+                    collected.push(b' ');
+                }
+            }
+
+            Some(collected)
+        } else {
+            warn!("contents entry of page was neither stream nor array of streams");
+
+            None
+        }
     }
 
     /// The decoded content of the page, as [`Self::page_stream`] joins it, or the
