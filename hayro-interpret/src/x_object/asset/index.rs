@@ -103,7 +103,7 @@ impl Checkpoints {
     }
 }
 
-/// Where states are saved: every `interval` rows, `slots` of them at most.
+/// Where states are saved: every `interval` rows before the last, `slots` of them.
 #[derive(Clone, Copy)]
 struct Plan {
     interval: u32,
@@ -113,15 +113,22 @@ struct Plan {
 impl Plan {
     /// The spacing for `height` rows of `row_bytes` stored bytes whose states hold
     /// `heap_bound` heap bytes at most: as many states as `budget` holds, spread over
-    /// the rows; `None` when not one fits.
+    /// the rows; `None` when not one fits. None is due at `height`, after the last
+    /// row, where no request resumes.
     fn new(heap_bound: usize, row_bytes: usize, height: u32, budget: usize) -> Option<Self> {
         let count = budget.checked_sub(size_of::<Checkpoints>())?
             / size_of::<Entry>().checked_add(heap_bound)?;
         let interval = height
             .div_ceil(u32::try_from(count).ok().filter(|&c| c > 0)?)
             .max(MIN_CHECKPOINT_BYTES.div_ceil(row_bytes) as u32);
-        let slots = (height / interval) as usize;
+        let slots = (height.checked_sub(1)? / interval) as usize;
         (slots > 0).then_some(Self { interval, slots })
+    }
+
+    /// Whether a state is due at `row`.
+    fn due(&self, row: u32) -> bool {
+        row.is_multiple_of(self.interval)
+            && (1..=self.slots).contains(&((row / self.interval) as usize))
     }
 }
 
@@ -172,7 +179,7 @@ impl Checkpointer<'_> {
         row: u32,
         state: impl FnOnce() -> Option<(DecodedCheckpoint, Option<Box<DecodedCheckpoint>>)>,
     ) -> Result<(), Stop> {
-        if !row.is_multiple_of(self.plan.interval) {
+        if !self.plan.due(row) {
             return Ok(());
         }
         let mut index = self.index.lock().map_err(|_| Stop::Failed)?;
@@ -225,6 +232,17 @@ mod tests {
             row[0] = (i % 5) as u8;
         }
         data
+    }
+
+    /// No state is due after the last row, where no request resumes: an image of
+    /// one row saves none.
+    #[test]
+    fn no_state_is_due_after_the_last_row() {
+        let plan = Plan::new(0, MIN_CHECKPOINT_BYTES, 4, CHECKPOINT_BUDGET).unwrap();
+        assert_eq!((plan.interval, plan.slots), (1, 3));
+        assert!((1..4).all(|row| plan.due(row)));
+        assert!(!plan.due(0) && !plan.due(4));
+        assert!(Plan::new(0, MIN_CHECKPOINT_BYTES, 1, CHECKPOINT_BUDGET).is_none());
     }
 
     fn saved(asset: &ImageAsset) -> usize {
