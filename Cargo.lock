@@ -1995,7 +1995,7 @@ checksum = "d56377fd46368984a170bc5aac5567e52ca5da874caa60bea39fcbca78fb658b"
 [[package]]
 name = "zune-jpeg"
 version = "0.5.16"
-source = "git+https://github.com/Vantrongs/zune-image?rev=b06abc4f241748e1d4bc15e3feb5101faa3ba853#b06abc4f241748e1d4bc15e3feb5101faa3ba853"
+source = "git+https://github.com/Vantrongs/zune-image?rev=4909a010e8edce7fae75276e4d997188f9012495#4909a010e8edce7fae75276e4d997188f9012495"
 dependencies = [
  "memchr",
  "zune-core",
