@@ -69,12 +69,7 @@ impl<'a> ImageXObject<'a> {
     ) -> Option<Self> {
         let dict = stream.dict();
 
-        let is_stencil_mask = dict
-            .get::<bool>(IM)
-            .or_else(|| dict.get::<bool>(IMAGE_MASK))
-            .unwrap_or(false);
-
-        if is_stencil_mask {
+        if image_mask(dict) {
             kind = ImageKind::StencilMask;
         }
 
@@ -208,6 +203,13 @@ impl CacheKey for ImageXObject<'_> {
     }
 }
 
+/// `/ImageMask` of an image's dictionary, which makes it a stencil mask.
+fn image_mask(dict: &Dict<'_>) -> bool {
+    dict.get::<bool>(IM)
+        .or_else(|| dict.get::<bool>(IMAGE_MASK))
+        .unwrap_or(false)
+}
+
 /// `/Interpolate` of an image's dictionary.
 fn interpolate(dict: &Dict<'_>) -> bool {
     dict.get::<bool>(I)
@@ -257,10 +259,7 @@ impl ImageRead {
             width,
             height,
             interpolate: interpolate(dict),
-            image_mask: dict
-                .get::<bool>(IM)
-                .or_else(|| dict.get::<bool>(IMAGE_MASK))
-                .unwrap_or(false),
+            image_mask: image_mask(dict),
             stream: stream.to_owned_stream(height),
             bpc: dict
                 .get::<u8>(BPC)
@@ -277,7 +276,11 @@ impl ImageRead {
 }
 
 /// What an image's dictionary says of its masks, read once for its object
-/// ([`Self::of`]), the mask streams as [`ImageRead::of`] reads them.
+/// ([`Self::of`]), the mask streams as [`ImageRead::of`] reads them. Only the masks
+/// decoding can use are resolved, by its rules (`decode_alpha`, `Alpha::new`): none
+/// of a stencil mask, which is decoded alone (`decode_mask`); `/Mask` neither where
+/// `/SMask` is a stream, which takes precedence, nor where `/SMaskInData` is 1, which
+/// takes the alpha from the data or, with `/Matte`, from `/SMask`.
 #[derive(Default)]
 pub(crate) struct MasksRead {
     /// `/SMask`, where it is a stream: `None` inside where it is no mask (it gives
@@ -291,7 +294,8 @@ pub(crate) struct MasksRead {
     pub(crate) color_key: Option<SmallVec<[u16; 4]>>,
     /// Whether `/SMaskInData` is 1.
     pub(crate) in_data: bool,
-    /// Whether the dictionary has `/SMask`, `/Mask` or `/SMaskInData`, of any value.
+    /// Whether the dictionary has `/SMask`, `/Mask` or `/SMaskInData`, of any value,
+    /// resolved or not: drawing drops the graphics state's soft mask then.
     pub(crate) any: bool,
 }
 
@@ -304,19 +308,34 @@ impl MasksRead {
 
     fn build(stream: Stream<'_>, cache: &Building<'_>) -> Option<Arc<Self>> {
         let dict = stream.dict();
+        let any =
+            dict.contains_key(SMASK_IN_DATA) || dict.contains_key(SMASK) || dict.contains_key(MASK);
+        if image_mask(dict) {
+            return Some(Arc::new(Self {
+                any,
+                ..Self::default()
+            }));
+        }
         let mask = |stream: Stream<'_>| ImageRead::of(&stream, cache);
+        let in_data = dict.get::<u8>(SMASK_IN_DATA) == Some(1);
         let smask = dict.get::<Stream<'_>>(SMASK);
+        let stencil = match smask.is_none() && !in_data {
+            true => dict.get::<Stream<'_>>(MASK),
+            false => None,
+        };
+        let color_key = match smask.is_none() && !in_data && stencil.is_none() {
+            true => dict.get::<SmallVec<[u16; 4]>>(MASK),
+            false => None,
+        };
         Some(Arc::new(Self {
             matte: smask
                 .as_ref()
                 .and_then(|s| s.dict().get::<ColorComponents>(MATTE)),
             soft: smask.map(mask),
-            stencil: dict.get::<Stream<'_>>(MASK).map(mask),
-            color_key: dict.get::<SmallVec<[u16; 4]>>(MASK),
-            in_data: dict.get::<u8>(SMASK_IN_DATA) == Some(1),
-            any: dict.contains_key(SMASK_IN_DATA)
-                || dict.contains_key(SMASK)
-                || dict.contains_key(MASK),
+            stencil: stencil.map(mask),
+            color_key,
+            in_data,
+            any,
         }))
     }
 }

@@ -314,3 +314,118 @@ fn an_image_placed_many_times_is_read_once() {
         "{small} bytes allocated for 100 placements of 100 filters, {large} for 200"
     );
 }
+
+/// The pixels of each image drawn, decoded as drawn and from its asset: a raster
+/// image's colour and alpha, a stencil mask's alpha.
+#[derive(Default)]
+struct Pixels {
+    drawn: Vec<Vec<u8>>,
+    assets: Vec<ImageAsset>,
+}
+
+impl<'a> Device<'a> for Pixels {
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
+    fn draw_glyph_run(&mut self, _: &GlyphRun<'_, 'a>, _: DrawProps<'a>, _: &DrawMode) {}
+    fn draw_image(&mut self, image: Image<'a, '_>, _: ImageDrawProps<'a>) {
+        match image {
+            Image::Raster(raster) => {
+                self.assets.push(raster.asset());
+                raster.with_rgba(
+                    |image, alpha| {
+                        let mut pixels = match image {
+                            hayro_interpret::ImageData::Luma(luma) => luma.data,
+                            hayro_interpret::ImageData::Rgb(rgb) => rgb.data,
+                        };
+                        pixels.extend(alpha.map(|a| a.data).unwrap_or_default());
+                        self.drawn.push(pixels);
+                    },
+                    None,
+                );
+            }
+            Image::Stencil(stencil) => {
+                self.assets.push(stencil.asset());
+                stencil.with_stencil(|luma, _| self.drawn.push(luma.data), None);
+            }
+        }
+    }
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
+}
+
+/// The object stream entries read drawing, then decoding, a 2 × 1 image, a raster
+/// image of greys 0x40 and 0xC0 or, if `stencil`, a stencil mask of bits 1 0, with
+/// `entries` in its dictionary; and its pixels drawn and from its asset. Object 6 is
+/// a 2 × 1 soft mask of greys 255 and 0; object 7, `[0 255]`, a colour key that masks
+/// every grey, lies in an object stream of 1024 objects no other object uses.
+fn masked_image(stencil: bool, entries: &str) -> (usize, Vec<Vec<u8>>) {
+    let content = b"q 10 0 0 10 0 0 cm /Im Do Q";
+    let mut objects = common::one_page_objects(
+        10,
+        "/Contents 4 0 R /Resources << /XObject << /Im 5 0 R >> >>",
+    );
+    objects.push(common::stream("", content));
+    let image = "/Type /XObject /Subtype /Image /Width 2 /Height 1";
+    objects.push(match stencil {
+        true => common::stream(&format!("{image} /ImageMask true {entries}"), &[0x80]),
+        false => common::stream(
+            &format!("{image} /ColorSpace /DeviceGray /BitsPerComponent 8 {entries}"),
+            &[0x40, 0xC0],
+        ),
+    });
+    objects.push(common::stream(
+        &format!("{image} /ColorSpace /DeviceGray /BitsPerComponent 8"),
+        &[255, 0],
+    ));
+    let mut padding = vec![b"0".to_vec(); 1024];
+    padding[0] = b"[0 255]".to_vec();
+    let pdf = Pdf::new(common::file_with_object_stream(&objects, &padding)).expect("valid pdf");
+    OBJECT_STREAM_ENTRIES.set(0);
+    let mut drawn = Pixels::default();
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut drawn);
+    let mut pixels = drawn.drawn;
+    pixels.extend(drawn.assets.iter().map(|asset| {
+        let mut source = asset.open(None, None).expect("the image opens");
+        let region = source
+            .request(&ImageRequest {
+                plane: Plane::Image,
+                grid: (2, 1),
+                window: [0, 0, 2, 1],
+                cancel: None,
+            })
+            .expect("the image decodes");
+        region.data.to_vec()
+    }));
+    assert_eq!(pixels.len(), 2, "{entries}");
+    (OBJECT_STREAM_ENTRIES.get(), pixels)
+}
+
+/// A mask decoding cannot use is not resolved: a stencil mask's `/SMask` and `/Mask`
+/// (it is decoded alone), and a raster image's `/Mask` beside an `/SMask` stream,
+/// which takes precedence, or beside `/SMaskInData 1`, which takes the alpha from the
+/// data. The image draws reading no object stream that mask refers into, and the
+/// same pixels as without it.
+#[test]
+fn masks_decoding_cannot_use_are_not_resolved() {
+    // The colour key is used where nothing takes precedence: the fixture reads it.
+    let (entries, keyed) = masked_image(false, "/Mask 7 0 R");
+    let (_, plain) = masked_image(false, "");
+    assert!(entries > 0 && keyed != plain, "{entries}, {keyed:?}");
+    // Each case, the entries it read, and whether its pixels are those without the mask.
+    let read: Vec<_> = [
+        (true, "/SMask 7 0 R", ""),
+        (true, "/Mask 7 0 R", ""),
+        (false, "/Mask 7 0 R", "/SMask 6 0 R"),
+        (false, "/Mask 7 0 R", "/SMaskInData 1"),
+    ]
+    .into_iter()
+    .map(|(stencil, unused, beside)| {
+        let (entries, pixels) = masked_image(stencil, &format!("{beside} {unused}"));
+        let (_, expected) = masked_image(stencil, beside);
+        let case = format!("stencil {stencil}: {unused} beside {beside:?}");
+        (case, entries, pixels == expected)
+    })
+    .collect();
+    assert!(read.iter().all(|r| r.1 == 0 && r.2), "{read:#?}");
+}
