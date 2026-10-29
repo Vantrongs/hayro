@@ -17,7 +17,7 @@ use crate::object::Name;
 use crate::object::ObjectIdentifier;
 use crate::object::dict::InlineImageDict;
 use crate::object::dict::keys::{DECODE_PARMS, DP, F, FILTER, IDENTITY, LENGTH, NAME, TYPE, XREF};
-use crate::object::{Array, Object, ObjectLike, ObjectRefLike, Written};
+use crate::object::{Array, Kind, Object, ObjectLike, ObjectRefLike, Written};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::sync::Arc;
@@ -1057,6 +1057,9 @@ impl<'a> TryFrom<Object<'a>> for Stream<'a> {
 
 impl<'a> ObjectLike<'a> for Stream<'a> {
     const STREAM: bool = true;
+    // No token starts a stream where an object is an item or a value: only an object
+    // of its own is one.
+    const KIND: Option<Kind> = Some(Kind::Stream);
 }
 impl<'a> ObjectRefLike<'a> for Stream<'a> {
     fn cast_ref<'b>(obj: &'b Object<'a>) -> Option<&'b Self> {

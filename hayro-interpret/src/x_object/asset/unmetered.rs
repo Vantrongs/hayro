@@ -193,8 +193,6 @@ fn stretches(pdf: &Pdf) -> Vec<(String, Stretch)> {
 /// [`stretches`], and the work of all of them.
 fn measure(pdf: &Pdf) -> (Vec<(String, Stretch)>, Stretch) {
     let asset = asset(pdf);
-    // The process makes its CMYK profile once, on first use.
-    ColorSpace::device_cmyk().to_rgba(&[0.0; 4], 1.0);
     // The document parses an object's dictionary a few times at most, however often
     // it is read, then keeps it: that parse is the document's, not the image's.
     for id in [3, 4] {
@@ -202,6 +200,13 @@ fn measure(pdf: &Pdf) -> (Vec<(String, Stretch)>, Stretch) {
             drop(pdf.xref().get::<Stream<'_>>(ObjectIdentifier::new(id, 0)));
         }
     }
+    measure_asset(asset)
+}
+
+/// [`measure`], of `asset`, whose document's objects are read as they are to be.
+fn measure_asset(asset: ImageAsset) -> (Vec<(String, Stretch)>, Stretch) {
+    // The process makes its CMYK profile once, on first use.
+    ColorSpace::device_cmyk().to_rgba(&[0.0; 4], 1.0);
     COUNTS.with(|c| c.set(Some(0)));
     let s = Stretches::default();
     let hook = || {
@@ -782,4 +787,159 @@ fn array_entries_past_those_read_are_not_read() {
             }
         }
     }
+}
+
+/// The pixels of `asset` requested streamed, which decoding it whole gives too.
+fn pixels(asset: &ImageAsset, name: &str) -> (PixelFormat, Vec<u8>) {
+    let mut streamed = asset.open(None, None).unwrap();
+    let a = request(&mut streamed, Plane::Image, (1, 1), [0, 0, 1, 1]);
+    let b = request(&mut whole(asset), Plane::Image, (1, 1), [0, 0, 1, 1]);
+    assert_eq!((a.format, &a.data), (b.format, &b.data), "{name}");
+    (a.format, a.data)
+}
+
+/// One-pixel 1-bit images whose arrays hold, after the entries their rule reads, a
+/// reference to object 5, an array of a growing number of numbers that nothing
+/// read before: the image's and a soft mask's `/Decode` after their pair, a colour
+/// key's `/Mask` after its pair and after a name that ends its numbers, and a
+/// `/Matte` after a name that ends its one number, after a second number that
+/// makes it no matte, and after a name that leaves it none. Opening, requesting and
+/// decoding each does the same work, reads the same bodies of objects and gives the
+/// same pixels, however long the array: the object is not read.
+#[cfg(debug_assertions)]
+#[test]
+fn references_past_the_entries_a_rule_reads_are_not_resolved() {
+    use crate::fixtures::{file, stream};
+    use hayro_syntax::work::BODIES_READ;
+    let bit = zlib(&[0x00]);
+    let gray1 = format!("{GRAY1} /Filter /FlateDecode");
+    let with_mask = |mask: &str| {
+        vec![
+            stream(&image(&format!("{gray1} /SMask 4 0 R"), 1, 1), &bit),
+            stream(&image(&format!("{gray1} {mask}"), 1, 1), &bit),
+        ]
+    };
+    let shapes: Vec<(&str, Vec<Vec<u8>>)> = vec![
+        (
+            "decode",
+            vec![stream(
+                &image(&format!("{gray1} /Decode [1 0 5 0 R]"), 1, 1),
+                &bit,
+            )],
+        ),
+        ("soft mask's decode", with_mask("/Decode [1 0 5 0 R]")),
+        ("matte of one", with_mask("/Matte [0.5 /N 5 0 R]")),
+        ("matte of two", with_mask("/Matte [0.5 0.5 5 0 R]")),
+        ("matte of none", with_mask("/Matte [/N 5 0 R]")),
+        (
+            "colour key",
+            vec![stream(
+                &image(&format!("{gray1} /Mask [0 0 5 0 R]"), 1, 1),
+                &bit,
+            )],
+        ),
+        (
+            "colour key cut short",
+            vec![stream(
+                &image(&format!("{gray1} /Mask [0 /N 5 0 R]"), 1, 1),
+                &bit,
+            )],
+        ),
+    ];
+    let mut grew = Vec::new();
+    for (name, objects) in shapes {
+        let mut first = None;
+        for numbers in [1, 10_000, 1_000_000] {
+            let mut all = vec![
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+                b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec(),
+            ];
+            all.extend(objects.iter().cloned());
+            all.resize(4, b"null".to_vec());
+            all.push(format!("[{}]", " 7".repeat(numbers)).into_bytes());
+            let pdf = Pdf::new(file(&all, "")).unwrap();
+            let bodies = BODIES_READ.with(Cell::get);
+            let pixels = pixels(&asset(&pdf), name);
+            let work = (
+                pixels,
+                measure(&pdf).1,
+                BODIES_READ.with(Cell::get) - bodies,
+            );
+            println!(
+                "{name}, {numbers} numbers referred to: {:?} {:?} {:?}",
+                work.0, work.1, work.2
+            );
+            match &first {
+                None => first = Some(work),
+                Some(first) if work != *first => grew.push(format!("{name}, {numbers} numbers")),
+                Some(_) => {}
+            }
+        }
+    }
+    assert!(grew.is_empty(), "work grew with the array: {grew:?}");
+}
+
+/// The image of the inline image `content` holds, as an asset.
+fn inline_asset(content: &[u8]) -> ImageAsset {
+    use hayro_syntax::content::TypedIter;
+    use hayro_syntax::content::ops::TypedInstruction;
+    let mut ops = TypedIter::new(content);
+    let stream = loop {
+        if let TypedInstruction::InlineImage(image) = ops.next().expect("an inline image") {
+            break image.0.clone();
+        }
+    };
+    let sink: WarningSinkFn = Arc::new(|_| {});
+    ImageXObject::new(&stream, |_| None, &sink, &Cache::new(), None)
+        .unwrap()
+        .asset(None)
+}
+
+/// One-pixel 1-bit inline images, whose dictionaries are read from their bytes,
+/// with a dictionary of a growing number of entries where an entry of another kind
+/// is: past the pair of a `/D` that is read, in place of a `/D` array, of a
+/// `/SMask` stream, and of the number of a Flate filter's `/Predictor`. Opening, requesting and decoding each does the same work and
+/// gives the same pixels, however many entries the dictionary has: it is not read.
+#[test]
+fn inline_entries_of_another_kind_are_not_read() {
+    let bit = zlib(&[0x00]);
+    let shapes = |entries: &str| {
+        [
+            (
+                "past the decode pair",
+                format!("/D [1 0 << {entries} >>]"),
+                &[0][..],
+            ),
+            ("a decode dictionary", format!("/D << {entries} >>"), &[0]),
+            (
+                "a soft mask dictionary",
+                format!("/SMask << {entries} >>"),
+                &[0],
+            ),
+            (
+                "a predictor dictionary",
+                format!("/F /Fl /DP << /Predictor << {entries} >> >>"),
+                &bit,
+            ),
+        ]
+    };
+    let mut first = Vec::new();
+    let mut grew = Vec::new();
+    for count in [1, 1_000, 100_000] {
+        let entries: String = (0..count).map(|i| format!("/K{i} 0 ")).collect();
+        for (i, (name, entry, data)) in shapes(&entries).into_iter().enumerate() {
+            let mut content = format!("BI /W 1 /H 1 /BPC 1 /CS /G {entry} ID ").into_bytes();
+            content.extend_from_slice(data);
+            content.extend_from_slice(b" EI");
+            let asset = inline_asset(&content);
+            let work = (pixels(&asset, name), measure_asset(asset).1);
+            println!("{name}, {count} entries: {:?} {:?}", work.0, work.1);
+            match first.get(i) {
+                None => first.push(work),
+                Some(first) if work != *first => grew.push(format!("{name}, {count} entries")),
+                Some(_) => {}
+            }
+        }
+    }
+    assert!(grew.is_empty(), "work grew with the dictionary: {grew:?}");
 }

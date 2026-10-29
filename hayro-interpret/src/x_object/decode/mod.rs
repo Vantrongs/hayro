@@ -12,11 +12,12 @@ use core::ops::Range;
 use hayro_syntax::Filter;
 use hayro_syntax::bit_reader::BitReader;
 use hayro_syntax::object::Stream;
+use hayro_syntax::object::array::Take;
 use hayro_syntax::object::dict::keys::*;
 use hayro_syntax::object::stream::{
     DecodeFailure, FilterResult, ImageColorSpace, ImageData, ImageDecodeParams,
 };
-use hayro_syntax::object::{Array, Object};
+use hayro_syntax::object::{Array, Dict, Kind};
 use hayro_syntax::work::{Cancelled, Meter, POLL_BYTES};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -195,13 +196,7 @@ fn sample_format_with(
         .or(dict_bpc)
         .unwrap_or_else(|| fallback_bpc(obj.kind));
 
-    let decode_arr = decode_array(
-        dict.get::<Object<'_>>(D)
-            .or_else(|| dict.get::<Object<'_>>(DECODE)),
-        &color_space,
-        bits_per_component,
-        meter,
-    )?;
+    let decode_arr = decode_array(dict, &color_space, bits_per_component, meter)?;
 
     Ok(SampleFormat {
         color_space,
@@ -210,25 +205,31 @@ fn sample_format_with(
     })
 }
 
-/// The decode array of samples of `color_space` and `bits_per_component` that `entry`
-/// gives, one pair per component, as `MuPDF` reads it (observed through `PyMuPDF`
+/// The decode array of samples of `color_space` and `bits_per_component` that
+/// `dict`'s `/D` gives, or where it has none (or one referring to no object) its
+/// `/Decode`, one pair per component, as `MuPDF` reads it (observed through `PyMuPDF`
 /// 1.28.2): without an entry, or a null one, the colour space's default; an entry
 /// missing from the array or not a number is 0, and entries past the components'
-/// are ignored, and not read; an entry that is no array maps every sample to 0.
-/// Reading the array counts on `meter`.
+/// are ignored, and not read; an entry that is no array maps every sample to 0, and
+/// is not read past its kind. Reading the array counts on `meter`.
 fn decode_array(
-    entry: Option<Object<'_>>,
+    dict: &Dict<'_>,
     color_space: &ColorSpace,
     bits_per_component: u8,
     meter: &Meter<'_>,
 ) -> Result<SmallVec<[(f32, f32); 4]>, Cancelled> {
     let pairs = color_space.num_components() as usize;
-    let values = match entry {
-        None | Some(Object::Null(_)) => {
+    let entry = |key| {
+        dict.get::<Array<'_>>(key)
+            .map(Ok)
+            .or_else(|| dict.get::<Kind>(key).map(Err))
+    };
+    let values = match entry(D).or_else(|| entry(DECODE)) {
+        None | Some(Err(Kind::Null)) => {
             return Ok(color_space.default_decode_arr(f32::from(bits_per_component)));
         }
-        Some(Object::Array(array)) => array.leading::<f32>(2 * pairs, meter)?.entries,
-        Some(_) => SmallVec::new(),
+        Some(Ok(array)) => array.leading::<f32>(Take::Each(2 * pairs), meter)?.entries,
+        Some(Err(_)) => SmallVec::new(),
     };
     let value = |i: usize| values.get(i).copied().flatten().unwrap_or(0.0);
     Ok((0..pairs)
@@ -427,7 +428,9 @@ pub(crate) fn colour_key(
     let Some(array) = obj.stream.dict().get::<Array<'_>>(MASK) else {
         return Ok(None);
     };
-    Ok(array.leading::<u16>(2 * components, meter)?.at_least())
+    Ok(array
+        .leading::<u16>(Take::AtLeast(2 * components), meter)?
+        .values())
 }
 
 /// The `/Matte` of `obj`'s soft mask, where it gives a value for each of the image's
@@ -446,7 +449,9 @@ pub(crate) fn matte(
     else {
         return Ok(None);
     };
-    Ok(array.leading::<f32>(components, meter)?.exactly())
+    Ok(array
+        .leading::<f32>(Take::Exactly(components), meter)?
+        .values())
 }
 
 /// A colour-key mask: a range of stored values for each component, low then high.
@@ -863,7 +868,7 @@ mod tests {
     use crate::cache::Cache;
     use crate::fixtures::{file, stream};
     use hayro_syntax::Pdf;
-    use hayro_syntax::object::{ObjectIdentifier, Stream};
+    use hayro_syntax::object::{Object, ObjectIdentifier, Stream};
     use std::sync::Arc;
 
     /// The bits per component and components an image of `dict` decodes with.
@@ -908,5 +913,105 @@ mod tests {
             let dict = format!("{dict} /Filter /JPXDecode");
             assert_eq!(decoded_with(&dict), expected, "{dict}");
         }
+    }
+
+    /// The decode array a dictionary gives, read as its entry was read before it was
+    /// read by kind: `/D`, or `/Decode` where it reads as no object, as an object.
+    fn read_as_object(dict: &Dict<'_>) -> SmallVec<[(f32, f32); 4]> {
+        let gray = ColorSpace::device_gray();
+        let values: SmallVec<[f32; 2]> = match dict
+            .get::<Object<'_>>(D)
+            .or_else(|| dict.get::<Object<'_>>(DECODE))
+        {
+            None | Some(Object::Null(_)) => return gray.default_decode_arr(1.0),
+            Some(Object::Array(array)) => array
+                .items::<f32>()
+                .take(2)
+                .map(|v| v.unwrap_or(0.0))
+                .collect(),
+            Some(_) => SmallVec::new(),
+        };
+        let value = |i: usize| values.get(i).copied().unwrap_or(0.0);
+        [(value(0), value(1))].into_iter().collect()
+    }
+
+    /// Whatever kind of object `/D` and `/Decode` are, directly or by reference, in
+    /// a dictionary read from bytes (an inline image's) or parsed with its object's
+    /// body, the decode array is the one reading the entry as an object gives.
+    #[test]
+    fn decode_entries_are_read_by_kind_as_they_were_read_as_objects() {
+        use hayro_syntax::content::TypedIter;
+        use hayro_syntax::content::ops::TypedInstruction;
+        let values = [
+            "[1 0]",
+            "[0.5]",
+            "[1 /N 0]",
+            "null",
+            "5",
+            "1e3",
+            "true",
+            "/N",
+            "(x)",
+            "<< /A 1 >>",
+            "[]",
+            "4 0 R",
+            "5 0 R",
+            "6 0 R",
+            "9 0 R",
+        ];
+        let mut dicts = Vec::new();
+        for d in values
+            .iter()
+            .map(|v| format!("/D {v}"))
+            .chain([String::new()])
+        {
+            for decode in values
+                .iter()
+                .map(|v| format!("/Decode {v}"))
+                .chain([String::new()])
+            {
+                dicts.push(format!("{d} {decode}"));
+            }
+        }
+        let gray = ColorSpace::device_gray();
+        let meter = Meter::default();
+        let mut inlines = 0;
+        for entries in dicts {
+            let objects = [
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+                b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec(),
+                format!("<< {entries} >>").into_bytes(),
+                b"[0.25 0.75]".to_vec(),
+                b"null".to_vec(),
+                b"<< /B 2 >>".to_vec(),
+            ];
+            let pdf = Pdf::new(file(&objects, "")).unwrap();
+            let parsed = pdf
+                .xref()
+                .get::<Dict<'_>>(ObjectIdentifier::new(3, 0))
+                .unwrap();
+            // An inline image holds no reference, nor a token a content stream
+            // cannot read (`1e3`): with one, it is no image.
+            let content = format!("BI {entries} ID x EI");
+            let mut ops = TypedIter::new(content.as_bytes());
+            let inline = loop {
+                match ops.next() {
+                    Some(TypedInstruction::InlineImage(image)) => {
+                        break Some(image.0.dict().clone());
+                    }
+                    Some(_) => {}
+                    None => break None,
+                }
+            };
+            inlines += usize::from(inline.is_some());
+            for (held, dict) in [("parsed", Some(&parsed)), ("inline", inline.as_ref())] {
+                let Some(dict) = dict else {
+                    continue;
+                };
+                let by_kind = decode_array(dict, &gray, 1, &meter).unwrap();
+                assert_eq!(by_kind, read_as_object(dict), "{held} << {entries} >>");
+            }
+        }
+        assert!(inlines > 100, "{inlines} inline images");
     }
 }

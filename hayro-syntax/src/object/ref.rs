@@ -1,6 +1,6 @@
 //! Object references.
 
-use crate::object::ObjectLike;
+use crate::object::{Kind, ObjectLike};
 use crate::object::{Number, ObjectIdentifier};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
@@ -151,16 +151,22 @@ where
     }
 }
 
+// An object whose first token tells it is of another kind than `T`'s one is no `T`,
+// and is not read: a dictionary where a number is wanted costs nothing.
 impl<'a, T> Readable<'a> for MaybeRef<T>
 where
-    T: Readable<'a>,
+    T: ObjectLike<'a>,
 {
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         if let Some(obj) = r.read::<ObjRef>(ctx) {
-            Some(Self::Ref(obj))
-        } else {
-            Some(Self::NotRef(r.read::<T>(ctx)?))
+            return Some(Self::Ref(obj));
         }
+        if let Some(kind) = T::KIND
+            && Kind::of_token(r).is_some_and(|other| other != kind)
+        {
+            return None;
+        }
+        Some(Self::NotRef(r.read::<T>(ctx)?))
     }
 }
 

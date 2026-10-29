@@ -3,7 +3,7 @@
 use crate::object::macros::object;
 use crate::object::parsed::{Items, Node, Part};
 use crate::object::r#ref::MaybeRef;
-use crate::object::{FromBytes, Object, ObjectIdentifier, ObjectLike, Written};
+use crate::object::{FromBytes, Kind, Object, ObjectIdentifier, ObjectLike, Written};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::work::{Cancelled, Meter};
@@ -162,33 +162,46 @@ impl<'a> Array<'a> {
         }
     }
 
-    /// The first `n` entries, and whether the one after them is a `T`, read as
-    /// [`Self::items`] reads them and each counted on `meter` before it is: an array
-    /// read for a few entries costs those, however many follow.
+    /// The first entries of the array, as `take` reads them, each read as
+    /// [`Self::items`] reads it and counted on `meter`: before it is read, as the
+    /// object it makes, and after, as the bytes it was read from. Each rule reads
+    /// the entries it decides on and no more, so an array read for a few entries
+    /// costs those, however many follow, and whatever they are.
     #[allow(
         private_bounds,
         reason = "users shouldn't be able to implement `ObjectLike` for custom objects."
     )]
-    pub fn leading<T>(&self, n: usize, meter: &Meter<'_>) -> Result<Leading<T>, Cancelled>
+    pub fn leading<T>(&self, take: Take, meter: &Meter<'_>) -> Result<Leading<T>, Cancelled>
     where
         T: ObjectLike<'a>,
     {
+        let (n, stop) = match take {
+            Take::Each(n) => (n, false),
+            Take::AtLeast(n) | Take::Exactly(n) => (n, true),
+        };
         let mut items = self.items::<T>();
-        let mut entries = SmallVec::new();
-        let mut more = false;
-        for i in 0..=n {
+        let mut next = || {
             meter.work(LEADING_ENTRY_WORK)?;
             crate::work::operation(1);
-            let Some(entry) = items.next() else {
-                break;
-            };
-            if i < n {
-                entries.push(entry);
-            } else {
-                more = entry.is_some();
+            let before = items.lexed();
+            let entry = items.next();
+            meter.work(items.lexed() - before)?;
+            Ok(entry)
+        };
+        let mut entries = SmallVec::new();
+        while entries.len() < n {
+            match next()? {
+                Some(entry @ Some(_)) => entries.push(entry),
+                Some(None) if !stop => entries.push(None),
+                Some(None) | None => break,
             }
         }
-        Ok(Leading { entries, more, n })
+        let met = match take {
+            Take::Each(_) => true,
+            Take::AtLeast(_) => entries.len() == n,
+            Take::Exactly(_) => entries.len() == n && !matches!(next()?, Some(Some(_))),
+        };
+        Ok(Leading { entries, met })
     }
 
     /// Return the raw data of the array.
@@ -384,8 +397,18 @@ where
     type Item = Option<T>;
 
     // Each entry read as an object and cast, as a parsed array's entries are, so
-    // that an entry of another type is passed over by the one rule that read it.
+    // that an entry of another type is passed over by the one rule that read it;
+    // but one read from bytes whose first token tells it is of another kind than a
+    // `T`'s is skipped, which reads it as reading does, unmade.
     fn next(&mut self) -> Option<Self::Item> {
+        if let (Some(kind), Cursor::Bytes(reader)) = (T::KIND, &mut self.raw.cursor) {
+            reader.skip_white_spaces_and_comments();
+            if Kind::of_token(reader).is_some_and(|other| other != kind) {
+                let skipped = reader.skip::<Object<'_>>(self.raw.ctx.in_content_stream())?;
+                crate::work::lexed(skipped.len());
+                return Some(None);
+            }
+        }
         Some(match self.raw.next()? {
             MaybeRef::Ref(r) => self.raw.ctx.xref().get_with::<T>(r.into(), &self.raw.ctx),
             MaybeRef::NotRef(object) => object.cast::<T>(),
@@ -393,36 +416,52 @@ where
     }
 }
 
+impl<T> ArrayItems<'_, T> {
+    /// How far into the array's bytes the entries read so far reach; 0 for an array
+    /// parsed with its object's body, whose entries are read from what that made.
+    fn lexed(&self) -> usize {
+        match &self.raw.cursor {
+            Cursor::Bytes(reader) => reader.offset(),
+            Cursor::Parsed { .. } => 0,
+        }
+    }
+}
+
 /// The work an entry [`Array::leading`] reads counts as: the object read.
 const LEADING_ENTRY_WORK: usize = size_of::<Object<'static>>();
+
+/// How many of an array's first entries [`Array::leading`] reads, and where it stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Take {
+    /// Each of the first `n` entries, a `T` or none, as [`Array::items`] gives them:
+    /// one of another type does not stop it.
+    Each(usize),
+    /// The first `n` entries, where each is a `T`, as reading a `T` from a
+    /// [`FlexArrayIter`] that many times reads them: it stops at the first that is
+    /// none.
+    AtLeast(usize),
+    /// The first `n` entries, where the array starts with exactly `n` `T`s, as
+    /// reading it as a vector of `T`s reads `n` of them: it stops at the first entry
+    /// that is no `T`, and reads entry `n + 1`, to tell, only after `n` `T`s.
+    Exactly(usize),
+}
 
 /// The first entries of an array ([`Array::leading`]).
 #[derive(Debug, Clone)]
 pub struct Leading<T> {
-    /// Each of the first `n` entries, or of all of a shorter array: a `T`, or `None`
-    /// where it is of another type or a reference to no object.
+    /// The entries read: for [`Take::Each`], each of the first `n`, or of all of a
+    /// shorter array, a `T` or `None` where it is of another type or a reference to
+    /// no object; for the others, the `T`s they start with, up to `n`.
     pub entries: SmallVec<[Option<T>; 8]>,
-    /// Whether the entry after them is a `T`.
-    pub more: bool,
-    n: usize,
+    /// Whether the array meets the rule: always for [`Take::Each`].
+    pub met: bool,
 }
 
 impl<T> Leading<T> {
-    /// The `n` entries, where the array starts with `n` `T`s or more.
-    pub fn at_least<C: FromIterator<T>>(self) -> Option<C> {
-        if self.entries.len() < self.n {
-            return None;
-        }
-        self.entries.into_iter().collect()
-    }
-
-    /// The `n` entries, where the array starts with `n` `T`s and no more: as reading
-    /// it as a vector of `T`s reads `n` of them.
-    pub fn exactly<C: FromIterator<T>>(self) -> Option<C> {
-        if self.more {
-            return None;
-        }
-        self.at_least()
+    /// The `T`s of an array that meets the rule.
+    pub fn values<C: FromIterator<T>>(self) -> Option<C> {
+        self.met
+            .then(|| self.entries.into_iter().flatten().collect())
     }
 }
 
@@ -514,7 +553,9 @@ impl<'a, T: ObjectLike<'a> + Copy + Default, const C: usize> Readable<'a> for [T
     }
 }
 
-impl<'a, T: ObjectLike<'a> + Copy + Default, const C: usize> ObjectLike<'a> for [T; C] {}
+impl<'a, T: ObjectLike<'a> + Copy + Default, const C: usize> ObjectLike<'a> for [T; C] {
+    const KIND: Option<Kind> = Some(Kind::Array);
+}
 
 impl<'a, T: ObjectLike<'a>> TryFrom<Array<'a>> for Vec<T> {
     type Error = ();
@@ -542,7 +583,9 @@ impl<'a, T: ObjectLike<'a>> Readable<'a> for Vec<T> {
     }
 }
 
-impl<'a, T: ObjectLike<'a>> ObjectLike<'a> for Vec<T> {}
+impl<'a, T: ObjectLike<'a>> ObjectLike<'a> for Vec<T> {
+    const KIND: Option<Kind> = Some(Kind::Array);
+}
 
 impl<'a, U: ObjectLike<'a>, T: ObjectLike<'a> + smallvec::Array<Item = U>> TryFrom<Array<'a>>
     for SmallVec<T>
@@ -582,16 +625,19 @@ where
     U: Clone,
     U: Debug,
 {
+    const KIND: Option<Kind> = Some(Kind::Array);
 }
 
 #[cfg(test)]
 mod tests {
+    use super::Take;
     use crate::object::Object;
     use crate::object::r#ref::MaybeRef;
     use crate::object::{Array, FromBytes};
     use crate::reader::Reader;
     use crate::reader::{ReaderContext, ReaderExt};
     use crate::xref::XRef;
+    use core::fmt::Debug;
 
     fn array_impl(data: &[u8]) -> Option<Vec<Object<'_>>> {
         Reader::new(data)
@@ -700,7 +746,7 @@ mod tests {
 
     /// Each array of `cases`, as read from its bytes and as parsed once.
     fn both_readings(f: impl Fn(&[u8], &Array<'_>)) {
-        let cases: [&[u8]; 14] = [
+        let cases: [&[u8]; 24] = [
             b"[]",
             b"[1]",
             b"[1 2]",
@@ -715,6 +761,16 @@ mod tests {
             b"[1 2 3 4 5 6 7 8 9 10]",
             b"[0 1 % a comment\n 2]",
             b"[1 2 3 4 /N]",
+            b"[0 1 << /A 1 /B [2] >> 2]",
+            b"[<< /A << /B 1 >> >> 1 2]",
+            b"[1 [2 [3]] 4 5]",
+            b"[1 <414243> 2 (a\\) b) 3]",
+            b"[1 1e3 2 true 3]",
+            b"[/A#41 1 /B 2]",
+            b"[1 2 <<>> []]",
+            b"[(x) 1 2]",
+            b"[<< /A 1 >>]",
+            b"[[] 1]",
         ];
         let ctx = ReaderContext::new(XRef::dummy(), false);
         for data in cases {
@@ -729,28 +785,114 @@ mod tests {
         }
     }
 
-    #[test]
-    fn leading_entries_read_as_the_whole_array_does() {
+    /// Each entry of `array` as a `T`, read as an object and cast, references
+    /// resolved: as every reading of entries read them before any was passed over by
+    /// its first token, which these readings are checked against.
+    fn cast<'a, T: crate::object::ObjectLike<'a>>(array: &Array<'a>) -> Vec<Option<T>> {
+        let ctx = array.ctx().clone();
+        array
+            .raw_iter()
+            .map(|entry| match entry {
+                MaybeRef::Ref(r) => ctx.xref().get_with::<T>(r.into(), &ctx),
+                MaybeRef::NotRef(object) => object.cast::<T>(),
+            })
+            .collect()
+    }
+
+    /// Every reading of `array`'s entries as `T`s reads what [`cast`] reads.
+    fn read_as_cast<'a, T: crate::object::ObjectLike<'a>>(data: &[u8], array: &Array<'a>) {
         use crate::work::Meter;
-        use smallvec::SmallVec;
+        let show = |v: &dyn Debug| format!("{v:?}");
+        let all = cast::<T>(array);
+        let prefix: Vec<T> = all.iter().map_while(Clone::clone).collect();
+        let items: Vec<Option<T>> = array.items::<T>().collect();
+        assert_eq!(show(&items), show(&all), "{data:?} items");
+        let mut flex = array.flex_iter();
+        let flexed: Vec<T> = core::iter::from_fn(|| flex.next::<T>()).collect();
+        assert_eq!(show(&flexed), show(&prefix), "{data:?} flex");
+        let collected = Vec::<T>::try_from(array.clone()).unwrap();
+        assert_eq!(show(&collected), show(&prefix), "{data:?} vector");
+        let meter = Meter::default();
+        for n in 0..6 {
+            let each = array.leading::<T>(Take::Each(n), &meter).unwrap();
+            let expected: Vec<_> = all.iter().take(n).cloned().collect();
+            assert_eq!(show(&each.entries), show(&expected), "{data:?} each {n}");
+            let at_least: Option<Vec<T>> = array
+                .leading::<T>(Take::AtLeast(n), &meter)
+                .unwrap()
+                .values();
+            let expected = (prefix.len() >= n).then(|| prefix[..n].to_vec());
+            assert_eq!(show(&at_least), show(&expected), "{data:?} at least {n}");
+            let exactly: Option<Vec<T>> = array
+                .leading::<T>(Take::Exactly(n), &meter)
+                .unwrap()
+                .values();
+            let expected = (prefix.len() == n).then(|| prefix.clone());
+            assert_eq!(show(&exactly), show(&expected), "{data:?} exactly {n}");
+        }
+    }
+
+    #[test]
+    fn entries_read_as_they_are_cast() {
+        use crate::object::{Dict, Name, String};
         both_readings(|data, array| {
-            for n in 0..6 {
-                let meter = Meter::default();
-                let exactly = array.leading::<f32>(n, &meter).unwrap().exactly();
-                let whole = SmallVec::<[f32; 4]>::try_from(array.clone())
-                    .ok()
-                    .filter(|v| v.len() == n);
-                assert_eq!(exactly, whole, "{data:?} exactly {n}");
-                let at_least = array.leading::<u16>(n, &meter).unwrap().at_least();
-                let mut entries = array.flex_iter();
-                let prefix: Option<SmallVec<[u16; 4]>> =
-                    (0..n).map(|_| entries.next::<u16>()).collect();
-                assert_eq!(at_least, prefix, "{data:?} at least {n}");
-                let leading = array.leading::<f32>(n, &meter).unwrap().entries;
-                let items: Vec<_> = array.items::<f32>().take(n).collect();
-                assert_eq!(leading.as_slice(), items.as_slice(), "{data:?} entries {n}");
-            }
+            read_as_cast::<f32>(data, array);
+            read_as_cast::<u16>(data, array);
+            read_as_cast::<Name<'_>>(data, array);
+            read_as_cast::<String<'_>>(data, array);
+            read_as_cast::<Array<'_>>(data, array);
+            read_as_cast::<Dict<'_>>(data, array);
+            read_as_cast::<Object<'_>>(data, array);
+            read_as_cast::<crate::object::Kind>(data, array);
         });
+    }
+
+    /// Entries of another kind than the one read, and those past the ones a rule
+    /// reads, are not made: no dictionary or array of theirs is parsed.
+    #[test]
+    fn entries_of_another_kind_are_not_made() {
+        use crate::object::dict::PARSED;
+        use crate::work::Meter;
+        let parsed = || PARSED.with(core::cell::Cell::get);
+        let array = numbers(b"[0 << /A 1 /B 2 >> 1 [2 3] (s) 4 << /C 3 >>]");
+        let meter = Meter::default();
+        let before = parsed();
+        let items: Vec<_> = array.items::<f32>().collect();
+        assert_eq!(
+            items,
+            [Some(0.0), None, Some(1.0), None, None, Some(4.0), None]
+        );
+        let each = array.leading::<f32>(Take::Each(6), &meter).unwrap();
+        assert_eq!(each.entries.as_slice(), &items[..6]);
+        let prefix = array.leading::<f32>(Take::AtLeast(1), &meter).unwrap();
+        assert!(prefix.met);
+        let exactly = array.leading::<f32>(Take::Exactly(1), &meter).unwrap();
+        assert!(exactly.met);
+        assert_eq!(Vec::<f32>::try_from(array.clone()), Ok(vec![0.0]));
+        assert_eq!(parsed(), before, "an entry was made");
+        let mut entries = array.flex_iter();
+        let kinds: Vec<_> = core::iter::from_fn(|| entries.next::<Kind>()).collect();
+        use crate::object::Kind;
+        assert_eq!(
+            kinds,
+            [
+                Kind::Number,
+                Kind::Dict,
+                Kind::Number,
+                Kind::Array,
+                Kind::String,
+                Kind::Number,
+                Kind::Dict
+            ]
+        );
+        let dict = Reader::new(b"<< /D << /A 1 >> /S <<>> >>")
+            .read_with_context::<crate::object::Dict<'_>>(&ReaderContext::new(XRef::dummy(), false))
+            .unwrap();
+        let before = parsed();
+        assert_eq!(dict.get::<Kind>("D"), Some(Kind::Dict));
+        assert_eq!(dict.get::<Array<'_>>("D"), None);
+        assert_eq!(dict.get::<crate::object::Stream<'_>>("S"), None);
+        assert_eq!(parsed(), before, "an entry was made for its kind");
     }
 
     #[test]
@@ -764,7 +906,7 @@ mod tests {
         };
         let meter = Meter::new(Some(&hook));
         let mut read = 0;
-        while array.leading::<f32>(3, &meter).is_ok() {
+        while array.leading::<f32>(Take::Each(3), &meter).is_ok() {
             read += 1;
         }
         assert!(

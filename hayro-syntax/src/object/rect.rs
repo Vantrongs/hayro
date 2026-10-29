@@ -1,7 +1,7 @@
 //! Rectangles.
 
 use crate::object::Array;
-use crate::object::{Object, ObjectLike};
+use crate::object::{Kind, Object, ObjectLike};
 use crate::reader::{Readable, ReaderContext, ReaderExt};
 
 use crate::reader::Reader;
@@ -80,4 +80,6 @@ impl TryFrom<Object<'_>> for Rect {
     }
 }
 
-impl ObjectLike<'_> for Rect {}
+impl ObjectLike<'_> for Rect {
+    const KIND: Option<Kind> = Some(Kind::Array);
+}

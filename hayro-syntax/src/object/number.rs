@@ -73,7 +73,7 @@
 
 use crate::math::powi_f64;
 use crate::object::macros::object;
-use crate::object::{Object, ObjectLike};
+use crate::object::{Kind, Object, ObjectLike};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::trivia::is_regular_character;
@@ -827,7 +827,9 @@ macro_rules! int_num {
             }
         }
 
-        impl<'a> ObjectLike<'a> for $i {}
+        impl<'a> ObjectLike<'a> for $i {
+            const KIND: Option<Kind> = Some(Kind::Number);
+        }
     };
 }
 
@@ -862,7 +864,9 @@ impl TryFrom<Object<'_>> for f32 {
     }
 }
 
-impl ObjectLike<'_> for f32 {}
+impl ObjectLike<'_> for f32 {
+    const KIND: Option<Kind> = Some(Kind::Number);
+}
 
 impl Skippable for f64 {
     fn skip(r: &mut Reader<'_>, is_content_stream: bool) -> Option<()> {
@@ -887,7 +891,9 @@ impl TryFrom<Object<'_>> for f64 {
     }
 }
 
-impl ObjectLike<'_> for f64 {}
+impl ObjectLike<'_> for f64 {
+    const KIND: Option<Kind> = Some(Kind::Number);
+}
 
 #[cfg(test)]
 mod tests {

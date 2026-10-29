@@ -141,6 +141,11 @@ pub(crate) trait ObjectLike<'a>: TryFrom<Object<'a>> + Readable<'a> + Debug + Cl
     /// of another kind.
     const STREAM: bool = false;
 
+    /// The one kind of object that is read as one, where there is one: an object
+    /// whose first token tells it is of another kind ([`Kind::of_token`]) is no such
+    /// object, and is not read as one.
+    const KIND: Option<Kind> = None;
+
     /// Reads the object an indirect object holds, after its header.
     fn read_indirect(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         r.read_with_context::<Self>(ctx)
@@ -211,6 +216,103 @@ impl<'a> Written<'a> {
             Object::Array(array) => Self::Array(array),
             Object::Stream(stream) => Self::Stream(stream),
         }
+    }
+}
+
+/// The kind of an object: the variant of [`Object`] it reads as. Read as an object,
+/// it is the kind of the object there, which is passed over, not read: a dictionary
+/// or an array of any size costs its bytes, looked at, not what reading it makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// The null object.
+    Null,
+    /// A boolean.
+    Boolean,
+    /// A number.
+    Number,
+    /// A string.
+    String,
+    /// A name.
+    Name,
+    /// A dictionary.
+    Dict,
+    /// An array.
+    Array,
+    /// A stream, which only an object of its own is.
+    Stream,
+}
+
+impl Kind {
+    /// The kind of the object `r` is at, where its first token alone tells it, as
+    /// [`Object::read`] reads it (rule 1 of the module doc): a dictionary, an array,
+    /// a name or a string. `None` for another token: a number, which may start a
+    /// reference or be `null` (rule 2), or a word.
+    #[inline]
+    pub(crate) fn of_token(r: &Reader<'_>) -> Option<Self> {
+        match r.peek_byte()? {
+            b'<' if r.peek_bytes(2) == Some(b"<<") => Some(Self::Dict),
+            b'[' => Some(Self::Array),
+            b'/' => Some(Self::Name),
+            b'(' | b'<' => Some(Self::String),
+            _ => None,
+        }
+    }
+}
+
+impl<'a> Readable<'a> for Kind {
+    fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
+        let in_content_stream = ctx.in_content_stream();
+        match Self::of_token(r) {
+            Some(kind @ (Self::Dict | Self::Array)) => {
+                r.skip::<Object<'_>>(in_content_stream)?;
+                Some(kind)
+            }
+            _ => leaf(r, in_content_stream, KindOf),
+        }
+    }
+}
+
+impl TryFrom<Object<'_>> for Kind {
+    type Error = ();
+
+    fn try_from(value: Object<'_>) -> Result<Self, Self::Error> {
+        Ok(match value {
+            Object::Null(_) => Self::Null,
+            Object::Boolean(_) => Self::Boolean,
+            Object::Number(_) => Self::Number,
+            Object::String(_) => Self::String,
+            Object::Name(_) => Self::Name,
+            Object::Dict(_) => Self::Dict,
+            Object::Array(_) => Self::Array,
+            Object::Stream(_) => Self::Stream,
+        })
+    }
+}
+
+// Read where an object is: a stream is one, as it is to an `Object`.
+impl ObjectLike<'_> for Kind {
+    const STREAM: bool = true;
+}
+
+/// Makes the kind of a token [`leaf`] reads, which it passes over.
+struct KindOf;
+
+impl<'a> Leaf<'a> for KindOf {
+    type Out = Kind;
+    fn null(&self) -> Kind {
+        Kind::Null
+    }
+    fn boolean(&self, _: bool) -> Kind {
+        Kind::Boolean
+    }
+    fn name(&self, _: &'a [u8]) -> Option<Kind> {
+        Some(Kind::Name)
+    }
+    fn string(&self, r: &mut Reader<'a>, is_content_stream: bool) -> Option<Kind> {
+        String::skip(r, is_content_stream).map(|()| Kind::String)
+    }
+    fn number(&self, r: &mut Reader<'a>) -> Option<Kind> {
+        Skip.number(r).map(|()| Kind::Number)
     }
 }
 
@@ -575,7 +677,9 @@ mod macros {
                 }
             }
 
-            impl<'a> crate::object::ObjectLike<'a> for $t$(<$l>),* {}
+            impl<'a> crate::object::ObjectLike<'a> for $t$(<$l>),* {
+                const KIND: Option<crate::object::Kind> = Some(crate::object::Kind::$s);
+            }
 
             impl<'a> crate::object::ObjectRefLike<'a> for $t$(<$l>),* {
                 fn cast_ref<'b>(obj: &'b crate::object::Object<'a>) -> Option<&'b Self> {

@@ -1,6 +1,6 @@
 use crate::filter::png::{self, RowFilter};
 use crate::object::dict::keys::{BITS_PER_COMPONENT, COLORS, COLUMNS, EARLY_CHANGE, PREDICTOR};
-use crate::object::{Dict, Object};
+use crate::object::{Dict, Number};
 use crate::work::{Cancelled, Meter, POLL_BYTES};
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -1431,9 +1431,9 @@ impl PredictorParams {
     /// 4, 8 or 16, or so many columns that a row's bits come near 2^31; also where
     /// the reading of a number is not established.
     pub(crate) fn from_params(dict: &Dict<'_>) -> Option<Self> {
-        let read = |key: &[u8], default: i32| match dict.get::<Object<'_>>(key) {
-            Some(Object::Number(n)) => n.viewer_i32(),
-            _ => Some(default),
+        let read = |key: &[u8], default: i32| match dict.get::<Number>(key) {
+            Some(n) => n.viewer_i32(),
+            None => Some(default),
         };
         let mut params = Self {
             // Read by LZW alone, so a reading not established leaves it the default.
