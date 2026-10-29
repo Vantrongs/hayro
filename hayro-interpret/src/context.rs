@@ -451,8 +451,17 @@ impl<'a> Context<'a> {
             font_cache
                 .entry(cache_key)
                 .or_insert_with(|| {
+                    // Kept for every page, the font is made from its dictionary read as
+                    // the object it is, not through the references this page reached
+                    // it by: what the font looks up later (a Type 3 font's resources)
+                    // would be refused where it leads back to one of them, for every
+                    // page drawn after this one, which drawn alone reads it.
+                    let rooted = font_dict
+                        .obj_id()
+                        .and_then(|id| self.xref.get::<Dict<'a>>(id))
+                        .filter(|read| core::ptr::eq(read.data(), font_dict.data()));
                     Font::new(
-                        font_dict,
+                        rooted.as_ref().unwrap_or(font_dict),
                         &self.settings.font_resolver,
                         &self.settings.cmap_resolver,
                     )
