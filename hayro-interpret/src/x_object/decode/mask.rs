@@ -1,6 +1,6 @@
 use super::{
-    DecodeContext, Held, Rows, complete, decode_context, into_owned, invert as invert_bytes, pixel_piece,
-    unpack_samples,
+    DecodeContext, Held, Rows, complete, decode_context, into_owned, invert as invert_bytes,
+    pixel_piece, unpack_samples,
 };
 use crate::LumaData;
 use crate::color::ColorSpace;

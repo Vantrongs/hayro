@@ -128,7 +128,11 @@ impl Decoded {
             }
         };
         let alpha = (plane == Plane::Image && self.same_grid)
-            .then(|| self.alpha.as_ref().map(|a| Held::new(&a.data, a.width, 1, None)))
+            .then(|| {
+                self.alpha
+                    .as_ref()
+                    .map(|a| Held::new(&a.data, a.width, 1, None))
+            })
             .flatten();
         let piece = piece_texels(c1 - c0, c + 1);
         let mut texels_with_alpha = Vec::with_capacity(piece * (c + 1));

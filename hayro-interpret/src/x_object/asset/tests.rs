@@ -604,7 +604,10 @@ fn every_window_streams_as_decoded(objects: &[(String, Vec<u8>)]) {
         let Some(p) = layout.plane(plane) else {
             continue;
         };
-        for grid in [(p.width, p.height), (p.width.div_ceil(2), p.height.div_ceil(2))] {
+        for grid in [
+            (p.width, p.height),
+            (p.width.div_ceil(2), p.height.div_ceil(2)),
+        ] {
             for (x0, x1) in (0..grid.0).flat_map(|a| (a + 1..=grid.0).map(move |b| (a, b))) {
                 for (y0, y1) in (0..grid.1).flat_map(|a| (a + 1..=grid.1).map(move |b| (a, b))) {
                     let window = [x0, y0, x1, y1];
@@ -630,11 +633,16 @@ fn every_window_streams_as_decoded(objects: &[(String, Vec<u8>)]) {
 fn masks_decoded_whole_that_hold_few_texels_read_their_fill_past_them() {
     let gray8 = "/ColorSpace /DeviceGray /BitsPerComponent 8";
     let mask16 = "/ColorSpace /DeviceGray /BitsPerComponent 16";
-    let tiff16 = "/Filter /FlateDecode /DecodeParms << /Predictor 2 /BitsPerComponent 16 /Columns 2 >>";
+    let tiff16 =
+        "/Filter /FlateDecode /DecodeParms << /Predictor 2 /BitsPerComponent 16 /Columns 2 >>";
     let bits = vec![0b1010_0000, 0b0110_0000, 0b1111_0000, 0b0001_0000];
     let colour = |w: u32, h: u32| {
         (
-            image("/ColorSpace /DeviceGray /BitsPerComponent 1 /SMask 4 0 R", w, h),
+            image(
+                "/ColorSpace /DeviceGray /BitsPerComponent 1 /SMask 4 0 R",
+                w,
+                h,
+            ),
             bits.clone(),
         )
     };
@@ -1660,7 +1668,8 @@ fn images_through_long_chains_of_filters_stream_on_a_small_stack() {
             .stack_size(256 << 10)
             .spawn_scoped(scope, || {
                 let filters = ["/AHx"].repeat(100_000).join(" ");
-                let dict = format!("/ColorSpace /DeviceGray /BitsPerComponent 1 /Filter [{filters}]");
+                let dict =
+                    format!("/ColorSpace /DeviceGray /BitsPerComponent 1 /Filter [{filters}]");
                 let pdf = pdf(&[(image(&dict, 8, 8), Vec::new())]);
                 let asset = asset(&pdf);
                 let mut source = asset.open(None, None).unwrap();

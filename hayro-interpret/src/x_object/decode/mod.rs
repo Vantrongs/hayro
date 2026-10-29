@@ -8,6 +8,7 @@ use crate::InterpreterWarning;
 use crate::color::ColorSpace;
 use crate::function::interpolate;
 use crate::x_object::image::{ImageKind, ImageXObject};
+use core::ops::Range;
 use hayro_syntax::Filter;
 use hayro_syntax::bit_reader::BitReader;
 use hayro_syntax::object::Stream;
@@ -17,7 +18,6 @@ use hayro_syntax::object::stream::{
 };
 use hayro_syntax::object::{Array, Object};
 use hayro_syntax::work::{Meter, POLL_BYTES};
-use core::ops::Range;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 
@@ -84,12 +84,7 @@ pub(crate) struct Held<'p> {
 }
 
 impl<'p> Held<'p> {
-    pub(crate) fn new(
-        data: &'p [u8],
-        width: u32,
-        channels: usize,
-        fill: Option<&'p [u8]>,
-    ) -> Self {
+    pub(crate) fn new(data: &'p [u8], width: u32, channels: usize, fill: Option<&'p [u8]>) -> Self {
         Self {
             data,
             width: width as usize,

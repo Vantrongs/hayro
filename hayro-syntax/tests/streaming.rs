@@ -1069,7 +1069,10 @@ fn deep_chains_are_read_on_a_small_stack() {
                 let mut cancelled = stream.decoded_reader().unwrap();
                 let mut buf = [0; 16];
                 let read = cancelled.read(&mut buf, &Meter::new(Some(&stop)));
-                assert!(n < POLL_BYTES || read == Err(Cancelled), "{n} {filter}: {read:?}");
+                assert!(
+                    n < POLL_BYTES || read == Err(Cancelled),
+                    "{n} {filter}: {read:?}"
+                );
                 drop((reader, cancelled));
             });
         }
@@ -1091,8 +1094,7 @@ fn chains_longer_than_the_filters_read_incrementally_read_as_lenient_decoding() 
         let n = 17 + rng.below(8);
         while filters.len() < n {
             let (filter, param, layer) = chains::layer(&encoded, &mut rng);
-            if layer.len() > 100_000 || filter == "/Unknown" || param.contains("/Predictor 2 ")
-            {
+            if layer.len() > 100_000 || filter == "/Unknown" || param.contains("/Predictor 2 ") {
                 continue;
             }
             encoded = match rng.chance(10) {
@@ -1115,7 +1117,12 @@ fn chains_longer_than_the_filters_read_incrementally_read_as_lenient_decoding() 
         let whole = stream.decoded().map(|d| d.into_owned()).unwrap_or_default();
         let mut reader = stream.decoded_reader().expect("a reader");
         let first = read_in_pieces(&mut reader, &mut rng, &Meter::default()).unwrap();
-        assert!(first == whole, "{dict}: {} vs {} bytes", first.len(), whole.len());
+        assert!(
+            first == whole,
+            "{dict}: {} vs {} bytes",
+            first.len(),
+            whole.len()
+        );
         reader.rewind();
         let again = read_in_pieces(&mut reader, &mut rng, &Meter::default()).unwrap();
         assert!(again == whole, "{dict}: read again");

@@ -568,7 +568,6 @@ impl MaskRows<'_> {
     }
 }
 
-
 /// Whether a row reader whose samples are of `bits` reads the bytes of row `y`: all
 /// of 8-bit samples the data reaches, else only whole rows; until the data's end is
 /// known, every row.
