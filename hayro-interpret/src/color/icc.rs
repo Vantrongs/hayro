@@ -1,4 +1,5 @@
-use super::{ToLuma, ToRgb};
+use super::{ICC_COST, ToLuma, ToRgb};
+use crate::encode::Cost;
 use moxcms::{
     ColorProfile, DataColorSpace, InPlaceTransformExecutor, Layout, Transform8BitExecutor,
     TransformOptions,
@@ -150,6 +151,14 @@ impl ICCProfile {
 }
 
 impl ToRgb for ICCProfile {
+    fn cost(&self) -> Cost {
+        ICC_COST + Cost::of(self.number_components())
+    }
+
+    fn setup_cost(&self) -> Cost {
+        Cost::ZERO
+    }
+
     fn convert(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
         self.transform_u8()?.transform(input, output).ok()?;
 

@@ -1,5 +1,6 @@
 use super::ToRgb;
 use super::icc::ICCProfile;
+use crate::encode::Cost;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::dict::keys::{BLACK_POINT, RANGE, WHITE_POINT};
 use moxcms::{ColorProfile, Xyzd};
@@ -34,6 +35,14 @@ impl Lab {
 }
 
 impl ToRgb for Lab {
+    fn cost(&self) -> Cost {
+        self.profile.cost()
+    }
+
+    fn setup_cost(&self) -> Cost {
+        self.profile.setup_cost()
+    }
+
     fn convert(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
         self.profile.convert(input, output)
     }

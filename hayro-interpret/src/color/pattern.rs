@@ -1,4 +1,5 @@
 use super::{ColorComponents, ColorSpace, ToLuma, ToRgb};
+use crate::encode::Cost;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Pattern(ColorSpace);
@@ -22,6 +23,14 @@ impl Pattern {
 }
 
 impl ToRgb for Pattern {
+    fn cost(&self) -> Cost {
+        self.0.cost()
+    }
+
+    fn setup_cost(&self) -> Cost {
+        self.0.setup_cost()
+    }
+
     fn convert(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
         self.0.convert(input, output)
     }

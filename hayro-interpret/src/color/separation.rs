@@ -1,4 +1,4 @@
-use super::{ColorSpace, ToRgb, U8Lookup};
+use super::{ColorSpace, ToRgb, U8Lookup, copy_cost};
 use crate::cache::Cache;
 use crate::encode::Cost;
 use crate::function::Function;
@@ -47,13 +47,6 @@ impl Separation {
         self.alternate_space.convert(&evaluated, output)
     }
 
-    /// The steps building the table a tint is looked up in takes, until it is built.
-    pub(super) fn setup_cost(&self) -> Cost {
-        self.lookup
-            .setup_cost(self.tint_transform.cost() + self.alternate_space.cost())
-            + self.alternate_space.setup_cost()
-    }
-
     fn u8_lookup(&self) -> Option<&[[u8; 3]; 256]> {
         self.lookup
             .get_or_init(|input, output| self.convert_inner(input, output))
@@ -61,6 +54,17 @@ impl Separation {
 }
 
 impl ToRgb for Separation {
+    fn cost(&self) -> Cost {
+        copy_cost(1)
+    }
+
+    /// The table a tint is looked up in, until it is built.
+    fn setup_cost(&self) -> Cost {
+        self.lookup
+            .setup_cost(self.tint_transform.cost() + self.alternate_space.cost())
+            + self.alternate_space.setup_cost()
+    }
+
     fn convert(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
         let lookup = self.u8_lookup()?;
         for (input, output) in input.iter().zip(output.as_chunks_mut::<3>().0) {

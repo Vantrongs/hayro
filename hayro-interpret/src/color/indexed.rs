@@ -1,4 +1,4 @@
-use super::{ColorSpace, ToLuma, ToRgb, U8Lookup};
+use super::{ColorSpace, ToLuma, ToRgb, U8Lookup, copy_cost};
 use crate::cache::Cache;
 use crate::encode::Cost;
 use hayro_syntax::object::{self, Array, Name, Object, Stream};
@@ -75,12 +75,6 @@ impl Indexed {
         self.base.convert(&indexed, output)
     }
 
-    /// The steps building the table a palette entry is looked up in takes, until it
-    /// is built.
-    pub(super) fn setup_cost(&self) -> Cost {
-        self.lookup.setup_cost(self.base.cost()) + self.base.setup_cost()
-    }
-
     fn u8_lookup(&self) -> Option<&[[u8; 3]; 256]> {
         self.lookup
             .get_or_init(|input, output| self.convert_inner(input, output))
@@ -102,6 +96,15 @@ impl Indexed {
 }
 
 impl ToRgb for Indexed {
+    fn cost(&self) -> Cost {
+        copy_cost(1)
+    }
+
+    /// The table a palette entry is looked up in, until it is built.
+    fn setup_cost(&self) -> Cost {
+        self.lookup.setup_cost(self.base.cost()) + self.base.setup_cost()
+    }
+
     fn convert(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
         let lookup = self.u8_lookup()?;
         for (input, output) in input.iter().zip(output.as_chunks_mut::<3>().0) {

@@ -1327,7 +1327,9 @@ mod tests {
     /// tint reads 2^16 samples around each point (its sizes sixteen 2s and
     /// forty-eight 1s, its table 2^16 bytes) costs `u64::MAX`, not that plus the
     /// colorants wrapped round to 65, so sampling it with a small allowance is
-    /// refused before any color is evaluated, in a debug build and a release one.
+    /// refused before any color is evaluated, in a debug build and a release one;
+    /// and so does that space wrapped in a `Pattern` space, whose conversion hands
+    /// each color to it.
     #[test]
     fn a_cost_past_counting_is_refused_before_any_evaluation() {
         use crate::function::TYPE0_EVALS;
@@ -1347,38 +1349,38 @@ mod tests {
             "<< /FunctionType 4 /Domain [0 1 0 1] /Range [{pairs}] /Length {} >>\nstream\n{program}\nendstream",
             program.len()
         );
-        let pattern = shading_pattern(&[
-            "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
-            format!(
-                "<< /ShadingType 1 /ColorSpace [/DeviceN [{}] /DeviceGray 6 0 R] \
-                 /Function 7 0 R >>",
-                names.join(" ")
-            ),
-            tint,
-            components,
-        ]);
-        assert_eq!(pattern.shading.color_space.cost(), Cost::new(u64::MAX));
-        let encoded = pattern.encode();
-        assert_eq!(encoded.point_cost(), Cost::new(u64::MAX));
-        TYPE0_EVALS.set(0);
-        let mut meter = Recording {
-            left: 1 << 20,
-            asked: vec![],
-            held: vec![],
-        };
-        let mut sampled = 0;
-        let refused = encoded.sample_texture_metered(
-            Rect::new(0.0, 0.0, 100.0, 100.0),
-            1.0,
-            &mut meter,
-            |_| sampled += 1,
-        );
-        assert_eq!(refused, Err(Exhausted));
-        assert_eq!((sampled, TYPE0_EVALS.get()), (0, 0));
-        // The tint does run when it is given the work, so the count above
-        // shows it was refused, not that it never would have run.
-        let _ = encoded.sample(Point::new(0.5, 0.5));
-        assert!(TYPE0_EVALS.get() > 0);
+        let device_n = format!("[/DeviceN [{}] /DeviceGray 6 0 R]", names.join(" "));
+        for space in [device_n.clone(), format!("[/Pattern {device_n}]")] {
+            let pattern = shading_pattern(&[
+                "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+                format!("<< /ShadingType 1 /ColorSpace {space} /Function 7 0 R >>"),
+                tint.clone(),
+                components.clone(),
+            ]);
+            let cost = pattern.shading.color_space.cost();
+            assert_eq!(cost, Cost::new(u64::MAX), "{space}");
+            let encoded = pattern.encode();
+            assert_eq!(encoded.point_cost(), Cost::new(u64::MAX), "{space}");
+            TYPE0_EVALS.set(0);
+            let mut meter = Recording {
+                left: 1 << 20,
+                asked: vec![],
+                held: vec![],
+            };
+            let mut sampled = 0;
+            let refused = encoded.sample_texture_metered(
+                Rect::new(0.0, 0.0, 100.0, 100.0),
+                1.0,
+                &mut meter,
+                |_| sampled += 1,
+            );
+            assert_eq!(refused, Err(Exhausted), "{space}");
+            assert_eq!((sampled, TYPE0_EVALS.get()), (0, 0), "{space}");
+            // The tint does run when it is given the work, so the count above
+            // shows it was refused, not that it never would have run.
+            let _ = encoded.sample(Point::new(0.5, 0.5));
+            assert!(TYPE0_EVALS.get() > 0, "{space}");
+        }
     }
 
     /// Gathering a stitching function's bounds, as each fill drawn as a native

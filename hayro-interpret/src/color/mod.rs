@@ -55,7 +55,13 @@ impl<T> std::fmt::Debug for U8Lookup<T> {
 
 /// The steps converting a color with a profile's transform takes, besides one a
 /// component.
-const ICC_COST: Cost = Cost::new(16);
+pub(super) const ICC_COST: Cost = Cost::new(16);
+
+/// The steps converting a color of `components` components by copying or looking
+/// it up takes: one, and one a component.
+pub(super) const fn copy_cost(components: u64) -> Cost {
+    Cost::new(1 + components)
+}
 
 impl<T> U8Lookup<T> {
     /// Whether the table is built.
@@ -475,34 +481,16 @@ impl ColorSpace {
     }
 
     /// The most steps [`to_rgba`](Self::to_rgba) takes for one color once the tables
-    /// it looks colors up in are built: a step a component, and for a `DeviceN` space
-    /// of several components the tint transform's ([`Function::cost`]).
-    ///
-    /// [`Function::cost`]: crate::Function::cost
+    /// it looks colors up in are built, those of every color space and function it
+    /// hands the color to included.
     pub fn cost(&self) -> Cost {
-        let components = Cost::of(usize::from(self.num_components()));
-        match self.0.as_ref() {
-            ColorSpaceType::DeviceN(d) if d.num_components > 1 => d.cost(),
-            // A profile's transform, or the table a component looks up.
-            ColorSpaceType::ICCBased(_)
-            | ColorSpaceType::DeviceCmyk(_)
-            | ColorSpaceType::CalGray(_)
-            | ColorSpaceType::CalRgb(_)
-            | ColorSpaceType::Lab(_) => ICC_COST + components,
-            _ => Cost::new(1) + components,
-        }
+        ToRgb::cost(self)
     }
 
     /// The steps building the tables [`to_rgba`](Self::to_rgba) looks colors up in
-    /// takes, those of a separation's tint transform and an indexed space's palette,
-    /// until they are built.
+    /// takes, until they are built.
     pub fn setup_cost(&self) -> Cost {
-        match self.0.as_ref() {
-            ColorSpaceType::Separation(s) => s.setup_cost(),
-            ColorSpaceType::DeviceN(d) => d.setup_cost(),
-            ColorSpaceType::Indexed(i) => i.setup_cost(),
-            _ => Cost::ZERO,
-        }
+        ToRgb::setup_cost(self)
     }
 
     /// Turn the given component values and opacity into an RGBA color.
@@ -562,6 +550,38 @@ impl ColorSpace {
 }
 
 impl ToRgb for ColorSpace {
+    fn cost(&self) -> Cost {
+        match self.0.as_ref() {
+            ColorSpaceType::DeviceCmyk(i) => i.cost(),
+            ColorSpaceType::DeviceGray(i) => i.cost(),
+            ColorSpaceType::DeviceRgb(i) => i.cost(),
+            ColorSpaceType::Pattern(i) => i.cost(),
+            ColorSpaceType::Indexed(i) => i.cost(),
+            ColorSpaceType::ICCBased(i) => i.cost(),
+            ColorSpaceType::CalGray(i) => i.cost(),
+            ColorSpaceType::CalRgb(i) => i.cost(),
+            ColorSpaceType::Lab(i) => i.cost(),
+            ColorSpaceType::Separation(i) => i.cost(),
+            ColorSpaceType::DeviceN(i) => i.cost(),
+        }
+    }
+
+    fn setup_cost(&self) -> Cost {
+        match self.0.as_ref() {
+            ColorSpaceType::DeviceCmyk(i) => i.setup_cost(),
+            ColorSpaceType::DeviceGray(i) => i.setup_cost(),
+            ColorSpaceType::DeviceRgb(i) => i.setup_cost(),
+            ColorSpaceType::Pattern(i) => i.setup_cost(),
+            ColorSpaceType::Indexed(i) => i.setup_cost(),
+            ColorSpaceType::ICCBased(i) => i.setup_cost(),
+            ColorSpaceType::CalGray(i) => i.setup_cost(),
+            ColorSpaceType::CalRgb(i) => i.setup_cost(),
+            ColorSpaceType::Lab(i) => i.setup_cost(),
+            ColorSpaceType::Separation(i) => i.setup_cost(),
+            ColorSpaceType::DeviceN(i) => i.setup_cost(),
+        }
+    }
+
     fn convert(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
         match self.0.as_ref() {
             ColorSpaceType::DeviceCmyk(i) => i.convert(input, output),
@@ -661,8 +681,16 @@ impl Color {
     }
 }
 
+/// A color space's conversion to RGB, with what it costs: whatever a conversion
+/// runs, another color space or a function it hands colors to included, is in
+/// its costs, which every implementation states beside its conversion.
 pub(crate) trait ToRgb {
     fn convert(&self, input: &[u8], output: &mut [u8]) -> Option<()>;
+    /// The most steps converting one color takes once the tables it looks colors
+    /// up in are built.
+    fn cost(&self) -> Cost;
+    /// The steps building those tables takes, until they are built.
+    fn setup_cost(&self) -> Cost;
     fn convert_in_place(&self, _input: &mut [u8]) -> Option<()> {
         None
     }

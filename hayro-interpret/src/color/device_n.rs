@@ -1,4 +1,4 @@
-use super::{ColorSpace, ToRgb, U8Lookup};
+use super::{ColorSpace, ToRgb, U8Lookup, copy_cost};
 use crate::cache::Cache;
 use crate::encode::Cost;
 use crate::function::Function;
@@ -56,23 +56,12 @@ impl DeviceN {
             .collect()
     }
 
-    /// The steps converting a color of several components takes: its tint
-    /// transform's, and the alternate space's.
-    pub(super) fn cost(&self) -> Cost {
+    /// The steps evaluating a color takes: its tint transform's, and the alternate
+    /// space's.
+    fn evaluation_cost(&self) -> Cost {
         Cost::of(usize::from(self.num_components))
             + self.tint_transform.cost()
             + self.alternate_space.cost()
-    }
-
-    /// The steps building the table a tint of one component is looked up in takes,
-    /// until it is built.
-    pub(super) fn setup_cost(&self) -> Cost {
-        let table = if self.num_components == 1 {
-            self.lookup.setup_cost(self.cost())
-        } else {
-            Cost::ZERO
-        };
-        table + self.alternate_space.setup_cost()
     }
 
     fn convert_inner(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
@@ -87,6 +76,25 @@ impl DeviceN {
 }
 
 impl ToRgb for DeviceN {
+    /// A tint of one component is looked up, others are evaluated.
+    fn cost(&self) -> Cost {
+        if self.num_components == 1 {
+            copy_cost(1)
+        } else {
+            self.evaluation_cost()
+        }
+    }
+
+    /// The table a tint of one component is looked up in, until it is built.
+    fn setup_cost(&self) -> Cost {
+        let table = if self.num_components == 1 {
+            self.lookup.setup_cost(self.evaluation_cost())
+        } else {
+            Cost::ZERO
+        };
+        table + self.alternate_space.setup_cost()
+    }
+
     fn convert(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
         if self.num_components == 1 {
             let lookup = self.u8_lookup()?;

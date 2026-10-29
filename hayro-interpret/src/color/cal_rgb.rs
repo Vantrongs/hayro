@@ -1,4 +1,5 @@
-use super::ToRgb;
+use super::{ICC_COST, ToRgb};
+use crate::encode::Cost;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::dict::keys::{BLACK_POINT, GAMMA, MATRIX, WHITE_POINT};
 
@@ -172,6 +173,14 @@ impl CalRgb {
 }
 
 impl ToRgb for CalRgb {
+    fn cost(&self) -> Cost {
+        ICC_COST + Cost::new(3)
+    }
+
+    fn setup_cost(&self) -> Cost {
+        Cost::ZERO
+    }
+
     fn convert(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
         for (input, output) in input
             .as_chunks::<3>()
