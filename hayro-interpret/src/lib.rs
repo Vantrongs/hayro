@@ -57,6 +57,8 @@ pub mod util;
 pub use cache::CacheKey;
 pub use context::*;
 pub use device::*;
+#[cfg(feature = "count-operators")]
+pub use function::operators_run;
 pub use function::{Function, TransferFunction};
 pub use hayro_cmap;
 pub use hayro_syntax;

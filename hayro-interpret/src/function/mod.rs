@@ -22,6 +22,8 @@ use std::sync::{Arc, OnceLock};
 pub(crate) use type0::EVALS as TYPE0_EVALS;
 #[cfg(test)]
 pub(crate) use type3::VISITED as TYPE3_VISITED;
+#[cfg(feature = "count-operators")]
+pub use type4::operators_run;
 
 /// The input/output type of functions.
 pub(crate) type Values = SmallVec<[f32; 4]>;

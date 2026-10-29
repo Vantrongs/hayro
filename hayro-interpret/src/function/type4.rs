@@ -177,6 +177,22 @@ impl<T: Default, const C: usize> ArgumentsStack<T, C> {
     }
 }
 
+#[cfg(any(test, feature = "count-operators"))]
+thread_local! {
+    /// The operators this thread's type 4 functions ran, and the values `copy`
+    /// and `roll` moved.
+    pub(crate) static RUN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The operators this thread's type 4 functions have run, and the values `copy`
+/// and `roll` moved, each a step of [`Function::cost`](crate::Function::cost):
+/// a count that does not vary from run to run, for a caller's tests to bound
+/// the work functions did.
+#[cfg(feature = "count-operators")]
+pub fn operators_run() -> u64 {
+    RUN.get()
+}
+
 /// The values the interpreter's stack holds.
 const STACK: usize = 64;
 
@@ -230,8 +246,8 @@ fn eval_inner(procedure: &[PostScriptOp], arg_stack: &mut InterpreterStack) -> O
     }
 
     for op in procedure {
-        #[cfg(test)]
-        tests::RUN.set(tests::RUN.get() + 1);
+        #[cfg(any(test, feature = "count-operators"))]
+        RUN.set(RUN.get() + 1);
         match op {
             PostScriptOp::Number(n) => arg_stack.push(Argument::Float(n.as_f64() as f32))?,
             PostScriptOp::Abs => {
@@ -389,8 +405,8 @@ fn eval_inner(procedure: &[PostScriptOp], arg_stack: &mut InterpreterStack) -> O
             PostScriptOp::Copy => {
                 let n = arg_stack.pop()?.as_f32() as u32 as usize;
                 let start = arg_stack.len().checked_sub(n)?;
-                #[cfg(test)]
-                tests::RUN.set(tests::RUN.get() + n as u64);
+                #[cfg(any(test, feature = "count-operators"))]
+                RUN.set(RUN.get() + n as u64);
                 for i in start..arg_stack.len() {
                     arg_stack.push(*arg_stack.at(i)?);
                 }
@@ -420,8 +436,8 @@ fn eval_inner(procedure: &[PostScriptOp], arg_stack: &mut InterpreterStack) -> O
                 let trimmed_n = arg_stack.len().checked_sub(n)?;
 
                 let target = &mut arg_stack.items_mut()[trimmed_n..];
-                #[cfg(test)]
-                tests::RUN.set(tests::RUN.get() + target.len() as u64);
+                #[cfg(any(test, feature = "count-operators"))]
+                RUN.set(RUN.get() + target.len() as u64);
 
                 if target.is_empty() {
                     continue;
@@ -593,10 +609,7 @@ mod tests {
     use hayro_syntax::object::Number;
     use smallvec::smallvec;
 
-    thread_local! {
-        /// The operators run, and the values `copy` and `roll` move.
-        pub(super) static RUN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    }
+    use super::RUN;
 
     /// A program's cost bounds what running it does, whichever branches it takes
     /// and however much of the stack it moves, and grows with its operators.
