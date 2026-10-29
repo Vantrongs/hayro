@@ -36,6 +36,17 @@ pub(crate) fn file(objects: &[Vec<u8>], trailer: &str) -> Vec<u8> {
 /// catalog, and of `packed` numbered on from there, held in one object stream, which
 /// with the table, an xref stream, follows them.
 pub(crate) fn file_with_object_stream(objects: &[Vec<u8>], packed: &[Vec<u8>]) -> Vec<u8> {
+    sealed_file_with_object_stream(objects, packed, "", |data| data.to_vec())
+}
+
+/// [`file_with_object_stream`], with `trailer` entries in the table's dictionary and
+/// the object stream's data stored as `seal` makes them, encrypted for one.
+pub(crate) fn sealed_file_with_object_stream(
+    objects: &[Vec<u8>],
+    packed: &[Vec<u8>],
+    trailer: &str,
+    seal: impl Fn(&[u8]) -> Vec<u8>,
+) -> Vec<u8> {
     let first = objects.len() + 1;
     let (mut header, mut body) = (String::new(), Vec::new());
     for (i, o) in packed.iter().enumerate() {
@@ -51,7 +62,7 @@ pub(crate) fn file_with_object_stream(objects: &[Vec<u8>], packed: &[Vec<u8>]) -
     all.extend(std::iter::repeat_n(b"null".to_vec(), packed.len()));
     all.push(stream(
         &format!("/Type /ObjStm /N {} /First {first_offset}", packed.len()),
-        &data,
+        &seal(&data),
     ));
     let mut out = b"%PDF-1.7\n".to_vec();
     // Type, field 2, field 3 of each object's entry.
@@ -78,7 +89,10 @@ pub(crate) fn file_with_object_stream(objects: &[Vec<u8>], packed: &[Vec<u8>]) -
     }
     out.extend_from_slice(format!("{table} 0 obj\n").as_bytes());
     out.extend(stream(
-        &format!("/Type /XRef /Size {} /W [1 4 2] /Root 1 0 R", table + 1),
+        &format!(
+            "/Type /XRef /Size {} /W [1 4 2] /Root 1 0 R {trailer}",
+            table + 1
+        ),
         &rows,
     ));
     out.extend_from_slice(format!("\nendobj\nstartxref\n{offset}\n%%EOF\n").as_bytes());

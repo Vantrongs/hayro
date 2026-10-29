@@ -60,8 +60,10 @@ pub use jpeg::{JpegCheckpoint, JpegInput, JpegRows};
 ///    reference to one, and none otherwise; parameters of another kind are none for
 ///    every filter.
 /// 4. Each entry ([`FilterEntry`]) gives the filter, the entry as written, its
-///    parameters as written and resolved, and whether they are reached through a
-///    reference, so that a writer can copy the entries it keeps.
+///    parameters as written, and whether they are reached through a reference, so
+///    that a writer can copy the entries it keeps; its parameters are resolved only
+///    where they are asked for ([`FilterEntry::params`]), so that a reading resolves
+///    those it uses alone.
 /// 5. Reading the filters parses each entry it reads once.
 #[derive(Clone, Debug)]
 pub struct FilterEntries<'a> {
@@ -85,8 +87,9 @@ enum Filters<'a> {
 #[derive(Clone, Debug)]
 enum Params<'a> {
     None,
-    /// The parameters of a filter given by name: as written, and resolved.
-    One(Written<'a>, Dict<'a>),
+    /// The parameters of a filter given by name, as written, and the context they
+    /// are resolved in.
+    One(Written<'a>, ReaderContext<'a>),
     /// An array of parameters, whether it is reached through a reference.
     Many(Array<'a>, bool),
 }
@@ -115,11 +118,22 @@ pub struct FilterEntry<'a> {
     /// The entry of the parameters in the same place, as written; `None` where
     /// they have none there.
     pub params_written: Option<Written<'a>>,
-    /// The parameters, resolved: empty where they are no dictionary.
-    pub params: Dict<'a>,
     /// Whether the parameters are reached through a reference: their entry, or
     /// the array of parameters it is in.
     pub params_by_reference: bool,
+    /// The context `params_written` is resolved in, where there is one.
+    params_ctx: Option<ReaderContext<'a>>,
+}
+
+impl<'a> FilterEntry<'a> {
+    /// The parameters, resolved: empty where they are no dictionary. They are
+    /// resolved at each call, and at none where the reading asks for none.
+    pub fn params(&self) -> Dict<'a> {
+        match (&self.params_written, &self.params_ctx) {
+            (Some(written), Some(ctx)) => resolved::<Dict<'a>>(written, ctx).unwrap_or_default(),
+            _ => Dict::empty(),
+        }
+    }
 }
 
 impl<'a> FilterEntries<'a> {
@@ -151,10 +165,7 @@ impl<'a> FilterEntries<'a> {
             },
         };
         let params = match (&filters, params) {
-            (Filters::One(..), Some(written)) => {
-                let params = resolved::<Dict<'a>>(&written, ctx).unwrap_or_default();
-                Params::One(written, params)
-            }
+            (Filters::One(..), Some(written)) => Params::One(written, ctx.clone()),
             (Filters::Many(_), Some(written)) => match resolved::<Array<'a>>(&written, ctx) {
                 Some(array) => Params::Many(array, matches!(written, Written::Ref(_))),
                 None => Params::None,
@@ -172,16 +183,16 @@ impl<'a> FilterEntries<'a> {
     pub fn entries(&self) -> impl Iterator<Item = FilterEntry<'a>> + '_ {
         let one = match (&self.filters, &self.params) {
             (Filters::One(written, filter), params) => {
-                let (params_written, params) = match params {
-                    Params::One(written, params) => (Some(written.clone()), params.clone()),
-                    _ => (None, Dict::empty()),
+                let (params_written, params_ctx) = match params {
+                    Params::One(written, ctx) => (Some(written.clone()), Some(ctx.clone())),
+                    _ => (None, None),
                 };
                 Some(FilterEntry {
                     filter: *filter,
                     written: written.clone(),
                     params_by_reference: matches!(params_written, Some(Written::Ref(_))),
                     params_written,
-                    params,
+                    params_ctx,
                 })
             }
             _ => None,
@@ -201,23 +212,22 @@ impl<'a> FilterEntries<'a> {
         });
         one.into_iter().chain(many.map(move |(name, written)| {
             // The parameters in the filter's place, whatever the entry names.
-            let (params_written, params, params_by_reference) = match &mut params {
+            let (params_written, params_ctx, params_by_reference) = match &mut params {
                 Some((items, ctx, by_reference)) => match items.next() {
                     Some(item) => {
-                        let params = resolved::<Dict<'a>>(&item, ctx).unwrap_or_default();
                         let by_reference = *by_reference || matches!(item, Written::Ref(_));
-                        (Some(item), params, by_reference)
+                        (Some(item), Some((*ctx).clone()), by_reference)
                     }
-                    None => (None, Dict::empty(), false),
+                    None => (None, None, false),
                 },
-                None => (None, Dict::empty(), false),
+                None => (None, None, false),
             };
             FilterEntry {
                 filter: name.and_then(Filter::from_name),
                 written,
                 params_written,
-                params,
                 params_by_reference,
+                params_ctx,
             }
         }))
     }
@@ -443,20 +453,23 @@ impl<'a> Stream<'a> {
     ) -> Result<Option<StrictReader<'a>>, DecodeFailure> {
         // The filters are read one at a time, as they become layers, and kept no
         // longer: what reading a chain of them holds is its layers alone. The
-        // parameters of a filter no layer reads are not read, nor, where a filter has
-        // none, the decryption.
+        // parameters of a filter no layer reads are not read, nor any where the
+        // decryption, read from the crypt filters alone, fails.
         let filters = FilterEntries::of(&self.dict);
+        let decryption = Decoding::decryption_of(&self.dict, &filters);
+        if let Err(failure) = decryption {
+            return Err(failure);
+        }
         let steps = filters.applied().map(|(filter, entry)| match filter {
             Filter::CcittFaxDecode
             | Filter::Jbig2Decode
             | Filter::DctDecode
             | Filter::JpxDecode => None,
-            _ => Some(Step::of(filter, &entry.params, true, 0)),
+            _ => Some(Step::of(filter, || entry.params(), true, 0)),
         });
         let Some(layers) = layers(steps) else {
             return Ok(None);
         };
-        let decryption = Decoding::decryption_of(&self.dict, &filters);
         let data = raw_data(self.data, self.decryptor(), &decryption, meter, true)?;
         Ok(Some(StrictReader::new(data, layers)))
     }
@@ -647,7 +660,7 @@ impl Decoding {
             Err(_) => SmallVec::new(),
             Ok(_) => filters
                 .applied()
-                .map(|(filter, entry)| Step::of(filter, &entry.params, globals, height))
+                .map(|(filter, entry)| Step::of(filter, || entry.params(), globals, height))
                 .collect(),
         };
         Self { decryption, steps }
@@ -657,8 +670,12 @@ impl Decoding {
     /// ([`Decryption`]).
     fn decryption_of(dict: &Dict<'_>, filters: &FilterEntries<'_>) -> Decryption {
         let mut crypt = CryptFilters::of(dict);
-        for (i, (filter, entry)) in filters.applied().enumerate() {
-            crypt.read(i, filter, &entry.params);
+        let mut applied = filters.applied().enumerate();
+        while !crypt.decided() {
+            let Some((i, (filter, entry))) = applied.next() else {
+                break;
+            };
+            crypt.read(i, filter, || entry.params());
         }
         crypt.decryption()
     }
@@ -769,7 +786,7 @@ fn incremental(filters: &FilterEntries<'_>) -> Option<SmallVec<[Step; 2]>> {
         (None, _) => Some(SmallVec::new()),
         (Some((filter @ Filter::FlateDecode, entry)), None) => Some(smallvec::smallvec![Step::of(
             filter,
-            &entry.params,
+            || entry.params(),
             true,
             0
         )]),
@@ -844,15 +861,22 @@ impl CryptFilters {
         }
     }
 
-    /// Reads applied filter `i`, `filter` with `params`.
-    fn read(&mut self, i: usize, filter: Filter, params: &Dict<'_>) {
-        // A misplaced crypt filter decides the decryption: nothing after it is read.
-        if self.id.is_none() || self.misplaced || filter != Filter::Crypt {
+    /// Whether the decryption is decided whatever filters follow: where the document
+    /// does not decrypt the data, or a crypt filter is misplaced. No filter is read
+    /// then.
+    fn decided(&self) -> bool {
+        self.id.is_none() || self.misplaced
+    }
+
+    /// Reads applied filter `i`, `filter` with `params`, which are resolved only for
+    /// a crypt filter.
+    fn read<'a>(&mut self, i: usize, filter: Filter, params: impl FnOnce() -> Dict<'a>) {
+        if filter != Filter::Crypt {
             return;
         }
         // Rules 5 and 6: the first filter may name a crypt filter; any /Crypt filter
         // that names none leaves the data as stored, unless the first one names one.
-        match params.get::<Name<'_>>(NAME) {
+        match params().get::<Name<'_>>(NAME) {
             Some(name) if name.deref() != IDENTITY => {
                 if i > 0 {
                     self.misplaced = true;

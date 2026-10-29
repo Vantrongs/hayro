@@ -12,7 +12,7 @@ pub(crate) mod upstream_flate;
 
 pub(crate) use fixtures::{
     CUT_ROW_CONTENT, cut_row_content_stream, file, file_with_aliases, noise, one_page,
-    one_page_objects, stored_zlib, stream,
+    one_page_objects, sealed_file_with_object_stream, stored_zlib, stream,
 };
 
 use aes::cipher::block_padding::{NoPadding, Pkcs7};

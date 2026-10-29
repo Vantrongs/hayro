@@ -1336,8 +1336,8 @@ fn filter_entries_keep_what_is_written() {
             (
                 e.filter,
                 format!("{:?}", e.written),
-                e.params_written.map(|p| format!("{p:?}")),
-                e.params.len(),
+                e.params_written.as_ref().map(|p| format!("{p:?}")),
+                e.params().len(),
                 e.params_by_reference,
             )
         })
@@ -1360,5 +1360,5 @@ fn filter_entries_keep_what_is_written() {
     let dict: Dict<'_> = pdf.xref().get(ObjectIdentifier::new(6, 0)).unwrap();
     let entry = FilterEntries::of(&dict).entries().next().unwrap();
     assert!(entry.params_by_reference);
-    assert_eq!(entry.params.len(), 0);
+    assert_eq!(entry.params().len(), 0);
 }

@@ -114,19 +114,25 @@ pub(crate) enum Step {
 impl Step {
     /// `filter` with what decoding it reads of `params`, for an image `height` rows
     /// high, 0 where none is given; JBIG2 globals only if `globals` (the globals of a
-    /// JBIG2 image, not those of its globals).
-    pub(crate) fn of(filter: Filter, params: &Dict<'_>, globals: bool, height: u32) -> Self {
+    /// JBIG2 image, not those of its globals). `params` are resolved only for a
+    /// filter whose decoder reads them.
+    pub(crate) fn of<'a>(
+        filter: Filter,
+        params: impl FnOnce() -> Dict<'a>,
+        globals: bool,
+        height: u32,
+    ) -> Self {
         match filter {
             Filter::AsciiHexDecode => Self::AsciiHex,
             Filter::Ascii85Decode => Self::Ascii85,
             Filter::RunLengthDecode => Self::RunLength,
-            Filter::LzwDecode => Self::Lzw(PredictorParams::from_params(params)),
-            Filter::FlateDecode => Self::Flate(PredictorParams::from_params(params)),
-            Filter::CcittFaxDecode => Self::Ccitt(CcittParams::of(params, height)),
-            Filter::DctDecode => Self::Dct(params.get::<u8>(COLOR_TRANSFORM)),
+            Filter::LzwDecode => Self::Lzw(PredictorParams::from_params(&params())),
+            Filter::FlateDecode => Self::Flate(PredictorParams::from_params(&params())),
+            Filter::CcittFaxDecode => Self::Ccitt(CcittParams::of(&params(), height)),
+            Filter::DctDecode => Self::Dct(params().get::<u8>(COLOR_TRANSFORM)),
             Filter::Jbig2Decode => Self::Jbig2(
                 globals
-                    .then(|| params.get::<Stream<'_>>(JBIG2_GLOBALS))
+                    .then(|| params().get::<Stream<'_>>(JBIG2_GLOBALS))
                     .flatten()
                     .map(|g| g.owned(false, 0)),
             ),
