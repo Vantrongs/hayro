@@ -1045,46 +1045,77 @@ fn on_stack<T: Send>(stack: usize, f: impl FnOnce() -> T + Send) -> T {
     })
 }
 
-/// Chains of 10,000 and 100,000 filters, ASCII hex or Flate, over empty data are read
-/// in pieces, skipped, read again after a rewind, cancelled, checkpointed and dropped
-/// on a 256 KiB stack, yielding what `decoded` returns: the stack a reader's
-/// operations go down does not grow with the number of filters.
+/// Chains of 10,000 and 100,000 filters, ASCII hex or Flate, over empty data, and of
+/// 1,000 run length filters over data, are read in pieces, skipped, read again after
+/// a rewind, checkpointed and resumed, cancelled and dropped on a 256 KiB stack,
+/// yielding what `decoded` returns: the stack a reader's operations go down does not
+/// grow with the number of filters.
 #[test]
 fn deep_chains_are_read_on_a_small_stack() {
-    for filter in ["/AHx", "/Fl"] {
-        for n in [10_000, 100_000] {
-            on_stack(256 << 10, move || {
-                let dict = format!("/Filter [{}]", [filter].repeat(n).join(" "));
-                let pdf = stream_file(&dict, b"");
-                let stream = object_3(&pdf);
-                let whole = stream.decoded().map(|d| d.into_owned()).unwrap_or_default();
-                let mut reader = stream.decoded_reader().expect("a reader");
-                let mut rng = chains::Rng(n as u64);
-                let first = read_in_pieces(&mut reader, &mut rng, &Meter::default());
-                assert_eq!(first, Ok(whole.clone()), "{n} {filter}");
-                reader.rewind();
-                assert_eq!(reader.skip(10, &Meter::default()), Ok(whole.len().min(10)));
-                reader.rewind();
-                let again = read_in_pieces(&mut reader, &mut rng, &Meter::default());
-                assert_eq!(again, Ok(whole.clone()), "{n} {filter}: read again");
-                #[cfg(feature = "unsafe")]
-                {
-                    assert!(reader.checkpoint_heap_bound().is_none());
-                    assert!(reader.checkpoint(&stream.to_owned_stream()).is_none());
-                }
-                // Each filter counts a step of work, so the hook is polled once a
-                // poll's worth of them are decoded.
-                let stop = || true;
-                let mut cancelled = stream.decoded_reader().unwrap();
-                let mut buf = [0; 16];
-                let read = cancelled.read(&mut buf, &Meter::new(Some(&stop)));
-                assert!(
-                    n < POLL_BYTES || read == Err(Cancelled),
-                    "{n} {filter}: {read:?}"
-                );
-                drop((reader, cancelled));
-            });
+    let run_length = |data: &[u8]| {
+        let mut encoded = Vec::new();
+        for piece in data.chunks(128) {
+            encoded.push(piece.len() as u8 - 1);
+            encoded.extend_from_slice(piece);
         }
+        encoded.push(128);
+        encoded
+    };
+    let mut nested = (0..100_u8).collect::<Vec<u8>>();
+    for _ in 0..1000 {
+        nested = run_length(&nested);
+    }
+    let cases = [
+        ("/AHx", 10_000, Vec::new()),
+        ("/AHx", 100_000, Vec::new()),
+        ("/Fl", 10_000, Vec::new()),
+        ("/Fl", 100_000, Vec::new()),
+        ("/RL", 1000, nested),
+    ];
+    for (filter, n, data) in cases {
+        on_stack(256 << 10, move || {
+            let dict = format!("/Filter [{}]", [filter].repeat(n).join(" "));
+            let pdf = stream_file(&dict, &data);
+            let stream = object_3(&pdf);
+            let whole = stream.decoded().map(|d| d.into_owned()).unwrap_or_default();
+            let mut reader = stream.decoded_reader().expect("a reader");
+            let mut rng = chains::Rng(n as u64);
+            let first = read_in_pieces(&mut reader, &mut rng, &Meter::default());
+            assert_eq!(first, Ok(whole.clone()), "{n} {filter}");
+            reader.rewind();
+            assert_eq!(reader.skip(10, &Meter::default()), Ok(whole.len().min(10)));
+            reader.rewind();
+            let again = read_in_pieces(&mut reader, &mut rng, &Meter::default());
+            assert_eq!(again, Ok(whole.clone()), "{n} {filter}: read again");
+            #[cfg(feature = "unsafe")]
+            {
+                reader.rewind();
+                let start = whole.len().min(37);
+                assert_eq!(read_up_to(&mut reader, start, 7), whole[..start]);
+                let owned = stream.to_owned_stream();
+                let checkpoint = reader.checkpoint(&owned).expect("a checkpoint");
+                assert!(reader.checkpoint_heap_bound().is_some());
+                let mut resumed = stream.decoded_reader().unwrap();
+                assert!(resumed.restore(&checkpoint), "{n} {filter}");
+                let rest = read_in_pieces(&mut resumed, &mut rng, &Meter::default());
+                assert_eq!(rest, Ok(whole[start..].to_vec()), "{n} {filter}: resumed");
+                drop((checkpoint, resumed));
+            }
+            // Each layer the loop goes down to counts a step of work, so the hook is
+            // polled once a poll's worth of them were gone down to.
+            let stop = || true;
+            let mut cancelled = stream.decoded_reader().unwrap();
+            let mut buf = [0; 16];
+            let read = cancelled.read(&mut buf, &Meter::new(Some(&stop)));
+            assert!(
+                n < POLL_BYTES || read == Err(Cancelled),
+                "{n} {filter}: {read:?}"
+            );
+            cancelled.rewind();
+            let after = read_in_pieces(&mut cancelled, &mut rng, &Meter::default());
+            assert_eq!(after, Ok(whole), "{n} {filter}: read after a stop");
+            drop((reader, cancelled));
+        });
     }
 }
 

@@ -175,15 +175,30 @@ impl<'a> DecryptedReader<'a> {
         }
     }
 
-    #[cfg(feature = "unsafe")]
+    #[cfg(any(feature = "unsafe", feature = "images"))]
     pub(crate) fn cursor(&self) -> Cursor {
         self.cursor.clone()
     }
 
     /// Continues from `cursor`, taken from a reader of the same data.
-    #[cfg(feature = "unsafe")]
+    #[cfg(any(feature = "unsafe", feature = "images"))]
     pub(crate) fn restore(&mut self, cursor: &Cursor) {
         self.cursor = cursor.clone();
+    }
+
+    /// The stored bytes not read yet, where they need no decryption: read where
+    /// they are, and moved past with [`Self::advance`].
+    pub(crate) fn plain_rest(&self) -> Option<&[u8]> {
+        match self.cursor.cipher {
+            Cipher::None => Some(&self.data[self.cursor.pos..]),
+            _ => None,
+        }
+    }
+
+    /// Moves past `n` bytes of [`Self::plain_rest`].
+    pub(crate) fn advance(&mut self, n: usize) {
+        debug_assert!(matches!(self.cursor.cipher, Cipher::None));
+        self.cursor.pos = (self.cursor.pos + n).min(self.data.len());
     }
 
     /// The stored bytes read.

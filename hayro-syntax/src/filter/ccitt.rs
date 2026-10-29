@@ -1,5 +1,5 @@
 use crate::crypto::reader::{DecryptedReader, Seekable};
-use crate::filter::reader::DecodedReader;
+use crate::filter::reader::{ChainState, DecodedReader};
 use crate::object::Dict;
 use crate::object::dict::keys::{
     BLACK_IS_1, COLUMNS, ENCODED_BYTE_ALIGN, END_OF_BLOCK, END_OF_LINE, K, ROWS,
@@ -105,7 +105,8 @@ impl Setup {
 /// as rows decode: 8-bit gray rows, or rows of a bit a pixel for an indexed image, as
 /// many as decode before the data ends or breaks off (the image pads the rest as it
 /// pads any data that ends early). It holds the decoder's state and a row's colour
-/// changes, not the rows, and of encrypted data a window of it decrypted.
+/// changes, not the rows, and of encrypted data or what other filters make a window
+/// of it.
 pub(crate) struct CcittBytes<'a> {
     data: Encoded<'a>,
     setup: Setup,
@@ -127,44 +128,13 @@ enum Encoded<'a> {
     /// Decrypted as it is read (boxed: a cipher's state is large).
     Encrypted(Box<DecryptedReader<'a>>),
     /// What other filters make of the stored data, read through a feed.
-    Decoded(Rc<Through<'a>>),
+    Decoded(Box<Feed<'a>>),
 }
 
-/// The decoder, and what encrypted or decoded data is read through.
+/// The decoder, and the window encrypted data is read through.
 struct Decoding<'a> {
     rows: RowDecoder<'a>,
-    through: Option<Rc<Through<'a>>>,
-}
-
-/// What the decoder reads data other than the stored bytes through.
-#[cfg_attr(
-    feature = "unsafe",
-    expect(
-        clippy::large_enum_variant,
-        reason = "held in an `Rc`, one allocation whichever variant it is"
-    )
-)]
-enum Through<'a> {
-    Window(Window<'a>),
-    Feed(Feed<'a>),
-}
-
-impl Source for Through<'_> {
-    fn read_at(&self, pos: usize, out: &mut [u8]) -> usize {
-        match self {
-            Self::Window(window) => window.read_at(pos, out),
-            Self::Feed(feed) => feed.read_at(pos, out),
-        }
-    }
-}
-
-impl<'a> Through<'a> {
-    fn feed(&self) -> Option<&Feed<'a>> {
-        match self {
-            Self::Feed(feed) => Some(feed),
-            Self::Window(_) => None,
-        }
-    }
+    window: Option<Rc<Window<'a>>>,
 }
 
 /// Where a reader of plain CCITT data was ([`CcittBytes::save`]): the decoder's
@@ -217,20 +187,8 @@ impl<'a> CcittBytes<'a> {
         params: &Dict<'_>,
         image_params: &ImageDecodeParams,
     ) -> Self {
-        let feed = Feed {
-            state: RefCell::new(FeedState {
-                reader,
-                bytes: Kept::default(),
-                start: 0,
-                ended: false,
-            }),
-            ahead: Cell::new(WINDOW),
-            least: Cell::new(WINDOW),
-            short: Cell::new(false),
-            before: Cell::new(None),
-        };
         Self::of(
-            Encoded::Decoded(Rc::new(Through::Feed(feed))),
+            Encoded::Decoded(Box::new(Feed::new(reader))),
             Setup::new(params, image_params),
             image_params.is_indexed,
         )
@@ -286,10 +244,7 @@ impl<'a> CcittBytes<'a> {
         self.decoder = state.rows.as_ref().map(|saved| {
             let mut rows = RowDecoder::new(data, self.setup.settings);
             rows.resume(saved);
-            Decoding {
-                rows,
-                through: None,
-            }
+            Decoding { rows, window: None }
         });
         (self.at, self.left) = (state.at, state.left);
         self.state = if state.done { State::Done } else { State::Row };
@@ -417,43 +372,26 @@ impl<'a> CcittBytes<'a> {
         }
         let decoding = match &mut self.decoder {
             Some(decoding) => decoding,
-            None => match start(&self.data, self.setup.settings, meter) {
-                Ok(decoding) => self.decoder.insert(decoding),
-                Err(Cancelled) => {
-                    self.stopped = true;
-                    return Err(Cancelled);
-                }
-            },
+            None => self.decoder.insert(start(&self.data, self.setup.settings)),
         };
-        let result = loop {
-            // The decoder as it was, for a row to decode again once more data are
-            // ready.
-            let feed = decoding.through.as_deref().and_then(Through::feed);
-            let saved = match feed {
-                Some(feed) => {
-                    if feed.prepare(decoding.rows.byte_position(), meter).is_err() {
-                        self.stopped = true;
-                        return Err(Cancelled);
-                    }
-                    Some(decoding.rows.clone())
-                }
-                None => None,
-            };
-            let mut sink = Sink {
-                through: decoding.through.as_deref(),
-                meter,
-            };
-            let result = decoding.rows.next_row(&mut sink);
-            let decrypted = sink.decrypted();
-            if meter.work(decrypted).is_err() || meter.cancelled() {
-                self.stopped = true;
-                return Err(Cancelled);
-            }
-            match (saved, feed) {
-                (Some(saved), Some(feed)) if feed.read_past() => decoding.rows = saved,
-                _ => break result,
-            }
+        let mut sink = Sink {
+            window: decoding.window.as_deref(),
+            meter,
         };
+        let result = match &self.data {
+            Encoded::Decoded(feed) => {
+                feed.row_starts(decoding.rows.byte_position());
+                decoding.rows.next_row_in(&Fed { feed, meter }, &mut sink)
+            }
+            _ => decoding.rows.next_row(&mut sink),
+        };
+        let decrypted = sink.decrypted();
+        // A stop while the feed read the filters before ends the data the decoder
+        // reads, and so leaves its row unfinished: it is not kept.
+        if meter.work(decrypted).is_err() || meter.cancelled() {
+            self.stopped = true;
+            return Err(Cancelled);
+        }
         // The rows decoded before data that breaks off are kept, as those before its
         // end are.
         if let Ok(true) = result {
@@ -466,70 +404,49 @@ impl<'a> CcittBytes<'a> {
 }
 
 /// Starts decoding `data`: plain data from its bytes, encrypted data through a window,
-/// decoded data through a feed, its first bytes made ready with `meter` (the
-/// decoder reads some as it starts).
-fn start<'a>(
-    data: &Encoded<'a>,
-    settings: DecodeSettings,
-    meter: &Meter<'_>,
-) -> Result<Decoding<'a>, Cancelled> {
-    Ok(match data {
+/// decoded data through a feed, from its start.
+fn start<'a>(data: &Encoded<'a>, settings: DecodeSettings) -> Decoding<'a> {
+    match data {
         Encoded::Plain(bytes) => Decoding {
             rows: RowDecoder::new(bytes, settings),
-            through: None,
+            window: None,
         },
-        Encoded::Decoded(through) => {
-            let feed = through.feed();
-            if let Some(feed) = feed {
-                feed.restart();
-            }
-            // The decoder reads the first bytes as it is made: made again until they
-            // are ready, so that no decoder that read past them is kept.
-            loop {
-                if let Some(feed) = feed {
-                    feed.prepare(0, meter)?;
-                }
-                let rows = RowDecoder::from_source(through.clone(), settings);
-                if !feed.is_some_and(Feed::read_past) {
-                    break Decoding {
-                        rows,
-                        through: Some(through.clone()),
-                    };
-                }
+        Encoded::Decoded(feed) => {
+            feed.restart();
+            Decoding {
+                rows: RowDecoder::detached(settings),
+                window: None,
             }
         }
         Encoded::Encrypted(reader) => {
             let reader = Seekable::new(DecryptedReader::clone(reader));
-            let window = Rc::new(Through::Window(Window {
+            let window = Rc::new(Window {
                 state: RefCell::new(WindowState {
                     reader,
                     bytes: Vec::new(),
                     start: 0,
                 }),
                 decrypted: Cell::new(0),
-            }));
+            });
             Decoding {
                 rows: RowDecoder::from_source(window.clone(), settings),
-                through: Some(window),
+                window: Some(window),
             }
         }
-    })
+    }
 }
 
 /// Counts the bits the decoder reads and the bytes decrypted on a meter; the rows it
 /// pushes are read from it ([`RowDecoder::last_row`]).
 struct Sink<'s, 'a, 'm> {
-    through: Option<&'s Through<'a>>,
+    window: Option<&'s Window<'a>>,
     meter: &'m Meter<'m>,
 }
 
 impl Sink<'_, '_, '_> {
     /// The bytes decrypted since this was last asked.
     fn decrypted(&self) -> usize {
-        match self.through {
-            Some(Through::Window(window)) => window.decrypted.take(),
-            _ => 0,
-        }
+        self.window.map_or(0, |window| window.decrypted.take())
     }
 }
 
@@ -597,240 +514,157 @@ impl Source for Window<'_> {
     }
 }
 
-/// CCITT data other filters make, read from them as the decoder reads it. Reading
-/// them counts on a meter, which the decoder's reads of a source do not carry: so
-/// before each row the bytes from where its decoding starts on are made ready, a
-/// window's worth past it, and a row whose decoding reads past them is decoded again
-/// from where it started, with twice as many ready (a decoder that read past them
-/// took their end for the data's, so it is not kept). Decoding reads no byte before
-/// where a row's decoding starts, so the feed keeps those of the row decoded last, a
-/// window and a chunk, of which a long run of zero bytes, the fill a Group 3 line
-/// may be padded with however long, takes no room ([`Kept`]).
+/// CCITT data other filters make, read from them as the decoder reads it, the work
+/// counted on the meter of the row being decoded ([`Fed`]). Decoding reads mostly
+/// forward, and again from where a row's decoding starts, never before it
+/// ([`RowDecoder::byte_position`]): so the feed holds the bytes from there on, up to
+/// [`HOLD`] of them, and past that the last half of those before the byte read. Before
+/// it drops bytes from the row's start on, it saves the filters' state and the bytes
+/// it holds from there ([`Mark`]); a read before the bytes held goes back to that
+/// state and decodes on from it. So a row whose code reads on however long, a long
+/// fill or codes that write nothing, holds a bounded window, and is decoded once,
+/// and again from its start at most once for each time the decoder goes back.
 struct Feed<'a> {
     state: RefCell<FeedState<'a>>,
-    /// The bytes made ready past where a row's decoding starts.
-    ahead: Cell<usize>,
-    /// The bytes made ready for a row at first.
-    least: Cell<usize>,
-    /// Whether the decoder read past the bytes ready since this was last asked.
-    short: Cell<bool>,
-    /// The first byte the decoder read before the bytes held, where it did, which a
-    /// decoder keeping to its contract does not.
-    before: Cell<Option<usize>>,
 }
+
+/// The bytes a feed holds at most, besides a chunk being read.
+const HOLD: usize = 2 * WINDOW;
 
 struct FeedState<'a> {
     reader: DecodedReader<'a>,
     /// Decoded bytes, the first at `start` in the data.
-    bytes: Kept,
+    bytes: Vec<u8>,
     start: usize,
     /// Whether `bytes` reach the end of the data.
     ended: bool,
+    /// Where the decoding of the row being decoded started.
+    row: usize,
+    mark: Option<Mark>,
+    /// [`HOLD`], and fewer for tests.
+    hold: usize,
 }
 
-impl Feed<'_> {
+/// The filters' state where a feed was once, and the bytes it held from the start
+/// of a row up to there.
+struct Mark {
+    state: ChainState,
+    bytes: Vec<u8>,
+    start: usize,
+    ended: bool,
+}
+
+/// A feed lent to the decoding of a row, with the meter that counts it.
+struct Fed<'f, 'a, 'm> {
+    feed: &'f Feed<'a>,
+    meter: &'m Meter<'m>,
+}
+
+impl Source for Fed<'_, '_, '_> {
+    fn read_at(&self, pos: usize, out: &mut [u8]) -> usize {
+        let mut state = self.feed.state.borrow_mut();
+        // A stop ends the data, which the caller then finds on the meter.
+        state.read_at(pos, out, self.meter).unwrap_or(0)
+    }
+}
+
+impl<'a> Feed<'a> {
+    fn new(reader: DecodedReader<'a>) -> Self {
+        Self {
+            state: RefCell::new(FeedState {
+                reader,
+                bytes: Vec::new(),
+                start: 0,
+                ended: false,
+                row: 0,
+                mark: None,
+                hold: HOLD,
+            }),
+        }
+    }
+
     /// Back to the start of the data.
     fn restart(&self) {
         let mut state = self.state.borrow_mut();
         state.reader.rewind();
         state.bytes.clear();
-        state.start = 0;
-        state.ended = false;
-        self.short.set(false);
-        self.before.set(None);
+        (state.start, state.ended, state.row) = (0, false, 0);
+        state.mark = None;
     }
 
-    /// Whether the decoder read past the bytes ready, or before them, since this was
-    /// last asked: then more are made ready for the row's next decoding, else as many
-    /// as at first for the next row.
-    fn read_past(&self) -> bool {
-        let short = self.short.take();
-        self.ahead.set(match short {
-            true => self.ahead.get().saturating_mul(2),
-            false => self.least.get(),
-        });
-        short
-    }
-
-    /// Makes the bytes from `from` on ready, [`Self::ahead`] of them or up to the
-    /// end, reading the filters before with `meter`, and drops those before `from`.
-    fn prepare(&self, from: usize, meter: &Meter<'_>) -> Result<(), Cancelled> {
-        let from = match self.before.take() {
-            Some(before) => before.min(from),
-            None => from,
-        };
+    /// Notes that a row's decoding starts at byte `row`: a mark of a row before is
+    /// dropped, where the bytes from `row` on are still held.
+    fn row_starts(&self, row: usize) {
         let mut state = self.state.borrow_mut();
-        let state = &mut *state;
-        if from < state.start {
-            state.reader.rewind();
-            state.bytes.clear();
-            state.ended = false;
-            state.start = state.reader.skip(from, meter)?;
+        state.row = row;
+        if state.start <= row {
+            state.mark = None;
         }
-        // Dropped a window at a time, so that the bytes held move once per window.
-        let gone = (from - state.start).min(state.bytes.len());
-        if gone >= WINDOW {
-            state.bytes.drop_front(gone);
-            state.start += gone;
+    }
+}
+
+impl FeedState<'_> {
+    /// Copies the bytes from `pos` on into `out`, reading the filters before with
+    /// `meter` as far as they are needed; returns how many the data hold there.
+    fn read_at(
+        &mut self,
+        pos: usize,
+        out: &mut [u8],
+        meter: &Meter<'_>,
+    ) -> Result<usize, Cancelled> {
+        if pos < self.start {
+            self.back(pos, meter)?;
         }
-        let end = from.saturating_add(self.ahead.get());
-        let mut chunk = [0; DECRYPT_CHUNK];
-        while !state.ended && state.start + state.bytes.len() < end {
-            let wanted = end - (state.start + state.bytes.len());
-            let read = state
-                .reader
-                .read(&mut chunk[..wanted.min(DECRYPT_CHUNK)], meter)?;
-            state.bytes.extend(&chunk[..read]);
-            state.ended = read == 0;
+        let end = pos.saturating_add(out.len());
+        let chunk = DECRYPT_CHUNK.min(self.hold);
+        while !self.ended && self.start + self.bytes.len() < end {
+            if self.bytes.len() + chunk > self.hold {
+                self.drop_before(pos.saturating_sub(self.hold / 2));
+            }
+            let held = self.bytes.len();
+            self.bytes.resize(held + chunk, 0);
+            let read = self.reader.read(&mut self.bytes[held..], meter);
+            self.bytes.truncate(held + *read.as_ref().unwrap_or(&0));
+            self.ended = read? == 0;
         }
+        let held = self.bytes.get(pos - self.start..).unwrap_or_default();
+        let n = held.len().min(out.len());
+        out[..n].copy_from_slice(&held[..n]);
+        Ok(n)
+    }
+
+    /// Drops the bytes before `to`, marking where the filters are first where they
+    /// include bytes of the row being decoded.
+    fn drop_before(&mut self, to: usize) {
+        let to = to.clamp(self.start, self.start + self.bytes.len());
+        if to > self.row && self.mark.is_none() && self.start <= self.row {
+            self.mark = self.reader.save().map(|state| Mark {
+                state,
+                bytes: self.bytes[self.row - self.start..].to_vec(),
+                start: self.row,
+                ended: self.ended,
+            });
+        }
+        self.bytes.drain(..to - self.start);
+        self.start = to;
+    }
+
+    /// Goes back to hold byte `pos` next: to the mark where it holds it, else to the
+    /// start of the data, decoding the filters again up to `pos`.
+    fn back(&mut self, pos: usize, meter: &Meter<'_>) -> Result<(), Cancelled> {
+        if let Some(mark) = &self.mark
+            && mark.start <= pos
+            && self.reader.load(&mark.state)
+        {
+            self.bytes.clone_from(&mark.bytes);
+            (self.start, self.ended) = (mark.start, mark.ended);
+            return Ok(());
+        }
+        self.reader.rewind();
+        self.bytes.clear();
+        self.start = self.reader.skip(pos, meter)?;
+        self.ended = self.start < pos;
         Ok(())
-    }
-}
-
-impl Source for Feed<'_> {
-    fn read_at(&self, pos: usize, out: &mut [u8]) -> usize {
-        let state = self.state.borrow();
-        let Some(at) = pos.checked_sub(state.start) else {
-            self.before.set(Some(pos));
-            self.short.set(true);
-            return 0;
-        };
-        let n = state.bytes.copy(at, out);
-        if n < out.len() && !state.ended {
-            self.short.set(true);
-        }
-        n
-    }
-}
-
-/// The fewest zero bytes in a row that [`Kept`] keeps as their number.
-const ZERO_RUN: usize = 64;
-
-/// Bytes kept from a position on, a run of at least [`ZERO_RUN`] zero bytes kept as
-/// its length: so fill, which carries no data, takes no room however long it is.
-#[derive(Default)]
-struct Kept {
-    /// The bytes, without those of the runs.
-    bytes: Vec<u8>,
-    /// The runs left out of `bytes`, in order.
-    runs: Vec<Run>,
-    /// The bytes kept, those of the runs included.
-    len: usize,
-    /// The zero bytes `bytes` ends with, after its last run.
-    zeros: usize,
-}
-
-#[derive(Clone, Copy)]
-struct Run {
-    /// The byte of `Kept::bytes` the run comes before.
-    at: usize,
-    /// Its first byte, and its zero bytes.
-    from: usize,
-    len: usize,
-}
-
-impl Kept {
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn clear(&mut self) {
-        *self = Self::default();
-    }
-
-    /// Appends `data`.
-    fn extend(&mut self, mut data: &[u8]) {
-        while let Some((&first, _)) = data.split_first() {
-            let n = data
-                .iter()
-                .position(|&b| (b == 0) != (first == 0))
-                .unwrap_or(data.len());
-            let (piece, rest) = data.split_at(n);
-            data = rest;
-            self.len += n;
-            if first != 0 {
-                self.bytes.extend_from_slice(piece);
-                self.zeros = 0;
-                continue;
-            }
-            match self.runs.last_mut() {
-                Some(run) if run.at == self.bytes.len() => run.len += n,
-                _ if self.zeros + n >= ZERO_RUN => {
-                    self.bytes.truncate(self.bytes.len() - self.zeros);
-                    self.runs.push(Run {
-                        at: self.bytes.len(),
-                        from: self.len - n - self.zeros,
-                        len: self.zeros + n,
-                    });
-                    self.zeros = 0;
-                }
-                _ => {
-                    self.bytes.extend_from_slice(piece);
-                    self.zeros += n;
-                }
-            }
-        }
-    }
-
-    /// Copies the bytes from `at` on into `out`; returns how many it keeps there.
-    fn copy(&self, at: usize, out: &mut [u8]) -> usize {
-        let n = out.len().min(self.len.saturating_sub(at));
-        let mut done = 0;
-        // The runs that end after `at`, and the zero bytes of those before them.
-        let mut next = self.runs.partition_point(|r| r.from + r.len <= at);
-        while done < n {
-            let pos = at + done;
-            let (gone, run) = self.before(next);
-            match run {
-                Some(run) if run.from <= pos => {
-                    let k = (run.from + run.len - pos).min(n - done);
-                    out[done..done + k].fill(0);
-                    done += k;
-                    next += 1;
-                }
-                _ => {
-                    let i = pos - gone;
-                    let end = run.map_or(self.bytes.len(), |r| r.at);
-                    let k = (end - i).min(n - done);
-                    out[done..done + k].copy_from_slice(&self.bytes[i..i + k]);
-                    done += k;
-                }
-            }
-        }
-        n
-    }
-
-    /// The zero bytes of the runs before run `i`, and run `i` if there is one.
-    fn before(&self, i: usize) -> (usize, Option<Run>) {
-        let gone = match i.checked_sub(1).map(|j| self.runs[j]) {
-            Some(r) => r.from + r.len - r.at,
-            None => 0,
-        };
-        (gone, self.runs.get(i).copied())
-    }
-
-    /// Drops the first `n` bytes kept.
-    fn drop_front(&mut self, n: usize) {
-        let n = n.min(self.len);
-        let i = self.runs.partition_point(|r| r.from + r.len <= n);
-        let (gone, run) = self.before(i);
-        // Where byte `n` lies: in run `i`, or among the bytes before it.
-        let cut = match run {
-            Some(run) if run.from <= n => run.at,
-            _ => n - gone,
-        };
-        self.bytes.drain(..cut);
-        self.runs.drain(..i);
-        for run in &mut self.runs {
-            run.at -= cut;
-            if run.from < n {
-                run.len -= n - run.from;
-                run.from = n;
-            }
-            run.from -= n;
-        }
-        self.len -= n;
-        self.zeros = self.zeros.min(self.bytes.len());
     }
 }
 
@@ -954,7 +788,7 @@ fn fill_short<T: Copy>(slice: &mut [T], value: T) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Seekable, Source, WINDOW, Window, WindowState, decode};
+    use super::{HOLD, Seekable, Source, WINDOW, Window, WindowState, decode};
     use crate::crypto::{DecryptionTarget, Decryptor};
     use crate::object::FromBytes;
     use crate::object::ObjectIdentifier;
@@ -962,9 +796,9 @@ mod tests {
     use crate::object::stream::ImageDecodeParams;
     use crate::work::Meter;
 
-    /// The bytes CCITT data in ASCII hex decode to, read through the feed with `ahead`
-    /// bytes made ready before each row, in pieces of `chunk` bytes.
-    fn through_a_feed(hex: &[u8], params: &Dict<'_>, ahead: usize, chunk: usize) -> Vec<u8> {
+    /// The bytes CCITT data in ASCII hex decode to, read through a feed that holds
+    /// `hold` bytes, in pieces of `chunk` bytes.
+    fn through_a_feed(hex: &[u8], params: &Dict<'_>, hold: usize, chunk: usize) -> Vec<u8> {
         use super::{CcittBytes, Encoded};
         use crate::crypto::reader::DecryptedReader;
         use crate::filter::reader::{Codec, DecodedReader};
@@ -974,10 +808,8 @@ mod tests {
         )
         .unwrap();
         let mut bytes = CcittBytes::decoded(reader, params, &ImageDecodeParams::default());
-        if let Encoded::Decoded(through) = &bytes.data {
-            let feed = through.feed().unwrap();
-            feed.ahead.set(ahead);
-            feed.least.set(ahead);
+        if let Encoded::Decoded(feed) = &bytes.data {
+            feed.state.borrow_mut().hold = hold;
         }
         let mut out = Vec::new();
         let mut buf = alloc::vec![0; chunk];
@@ -990,9 +822,10 @@ mod tests {
     }
 
     /// Group 3 and 4 data, with lines damaged and cut short, which the decoder reads
-    /// again from a line's start, and cut after a sample of bytes, read through the
-    /// feed with a byte made ready before each row, so that rows are decoded again
-    /// as they read past it, and with a window: as decoding the data whole does.
+    /// again from a line's start, and cut after a sample of bytes, read through a
+    /// feed that holds 16 bytes, so that the decoder going back reads bytes the feed
+    /// dropped, and through one that holds its default: as decoding the data whole
+    /// does.
     #[test]
     fn a_feed_reads_as_whole_decoding() {
         let streams: [(&str, &[u8]); 5] = [
@@ -1035,66 +868,60 @@ mod tests {
                     .iter()
                     .flat_map(|b| alloc::format!("{b:02x}").into_bytes())
                     .collect();
-                for (ahead, chunk) in [(1, 211), (WINDOW, 4096)] {
-                    let read = through_a_feed(&hex, &params, ahead, chunk);
-                    assert!(read == whole, "{dict}: cut after {cut}, {ahead} ahead");
+                for (hold, chunk) in [(16, 211), (HOLD, 4096)] {
+                    let read = through_a_feed(&hex, &params, hold, chunk);
+                    assert!(read == whole, "{dict}: cut after {cut}, {hold} held");
                 }
             }
         }
     }
 
-    /// Bytes kept with their long zero runs as lengths read back as kept, from any
-    /// position after appends of any size and drops from the front, and a run of a
-    /// million zero bytes takes no room.
+    /// A feed that dropped the bytes of a row goes back to them through its mark,
+    /// and, without one, by decoding the filters again from their start: either way
+    /// it reads the bytes from any position the row's decoding may go back to.
     #[test]
-    fn kept_bytes_read_back_as_appended() {
-        use super::{Kept, ZERO_RUN};
-        let mut state = 7_u32;
-        let mut next = |n: u32| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state % n
-        };
-        let mut kept = Kept::default();
-        let mut plain: Vec<u8> = Vec::new();
-        for _ in 0..3000 {
-            match next(10) {
-                0..=5 => {
-                    let len = next(3) as usize * ZERO_RUN / 2 + next(40) as usize;
-                    let zero = next(3) > 0;
-                    let piece: Vec<u8> = (0..len)
-                        .map(|_| if zero { 0 } else { next(3) as u8 })
-                        .collect();
-                    kept.extend(&piece);
-                    plain.extend_from_slice(&piece);
-                }
-                6 => {
-                    let n = next(plain.len() as u32 + 1) as usize;
-                    kept.drop_front(n);
-                    plain.drain(..n);
-                }
-                _ => {}
+    fn a_feed_goes_back_to_bytes_it_dropped() {
+        use super::Feed;
+        use crate::crypto::reader::DecryptedReader;
+        use crate::filter::reader::{Codec, DecodedReader};
+        let data: Vec<u8> = (0..5000_u32).map(|i| (i * 7 % 251) as u8).collect();
+        let hex: Vec<u8> = data
+            .iter()
+            .flat_map(|b| alloc::format!("{b:02x}").into_bytes())
+            .collect();
+        let reader = DecodedReader::decoding(
+            DecryptedReader::raw(alloc::borrow::Cow::Borrowed(&hex)),
+            &[Codec::AsciiHex],
+        )
+        .unwrap();
+        let feed = Feed::new(reader);
+        let meter = Meter::default();
+        for marked in [true, false] {
+            feed.restart();
+            feed.state.borrow_mut().hold = 64;
+            feed.row_starts(1000);
+            for pos in (1000..4000).step_by(4) {
+                let mut out = [0; 8];
+                let n = feed.state.borrow_mut().read_at(pos, &mut out, &meter);
+                assert_eq!(n, Ok(8));
+                assert_eq!(out, data[pos..pos + 8]);
             }
-            assert_eq!(kept.len(), plain.len());
-            for _ in 0..4 {
-                let at = next(plain.len() as u32 + 2) as usize;
+            {
+                let mut state = feed.state.borrow_mut();
+                assert!(state.start > 1000 && state.bytes.capacity() < 256);
+                assert!(state.mark.is_some());
+                if !marked {
+                    state.mark = None;
+                }
+            }
+            for pos in [1000, 1001, 2345, 4990, 1500] {
                 let mut out = [0xAA; 8];
-                let wanted = 1 + next(8) as usize;
-                let n = kept.copy(at, &mut out[..wanted]);
-                let expected = plain.get(at..).unwrap_or_default();
-                assert_eq!(n, wanted.min(expected.len()));
-                assert_eq!(out[..n], expected[..n]);
+                let n = feed.state.borrow_mut().read_at(pos, &mut out, &meter);
+                let expected = &data[pos..(pos + 8).min(data.len())];
+                assert_eq!(n, Ok(expected.len()), "back to {pos}, marked {marked}");
+                assert_eq!(out[..expected.len()], *expected, "back to {pos}");
             }
         }
-        kept.clear();
-        kept.extend(&[1]);
-        kept.extend(&alloc::vec![0; 1 << 20]);
-        kept.extend(&[2]);
-        assert!(kept.bytes.capacity() < 4 * ZERO_RUN && kept.len() == (1 << 20) + 2);
-        let mut out = [0xAA; 3];
-        assert_eq!(kept.copy((1 << 20) - 1, &mut out), 3);
-        assert_eq!(out, [0, 0, 2]);
     }
 
     #[test]

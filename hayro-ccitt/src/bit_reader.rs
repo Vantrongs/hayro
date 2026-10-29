@@ -8,6 +8,10 @@ use alloc::rc::Rc;
 pub(crate) enum Data<'a> {
     Slice(&'a [u8]),
     Source(Rc<dyn Source + 'a>),
+    /// A source lent for a call ([`BitReader::lent`]).
+    Lent(&'a dyn Source),
+    /// None at hand: a source is lent to each call that reads.
+    Detached,
 }
 
 #[derive(Clone)]
@@ -56,6 +60,22 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    /// A reader of `source` from `position`, taken of a reader of the same data.
+    pub(crate) fn lent<'s>(source: &'s dyn Source, position: &Position) -> BitReader<'s> {
+        let mut reader = BitReader {
+            data: Data::Lent(source),
+            len: 0,
+            bit_offset: 0,
+            buffer: 0,
+            limit: 0,
+            poll_at: 0,
+            overrun: false,
+        };
+        reader.seek(position);
+        reader.refill();
+        reader
+    }
+
     /// Goes on from `position`, taken of a reader of the same data.
     pub(crate) fn seek(&mut self, position: &Position) {
         let Position {
@@ -74,7 +94,7 @@ impl<'a> BitReader<'a> {
     pub(crate) fn new(data: Data<'a>) -> Self {
         let len = match &data {
             Data::Slice(bytes) => bytes.len(),
-            Data::Source(_) => usize::MAX,
+            Data::Source(_) | Data::Lent(_) | Data::Detached => usize::MAX,
         };
         let mut reader = Self {
             data,
@@ -216,18 +236,10 @@ impl<'a> BitReader<'a> {
                     u64::from_be_bytes(bytes)
                 }
             }
-            Data::Source(source) => {
-                let mut bytes = [0; 8];
-                if byte_pos < self.len {
-                    let n = (self.len - byte_pos).min(8);
-                    let read = source.read_at(byte_pos, &mut bytes[..n]);
-                    if read < n {
-                        self.len = byte_pos + read;
-                        bytes[read..].fill(0);
-                    }
-                }
-                u64::from_be_bytes(bytes)
-            }
+            Data::Source(source) => source_word(&**source, byte_pos, &mut self.len),
+            Data::Lent(source) => source_word(*source, byte_pos, &mut self.len),
+            // Read again from a lent source before any bit is consumed.
+            Data::Detached => 0,
         };
 
         self.buffer = word << self.bit_pos();
@@ -235,4 +247,19 @@ impl<'a> BitReader<'a> {
         // than 32 of them are left.
         self.limit = (byte_pos * 8 + 32).min(self.len.saturating_mul(8));
     }
+}
+
+/// The 8 bytes of `source` from `byte_pos`, those past its end zero: a source tells
+/// where it ends, which `len` is set to, only once read there.
+fn source_word(source: &dyn Source, byte_pos: usize, len: &mut usize) -> u64 {
+    let mut bytes = [0; 8];
+    if byte_pos < *len {
+        let n = (*len - byte_pos).min(8);
+        let read = source.read_at(byte_pos, &mut bytes[..n]);
+        if read < n {
+            *len = byte_pos + read;
+            bytes[read..].fill(0);
+        }
+    }
+    u64::from_be_bytes(bytes)
 }

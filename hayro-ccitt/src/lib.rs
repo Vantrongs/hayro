@@ -132,6 +132,13 @@ impl<'a> RowDecoder<'a> {
         Self::with(Data::Source(source), settings)
     }
 
+    /// A decoder of data a source lent to each call reads ([`Self::next_row_in`]):
+    /// so the source may borrow what holds for that call alone, such as a way to
+    /// stop it. Each source lent must read the same data.
+    pub fn detached(settings: DecodeSettings) -> Self {
+        Self::with(Data::Detached, settings)
+    }
+
     fn with(data: Data<'a>, settings: DecodeSettings) -> Self {
         Self {
             reader: BitReader::new(data),
@@ -184,37 +191,54 @@ impl<'a> RowDecoder<'a> {
     /// `decoder` asked once more); an error where [`decode`] fails, after the rows
     /// it pushes before failing. After `Ok(false)` or an error, it pushes no more.
     pub fn next_row(&mut self, decoder: &mut impl Decoder) -> Result<bool> {
-        let result = self.advance(decoder);
+        let result = advance(&mut self.ctx, &mut self.state, &mut self.reader, decoder);
         if !matches!(result, Ok(true)) {
             self.state = State::Done;
         }
         result
     }
 
-    fn advance(&mut self, decoder: &mut impl Decoder) -> Result<bool> {
-        let (ctx, reader) = (&mut self.ctx, &mut self.reader);
-        if self.state == State::Start {
-            if ctx.settings.columns == 0 {
-                return Ok(false);
-            }
-            start(ctx, reader, decoder)?;
-            self.state = State::Rows;
+    /// [`Self::next_row`] of a [`Self::detached`] decoder, reading `source`.
+    pub fn next_row_in(&mut self, source: &dyn Source, decoder: &mut impl Decoder) -> Result<bool> {
+        let mut reader = BitReader::lent(source, &self.reader.position());
+        let result = advance(&mut self.ctx, &mut self.state, &mut reader, decoder);
+        self.reader.seek(&reader.position());
+        if !matches!(result, Ok(true)) {
+            self.state = State::Done;
         }
-        if self.state == State::Rows {
-            let rows = ctx.decoded_rows;
-            let more = step(ctx, reader, decoder)?;
-            if !more {
-                self.state = State::Last;
-            }
-            if ctx.decoded_rows > rows {
-                return Ok(true);
-            }
-        }
-        if self.state == State::Last {
-            finish(reader, decoder)?;
-        }
-        Ok(false)
+        result
     }
+}
+
+/// Decodes the next row of `reader`'s data and pushes it to `decoder`, as
+/// [`RowDecoder::next_row`] does.
+fn advance(
+    ctx: &mut DecoderContext,
+    state: &mut State,
+    reader: &mut BitReader<'_>,
+    decoder: &mut impl Decoder,
+) -> Result<bool> {
+    if *state == State::Start {
+        if ctx.settings.columns == 0 {
+            return Ok(false);
+        }
+        start(ctx, reader, decoder)?;
+        *state = State::Rows;
+    }
+    if *state == State::Rows {
+        let rows = ctx.decoded_rows;
+        let more = step(ctx, reader, decoder)?;
+        if !more {
+            *state = State::Last;
+        }
+        if ctx.decoded_rows > rows {
+            return Ok(true);
+        }
+    }
+    if *state == State::Last {
+        finish(reader, decoder)?;
+    }
+    Ok(false)
 }
 
 /// Reads what the data starts with, before its first line.

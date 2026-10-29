@@ -1020,6 +1020,175 @@ fn ccitt_fill_after_a_filter_takes_no_room() {
     assert_eq!(cancelled.results, [Err(RequestError::Cancelled)]);
 }
 
+/// The first pixel of images behind chains of 17 and 18 filters: Flate, then 16 run
+/// length filters of literal runs, over 256, 1024 and 4096 rows of 8192 samples;
+/// and Flate, then 17 ASCII base-85 filters, over 8 × 8 samples whose first ASCII
+/// base-85 data start with 1, 4 or 16 MiB of white space. A request of the pixel
+/// holds what the filters' decoders hold, not what the data expand to, and is
+/// cancelled while the white space is read.
+#[test]
+fn a_pixel_behind_a_long_chain_of_filters_costs_its_decoders() {
+    fn literal_runs(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(data.len() + data.len() / 128 + 2);
+        for piece in data.chunks(128) {
+            out.push(piece.len() as u8 - 1);
+            out.extend_from_slice(piece);
+        }
+        out.push(128);
+        out
+    }
+    fn ascii_85(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for group in data.chunks(4) {
+            let mut word = [0; 4];
+            word[..group.len()].copy_from_slice(group);
+            let mut value = u32::from_be_bytes(word);
+            let mut digits = [0; 5];
+            for d in digits.iter_mut().rev() {
+                *d = b'!' + (value % 85) as u8;
+                value /= 85;
+            }
+            out.extend_from_slice(&digits[..group.len() + 1]);
+        }
+        out.extend_from_slice(b"~>");
+        out
+    }
+    let first: Bins = |w, h| ((w, h), [0, 0, 1, 1]);
+    const GRAY: &str = "/ColorSpace /DeviceGray /BitsPerComponent 1";
+    fn run_length(rows: usize) -> (String, Vec<u8>) {
+        let mut data = vec![0; rows * 1024];
+        for _ in 0..16 {
+            data = literal_runs(&data);
+        }
+        let filters = ["/RL"; 16].join(" ");
+        let dict = format!("{GRAY} /Width 8192 /Height {rows} /Filter [/FlateDecode {filters}]");
+        (dict, common::chains::zlib(&data, 6))
+    }
+    fn white_space(mib: usize) -> (String, Vec<u8>) {
+        let mut data = vec![0x0F; 8];
+        for _ in 0..17 {
+            data = ascii_85(&data);
+        }
+        let mut spaced = vec![b' '; mib << 20];
+        spaced.extend(data);
+        let filters = ["/A85"; 17].join(" ");
+        let dict = format!("{GRAY} /Width 8 /Height 8 /Filter [/FlateDecode {filters}]");
+        (dict, common::chains::zlib(&spaced, 6))
+    }
+    // What a thread allocates once, before the first image is measured, is not
+    // counted.
+    let (dict, data) = white_space(0);
+    region_cost(&dict, &data, first);
+    type Case = (&'static str, [usize; 3], fn(usize) -> (String, Vec<u8>), u8);
+    let cases: [Case; 2] = [
+        ("run length", [256, 1024, 4096], run_length, 0),
+        ("white space", [1, 4, 16], white_space, 0),
+    ];
+    for (name, sizes, make, pixel) in cases {
+        let mut peaks = Vec::new();
+        for size in sizes {
+            let (dict, data) = make(size);
+            let pdf = page(
+                "q 100 0 0 100 0 0 cm /Im Do Q",
+                "/XObject << /Im 5 0 R >>",
+                vec![image(&dict, &data)],
+            );
+            let mut requested = Requested::new(Plane::Image, first);
+            common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+            let [(peak, data)] = &requested.regions[..] else {
+                panic!("{name}: one image")
+            };
+            assert_eq!(data, &[pixel], "{name} {size}");
+            peaks.push(*peak - requested.saved[0]);
+        }
+        println!("{name}: peaks {peaks:?} for {sizes:?}");
+        assert!(
+            peaks.iter().all(|&p| p < 2 << 20) && peaks[2] <= peaks[0] + (64 << 10),
+            "{name}: peaks {peaks:?} for {sizes:?}"
+        );
+    }
+    let (dict, data) = white_space(16);
+    let pdf = page(
+        "q 100 0 0 100 0 0 cm /Im Do Q",
+        "/XObject << /Im 5 0 R >>",
+        vec![image(&dict, &data)],
+    );
+    let mut cancelled = Cancelled::default();
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut cancelled);
+    assert_eq!(cancelled.results, [Err(RequestError::Cancelled)]);
+}
+
+/// Group 4 data after a Flate filter whose one line repeats codes that write
+/// nothing (horizontal mode with a white and a black run of 0) 100,000, 400,000 or
+/// 1,600,000 times before the code that ends it: a request of the line decodes it
+/// once, holding a bounded window of the codes, not all of them; its pixels are
+/// white, as whole decoding makes them; and a request is cancelled while the codes
+/// are read.
+#[test]
+fn ccitt_codes_writing_nothing_after_a_filter_take_bounded_room_and_linear_work() {
+    #[cfg(debug_assertions)]
+    use hayro_interpret::hayro_syntax::work::TOLD;
+    let dict = "/Width 8 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 1 \
+                /Filter [/FlateDecode /CCITTFaxDecode] /DecodeParms [null << /K -1 /Columns 8 >>]";
+    let codes = |times: usize| {
+        let mut bits = String::new();
+        for _ in 0..times {
+            bits.push_str("001" /* horizontal */);
+            bits.push_str("00110101" /* white 0 */);
+            bits.push_str("0000110111" /* black 0 */);
+        }
+        // Vertical mode, no offset, which ends the line; then EOFB.
+        bits.push_str("1000000000001000000000001");
+        let mut data = vec![0; bits.len().div_ceil(8)];
+        for (i, bit) in bits.bytes().enumerate() {
+            data[i / 8] |= (bit - b'0') << (7 - i % 8);
+        }
+        common::chains::zlib(&data, 6)
+    };
+    let all: Bins = |w, h| ((w, h), [0, 0, w, h]);
+    // What a thread allocates once, before the first image is measured, is not
+    // counted.
+    region_cost(dict, &codes(0), all);
+    let times = [100_000, 400_000, 1_600_000];
+    let (mut peaks, mut work) = (Vec::new(), Vec::new());
+    for n in times {
+        let pdf = page(
+            "q 100 0 0 100 0 0 cm /Im Do Q",
+            "/XObject << /Im 5 0 R >>",
+            vec![image(dict, &codes(n))],
+        );
+        let mut requested = Requested::new(Plane::Image, all);
+        #[cfg(debug_assertions)]
+        TOLD.set(0);
+        common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+        #[cfg(debug_assertions)]
+        work.push(TOLD.get());
+        let [(peak, data)] = &requested.regions[..] else {
+            panic!("one image")
+        };
+        assert_eq!(data, &[255; 8], "{n} codes");
+        peaks.push(*peak);
+    }
+    println!("peaks {peaks:?}, work {work:?} for {times:?} codes");
+    assert!(
+        peaks.iter().all(|&p| p < 1 << 20) && peaks[2] <= peaks[0] + (64 << 10),
+        "peaks {peaks:?} for {times:?} codes"
+    );
+    // Each code's 21 bits are read once: a step each, besides the Flate work of
+    // its bytes.
+    for (w, n) in work.iter().zip(times) {
+        assert!((21 * n..30 * n).contains(w), "{w} work for {n} codes");
+    }
+    let pdf = page(
+        "q 100 0 0 100 0 0 cm /Im Do Q",
+        "/XObject << /Im 5 0 R >>",
+        vec![image(dict, &codes(times[2]))],
+    );
+    let mut cancelled = Cancelled::default();
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut cancelled);
+    assert_eq!(cancelled.results, [Err(RequestError::Cancelled)]);
+}
+
 /// Requests each image's plane whole with a hook that asks to stop at its third poll.
 #[derive(Default)]
 struct Cancelled {

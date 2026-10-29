@@ -270,6 +270,13 @@ pub(crate) mod flate {
             fn taken(&self) -> usize;
             /// Takes the next bytes, at most `max` and at least one where any is left.
             fn take(&mut self, max: usize, meter: &Meter<'_>) -> &[u8];
+            /// Whether fewer bytes are at hand than the longest step of a decoder
+            /// reads, and more are to come: a decoder then stops before its next step,
+            /// to go on once more are at hand. Input that holds all of its data never
+            /// is.
+            fn low(&self) -> bool {
+                false
+            }
         }
 
         /// Bytes all at hand.
@@ -315,7 +322,10 @@ pub(crate) mod flate {
 
         /// The decoder, which can stop between two codes and go on later
         /// ([`Self::step`]), so that it is read a part at a time: its output is the
-        /// history back references reach into, then the bytes not handed out yet.
+        /// history back references reach into, then the bytes not handed out yet. It
+        /// also stops before a block or a code where its input is [`Input::low`]: the
+        /// longest, a block's header and tables, reads fewer than 600 bytes.
+        #[derive(Clone)]
         pub(crate) struct FlateStream<I: Input> {
             pub(crate) input: I,
             code_buf: u32,
@@ -419,6 +429,9 @@ pub(crate) mod flate {
                 pending: usize,
             ) -> Result<(), Cancelled> {
                 if !self.started {
+                    if self.input.low() {
+                        return Ok(());
+                    }
                     self.started = true;
                     self.skip_header(meter);
                 }
@@ -436,6 +449,9 @@ pub(crate) mod flate {
                             return Ok(());
                         }
                         meter.work(self.input.taken() - from + 1)?;
+                    }
+                    if !self.eof && self.input.low() {
+                        return Ok(());
                     }
                     if self.eof || self.input.peek(0, meter).is_none() {
                         self.eof = true;
@@ -607,14 +623,19 @@ pub(crate) mod flate {
             }
 
             /// Copies the stored block's data until at least `pending` bytes made are
-            /// not handed out: to its end, or the end of the data (true), or not (false).
+            /// not handed out: to its end, or the end of the data (true), or not, or
+            /// until no byte is at hand while more are to come (false).
             fn copy_stored(&mut self, meter: &Meter<'_>, pending: usize) -> bool {
                 while self.stored > 0 {
                     let room = pending.saturating_sub(self.output.len() - self.handed);
                     if room == 0 {
                         return false;
                     }
+                    let low = self.input.low();
                     let bytes = self.input.take(self.stored.min(room), meter);
+                    if bytes.is_empty() && low {
+                        return false;
+                    }
                     if bytes.is_empty() {
                         self.stored = 0;
                         self.eof = true;
@@ -640,7 +661,7 @@ pub(crate) mod flate {
                 pending: usize,
             ) -> Result<bool, Cancelled> {
                 loop {
-                    if self.output.len() - self.handed >= pending {
+                    if self.output.len() - self.handed >= pending || self.input.low() {
                         self.block = Some((lit_code_table, dist_code_table, from));
                         return Ok(false);
                     }
@@ -798,6 +819,7 @@ pub(crate) mod flate {
             }
         }
 
+        #[derive(Clone)]
         struct HuffmanTable {
             codes: Vec<u32>,
             max_len: u8,
@@ -1553,17 +1575,28 @@ impl Unpredictor {
     /// first row.
     pub(crate) fn fill<E: From<Cancelled>>(
         &mut self,
-        mut read: impl FnMut(&mut [u8]) -> Result<usize, E>,
+        read: impl FnMut(&mut [u8]) -> Result<usize, E>,
         meter: &Meter<'_>,
     ) -> Result<bool, E> {
-        let filled = match self {
-            Self::Png(rows) => rows.fill(&mut read, meter),
-            Self::Tiff(pieces) => pieces.fill(&mut read, meter),
-        };
+        let filled = self.resume(read, meter);
         if filled.is_err() {
             self.reset();
         }
         filled
+    }
+
+    /// [`Self::fill`], but an error leaves it where it was, with the bytes read before
+    /// the error kept: a `read` that fails while its bytes are still to come lets the
+    /// next call go on where this one stopped.
+    pub(crate) fn resume<E: From<Cancelled>>(
+        &mut self,
+        mut read: impl FnMut(&mut [u8]) -> Result<usize, E>,
+        meter: &Meter<'_>,
+    ) -> Result<bool, E> {
+        match self {
+            Self::Png(rows) => rows.fill(&mut read, meter),
+            Self::Tiff(pieces) => pieces.fill(&mut read, meter),
+        }
     }
 
     /// The bytes the last [`Self::fill`] decoded: a row for PNG prediction, a piece

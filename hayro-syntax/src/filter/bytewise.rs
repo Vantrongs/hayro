@@ -89,8 +89,9 @@ impl Decoder {
     }
 
     /// Decodes `input` into `out` until `out` holds `until` bytes (a run may make a
-    /// few more) or the data end or fail, each byte taken and made counted on
-    /// `meter`.
+    /// few more), the data end or fail, or the input is [`Input::low`] before a step
+    /// (a step reads at most 129 bytes, a run of bytes as they are), each byte taken
+    /// and made counted on `meter`.
     pub(crate) fn make(
         &mut self,
         input: &mut impl Input,
@@ -101,7 +102,7 @@ impl Decoder {
     ) -> State {
         match self {
             Self::Lzw(decoder) => loop {
-                if out.len() >= until {
+                if out.len() >= until || input.low() {
                     break State::Going;
                 }
                 match decoder.step(input, out, meter) {
@@ -167,7 +168,7 @@ fn ascii_hex(
     meter: &Meter<'_>,
 ) -> State {
     loop {
-        if out.len() >= until {
+        if out.len() >= until || input.low() {
             return State::Going;
         }
         let Some(byte) = input.next(meter) else {
@@ -209,7 +210,7 @@ fn ascii_85(
         Some(()) => State::Done,
         None => State::Failed,
     };
-    while out.len() < until {
+    while out.len() < until && !input.low() {
         let Some(b) = input.next(meter) else {
             // Be lenient and accept what we have (see PDFBOX-5910).
             return end(group, out);
@@ -284,7 +285,7 @@ fn run_length(
         true => State::Failed,
         false => State::Done,
     };
-    while out.len() < until {
+    while out.len() < until && !input.low() {
         let Some(length) = input.next(meter) else {
             return cut;
         };
