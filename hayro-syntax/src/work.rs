@@ -102,6 +102,49 @@ std::thread_local! {
     pub static RESERVED: Cell<usize> = const { Cell::new(0) };
 }
 
+#[cfg(all(debug_assertions, feature = "std"))]
+std::thread_local! {
+    /// The steps of loops that work on data done on this thread, counted where they
+    /// are taken, apart from the meter they count on: a layer of a filter chain
+    /// reached, a byte a decoder took or made, a row's bytes reversed. With
+    /// [`hayro_ccitt::OPERATIONS`] ([`operations`]), what tests find work done
+    /// between two polls by that allocates nothing. Debug builds only.
+    #[doc(hidden)]
+    pub static OPERATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// The steps counted on this thread so far ([`OPERATIONS`]), those of the CCITT
+/// decoder included. Debug builds only.
+#[cfg(all(debug_assertions, feature = "std"))]
+#[doc(hidden)]
+pub fn operations() -> usize {
+    #[cfg(feature = "images")]
+    let ccitt = hayro_ccitt::OPERATIONS.get();
+    #[cfg(not(feature = "images"))]
+    let ccitt = 0;
+    OPERATIONS.get() + ccitt
+}
+
+/// The bytes of room made on this thread to be filled under a meter so far
+/// ([`RESERVED`]), and those the CCITT decoder made for a line's colour changes,
+/// filled a change per code read. Debug builds only.
+#[cfg(all(debug_assertions, feature = "std"))]
+#[doc(hidden)]
+pub fn reserved() -> usize {
+    #[cfg(feature = "images")]
+    let ccitt = hayro_ccitt::RESERVED.get();
+    #[cfg(not(feature = "images"))]
+    let ccitt = 0;
+    RESERVED.get() + ccitt
+}
+
+/// Counts `steps` of a loop that works on data ([`OPERATIONS`]).
+#[inline(always)]
+pub(crate) fn operation(_steps: usize) {
+    #[cfg(all(debug_assertions, feature = "std"))]
+    OPERATIONS.set(OPERATIONS.get() + _steps);
+}
+
 /// Counts a byte a reader looked at ([`EXAMINED`]).
 #[inline(always)]
 pub(crate) fn examined() {

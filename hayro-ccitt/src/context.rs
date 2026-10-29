@@ -6,6 +6,10 @@ use alloc::vec::Vec;
 /// The most changes per line that room is made for before decoding.
 const MAX_RESERVED_CHANGES: usize = 1 << 8;
 
+/// The changes of the line above a search after a horizontal mode code passes a
+/// change at a time, before it gallops ([`DecoderContext::update_b_after_runs`]).
+const NEAR: usize = 8;
+
 /// A reusable context for decoding CCITT images.
 #[derive(Clone)]
 pub struct DecoderContext {
@@ -103,7 +107,9 @@ impl DecoderContext {
             let last_is_white = self.coding_changes.len().is_multiple_of(2);
 
             if last_is_white != self.color.is_white() {
+                let room = self.coding_changes.capacity();
                 self.coding_changes.push(self.pixels_decoded);
+                crate::reserved((self.coding_changes.capacity() - room) * size_of::<u32>());
             }
 
             self.pixels_decoded += count;
@@ -127,8 +133,6 @@ impl DecoderContext {
         self.b1_idx = 0;
         self.color = Color::White;
         self.decoded_rows += 1;
-
-        self.update_b();
     }
 
     /// Ends the line being decoded where the data ends within it, as `MuPDF` does
@@ -197,17 +201,73 @@ impl DecoderContext {
             .unwrap_or(self.line_width)
     }
 
-    /// Compute the new position of b1 (and implicitly b2).
+    /// Compute the new position of b1 (and implicitly b2) after a vertical or a pass
+    /// mode code, searching the changes of the line above a change at a time from
+    /// where the line's last search ended: such a code moves a0 at most 3 past b1,
+    /// or to b2, so the search passes at most 5 changes.
     #[inline(always)]
     fn update_b(&mut self) {
-        // b1 must be strictly greater than a0.
-        let min_idx = self.a0().map_or(0, |a| a + 1);
         let mut idx = self.ref_pos as usize;
-
+        let min_idx = self.min_b1();
         while self.ref_changes.get(idx).is_some_and(|&c| c < min_idx) {
             idx += 1;
         }
+        crate::operation(idx - self.ref_pos as usize);
+        debug_assert!(
+            idx - self.ref_pos as usize <= 5,
+            "a long search after a code"
+        );
+        self.set_b1(idx);
+    }
 
+    /// [`Self::update_b`] after a horizontal mode code, whose two runs move a0 past
+    /// any number of changes of the line above: past the first few, passed a change
+    /// at a time, they are passed in steps twice the logarithm of their number,
+    /// doubling the step until it passes b1, then halving it, so that a code of a
+    /// few bits does a bounded amount of work over a line of any width.
+    #[inline(always)]
+    fn update_b_after_runs(&mut self) {
+        let min_idx = self.min_b1();
+        let start = self.ref_pos as usize;
+        let near = self.ref_changes.len().min(start + NEAR);
+        let mut idx = start;
+        while idx < near && self.ref_changes[idx] < min_idx {
+            idx += 1;
+        }
+        crate::operation(idx - start);
+        if idx == start + NEAR {
+            idx = self.gallop(idx, min_idx);
+        }
+        self.set_b1(idx);
+    }
+
+    /// The first change of the line above from `start` on that is not before
+    /// `min_idx`, found in steps twice the logarithm of how far it is.
+    #[cold]
+    #[inline(never)]
+    fn gallop(&self, start: usize, min_idx: u32) -> usize {
+        let rest = &self.ref_changes[start..];
+        let mut bound = 1;
+        while bound <= rest.len() && rest[bound - 1] < min_idx {
+            bound *= 2;
+        }
+        // The changes before `bound / 2` are before b1; the one at `bound - 1` is not,
+        // or is past the end.
+        let (from, to) = (bound / 2, bound.min(rest.len()));
+        crate::operation(2 * bound.trailing_zeros() as usize + 1);
+        start + from + rest[from..to].partition_point(|&c| c < min_idx)
+    }
+
+    /// The least position b1 may have: b1 must be strictly greater than a0.
+    #[inline(always)]
+    fn min_b1(&self) -> u32 {
+        self.a0().map_or(0, |a| a + 1)
+    }
+
+    /// Sets b1 to the change at `idx` or after it, the first change of the line above
+    /// at or past [`Self::min_b1`], of the colour opposite to a0's.
+    #[inline(always)]
+    fn set_b1(&mut self, mut idx: usize) {
         self.ref_pos = idx as u32;
 
         // b1 refers to an element of the opposite color, i.e. a change to black
@@ -233,6 +293,7 @@ pub(crate) fn decode_1d_line(
     decoder: &mut impl Decoder,
 ) -> Result<()> {
     while !ctx.at_eol() {
+        crate::operation(1);
         reader.poll(decoder)?;
         if reader.overrun() {
             return Err(DecodeError::UnexpectedEof);
@@ -253,6 +314,7 @@ pub(crate) fn decode_2d_line(
     decoder: &mut impl Decoder,
 ) -> Result<()> {
     while !ctx.at_eol() {
+        crate::operation(1);
         reader.poll(decoder)?;
         if reader.overrun() {
             return Err(DecodeError::UnexpectedEof);
@@ -292,7 +354,7 @@ pub(crate) fn decode_2d_line(
                 ctx.push_pixels(a1a2)?;
                 ctx.color = ctx.color.opposite();
 
-                ctx.update_b();
+                ctx.update_b_after_runs();
             }
         }
     }

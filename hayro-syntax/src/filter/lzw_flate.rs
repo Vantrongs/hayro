@@ -302,6 +302,7 @@ pub(crate) mod flate {
             fn next(&mut self, _: &Meter<'_>) -> Option<u8> {
                 let byte = *self.data.get(self.at)?;
                 self.at += 1;
+                crate::work::operation(1);
                 Some(byte)
             }
 
@@ -316,6 +317,7 @@ pub(crate) mod flate {
             fn take(&mut self, max: usize, _: &Meter<'_>) -> &[u8] {
                 let n = max.min(self.data.len() - self.at);
                 self.at += n;
+                crate::work::operation(n);
                 &self.data[self.at - n..self.at]
             }
         }
@@ -1760,6 +1762,7 @@ impl PngRows {
         if end <= done || end - done < min {
             return Ok(());
         }
+        crate::work::operation(end - done);
         if let Some(filter) = RowFilter::from_u8(filter) {
             let previous = self.prev.get(1..).unwrap_or_default();
             png::unfilter_part(filter, bpp, previous, row, done..end);
@@ -1799,6 +1802,7 @@ impl TiffPieces {
         let (components, row_len) = (self.components as usize, self.row_len as usize);
         let mut at = self.at as usize;
         let mut colour = at * per_byte % colors;
+        crate::work::operation(self.piece.len());
         for byte in &mut self.piece {
             if at == row_len {
                 at = 0;

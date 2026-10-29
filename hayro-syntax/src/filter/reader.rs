@@ -7,7 +7,9 @@
 //! loop down to the layer below it, whose bytes it decodes on the way back up. No
 //! read, rewind, checkpoint or drop goes from one layer to the next by a call, so
 //! the stack stays the same however many filters there are, and no layer holds more
-//! than a step of what it makes, however much that is.
+//! than a step of what it makes, however much that is. Nothing walks over the layers
+//! but through [`Layers`], which counts each layer reached as work, so that however
+//! many there are, the hook is polled.
 
 #[cfg(any(feature = "unsafe", feature = "images"))]
 use crate::crypto::reader::Cursor;
@@ -24,6 +26,9 @@ use crate::object::stream::OwnedStream;
 use crate::work::{Cancelled, Meter, POLL_BYTES};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+#[cfg(any(feature = "unsafe", feature = "images"))]
+use layers::Copies;
+use layers::Layers;
 
 /// How many decrypted bytes are read at a time, and how many bytes the Flate
 /// decoder is given at a time.
@@ -107,7 +112,7 @@ enum Source<'a> {
 /// stored bytes; none for data stored without a filter.
 struct Chain<'a> {
     stored: Stored<'a>,
-    layers: Vec<Layer>,
+    layers: Layers,
     /// The bytes the decoders made, those not read yet included.
     inflated: u64,
 }
@@ -259,18 +264,18 @@ enum Saved {
 #[cfg(any(feature = "unsafe", feature = "images"))]
 pub(crate) struct ChainState {
     cursor: Cursor,
-    pending: Vec<u8>,
-    layers: Box<[Layer]>,
+    pending: Box<[u8]>,
+    layers: Copies,
 }
 
 impl<'a> DecodedReader<'a> {
     /// The data as stored, without filters.
     #[cfg(test)]
     pub(crate) fn raw(data: DecryptedReader<'a>) -> Self {
-        Self::chain(data, Vec::new())
+        Self::chain(data, Layers::none())
     }
 
-    fn chain(data: DecryptedReader<'a>, layers: Vec<Layer>) -> Self {
+    fn chain(data: DecryptedReader<'a>, layers: Layers) -> Self {
         Self {
             source: Source::Chain(Chain {
                 stored: Stored {
@@ -292,15 +297,7 @@ impl<'a> DecodedReader<'a> {
         codecs: &[Codec],
         meter: &Meter<'_>,
     ) -> Result<Option<Self>, Cancelled> {
-        let mut layers = meter.room(codecs.len());
-        for codec in codecs {
-            meter.work(size_of::<Layer>())?;
-            let Some(layer) = Layer::new(codec) else {
-                return Ok(None);
-            };
-            layers.push(layer);
-        }
-        Ok(Some(Self::chain(stored, layers)))
+        Ok(Layers::new(codecs, meter)?.map(|layers| Self::chain(stored, layers)))
     }
 
     /// Flate data with its predictor `params` (see [`Self::decoding`]).
@@ -441,13 +438,10 @@ impl<'a> DecodedReader<'a> {
                 chain.stored.data.is_rc4().then_some(())?;
                 chain.stored.data.borrowed_data()
             }
-            Source::Chain(chain) => {
-                let permissive = |l: &Layer| matches!(l.stage, Stage::Permissive(_));
-                match chain.layers.iter().any(permissive) {
-                    true => None,
-                    false => chain.stored.data.borrowed_data(),
-                }
-            }
+            Source::Chain(chain) => match chain.layers.checkpointable() {
+                true => chain.stored.data.borrowed_data(),
+                false => None,
+            },
             #[cfg(feature = "images")]
             Source::Ccitt(bytes) => bytes.plain(),
         }
@@ -547,25 +541,8 @@ impl DecodedCheckpoint {
 #[cfg(feature = "unsafe")]
 impl ChainState {
     fn heap_bytes(&self) -> usize {
-        self.pending.capacity()
-            + size_of_val(&*self.layers)
-            + self.layers.iter().map(Layer::heap_bytes).sum::<usize>()
+        self.pending.len() + self.layers.heap_bytes()
     }
-}
-
-/// A copy of each of `layers`, allocated at its length, which collecting an
-/// iterator of options would not, counted on `meter` ([`Layer::copy`]); `None`
-/// where a decoder's state cannot be allocated.
-#[cfg(any(feature = "unsafe", feature = "images"))]
-fn copies(layers: &[Layer], meter: &Meter<'_>) -> Result<Option<Vec<Layer>>, Cancelled> {
-    let mut copies = Vec::with_capacity(layers.len());
-    for layer in layers {
-        match layer.copy(meter)? {
-            Some(copy) => copies.push(copy),
-            None => return Ok(None),
-        }
-    }
-    Ok(Some(copies))
 }
 
 /// Identifies stored bytes by where they are.
@@ -599,7 +576,7 @@ impl Chain<'_> {
         if !self.pull(meter)? {
             return Ok(0);
         }
-        let Some(top) = self.layers.last_mut() else {
+        let Some(top) = self.layers.top() else {
             return Ok(0);
         };
         let n = buf.len().min(top.out().len());
@@ -616,14 +593,13 @@ impl Chain<'_> {
     /// Steps the layers until the top one has bytes to read (true) or its data ended
     /// (false): a layer that needs bytes the one below it has still to make sends the
     /// loop down to that one, and a layer that made bytes or ended sends it back up
-    /// to the one above. Going down counts a step of work, so that the hook is
-    /// polled however many layers there are.
+    /// to the one above. Reaching a layer, down or up, counts a step of work
+    /// ([`Layers::reach`]), so that the hook is polled however many layers there are.
     fn pull(&mut self, meter: &Meter<'_>) -> Result<bool, Cancelled> {
         let top = self.layers.len() - 1;
         let mut i = top;
         loop {
-            let (below, rest) = self.layers.split_at_mut(i);
-            let layer = &mut rest[0];
+            let (below, layer) = self.layers.reach(i, meter)?;
             if !layer.out().is_empty() {
                 if i == top {
                     return Ok(true);
@@ -631,7 +607,7 @@ impl Chain<'_> {
                 i += 1;
                 continue;
             }
-            let mut under = match below.last_mut() {
+            let mut under = match below {
                 Some(below) => Under::Layer(below),
                 None => Under::Stored(&mut self.stored),
             };
@@ -639,46 +615,23 @@ impl Chain<'_> {
                 Step::Made => {}
                 Step::Done if i == top => return Ok(false),
                 Step::Done => i += 1,
-                Step::Starved => {
-                    meter.work(1)?;
-                    // A layer starves only for bytes another layer makes: the stored
-                    // ones are all at hand.
-                    i = i.checked_sub(1).expect("the first layer never starves");
-                }
+                // A layer starves only for bytes another layer makes: the stored ones
+                // are all at hand.
+                Step::Starved => i = i.checked_sub(1).expect("the first layer never starves"),
                 #[cfg(feature = "unsafe")]
-                Step::Restart => self.restart(i),
+                Step::Restart => {
+                    self.stored.rewind();
+                    if self.layers.restart(i) {
+                        warn!("flate stream is broken, decoding with fallback");
+                    }
+                }
             }
         }
     }
 
-    /// Moves layer `i` on to the next decoder in the order whole decoding tries them,
-    /// after the one in use found the data corrupt before making a byte (so none was
-    /// handed out): zlib, raw deflate, then the permissive decoder, each over the
-    /// data from its start.
-    #[cfg(feature = "unsafe")]
-    fn restart(&mut self, i: usize) {
-        self.stored.rewind();
-        for layer in &mut self.layers[..i] {
-            layer.rewind();
-        }
-        let layer = &mut self.layers[i];
-        layer.rewind();
-        if let Stage::Inflating(inflating) = &mut layer.stage
-            && inflating.zlib
-        {
-            inflating.zlib = false;
-            inflating.rewind();
-            return;
-        }
-        warn!("flate stream is broken, decoding with fallback");
-        layer.stage = Stage::permissive();
-    }
-
     fn rewind(&mut self) {
         self.stored.rewind();
-        for layer in &mut self.layers {
-            layer.rewind();
-        }
+        self.layers.rewind();
     }
 
     /// The most heap bytes a copy of its state holds.
@@ -688,11 +641,7 @@ impl Chain<'_> {
             Some(_) => 0,
             None => INPUT_CHUNK,
         };
-        self.layers
-            .iter()
-            .try_fold(pending + size_of_val(&*self.layers), |bound, layer| {
-                bound.checked_add(layer.heap_bound()?)
-            })
+        self.layers.heap_bound()?.checked_add(pending)
     }
 
     /// A copy of its state, counted on `meter`; `None` where a decoder's state cannot
@@ -700,42 +649,25 @@ impl Chain<'_> {
     #[cfg(any(feature = "unsafe", feature = "images"))]
     fn save(&self, meter: &Meter<'_>) -> Result<Option<ChainState>, Cancelled> {
         let pending = match self.stored.data.plain_rest() {
-            Some(_) => Vec::new(),
-            None => meter.copied(&self.stored.buf[self.stored.at..])?,
+            Some(_) => Box::default(),
+            None => meter.copied(&self.stored.buf[self.stored.at..])?.into(),
         };
-        Ok(copies(&self.layers, meter)?.map(|layers| ChainState {
+        Ok(self.layers.copy(meter)?.map(|layers| ChainState {
             cursor: self.stored.data.cursor(),
             pending,
-            layers: layers.into_boxed_slice(),
+            layers,
         }))
     }
 
-    /// Whether `state` was saved of a chain of the same filters.
-    #[cfg(any(feature = "unsafe", feature = "images"))]
-    fn fits(&self, state: &ChainState) -> bool {
-        self.layers.len() == state.layers.len()
-            && self
-                .layers
-                .iter()
-                .zip(&state.layers)
-                .all(|(layer, saved)| layer.same_filter(saved))
-    }
-
     /// Takes the state of `state`, saved of this chain, the copying counted on
-    /// `meter`; false, with the chain unchanged, where `state` is of a chain that
-    /// does not [`Self::fits`] it or a decoder's state cannot be allocated, and
-    /// unchanged too where the meter's hook asks to stop.
+    /// `meter`; false, with the chain unchanged, where `state` is of a chain of other
+    /// filters or a decoder's state cannot be allocated, and unchanged too where the
+    /// meter's hook asks to stop.
     #[cfg(any(feature = "unsafe", feature = "images"))]
     fn load(&mut self, state: &ChainState, meter: &Meter<'_>) -> Result<bool, Cancelled> {
-        if !self.fits(state) {
-            return Ok(false);
-        }
-        let Some(copies) = copies(&state.layers, meter)? else {
-            return Ok(false);
-        };
         let pending = meter.copied(&state.pending)?;
-        for (layer, copy) in self.layers.iter_mut().zip(copies) {
-            *layer = copy;
+        if !self.layers.load(&state.layers, meter)? {
+            return Ok(false);
         }
         self.stored.data.restore(&state.cursor);
         self.stored.buf = pending;
@@ -918,6 +850,12 @@ impl Layer {
             None => None,
         };
         Ok(Some(Self { stage, predictor }))
+    }
+
+    /// Whether the permissive Flate decoder reads it, which is not checkpointed.
+    #[cfg(feature = "unsafe")]
+    fn permissive(&self) -> bool {
+        matches!(self.stage, Stage::Permissive(_))
     }
 
     /// Whether `other` decodes the same filter.
@@ -1180,6 +1118,7 @@ impl Inflating {
             under.hand(taken);
             (self.handed, self.end) = (0, written);
             *inflated += written as u64;
+            crate::work::operation(written + taken);
             meter.work(written + taken)?;
             match result {
                 Ok(zlib_rs::Status::StreamEnd) => self.finish(),
@@ -1316,6 +1255,7 @@ impl Input for Fed {
         self.check(byte.is_some());
         self.at += usize::from(byte.is_some());
         self.taken += usize::from(byte.is_some());
+        crate::work::operation(usize::from(byte.is_some()));
         byte
     }
 
@@ -1334,11 +1274,254 @@ impl Input for Fed {
         let n = max.min(self.buf.len() - self.at);
         self.at += n;
         self.taken += n;
+        crate::work::operation(n);
         &self.buf[self.at - n..self.at]
     }
 
     fn low(&self) -> bool {
         !self.ended && self.buf.len() - self.at < LOOKAHEAD
+    }
+}
+
+/// The layers of a chain, reached only through [`Layers::reach`], which counts a step
+/// of work for the layers it reaches, and walked over only by walks that count a step
+/// for each layer ([`Layers::new`], [`Layers::copy`], [`Layers::load`]). A rewind
+/// marks the layers to be rewound as they are next reached, and whether the layers
+/// can be checkpointed, and the heap a checkpoint of them holds, are kept as they
+/// are made and changed: so no work over any number of layers goes uncounted.
+mod layers {
+    #[cfg(feature = "unsafe")]
+    use super::Stage;
+    use super::{Codec, Layer};
+    use crate::work::{Cancelled, Meter, operation};
+    #[cfg(any(feature = "unsafe", feature = "images"))]
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+
+    pub(super) struct Layers {
+        list: Vec<Layer>,
+        /// The layers below this one are rewound when they are next reached. A read
+        /// reaches the top layer first, then each next to one reached, so the
+        /// layers rewound since are those from here up.
+        rewound_from: usize,
+        /// How many layers the permissive Flate decoder reads.
+        #[cfg(feature = "unsafe")]
+        permissive: usize,
+        /// The most heap bytes a copy of them holds while the permissive decoder reads
+        /// none: their filters' bounds ([`Layer::heap_bound`]), which no restart
+        /// changes but to the permissive decoder.
+        #[cfg(feature = "unsafe")]
+        bound: Option<usize>,
+    }
+
+    /// A copy of a chain's layers ([`Layers::copy`]).
+    #[cfg(any(feature = "unsafe", feature = "images"))]
+    pub(super) struct Copies {
+        list: Box<[Layer]>,
+        /// The heap bytes they hold.
+        #[cfg(feature = "unsafe")]
+        heap: usize,
+    }
+
+    #[cfg(feature = "unsafe")]
+    impl Copies {
+        /// The heap bytes they hold, counted as they were copied.
+        pub(super) fn heap_bytes(&self) -> usize {
+            self.heap
+        }
+    }
+
+    impl Layers {
+        /// No layer: data stored without a filter.
+        pub(super) fn none() -> Self {
+            Self {
+                list: Vec::new(),
+                rewound_from: 0,
+                #[cfg(feature = "unsafe")]
+                permissive: 0,
+                #[cfg(feature = "unsafe")]
+                bound: Some(0),
+            }
+        }
+
+        /// The layers of `codecs`, each counted on `meter` as it is made; `None` when a
+        /// predictor is one only the whole-data decoder reverses.
+        pub(super) fn new(codecs: &[Codec], meter: &Meter<'_>) -> Result<Option<Self>, Cancelled> {
+            let mut layers = Self::none();
+            layers.list = meter.room(codecs.len());
+            #[cfg(feature = "unsafe")]
+            {
+                layers.bound = codecs.len().checked_mul(size_of::<Layer>());
+            }
+            for codec in codecs {
+                operation(1);
+                meter.work(size_of::<Layer>())?;
+                let Some(layer) = Layer::new(codec) else {
+                    return Ok(None);
+                };
+                #[cfg(feature = "unsafe")]
+                {
+                    layers.permissive += usize::from(layer.permissive());
+                    layers.bound = layers
+                        .bound
+                        .zip(layer.heap_bound())
+                        .and_then(|(bound, layer)| bound.checked_add(layer));
+                }
+                layers.list.push(layer);
+            }
+            Ok(Some(layers))
+        }
+
+        pub(super) fn len(&self) -> usize {
+            self.list.len()
+        }
+
+        pub(super) fn is_empty(&self) -> bool {
+            self.list.is_empty()
+        }
+
+        /// Layer `i` and the one below it, none below the first, each rewound first
+        /// where it is to be: reaching them counts a step of work on `meter`. `i` is
+        /// the top layer, or next to one reached since the last rewind or restart.
+        pub(super) fn reach(
+            &mut self,
+            i: usize,
+            meter: &Meter<'_>,
+        ) -> Result<(Option<&mut Layer>, &mut Layer), Cancelled> {
+            operation(1);
+            meter.work(1)?;
+            self.rewound_down_to(i.saturating_sub(1));
+            let (below, rest) = self.list.split_at_mut(i);
+            Ok((below.last_mut(), &mut rest[0]))
+        }
+
+        /// The last layer, as [`Self::reach`] left it.
+        pub(super) fn top(&mut self) -> Option<&mut Layer> {
+            self.rewound_down_to(self.list.len().checked_sub(1)?);
+            self.list.last_mut()
+        }
+
+        /// Rewinds the layers from `to` up that are to be rewound: at most two, as
+        /// layers are reached each next to one reached.
+        fn rewound_down_to(&mut self, to: usize) {
+            debug_assert!(to + 2 >= self.rewound_from, "a layer reached out of turn");
+            while self.rewound_from > to {
+                self.rewound_from -= 1;
+                self.list[self.rewound_from].rewind();
+            }
+        }
+
+        /// Back to the start of the data, each decoder kept as restarts chose it: each
+        /// layer is rewound when it is next reached or copied.
+        pub(super) fn rewind(&mut self) {
+            self.rewound_from = self.list.len();
+        }
+
+        /// Moves layer `i` on to the next decoder in the order whole decoding tries
+        /// them, after the one in use found the data corrupt before making a byte:
+        /// zlib, raw deflate, then the permissive decoder, each over the data from its
+        /// start; true where that is the permissive decoder. It and the layers below
+        /// it are rewound as they are next reached, which `i` is next.
+        #[cfg(feature = "unsafe")]
+        pub(super) fn restart(&mut self, i: usize) -> bool {
+            self.rewound_from = i + 1;
+            let layer = &mut self.list[i];
+            if let Stage::Inflating(inflating) = &mut layer.stage
+                && inflating.zlib
+            {
+                inflating.zlib = false;
+                return false;
+            }
+            debug_assert!(matches!(layer.stage, Stage::Inflating(_)));
+            layer.stage = Stage::permissive();
+            self.permissive += 1;
+            true
+        }
+
+        /// Whether they can be checkpointed: the permissive decoder reads none.
+        #[cfg(feature = "unsafe")]
+        pub(super) fn checkpointable(&self) -> bool {
+            self.permissive == 0
+        }
+
+        /// The most heap bytes a copy of them holds ([`Copies::heap_bytes`]), at any
+        /// position; `None` where the permissive decoder reads one, as such a chain
+        /// is not checkpointed.
+        #[cfg(feature = "unsafe")]
+        pub(super) fn heap_bound(&self) -> Option<usize> {
+            match self.permissive {
+                0 => self.bound,
+                _ => None,
+            }
+        }
+
+        /// A copy of each layer as it is next reached, rewound where it is to be,
+        /// holding only the bytes it has not handed on, each counted on `meter`
+        /// ([`Layer::copy`]); `None` where a decoder's state cannot be allocated.
+        #[cfg(any(feature = "unsafe", feature = "images"))]
+        pub(super) fn copy(&self, meter: &Meter<'_>) -> Result<Option<Copies>, Cancelled> {
+            let mut list = meter.room(self.list.len());
+            #[cfg(feature = "unsafe")]
+            let mut heap = self.list.len() * size_of::<Layer>();
+            for (i, layer) in self.list.iter().enumerate() {
+                operation(1);
+                let Some(mut copy) = layer.copy(meter)? else {
+                    return Ok(None);
+                };
+                if i < self.rewound_from {
+                    copy.rewind();
+                }
+                #[cfg(feature = "unsafe")]
+                {
+                    heap += copy.heap_bytes();
+                }
+                list.push(copy);
+            }
+            Ok(Some(Copies {
+                list: list.into_boxed_slice(),
+                #[cfg(feature = "unsafe")]
+                heap,
+            }))
+        }
+
+        /// Takes a copy of each of `copies`, copied of a chain of the same filters,
+        /// each counted on `meter` ([`Layer::copy`]); false, with the layers
+        /// unchanged, where they are of other filters or a decoder's state cannot be
+        /// allocated, and unchanged too where the meter's hook asks to stop.
+        #[cfg(any(feature = "unsafe", feature = "images"))]
+        pub(super) fn load(
+            &mut self,
+            copies: &Copies,
+            meter: &Meter<'_>,
+        ) -> Result<bool, Cancelled> {
+            if copies.list.len() != self.list.len() {
+                return Ok(false);
+            }
+            let mut list = meter.room(self.list.len());
+            #[cfg(feature = "unsafe")]
+            let mut permissive = 0;
+            for (layer, saved) in self.list.iter().zip(&copies.list) {
+                operation(1);
+                if !layer.same_filter(saved) {
+                    return Ok(false);
+                }
+                let Some(layer) = saved.copy(meter)? else {
+                    return Ok(false);
+                };
+                #[cfg(feature = "unsafe")]
+                {
+                    permissive += usize::from(layer.permissive());
+                }
+                list.push(layer);
+            }
+            self.list = list;
+            self.rewound_from = 0;
+            #[cfg(feature = "unsafe")]
+            {
+                self.permissive = permissive;
+            }
+            Ok(true)
+        }
     }
 }
 

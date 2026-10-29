@@ -1160,8 +1160,8 @@ fn deep_chains_are_read_on_a_small_stack() {
                 assert_eq!(rest, Ok(whole[start..].to_vec()), "{n} {filter}: resumed");
                 drop((checkpoint, resumed));
             }
-            // Each layer the loop goes down to counts a step of work, so the hook is
-            // polled once a poll's worth of them were gone down to.
+            // Each layer the loop reaches counts a step of work, so the hook is polled
+            // once a poll's worth of them were reached.
             let stop = || true;
             let mut cancelled = stream.decoded_reader(&Meter::default()).unwrap().unwrap();
             let mut buf = [0; 16];

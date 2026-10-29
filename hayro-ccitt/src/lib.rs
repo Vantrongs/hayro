@@ -29,6 +29,8 @@
 #![forbid(missing_docs)]
 
 extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
 
 use crate::bit_reader::{BitReader, Data, Position};
 use alloc::rc::Rc;
@@ -299,6 +301,39 @@ fn finish(reader: &mut BitReader<'_>, decoder: &mut impl Decoder) -> Result<usiz
     Ok(reader.byte_pos())
 }
 
+#[cfg(all(debug_assertions, feature = "std"))]
+std::thread_local! {
+    /// The steps of the decoder's loops taken on this thread: a code read, a change
+    /// of the reference line searched. Counted where they are taken, apart from what
+    /// [`Decoder::stop`] is told, so that tests can bound the work between two asks
+    /// by it. Debug builds with the `std` feature only.
+    #[doc(hidden)]
+    pub static OPERATIONS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(all(debug_assertions, feature = "std"))]
+std::thread_local! {
+    /// The bytes of room made on this thread for a line's colour changes, filled a
+    /// change per code read: what tests tell an allocation filled as bits are read
+    /// from one made at once by. Debug builds with the `std` feature only.
+    #[doc(hidden)]
+    pub static RESERVED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Counts `steps` of the decoder's loops ([`OPERATIONS`]).
+#[inline(always)]
+pub(crate) fn operation(_steps: usize) {
+    #[cfg(all(debug_assertions, feature = "std"))]
+    OPERATIONS.set(OPERATIONS.get() + _steps);
+}
+
+/// Notes room of `bytes` made for colour changes ([`RESERVED`]).
+#[inline(always)]
+pub(crate) fn reserved(_bytes: usize) {
+    #[cfg(all(debug_assertions, feature = "std"))]
+    RESERVED.set(RESERVED.get() + _bytes);
+}
+
 /// The bits read after which [`Decoder::stop`] is asked again.
 pub const POLL_BITS: usize = 1 << 12;
 
@@ -316,10 +351,11 @@ pub trait Decoder {
     /// Asked between codes and within runs of fill bits each time [`POLL_BITS`]
     /// more bits were read, and once more when decoding succeeds, with `bits`,
     /// the number of bits read since the previous ask. Every code takes at least
-    /// one bit, so the work between two asks is bounded whatever the data, apart
-    /// from the rows pushed meanwhile. Bits read again after a damaged line are
-    /// told again; bits looked at ahead and then not consumed may not be told.
-    /// Never by default.
+    /// one bit, and each does a bounded amount of work, the search of the line
+    /// above for the changes it refers to included, whatever the line's width, so
+    /// the work between two asks is bounded whatever the data, apart from the rows
+    /// pushed meanwhile. Bits read again after a damaged line are told again; bits
+    /// looked at ahead and then not consumed may not be told. Never by default.
     fn stop(&mut self, bits: usize) -> bool {
         let _ = bits;
         false

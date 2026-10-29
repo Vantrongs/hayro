@@ -624,7 +624,7 @@ fn deep_expanding_chains_read_what_strict_decoding_returns() {
         // end, its raw decoder's and its permissive decoder's.
         assert!(
             work < (3 * damaged.len() + 6) * n * content.len(),
-            "{name}: {work} bytes of work"
+            "{name}: {work} bytes of work, {restarts} restarts"
         );
         let most = match n {
             ..=17 => decoding.peak.min((1 << 20) + n * (256 << 10)),
@@ -639,6 +639,37 @@ fn deep_expanding_chains_read_what_strict_decoding_returns() {
         println!(
             "{name}: {restarts} restarts, peak {} ({} decoding whole), work {work}",
             allocations.peak, decoding.peak
+        );
+    }
+}
+
+/// Making the stages of a chain of any number of filters over no data, which decode
+/// to nothing, counts a step of work for each filter, so the hook is polled within a
+/// bounded number of steps of the loops ([`operations`]) however many there are.
+#[cfg(debug_assertions)]
+#[test]
+fn making_the_stages_of_a_long_chain_polls_the_hook() {
+    use hayro_syntax::work::operations;
+    use std::cell::Cell;
+    for n in [100_000, 300_000] {
+        let dict = format!("/Filter [{}]", ["/AHx"].repeat(n).join(" "));
+        let pdf = stream_file(&dict, &[]);
+        let stream = object_3(&pdf);
+        let last = Cell::new(operations());
+        let worst = Cell::new(0);
+        let hook = || {
+            let now = operations();
+            worst.set(worst.get().max(now - last.replace(now)));
+            false
+        };
+        let meter = Meter::new(Some(&hook));
+        let mut reader = stream.decoded_strict_reader(&meter).unwrap().unwrap();
+        while reader.read(&mut [0; 16], &meter).unwrap() > 0 {}
+        hook();
+        assert!(
+            worst.get() <= 3 * POLL_BYTES,
+            "{n} filters: {} steps",
+            worst.get()
         );
     }
 }

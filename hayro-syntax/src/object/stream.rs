@@ -680,11 +680,10 @@ impl<'a> Stream<'a> {
     /// The decoded data, read incrementally, when the stream's filters allow it: any
     /// number of Flate, LZW, ASCII hex, ASCII base-85 and run length filters, with no
     /// predictor, a PNG predictor, or the TIFF predictor of components of up to 8
-    /// bits; the last 16 each read as the one before it decodes, any before them
-    /// decoded whole on the first read. It yields the bytes [`Stream::decoded`]
-    /// returns, without holding them all. `None` for other filters, or where
-    /// decryption would fail. Reading the filters and making their decoders counts
-    /// on `meter`, and fails once its hook asks to stop.
+    /// bits, each read as the one before it decodes. It yields the bytes
+    /// [`Stream::decoded`] returns, without holding them all. `None` for other
+    /// filters, or where decryption would fail. Reading the filters and making their
+    /// decoders counts on `meter`, and fails once its hook asks to stop.
     pub fn decoded_reader(
         &self,
         meter: &Meter<'_>,

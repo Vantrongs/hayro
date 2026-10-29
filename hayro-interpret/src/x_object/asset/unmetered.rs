@@ -5,8 +5,14 @@
 //! binary's allocator: those allocated, a copy's included, and those a reallocation
 //! adds. The bytes a reallocation moves are not: the allocator moves them as it can
 //! ([`Meter::reserve`]). Room made by [`Meter::room`] and [`Meter::reserve`] is
-//! filled a counted piece at a time, so it counts as no work. Each poll also reads
-//! the asset's statistics, which no lock held across a poll may block.
+//! filled a counted piece at a time, and that the CCITT decoder makes for a line's
+//! colour changes a change per code read, so it counts as no work ([`reserved`]).
+//! Work that allocates
+//! nothing is bounded by the steps of the loops that work on data, counted where
+//! they are taken apart from the meter ([`operations`]): a layer of a filter chain
+//! reached, a byte a decoder took, a CCITT code read or reference change searched.
+//! Each poll also reads the asset's statistics, which no lock held across a poll
+//! may block.
 
 use super::tests::{asset, image, is_streamed, pdf, zlib};
 use super::*;
@@ -14,7 +20,7 @@ use crate::chains::{self, Rng};
 use crate::fixtures::noise;
 use hayro_syntax::Pdf;
 use hayro_syntax::object::{ObjectIdentifier, Stream};
-use hayro_syntax::work::{POLL_BYTES, RESERVED};
+use hayro_syntax::work::{POLL_BYTES, operations, reserved};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::{Cell, RefCell};
 
@@ -27,6 +33,12 @@ const PARSES: usize = 3;
 /// the shapes below make is some 160 KiB.
 const BOUND: usize = 4 * POLL_BYTES + FIXED;
 const FIXED: usize = 64 * 1024;
+
+/// The steps of loops one stretch of work between two polls may take: a poll's
+/// worth, as a step counts as a byte of work or more, and what one step of a
+/// decoder takes past it (a call to zlib makes up to a poll's worth from a chunk of
+/// input). The worst stretch the shapes below take is some 140,000 steps.
+const STEPS: usize = 3 * POLL_BYTES;
 
 thread_local! {
     /// The bytes allocated on this thread, and those reallocations added, while
@@ -111,36 +123,53 @@ static ALLOCATOR: Counting = Counting;
 /// the room the meter made. Only its growth tells.
 fn uncounted() -> i128 {
     let allocated = COUNTS.with(Cell::get).expect("counting");
-    allocated as i128 - RESERVED.get() as i128
+    allocated as i128 - reserved() as i128
 }
 
 /// The most work done between two polls of a hook, by the operation it was polled
-/// in.
+/// in: bytes allocated and steps of loops taken.
 #[derive(Default)]
 struct Stretches {
     /// The work [`uncounted`] at the last poll.
     last: Cell<i128>,
-    worst: RefCell<Vec<(String, usize)>>,
+    /// The [`operations`] at the last poll.
+    steps: Cell<usize>,
+    worst: RefCell<Vec<(String, Stretch)>>,
     operation: RefCell<&'static str>,
+}
+
+/// The most bytes allocated and steps taken between two polls.
+#[derive(Clone, Copy, Default)]
+struct Stretch {
+    bytes: usize,
+    steps: usize,
 }
 
 impl Stretches {
     /// Ends a stretch of the current operation, at a poll or at its end.
     fn end(&self) {
         let now = uncounted();
-        let stretch = usize::try_from(now - self.last.replace(now)).unwrap_or(0);
+        let bytes = usize::try_from(now - self.last.replace(now)).unwrap_or(0);
+        let now = operations();
+        let steps = now - self.steps.replace(now);
         let operation = *self.operation.borrow();
         let mut worst = self.worst.borrow_mut();
-        match worst.iter_mut().find(|(o, _)| o == operation) {
-            Some((_, w)) => *w = (*w).max(stretch),
-            None => worst.push((operation.to_owned(), stretch)),
-        }
+        let w = match worst.iter_mut().find(|(o, _)| o == operation) {
+            Some((_, w)) => w,
+            None => {
+                worst.push((operation.to_owned(), Stretch::default()));
+                &mut worst.last_mut().unwrap().1
+            }
+        };
+        w.bytes = w.bytes.max(bytes);
+        w.steps = w.steps.max(steps);
     }
 
     /// Runs `f` as `operation`, from a stretch's start.
     fn run<T>(&self, operation: &'static str, f: impl FnOnce() -> T) -> T {
         *self.operation.borrow_mut() = operation;
         self.last.set(uncounted());
+        self.steps.set(operations());
         let result = f();
         self.end();
         result
@@ -150,7 +179,7 @@ impl Stretches {
 /// Opens, requests and decodes whole the image in object 3 of `pdf` with a hook
 /// that ends a stretch at each poll and reads the asset's statistics; returns each
 /// operation's largest stretch.
-fn stretches(pdf: &Pdf) -> Vec<(String, usize)> {
+fn stretches(pdf: &Pdf) -> Vec<(String, Stretch)> {
     let asset = asset(pdf);
     // The process makes its CMYK profile once, on first use.
     ColorSpace::device_cmyk().to_rgba(&[0.0; 4], 1.0);
@@ -214,14 +243,18 @@ fn stretches(pdf: &Pdf) -> Vec<(String, usize)> {
 }
 
 /// Every shape in `shapes`, a name and a file, does no more work between two polls
-/// than [`BOUND`].
+/// than [`BOUND`] bytes and [`STEPS`] steps.
 fn assert_metered(shapes: Vec<(String, Pdf)>) {
     let mut over = Vec::new();
     for (name, pdf) in shapes {
         for (operation, worst) in stretches(&pdf) {
-            println!("{name}: {operation}: {worst}");
-            if worst > BOUND {
-                over.push(format!("{name}: {operation}: {worst} bytes"));
+            let Stretch { bytes, steps } = worst;
+            println!("{name}: {operation}: {bytes} bytes, {steps} steps");
+            if bytes > BOUND {
+                over.push(format!("{name}: {operation}: {bytes} bytes"));
+            }
+            if steps > STEPS {
+                over.push(format!("{name}: {operation}: {steps} steps"));
             }
         }
     }
@@ -282,6 +315,22 @@ fn filters_and_chains_of_them_are_metered() {
                 pdf(&[(image(&dict, 8, 8), data)]),
             ));
         }
+    }
+    assert_metered(shapes);
+}
+
+/// Chains of growing length of Flate filters over no data: requests reach every
+/// layer, to plan a checkpoint of them and to read through them to the end.
+#[test]
+fn walks_over_long_chains_are_metered() {
+    let mut shapes = Vec::new();
+    for length in [100_000, 300_000] {
+        let filters = ["/FlateDecode"].repeat(length).join(" ");
+        let dict = format!("{GRAY1} /Filter [{filters}]");
+        shapes.push((
+            format!("{length} x /FlateDecode over no data"),
+            pdf(&[(image(&dict, 8, 8), Vec::new())]),
+        ));
     }
     assert_metered(shapes);
 }
@@ -478,5 +527,52 @@ fn masks_are_metered() {
             ]),
         ),
     ];
+    assert_metered(shapes);
+}
+
+/// Two Group 4 rows of `width` columns: one of pixels alternately white and black,
+/// then one coded as a single white run over it all, after which the decoder looks
+/// for the next change on the row above past each of its changes.
+fn wide_reference(width: u32) -> Vec<u8> {
+    const HORIZONTAL: &str = "001";
+    const WHITE_1: &str = "000111";
+    const BLACK_1: &str = "010";
+    const WHITE_2560: &str = "000000011111";
+    const WHITE_0: &str = "00110101";
+    const BLACK_0: &str = "0000110111";
+    assert!(width.is_multiple_of(2560));
+    let mut codes = String::new();
+    for _ in 0..width / 2 {
+        codes.extend([HORIZONTAL, WHITE_1, BLACK_1]);
+    }
+    codes.push_str(HORIZONTAL);
+    for _ in 0..width / 2560 {
+        codes.push_str(WHITE_2560);
+    }
+    codes.extend([WHITE_0, BLACK_0]);
+    let bits = codes.as_bytes();
+    (0..bits.len().div_ceil(8))
+        .map(|byte| {
+            (0..8).fold(0_u8, |acc, bit| {
+                acc << 1 | u8::from(bits.get(8 * byte + bit) == Some(&b'1'))
+            })
+        })
+        .collect()
+}
+
+/// A row of CCITT data coded in a few bits whose reference row has a change at every
+/// pixel, at growing widths: the search of the reference row counts as the work it
+/// is.
+#[test]
+fn ccitt_reference_searches_are_metered() {
+    let mut shapes = Vec::new();
+    for width in [2560 * 16, 2560 * 64, 2560 * 256] {
+        let params = format!("<< /K -1 /Columns {width} /Rows 2 >>");
+        let dict = format!("{GRAY1} /Filter /CCITTFaxDecode /DecodeParms {params}");
+        shapes.push((
+            format!("ccitt {width} columns"),
+            pdf(&[(image(&dict, width, 2), wide_reference(width))]),
+        ));
+    }
     assert_metered(shapes);
 }

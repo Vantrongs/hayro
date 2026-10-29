@@ -212,7 +212,9 @@ impl<'a> StrictReader<'a> {
 
     /// The stages: each layer but the last decoded whole into a buffer where it reads
     /// one and makes at most [`HELD`] bytes, else streamed, up to [`LIVE`] at once,
-    /// the next one then read whole into a buffer; and the last one over them.
+    /// the next one then read whole into a buffer; and the last one over them. A
+    /// layer held over no bytes, whose decoding takes and makes none, counts a step
+    /// of work, so that any number of them polls the hook.
     fn build(&self, meter: &Meter<'_>) -> Result<Box<dyn Stage + 'a>, ReadError> {
         let mut from = Source::Held(self.stored.clone());
         let Some((last, layers)) = self.layers.split_last() else {
@@ -220,14 +222,20 @@ impl<'a> StrictReader<'a> {
         };
         let mut live = 0;
         for layer in layers {
+            crate::work::operation(1);
             from = match from {
-                Source::Held(data) => match layer.decode(data.as_slice(), meter, HELD) {
-                    Ok(decoded) => Source::Held(Data::Held(decoded?)),
-                    Err(tried) => {
-                        live = 1;
-                        Source::Live(layer.stage(Source::Held(data).stage(), tried))
+                Source::Held(data) => {
+                    if data.as_slice().is_empty() {
+                        meter.work(1)?;
                     }
-                },
+                    match layer.decode(data.as_slice(), meter, HELD) {
+                        Ok(decoded) => Source::Held(Data::Held(decoded?)),
+                        Err(tried) => {
+                            live = 1;
+                            Source::Live(layer.stage(Source::Held(data).stage(), tried))
+                        }
+                    }
+                }
                 Source::Live(stage) if live < LIVE => {
                     live += 1;
                     Source::Live(layer.stage(stage, 0))
@@ -463,6 +471,7 @@ impl Input for Pulled<'_> {
         }
         let byte = self.buf[self.at];
         self.consume(1);
+        crate::work::operation(1);
         Some(byte)
     }
 

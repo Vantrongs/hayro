@@ -11,6 +11,11 @@ readme = "README.md"
 exclude = ["/tests/"]
 autotests = false
 
+[features]
+# Counts the decoder's steps on each thread in debug builds, for tests that bound
+# the work between two asks of `Decoder::stop`.
+std = []
+
 [lints]
 workspace = true
 
