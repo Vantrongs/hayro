@@ -1024,3 +1024,113 @@ fn lenient_decoding_keeps_what_comes_before_damage() {
         assert_eq!(read_up_to(&mut reader, usize::MAX, 3), expected, "{filter}");
     }
 }
+
+fn on_stack<T: Send>(stack: usize, f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(stack)
+            .spawn_scoped(scope, f)
+            .unwrap()
+            .join()
+            .unwrap()
+    })
+}
+
+/// Chains of 10,000 and 100,000 filters, ASCII hex or Flate, over empty data are read
+/// in pieces, skipped, read again after a rewind, cancelled, checkpointed and dropped
+/// on a 256 KiB stack, yielding what `decoded` returns: the stack a reader's
+/// operations go down does not grow with the number of filters.
+#[test]
+fn deep_chains_are_read_on_a_small_stack() {
+    for filter in ["/AHx", "/Fl"] {
+        for n in [10_000, 100_000] {
+            on_stack(256 << 10, move || {
+                let dict = format!("/Filter [{}]", [filter].repeat(n).join(" "));
+                let pdf = stream_file(&dict, b"");
+                let stream = object_3(&pdf);
+                let whole = stream.decoded().map(|d| d.into_owned()).unwrap_or_default();
+                let mut reader = stream.decoded_reader().expect("a reader");
+                let mut rng = chains::Rng(n as u64);
+                let first = read_in_pieces(&mut reader, &mut rng, &Meter::default());
+                assert_eq!(first, Ok(whole.clone()), "{n} {filter}");
+                reader.rewind();
+                assert_eq!(reader.skip(10, &Meter::default()), Ok(whole.len().min(10)));
+                reader.rewind();
+                let again = read_in_pieces(&mut reader, &mut rng, &Meter::default());
+                assert_eq!(again, Ok(whole.clone()), "{n} {filter}: read again");
+                #[cfg(feature = "unsafe")]
+                {
+                    assert!(reader.checkpoint_heap_bound().is_none());
+                    assert!(reader.checkpoint(&stream.to_owned_stream()).is_none());
+                }
+                // Each filter counts a step of work, so the hook is polled once a
+                // poll's worth of them are decoded.
+                let stop = || true;
+                let mut cancelled = stream.decoded_reader().unwrap();
+                let mut buf = [0; 16];
+                let read = cancelled.read(&mut buf, &Meter::new(Some(&stop)));
+                assert!(n < POLL_BYTES || read == Err(Cancelled), "{n} {filter}: {read:?}");
+                drop((reader, cancelled));
+            });
+        }
+    }
+}
+
+/// Chains of more filters than the reader decodes as it reads (17 to 24), of every
+/// kind, over data of every sort, some damaged, plain or encrypted, read in pieces:
+/// the reader yields what lenient decoding returns, and again after a rewind and
+/// after a read the meter's hook stopped.
+#[test]
+fn chains_longer_than_the_filters_read_incrementally_read_as_lenient_decoding() {
+    let mut rng = chains::Rng(0x9e37_79b9_7f4a_7c15);
+    let mut cases = 0;
+    while cases < 40 {
+        let mut encoded = chains::data(&mut rng);
+        encoded.truncate(20_000);
+        let (mut filters, mut params) = (Vec::new(), Vec::new());
+        let n = 17 + rng.below(8);
+        while filters.len() < n {
+            let (filter, param, layer) = chains::layer(&encoded, &mut rng);
+            if layer.len() > 100_000 || filter == "/Unknown" || param.contains("/Predictor 2 ")
+            {
+                continue;
+            }
+            encoded = match rng.chance(10) {
+                true => chains::damaged(layer, &mut rng),
+                false => layer,
+            };
+            filters.insert(0, filter);
+            params.insert(0, param);
+        }
+        let dict = format!(
+            "/Filter [{}] /DecodeParms [{}]",
+            filters.join(" "),
+            params.join(" ")
+        );
+        let pdf = match cases % 4 {
+            0 => encrypted_file(&dict, &encoded),
+            _ => stream_file(&dict, &encoded),
+        };
+        let stream = object_3(&pdf);
+        let whole = stream.decoded().map(|d| d.into_owned()).unwrap_or_default();
+        let mut reader = stream.decoded_reader().expect("a reader");
+        let first = read_in_pieces(&mut reader, &mut rng, &Meter::default()).unwrap();
+        assert!(first == whole, "{dict}: {} vs {} bytes", first.len(), whole.len());
+        reader.rewind();
+        let again = read_in_pieces(&mut reader, &mut rng, &Meter::default()).unwrap();
+        assert!(again == whole, "{dict}: read again");
+        let polls = Cell::new(0);
+        let second = || {
+            polls.set(polls.get() + 1);
+            polls.get() > 1
+        };
+        let mut stopped = stream.decoded_reader().unwrap();
+        let read = read_in_pieces(&mut stopped, &mut rng, &Meter::new(Some(&second)));
+        if read.is_err() {
+            stopped.rewind();
+            let after = read_in_pieces(&mut stopped, &mut rng, &Meter::default()).unwrap();
+            assert!(after == whole, "{dict}: read after a stop");
+        }
+        cases += 1;
+    }
+}

@@ -1648,3 +1648,42 @@ fn chained_rows_before_a_request_resume_from_a_saved_state() {
         }
     }
 }
+
+/// An image whose data pass through 100,000 filters over no data is opened,
+/// requested and dropped on a 256 KiB stack, reading as decoding it whole does; one
+/// through 20 Flate filters, more than a reader decodes as it reads, streams as it
+/// decodes whole.
+#[test]
+fn images_through_long_chains_of_filters_stream_on_a_small_stack() {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(256 << 10)
+            .spawn_scoped(scope, || {
+                let filters = ["/AHx"].repeat(100_000).join(" ");
+                let dict = format!("/ColorSpace /DeviceGray /BitsPerComponent 1 /Filter [{filters}]");
+                let pdf = pdf(&[(image(&dict, 8, 8), Vec::new())]);
+                let asset = asset(&pdf);
+                let mut source = asset.open(None, None).unwrap();
+                assert!(is_streamed(&source));
+                let streamed = request(&mut source, Plane::Image, (8, 8), [0, 0, 8, 8]);
+                let decoded = request(&mut whole(&asset), Plane::Image, (8, 8), [0, 0, 8, 8]);
+                assert_eq!(streamed.data, decoded.data);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    });
+    let mut data = noise(8 * 8 / 8, 9);
+    for _ in 0..20 {
+        data = zlib(&data);
+    }
+    let filters = ["/FlateDecode"].repeat(20).join(" ");
+    assert_streams_as_decoded(&[(
+        image(
+            &format!("/ColorSpace /DeviceGray /BitsPerComponent 1 /Filter [{filters}]"),
+            8,
+            8,
+        ),
+        data,
+    )]);
+}

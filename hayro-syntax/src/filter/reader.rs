@@ -3,11 +3,11 @@
 #[cfg(feature = "unsafe")]
 use crate::crypto::reader::Cursor;
 use crate::crypto::reader::DecryptedReader;
-use crate::filter::bytewise::{Decoder, State};
+use crate::filter::bytewise::{self, Decoder, State};
 #[cfg(feature = "images")]
 use crate::filter::ccitt::CcittBytes;
 use crate::filter::lzw_flate::flate::fallback::{FlateStream, Input};
-use crate::filter::lzw_flate::{PredictorParams, Unpredictor};
+use crate::filter::lzw_flate::{PredictorParams, Unpredictor, flate, lzw};
 #[cfg(feature = "unsafe")]
 use crate::object::stream::OwnedStream;
 use crate::work::{Cancelled, Meter, POLL_BYTES};
@@ -54,7 +54,8 @@ impl From<Cancelled> for ReadError {
 /// bytes [`Stream::decoded`](crate::object::Stream::decoded) returns, but holds only
 /// each filter's decoder state, up to [`POLL_BYTES`] it made ahead of the reads, a
 /// chunk of its input and a predictor row, not the whole result. A filter reads what
-/// the filters before it make as they make it. A byte handed out is never taken back:
+/// the filters before it make as they make it, for the last [`LIVE`] filters of a
+/// chain; what any before them make is decoded whole on the first read. A byte handed out is never taken back:
 /// a Flate decoder is chosen before its first byte, as lenient whole decoding chooses
 /// it ([`flate::decode`](crate::filter::lzw_flate::flate::decode)), and other filters
 /// keep what they made before data they cannot read, as lenient whole decoding does
@@ -88,8 +89,9 @@ enum Source<'a> {
     Ccitt(Box<CcittBytes<'a>>),
 }
 
-/// What a filter decodes: the stored bytes, or what the filters before it make of
-/// them.
+/// What a filter decodes: the stored bytes, what the filters before it make of them,
+/// or, at the bottom of a chain longer than [`LIVE`], what its filters below those
+/// read incrementally make, decoded whole.
 #[expect(
     clippy::large_enum_variant,
     reason = "every chain reads stored bytes, without an allocation; only a filter after another boxes its reader"
@@ -97,9 +99,18 @@ enum Source<'a> {
 enum Lower<'a> {
     Stored(DecryptedReader<'a>),
     Decoded(Box<DecodedReader<'a>>),
+    Held(Box<Held<'a>>),
 }
 
+/// The most filters of a chain a reader decodes as it reads, its last ones: each is a
+/// reader nested in the one after it, so this bounds the stack a read, a checkpoint
+/// and a drop go down and the decoders' state and buffers alive at once, as the
+/// strict chain bounds them ([`crate::filter::chain`]). The filters below them, of a
+/// chain no real document has, are decoded whole on the first read.
+const LIVE: usize = 16;
+
 /// A filter a reader decodes, with its predictor's parameters.
+#[derive(Clone)]
 pub(crate) enum Codec {
     Flate(PredictorParams),
     Lzw(PredictorParams),
@@ -190,17 +201,28 @@ impl<'a> DecodedReader<'a> {
         }
     }
 
-    /// `stored` decoded by `codecs` in turn; `None` when a predictor is one only the
-    /// whole-data decoder reverses.
+    /// `stored` decoded by `codecs` in turn, the last [`LIVE`] of them as it is read
+    /// and those below them whole on the first read; `None` when a predictor is one
+    /// only the whole-data decoder reverses.
     pub(crate) fn decoding(stored: DecryptedReader<'a>, codecs: &[Codec]) -> Option<Self> {
-        let mut lower = Lower::Stored(stored);
-        for codec in codecs {
+        let (held, live) = codecs.split_at(codecs.len().saturating_sub(LIVE));
+        let mut lower = match held {
+            [] => Lower::Stored(stored),
+            held => Lower::Held(Box::new(Held {
+                stored,
+                codecs: held.to_vec(),
+                data: None,
+                at: 0,
+            })),
+        };
+        for codec in live {
             lower = Lower::Decoded(Box::new(Self::layer(lower, codec)?));
         }
-        Some(match lower {
-            Lower::Stored(data) => Self::raw(data),
-            Lower::Decoded(reader) => *reader,
-        })
+        match lower {
+            Lower::Stored(data) => Some(Self::raw(data)),
+            Lower::Decoded(reader) => Some(*reader),
+            Lower::Held(_) => None,
+        }
     }
 
     /// `lower` decoded by `codec`.
@@ -292,6 +314,7 @@ impl<'a> DecodedReader<'a> {
         let lower = match lower {
             Lower::Stored(_) => 0,
             Lower::Decoded(reader) => reader.heap_bound()?,
+            Lower::Held(_) => return None,
         };
         own.checked_add(predictor)?.checked_add(lower)
     }
@@ -352,6 +375,7 @@ impl<'a> DecodedReader<'a> {
         match lower {
             Lower::Stored(data) => Some(data.cursor()),
             Lower::Decoded(reader) => reader.save(layers),
+            Lower::Held(_) => None,
         }
     }
 
@@ -410,6 +434,7 @@ impl<'a> DecodedReader<'a> {
         match lower {
             Lower::Stored(_) => rest.is_empty(),
             Lower::Decoded(reader) => reader.fits(rest),
+            Lower::Held(_) => false,
         }
     }
 
@@ -473,6 +498,7 @@ impl<'a> DecodedReader<'a> {
         match lower {
             Lower::Stored(data) => data.restore(cursor),
             Lower::Decoded(reader) => reader.load(cursor, rest, decoders),
+            Lower::Held(_) => {}
         }
     }
 
@@ -490,6 +516,7 @@ impl<'a> DecodedReader<'a> {
         match lower {
             Lower::Stored(data) => data.borrowed_data(),
             Lower::Decoded(reader) => reader.checkpointable(),
+            Lower::Held(_) => None,
         }
     }
 
@@ -800,6 +827,7 @@ impl<'a> Lower<'a> {
         match self {
             Lower::Stored(data) => Ok(data.read(buf)),
             Lower::Decoded(reader) => reader.read(buf, meter),
+            Lower::Held(held) => held.read(buf, meter),
         }
     }
 
@@ -807,6 +835,7 @@ impl<'a> Lower<'a> {
         match self {
             Lower::Stored(data) => data.rewind(),
             Lower::Decoded(reader) => reader.rewind(),
+            Lower::Held(held) => held.at = 0,
         }
     }
 
@@ -814,6 +843,7 @@ impl<'a> Lower<'a> {
         match self {
             Lower::Stored(_) => 0,
             Lower::Decoded(reader) => reader.inflated_bytes(),
+            Lower::Held(held) => held.data.as_ref().map_or(0, |d| d.len() as u64),
         }
     }
 
@@ -822,7 +852,60 @@ impl<'a> Lower<'a> {
         match self {
             Lower::Stored(data) => data.position(),
             Lower::Decoded(reader) => reader.stored_read(),
+            Lower::Held(held) => held.stored.position(),
         }
+    }
+}
+
+/// What the filters of a chain below the [`LIVE`] ones read incrementally make of
+/// the stored bytes, decoded whole on the first read, as lenient whole decoding
+/// decodes each, and kept until the reader is dropped. Data a filter cannot decode
+/// at all, which fails whole decoding, reads as none, as the incremental decoders
+/// read it.
+struct Held<'a> {
+    stored: DecryptedReader<'a>,
+    codecs: Vec<Codec>,
+    /// The bytes the filters made, of which `at` were read; `None` until the first
+    /// read, and again after one the meter's hook stopped.
+    data: Option<Vec<u8>>,
+    at: usize,
+}
+
+impl Held<'_> {
+    fn read(&mut self, buf: &mut [u8], meter: &Meter<'_>) -> Result<usize, Cancelled> {
+        let data = match &mut self.data {
+            Some(data) => data,
+            None => {
+                let data = self.decode(meter)?;
+                self.data.insert(data)
+            }
+        };
+        let n = buf.len().min(data.len() - self.at);
+        buf[..n].copy_from_slice(&data[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
+    }
+
+    /// The stored bytes decrypted and decoded by each filter in turn, a loop rather
+    /// than readers nested in each other, the work counted on `meter`.
+    fn decode(&mut self, meter: &Meter<'_>) -> Result<Vec<u8>, Cancelled> {
+        let mut data = self.stored.decrypt_all(meter)?;
+        for codec in &self.codecs {
+            let decoded = match codec {
+                Codec::Flate(params) => flate::decode(&data, params, meter, false, 0),
+                Codec::Lzw(params) => lzw::decode(&data, params, meter, false),
+                Codec::AsciiHex => bytewise::decode(Decoder::ascii_hex(), &data, false, meter),
+                Codec::Ascii85 => bytewise::decode(Decoder::ascii_85(), &data, false, meter),
+                Codec::RunLength => bytewise::decode(Decoder::RunLength, &data, false, meter),
+            };
+            if meter.cancelled() {
+                return Err(Cancelled);
+            }
+            // A filter over no data counts too, so that a long chain of them is polled.
+            meter.work(1)?;
+            data = decoded.unwrap_or_default();
+        }
+        Ok(data)
     }
 }
 
