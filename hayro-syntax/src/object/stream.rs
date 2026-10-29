@@ -334,10 +334,13 @@ impl<'a> Stream<'a> {
     }
 
     /// The stream read as where a resolution of references starts
-    /// ([`Dict::as_root`]).
+    /// ([`Dict::as_root`]), its own body still being resolved: what it leads to is
+    /// read alike whichever chain of references reached it, as its body, which its
+    /// [`Self::identity`] names, decides alone, and a reference back to its body is
+    /// refused as a cycle, as from any chain that reaches it.
     pub fn as_root(&self) -> Self {
         Self {
-            dict: self.dict.as_root(),
+            dict: self.dict.rooted(ReaderContext::as_body_root),
             data: self.data,
         }
     }

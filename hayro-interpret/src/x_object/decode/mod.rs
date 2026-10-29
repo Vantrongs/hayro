@@ -478,7 +478,7 @@ mod tests {
             .unwrap();
         let sink: WarningSinkFn = Arc::new(|_| {});
         let obj = ImageXObject::new(&stream, |_| None, &sink, &Cache::new(), None).unwrap();
-        let obj = SampledImage::read(&obj, true);
+        let obj = SampledImage::read(&obj).unwrap();
         let params = decode_params(&obj, None, dict_bpc(&obj));
         (params.bpc, params.num_components)
     }

@@ -46,6 +46,22 @@ impl Cache {
         })
     }
 
+    /// [`Self::rooted`] of `stream`, but for a stream that is no object of a loaded
+    /// document ([`Stream::identity`], an inline image) built as it was reached and
+    /// kept nowhere: what it is is its bytes, in the content each time it is drawn,
+    /// which a key would hash each time, and which the cache would keep past the
+    /// content.
+    fn rooted_stream_in<'a, T: Clone + Send + Sync + 'static>(
+        &self,
+        stream: &Stream<'a>,
+        build: fn(Stream<'a>, &Building<'_>) -> Option<T>,
+    ) -> Option<T> {
+        match stream.identity() {
+            Some(_) => self.rooted(stream, build),
+            None => build(stream.clone(), &Building(self)),
+        }
+    }
+
     fn get_or_insert_with<T: Clone + Send + Sync + 'static>(
         &self,
         key: u128,
@@ -113,6 +129,39 @@ impl Building<'_> {
     }
 }
 
+/// Where a value built from a stream alone is kept ([`Cache::rooted`], for an inline
+/// image nowhere): the document's cache, or the cache as a value built for it sees
+/// it ([`Building`]), where the value, built from its own stream read as where a
+/// resolution starts, depends on nothing the value being built was reached by.
+pub(crate) trait KeepsStreams {
+    /// The value `build` makes of `stream`, kept for it.
+    fn rooted_stream<'a, T: Clone + Send + Sync + 'static>(
+        &self,
+        stream: &Stream<'a>,
+        build: fn(Stream<'a>, &Building<'_>) -> Option<T>,
+    ) -> Option<T>;
+}
+
+impl KeepsStreams for Cache {
+    fn rooted_stream<'a, T: Clone + Send + Sync + 'static>(
+        &self,
+        stream: &Stream<'a>,
+        build: fn(Stream<'a>, &Building<'_>) -> Option<T>,
+    ) -> Option<T> {
+        self.rooted_stream_in(stream, build)
+    }
+}
+
+impl KeepsStreams for Building<'_> {
+    fn rooted_stream<'a, T: Clone + Send + Sync + 'static>(
+        &self,
+        stream: &Stream<'a>,
+        build: fn(Stream<'a>, &Building<'_>) -> Option<T>,
+    ) -> Option<T> {
+        self.0.rooted_stream_in(stream, build)
+    }
+}
+
 /// An object a value is kept for by [`Cache::rooted`].
 pub(crate) trait Root: CacheKey {
     /// The object read as where a resolution starts ([`Dict::as_root`]).
@@ -122,6 +171,12 @@ pub(crate) trait Root: CacheKey {
 impl Root for Object<'_> {
     fn as_root(&self) -> Self {
         Object::as_root(self)
+    }
+}
+
+impl Root for Stream<'_> {
+    fn as_root(&self) -> Self {
+        Stream::as_root(self)
     }
 }
 

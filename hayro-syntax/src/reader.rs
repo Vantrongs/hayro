@@ -369,12 +369,28 @@ impl<'a> ReaderContext<'a> {
     /// This context as where a resolution starts, no reference being resolved in
     /// it ([`Dict::as_root`](crate::object::Dict::as_root)).
     pub(crate) fn as_root(&self) -> Self {
+        self.rooted_at(None)
+    }
+
+    /// [`Self::as_root`], but with the body what it reads lies in, the last of its
+    /// chain, still being resolved
+    /// ([`Stream::as_root`](crate::object::Stream::as_root)).
+    pub(crate) fn as_body_root(&self) -> Self {
+        match &self.0 {
+            ReaderContextInner::Shared(inner) => self.rooted_at(inner.parent_chain.last()),
+            ReaderContextInner::Dummy { .. } => self.clone(),
+        }
+    }
+
+    /// This context with `body` alone being resolved in it.
+    fn rooted_at(&self, body: Option<&Link>) -> Self {
         match &self.0 {
             ReaderContextInner::Shared(inner)
-                if !inner.parent_chain.is_empty() || inner.rejected.is_some() =>
+                if inner.parent_chain.len() > usize::from(body.is_some())
+                    || inner.rejected.is_some() =>
             {
                 Self(ReaderContextInner::Shared(Arc::new(ReaderContextData {
-                    parent_chain: smallvec![],
+                    parent_chain: body.copied().into_iter().collect(),
                     rejected: None,
                     ..(**inner).clone()
                 })))

@@ -1,6 +1,6 @@
 use super::decode::{DecodedImage, DecodedMask, decode_image, decode_mask};
 use crate::WarningSinkFn;
-use crate::cache::Cache;
+use crate::cache::{Building, Cache, KeepsStreams};
 use crate::color::{ColorComponents, ColorSpace};
 use crate::context::Context;
 use crate::device::Device;
@@ -17,11 +17,8 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub(crate) struct ImageXObject<'a> {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
     pub(crate) color_space: Option<ColorSpace>,
     pub(crate) cache: Cache,
-    pub(crate) interpolate: bool,
     pub(crate) kind: ImageKind,
     pub(crate) stream: Stream<'a>,
     pub(crate) transfer_function: Option<ActiveTransferFunction>,
@@ -60,14 +57,6 @@ impl<'a> ImageXObject<'a> {
             ImageKind::Image,
             transfer_function,
         )
-    }
-
-    pub(crate) fn new_mask(
-        stream: &Stream<'a>,
-        warning_sink: &WarningSinkFn,
-        cache: &Cache,
-    ) -> Option<Self> {
-        Self::new_inner(stream, |_| None, warning_sink, cache, ImageKind::Mask, None)
     }
 
     fn new_inner(
@@ -111,26 +100,11 @@ impl<'a> ImageXObject<'a> {
                 })
         };
 
-        let interpolate = dict
-            .get::<bool>(I)
-            .or_else(|| dict.get::<bool>(INTERPOLATE))
-            .unwrap_or(false);
-
-        let width = dict.get::<u32>(W).or_else(|| dict.get::<u32>(WIDTH))?;
-        let height = dict.get::<u32>(H).or_else(|| dict.get::<u32>(HEIGHT))?;
-
-        if width == 0 || height == 0 {
-            return None;
-        }
-
         Some(Self {
-            width,
             cache: cache.clone(),
-            height,
             color_space: image_cs,
             warning_sink: warning_sink.clone(),
             transfer_function,
-            interpolate,
             stream: stream.clone(),
             kind,
             cs_by_name,
@@ -157,8 +131,16 @@ impl<'a> ImageXObject<'a> {
             return;
         }
 
-        let width = self.width as f64;
-        let height = self.height as f64;
+        // Read here, through the document, which counts it, and not again.
+        let Some(sampled) = SampledImage::read(self) else {
+            if has_oc {
+                context.ocg_state.end_marked_content();
+            }
+            return;
+        };
+        let sampled = Arc::new(sampled);
+        let width = sampled.width as f64;
+        let height = sampled.height as f64;
 
         context.save_state();
         context.pre_concat_affine(Affine::new([
@@ -171,7 +153,7 @@ impl<'a> ImageXObject<'a> {
         ]));
         let transform = context.ctm();
 
-        let has_alpha = self.has_mask();
+        let has_alpha = sampled.masks.any;
 
         let mut soft_mask = std::mem::take(&mut context.compositing_mut().soft_mask);
         let blend_mode = std::mem::take(&mut context.compositing_mut().blend_mode);
@@ -188,8 +170,6 @@ impl<'a> ImageXObject<'a> {
             blend_mode,
         );
 
-        // Read here, through the document, which counts it, and not again.
-        let sampled = Arc::new(SampledImage::read(self, true));
         let image = if self.kind.is_mask() {
             Image::Stencil(StencilImage {
                 paint: context.get_paint(false),
@@ -220,12 +200,6 @@ impl<'a> ImageXObject<'a> {
             context.ocg_state.end_marked_content();
         }
     }
-
-    fn has_mask(&self) -> bool {
-        let dict = self.stream.dict();
-
-        dict.contains_key(SMASK_IN_DATA) || dict.contains_key(SMASK) || dict.contains_key(MASK)
-    }
 }
 
 impl CacheKey for ImageXObject<'_> {
@@ -234,81 +208,60 @@ impl CacheKey for ImageXObject<'_> {
     }
 }
 
-/// What decoding an image reads, read from its dictionary once, as it is drawn
-/// ([`Self::read`]), through the document, which counts what that keeps: its stream
-/// owned ([`OwnedStream`]), with how its data decode, the entries of its dictionary
-/// decoding reads, and its masks, read alike. Decoding reads no object of the
+/// `/Interpolate` of an image's dictionary.
+fn interpolate(dict: &Dict<'_>) -> bool {
+    dict.get::<bool>(I)
+        .or_else(|| dict.get::<bool>(INTERPOLATE))
+        .unwrap_or(false)
+}
+
+/// The width and height an image's dictionary gives; `None` where either is missing
+/// or 0.
+fn size(dict: &Dict<'_>) -> Option<(u32, u32)> {
+    let width = dict.get::<u32>(W).or_else(|| dict.get::<u32>(WIDTH))?;
+    let height = dict.get::<u32>(H).or_else(|| dict.get::<u32>(HEIGHT))?;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+/// What decoding an image reads of its stream alone, whatever it is drawn with
+/// ([`Self::of`]): its stream owned ([`OwnedStream`]), with how its data decode, and
+/// the entries of its dictionary decoding reads. Decoding reads no object of the
 /// document, so it keeps nothing in the document, and what holds the image holds
 /// nothing decoding read, however often it decodes it.
-pub(crate) struct SampledImage {
+pub(crate) struct ImageRead {
     pub(crate) width: u32,
     pub(crate) height: u32,
-    pub(crate) kind: ImageKind,
     pub(crate) interpolate: bool,
-    pub(crate) color_space: Option<ColorSpace>,
-    pub(crate) transfer_function: Option<ActiveTransferFunction>,
-    pub(crate) warning_sink: WarningSinkFn,
+    /// `/ImageMask`, which makes a mask stream a stencil mask.
+    image_mask: bool,
     pub(crate) stream: OwnedStream,
     /// `/BitsPerComponent`.
     pub(crate) bpc: Option<u8>,
     /// The pairs of `/Decode`, where it is an array.
     pub(crate) decode: Option<SmallVec<[(f32, f32); 4]>>,
-    pub(crate) masks: Masks,
 }
 
-/// A mask stream as decoding reads it: `None` where it is no mask
-/// ([`ImageXObject::new_mask`] refuses it).
-pub(crate) type MaskImage = Option<Box<SampledImage>>;
+impl ImageRead {
+    /// What decoding `stream` reads, read once for its object, through the document,
+    /// which counts and keeps it: every placement of the image, on any page, shares
+    /// it. An inline image, which is no object, is read for each placement: its
+    /// bytes are in the content each time. `None` where the dictionary gives no size.
+    fn of(stream: &Stream<'_>, cache: &impl KeepsStreams) -> Option<Arc<Self>> {
+        cache.rooted_stream(stream, Self::build)
+    }
 
-/// What an image's dictionary says of its masks; nothing for a mask's own.
-#[derive(Default)]
-pub(crate) struct Masks {
-    /// `/SMask`, where it is a stream.
-    pub(crate) smask: Option<MaskImage>,
-    /// The soft mask's `/Matte`.
-    pub(crate) matte: Option<ColorComponents>,
-    /// `/Mask`, where it is a stream.
-    pub(crate) mask: Option<MaskImage>,
-    /// `/Mask`, where it is an array: a colour key.
-    pub(crate) color_key: Option<SmallVec<[u16; 4]>>,
-    /// Whether `/SMaskInData` is 1.
-    pub(crate) in_data: bool,
-    /// Whether the dictionary has `/SMask`, `/Mask` or `/SMaskInData`, of any value.
-    pub(crate) any: bool,
-}
-
-impl SampledImage {
-    /// What decoding `image` reads, with its masks if `masks`.
-    pub(crate) fn read(image: &ImageXObject<'_>, masks: bool) -> Self {
-        let dict = image.stream.dict();
-        let mask = |stream: Stream<'_>| -> MaskImage {
-            let mask = ImageXObject::new_mask(&stream, &image.warning_sink, &image.cache)?;
-            Some(Box::new(Self::read(&mask, false)))
-        };
-        let masks = if masks {
-            let smask = dict.get::<Stream<'_>>(SMASK);
-            Masks {
-                matte: smask
-                    .as_ref()
-                    .and_then(|s| s.dict().get::<ColorComponents>(MATTE)),
-                smask: smask.map(mask),
-                mask: dict.get::<Stream<'_>>(MASK).map(mask),
-                color_key: dict.get::<SmallVec<[u16; 4]>>(MASK),
-                in_data: dict.get::<u8>(SMASK_IN_DATA) == Some(1),
-                any: image.has_mask(),
-            }
-        } else {
-            Masks::default()
-        };
-        Self {
-            width: image.width,
-            height: image.height,
-            kind: image.kind,
-            interpolate: image.interpolate,
-            color_space: image.color_space.clone(),
-            transfer_function: image.transfer_function.clone(),
-            warning_sink: image.warning_sink.clone(),
-            stream: image.stream.to_owned_stream(image.height),
+    fn build(stream: Stream<'_>, _: &Building<'_>) -> Option<Arc<Self>> {
+        let dict = stream.dict();
+        let (width, height) = size(dict)?;
+        Some(Arc::new(Self {
+            width,
+            height,
+            interpolate: interpolate(dict),
+            image_mask: dict
+                .get::<bool>(IM)
+                .or_else(|| dict.get::<bool>(IMAGE_MASK))
+                .unwrap_or(false),
+            stream: stream.to_owned_stream(height),
             bpc: dict
                 .get::<u8>(BPC)
                 .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT)),
@@ -319,8 +272,132 @@ impl SampledImage {
                     let mut pairs = a.flex_iter();
                     core::iter::from_fn(|| pairs.next::<(f32, f32)>()).collect()
                 }),
-            masks,
-        }
+        }))
+    }
+}
+
+/// What an image's dictionary says of its masks, read once for its object
+/// ([`Self::of`]), the mask streams as [`ImageRead::of`] reads them.
+#[derive(Default)]
+pub(crate) struct MasksRead {
+    /// `/SMask`, where it is a stream: `None` inside where it is no mask (it gives
+    /// no size).
+    soft: Option<Option<Arc<ImageRead>>>,
+    /// The soft mask's `/Matte`.
+    pub(crate) matte: Option<ColorComponents>,
+    /// `/Mask`, where it is a stream, as `soft`.
+    stencil: Option<Option<Arc<ImageRead>>>,
+    /// `/Mask`, where it is an array: a colour key.
+    pub(crate) color_key: Option<SmallVec<[u16; 4]>>,
+    /// Whether `/SMaskInData` is 1.
+    pub(crate) in_data: bool,
+    /// Whether the dictionary has `/SMask`, `/Mask` or `/SMaskInData`, of any value.
+    pub(crate) any: bool,
+}
+
+impl MasksRead {
+    /// What the dictionary of `stream`, an image's, says of its masks, read as
+    /// [`ImageRead::of`] reads an image.
+    fn of(stream: &Stream<'_>, cache: &Cache) -> Arc<Self> {
+        cache.rooted_stream(stream, Self::build).unwrap_or_default()
+    }
+
+    fn build(stream: Stream<'_>, cache: &Building<'_>) -> Option<Arc<Self>> {
+        let dict = stream.dict();
+        let mask = |stream: Stream<'_>| ImageRead::of(&stream, cache);
+        let smask = dict.get::<Stream<'_>>(SMASK);
+        Some(Arc::new(Self {
+            matte: smask
+                .as_ref()
+                .and_then(|s| s.dict().get::<ColorComponents>(MATTE)),
+            soft: smask.map(mask),
+            stencil: dict.get::<Stream<'_>>(MASK).map(mask),
+            color_key: dict.get::<SmallVec<[u16; 4]>>(MASK),
+            in_data: dict.get::<u8>(SMASK_IN_DATA) == Some(1),
+            any: dict.contains_key(SMASK_IN_DATA)
+                || dict.contains_key(SMASK)
+                || dict.contains_key(MASK),
+        }))
+    }
+}
+
+/// An image as it is drawn ([`Self::read`]): what decoding reads of its stream
+/// alone ([`ImageRead`]), which every placement shares, with what differs between
+/// placements: the colour space a name in the resources may give, the transfer
+/// function, and where warnings go.
+pub(crate) struct SampledImage {
+    read: Arc<ImageRead>,
+    pub(crate) kind: ImageKind,
+    pub(crate) color_space: Option<ColorSpace>,
+    pub(crate) transfer_function: Option<ActiveTransferFunction>,
+    pub(crate) warning_sink: WarningSinkFn,
+    pub(crate) masks: Masks,
+}
+
+impl core::ops::Deref for SampledImage {
+    type Target = ImageRead;
+
+    fn deref(&self) -> &ImageRead {
+        &self.read
+    }
+}
+
+/// A mask stream as decoding reads it: `None` where it is no mask (it gives no
+/// size).
+pub(crate) type MaskImage = Option<Box<SampledImage>>;
+
+/// An image's masks as it is drawn: the mask streams, drawn as masks of it, and what
+/// its dictionary says of them besides ([`MasksRead`]); nothing for a mask's own.
+#[derive(Default)]
+pub(crate) struct Masks {
+    /// `/SMask`, where it is a stream.
+    pub(crate) smask: Option<MaskImage>,
+    /// `/Mask`, where it is a stream.
+    pub(crate) mask: Option<MaskImage>,
+    read: Arc<MasksRead>,
+}
+
+impl core::ops::Deref for Masks {
+    type Target = MasksRead;
+
+    fn deref(&self) -> &MasksRead {
+        &self.read
+    }
+}
+
+impl SampledImage {
+    /// What decoding `image` reads, its masks included; `None` where its dictionary,
+    /// read alone, gives no size.
+    pub(crate) fn read(image: &ImageXObject<'_>) -> Option<Self> {
+        let read = ImageRead::of(&image.stream, &image.cache)?;
+        let masks = MasksRead::of(&image.stream, &image.cache);
+        let mask = |mask: &Option<Arc<ImageRead>>| {
+            let read = mask.clone()?;
+            Some(Box::new(Self {
+                kind: match read.image_mask {
+                    true => ImageKind::StencilMask,
+                    false => ImageKind::Mask,
+                },
+                read,
+                // Masks are always single-channel.
+                color_space: Some(ColorSpace::device_gray()),
+                transfer_function: None,
+                warning_sink: image.warning_sink.clone(),
+                masks: Masks::default(),
+            }))
+        };
+        Some(Self {
+            read,
+            kind: image.kind,
+            color_space: image.color_space.clone(),
+            transfer_function: image.transfer_function.clone(),
+            warning_sink: image.warning_sink.clone(),
+            masks: Masks {
+                smask: masks.soft.as_ref().map(mask),
+                mask: masks.stencil.as_ref().map(mask),
+                read: masks,
+            },
+        })
     }
 
     pub(crate) fn width(&self) -> u32 {

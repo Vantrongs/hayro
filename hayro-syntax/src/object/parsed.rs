@@ -1041,11 +1041,16 @@ impl<'a> Part<'a> {
 
     /// The same part read where a resolution starts ([`ReaderContext::as_root`]).
     pub(crate) fn as_root(&self) -> Self {
+        self.rooted(ReaderContext::as_root)
+    }
+
+    /// The same part read in the context `root` makes of its own.
+    pub(crate) fn rooted(&self, root: fn(&ReaderContext<'a>) -> ReaderContext<'a>) -> Self {
         Self {
             held: Arc::new(Held {
                 data: self.held.data,
                 nodes: self.held.nodes.clone(),
-                ctx: self.held.ctx.as_root(),
+                ctx: root(&self.held.ctx),
             }),
             at: self.at,
             offset: self.offset,

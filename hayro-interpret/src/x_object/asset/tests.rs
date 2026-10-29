@@ -82,7 +82,7 @@ pub(super) fn asset(pdf: &Pdf) -> ImageAsset {
         .unwrap();
     let sink: WarningSinkFn = Arc::new(|_| {});
     let obj = ImageXObject::new(&stream, |_| None, &sink, &Cache::new(), None).unwrap();
-    ImageAsset::new(Arc::new(SampledImage::read(&obj, true)), None)
+    ImageAsset::new(Arc::new(SampledImage::read(&obj).unwrap()), None)
 }
 
 /// `asset`, its image decoded with transfer function `function`.
@@ -896,7 +896,7 @@ fn a_stencil_asset_is_the_alpha_the_paint_is_drawn_through() {
         .unwrap();
     let sink: WarningSinkFn = Arc::new(|_| {});
     let obj = ImageXObject::new(&stream, |_| None, &sink, &Cache::new(), None).unwrap();
-    let obj = Arc::new(SampledImage::read(&obj, true));
+    let obj = Arc::new(SampledImage::read(&obj).unwrap());
     let expected = obj.decoded_mask(None).unwrap().luma.data;
     assert_eq!(&expected[..10], &[0, 255, 0, 255, 0, 255, 0, 255, 0, 0]);
     let asset = ImageAsset::new(obj, None);

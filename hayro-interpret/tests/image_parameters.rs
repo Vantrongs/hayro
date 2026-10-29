@@ -16,6 +16,8 @@ use hayro_interpret::{
 };
 use kurbo::{Affine, BezPath, Rect};
 
+#[path = "../../hayro-syntax/tests/common/allocations.rs"]
+mod allocations;
 mod common;
 
 /// The image assets drawn, and the grey of each image decoded as it is drawn: of its
@@ -269,4 +271,46 @@ fn ccitt_rows_are_not_resolved_beside_a_height() {
     assert_eq!(expected_drawn.len(), 8);
     assert_eq!((&drawn, &decoded), (&expected_drawn, &expected_decoded));
     assert_eq!(entries, 0);
+}
+
+/// The bytes allocated drawing a page that places one 1 × 1 grey image `placements`
+/// times, the image passing through `filters` /Crypt filters (which leave an
+/// unencrypted document's data as stored), and the grey of each placement.
+fn placed_image(placements: usize, filters: usize) -> (usize, Vec<u8>) {
+    let content: String = (0..placements)
+        .map(|_| "q 10 0 0 10 0 0 cm /Im Do Q ")
+        .collect();
+    let mut objects = common::one_page_objects(
+        10,
+        "/Contents 4 0 R /Resources << /XObject << /Im 5 0 R >> >>",
+    );
+    objects.push(common::stream("", content.as_bytes()));
+    objects.push(common::stream(
+        &format!(
+            "/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray \
+             /BitsPerComponent 8 /Filter [{}]",
+            "/Crypt ".repeat(filters)
+        ),
+        &[128],
+    ));
+    let pdf = Pdf::new(common::file(&objects, "")).expect("valid pdf");
+    let mut drawn = Drawn::default();
+    let ((), used) = allocations::measure(|| {
+        common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut drawn);
+    });
+    (used.allocated, drawn.decoded)
+}
+
+/// Every placement of an image shares what decoding it reads, read once: drawing
+/// twice the placements of an image with twice the filters allocates twice the
+/// bytes (each placement read the filters again, four times the bytes).
+#[test]
+fn an_image_placed_many_times_is_read_once() {
+    let (small, small_greys) = placed_image(100, 100);
+    let (large, large_greys) = placed_image(200, 200);
+    assert_eq!((small_greys, large_greys), (vec![128; 100], vec![128; 200]));
+    assert!(
+        large <= small * 22 / 10,
+        "{small} bytes allocated for 100 placements of 100 filters, {large} for 200"
+    );
 }

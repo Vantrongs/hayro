@@ -222,14 +222,19 @@ impl<'a> Dict<'a> {
     /// what it leads to back to what is being resolved is still refused as a cycle,
     /// as from any chain.
     pub fn as_root(&self) -> Self {
+        self.rooted(ReaderContext::as_root)
+    }
+
+    /// The dictionary read in the context `root` makes of its own.
+    pub(crate) fn rooted(&self, root: fn(&ReaderContext<'a>) -> ReaderContext<'a>) -> Self {
         Self(match &self.0 {
             Inner::Read(None) => Inner::Read(None),
             Inner::Read(Some(repr)) => Inner::Read(Some(Arc::new(Repr {
                 data: repr.data,
                 offsets: repr.offsets.clone(),
-                ctx: repr.ctx.as_root(),
+                ctx: root(&repr.ctx),
             }))),
-            Inner::Parsed(part) => Inner::Parsed(part.as_root()),
+            Inner::Parsed(part) => Inner::Parsed(part.rooted(root)),
         })
     }
 
