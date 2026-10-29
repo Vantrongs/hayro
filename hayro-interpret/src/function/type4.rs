@@ -27,6 +27,23 @@ impl Type4 {
         })
     }
 
+    /// The most steps `eval` takes: the program has no loops, so it runs each of
+    /// its operators at most once, and moves at most the whole stack for one.
+    pub(crate) fn cost(&self) -> u64 {
+        fn ops(procedure: &[PostScriptOp]) -> u64 {
+            procedure
+                .iter()
+                .map(|op| match op {
+                    PostScriptOp::If(p) => 1 + ops(p),
+                    PostScriptOp::IfElse(p1, p2) => 1 + ops(p1).max(ops(p2)),
+                    PostScriptOp::Copy | PostScriptOp::Roll => 1 + STACK as u64,
+                    _ => 1,
+                })
+                .sum()
+        }
+        ops(&self.program) + 2 * STACK as u64 + self.clamper.cost()
+    }
+
     /// Evaluate the function with the given input.
     pub(crate) fn eval(&self, mut input: Values) -> Option<Values> {
         self.clamper.clamp_input(&mut input);
@@ -159,7 +176,10 @@ impl<T: Default, const C: usize> ArgumentsStack<T, C> {
     }
 }
 
-type InterpreterStack = ArgumentsStack<Argument, 64>;
+/// The values the interpreter's stack holds.
+const STACK: usize = 64;
+
+type InterpreterStack = ArgumentsStack<Argument, STACK>;
 type ParseStack = ArgumentsStack<Vec<PostScriptOp>, 2>;
 
 fn eval_inner(procedure: &[PostScriptOp], arg_stack: &mut InterpreterStack) -> Option<()> {
@@ -209,6 +229,8 @@ fn eval_inner(procedure: &[PostScriptOp], arg_stack: &mut InterpreterStack) -> O
     }
 
     for op in procedure {
+        #[cfg(test)]
+        tests::RUN.set(tests::RUN.get() + 1);
         match op {
             PostScriptOp::Number(n) => arg_stack.push(Argument::Float(n.as_f64() as f32))?,
             PostScriptOp::Abs => {
@@ -366,6 +388,8 @@ fn eval_inner(procedure: &[PostScriptOp], arg_stack: &mut InterpreterStack) -> O
             PostScriptOp::Copy => {
                 let n = arg_stack.pop()?.as_f32() as u32 as usize;
                 let start = arg_stack.len().checked_sub(n)?;
+                #[cfg(test)]
+                tests::RUN.set(tests::RUN.get() + n as u64);
                 for i in start..arg_stack.len() {
                     arg_stack.push(*arg_stack.at(i)?);
                 }
@@ -395,6 +419,8 @@ fn eval_inner(procedure: &[PostScriptOp], arg_stack: &mut InterpreterStack) -> O
                 let trimmed_n = arg_stack.len().checked_sub(n)?;
 
                 let target = &mut arg_stack.items_mut()[trimmed_n..];
+                #[cfg(test)]
+                tests::RUN.set(tests::RUN.get() + target.len() as u64);
 
                 if target.is_empty() {
                     continue;
@@ -562,10 +588,57 @@ mod tests {
     use crate::function::type4::{PostScriptOp, Type4, parse_procedure};
     use crate::function::{Clamper, Function, FunctionType, TupleVec, Values};
     use std::f32::consts::LN_10;
-    use std::sync::Arc;
 
     use hayro_syntax::object::Number;
     use smallvec::smallvec;
+
+    thread_local! {
+        /// The operators run, and the values `copy` and `roll` move.
+        pub(super) static RUN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A program's cost bounds what running it does, whichever branches it takes
+    /// and however much of the stack it moves, and grows with its operators.
+    #[test]
+    fn a_program_costs_no_less_than_it_runs() {
+        let programs = [
+            "{ add 2 div }",
+            "{ dup 0.5 gt { 1 sub { 2 mul } if } { 3 copy pop pop } ifelse }",
+            "{ 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 16 copy 32 5 roll 32 7 roll }",
+            "{ 0.3 lt { 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 } { 0 } ifelse }",
+        ];
+        for program in programs {
+            let function = Function::of(FunctionType::Type4(Type4 {
+                program: parse_procedure(program.as_bytes()).unwrap(),
+                clamper: Clamper {
+                    domain: smallvec![(0.0, 1.0), (0.0, 1.0)],
+                    range: None,
+                },
+            }));
+            for input in [0.0, 0.2, 0.7, 1.0] {
+                RUN.set(0);
+                function.eval(smallvec![input, 1.0 - input]);
+                assert!(
+                    RUN.get() <= function.cost(),
+                    "{program} at {input}: ran {}, costs {}",
+                    RUN.get(),
+                    function.cost()
+                );
+            }
+        }
+        let cost = |n: usize| {
+            let program = format!("{{ {}}}", "0 add ".repeat(n));
+            Function::of(FunctionType::Type4(Type4 {
+                program: parse_procedure(program.as_bytes()).unwrap(),
+                clamper: Clamper {
+                    domain: smallvec![(0.0, 1.0)],
+                    range: None,
+                },
+            }))
+            .cost()
+        };
+        assert_eq!(cost(100_000) - cost(1000), 2 * 99_000);
+    }
 
     #[test]
     fn lex_1() {
@@ -894,13 +967,13 @@ mod tests {
     fn domain() {
         let procedure = parse_procedure(b"{  }").unwrap();
 
-        let type4 = Function(Arc::new(FunctionType::Type4(Type4 {
+        let type4 = Function::of(FunctionType::Type4(Type4 {
             program: procedure,
             clamper: Clamper {
                 domain: smallvec![(-5.0, 5.0), (-5.0, 5.0), (-5.0, 5.0)],
                 range: None,
             },
-        })));
+        }));
 
         let input = smallvec![-10.0, -2.0, 6.0];
         let res = type4.eval(input).unwrap();

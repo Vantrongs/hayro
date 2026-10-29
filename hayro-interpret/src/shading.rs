@@ -31,6 +31,30 @@ pub enum ShadingFunction {
 }
 
 impl ShadingFunction {
+    /// The most steps one [`eval`](Self::eval) takes ([`Function::cost`]).
+    pub fn cost(&self) -> u64 {
+        match self {
+            Self::Single(function) => function.cost(),
+            Self::Multiple(functions) => functions
+                .iter()
+                .map(|function| function.cost().saturating_add(1))
+                .fold(0, u64::saturating_add),
+        }
+    }
+
+    /// The most steps [`stitching_bounds`](Self::stitching_bounds) takes.
+    pub(crate) fn bounds_cost(&self) -> u64 {
+        let bounds = match self {
+            Self::Single(function) => function.bounds_cost(),
+            Self::Multiple(functions) => functions
+                .iter()
+                .map(Function::bounds_cost)
+                .fold(0, u64::saturating_add),
+        };
+        // Sorting them.
+        bounds.saturating_mul(u64::from(64 - bounds.leading_zeros()).max(1))
+    }
+
     /// Evaluate the shading function.
     pub fn eval(&self, input: &Values) -> Option<Values> {
         match self {

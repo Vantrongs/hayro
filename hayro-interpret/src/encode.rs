@@ -11,6 +11,57 @@ use smallvec::{SmallVec, ToSmallVec, smallvec};
 use std::ops::Range;
 use std::sync::Arc;
 
+/// What a caller lets sampling a shading take, asked before the work is done: the
+/// steps of work (an operator of a function run, a value read, computed or written,
+/// a pixel visited) and the bytes held while it runs. A sampling it refuses stops
+/// unfinished, with [`Exhausted`], having done no more than it was given.
+pub trait Meter {
+    /// Takes `steps`: `false`, and the work stops, when fewer are left.
+    fn work(&mut self, steps: u64) -> bool;
+
+    /// Takes `bytes` held until the call that takes them returns: `false`, and the
+    /// work stops, when they do not fit.
+    fn hold(&mut self, bytes: usize) -> bool;
+}
+
+/// A meter that gives any work and memory asked.
+pub struct Unmetered;
+
+impl Meter for Unmetered {
+    fn work(&mut self, _: u64) -> bool {
+        true
+    }
+
+    fn hold(&mut self, _: usize) -> bool {
+        true
+    }
+}
+
+/// Work its [`Meter`] refused to give more to, stopped unfinished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Exhausted;
+
+/// Takes `steps` of `meter`, or stops with [`Exhausted`].
+pub(crate) fn take(meter: &mut dyn Meter, steps: u64) -> Result<(), Exhausted> {
+    meter.work(steps).then_some(()).ok_or(Exhausted)
+}
+
+/// The steps sampling a point takes besides its function and its color: finding the
+/// value it is evaluated at, adding it to the reach a mesh is sampled over, and
+/// putting the result out.
+const POINT_COST: u64 = 8;
+
+/// The steps placing a triangle of a mesh takes, its box found and cut by the
+/// region sampled, or a patch's cut out of it (`PATCH_TRIANGLES` of them a patch).
+const TRIANGLE_COST: u64 = 64;
+
+/// The steps visiting a pixel of a triangle's box takes, besides one for each
+/// color component it interpolates there.
+const VISIT_COST: u64 = 4;
+
+/// Why an [`Unmetered`] sampling cannot stop.
+const UNMETERED: &str = "an unmetered sampling is never refused";
+
 /// A shading pattern that was encoded so it can be sampled.
 #[derive(Clone, Debug)]
 pub struct EncodedShadingPattern {
@@ -64,28 +115,67 @@ pub struct EncodedSampledShading {
 }
 
 impl EncodedSampledShading {
-    /// The colors of the pixels in `region` the mesh covers.
-    fn sample(&self, region: &Region) -> Samples {
-        let mut patched = vec![];
-        let triangles = match self.mesh.as_ref() {
-            ShadingType::TriangleMesh { triangles, .. } => triangles,
+    /// The triangles the mesh is cut into.
+    fn triangles(&self) -> u64 {
+        match self.mesh.as_ref() {
+            ShadingType::TriangleMesh { triangles, .. } => triangles.len() as u64,
             ShadingType::CoonsPatchMesh { patches, .. } => {
-                patched.reserve_exact(patches.len() * PATCH_TRIANGLES);
-                for patch in patches {
-                    patch.to_triangles(&mut patched);
-                }
-                &patched
+                (patches.len() as u64).saturating_mul(PATCH_TRIANGLES as u64)
             }
             ShadingType::TensorProductPatchMesh { patches, .. } => {
-                patched.reserve_exact(patches.len() * PATCH_TRIANGLES);
-                for patch in patches {
-                    patch.to_triangles(&mut patched);
-                }
-                &patched
+                (patches.len() as u64).saturating_mul(PATCH_TRIANGLES as u64)
             }
-            _ => &patched,
+            _ => 0,
+        }
+    }
+
+    /// Calls `f` with each triangle of the mesh in order, a patch's cut only when
+    /// it is reached, so no more than one patch's are held at once.
+    fn each_triangle(&self, mut f: impl FnMut(&Triangle)) {
+        let mut patched = vec![];
+        let mut cut = |to_triangles: &dyn Fn(&mut Vec<Triangle>)| {
+            patched.clear();
+            to_triangles(&mut patched);
+            patched.iter().for_each(&mut f);
         };
-        sample_triangles(triangles, self.transform, region)
+        match self.mesh.as_ref() {
+            ShadingType::TriangleMesh { triangles, .. } => triangles.iter().for_each(f),
+            ShadingType::CoonsPatchMesh { patches, .. } => {
+                for patch in patches {
+                    cut(&|buffer| patch.to_triangles(buffer));
+                }
+            }
+            ShadingType::TensorProductPatchMesh { patches, .. } => {
+                for patch in patches {
+                    cut(&|buffer| patch.to_triangles(buffer));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The colors of the pixels in `region` the mesh covers, the work and memory
+    /// taken of `meter` before each pass over the triangles.
+    fn sample(&self, region: &Region, meter: &mut dyn Meter) -> Result<Samples, Exhausted> {
+        let placing = self.triangles().saturating_mul(TRIANGLE_COST);
+        take(meter, placing)?;
+        let plan = plan(|f| self.each_triangle(f), self.transform, region);
+        if !meter.hold(plan.bytes()) {
+            return Err(Exhausted);
+        }
+        take(
+            meter,
+            placing.saturating_add(
+                plan.visits
+                    .saturating_mul(VISIT_COST + plan.components as u64),
+            ),
+        )?;
+        Ok(sample_planned(
+            &plan,
+            |f| self.each_triangle(f),
+            self.transform,
+            region,
+        ))
     }
 }
 
@@ -183,14 +273,53 @@ impl EncodedShadingPattern {
     /// A mesh shading places all its triangles for each call;
     /// [`sample_texture`](Self::sample_texture) places them once for all its points.
     pub fn sample(&self, pos: Point) -> [f32; 4] {
-        let samples = self.samples_at(|pixels| pixels.add(pos));
+        let samples = self
+            .samples_at(&mut Unmetered, |pixels| pixels.add(pos))
+            .expect(UNMETERED);
         self.sample_in(pos, samples.as_ref())
     }
 
-    /// For a mesh shading, its samples at every pixel `walk` adds a point in.
-    fn samples_at(&self, walk: impl FnOnce(&mut Reach)) -> Option<Samples> {
+    /// The most steps sampling a point takes once the tables its color is looked up
+    /// in are built ([`setup_cost`](Self::setup_cost)): its function's
+    /// ([`Function::cost`](crate::Function::cost)), its color's
+    /// ([`ColorSpace::cost`](crate::color::ColorSpace::cost)) and the transfer
+    /// function's. A mesh's triangles are placed besides, once for all points.
+    pub fn point_cost(&self) -> u64 {
+        let function = match &self.shading_type {
+            EncodedShadingType::FunctionBased(shading) => shading.function.cost(),
+            EncodedShadingType::RadialAxial(shading) => shading.function.cost(),
+            EncodedShadingType::Sampled(mesh) => mesh.function.as_ref().map_or(0, |f| f.cost()),
+            EncodedShadingType::Dummy(_) => 0,
+        };
+        let transfer = if self.transfer_function.is_some() {
+            3
+        } else {
+            0
+        };
+        (POINT_COST + transfer)
+            .saturating_add(function)
+            .saturating_add(self.color_space.cost())
+    }
+
+    /// The steps building the tables sampling looks colors up in takes, until they
+    /// are built: the color space's and the transfer function's.
+    pub fn setup_cost(&self) -> u64 {
+        let transfer = self
+            .transfer_function
+            .as_ref()
+            .map_or(0, ActiveTransferFunction::setup_cost);
+        self.color_space.setup_cost().saturating_add(transfer)
+    }
+
+    /// For a mesh shading, its samples at every pixel `walk` adds a point in, the
+    /// work and memory taken of `meter` first.
+    fn samples_at(
+        &self,
+        meter: &mut dyn Meter,
+        walk: impl FnOnce(&mut Reach),
+    ) -> Result<Option<Samples>, Exhausted> {
         let EncodedShadingType::Sampled(mesh) = &self.shading_type else {
-            return None;
+            return Ok(None);
         };
         let mut reach = Reach(None);
         walk(&mut reach);
@@ -198,7 +327,7 @@ impl EncodedShadingPattern {
         let region = reach.0.map_or((0..0, 0..0), |(x0, x1, y0, y1)| {
             (x0..x1.saturating_add(1), y0..y1.saturating_add(1))
         });
-        Some(mesh.sample(&region))
+        mesh.sample(&region, meter).map(Some)
     }
 
     /// The shading at `pos`, a mesh's looked up in `samples`.
@@ -232,10 +361,34 @@ impl EncodedShadingPattern {
         &self,
         bbox: Rect,
         scale: f32,
-        mut f: impl FnMut([f32; 4]),
+        f: impl FnMut([f32; 4]),
     ) -> (u32, u32, Affine) {
+        self.sample_texture_metered(bbox, scale, &mut Unmetered, f)
+            .expect(UNMETERED)
+    }
+
+    /// [`sample_texture`](Self::sample_texture), taking its work and memory of
+    /// `meter` before it does it: the tables colors are looked up in
+    /// ([`setup_cost`](Self::setup_cost)), each point
+    /// ([`point_cost`](Self::point_cost)), and for a mesh, each triangle placed and
+    /// each pixel of its box visited, twice, and the samples held. `Exhausted`, with
+    /// no point passed to `f`, when `meter` refuses.
+    pub fn sample_texture_metered(
+        &self,
+        bbox: Rect,
+        scale: f32,
+        meter: &mut dyn Meter,
+        mut f: impl FnMut([f32; 4]),
+    ) -> Result<(u32, u32, Affine), Exhausted> {
+        let (width, height) = texture_dimensions(bbox, scale);
+        let points = u64::from(width) * u64::from(height);
+        take(
+            meter,
+            self.setup_cost()
+                .saturating_add(points.saturating_mul(self.point_cost())),
+        )?;
         // A mesh is sampled only at the pixels the texture reads.
-        let samples = self.samples_at(|reach| {
+        let samples = self.samples_at(meter, |reach| {
             let (start, x_advance, y_advance, width, height) = self.texture_grid(bbox, scale);
             if x_advance.y == 0.0 && y_advance.x == 0.0 {
                 // A row's points differ only across, a column's only up.
@@ -252,18 +405,17 @@ impl EncodedShadingPattern {
             } else {
                 self.texture_points(bbox, scale, |point| reach.add(point));
             }
-        });
+        })?;
         self.texture_points(bbox, scale, |point| {
             f(self.sample_in(point, samples.as_ref()));
         });
 
-        let (width, height) = texture_dimensions(bbox, scale);
         let inv_scale = 1.0 / scale as f64;
-        (
+        Ok((
             width,
             height,
             Affine::translate((bbox.x0, bbox.y0)) * Affine::scale(inv_scale),
-        )
+        ))
     }
 
     /// The first point [`sample_texture`](Self::sample_texture) samples, the steps to
@@ -330,6 +482,23 @@ impl EncodedShadingPattern {
 }
 
 impl ShadingPattern {
+    /// [`encode`](Self::encode), taking first of `meter` the steps building the
+    /// tables its background color is looked up in, until they are built, and
+    /// converting it.
+    pub fn encode_metered(
+        &self,
+        meter: &mut dyn Meter,
+    ) -> Result<EncodedShadingPattern, Exhausted> {
+        let color_space = &self.shading.color_space;
+        if self.shading.background.is_some() {
+            take(
+                meter,
+                color_space.setup_cost().saturating_add(color_space.cost()),
+            )?;
+        }
+        Ok(self.encode())
+    }
+
     /// Encode the shading pattern.
     pub fn encode(&self) -> EncodedShadingPattern {
         let base_transform;
@@ -439,20 +608,67 @@ fn encode_axial_shading(
     )
 }
 
-fn sample_triangles(triangles: &[Triangle], transform: Affine, region: &Region) -> Samples {
-    // A grid of the box that holds the pixels sampling may put takes at most twice
-    // the cells of the samples it may put, and no more than the region.
-    let mut most = 0;
-    let boxes: Vec<_> = triangles
-        .iter()
-        .map(|t| {
-            let (xs, ys, covered) = pixels(t, transform, region)?;
-            most += covered;
-            Some((xs, ys))
-        })
-        .collect();
+/// What sampling a mesh's triangles in a region takes, found in a pass over them
+/// before any is sampled.
+struct Plan {
+    /// The box of the pixels sampled, `x0`, `x1`, `y0`, `y1`, where a grid of it
+    /// takes at most twice the cells of the samples it may put; `None` for a map.
+    grid: Option<(u16, u16, u16, u16)>,
+    /// The most pixels the triangles cover, counting each time one is covered.
+    most: usize,
+    /// The pixels of the region the triangles' boxes hold, each as often as a box
+    /// holds it: those sampling visits.
+    visits: u64,
+    /// The most color components a triangle interpolates.
+    components: usize,
+    /// The pixels of the region.
+    region: usize,
+}
+
+impl Plan {
+    /// The most bytes the samples take while they are put.
+    fn bytes(&self) -> usize {
+        // Components past those a sample holds inline are on the heap.
+        let spill = if self.components > 4 {
+            self.components * size_of::<f32>()
+        } else {
+            0
+        };
+        let samples = self.most.min(self.region);
+        match self.grid {
+            Some((x0, x1, y0, y1)) => {
+                let cells = usize::from(x1 - x0) * usize::from(y1 - y0);
+                cells * size_of::<Option<ColorComponents>>() + samples * spill
+            }
+            None => {
+                // A table of buckets a power of two, at most seven eighths full,
+                // while it grows next to the one before.
+                let buckets = (samples * 8 / 7 + 1).next_power_of_two();
+                let bucket = size_of::<((u16, u16), ColorComponents)>() + 1;
+                buckets * bucket * 3 / 2 + samples * spill
+            }
+        }
+    }
+}
+
+/// Plans sampling the triangles `triangles` passes on, placed by `transform`, in
+/// `region`.
+fn plan(
+    triangles: impl FnOnce(&mut dyn FnMut(&Triangle)),
+    transform: Affine,
+    region: &Region,
+) -> Plan {
+    let mut most = 0_usize;
+    let mut visits = 0_u64;
+    let mut components = 0;
     let mut bounds: Option<(u16, u16, u16, u16)> = None;
-    for (xs, ys) in boxes.iter().flatten() {
+    triangles(&mut |t| {
+        let Some((xs, ys, covered)) = pixels(t, transform, region) else {
+            return;
+        };
+        most = most.saturating_add(covered);
+        visits = visits.saturating_add((xs.len() * ys.len()) as u64);
+        components = components.max(t.p0.colors.len());
         let (x0, x1, y0, y1) = bounds.unwrap_or((xs.start, xs.end, ys.start, ys.end));
         bounds = Some((
             x0.min(xs.start),
@@ -460,15 +676,33 @@ fn sample_triangles(triangles: &[Triangle], transform: Affine, region: &Region) 
             y0.min(ys.start),
             y1.max(ys.end),
         ));
+    });
+    // A grid of the box that holds the pixels sampling may put takes at most twice
+    // the cells of the samples it may put, and no more than the region.
+    let grid = bounds.filter(|(x0, x1, y0, y1)| {
+        usize::from(x1 - x0) * usize::from(y1 - y0) <= most.saturating_mul(2)
+    });
+    Plan {
+        grid,
+        most,
+        visits,
+        components,
+        region: region.0.len() * region.1.len(),
     }
-    let grid =
-        bounds.filter(|(x0, x1, y0, y1)| usize::from(x1 - x0) * usize::from(y1 - y0) <= 2 * most);
+}
 
-    match grid {
+/// The samples of the triangles `triangles` passes on, as `plan` planned them.
+fn sample_planned(
+    plan: &Plan,
+    triangles: impl FnOnce(&mut dyn FnMut(&Triangle)),
+    transform: Affine,
+    region: &Region,
+) -> Samples {
+    match plan.grid {
         Some((x0, x1, y0, y1)) => {
             let width = usize::from(x1 - x0);
             let mut cells = vec![None; width * usize::from(y1 - y0)];
-            sample(triangles, &boxes, transform, |x, y, color| {
+            sample(triangles, transform, region, |x, y, color| {
                 cells[usize::from(y - y0) * width + usize::from(x - x0)] = Some(color);
             });
             Samples::Grid {
@@ -480,12 +714,18 @@ fn sample_triangles(triangles: &[Triangle], transform: Affine, region: &Region) 
         }
         None => {
             let mut map = hash::Map::default();
-            sample(triangles, &boxes, transform, |x, y, color| {
+            sample(triangles, transform, region, |x, y, color| {
                 map.insert((x, y), color);
             });
             Samples::Map(map)
         }
     }
+}
+
+#[cfg(test)]
+fn sample_triangles(triangles: &[Triangle], transform: Affine, region: &Region) -> Samples {
+    let each = |f: &mut dyn FnMut(&Triangle)| triangles.iter().for_each(f);
+    sample_planned(&plan(each, transform, region), each, transform, region)
 }
 
 /// The most pixels of a triangle's box counted as covered without a bound on those
@@ -590,17 +830,18 @@ fn span(lo: f64, hi: f64) -> Range<u16> {
     (lo as u16)..end
 }
 
-/// Puts the color of each pixel of each triangle's box, `boxes` in the order of the
-/// triangles, that the triangle, placed by `transform`, covers, in that order.
+/// Puts the color of each pixel of each triangle's box in `region` that the
+/// triangle, placed by `transform`, covers, the triangles in the order `triangles`
+/// passes them on.
 fn sample(
-    triangles: &[Triangle],
-    boxes: &[Option<(Range<u16>, Range<u16>)>],
+    triangles: impl FnOnce(&mut dyn FnMut(&Triangle)),
     transform: Affine,
+    region: &Region,
     mut put: impl FnMut(u16, u16, ColorComponents),
 ) {
-    for (t, pixels) in triangles.iter().zip(boxes) {
-        let Some((xs, ys)) = pixels else {
-            continue;
+    triangles(&mut |t| {
+        let Some((xs, ys, _)) = pixels(t, transform, region) else {
+            return;
         };
         let t = {
             let mut v0 = t.p0.clone();
@@ -611,7 +852,7 @@ fn sample(
             v2.point = transform * t.p2.point;
             Triangle::new(v0, v1, v2)
         };
-        for y in ys.clone() {
+        for y in ys {
             for x in xs.clone() {
                 let point = Point::new(x as f64, y as f64);
                 if t.contains_point(point) {
@@ -619,7 +860,7 @@ fn sample(
                 }
             }
         }
-    }
+    });
 }
 
 fn encode_function_shading(domain: &[f32; 4], function: &ShadingFunction) -> EncodedShadingType {
@@ -808,11 +1049,15 @@ fn radial_pos(
 #[cfg(test)]
 mod tests {
     use super::span;
-    use super::{Region, Samples, cut_by, sample_triangles};
-    use crate::shading::{Triangle, TriangleVertex};
+    use super::{
+        EncodedSampledShading, Exhausted, Meter, PATCH_TRIANGLES, Region, Samples, TRIANGLE_COST,
+        cut_by, sample_triangles,
+    };
+    use crate::shading::{CoonsPatch, ShadingType, Triangle, TriangleVertex};
     use hayro_syntax::hash;
     use kurbo::{Affine, Point, Rect};
     use smallvec::smallvec;
+    use std::sync::Arc;
 
     struct Random(u64);
 
@@ -973,6 +1218,99 @@ mod tests {
         // Nothing, and a mesh off the device.
         assert!(matches!(check(&[], Affine::IDENTITY), Samples::Map(_)));
         check(&tiles, Affine::translate((-500.0, -500.0)));
+    }
+
+    /// Gives `left` steps, and records what it is asked.
+    struct Recording {
+        left: u64,
+        asked: Vec<u64>,
+        held: Vec<usize>,
+    }
+
+    impl Meter for Recording {
+        fn work(&mut self, steps: u64) -> bool {
+            self.asked.push(steps);
+            let Some(left) = self.left.checked_sub(steps) else {
+                return false;
+            };
+            self.left = left;
+            true
+        }
+
+        fn hold(&mut self, bytes: usize) -> bool {
+            self.held.push(bytes);
+            true
+        }
+    }
+
+    /// A patch mesh is sampled as the triangles it is cut into are, one patch
+    /// cut at a time, its triangles paid for before each pass over them and the
+    /// pixels of their boxes before they are visited, with what its samples hold
+    /// asked first; a meter that refuses stops it before it places any.
+    #[test]
+    fn a_mesh_takes_its_work_before_it_samples() {
+        let mut random = Random(0x9e37_79b9_7f4a_7c15);
+        let patches: Vec<_> = (0..30)
+            .map(|_| {
+                let (x, y) = (random.below(300.0), random.below(300.0));
+                let corner = |dx: f64, dy: f64| Point::new(x + dx, y + dy);
+                let mut control_points = [Point::ZERO; 12];
+                for (i, point) in control_points.iter_mut().enumerate() {
+                    let t = i as f64 / 12.0 * std::f64::consts::TAU;
+                    *point = corner(60.0 * t.cos(), 40.0 * t.sin());
+                }
+                let colors = std::array::from_fn(|i| smallvec![i as f32 / 4.0, 0.5, 1.0]);
+                CoonsPatch {
+                    control_points,
+                    colors,
+                }
+            })
+            .collect();
+        let mut triangles = vec![];
+        for patch in &patches {
+            patch.to_triangles(&mut triangles);
+        }
+        let mesh = EncodedSampledShading {
+            mesh: Arc::new(ShadingType::CoonsPatchMesh {
+                patches,
+                function: None,
+            }),
+            transform: Affine::IDENTITY,
+            function: None,
+        };
+        let region: Region = (20..380, 10..360);
+        let expected = sample_triangles(&triangles, Affine::IDENTITY, &region);
+        let placing = 30 * PATCH_TRIANGLES as u64 * TRIANGLE_COST;
+        let mut meter = Recording {
+            left: u64::MAX,
+            asked: vec![],
+            held: vec![],
+        };
+        let samples = mesh.sample(&region, &mut meter).unwrap();
+        for y in region.1.clone() {
+            for x in region.0.clone() {
+                assert_eq!(samples.get((x, y)), expected.get((x, y)), "({x}, {y})");
+            }
+        }
+        assert_eq!(meter.asked.len(), 2);
+        assert_eq!(meter.asked[0], placing);
+        // Placing them again, and a step a pixel visited besides its components.
+        assert!(meter.asked[1] > placing + 4 * 10_000, "{:?}", meter.asked);
+        if let Samples::Grid { cells, .. } = &samples {
+            assert!(
+                meter.held[0] >= size_of_val(cells.as_slice()),
+                "{:?}",
+                meter.held
+            );
+        }
+        for left in [0, placing - 1, placing, meter.asked[1] + placing - 1] {
+            let mut meter = Recording {
+                left,
+                asked: vec![],
+                held: vec![],
+            };
+            assert_eq!(mesh.sample(&region, &mut meter).err(), Some(Exhausted));
+        }
     }
 
     #[test]

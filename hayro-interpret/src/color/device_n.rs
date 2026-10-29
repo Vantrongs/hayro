@@ -55,6 +55,24 @@ impl DeviceN {
             .collect()
     }
 
+    /// The steps converting a color of several components takes: its tint
+    /// transform's, and the alternate space's.
+    pub(super) fn cost(&self) -> u64 {
+        (u64::from(self.num_components) + self.tint_transform.cost())
+            .saturating_add(self.alternate_space.cost())
+    }
+
+    /// The steps building the table a tint of one component is looked up in takes,
+    /// until it is built.
+    pub(super) fn setup_cost(&self) -> u64 {
+        let table = if self.num_components == 1 {
+            self.lookup.setup_cost(self.cost())
+        } else {
+            0
+        };
+        table.saturating_add(self.alternate_space.setup_cost())
+    }
+
     fn convert_inner(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
         let evaluated = self.evaluate(input);
         self.alternate_space.convert(&evaluated, output)

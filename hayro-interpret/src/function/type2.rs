@@ -30,6 +30,11 @@ impl Type2 {
         })
     }
 
+    /// The most steps `eval` takes: the power, and a step an output.
+    pub(crate) fn cost(&self) -> u64 {
+        2 + 2 * self.c0.len() as u64 + self.clamper.cost()
+    }
+
     /// Evaluate the function with the given input.
     pub(crate) fn eval(&self, input: f32) -> Values {
         let mut input = [input];

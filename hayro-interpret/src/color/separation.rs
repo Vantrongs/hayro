@@ -46,6 +46,13 @@ impl Separation {
         self.alternate_space.convert(&evaluated, output)
     }
 
+    /// The steps building the table a tint is looked up in takes, until it is built.
+    pub(super) fn setup_cost(&self) -> u64 {
+        self.lookup
+            .setup_cost(self.tint_transform.cost() + self.alternate_space.cost())
+            .saturating_add(self.alternate_space.setup_cost())
+    }
+
     fn u8_lookup(&self) -> Option<&[[u8; 3]; 256]> {
         self.lookup
             .get_or_init(|input, output| self.convert_inner(input, output))

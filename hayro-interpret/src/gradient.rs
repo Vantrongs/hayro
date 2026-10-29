@@ -5,7 +5,10 @@
 //! SVG-like sRGB gradients.
 
 use crate::color::AlphaColor;
-use crate::encode::{EncodedRadialAxialShading, EncodedShadingPattern, RadialAxialParams};
+use crate::encode::{
+    EncodedRadialAxialShading, EncodedShadingPattern, Exhausted, Meter, RadialAxialParams,
+    Unmetered, take,
+};
 use crate::function::StitchingBounds;
 use kurbo::{Affine, Circle, Point, Rect, Shape};
 use smallvec::smallvec;
@@ -61,31 +64,60 @@ impl EncodedRadialAxialShading {
         path_bbox: Rect,
         tolerance: f32,
     ) -> Option<SvgGradient> {
+        self.as_svg_gradient_metered(pattern, path_bbox, tolerance, &mut Unmetered)
+            .expect("an unmetered conversion is never refused")
+    }
+
+    /// [`as_svg_gradient`](Self::as_svg_gradient), taking its work of `meter` before
+    /// it does it: the tables colors are looked up in, the function's stitching
+    /// bounds gathered, and each value sampled
+    /// ([`point_cost`](EncodedShadingPattern::point_cost)), up to
+    /// `3 * 2^MAX_GRADIENT_SUBDIVISION_DEPTH` between two bounds. `Exhausted` when
+    /// `meter` refuses; `Ok(None)` for a shading no such gradient draws.
+    pub fn as_svg_gradient_metered(
+        &self,
+        pattern: &EncodedShadingPattern,
+        path_bbox: Rect,
+        tolerance: f32,
+        meter: &mut dyn Meter,
+    ) -> Result<Option<SvgGradient>, Exhausted> {
         // A couple of cases cannot be losslessly represented by an SVG gradient.
         match self.params {
             RadialAxialParams::Axial => {
                 if !self.axial_extend_covers_bbox(pattern, path_bbox) {
-                    return None;
+                    return Ok(None);
                 }
             }
             RadialAxialParams::Radial { .. } => {
                 if !self.radial_extend_covers_bbox(pattern, path_bbox)
                     || pattern.background_color.components()[3] > 0.0
                 {
-                    return None;
+                    return Ok(None);
                 }
             }
         }
 
-        Some(SvgGradient {
+        take(
+            meter,
+            pattern
+                .setup_cost()
+                .saturating_add(self.function.bounds_cost()),
+        )?;
+        let stops = approximate_gradient_stops(
+            &mut Stops {
+                meter,
+                sample_cost: pattern.point_cost(),
+                stops: Vec::new(),
+            },
+            |t| self.sample_t(pattern, t),
+            &self.normalized_stitching_bounds(),
+            tolerance,
+        )?;
+        Ok(Some(SvgGradient {
             kind: self.native_gradient_kind(),
             transform: pattern.base_transform.inverse(),
-            stops: approximate_gradient_stops(
-                |t| self.sample_t(pattern, t),
-                &self.normalized_stitching_bounds(),
-                tolerance,
-            ),
-        })
+            stops,
+        }))
     }
 
     fn native_gradient_kind(&self) -> SvgGradientKind {
@@ -219,32 +251,62 @@ fn circle_outside_bbox(circle: Circle, bbox: Rect) -> bool {
     !circle.contains(closest)
 }
 
+/// Stops as they are found, each sample taken for them and each growth of the
+/// list paid for with `meter` first.
+struct Stops<'m> {
+    meter: &'m mut dyn Meter,
+    /// The steps a sample takes.
+    sample_cost: u64,
+    stops: Vec<SvgGradientStop>,
+}
+
+impl Stops<'_> {
+    /// Pays for `samples` samples.
+    fn pay(&mut self, samples: u64) -> Result<(), Exhausted> {
+        take(self.meter, self.sample_cost.saturating_mul(samples))
+    }
+
+    fn push(&mut self, offset: f32, color: [f32; 4]) -> Result<(), Exhausted> {
+        if self.stops.len() == self.stops.capacity() {
+            // Twice as many, held while the list grows next to the one before.
+            let more = self.stops.len().max(4);
+            let bytes = (2 * self.stops.len() + more) * size_of::<SvgGradientStop>();
+            if !self.meter.hold(bytes) {
+                return Err(Exhausted);
+            }
+            self.stops.reserve_exact(more);
+        }
+        self.stops.push(SvgGradientStop { offset, color });
+        Ok(())
+    }
+}
+
+/// The stops approximating, within `tolerance`, the colors `sample` finds between
+/// each two `breakpoints`, each sample and the stops held paid for first.
 fn approximate_gradient_stops(
+    stops: &mut Stops<'_>,
     mut sample: impl FnMut(f32) -> [f32; 4],
     breakpoints: &[f32],
     tolerance: f32,
-) -> Vec<SvgGradientStop> {
+) -> Result<Vec<SvgGradientStop>, Exhausted> {
     let mut interval_bounds = Vec::with_capacity(breakpoints.len() + 2);
     interval_bounds.push(0.0);
     interval_bounds.extend(breakpoints.iter().copied());
     interval_bounds.push(1.0);
 
-    let mut stops = Vec::new();
     for interval in interval_bounds.windows(2) {
         let start_offset = interval[0];
         let end_offset = interval[1];
 
+        stops.pay(2)?;
         let start_color = sample(start_offset);
-        stops.push(SvgGradientStop {
-            offset: start_offset,
-            color: start_color,
-        });
+        stops.push(start_offset, start_color)?;
 
         let end_color = sample(end_offset);
 
         approximate_gradient_interval(
+            stops,
             &mut sample,
-            &mut stops,
             GradientSample {
                 offset: start_offset,
                 color: start_color,
@@ -255,10 +317,10 @@ fn approximate_gradient_stops(
             },
             tolerance.max(0.0),
             0,
-        );
+        )?;
     }
 
-    stops
+    Ok(std::mem::take(&mut stops.stops))
 }
 
 #[derive(Clone, Copy)]
@@ -268,18 +330,19 @@ struct GradientSample {
 }
 
 fn approximate_gradient_interval(
+    stops: &mut Stops<'_>,
     sample: &mut impl FnMut(f32) -> [f32; 4],
-    stops: &mut Vec<SvgGradientStop>,
     start: GradientSample,
     end: GradientSample,
     tolerance: f32,
     depth: u8,
-) {
+) -> Result<(), Exhausted> {
     let offset_delta = end.offset - start.offset;
     let quarter_offset = start.offset + offset_delta * 0.25;
     let mid_offset = start.offset + offset_delta * 0.5;
     let three_quarter_offset = start.offset + offset_delta * 0.75;
 
+    stops.pay(3)?;
     let quarter_color = sample(quarter_offset);
     let mid_color = sample(mid_offset);
     let three_quarter_color = sample(three_quarter_offset);
@@ -292,12 +355,7 @@ fn approximate_gradient_interval(
         ) <= tolerance
         || depth == MAX_GRADIENT_SUBDIVISION_DEPTH
     {
-        stops.push(SvgGradientStop {
-            offset: end.offset,
-            color: end.color,
-        });
-
-        return;
+        return stops.push(end.offset, end.color);
     }
 
     let mid = GradientSample {
@@ -305,8 +363,8 @@ fn approximate_gradient_interval(
         color: mid_color,
     };
 
-    approximate_gradient_interval(sample, stops, start, mid, tolerance, depth + 1);
-    approximate_gradient_interval(sample, stops, mid, end, tolerance, depth + 1);
+    approximate_gradient_interval(stops, sample, start, mid, tolerance, depth + 1)?;
+    approximate_gradient_interval(stops, sample, mid, end, tolerance, depth + 1)
 }
 
 fn lerp_color(c0: [f32; 4], c1: [f32; 4], t: f32) -> [f32; 4] {
@@ -323,4 +381,67 @@ fn color_error(c0: [f32; 4], c1: [f32; 4]) -> f32 {
         .zip(c1)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0, f32::max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Exhausted, Meter, Stops, SvgGradientStop, approximate_gradient_stops};
+
+    /// Gives `left` steps, and records the most bytes asked to be held.
+    struct Giving {
+        left: u64,
+        held: usize,
+    }
+
+    impl Meter for Giving {
+        fn work(&mut self, steps: u64) -> bool {
+            let Some(left) = self.left.checked_sub(steps) else {
+                return false;
+            };
+            self.left = left;
+            true
+        }
+
+        fn hold(&mut self, bytes: usize) -> bool {
+            self.held += bytes;
+            true
+        }
+    }
+
+    /// Stops are found by sampling only what was paid for first, and held only
+    /// as asked: the samples a gradient of twenty turns takes at the deepest
+    /// subdivision, each paid for before it is taken, none past what the meter
+    /// gives, and the list's bytes asked before it grows.
+    #[test]
+    fn stops_are_sampled_only_as_paid() {
+        let wave = |t: f32| [(t * 125.0).sin() * 0.5 + 0.5, 0.0, 0.0, 1.0];
+        let find = |left: u64| {
+            let mut meter = Giving { left, held: 0 };
+            let mut sampled = 0;
+            let found = approximate_gradient_stops(
+                &mut Stops {
+                    meter: &mut meter,
+                    sample_cost: 1,
+                    stops: Vec::new(),
+                },
+                |t| {
+                    sampled += 1;
+                    wave(t)
+                },
+                &[0.5],
+                0.01,
+            );
+            (found, sampled, meter)
+        };
+        let (found, sampled, meter) = find(u64::MAX);
+        let stops = found.unwrap();
+        assert_eq!(u64::MAX - meter.left, sampled);
+        assert!(stops.len() > 100, "{}", stops.len());
+        assert!(meter.held >= stops.capacity() * size_of::<SvgGradientStop>());
+        for give in [0, 1, sampled / 2, sampled - 1] {
+            let (found, taken, _) = find(give);
+            assert_eq!(found.err(), Some(Exhausted), "{give}");
+            assert!(taken <= give, "{give}: sampled {taken}");
+        }
+    }
 }

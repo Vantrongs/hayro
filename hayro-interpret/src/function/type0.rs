@@ -88,6 +88,20 @@ impl Type0 {
         })
     }
 
+    /// The most steps `eval` takes: interpolating between the samples around a
+    /// point reads 2^m of them for m inputs, each with all its outputs.
+    pub(crate) fn cost(&self) -> u64 {
+        let (inputs, outputs) = (self.sizes.len() as u64, self.range.len() as u64);
+        let corners = 1_u64.checked_shl(inputs as u32).filter(|_| inputs < 64);
+        corners
+            .and_then(|corners| corners.checked_mul(outputs + 2))
+            .map_or(u64::MAX, |corners| {
+                corners
+                    .saturating_add(4 * inputs + 2 * outputs)
+                    .saturating_add(self.clamper.cost())
+            })
+    }
+
     /// Evaluate a type 0 function with the given input.
     pub(crate) fn eval(&self, mut input: Values) -> Option<Values> {
         if input.len() != self.sizes.len() {

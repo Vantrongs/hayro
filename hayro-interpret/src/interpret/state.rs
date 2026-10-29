@@ -41,6 +41,18 @@ impl crate::CacheKey for ActiveTransferFunction {
 }
 
 impl ActiveTransferFunction {
+    /// The steps building the tables the functions map by takes, until they are
+    /// built.
+    pub fn setup_cost(&self) -> u64 {
+        match self {
+            Self::Single(f) => f.setup_cost(),
+            Self::Four(functions) => functions
+                .iter()
+                .map(TransferFunction::setup_cost)
+                .fold(0, u64::saturating_add),
+        }
+    }
+
     /// Apply the transfer function to the RGB channels of an RGBA color.
     /// The alpha channel is left unchanged.
     pub fn apply(&self, color: &AlphaColor) -> AlphaColor {

@@ -33,7 +33,14 @@ enum FunctionType {
 
 /// A PDF function.
 #[derive(Debug, Clone)]
-pub struct Function(Arc<FunctionType>);
+pub struct Function(Arc<(FunctionType, Cost)>);
+
+/// What evaluating a function once may take, found once when it is read.
+#[derive(Debug, Clone, Copy)]
+struct Cost {
+    eval: u64,
+    bounds: u64,
+}
 
 impl Function {
     /// Create a new function.
@@ -47,13 +54,44 @@ impl Function {
             4 => FunctionType::Type4(Type4::new(stream?)?),
             _ => return None,
         };
+        Some(Self::of(function_type))
+    }
 
-        Some(Self(Arc::new(function_type)))
+    /// The function of `function_type`, its cost found once.
+    fn of(function_type: FunctionType) -> Self {
+        let cost = match &function_type {
+            FunctionType::Type0(t0) => Cost {
+                eval: t0.cost(),
+                bounds: 0,
+            },
+            FunctionType::Type2(t2) => Cost {
+                eval: t2.cost(),
+                bounds: 0,
+            },
+            FunctionType::Type3(t3) => t3.cost(),
+            FunctionType::Type4(t4) => Cost {
+                eval: t4.cost(),
+                bounds: 0,
+            },
+        };
+        Self(Arc::new((function_type, cost)))
+    }
+
+    /// The most steps one [`eval`](Self::eval) takes: an operator run, or a value
+    /// read, computed or written, whatever the input. Known before evaluating, so a
+    /// caller can bound the work of evaluating many times.
+    pub fn cost(&self) -> u64 {
+        self.0.1.eval
+    }
+
+    /// The most steps [`stitching_bounds`](Self::stitching_bounds) takes.
+    pub(crate) fn bounds_cost(&self) -> u64 {
+        self.0.1.bounds
     }
 
     /// Evaluate the function with the given input.
     pub fn eval(&self, input: Values) -> Option<Values> {
-        match self.0.as_ref() {
+        match &self.0.0 {
             FunctionType::Type0(t0) => t0.eval(input),
             FunctionType::Type2(t2) => Some(t2.eval(*input.first()?)),
             FunctionType::Type3(t3) => t3.eval(*input.first()?),
@@ -62,7 +100,7 @@ impl Function {
     }
 
     pub(crate) fn stitching_bounds(&self) -> StitchingBounds {
-        match self.0.as_ref() {
+        match &self.0.0 {
             FunctionType::Type3(t3) => t3.stitching_bounds(),
             _ => SmallVec::new(),
         }
@@ -101,6 +139,16 @@ impl TransferFunction {
         self.samples()[(value * 255.0 + 0.5) as u8 as usize] as f32 / 255.0
     }
 
+    /// The steps building the table [`apply_to`](Self::apply_to) maps by takes, until
+    /// it is built.
+    pub fn setup_cost(&self) -> u64 {
+        if self.samples.get().is_some() {
+            0
+        } else {
+            256 * self.function.cost().saturating_add(1)
+        }
+    }
+
     pub(crate) fn samples(&self) -> &[u8; 256] {
         self.samples.get_or_init(|| {
             std::array::from_fn(|sample| {
@@ -121,6 +169,11 @@ struct Clamper {
 }
 
 impl Clamper {
+    /// The steps clamping an input and an output takes.
+    fn cost(&self) -> u64 {
+        (self.domain.len() + self.range.as_ref().map_or(0, |range| range.len())) as u64
+    }
+
     fn new(dict: &Dict<'_>) -> Option<Self> {
         let domain = dict.get::<TupleVec>(DOMAIN)?;
         let range = dict.get::<TupleVec>(RANGE);

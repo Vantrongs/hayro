@@ -74,6 +74,14 @@ impl Indexed {
         self.base.convert(&indexed, output)
     }
 
+    /// The steps building the table a palette entry is looked up in takes, until it
+    /// is built.
+    pub(super) fn setup_cost(&self) -> u64 {
+        self.lookup
+            .setup_cost(self.base.cost())
+            .saturating_add(self.base.setup_cost())
+    }
+
     fn u8_lookup(&self) -> Option<&[[u8; 3]; 256]> {
         self.lookup
             .get_or_init(|input, output| self.convert_inner(input, output))

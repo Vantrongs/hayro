@@ -1,4 +1,4 @@
-use crate::function::{Clamper, Function, StitchingBounds, TupleVec, Values, interpolate};
+use crate::function::{Clamper, Cost, Function, StitchingBounds, TupleVec, Values, interpolate};
 use hayro_syntax::object::Array;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Object;
@@ -41,6 +41,28 @@ impl Type3 {
             bounds,
             encode,
         })
+    }
+
+    /// The most steps `eval` takes, finding the one function the input falls to
+    /// and evaluating it, and those `stitching_bounds` takes, gathering the bounds
+    /// of every function under this one and sorting them.
+    pub(super) fn cost(&self) -> Cost {
+        let search = u64::from(usize::BITS - self.bounds.len().leading_zeros());
+        let eval = self
+            .functions
+            .iter()
+            .map(Function::cost)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(search + 2 + self.clamper.cost());
+        let bounds = self
+            .functions
+            .iter()
+            .map(Function::bounds_cost)
+            .fold(self.bounds.len() as u64, u64::saturating_add);
+        // Sorting them.
+        let bounds = bounds.saturating_mul(u64::from(64 - bounds.leading_zeros()).max(1));
+        Cost { eval, bounds }
     }
 
     /// Evaluate the function with the given input.
@@ -131,6 +153,32 @@ fn find_interval(bounds: &[f32], x: f32) -> Option<usize> {
 mod tests {
     use super::*;
     use hayro_syntax::object::FromBytes;
+
+    /// One evaluation runs one of the functions stitched: it costs the costliest.
+    #[test]
+    fn a_stitching_costs_its_costliest_function() {
+        let exponential = |outputs: usize| {
+            let c = vec!["0"; outputs].join(" ");
+            format!("<< /FunctionType 2 /Domain [0 1] /C0 [{c}] /C1 [{c}] /N 1 >>")
+        };
+        let function = |functions: &[String]| {
+            let data = format!(
+                "<< /FunctionType 3 /Domain [0 1] /Functions [{}] /Bounds [{}] /Encode [{}] >>",
+                functions.join(" "),
+                vec!["0.5"; functions.len() - 1].join(" "),
+                vec!["0 1"; functions.len()].join(" "),
+            );
+            Function::new(&Object::from_bytes(data.as_bytes()).unwrap()).unwrap()
+        };
+        let small = function(&[exponential(1)]).cost();
+        let large = function(&[exponential(1000)]).cost();
+        let both = function(&[exponential(1), exponential(1000)]).cost();
+        assert!(large >= 2000, "{large}");
+        assert!(
+            both >= large && both < large + small,
+            "{small} {large} {both}"
+        );
+    }
 
     #[test]
     fn simple() {
