@@ -24,9 +24,9 @@ use hayro_syntax::work::{Cancelled, Meter};
 use index::Checkpoints;
 use jpeg::JpegStreamed;
 use kurbo::Affine;
-use rows::PIECE_BYTES;
+use rows::{DataEnds, PIECE_BYTES};
 use std::sync::Arc;
-use streamed::{HeldRows, Streamed};
+use streamed::Streamed;
 
 /// A raster image's source, owned: its stream (by object identifier, or a copy of an
 /// inline image's bytes), resolved colour space, transfer function, interpolation
@@ -38,7 +38,7 @@ pub struct ImageAsset(Arc<AssetData>);
 struct AssetData {
     stream: OwnedStream,
     checkpoints: Checkpoints,
-    held_rows: HeldRows,
+    ends: DataEnds,
     width: u32,
     height: u32,
     kind: ImageKind,
@@ -56,7 +56,7 @@ impl ImageXObject<'_> {
         ImageAsset(Arc::new(AssetData {
             stream: self.stream.to_owned_stream(),
             checkpoints: Checkpoints::default(),
-            held_rows: HeldRows::default(),
+            ends: DataEnds::default(),
             width: self.width(),
             height: self.height(),
             kind: self.kind,
@@ -120,22 +120,21 @@ impl ImageAsset {
     /// gray, or of one bit for an `Indexed` image) have fewer than eight bits, in any
     /// colour space, or are 8-bit samples of one component, or 8-bit `DeviceRGB`
     /// samples used as stored or inverted, with masks of one component of the same
-    /// kinds, or
-    /// decoded whole, and stencil masks of the same kinds, only read their
-    /// dictionaries here (and, the first time, read the data of an image with a mask
-    /// stream and of its mask through the rows they declare, to count the rows
-    /// decoding them whole keeps, on which the mask's grid depends); requests read
-    /// their data from the start and keep a piece of a row and a few sums per bin (and
-    /// a CCITT decoder's state and a row's colour changes), the rows the data does not
-    /// reach being transparent, and fail where the data holds no row, as decoding it
-    /// whole does. A request of such a Flate image without a mask read alongside
-    /// resumes from the nearest decoder state an earlier request of the asset saved,
-    /// instead of from the start. So does a request of a single-scan baseline
-    /// grayscale JPEG of its declared size without masks, read in bands of eight
-    /// rows; once its data fails to decode, it is decoded whole like other images.
-    /// Other images are decoded whole here (with `hint`, the size they are wanted at,
-    /// for decoders that can reduce), and requests read the decoded planes, which the
-    /// source holds until it is dropped. `cancel` is polled as
+    /// kinds, or decoded whole, and stencil masks of the same kinds, only read their
+    /// dictionaries here; requests read their data from the start and keep a piece of
+    /// a row and a few sums per bin (and a CCITT decoder's state and a row's colour
+    /// changes). Data that ends early reads as decoding it whole reads it (stored zero
+    /// past it, or transparent rows under a colour key or `/Matte`), and a request
+    /// that pushed part of a row the data ends within, which reads as stored zero,
+    /// reads the image again once, knowing where the data ends. A request of such a
+    /// Flate image without a mask read alongside resumes from the nearest decoder
+    /// state an earlier request of the asset saved, instead of from the start. So does
+    /// a request of a single-scan baseline grayscale JPEG of its declared size without
+    /// masks, read in bands of eight rows; once its data fails to decode, it is decoded
+    /// whole like other images. Other images are decoded whole here (with `hint`, the
+    /// size they are wanted at, for decoders that can reduce), and requests read the
+    /// decoded planes, which the source holds until it is dropped: the rows their data
+    /// holds and one of stored zero, which the rows past it repeat. `cancel` is polled as
     /// [`ImageRequest::cancel`] is; a cancelled open leaves the asset as it was, to be
     /// opened again.
     pub fn open(
@@ -147,19 +146,18 @@ impl ImageAsset {
         meter.poll()?;
         let obj = self.xobject().ok_or(RequestError::Failed)?;
         let a = &*self.0;
-        let streamed = Streamed::new(&obj, &a.stream, &a.checkpoints, &a.held_rows, &meter)?;
+        let streamed = Streamed::new(&obj, &a.stream, &a.checkpoints, &a.ends, &meter)?;
         if let Some(streamed) = streamed {
-            let (layout, opened) = (streamed.layout(), streamed.opened);
             return Ok(ImageSource::new(
-                layout,
+                streamed.layout(),
                 Inner::Streamed(Box::new(streamed)),
-                opened,
+                DecodeWork::default(),
             ));
         }
         if a.kind == ImageKind::StencilMask {
             let decoded = decode_mask(&obj, hint, &meter);
             meter.poll()?;
-            let decoded = Decoded::stencil(decoded.ok_or(RequestError::Failed)?.luma);
+            let decoded = Decoded::stencil(decoded.ok_or(RequestError::Failed)?);
             return Ok(ImageSource::new(
                 decoded.layout(),
                 Inner::Decoded(decoded),
@@ -177,7 +175,7 @@ impl ImageAsset {
         let decoded = decode_image(&obj, hint, &meter);
         meter.poll()?;
         let decoded = decoded.ok_or(RequestError::Failed)?;
-        let decoded = Decoded::new(decoded.image, decoded.alpha, &meter)?;
+        let decoded = Decoded::new(decoded, &meter)?;
         Ok(ImageSource::new(
             decoded.layout(),
             Inner::Decoded(decoded),
@@ -466,13 +464,17 @@ fn with_coverage(
 enum Stop {
     Cancelled,
     Failed,
+    /// The request pushed part of a row its data turned out to end within, which
+    /// reads as stored zero ([`rows::DataEnds`]): it is to be read again, knowing
+    /// where the data ends. A request read again does not stop so.
+    Retry,
 }
 
 impl From<Stop> for RequestError {
     fn from(stop: Stop) -> Self {
         match stop {
             Stop::Cancelled => Self::Cancelled,
-            Stop::Failed => Self::Failed,
+            Stop::Failed | Stop::Retry => Self::Failed,
         }
     }
 }
@@ -503,5 +505,7 @@ fn interleave(texels: &[u8], channels: usize, alpha: &[u8], out: &mut Vec<u8>) {
 
 #[cfg(test)]
 mod differential;
+#[cfg(test)]
+mod short;
 #[cfg(test)]
 mod tests;

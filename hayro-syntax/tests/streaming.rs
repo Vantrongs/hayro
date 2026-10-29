@@ -411,8 +411,8 @@ fn read_skipping(stream: &Stream<'_>, params: &ImageDecodeParams, chunk: usize) 
 
 /// CCITT data read through an image reader yields what decoding the image whole
 /// returns, as it decodes: data of every encoding, gray and indexed, with
-/// `BlackIs1`, a `/Width` other than its columns, ending before the rows declared
-/// (padded white where whole decoding pads), breaking off, and holding no row.
+/// `BlackIs1`, a `/Width` other than its columns, ending before the rows declared,
+/// breaking off, and holding no row.
 #[test]
 fn ccitt_image_bytes_read_as_whole_decoding_returns_them() {
     let streams = [

@@ -1,7 +1,7 @@
 //! Images whose samples are read incrementally for each request.
 
 use super::index::{Checkpointer, Checkpoints};
-use super::rows::{MaskRows, MaskSource, RawRow, RawRows, RowsHeld, piece_texels, rows_held};
+use super::rows::{DataEnds, MaskRows, MaskSource, RawRow, RawRows, piece_texels};
 use super::{
     DecodeWork, ImageLayout, PixelFormat, Plane, PlaneLayout, Stop, interleave, premultiply,
 };
@@ -10,7 +10,7 @@ use crate::interpret::state::ActiveTransferFunction;
 use crate::x_object::area::Area;
 use crate::x_object::decode::{
     MaskPath, SampleFormat, SampleRows, direct_invert, image_decode_params, mask_lut,
-    sample_format, sample_lut, unpack_packed, unpremultiply_samples,
+    sample_format, sample_lut, short_rows_transparent, unpack_packed, unpremultiply_samples,
 };
 use crate::x_object::image::{ImageKind, ImageXObject};
 use core::ops::Range;
@@ -19,6 +19,7 @@ use hayro_syntax::object::dict::keys::{MASK, MATTE, SMASK, SMASK_IN_DATA};
 use hayro_syntax::object::stream::{ImageData, OwnedStream};
 use hayro_syntax::work::{Cancelled, Meter};
 use smallvec::SmallVec;
+use std::sync::OnceLock;
 
 /// An image read incrementally.
 pub(super) struct Streamed<'a> {
@@ -26,14 +27,13 @@ pub(super) struct Streamed<'a> {
     colour: Colour,
     alpha: Alpha<'a>,
     grid: Grid,
-    /// The rows of the colour: those whole decoding keeps where a mask's grid depends
-    /// on them, else those declared.
-    height: u32,
+    /// Whether rows the colour's data does not hold whole are transparent
+    /// (`short_rows_transparent`), not stored zero.
+    transparent: bool,
     /// `obj`'s stream, owned, which the decoder states saved in `checkpoints` keep.
     stream: &'a OwnedStream,
     checkpoints: &'a Checkpoints,
-    /// The decoding opening the image did.
-    pub(super) opened: DecodeWork,
+    ends: &'a DataEnds,
 }
 
 /// How an image's stored samples lie, as whole decoding reads them: in rows of the
@@ -99,16 +99,15 @@ pub(super) struct Colour {
 }
 
 /// How stored samples become a byte per component. Whole decoding takes samples
-/// the data does not hold whole as stored `fill`.
+/// the data does not hold as stored zero.
 enum Samples {
     /// A byte each, used as stored or inverted.
-    Bytes { invert: bool, fill: u8 },
+    Bytes { invert: bool },
     /// Fewer than eight bits each, rows starting on a byte: `lut[c][v]` is what
     /// stored value `v` of component `c` becomes.
     Packed {
         bits: u8,
         lut: Vec<[u8; 256]>,
-        fill: u8,
         /// For one component of bits that divide a byte, what the samples of each
         /// stored byte become, in its first `8 / bits` bytes.
         bytes: Option<Box<[[u8; 8]; 256]>>,
@@ -116,7 +115,7 @@ enum Samples {
 }
 
 impl Samples {
-    fn packed(bits: u8, lut: Vec<[u8; 256]>, fill: u8) -> Self {
+    fn packed(bits: u8, lut: Vec<[u8; 256]>) -> Self {
         let bytes = (lut.len() == 1 && bits < 8 && 8 % bits == 0).then(|| {
             let mask = (1_u8 << bits) - 1;
             let mut table = Box::new([[0; 8]; 256]);
@@ -128,12 +127,7 @@ impl Samples {
             }
             table
         });
-        Self::Packed {
-            bits,
-            lut,
-            fill,
-            bytes,
-        }
+        Self::Packed { bits, lut, bytes }
     }
 }
 
@@ -168,23 +162,14 @@ impl Colour {
         if obj.kind == ImageKind::StencilMask {
             let samples = match MaskPath::new(&color_space, bits_per_component, &decode_arr, true) {
                 MaskPath::Bilevel { invert } => {
-                    // Bits past the data are transparent, as whole decoding pads
-                    // the alpha.
-                    let (transparent, opaque) = if invert { (1, 0) } else { (0, 1) };
                     let mut lut = [0; 256];
-                    lut[opaque] = 255;
-                    Samples::packed(1, vec![lut], transparent as u8)
+                    lut[usize::from(!invert)] = 255;
+                    Samples::packed(1, vec![lut])
                 }
-                // Bytes past the data are transparent too.
-                MaskPath::Bytes { invert } => Samples::Bytes {
-                    invert,
-                    fill: if invert { 255 } else { 0 },
-                },
-                // Through the decode array, samples past the data as stored zero.
+                MaskPath::Bytes { invert } => Samples::Bytes { invert },
                 MaskPath::Decoded => Samples::packed(
                     bits_per_component,
                     vec![mask_lut(bits_per_component, &decode_arr, true)?],
-                    0,
                 ),
             };
             return Some(Self {
@@ -202,10 +187,10 @@ impl Colour {
             bits_per_component,
             direct_invert(&color_space, 8, &decode_arr),
         ) {
-            (8, Some(invert)) if direct => Samples::Bytes { invert, fill: 0 },
+            (8, Some(invert)) if direct => Samples::Bytes { invert },
             (8, _) if !one => return None,
             // Through a table of the values a byte holds, as samples of fewer bits.
-            (bits, _) => Samples::packed(bits, sample_lut(&color_space, bits, &decode_arr)?, 0),
+            (bits, _) => Samples::packed(bits, sample_lut(&color_space, bits, &decode_arr)?),
         };
         let luma = obj
             .transfer_function
@@ -259,18 +244,6 @@ impl Colour {
         (texels * self.components * self.bits()).div_ceil(8)
     }
 
-    /// The texels whose samples `bytes` stored bytes hold whole.
-    fn texels_in(&self, bytes: usize) -> usize {
-        bytes * 8 / (self.components * self.bits())
-    }
-
-    /// Whether whole decoding pads samples the data does not hold after mapping them
-    /// (8-bit samples through a table), where it also leaves them out of a colour key
-    /// (transparent).
-    fn pads_mapped(&self) -> bool {
-        matches!(self.samples, Samples::Packed { bits: 8, .. })
-    }
-
     /// The texels a read of the samples starts at a multiple of: whole bytes.
     fn align(&self) -> usize {
         match self.samples {
@@ -284,16 +257,9 @@ impl Colour {
         SampleRows::new(width, self.components, self.bits() as u8, height)
     }
 
-    /// The stored value of samples the data does not hold whole.
-    fn fill(&self) -> u8 {
-        match self.samples {
-            Samples::Bytes { fill, .. } | Samples::Packed { fill, .. } => fill,
-        }
-    }
-
     /// The samples `bytes` starts with, one byte each into `out` (as many as it
     /// holds): as stored with `stored`, else what they become. Those the bytes do not
-    /// hold whole are [`Self::fill`].
+    /// hold whole are stored zero.
     fn unpack(&self, bytes: &[u8], out: &mut [u8], stored: bool) {
         if let Samples::Packed {
             bits,
@@ -316,17 +282,9 @@ impl Colour {
             }
             return;
         }
-        unpack_packed(self.bits() as u8, bytes, out, self.fill());
+        unpack_packed(self.bits() as u8, bytes, out, 0);
         if !stored {
-            // Whole decoding pads mapped 8-bit samples with zero, where it pads samples
-            // of fewer bits before mapping them.
-            let held = match self.samples {
-                Samples::Packed { bits: 8, .. } => bytes.len().min(out.len()),
-                _ => out.len(),
-            };
-            let (held, rest) = out.split_at_mut(held);
-            self.map(held);
-            rest.fill(0);
+            self.map(out);
         }
     }
 
@@ -346,17 +304,11 @@ impl Colour {
         }
     }
 
-    /// The plane of `obj`'s colour on `grid`, of `height` rows, with alpha or not.
-    pub(super) fn plane(
-        &self,
-        obj: &ImageXObject<'_>,
-        grid: &Grid,
-        height: u32,
-        alpha: bool,
-    ) -> PlaneLayout {
+    /// The plane of `obj`'s colour on `grid`, with alpha or not.
+    pub(super) fn plane(&self, obj: &ImageXObject<'_>, grid: &Grid, alpha: bool) -> PlaneLayout {
         PlaneLayout {
             width: grid.width,
-            height,
+            height: grid.height,
             to_image: grid.to_image,
             interpolate: obj.interpolate,
             format: self.format(alpha),
@@ -432,19 +384,14 @@ enum Alpha<'a> {
 }
 
 impl<'a> Alpha<'a> {
-    /// The alpha `decode_alpha` gives `obj`, and the rows of the colour: where there
-    /// is a mask stream (whose grid, and whether `/Matte` applies, depend on them),
-    /// those whole decoding keeps, else those declared. The rows of the colour's data
-    /// and of the mask's are counted into `rows` once, adding to `work`. Fails where
-    /// whole decoding keeps no row of the colour.
+    /// The alpha `decode_alpha` gives `obj`, a mask lying on the grid the colour
+    /// declares.
     fn new(
         obj: &ImageXObject<'a>,
         colour: &Colour,
         grid: &Grid,
-        rows: &HeldRows,
-        work: &mut DecodeWork,
         meter: &Meter<'_>,
-    ) -> Result<(Self, u32), Stop> {
+    ) -> Result<Self, Stop> {
         let dict = obj.stream.dict();
         let smask = dict.get::<Stream<'_>>(SMASK);
         let matte = smask
@@ -460,24 +407,15 @@ impl<'a> Alpha<'a> {
             None
         };
         let Some(stream) = stream else {
-            let alpha = match dict.get::<SmallVec<[u16; 4]>>(MASK) {
+            return Ok(match dict.get::<SmallVec<[u16; 4]>>(MASK) {
                 Some(key) if !in_data => Alpha::ColourKey(key),
                 _ => Alpha::None,
-            };
-            return Ok((alpha, grid.height));
+            });
         };
-        let height = match rows.colour.get() {
-            Some(&held) => held,
-            None => {
-                let held = rows_held(obj, colour.rows(grid.width, grid.height), work, meter)?;
-                *rows.colour.get_or_init(|| held)
-            }
+        let Some(mask) = MaskSource::new(&stream, obj, meter)? else {
+            return Ok(Alpha::None);
         };
-        let height = height.filter(|&h| h > 0).ok_or(Stop::Failed)?;
-        let Some(mask) = MaskSource::new(&stream, obj, &rows.mask, work, meter)? else {
-            return Ok((Alpha::None, height));
-        };
-        let size = (grid.width, height);
+        let size = (grid.width, grid.height);
         let matte = match matte {
             Some(m) if mask.size() == size => {
                 let mut rgb = [0; 3];
@@ -486,15 +424,14 @@ impl<'a> Alpha<'a> {
                 }
                 Some(rgb)
             }
-            _ if in_data => return Ok((Alpha::None, height)),
+            _ if in_data => return Ok(Alpha::None),
             _ => None,
         };
-        let alpha = Alpha::Mask {
+        Ok(Alpha::Mask {
             same_grid: mask.size() == size && mask.interpolate() == obj.interpolate,
             mask,
             matte,
-        };
-        Ok((alpha, height))
+        })
     }
 
     /// Whether the alpha comes with the colour, on its grid.
@@ -510,22 +447,14 @@ impl<'a> Alpha<'a> {
     }
 }
 
-/// The rows of an image's data and of its mask stream's data that whole decoding
-/// keeps, counted when an asset is first opened, where needed.
-#[derive(Default)]
-pub(super) struct HeldRows {
-    colour: RowsHeld,
-    mask: RowsHeld,
-}
-
 impl<'a> Streamed<'a> {
-    /// `obj` read incrementally, if its samples allow; the rows of its data and its
-    /// mask's are counted into `rows` once, where needed.
+    /// `obj` read incrementally, if its samples allow; where its data and its mask's
+    /// end is noted in `ends`.
     pub(super) fn new(
         obj: &ImageXObject<'a>,
         stream: &'a OwnedStream,
         checkpoints: &'a Checkpoints,
-        rows: &HeldRows,
+        ends: &'a DataEnds,
         meter: &Meter<'_>,
     ) -> Result<Option<Self>, Stop> {
         let Some((grid, format)) = incremental_samples(obj) else {
@@ -534,32 +463,37 @@ impl<'a> Streamed<'a> {
         let Some(colour) = Colour::of(obj, format) else {
             return Ok(None);
         };
-        let mut opened = DecodeWork::default();
         // A stencil mask is alpha alone, as whole decoding reads it.
-        let (alpha, height) = if colour.is_stencil() {
-            (Alpha::None, grid.height)
+        let alpha = if colour.is_stencil() {
+            Alpha::None
         } else {
-            Alpha::new(obj, &colour, &grid, rows, &mut opened, meter)?
+            Alpha::new(obj, &colour, &grid, meter)?
         };
         Ok(Some(Self {
             obj: obj.clone(),
             colour,
             alpha,
             grid,
-            height,
+            transparent: short_rows_transparent(obj),
             stream,
             checkpoints,
-            opened,
+            ends,
         }))
     }
 
     /// How the colour's samples lie in its rows.
     fn rows(&self) -> SampleRows {
-        self.colour.rows(self.grid.width, self.height)
+        self.colour.rows(self.grid.width, self.grid.height)
+    }
+
+    /// Whether every stored byte of a colour row the data ends within counts; else
+    /// only whole rows do.
+    fn byte_granular(&self) -> bool {
+        self.rows().byte_granular() && !self.transparent
     }
 
     pub(super) fn layout(&self) -> ImageLayout {
-        let (w, h) = (self.grid.width, self.height);
+        let (w, h) = (self.grid.width, self.grid.height);
         let (sx, sy) = self.grid.to_image;
         let mask = match &self.alpha {
             Alpha::Mask {
@@ -571,7 +505,7 @@ impl<'a> Streamed<'a> {
                 Some(PlaneLayout {
                     width: mw,
                     height: mh,
-                    // As whole decoding maps the mask onto the colour's samples.
+                    // As whole decoding lays the mask on the grid the colour declares.
                     to_image: (sx * w as f64 / mw as f64, sy * h as f64 / mh as f64),
                     interpolate: mask.interpolate(),
                     format: PixelFormat::Alpha,
@@ -580,12 +514,9 @@ impl<'a> Streamed<'a> {
             _ => None,
         };
         ImageLayout {
-            image: self.colour.plane(
-                &self.obj,
-                &self.grid,
-                self.height,
-                self.alpha.on_image_grid(),
-            ),
+            image: self
+                .colour
+                .plane(&self.obj, &self.grid, self.alpha.on_image_grid()),
             mask,
         }
     }
@@ -597,21 +528,33 @@ impl<'a> Streamed<'a> {
         area: &mut Area<'_>,
         meter: &Meter<'_>,
     ) -> Result<DecodeWork, Stop> {
-        match plane {
-            Plane::Image => {
-                let mut pass = ImagePass::new(self, area, meter)?;
-                pass.run(area)?;
-                Ok(pass.work())
-            }
-            Plane::Mask => {
-                let Alpha::Mask { mask, .. } = &self.alpha else {
-                    return Err(Stop::Failed);
-                };
-                let mut pass = MaskPass::new(mask, area, meter)?;
-                pass.run(area)?;
-                Ok(pass.work())
+        let mut work = DecodeWork::default();
+        // A pass that stops to be read again knows where the data ends, and does not
+        // stop so again.
+        for retry in [true, false] {
+            let result = match plane {
+                Plane::Image => {
+                    let mut pass = ImagePass::new(self, area, meter)?;
+                    let result = pass.run(area);
+                    work.add(pass.work());
+                    result
+                }
+                Plane::Mask => {
+                    let Alpha::Mask { mask, .. } = &self.alpha else {
+                        return Err(Stop::Failed);
+                    };
+                    let mut pass = MaskPass::new(mask, &self.ends.mask, area, meter)?;
+                    let result = pass.run(area);
+                    work.add(pass.work());
+                    result
+                }
+            };
+            match result {
+                Err(Stop::Retry) if retry => area.reset()?,
+                result => return result.map(|()| work),
             }
         }
+        Err(Stop::Failed)
     }
 }
 
@@ -652,20 +595,26 @@ struct ImagePass<'s, 'a> {
 
 /// How a row read of the colour ended.
 enum RowEnd {
-    Full,
-    /// The data ended within it, and it is kept, padded.
-    Last,
-    /// The data ended before or within it, and it is dropped.
+    /// The data holds it whole.
+    Whole,
+    /// The data ends within it, and it holds the 8-bit samples before the end,
+    /// stored zero after it.
+    Cut,
+    /// It reads as stored zero: the data ends before it, or within it where only
+    /// whole rows count.
+    Zero,
+    /// It and the rows after it are transparent: the data does not hold it whole,
+    /// and short rows are transparent.
     Missing,
 }
 
 impl<'s, 'a> ImagePass<'s, 'a> {
     fn new(image: &'s Streamed<'a>, area: &Area<'_>, meter: &'s Meter<'s>) -> Result<Self, Stop> {
-        let h = image.height;
         let colour = &image.colour;
         let n = colour.components();
         let row_bytes = image.rows().row_bytes();
-        let mut raw = RawRows::new(&image.obj, row_bytes, meter).ok_or(Stop::Failed)?;
+        let mut raw =
+            RawRows::new(&image.obj, row_bytes, &image.ends.colour, meter).ok_or(Stop::Failed)?;
         let columns = area.columns();
         let start = columns.start as usize / colour.align() * colour.align();
         let piece = piece_texels(columns.end as usize - start, n);
@@ -675,7 +624,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
                 matte,
                 same_grid,
             } if *same_grid || matte.is_some() => Some(Lockstep {
-                rows: mask.rows(meter).ok_or(Stop::Failed)?,
+                rows: mask.rows(&image.ends.mask, meter).ok_or(Stop::Failed)?,
                 matte: *matte,
                 same_grid: *same_grid,
                 alpha: vec![0; piece],
@@ -688,7 +637,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
                 image.stream,
                 &mut raw,
                 row_bytes,
-                h,
+                image.grid.height,
                 area.rows().start,
             )?,
         };
@@ -727,57 +676,80 @@ impl<'s, 'a> ImagePass<'s, 'a> {
     fn run(&mut self, area: &mut Area<'_>) -> Result<(), Stop> {
         let wanted = area.rows();
         let first = std::mem::take(&mut self.first_row);
-        for y in first..wanted.end.min(self.image.height) {
+        for y in first..wanted.end.min(self.image.grid.height) {
             let end = if y >= wanted.start {
-                self.read_row(area)?
+                self.read_row(y, area)?
             } else {
-                self.skip_row()?
+                self.skip_row(y)?
             };
-            if matches!(end, RowEnd::Missing) {
-                // Data that holds no row fails, as decoding it whole does.
-                if y == 0 {
-                    return Err(Stop::Failed);
+            match end {
+                RowEnd::Missing => {
+                    // Data that holds no whole row fails, as decoding it whole does.
+                    if y == 0 {
+                        return Err(Stop::Failed);
+                    }
+                    break;
                 }
-                break;
-            }
-            self.decoded += 1;
-            if matches!(end, RowEnd::Last) {
-                break;
-            }
-            if let Some(c) = &self.checkpointer {
-                c.after_row(y + 1, &self.raw.reader)?;
+                RowEnd::Whole => {
+                    self.decoded += 1;
+                    if let Some(c) = &self.checkpointer {
+                        c.after_row(y + 1, &self.raw.reader)?;
+                    }
+                }
+                RowEnd::Cut => self.decoded += 1,
+                RowEnd::Zero => {}
             }
         }
         Ok(())
     }
 
-    /// Reads past the next row, and the mask's.
-    fn skip_row(&mut self) -> Result<RowEnd, Cancelled> {
-        let row = self.raw.skip_row()?;
+    /// Whether the bytes of row `y` are read: until the data's end is known, every
+    /// row's; then those of rows it holds whole, and of a row it ends within where
+    /// every byte counts.
+    fn reads(&self, y: u32) -> bool {
+        let known = if self.image.byte_granular() {
+            self.raw.reaches_row(y)
+        } else {
+            self.raw.holds_row(y)
+        };
+        known.unwrap_or(true)
+    }
+
+    /// How a row the data does not hold whole and that keeps no byte ends.
+    fn short(&self) -> RowEnd {
+        if self.image.transparent {
+            RowEnd::Missing
+        } else {
+            RowEnd::Zero
+        }
+    }
+
+    /// Reads past row `y`, and the mask's.
+    fn skip_row(&mut self, y: u32) -> Result<RowEnd, Stop> {
         if let Some(m) = &mut self.mask {
             m.rows.skip_row()?;
         }
-        Ok(self.row_end(row))
-    }
-
-    /// Whether a row read through, as `row`, is kept.
-    fn row_end(&self, row: RawRow) -> RowEnd {
-        match row {
-            RawRow::Full => RowEnd::Full,
-            RawRow::Partial if self.keeps_row() => RowEnd::Last,
-            _ => RowEnd::Missing,
+        if !self.reads(y) {
+            return Ok(self.short());
         }
+        Ok(match self.raw.skip_row()? {
+            RawRow::Full => RowEnd::Whole,
+            RawRow::Partial if self.image.byte_granular() => RowEnd::Cut,
+            _ => self.short(),
+        })
     }
 
-    /// Whether the row being read is kept if the data ends where it is read to.
-    fn keeps_row(&self) -> bool {
-        self.image.rows().keeps_row_cut_at(self.raw.total)
-    }
-
-    /// Reads the next row, converting and pushing the columns `area` reads piece by
-    /// piece. A row the data ends within is padded with the samples whole decoding
-    /// pads it with, those past the mask's data pushed at once, or dropped.
-    fn read_row(&mut self, area: &mut Area<'_>) -> Result<RowEnd, Stop> {
+    /// Reads row `y`, converting and pushing the columns `area` reads piece by piece.
+    /// Samples the data does not hold are stored zero, those past the mask's data
+    /// too pushed at once; where only whole rows count, a row the data ends within
+    /// is all stored zero, or missing where short rows are transparent. Fails with
+    /// [`Stop::Retry`] where such a row turns out short after part of it was pushed.
+    fn read_row(&mut self, y: u32, area: &mut Area<'_>) -> Result<RowEnd, Stop> {
+        let reads = self.reads(y);
+        if !reads && self.image.transparent {
+            return Ok(RowEnd::Missing);
+        }
+        let granular = self.image.byte_granular();
         let columns = area.columns();
         let n = self.image.colour.components();
         let (c0, c1) = (columns.start as usize, columns.end as usize);
@@ -787,10 +759,13 @@ impl<'s, 'a> ImagePass<'s, 'a> {
         if let Some(m) = &mut self.mask {
             m.rows.begin_row();
         }
-        let mut held = self.raw.skip(self.image.colour.bytes(start))?;
-        if !held && !self.keeps_row() {
+        // Whether the data holds the samples from `col` on.
+        let mut held = reads && self.raw.skip(self.image.colour.bytes(start))?;
+        if reads && !held && self.image.transparent {
             return Ok(RowEnd::Missing);
         }
+        let mut cut = reads && !held && granular;
+        let mut pushed = false;
         // Whether the mask's row holds data from `col` on.
         let mut mask_held = self.mask.is_some();
         let mut col = start;
@@ -804,39 +779,47 @@ impl<'s, 'a> ImagePass<'s, 'a> {
             }
             let len = piece.min(c1 - col);
             let (got, wanted) = self.read_samples(len, held)?;
-            let mut held_texels = len;
             if got < wanted {
-                held_texels = self.image.colour.texels_in(got);
-                if held && !self.keeps_row() {
-                    // Only the first row of the data can be too short to keep (a later
-                    // row is padded with at most the samples before it), and data
-                    // that holds no row fails.
-                    return Ok(RowEnd::Missing);
+                if held && !granular {
+                    if pushed {
+                        return Err(Stop::Retry);
+                    }
+                    if self.image.transparent {
+                        return Ok(RowEnd::Missing);
+                    }
                 }
+                cut |= held && granular;
                 held = false;
-                self.pad_samples(len, got);
+                self.pad_samples(len, if granular { got } else { 0 });
             }
             if let Some(m) = &mut self.mask {
-                mask_held = m.rows.alpha(col..col + len, &mut m.alpha[..len])? == len;
+                mask_held = m.rows.alpha(col..col + len, &mut m.alpha[..len])?;
             }
-            let texels = self.texels(len, held_texels)?;
+            let texels = self.texels(len)?;
             let skipped = texels.len() / len * (first - col);
             area.push_texels(first as u32, &texels[skipped..])?;
+            pushed = true;
             col += len;
         }
-        let row = if held {
-            self.raw.finish()?
-        } else {
-            RawRow::Partial
-        };
+        if held {
+            match self.raw.finish()? {
+                RawRow::Full => {}
+                _ if granular => cut = true,
+                // The data ends past the columns pushed, within the row.
+                _ => return Err(Stop::Retry),
+            }
+        }
         if let Some(m) = &mut self.mask {
             m.rows.end_row()?;
         }
-        let end = self.row_end(row);
-        if !matches!(end, RowEnd::Missing) {
-            area.end_row()?;
-        }
-        Ok(end)
+        area.end_row()?;
+        Ok(if cut {
+            RowEnd::Cut
+        } else if held {
+            RowEnd::Whole
+        } else {
+            RowEnd::Zero
+        })
     }
 
     /// Reads the stored bytes of the next `len` texels, if the data still holds the
@@ -868,40 +851,38 @@ impl<'s, 'a> ImagePass<'s, 'a> {
         matches!(self.image.alpha, Alpha::ColourKey(_))
     }
 
-    /// Pads the samples of the next `len` texels past the `got` stored bytes read.
+    /// The samples of the next `len` texels, of which the first `got` stored bytes
+    /// were read, the rest stored zero.
     fn pad_samples(&mut self, len: usize, got: usize) {
         let stored = self.stored();
         let colour = &self.image.colour;
         let n = colour.components();
         if self.packed.is_empty() {
-            self.samples[got..len * n].fill(colour.fill());
+            self.samples[got..len * n].fill(0);
             return;
         }
         colour.unpack(&self.packed[..got], &mut self.samples[..len * n], stored);
     }
 
-    /// The texel to push for padded samples the mask's data does not reach either.
+    /// The texel to push for samples stored zero that the mask's data does not
+    /// reach either.
     fn padding(&mut self) -> Result<&[u8], Stop> {
         let stored = self.stored();
         let colour = &self.image.colour;
         let n = colour.components();
         colour.unpack(&[], &mut self.samples[..n], stored);
         if let Some(m) = &mut self.mask {
-            m.alpha[0] = 0;
+            m.alpha[0] = m.rows.fill();
         }
-        self.texels(1, 0)
+        self.texels(1)
     }
 
-    /// The texels to push of the first `len` samples read, of which the data held the
-    /// first `held`, with their alpha read.
-    fn texels(&mut self, len: usize, held: usize) -> Result<&[u8], Stop> {
+    /// The texels to push of the first `len` samples read, with their alpha read.
+    fn texels(&mut self, len: usize) -> Result<&[u8], Stop> {
         let n = self.image.colour.components();
         let samples = &mut self.samples[..len * n];
         if let Alpha::ColourKey(key) = &self.image.alpha {
             colour_key_alpha(samples, n, key, &mut self.key_alpha);
-            if self.image.colour.pads_mapped() {
-                self.key_alpha[held..].fill(0);
-            }
             self.image.colour.map(samples);
         }
         let colour = self.image.colour.convert(samples, &mut self.rgb)?;
@@ -950,10 +931,15 @@ struct MaskPass<'a> {
 }
 
 impl<'a> MaskPass<'a> {
-    fn new(mask: &'a MaskSource<'a>, area: &Area<'_>, meter: &'a Meter<'a>) -> Result<Self, Stop> {
+    fn new(
+        mask: &'a MaskSource<'a>,
+        end: &'a OnceLock<usize>,
+        area: &Area<'_>,
+        meter: &'a Meter<'a>,
+    ) -> Result<Self, Stop> {
         let (_, h) = mask.size();
         Ok(Self {
-            rows: mask.rows(meter).ok_or(Stop::Failed)?,
+            rows: mask.rows(end, meter).ok_or(Stop::Failed)?,
             alpha: vec![0; piece_texels(area.columns().len(), 1)],
             height: h,
             decoded: 0,
@@ -968,7 +954,7 @@ impl<'a> MaskPass<'a> {
     }
 
     /// Moves past the rows before those `area` reads, then reads and pushes those.
-    fn run(&mut self, area: &mut Area<'_>) -> Result<(), Cancelled> {
+    fn run(&mut self, area: &mut Area<'_>) -> Result<(), Stop> {
         let (wanted, columns) = (area.rows(), area.columns());
         let (c0, c1) = (columns.start as usize, columns.end as usize);
         let end = wanted.end.min(self.height);
@@ -981,21 +967,27 @@ impl<'a> MaskPass<'a> {
         Ok(())
     }
 
-    /// Reads the next row, pushing `columns` of it.
-    fn read_row(&mut self, area: &mut Area<'_>, columns: Range<usize>) -> Result<(), Cancelled> {
+    /// Reads the next row, pushing `columns` of it; past the mask's data, stored
+    /// zero's alpha at once.
+    fn read_row(&mut self, area: &mut Area<'_>, columns: Range<usize>) -> Result<(), Stop> {
         self.rows.begin_row();
+        if self.rows.fills_row() {
+            area.push_rest(columns.start as u32, &[self.rows.fill()])?;
+            self.rows.end_row()?;
+            area.end_row()?;
+            return Ok(());
+        }
         let mut col = columns.start;
         while col < columns.end {
             let len = self.alpha.len().min(columns.end - col);
             let alpha = &mut self.alpha[..len];
-            let present = self.rows.alpha(col..col + len, alpha)?;
-            area.push_texels(col as u32, &alpha[..present])?;
-            if present < len {
-                // The rest of a last row cut short is transparent.
-                area.push_rest((col + present) as u32, &[0])?;
+            let held = self.rows.alpha(col..col + len, alpha)?;
+            area.push_texels(col as u32, alpha)?;
+            col += len;
+            if !held && col < columns.end {
+                area.push_rest(col as u32, &[self.rows.fill()])?;
                 break;
             }
-            col += len;
         }
         self.rows.end_row()?;
         area.end_row()?;

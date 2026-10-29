@@ -7,7 +7,7 @@ mod tests {
     use super::super::differential::assert_streams_as_whole;
     use super::super::tests::{
         assert_asset_streams_as_decoded, asset, image, is_streamed, named, pdf, request, transfer,
-        try_whole, whole,
+        whole,
     };
     use std::sync::Arc;
 
@@ -60,50 +60,45 @@ mod tests {
         }
     }
 
-    /// Data that ends before the image's rows: the missing rows are white where whole
-    /// decoding pads them (few, after data that decodes through), and transparent
-    /// where it leaves them out; data that breaks off keeps the rows before; data that
-    /// holds no row fails as decoding it whole does, at the first request.
+    /// Data that ends before the image's rows, breaks off within them or holds none
+    /// of them: the image keeps its declared rows, and those the data does not give
+    /// are black, whatever `BlackIs1` says, as `MuPDF` draws them.
     #[test]
     fn ccitt_data_that_ends_early_streams_as_decoded() {
         let gray = "/ColorSpace /DeviceGray /BitsPerComponent 1";
-        for (height, data, rows) in [
-            // Padded: fewer missing rows than rows decoded.
-            (150, G4_EOFB.to_vec(), 150..151),
-            // Left out: more missing rows than rows decoded, and above the small
-            // image's padding.
-            (5_000, G4_EOFB.to_vec(), 96..97),
-            // Left out: the data, without an end-of-block code, fails past its rows.
-            (150, G4.to_vec(), 96..97),
-            // Broken off within its rows.
-            (96, G4[..G4.len() / 2].to_vec(), 1..96),
+        for (height, data) in [
+            (150, G4_EOFB.to_vec()),
+            (5_000, G4_EOFB.to_vec()),
+            // Without an end-of-block code: the data fails past its rows.
+            (150, G4.to_vec()),
+            (96, G4[..G4.len() / 2].to_vec()),
+            (96, vec![0xFF; 4]),
+            (96, vec![0; 4]),
+            (96, vec![0x12, 0x34, 0x56, 0x78]),
+            (96, vec![]),
         ] {
-            let pdf = pdf(&[(
-                image(&format!("{gray} {}", ccitt(-1, "")), 211, height),
-                data,
-            )]);
-            let asset = asset(&pdf);
-            assert_streams_as_whole(&asset, &format!("height {height}"));
-            let source = asset.open(None, None).unwrap();
-            assert_eq!(source.layout().image.height, height);
-            let kept = try_whole(&asset).unwrap().layout().image.height;
-            assert!(rows.contains(&kept), "height {height}: {kept} rows");
+            for params in ["", "/BlackIs1 true"] {
+                let case = format!("height {height}, {} bytes, {params}", data.len());
+                let pdf = pdf(&[(
+                    image(&format!("{gray} {}", ccitt(-1, params)), 211, height),
+                    data.clone(),
+                )]);
+                let asset = asset(&pdf);
+                assert_streams_as_whole(&asset, &case);
+                let mut whole = whole(&asset);
+                assert_eq!(whole.layout().image.height, height, "{case}");
+                let last = request(
+                    &mut whole,
+                    Plane::Image,
+                    (211, height),
+                    [0, height - 1, 211, height],
+                );
+                assert!(
+                    last.data.iter().all(|&v| v == 0),
+                    "{case}: the last row is black"
+                );
+            }
         }
-        // Data that holds no row: where whole decoding fails, so does a request.
-        let mut failed = 0;
-        for data in [
-            vec![0xFF; 4],
-            vec![0; 4],
-            vec![0x12, 0x34, 0x56, 0x78],
-            vec![],
-        ] {
-            let case = format!("{data:?}");
-            let pdf = pdf(&[(image(&format!("{gray} {}", ccitt(-1, "")), 211, 96), data)]);
-            let asset = asset(&pdf);
-            assert_streams_as_whole(&asset, &case);
-            failed += usize::from(try_whole(&asset).is_none());
-        }
-        assert!(failed > 0);
     }
 
     /// Opening reads none of the data, and a request decodes the rows through the
@@ -136,7 +131,7 @@ mod tests {
     }
 
     /// A request of the first row of data that breaks off later returns it, as whole
-    /// decoding does.
+    /// decoding does, and the rows past the break are black.
     #[test]
     fn a_request_before_the_data_breaks_returns_its_rows() {
         let gray = "/ColorSpace /DeviceGray /BitsPerComponent 1";
@@ -149,9 +144,10 @@ mod tests {
         let a = request(&mut source, Plane::Image, (211, 96), [0, 0, 211, 1]);
         assert_eq!(source.work().rows_decoded, 1);
         let mut whole = whole(&asset);
-        let kept = whole.layout().image.height;
-        assert!(kept < 96);
-        let b = request(&mut whole, Plane::Image, (211, kept), [0, 0, 211, 1]);
+        assert_eq!(whole.layout().image.height, 96);
+        let b = request(&mut whole, Plane::Image, (211, 96), [0, 0, 211, 1]);
         assert_eq!(a.data, b.data);
+        let last = request(&mut source, Plane::Image, (211, 96), [0, 95, 211, 96]);
+        assert!(last.data.iter().all(|&v| v == 0));
     }
 }

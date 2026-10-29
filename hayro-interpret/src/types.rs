@@ -45,7 +45,7 @@ impl<'a, 'b> StencilImage<'a, 'b> {
         target_dimension: Option<(u32, u32)>,
     ) {
         if let Some(decoded) = self.image_xobject.decoded_mask(target_dimension) {
-            func(decoded.luma, &self.paint);
+            func(decoded.into_whole(), &self.paint);
         }
     }
 
@@ -105,7 +105,8 @@ impl RasterImage<'_> {
         target_dimension: Option<(u32, u32)>,
     ) {
         if let Some(decoded) = self.0.decoded_image(target_dimension) {
-            func(decoded.image, decoded.alpha);
+            let (image, alpha) = decoded.into_whole();
+            func(image, alpha);
         }
     }
 
@@ -293,6 +294,14 @@ impl ImageData {
         match self {
             Self::Rgb(d) => d.scale_factors,
             Self::Luma(d) => d.scale_factors,
+        }
+    }
+
+    /// The samples, the rows they hold, and the channels of a texel.
+    pub(crate) fn rows_mut(&mut self) -> (&mut Vec<u8>, &mut u32, usize) {
+        match self {
+            Self::Rgb(d) => (&mut d.data, &mut d.height, 3),
+            Self::Luma(d) => (&mut d.data, &mut d.height, 1),
         }
     }
 }

@@ -1,7 +1,7 @@
 use super::mask::decode_mask;
 use super::{
-    DecodeContext, decode_context, decode_u8_samples, fix_image_length, in_pieces, into_owned,
-    pixel_piece, unpack_samples,
+    DecodeContext, Rows, decode_context, decode_u8_samples, in_pieces, into_owned, pixel_piece,
+    repeat_last_row, short_rows_transparent, unpack_samples,
 };
 use crate::color::{ColorComponents, ColorSpace, ToLuma, ToRgb};
 use crate::interpret::state::ActiveTransferFunction;
@@ -46,8 +46,35 @@ pub(crate) fn direct_invert(
 }
 
 pub(crate) struct DecodedImage {
+    /// The colour: the rows its data holds, and those `rows` covers past them.
     pub(crate) image: ImageData,
-    pub(crate) alpha: Option<LumaData>,
+    pub(crate) rows: Rows,
+    /// Alpha on the grid the colour declares holds the colour's rows and covers
+    /// `rows`; a mask on another grid lies on the rows the colour declares.
+    pub(crate) alpha: Option<(LumaData, Rows)>,
+}
+
+impl DecodedImage {
+    /// The colour and alpha with every row they cover, the last row each holds
+    /// repeated: as large as the image intact.
+    pub(crate) fn into_whole(self) -> (ImageData, Option<LumaData>) {
+        let meter = Meter::default();
+        let mut image = self.image;
+        let width = image.width() as usize;
+        let (data, height, channels) = image.rows_mut();
+        if self.rows.repeat {
+            repeat_last_row(data, width * channels, self.rows.declared, &meter);
+            *height = self.rows.declared;
+        }
+        let alpha = self.alpha.map(|(mut a, rows)| {
+            if rows.repeat {
+                repeat_last_row(&mut a.data, a.width as usize, rows.declared, &meter);
+                a.height = rows.declared;
+            }
+            a
+        });
+        (image, alpha)
+    }
 }
 
 /// The image decoded whole, its work counted on `meter`; `None` also once the
@@ -77,7 +104,7 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
         target_dimension: Option<(u32, u32)>,
         meter: &'m Meter<'m>,
     ) -> Option<Self> {
-        let ctx = decode_context(obj, target_dimension, meter)?;
+        let ctx = decode_context(obj, target_dimension, short_rows_transparent(obj), meter)?;
         let color_key_mask = obj.stream.dict().get::<SmallVec<[u16; 4]>>(MASK);
 
         Some(Self {
@@ -92,9 +119,26 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
 
     fn decode(mut self) -> Option<DecodedImage> {
         let mut image = self.decode_image()?;
-        let alpha = self.decode_alpha(&mut image);
+        let mut rows = self.ctx.rows;
+        let matte = self.resolve_matte();
+        let on_grid = |(a, a_rows): &(LumaData, Rows)| {
+            (a.width, a_rows.declared) == (self.ctx.width, rows.declared)
+        };
+        // A mask lies on the grid the colour declares.
+        let (mut alpha, matte) = match matte {
+            Some((alpha, matte_rgb)) if on_grid(&alpha) => (Some(alpha), Some(matte_rgb)),
+            _ => (self.decode_alpha(), None),
+        };
+        if let Some((a, a_rows)) = &mut alpha
+            && (a.width, a_rows.declared) == (self.ctx.width, rows.declared)
+        {
+            share_rows(&mut image, &mut rows, a, a_rows, self.meter)?;
+            if let Some(matte_rgb) = matte {
+                unpremultiply(&mut image, &a.data, &matte_rgb, self.meter)?;
+            }
+        }
 
-        Some(DecodedImage { image, alpha })
+        Some(DecodedImage { image, rows, alpha })
     }
 
     fn decode_image(&mut self) -> Option<ImageData> {
@@ -116,15 +160,7 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
             // This is actually the most common case, where the PDF is embedded
             // in such a way where we don't need to decode. In this case,
             // we can use the raw decoded component values directly.
-            let mut data = into_owned(core::mem::take(&mut self.ctx.decoded.data), meter)?;
-            fix_image_length(
-                &mut data,
-                self.ctx.width,
-                &mut self.ctx.height,
-                0,
-                num_components,
-                meter,
-            )?;
+            let data = into_owned(core::mem::take(&mut self.ctx.decoded.data), meter)?;
             self.ctx.decoded.data = data.into();
 
             if self.color_key_mask.is_some() {
@@ -137,7 +173,7 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
 
             core::mem::take(&mut self.ctx.decoded.data).into_owned()
         } else {
-            let mut components = decode_u8_samples(
+            decode_u8_samples(
                 &self.ctx.decoded.data,
                 self.ctx.width,
                 self.ctx.height,
@@ -145,18 +181,7 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
                 self.ctx.bits_per_component,
                 &self.ctx.decode_arr,
                 meter,
-            )?;
-
-            fix_image_length(
-                &mut components,
-                self.ctx.width,
-                &mut self.ctx.height,
-                0,
-                num_components,
-                meter,
-            )?;
-
-            components
+            )?
         };
 
         if self
@@ -247,16 +272,7 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
         Some(())
     }
 
-    fn decode_alpha(&mut self, image: &mut ImageData) -> Option<LumaData> {
-        if let Some((alpha, matte_rgb)) = self.resolve_matte()
-            && alpha.width == self.ctx.width
-            && alpha.height == self.ctx.height
-        {
-            unpremultiply(image, &alpha.data, &matte_rgb, self.meter)?;
-
-            return Some(alpha);
-        }
-
+    fn decode_alpha(&mut self) -> Option<(LumaData, Rows)> {
         // If the alpha channel is invalid, return no alpha so the main image can
         // still be returned (see PDFJS-19611).
         let dict = self.obj.stream.dict();
@@ -268,22 +284,18 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
                 .image_data
                 .as_mut()
                 .and_then(|image| image.alpha.take())?;
-            fix_image_length(
-                &mut data,
-                self.ctx.width,
-                &mut self.ctx.height,
-                0,
-                1,
-                self.meter,
-            )?;
+            data.resize(self.ctx.width as usize * self.ctx.height as usize, 0);
 
-            Some(LumaData {
-                data,
-                width: self.ctx.width,
-                height: self.ctx.height,
-                interpolate: self.obj.interpolate,
-                scale_factors: self.ctx.scale_factors,
-            })
+            Some((
+                LumaData {
+                    data,
+                    width: self.ctx.width,
+                    height: self.ctx.height,
+                    interpolate: self.obj.interpolate,
+                    scale_factors: self.ctx.scale_factors,
+                },
+                self.ctx.rows,
+            ))
             // Note: `SMASK` field takes precedence over `MASK`, so order matters here.
         } else if let Some(s_mask) = dict
             .get::<Stream<'_>>(SMASK)
@@ -291,17 +303,19 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
         {
             let obj = ImageXObject::new_mask(&s_mask, &self.obj.warning_sink, &self.obj.cache)?;
 
-            decode_mask(&obj, self.target_dimension, self.meter).map(|decoded| decoded.luma)
+            decode_mask(&obj, self.target_dimension, self.meter).map(|m| (m.luma, m.rows))
         } else if self.color_key_mask.is_some() {
-            self.decoded_color_key_mask
-                .take()
-                .or_else(|| self.decode_color_key_mask())
+            let mask = self.decoded_color_key_mask.take();
+            Some((
+                mask.or_else(|| self.decode_color_key_mask())?,
+                self.ctx.rows,
+            ))
         } else {
             None
         }
     }
 
-    fn resolve_matte(&self) -> Option<(LumaData, [u8; 3])> {
+    fn resolve_matte(&self) -> Option<((LumaData, Rows), [u8; 3])> {
         let s_mask = self.obj.stream.dict().get::<Stream<'_>>(SMASK)?;
         let matte = s_mask.dict().get::<ColorComponents>(MATTE)?;
 
@@ -315,9 +329,9 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
         self.ctx.color_space.convert_values(&matte, &mut matte_rgb);
 
         let mask_obj = ImageXObject::new_mask(&s_mask, &self.obj.warning_sink, &self.obj.cache)?;
-        let alpha = decode_mask(&mask_obj, self.target_dimension, self.meter)?.luma;
+        let alpha = decode_mask(&mask_obj, self.target_dimension, self.meter)?;
 
-        Some((alpha, matte_rgb))
+        Some(((alpha.luma, alpha.rows), matte_rgb))
     }
 
     fn decode_color_key_mask(&self) -> Option<LumaData> {
@@ -348,17 +362,40 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
             self.meter.work(piece.len()).ok()?;
         }
 
-        let mut height = self.ctx.height;
-        fix_image_length(&mut data, self.ctx.width, &mut height, 0, 1, self.meter)?;
-
         Some(LumaData {
             data,
             width: self.ctx.width,
-            height,
+            height: self.ctx.height,
             interpolate: self.obj.interpolate,
             scale_factors: self.ctx.scale_factors,
         })
     }
+}
+
+/// The colour and alpha on its grid made to hold the same rows, which both then
+/// cover: the alpha's rows past the colour's dropped where those are transparent, and
+/// otherwise the plane holding fewer rows given the other's by repeating its last.
+fn share_rows(
+    image: &mut ImageData,
+    rows: &mut Rows,
+    alpha: &mut LumaData,
+    alpha_rows: &mut Rows,
+    meter: &Meter<'_>,
+) -> Option<()> {
+    let (data, height, channels) = image.rows_mut();
+    let held = if rows.repeat {
+        (*height).max(alpha.height)
+    } else {
+        *height
+    };
+    let row_len = alpha.width as usize * channels;
+    repeat_last_row(data, row_len, held, meter)?;
+    *height = held;
+    alpha.data.truncate(alpha.width as usize * held as usize);
+    repeat_last_row(&mut alpha.data, alpha.width as usize, held, meter)?;
+    alpha.height = held;
+    *alpha_rows = *rows;
+    Some(())
 }
 
 /// Undoes `/Matte` premultiplication of `image`, a counted piece at a time.

@@ -97,9 +97,8 @@ impl Cases {
     }
 }
 
-/// Requests of `asset` opened equal the same requests of it decoded whole. Where
-/// whole decoding leaves out the rows its data does not reach, streaming has them,
-/// transparent; where whole decoding fails, opening the image or requesting it does.
+/// Requests of `asset` opened equal the same requests of it decoded whole, over the
+/// same layout; where whole decoding fails, opening the image or requesting it does.
 pub(super) fn assert_streams_as_whole(asset: &ImageAsset, case: &str) {
     let streamed = asset.open(None, None);
     let (mut streamed, mut whole) = match (streamed, try_whole(asset)) {
@@ -123,11 +122,8 @@ pub(super) fn assert_streams_as_whole(asset: &ImageAsset, case: &str) {
         (Err(e), Some(_)) => panic!("{case}: opening fails ({e:?}), whole decoding does not"),
         (Err(e), None) => panic!("{case}: opening ends {e:?}, whole decoding fails"),
     };
-    if streamed.layout() == whole.layout() {
-        assert_requests_equal(&mut streamed, &mut whole, case);
-        return;
-    }
-    assert_missing_rows_transparent(&mut streamed, &mut whole, case);
+    assert_eq!(streamed.layout(), whole.layout(), "{case}");
+    assert_requests_equal(&mut streamed, &mut whole, case);
 }
 
 /// Requests of every plane of `streamed`, at full size and reduced, of the whole
@@ -158,49 +154,6 @@ fn assert_requests_equal(streamed: &mut ImageSource<'_>, whole: &mut ImageSource
             }
         }
     }
-}
-
-/// `streamed` has the rows `whole` leaves out, past its data: the rows `whole` has
-/// are the same, with alpha where `whole` has none, and the rest transparent.
-fn assert_missing_rows_transparent(
-    streamed: &mut ImageSource<'_>,
-    whole: &mut ImageSource<'_>,
-    case: &str,
-) {
-    let (s, w) = (*streamed.layout(), *whole.layout());
-    assert_eq!((s.mask, w.mask), (None, None), "{case}: {s:?} {w:?}");
-    let (si, wi) = (s.image, w.image);
-    assert_eq!(
-        (si.width, si.to_image, si.interpolate),
-        (wi.width, wi.to_image, wi.interpolate),
-        "{case}"
-    );
-    assert!(si.height > wi.height, "{case}: {si:?} {wi:?}");
-    let a = request(
-        streamed,
-        Plane::Image,
-        (si.width, si.height),
-        [0, 0, si.width, si.height],
-    );
-    let b = request(
-        whole,
-        Plane::Image,
-        (wi.width, wi.height),
-        [0, 0, wi.width, wi.height],
-    );
-    let c = b.format.channels();
-    let expected: Vec<u8> = if a.format == b.format {
-        b.data.clone()
-    } else {
-        assert_eq!(a.format, b.format.with_alpha(), "{case}");
-        b.data
-            .chunks_exact(c)
-            .flat_map(|t| t.iter().copied().chain([255]))
-            .collect()
-    };
-    let (present, missing) = a.data.split_at(expected.len());
-    assert_eq!(present, expected, "{case}");
-    assert!(missing.iter().all(|&v| v == 0), "{case}");
 }
 
 /// A colour space of `n` components: its entry, and whether it is `Indexed`.
@@ -450,15 +403,12 @@ fn stencil_masks_cut_stream_as_whole() {
 }
 
 /// The bytes to cut data of rows of `row_bytes` bytes after, `len` in all, where every
-/// byte takes too long: every byte within `NEAR` of a row's start or middle, or of
-/// `first` (where a first row cut short starts to be kept), and every `STRIDE`th
-/// byte between.
-fn sampled(len: usize, row_bytes: usize, first: usize) -> Vec<usize> {
+/// byte takes too long: every byte within `NEAR` of a row's start or middle (past the
+/// first piece a request pushes of it), and every `STRIDE`th byte between.
+fn sampled(len: usize, row_bytes: usize) -> Vec<usize> {
     const NEAR: usize = 4;
     const STRIDE: usize = 8191;
-    let marks = (0..=2 * len / row_bytes)
-        .map(|k| k * row_bytes / 2)
-        .chain([first]);
+    let marks = (0..=2 * len / row_bytes).map(|k| k * row_bytes / 2);
     let mut at: Vec<usize> = marks
         .flat_map(|m| m.saturating_sub(NEAR)..=m + NEAR)
         .chain((0..len).step_by(STRIDE))
@@ -486,19 +436,15 @@ fn wide_gray(w: u32, bits: usize, extra: &str) -> (String, Vec<u8>) {
 }
 
 /// Images of `dict`, rows of `w` texels of `n` components of `bits` each wider
-/// than a piece of work, and than a first row cut short is kept at whatever it
-/// holds (`MIN_ROW_PAD` samples of padding), under `mask` (object 4), cut short at
-/// a dense sample of bytes ([`sampled`]): every byte of them takes minutes.
+/// than a piece of work, so that a request finds Flate data ending within a row after
+/// pushing part of it, under `mask` (object 4), cut short at a dense sample of bytes
+/// ([`sampled`]): every byte of them takes minutes.
 fn wide_cut(dict: &str, w: u32, n: usize, bits: usize, mask: Option<(String, Vec<u8>)>) {
-    const MIN_ROW_PAD: usize = 1 << 16;
     let mut cases = Cases::default();
-    let row_len = w as usize * n;
-    let row_bytes = (row_len * bits).div_ceil(8);
+    let row_bytes = (w as usize * n * bits).div_ceil(8);
     let data = samples(row_bytes * WIDE_H as usize, 53);
-    // The bytes past which a first row is kept for its padding alone.
-    let first = ((row_len - MIN_ROW_PAD) * bits).div_ceil(8);
     let mask = mask.unwrap_or_else(|| wide_gray(1, 8, ""));
-    for (filter, stored) in cuts_at(&data, |len| sampled(len, row_bytes, first)) {
+    for (filter, stored) in cuts_at(&data, |len| sampled(len, row_bytes)) {
         for (k, stored) in stored {
             let pdf = pdf(&[
                 (image(&format!("{dict} {filter}"), w, WIDE_H), stored),
@@ -608,8 +554,7 @@ type Mask = (String, u32, u32, Vec<u8>);
 
 /// CCITT images that are indexed or have masks of every kind, and images whose
 /// mask is CCITT data, the CCITT data cut after every eighth byte (the other data
-/// complete), with the declared rows of the page and more than its data holds
-/// (padded white where whole decoding pads, which the mask's grid depends on).
+/// complete), with the declared rows of the page and more than its data holds.
 #[test]
 fn indexed_and_masked_ccitt_cut_streams_as_whole() {
     let mut cases = Cases::default();

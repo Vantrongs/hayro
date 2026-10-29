@@ -3,6 +3,7 @@
 use super::rows::{PIECE_BYTES, piece_texels};
 use super::{ImageLayout, PixelFormat, Plane, PlaneLayout, Stop, interleave, premultiply};
 use crate::x_object::area::Area;
+use crate::x_object::decode::{DecodedImage, DecodedMask, Rows};
 use crate::{ImageData, LumaData};
 use hayro_syntax::work::{Cancelled, Meter};
 
@@ -14,18 +15,25 @@ pub(super) struct Decoded {
     same_grid: bool,
     /// Whether `image` is a stencil mask's alpha, drawn as a mask is.
     stencil: bool,
+    /// The rows `image`'s plane covers, and `alpha`'s, past the rows they hold.
+    rows: Rows,
+    alpha_rows: Rows,
 }
 
 impl Decoded {
-    pub(super) fn new(
-        mut image: ImageData,
-        alpha: Option<LumaData>,
-        meter: &Meter<'_>,
-    ) -> Result<Self, Cancelled> {
+    /// The colour and alpha of an image decoded whole.
+    pub(super) fn new(decoded: DecodedImage, meter: &Meter<'_>) -> Result<Self, Cancelled> {
+        let DecodedImage {
+            mut image,
+            rows,
+            alpha,
+        } = decoded;
+        let (alpha, alpha_rows) = alpha.map_or((None, rows), |(a, r)| (Some(a), r));
         let (w, h) = (image.width(), image.height());
-        let same_grid = alpha
-            .as_ref()
-            .is_some_and(|a| (a.width, a.height) == (w, h) && a.interpolate == image.interpolate());
+        // Alpha on the colour's grid holds the colour's rows (`DecodedImage`).
+        let same_grid = alpha.as_ref().is_some_and(|a| {
+            (a.width, a.height, alpha_rows) == (w, h, rows) && a.interpolate == image.interpolate()
+        });
         if same_grid && let Some(a) = &alpha {
             let (data, c) = match &mut image {
                 ImageData::Rgb(d) => (&mut d.data, 3),
@@ -42,13 +50,17 @@ impl Decoded {
             alpha,
             same_grid,
             stencil: false,
+            rows,
+            alpha_rows,
         })
     }
 
     /// A stencil mask: its one plane is the alpha the paint is drawn through.
-    pub(super) fn stencil(mask: LumaData) -> Self {
+    pub(super) fn stencil(mask: DecodedMask) -> Self {
         Self {
-            image: ImageData::Luma(mask),
+            rows: mask.rows,
+            alpha_rows: mask.rows,
+            image: ImageData::Luma(mask.luma),
             alpha: None,
             same_grid: false,
             stencil: true,
@@ -56,7 +68,7 @@ impl Decoded {
     }
 
     pub(super) fn layout(&self) -> ImageLayout {
-        let (w, h) = (self.image.width(), self.image.height());
+        let (w, h) = (self.image.width(), self.rows.declared);
         let (sx, sy) = self.image.scale_factors();
         let format = match (&self.image, self.same_grid) {
             (ImageData::Luma(_), _) if self.stencil => PixelFormat::Alpha,
@@ -79,10 +91,10 @@ impl Decoded {
                 .filter(|_| !self.same_grid)
                 .map(|a| PlaneLayout {
                     width: a.width,
-                    height: a.height,
+                    height: self.alpha_rows.declared,
                     to_image: (
                         sx as f64 * w as f64 / a.width as f64,
-                        sy as f64 * h as f64 / a.height as f64,
+                        sy as f64 * h as f64 / f64::from(self.alpha_rows.declared),
                     ),
                     interpolate: a.interpolate,
                     format: PixelFormat::Alpha,
@@ -90,18 +102,29 @@ impl Decoded {
         }
     }
 
-    /// Pushes the rows of `plane` that `area` reads, a piece at a time; returns how
-    /// many.
+    /// Pushes the rows of `plane` that `area` reads and the plane covers, a piece at
+    /// a time; returns how many.
     pub(super) fn run(&self, plane: Plane, area: &mut Area<'_>) -> Result<u32, Stop> {
         let (rows, cols) = (area.rows(), area.columns());
         let (c0, c1) = (cols.start as usize, cols.end as usize);
-        let (data, c, w) = match (plane, &self.image) {
+        let (data, c, w, held, covers) = match (plane, &self.image) {
             (Plane::Mask, _) => {
                 let a = self.alpha.as_ref().ok_or(Stop::Failed)?;
-                (&a.data, 1, a.width as usize)
+                (&a.data, 1, a.width as usize, a.height, self.alpha_rows)
             }
-            (Plane::Image, ImageData::Rgb(d)) => (&d.data, 3, d.width as usize),
-            (Plane::Image, ImageData::Luma(d)) => (&d.data, 1, d.width as usize),
+            (Plane::Image, ImageData::Rgb(d)) => {
+                (&d.data, 3, d.width as usize, d.height, self.rows)
+            }
+            (Plane::Image, ImageData::Luma(d)) => {
+                (&d.data, 1, d.width as usize, d.height, self.rows)
+            }
+        };
+        // Rows past those held that are transparent are not pushed.
+        let rows = if covers.repeat {
+            rows
+        } else {
+            let end = rows.end.min(held);
+            rows.start.min(end)..end
         };
         let alpha = (plane == Plane::Image && self.same_grid)
             .then_some(self.alpha.as_ref())
@@ -109,6 +132,17 @@ impl Decoded {
         let piece = piece_texels(c1 - c0, c + 1);
         let mut texels_with_alpha = Vec::with_capacity(piece * (c + 1));
         for y in rows.clone() {
+            if y >= held {
+                // The rows past those held repeat the last, all stored zero.
+                let at = (held - 1) as usize * w;
+                let mut texel = data[at * c..(at + 1) * c].to_vec();
+                if let Some(a) = alpha {
+                    texel.push(a.data[at]);
+                }
+                area.push_rest(c0 as u32, &texel)?;
+                area.end_row()?;
+                continue;
+            }
             let at = y as usize * w;
             for col in (c0..c1).step_by(piece) {
                 let end = (col + piece).min(c1);

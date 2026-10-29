@@ -94,10 +94,10 @@ pub(super) fn try_whole(asset: &ImageAsset) -> Option<ImageSource<'_>> {
     let meter = Meter::default();
     let obj = asset.xobject().unwrap();
     let decoded = if obj.kind == ImageKind::StencilMask {
-        Decoded::stencil(decode_mask(&obj, None, &meter)?.luma)
+        Decoded::stencil(decode_mask(&obj, None, &meter)?)
     } else {
         let decoded = decode_image(&obj, None, &meter)?;
-        Decoded::new(decoded.image, decoded.alpha, &meter).unwrap()
+        Decoded::new(decoded, &meter).unwrap()
     };
     Some(ImageSource::new(
         decoded.layout(),
@@ -398,9 +398,9 @@ fn a_stencil_with_another_decode_streams_as_decoded() {
     differential::assert_streams_as_whole(&asset, "stencil /Decode [0.2 0.8]");
 }
 
-/// Rows of packed samples the data ends within stream as they decode whole: padded
-/// with samples whose value is not zero once decoded, with the texel the data ends
-/// within split, and a stencil mask's padding transparent whatever its `/Decode`.
+/// Rows of packed samples the data ends within stream as they decode whole: read as
+/// stored zero, whose value is not zero once decoded, and a stencil mask's painted
+/// or not as its `/Decode` says.
 #[test]
 fn packed_rows_cut_short_stream_as_decoded() {
     for w in [13_u32, 150_001] {
@@ -421,8 +421,7 @@ fn packed_rows_cut_short_stream_as_decoded() {
         ] {
             let row = (w as usize * n * bits).div_ceil(8);
             let data = noise(2 * row, 46);
-            // Into the last row, the first or the second; whole decoding keeps the
-            // rows present.
+            // Into the last row, the first or the second.
             let half = row.div_ceil(2);
             for (rows, cut) in [(1, half), (2, row + half), (2, row + 1)] {
                 named(&format!("{w} {dict} {cut}"), || {
@@ -433,14 +432,14 @@ fn packed_rows_cut_short_stream_as_decoded() {
     }
 }
 
-/// A stencil mask's rows its data does not reach are transparent; whole decoding
-/// leaves them out.
+/// A stencil mask's rows its data does not hold whole are stored zero: painted, and
+/// with `/Decode [1 0]` not painted.
 #[test]
-fn a_stencil_that_ends_early_leaves_the_rest_transparent() {
+fn a_stencil_that_ends_early_reads_the_rest_as_zero() {
     let (w, h) = (10_u32, 8_u32);
     let row = w.div_ceil(8);
     let bits = noise((row * h) as usize, 47);
-    for decode in ["", "/Decode [1 0]"] {
+    for (decode, fill) in [("", 255), ("/Decode [1 0]", 0)] {
         let pdf = pdf(&[(
             image(&format!("/ImageMask true {decode}"), w, h),
             bits[..(row * 3 + 1) as usize].to_vec(),
@@ -449,13 +448,13 @@ fn a_stencil_that_ends_early_leaves_the_rest_transparent() {
         let mut streamed = asset.open(None, None).unwrap();
         assert!(is_streamed(&streamed));
         let mut decoded = whole(&asset);
-        assert_eq!(decoded.layout().image.height, 4);
+        assert_eq!(decoded.layout().image.height, h);
         let a = request(&mut streamed, Plane::Image, (w, h), [0, 0, w, h]);
-        let b = request(&mut decoded, Plane::Image, (w, 4), [0, 0, w, 4]);
+        let b = request(&mut decoded, Plane::Image, (w, h), [0, 0, w, h]);
         assert_eq!(a.format, PixelFormat::Alpha);
-        let (present, missing) = a.data.split_at((w * 4) as usize);
-        assert_eq!(present, b.data, "{decode}");
-        assert!(missing.iter().all(|&v| v == 0), "{decode}");
+        assert_eq!(a.data, b.data, "{decode}");
+        let missing = &a.data[(w * 3) as usize..];
+        assert!(missing.iter().all(|&v| v == fill), "{decode}");
     }
 }
 
@@ -592,11 +591,12 @@ fn masks_that_end_early_stream_as_decoded() {
     }
 }
 
+/// 8-bit samples the data does not hold are stored zero: the short last row keeps
+/// the bytes it holds, and the rows after it are black.
 #[test]
-fn data_that_ends_early_leaves_the_rest_transparent() {
+fn data_that_ends_early_reads_the_rest_as_zero() {
     let (w, h) = (10_u32, 8_u32);
     let gray = noise((w * h) as usize, 4);
-    // A short last row is padded; the rows after it are missing.
     let cut = &gray[..(w * 3 + 4) as usize];
     let dict = image("/ColorSpace /DeviceGray /BitsPerComponent 8", w, h);
     for (dict, data) in [
@@ -607,26 +607,20 @@ fn data_that_ends_early_leaves_the_rest_transparent() {
         let asset = asset(&pdf);
         let mut streamed = asset.open(None, None).unwrap();
         let mut decoded = whole(&asset);
-        assert_eq!(decoded.layout().image.height, 4);
+        assert_eq!(decoded.layout().image.height, h);
         let a = request(&mut streamed, Plane::Image, (w, h), [0, 0, w, h]);
-        let b = request(&mut decoded, Plane::Image, (w, 4), [0, 0, w, 4]);
-        assert_eq!(a.format, PixelFormat::LumaAlpha);
-        let (present, missing) = a.data.split_at((w * 4 * 2) as usize);
-        let expected: Vec<u8> = b.data.iter().flat_map(|&v| [v, 255]).collect();
-        assert_eq!(present, expected);
+        let b = request(&mut decoded, Plane::Image, (w, h), [0, 0, w, h]);
+        assert_eq!(a.format, PixelFormat::Luma);
+        assert_eq!(a.data, b.data);
+        let (held, missing) = a.data.split_at(cut.len());
+        assert_eq!(held, cut);
         assert!(missing.iter().all(|&v| v == 0));
-        assert_eq!(streamed.work().rows_decoded, 4);
-        // Bins over present and missing rows are covered in part.
-        let half = request(&mut streamed, Plane::Image, (1, 2), [0, 0, 1, 2]);
-        assert_eq!(half.data[1], 255);
-        assert_eq!(half.data[3], 0);
     }
 }
 
 #[test]
 fn a_huge_declared_image_with_little_data_costs_the_data() {
-    // The short row is kept (padding it takes under `MIN_ROW_PAD`); a whole decode
-    // would hold `w` bytes, a request holds its bins.
+    // A request holds its bins, where a whole decode would hold `w * h` bytes.
     let (w, h) = (60_000, 1_000_000);
     let pdf = pdf(&[(
         image("/ColorSpace /DeviceGray /BitsPerComponent 8", w, h),
@@ -635,14 +629,10 @@ fn a_huge_declared_image_with_little_data_costs_the_data() {
     let asset = asset(&pdf);
     let mut source = asset.open(None, None).unwrap();
     let region = request(&mut source, Plane::Image, (100, 100), [0, 0, 100, 100]);
-    assert_eq!(region.format, PixelFormat::LumaAlpha);
-    assert_eq!(source.work().rows_decoded, 1);
-    assert!(region.data.chunks(2).all(|t| t == [0, 0]));
+    assert_eq!(region.format, PixelFormat::Luma);
+    assert!(region.data.iter().all(|&v| v == 0));
     let region = request(&mut source, Plane::Image, (w, h), [0, 0, 4, 2]);
-    assert_eq!(
-        region.data,
-        [7, 255, 7, 255, 7, 255, 7, 255, 0, 0, 0, 0, 0, 0, 0, 0]
-    );
+    assert_eq!(region.data, [7, 7, 7, 7, 0, 0, 0, 0]);
 }
 
 /// Rows read in pieces, under every kind of mask and from windows that start within
@@ -681,46 +671,50 @@ fn rows_wider_than_a_piece_stream_as_decoded() {
     )]);
 }
 
-/// Data whose first row is too short to pad holds no row: requests fail, as decoding
-/// it whole does, whether the row is read in pieces into texels kept whole or into
-/// sums, also after pieces of it were pushed, and when its data ends past the window.
+/// A row of packed samples the data ends within reads as stored zero, also when the
+/// data's end is found only after pieces of the row were pushed: the Flate data's
+/// length is not known before it is read, and the row is wider than a piece.
 #[test]
-fn a_short_wide_first_row_fails() {
+fn a_packed_row_found_short_after_pushing_reads_as_zero() {
     let (w, h) = (300_000_u32, 3_u32);
+    let row = (w as usize * 2).div_ceil(8);
+    let held = row + PIECE_BYTES + 100;
     let pdf = pdf(&[(
-        image("/ColorSpace /DeviceGray /BitsPerComponent 8", w, h),
-        noise(70_000, 16),
+        image(
+            "/ColorSpace /DeviceGray /BitsPerComponent 2 /Decode [1 0] /Filter /FlateDecode",
+            w,
+            h,
+        ),
+        zlib(&noise(held, 16)),
     )]);
     let asset = asset(&pdf);
-    assert!(try_whole(&asset).is_none());
-    let mut streamed = asset.open(None, None).unwrap();
+    let mut decoded = whole(&asset);
+    assert_eq!(decoded.layout().image.height, h);
     for grid in [(w, h), (w / 2, 2), (70, 2)] {
-        for window in [[0, 0, grid.0, grid.1], [0, 0, grid.0 / 70, 1]] {
-            let result = streamed.request(&ImageRequest {
-                plane: Plane::Image,
-                grid,
-                window,
-                cancel: None,
-            });
+        for window in [[0, 0, grid.0, grid.1], [0, 1, grid.0, 2]] {
+            let mut streamed = asset.open(None, None).unwrap();
+            let a = request(&mut streamed, Plane::Image, grid, window);
+            let b = request(&mut decoded, Plane::Image, grid, window);
             assert_eq!(
-                result.err(),
-                Some(RequestError::Failed),
+                (a.format, &a.data),
+                (b.format, &b.data),
                 "{grid:?} {window:?}"
             );
         }
     }
-    assert_eq!(streamed.work().rows_decoded, 0);
+    let mut streamed = asset.open(None, None).unwrap();
+    let second = request(&mut streamed, Plane::Image, (w, h), [0, 1, w, 2]);
+    assert!(second.data.iter().all(|&v| v == 255));
 }
 
 /// A row the data ends within pushes the texels its data holds, not the texels the
-/// row's width declares: one byte of a row 20 million samples wide fails the request
-/// before any texel is pushed, and the padding of a row kept, whose padded samples
-/// are not zero once inverted, is pushed at once.
+/// row's width declares: the rest of a row of one byte, whose stored zeros are not
+/// zero once inverted, is pushed at once.
 #[test]
 fn a_row_cut_short_pushes_the_texels_it_holds() {
     let gray = "/ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [1 0]";
-    for (w, data, kept) in [(20_000_000, 1, 0), (2_000_000, 1_000_001, 1)] {
-        let pdf = pdf(&[(image(gray, w, 2), noise(data, 17))]);
+    for w in [20_000_000, 2_000_000] {
+        let pdf = pdf(&[(image(gray, w, 2), noise(1, 17))]);
         let asset = asset(&pdf);
         let mut streamed = asset.open(None, None).unwrap();
         crate::x_object::area::PUSHED.set(0);
@@ -732,15 +726,9 @@ fn a_row_cut_short_pushes_the_texels_it_holds() {
         });
         let pushed = crate::x_object::area::PUSHED.get();
         assert!(pushed <= PIECE_BYTES as u64, "{w}: {pushed} texels pushed");
-        assert_eq!(streamed.work().rows_decoded, kept);
-        if kept == 0 {
-            assert_eq!(a.err(), Some(RequestError::Failed));
-        } else {
-            // Whole decoding keeps the rows present.
-            let a = a.unwrap();
-            let b = request(&mut whole(&asset), Plane::Image, (2, 1), [1, 0, 2, 1]);
-            assert_eq!((a.format, a.data), (b.format, b.data));
-        }
+        assert_eq!(streamed.work().rows_decoded, 1);
+        let a = a.unwrap();
+        assert_eq!((a.format, a.data), (PixelFormat::Luma, vec![255]));
     }
 }
 
@@ -751,15 +739,17 @@ fn a_row_cut_short_pushes_the_texels_it_holds() {
 fn rows_cut_short_stream_as_decoded() {
     let (w, h) = (150_001_u32, 2_u32);
     let colour = "/ColorSpace /DeviceRGB /BitsPerComponent 8 /Decode [1 0 1 0 1 0]";
-    // Into the last row, the first or the second; whole decoding keeps the rows
-    // present.
+    // Into the last row, the first or the second.
     let second = noise((w * 3 + w * 3 / 2 + 7) as usize, 18);
     for (rows, rgb) in [(1, &second[..(w * 3 / 2 + 7) as usize]), (h, &second)] {
         assert_streams_as_decoded(&[(image(colour, w, rows), rgb.to_vec())]);
-        assert_streams_as_decoded(&[(
+        // Under a colour key, a row the data ends within is transparent: with no
+        // whole row, opening or requesting the image fails as decoding it whole does.
+        let keyed = pdf(&[(
             image(&format!("{colour} /Mask [0 120 60 255 0 200]"), w, rows),
             rgb.to_vec(),
         )]);
+        differential::assert_streams_as_whole(&asset(&keyed), &format!("{rows} rows"));
     }
     let gray = |cut: u32, extra: &str| {
         (
@@ -913,74 +903,72 @@ fn a_request_is_cancelled_within_two_pieces() {
     assert!(a.data == expected.data);
 }
 
-/// The first open of an image with a soft mask counts the rows whole decoding keeps
-/// of its data and the mask's: data stored without a filter by its length, reading
-/// none of it, and Flate data only up to the rows it declares, whatever follows
-/// them. Its requests still equal those of the image decoded whole.
+/// The first open of an image with a soft mask or a mask stream reads none of its
+/// data or the mask's, raw or Flate, so its work does not grow with the image's
+/// height. Its requests still equal those of the image decoded whole.
 #[test]
 #[cfg(debug_assertions)]
-fn a_first_open_reads_no_data_past_the_rows_declared() {
-    const EXTRA: usize = 1 << 20;
+fn a_first_open_reads_no_data() {
     let w = 512_u32;
     for flate in [false, true] {
-        for h in [256_u32, 1024] {
-            let colour = (w / 8 * h) as usize;
-            let mask = (w * h) as usize;
-            let stored = |declared: usize, seed: u32| {
-                let data = noise(declared + EXTRA, seed);
-                if flate {
-                    stored_zlib(&data, 65_535)
-                } else {
-                    data
-                }
-            };
-            let filter = if flate { "/Filter /FlateDecode" } else { "" };
-            let pdf = pdf(&[
-                (
-                    image(
-                        &format!(
-                            "/ColorSpace /DeviceGray /BitsPerComponent 1 /SMask 4 0 R {filter}"
+        for (entry, mask_dict, mask_bytes) in [
+            ("/SMask", "/ColorSpace /DeviceGray /BitsPerComponent 8", w),
+            ("/Mask", "/ImageMask true", w / 8),
+        ] {
+            let mut work = Vec::new();
+            for h in [256_u32, 1024] {
+                let stored = |len: usize, seed: u32| {
+                    let data = noise(len, seed);
+                    if flate {
+                        stored_zlib(&data, 65_535)
+                    } else {
+                        data
+                    }
+                };
+                let filter = if flate { "/Filter /FlateDecode" } else { "" };
+                let pdf = pdf(&[
+                    (
+                        image(
+                            &format!(
+                                "/ColorSpace /DeviceGray /BitsPerComponent 1 {entry} 4 0 R {filter}"
+                            ),
+                            w,
+                            h,
                         ),
-                        w,
-                        h,
+                        stored((w / 8 * h) as usize, h),
                     ),
-                    stored(colour, h),
-                ),
-                (
-                    image(
-                        &format!("/ColorSpace /DeviceGray /BitsPerComponent 8 {filter}"),
-                        w,
-                        h,
+                    (
+                        image(&format!("{mask_dict} {filter}"), w, h),
+                        stored((mask_bytes * h) as usize, h + 1),
                     ),
-                    stored(mask, h + 1),
-                ),
-            ]);
-            let asset = asset(&pdf);
-            TOLD.set(0);
-            let source = asset.open(None, None).unwrap();
-            let (told, inflated) = (TOLD.get(), source.work().bytes_inflated);
-            assert!(is_streamed(&source));
-            println!(
-                "flate {flate}, height {h}: first open {told} bytes of work, {inflated} inflated"
-            );
-            if flate {
-                // Each reader inflates at most a poll's worth ahead of its reads.
-                let bound = (colour + mask + 2 * POLL_BYTES) as u64;
-                assert!(inflated <= bound, "height {h}: {inflated} bytes inflated");
-            } else {
-                assert!(told < POLL_BYTES, "height {h}: {told} bytes of work");
+                ]);
+                let asset = asset(&pdf);
+                TOLD.set(0);
+                rows::READ.set(0);
+                let source = asset.open(None, None).unwrap();
+                assert!(is_streamed(&source));
+                let opened = (TOLD.get(), rows::READ.get(), source.work().bytes_inflated);
+                println!(
+                    "flate {flate}, {entry}, height {h}: first open (told, read, inflated) {opened:?}"
+                );
+                assert_eq!(
+                    (opened.1, opened.2),
+                    (0, 0),
+                    "flate {flate}, {entry}, height {h}"
+                );
+                work.push(opened.0);
+                if h == 256 {
+                    assert_asset_streams_as_decoded(&asset);
+                }
             }
-            if h == 256 {
-                assert_asset_streams_as_decoded(&asset);
-            }
+            assert_eq!(work[0], work[1], "flate {flate}, {entry}");
         }
     }
 }
 
 /// A first open stopped by its hook returns within three polls' worth of work, wherever
-/// the work is: counting a Flate soft mask's rows, decoding a mask whole, or decoding
-/// an image that is not streamed whole (through a filter, or converting 16-bit
-/// samples). The asset is left as it was: opening it again gives what decoding the
+/// the work is: decoding a mask whole, or decoding an image that is not streamed
+/// whole (through a filter, or converting 16-bit samples). The asset is left as it was: opening it again gives what decoding the
 /// image whole does.
 #[test]
 #[cfg(debug_assertions)]
@@ -1001,10 +989,6 @@ fn a_first_open_is_cancelled_within_bounded_work() {
     };
     let noise = noise((w * h) as usize, 31);
     for (name, objects) in [
-        (
-            "Flate soft mask",
-            masked("/Filter /FlateDecode", zlib(&noise)),
-        ),
         (
             "decoded soft mask",
             masked("/Filter /ASCIIHexDecode", hex(&noise)),
@@ -1057,12 +1041,10 @@ fn a_first_open_is_cancelled_within_bounded_work() {
 }
 
 /// Rows missing from the data are padded a piece at a time: a request of a huge grid
-/// whose data holds one byte, of a first row kept, is cancelled within three polls'
-/// worth of work.
+/// whose data holds one byte is cancelled within three polls' worth of work.
 #[test]
 #[cfg(debug_assertions)]
 fn padding_missing_rows_is_cancelled_within_bounded_work() {
-    // Padding the first row takes no more than `MIN_ROW_PAD`, so it is kept.
     let (w, h) = (65_537, 40);
     let pdf = pdf(&[(
         image("/ColorSpace /DeviceGray /BitsPerComponent 8", w, h),
@@ -1089,8 +1071,8 @@ fn padding_missing_rows_is_cancelled_within_bounded_work() {
     let told = TOLD.get();
     assert!(told < 3 * POLL_BYTES, "{told} bytes of work");
     let region = source.request(&request_of(None)).unwrap();
-    assert_eq!(region.data.len(), 2 * (w * h) as usize);
-    assert_eq!(region.data[..2], [7, 255]);
+    assert_eq!(region.data.len(), (w * h) as usize);
+    assert_eq!(region.data[..2], [7, 0]);
 }
 
 /// Rows of a mask decoded whole are skipped without work: a request of the last row of

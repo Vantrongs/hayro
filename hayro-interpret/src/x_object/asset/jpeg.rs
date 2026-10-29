@@ -147,12 +147,9 @@ impl<'a> JpegStreamed<'a> {
 
     pub(super) fn layout(&self) -> ImageLayout {
         ImageLayout {
-            image: self.colour.plane(
-                &self.obj,
-                &Grid::declared(&self.obj),
-                self.obj.height(),
-                false,
-            ),
+            image: self
+                .colour
+                .plane(&self.obj, &Grid::declared(&self.obj), false),
             mask: None,
         }
     }
@@ -251,7 +248,7 @@ impl<'a> JpegStreamed<'a> {
         meter.poll()?;
         let decoded = decoded.ok_or(Stop::Failed)?;
         let rows = decoded.image.height();
-        Decoded::new(decoded.image, decoded.alpha, meter)?.run(Plane::Image, area)?;
+        Decoded::new(decoded, meter)?.run(Plane::Image, area)?;
         Ok(rows)
     }
 }

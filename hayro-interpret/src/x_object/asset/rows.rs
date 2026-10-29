@@ -1,12 +1,11 @@
 //! Rows of stored samples read incrementally, piece by piece, and masks as rows of
 //! alpha.
 
-use super::DecodeWork;
+use super::Stop;
 use super::streamed::incremental_samples;
-use crate::LumaData;
 use crate::x_object::decode::{
-    BILEVEL_MASK_LUT, MaskPath, SampleFormat, SampleRows, decode_mask, image_decode_params,
-    mask_lut,
+    BILEVEL_MASK_LUT, DecodedMask, MaskPath, SampleFormat, SampleRows, decode_mask,
+    image_decode_params, mask_lut,
 };
 use crate::x_object::image::{ImageKind, ImageXObject};
 use core::ops::Range;
@@ -31,11 +30,25 @@ pub(super) fn piece_texels(columns: usize, bytes: usize) -> usize {
     columns.min((PIECE_BYTES / bytes).max(8) & !7).max(1)
 }
 
+/// Where the stored data of an image and of its mask stream end, in bytes from their
+/// start, once known: from the stored length of data without a filter, or found by a
+/// request reading to it. Whole decoding keeps of samples other than 8-bit only whole
+/// rows, so a row the data ends within reads as stored zero; a request that has
+/// pushed part of such a row before finding the end reads the image again, knowing
+/// it.
+#[derive(Default)]
+pub(super) struct DataEnds {
+    pub(super) colour: OnceLock<usize>,
+    pub(super) mask: OnceLock<usize>,
+}
+
 /// Rows of an image's or mask's stored samples, read incrementally, the reading
 /// counted on a meter.
 pub(super) struct RawRows<'a> {
     pub(super) reader: DecodedReader<'a>,
     meter: &'a Meter<'a>,
+    /// Where the data ends, noted when a read reaches it.
+    end: &'a OnceLock<usize>,
     /// Stored bytes per row.
     pub(super) row_bytes: usize,
     /// Bytes read since the start of the data.
@@ -53,19 +66,43 @@ pub(super) enum RawRow {
 }
 
 impl<'a> RawRows<'a> {
-    /// The rows of `obj`'s samples, `row_bytes` each, read on `meter`.
+    /// The rows of `obj`'s samples, `row_bytes` each, read on `meter`, noting where
+    /// the data ends in `end`.
     pub(super) fn new(
         obj: &ImageXObject<'a>,
         row_bytes: usize,
+        end: &'a OnceLock<usize>,
         meter: &'a Meter<'a>,
     ) -> Option<Self> {
+        let reader = image_reader(obj)?;
+        if let Some(len) = reader.stored_len() {
+            end.get_or_init(|| len);
+        }
         Some(Self {
-            reader: image_reader(obj)?,
+            reader,
             meter,
+            end,
             row_bytes,
             total: 0,
             at: 0,
         })
+    }
+
+    /// Whether the data holds row `y` whole: `None` until its end is known.
+    pub(super) fn holds_row(&self, y: u32) -> Option<bool> {
+        let end = *self.end.get()?;
+        Some(end >= (y as usize + 1).saturating_mul(self.row_bytes))
+    }
+
+    /// Whether the data holds any byte of row `y`: `None` until its end is known.
+    pub(super) fn reaches_row(&self, y: u32) -> Option<bool> {
+        let end = *self.end.get()?;
+        Some(end > (y as usize).saturating_mul(self.row_bytes))
+    }
+
+    /// Notes that the data ends where it is read to.
+    fn ended(&self) {
+        self.end.get_or_init(|| self.total);
     }
 
     /// Continues from `state`, saved at the start of `row`; false if it does not
@@ -104,6 +141,9 @@ impl<'a> RawRows<'a> {
         self.total += filled;
         #[cfg(test)]
         READ.set(READ.get() + filled as u64);
+        if filled < len {
+            self.ended();
+        }
         Ok(filled)
     }
 
@@ -115,6 +155,9 @@ impl<'a> RawRows<'a> {
         self.total += got;
         #[cfg(test)]
         READ.set(READ.get() + got as u64);
+        if got < wanted {
+            self.ended();
+        }
         Ok(got == wanted)
     }
 
@@ -136,7 +179,7 @@ impl<'a> RawRows<'a> {
 }
 
 /// A mask, read incrementally where its samples allow, else decoded whole; either way
-/// with the rows its data holds, as `decode_mask` counts them.
+/// on the grid it declares, as `decode_mask` decodes it.
 pub(super) enum MaskSource<'a> {
     Streamed {
         obj: ImageXObject<'a>,
@@ -145,7 +188,7 @@ pub(super) enum MaskSource<'a> {
         width: u32,
         height: u32,
     },
-    Decoded(LumaData),
+    Decoded(DecodedMask),
 }
 
 /// How the samples of a mask read as rows become alpha (`MaskPath`).
@@ -162,6 +205,29 @@ pub(super) enum RowPath {
 }
 
 impl RowPath {
+    /// Bits per sample.
+    fn bits(&self) -> u8 {
+        match self {
+            Self::Bilevel { .. } => 1,
+            Self::Bytes { .. } => 8,
+            Self::Mapped { bits, .. } => *bits,
+        }
+    }
+
+    /// The alpha of a sample the data does not hold: stored zero's.
+    pub(super) fn fill(&self) -> u8 {
+        match self {
+            Self::Bilevel { invert } | Self::Bytes { invert } => {
+                if *invert {
+                    255
+                } else {
+                    0
+                }
+            }
+            Self::Mapped { lut, .. } => lut[0],
+        }
+    }
+
     /// The path of a mask's samples of `format`, if they are read as rows.
     fn of(path: MaskPath, format: &SampleFormat, stencil: bool) -> Option<Self> {
         match path {
@@ -180,29 +246,16 @@ impl RowPath {
 
     /// How the samples of a mask lie in rows of `width` and `height`.
     fn rows(&self, width: u32, height: u32) -> SampleRows {
-        let bits = match self {
-            Self::Bilevel { .. } => 1,
-            Self::Bytes { .. } => 8,
-            Self::Mapped { bits, .. } => *bits,
-        };
-        SampleRows::new(width, 1, bits, height)
+        SampleRows::new(width, 1, self.bits(), height)
     }
 }
 
-/// The rows whole decoding keeps of a stream's data, counted when an asset is first
-/// opened; `None` when the data cannot be decoded.
-pub(super) type RowsHeld = OnceLock<Option<u32>>;
-
 impl<'a> MaskSource<'a> {
     /// The mask in `stream`, as `decode_alpha` reads a soft mask or a mask stream:
-    /// `None` when it has no rows. The rows of a streamed mask are counted once, into
-    /// `height`, by reading its data through, which adds to `work`; a count `meter`
-    /// cancelled is not kept.
+    /// `None` when it is not an image or decoding it whole fails.
     pub(super) fn new(
         stream: &Stream<'a>,
         image: &ImageXObject<'a>,
-        height: &RowsHeld,
-        work: &mut DecodeWork,
         meter: &Meter<'_>,
     ) -> Result<Option<Self>, Cancelled> {
         let Some(mask) = ImageXObject::new_mask(stream, &image.warning_sink, &image.cache) else {
@@ -217,43 +270,39 @@ impl<'a> MaskSource<'a> {
                 stencil,
             );
             if let Some(path) = RowPath::of(path, &format, stencil) {
-                let held = match height.get() {
-                    Some(&held) => held,
-                    None => {
-                        let rows = path.rows(grid.width, grid.height);
-                        let held = rows_held(&mask, rows, work, meter)?;
-                        *height.get_or_init(|| held)
-                    }
-                };
-                return Ok(held.filter(|&h| h > 0).map(|height| Self::Streamed {
+                return Ok(Some(Self::Streamed {
                     obj: mask,
                     path,
                     width: grid.width,
-                    height,
+                    height: grid.height,
                 }));
             }
         }
         let decoded = decode_mask(&mask, None, meter);
         meter.poll()?;
-        Ok(decoded.map(|m| Self::Decoded(m.luma)))
+        Ok(decoded.map(Self::Decoded))
     }
 
     pub(super) fn size(&self) -> (u32, u32) {
         match self {
             Self::Streamed { width, height, .. } => (*width, *height),
-            Self::Decoded(luma) => (luma.width, luma.height),
+            Self::Decoded(m) => (m.luma.width, m.rows.declared),
         }
     }
 
     pub(super) fn interpolate(&self) -> bool {
         match self {
             Self::Streamed { obj, .. } => obj.interpolate,
-            Self::Decoded(luma) => luma.interpolate,
+            Self::Decoded(m) => m.luma.interpolate,
         }
     }
 
-    /// The mask's rows, read on `meter`.
-    pub(super) fn rows(&'a self, meter: &'a Meter<'a>) -> Option<MaskRows<'a>> {
+    /// The mask's rows, read on `meter`, noting where its data ends in `end`.
+    pub(super) fn rows(
+        &'a self,
+        end: &'a OnceLock<usize>,
+        meter: &'a Meter<'a>,
+    ) -> Option<MaskRows<'a>> {
         Some(match self {
             Self::Streamed {
                 obj,
@@ -263,14 +312,16 @@ impl<'a> MaskSource<'a> {
             } => {
                 let row_bytes = path.rows(*width, *height).row_bytes();
                 MaskRows::Streamed {
-                    raw: Box::new(RawRows::new(obj, row_bytes, meter)?),
+                    raw: Box::new(RawRows::new(obj, row_bytes, end, meter)?),
                     path: path.clone(),
-                    width: *width as usize,
                     bytes: Vec::new(),
                     last: 0,
+                    row: 0,
+                    fill: false,
+                    given: false,
                 }
             }
-            Self::Decoded(luma) => MaskRows::Decoded { luma, row: 0 },
+            Self::Decoded(mask) => MaskRows::Decoded { mask, row: 0 },
         })
     }
 }
@@ -280,42 +331,27 @@ fn image_reader<'a>(obj: &ImageXObject<'a>) -> Option<DecodedReader<'a>> {
     obj.stream.image_reader(&image_decode_params(obj))
 }
 
-/// The rows whole decoding keeps of `obj`'s data, of samples lying in `rows`: the
-/// length of data stored without a filter, else its data moved through, as whole
-/// decoding decodes it, until it ends or holds the rows declared (data after them
-/// changes nothing), adding the bytes inflated to `work`.
-pub(super) fn rows_held(
-    obj: &ImageXObject<'_>,
-    rows: SampleRows,
-    work: &mut DecodeWork,
-    meter: &Meter<'_>,
-) -> Result<Option<u32>, Cancelled> {
-    let Some(mut reader) = image_reader(obj) else {
-        return Ok(None);
-    };
-    if let Some(len) = reader.stored_len() {
-        return Ok(Some(rows.rows_kept(len)));
-    }
-    let declared = rows.row_bytes().saturating_mul(rows.height as usize);
-    let held = reader.skip(declared, meter);
-    work.bytes_inflated += reader.inflated_bytes();
-    Ok(Some(rows.rows_kept(held?)))
-}
-
 /// A mask's rows, as alpha, each read from its start in pieces of columns from left
-/// to right. Every row asked for is present: a mask has the rows its data holds.
+/// to right. Every row it declares is present, a sample its data does not hold being
+/// stored zero, as `decode_mask` pads it.
 pub(super) enum MaskRows<'a> {
     Streamed {
         raw: Box<RawRows<'a>>,
         path: RowPath,
-        width: usize,
         /// The bytes of a bilevel piece, and the last one read of the row, which a
         /// piece starting within it needs again.
         bytes: Vec<u8>,
         last: u8,
+        /// The row being read.
+        row: u32,
+        /// Whether the row being read is all stored zero: its data ends within it,
+        /// and its samples are not 8-bit.
+        fill: bool,
+        /// Whether alpha of the row being read was given.
+        given: bool,
     },
     Decoded {
-        luma: &'a LumaData,
+        mask: &'a DecodedMask,
         row: u32,
     },
 }
@@ -329,70 +365,138 @@ impl MaskRows<'_> {
         }
     }
 
+    /// The alpha of a sample the data does not hold.
+    pub(super) fn fill(&self) -> u8 {
+        match self {
+            MaskRows::Streamed { path, .. } => path.fill(),
+            // The rows past those held repeat the last, of stored zero.
+            MaskRows::Decoded { mask, .. } => {
+                let luma = &mask.luma;
+                luma.data[(luma.height as usize - 1) * luma.width as usize]
+            }
+        }
+    }
+
+    /// Whether the row begun is all stored zero's alpha ([`Self::fill`]).
+    pub(super) fn fills_row(&self) -> bool {
+        match self {
+            MaskRows::Streamed { fill, .. } => *fill,
+            MaskRows::Decoded { mask, row } => *row >= mask.luma.height,
+        }
+    }
+
     /// Starts the next row.
     pub(super) fn begin_row(&mut self) {
-        if let MaskRows::Streamed { raw, .. } = self {
+        if let MaskRows::Streamed {
+            raw,
+            path,
+            row,
+            fill,
+            given,
+            ..
+        } = self
+        {
             raw.begin();
+            *given = false;
+            *fill = !reads_row(raw, path.bits(), *row);
         }
     }
 
     /// Writes the alpha of columns `cols` of the row into `out` (`cols` long), after
-    /// the columns written before; returns how many of them the data holds, the rest
-    /// of a last row cut short being transparent.
-    pub(super) fn alpha(&mut self, cols: Range<usize>, out: &mut [u8]) -> Result<usize, Cancelled> {
+    /// the columns written before; returns whether the data holds all of them (the
+    /// rest being stored zero's alpha). Fails with [`Stop::Retry`] where the data
+    /// ends within a row of samples other than 8-bit whose alpha was given.
+    pub(super) fn alpha(&mut self, cols: Range<usize>, out: &mut [u8]) -> Result<bool, Stop> {
         match self {
-            MaskRows::Decoded { luma, row } => {
+            MaskRows::Decoded { mask, row } => {
+                let luma = &mask.luma;
+                if *row >= luma.height {
+                    out.fill(self.fill());
+                    return Ok(false);
+                }
                 let at = *row as usize * luma.width as usize;
                 out.copy_from_slice(&luma.data[at + cols.start..at + cols.end]);
-                Ok(out.len())
+                Ok(true)
             }
             MaskRows::Streamed {
                 raw,
                 path,
-                width,
                 bytes,
                 last,
-            } => match path {
-                RowPath::Bytes { invert } => {
-                    raw.skip(cols.start - raw.at())?;
-                    let got = raw.read(out)?;
-                    if *invert {
-                        out[..got].iter_mut().for_each(|a| *a = 255 - *a);
+                fill,
+                given,
+                ..
+            } => {
+                if *fill {
+                    out.fill(path.fill());
+                    return Ok(false);
+                }
+                let held = match path {
+                    RowPath::Bytes { invert } => {
+                        let wanted = out.len();
+                        let got = if raw.skip(cols.start - raw.at())? {
+                            raw.read(out)?
+                        } else {
+                            0
+                        };
+                        if *invert {
+                            out[..got].iter_mut().for_each(|a| *a = 255 - *a);
+                        }
+                        out[got..].fill(if *invert { 255 } else { 0 });
+                        got == wanted
                     }
-                    out[got..].fill(0);
-                    Ok(got)
+                    RowPath::Bilevel { invert } => {
+                        bilevel_alpha(raw, bytes, last, *invert, cols, out)?
+                    }
+                    RowPath::Mapped { bits, lut } => {
+                        mapped_alpha(raw, bytes, last, *bits, lut, cols, out)?
+                    }
+                };
+                if !held && path.bits() != 8 {
+                    // Only whole rows of these samples count.
+                    if *given {
+                        return Err(Stop::Retry);
+                    }
+                    *fill = true;
+                    out.fill(path.fill());
                 }
-                RowPath::Bilevel { invert } => {
-                    bilevel_alpha(raw, bytes, last, *invert, *width, cols, out)
-                }
-                RowPath::Mapped { bits, lut } => {
-                    mapped_alpha(raw, bytes, last, *bits, lut, cols, out)?;
-                    Ok(out.len())
-                }
-            },
+                *given = true;
+                Ok(held)
+            }
         }
     }
 
-    /// Ends the row, reading past the rest of it.
-    pub(super) fn end_row(&mut self) -> Result<(), Cancelled> {
+    /// Ends the row, reading past the rest of it. Fails with [`Stop::Retry`] where the
+    /// data ends within a row of samples other than 8-bit whose alpha was given.
+    pub(super) fn end_row(&mut self) -> Result<(), Stop> {
         match self {
             MaskRows::Decoded { row, .. } => *row += 1,
-            MaskRows::Streamed { raw, .. } => {
-                raw.finish()?;
+            MaskRows::Streamed {
+                raw,
+                path,
+                row,
+                fill,
+                given,
+                ..
+            } => {
+                *row += 1;
+                if !*fill && !matches!(raw.finish()?, RawRow::Full) && path.bits() != 8 && *given {
+                    return Err(Stop::Retry);
+                }
             }
         }
         Ok(())
     }
 
     /// Reads past the next row.
-    pub(super) fn skip_row(&mut self) -> Result<(), Cancelled> {
+    pub(super) fn skip_row(&mut self) -> Result<(), Stop> {
         self.begin_row();
         self.end_row()
     }
 
     /// Moves past the next `n` rows: reads past each of a streamed mask's, and jumps
     /// over those of a mask decoded whole.
-    pub(super) fn skip_rows(&mut self, n: u32) -> Result<(), Cancelled> {
+    pub(super) fn skip_rows(&mut self, n: u32) -> Result<(), Stop> {
         match self {
             MaskRows::Decoded { row, .. } => *row += n,
             MaskRows::Streamed { .. } => (0..n).try_for_each(|_| self.skip_row())?,
@@ -401,10 +505,22 @@ impl MaskRows<'_> {
     }
 }
 
+/// Whether a row reader whose samples are of `bits` reads the bytes of row `y`: all
+/// of 8-bit samples the data reaches, else only whole rows; until the data's end is
+/// known, every row.
+fn reads_row(raw: &RawRows<'_>, bits: u8, y: u32) -> bool {
+    let reads = if bits == 8 {
+        raw.reaches_row(y)
+    } else {
+        raw.holds_row(y)
+    };
+    reads.unwrap_or(true)
+}
+
 /// The alpha of columns `cols` of a row of samples of `bits` through `lut`, into
 /// `out`, its bytes read into `bytes`; `last` is the last byte read of the row. A
 /// sample the data does not hold whole is stored zero, as decoding the mask whole
-/// unpacks it, so every column has alpha.
+/// pads it. Returns whether the data holds every column.
 fn mapped_alpha(
     raw: &mut RawRows<'_>,
     bytes: &mut Vec<u8>,
@@ -413,7 +529,7 @@ fn mapped_alpha(
     lut: &[u8; 256],
     cols: Range<usize>,
     out: &mut [u8],
-) -> Result<(), Cancelled> {
+) -> Result<bool, Cancelled> {
     let bits = usize::from(bits);
     let (first, end) = (cols.start * bits / 8, (cols.end * bits).div_ceil(8));
     if raw.at() <= first {
@@ -440,28 +556,24 @@ fn mapped_alpha(
         *alpha = if at + bits <= held_bits {
             let pair = [bytes[at / 8], bytes.get(at / 8 + 1).copied().unwrap_or(0)];
             lut[usize::from((u16::from_be_bytes(pair) >> (16 - bits - at % 8)) & mask)]
-        } else if bits == 8 {
-            // Decoding the mask whole pads its mapped 8-bit samples with zero.
-            0
         } else {
             lut[0]
         };
     }
-    Ok(())
+    Ok(offset + out.len() * bits <= held_bits)
 }
 
 /// The alpha of columns `cols` of a bilevel row from `raw`, into `out`, its bytes
-/// read into `bytes`; `last` is the last byte read of the row. Returns how many of
-/// the columns the data holds.
+/// read into `bytes`; `last` is the last byte read of the row. Returns whether the
+/// data holds every column.
 fn bilevel_alpha(
     raw: &mut RawRows<'_>,
     bytes: &mut Vec<u8>,
     last: &mut u8,
     invert: bool,
-    width: usize,
     cols: Range<usize>,
     out: &mut [u8],
-) -> Result<usize, Cancelled> {
+) -> Result<bool, Cancelled> {
     let (first, end) = (cols.start / 8, cols.end.div_ceil(8));
     // A piece starting within the byte the one before ended in has it in `last`.
     if raw.at() <= first {
@@ -488,12 +600,5 @@ fn bilevel_alpha(
     if got > 0 {
         *last = bytes[got - 1];
     }
-    if held >= end {
-        return Ok(out.len());
-    }
-    // A last row cut short keeps the samples of its whole bytes; the rest are zero,
-    // after inversion.
-    let present = (held.min(width / 8) * 8).clamp(cols.start, cols.end);
-    out[present - cols.start..].fill(0);
-    Ok(present - cols.start)
+    Ok(held >= end)
 }

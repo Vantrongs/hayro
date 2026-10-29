@@ -1,7 +1,8 @@
-//! Decoding an image costs memory in proportion to the data it holds, not to the size
-//! its dictionary declares: an image 100 000 × 100 000 with a one-byte stream must
-//! not reserve 10 GB before reading it. `RasterImage::pixels_key` tells images apart
-//! that decode differently.
+//! Requesting a region of an image's asset costs memory in proportion to the region
+//! and the data the image holds, not to the size its dictionary declares: an image
+//! 100 000 × 100 000 with a one-byte stream must not reserve 10 GB. (`with_rgba` and
+//! `with_stencil` hand over every row the image declares, as large as the image
+//! intact.) `RasterImage::pixels_key` tells images apart that decode differently.
 
 use hayro_interpret::font::GlyphRun;
 use hayro_interpret::hayro_syntax::Pdf;
@@ -84,57 +85,114 @@ fn draw(dict: &str, data: &[u8], extra: Option<(&str, &[u8])>) -> Vec<(u32, u32)
 
 const HUGE: &str = "/Width 100000 /Height 100000";
 
+/// A region of 100 × 100 bins over `plane` of the image `dict` with stream `data`
+/// (object 5), `extra` being object 6 (a mask, say), asserting that opening and
+/// requesting it stayed under 64 MiB.
+fn huge_region(dict: &str, data: &[u8], extra: Option<(&str, &[u8])>, plane: Plane) -> Vec<u8> {
+    let mut objects = vec![image(dict, data)];
+    objects.extend(extra.map(|(dict, data)| image(dict, data)));
+    let pdf = page(
+        "q 100 0 0 100 0 0 cm /Im Do Q",
+        "/XObject << /Im 5 0 R >>",
+        objects,
+    );
+    let mut requested = Requested::new(plane, |_, _| ((100, 100), [0, 0, 100, 100]));
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+    let [(peak, data)] = requested.regions.try_into().expect("one image");
+    assert!(peak < 64 << 20, "{dict}: peak {peak} bytes");
+    data
+}
+
+/// Eight samples are far from a row of 100 000: every row reads as stored zero, black.
 #[test]
 fn a_huge_gray_image_with_one_byte_costs_little() {
     let dict = format!("{HUGE} /ColorSpace /DeviceGray /BitsPerComponent 1");
-    // Eight samples are far from a row of 100 000: nothing to draw.
-    assert_eq!(draw(&dict, &[0xAA], None), []);
+    let region = huge_region(&dict, &[0xAA], None, Plane::Image);
+    assert_eq!(region, vec![0; 100 * 100]);
 }
 
 #[test]
 fn a_huge_rgb_image_with_one_byte_costs_little() {
     let dict = format!("{HUGE} /ColorSpace /DeviceRGB /BitsPerComponent 4");
-    assert_eq!(draw(&dict, &[0xAA], None), []);
+    let region = huge_region(&dict, &[0xAA], None, Plane::Image);
+    assert_eq!(region, vec![0; 3 * 100 * 100]);
 }
 
+/// A stencil's stored zero is painted.
 #[test]
 fn a_huge_stencil_with_one_byte_costs_little() {
     let dict = format!("{HUGE} /ImageMask true /BitsPerComponent 1");
-    assert_eq!(draw(&dict, &[0xAA], None), []);
+    let region = huge_region(&dict, &[0xAA], None, Plane::Image);
+    assert_eq!(region, vec![255; 100 * 100]);
 }
 
+/// A soft mask's stored zero hides the colour.
 #[test]
 fn huge_soft_masks_with_one_byte_cost_little() {
     let image = "/Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R";
     for bpc in [1, 2] {
         let mask = format!("{HUGE} /ColorSpace /DeviceGray /BitsPerComponent {bpc}");
-        // The colour is drawn without the mask, which holds no row.
-        assert_eq!(
-            draw(image, &[255, 0, 0], Some((&mask, &[0xAA]))),
-            [(1, 1)],
-            "{bpc}"
-        );
+        let region = huge_region(image, &[255, 0, 0], Some((&mask, &[0xAA])), Plane::Mask);
+        assert_eq!(region, vec![0; 100 * 100], "{bpc}");
     }
 }
 
+/// Images decoded whole hold the rows their data holds and one of stored zero, which
+/// the rows past it repeat: 16-bit samples, a filter that is not streamed, and a soft
+/// mask through one.
+#[test]
+fn huge_images_decoded_whole_with_little_data_cost_little() {
+    let gray = |bits: u8, extra: &str| {
+        format!("{HUGE} /ColorSpace /DeviceGray /BitsPerComponent {bits} {extra}")
+    };
+    for (dict, data, fill) in [
+        (gray(16, ""), &b"\xff\xff"[..], 0),
+        (gray(16, "/Decode [1 0]"), b"\xff\xff", 255),
+        (gray(8, "/Filter /ASCIIHexDecode"), b"ff>", 0),
+        (
+            gray(8, "/Filter /ASCIIHexDecode /Decode [1 0]"),
+            b"00>",
+            255,
+        ),
+    ] {
+        let region = huge_region(&dict, data, None, Plane::Image);
+        assert_eq!(region, vec![fill; 100 * 100], "{dict}");
+    }
+    let image = "/Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R";
+    let mask = gray(8, "/Filter /ASCIIHexDecode");
+    let region = huge_region(image, &[255, 0, 0], Some((&mask, b"ff>")), Plane::Mask);
+    assert_eq!(region, vec![0; 100 * 100]);
+}
+
+/// Whatever one byte decodes to, it is at most a few rows; the rest are black.
 #[test]
 fn a_huge_ccitt_image_with_one_byte_costs_little() {
     let dict = format!(
         "{HUGE} /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode \
          /DecodeParms << /K -1 /Columns 100000 /Rows 100000 >>"
     );
-    // Whatever one byte decodes to, it is at most a few rows.
-    for (_, height) in draw(&dict, &[0x00], None) {
-        assert!(height < 100, "{height} rows");
-    }
+    let region = huge_region(&dict, &[0x00], None, Plane::Image);
+    assert_eq!(region[100..], vec![0; 99 * 100]);
 }
 
-/// An image whose data stops in its second row keeps that row, padded, and drops
-/// the rows the data does not reach.
+/// An image whose data stops in its second row keeps its declared rows: the first
+/// as its data holds it, and the rest, the second among them, stored zero.
 #[test]
-fn a_short_image_keeps_the_rows_its_data_holds() {
+fn a_short_image_keeps_its_declared_rows() {
     let dict = "/Width 16 /Height 4 /ColorSpace /DeviceGray /BitsPerComponent 1";
-    assert_eq!(draw(dict, &[0xFF, 0x00, 0xF0], None), [(16, 2)]);
+    assert_eq!(draw(dict, &[0xFF, 0x00, 0xF0], None), [(16, 4)]);
+    let stencil = "/Width 16 /Height 4 /ImageMask true";
+    assert_eq!(draw(stencil, &[0xFF, 0x00, 0xF0], None), [(16, 4)]);
+    let mut pixels = Pixels::default();
+    let pdf = page(
+        "q 100 0 0 100 0 0 cm /Im Do Q",
+        "/XObject << /Im 5 0 R >>",
+        vec![image(dict, &[0xFF, 0x00, 0xF0])],
+    );
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut pixels);
+    let mut expected = [[255; 8], [0; 8]].concat();
+    expected.extend([0; 48]);
+    assert_eq!(pixels.0[0].1, expected);
 }
 
 /// The `pixels_key` and `cache_key` of each raster image drawn.
@@ -596,8 +654,8 @@ fn a_small_region_of_an_indexed_or_masked_ccitt_image_costs_the_region() {
 }
 
 /// The last texel of a bilevel mask 40 million samples wide whose data ends halfway
-/// through its row holds a piece of the row, not the bytes between the data's end and
-/// the texel.
+/// through its row reads as stored zero, as the whole row does, holding a piece of
+/// the row at most, not the bytes between the data's end and the texel.
 #[test]
 fn a_texel_past_a_masks_data_holds_a_piece() {
     let w = 40_000_000_u32;
@@ -611,7 +669,7 @@ fn a_texel_past_a_masks_data_holds_a_piece() {
             ),
             image(
                 &format!("/Width {w} /Height 1 /ImageMask true"),
-                &vec![0; (w / 16) as usize],
+                &vec![0xFF; (w / 16) as usize],
             ),
         ],
     );
@@ -620,7 +678,7 @@ fn a_texel_past_a_masks_data_holds_a_piece() {
     let [(peak, data)] = &requested.regions[..] else {
         panic!("one image")
     };
-    assert_eq!(data, &[0]);
+    assert_eq!(data, &[255]);
     assert!(*peak < 1 << 20, "peak {peak} bytes");
 }
 

@@ -11,6 +11,7 @@ use crate::x_object::image::{ImageKind, ImageXObject};
 use hayro_syntax::Filter;
 use hayro_syntax::bit_reader::BitReader;
 use hayro_syntax::object::Array;
+use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::*;
 use hayro_syntax::object::stream::{
     DecodeFailure, FilterResult, ImageColorSpace, ImageData, ImageDecodeParams,
@@ -20,13 +21,50 @@ use smallvec::SmallVec;
 use std::borrow::Cow;
 
 struct DecodeContext<'a> {
+    /// The stored samples, as many as the rows `height` hold ([`fit_rows`]).
     decoded: FilterResult<'a>,
     width: u32,
+    /// The rows of samples decoded ([`fit_rows`]).
     height: u32,
+    /// The rows the plane covers past those decoded.
+    rows: Rows,
     scale_factors: (f32, f32),
     color_space: ColorSpace,
     bits_per_component: u8,
     decode_arr: SmallVec<[(f32, f32); 4]>,
+}
+
+/// The rows a decoded plane covers: those its image declares (or its filter reports).
+/// Past the rows the plane holds, its last row repeats, or they are transparent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Rows {
+    pub(crate) declared: u32,
+    /// Whether the plane's last row repeats past the rows it holds.
+    pub(crate) repeat: bool,
+}
+
+/// `data`, rows of `row_len` bytes, with its last row repeated up to `rows`, a piece
+/// at a time; `None` once the meter's hook asks to stop.
+pub(crate) fn repeat_last_row(
+    data: &mut Vec<u8>,
+    row_len: usize,
+    rows: u32,
+    meter: &Meter<'_>,
+) -> Option<()> {
+    let want = row_len * rows as usize;
+    if row_len == 0 || data.len() >= want {
+        return Some(());
+    }
+    let last = data.len() - row_len;
+    data.reserve_exact(want - data.len());
+    let rows_per_piece = (POLL_BYTES / row_len).max(1);
+    while data.len() < want {
+        for _ in 0..rows_per_piece.min((want - data.len()) / row_len) {
+            data.extend_from_within(last..last + row_len);
+        }
+        meter.work(rows_per_piece * row_len).ok()?;
+    }
+    Some(())
 }
 
 /// How an image's samples are laid out and what they mean: from its dictionary, and
@@ -134,15 +172,18 @@ fn fallback_bpc(kind: ImageKind) -> u8 {
     if kind == ImageKind::StencilMask { 1 } else { 8 }
 }
 
+/// The context `obj` decodes in; `transparent` when rows its data does not hold are
+/// transparent ([`short_rows_transparent`]).
 fn decode_context<'a>(
     obj: &ImageXObject<'a>,
     target_dimension: Option<(u32, u32)>,
+    transparent: bool,
     meter: &Meter<'_>,
 ) -> Option<DecodeContext<'a>> {
     let dict_bpc = dict_bpc(obj);
     let decode_params = decode_params(obj, target_dimension, dict_bpc);
 
-    let decoded = obj
+    let mut decoded = obj
         .stream
         .decoded_image_metered(&decode_params, meter)
         .map_err(|e| {
@@ -171,10 +212,26 @@ fn decode_context<'a>(
         decode_arr,
     } = sample_format_with(obj, decoded.image_data.as_ref(), dict_bpc);
 
+    let rows = SampleRows::new(
+        width,
+        color_space.num_components() as usize,
+        bits_per_component,
+        height,
+    );
+    let (data, kept) = fit_rows(core::mem::take(&mut decoded.data), rows, transparent, meter)?;
+    decoded.data = data;
+    if width == 0 || kept == 0 {
+        return None;
+    }
+
     Some(DecodeContext {
         decoded,
         width,
-        height,
+        height: kept,
+        rows: Rows {
+            declared: height,
+            repeat: !transparent,
+        },
         scale_factors: (scale_x, scale_y),
         color_space,
         bits_per_component,
@@ -182,31 +239,64 @@ fn decode_context<'a>(
     })
 }
 
-#[must_use]
-fn fix_image_length<T: Copy>(
-    image: &mut Vec<T>,
-    width: u32,
-    height: &mut u32,
-    filler: T,
-    num_components: usize,
+/// `data`, the stored samples of an image lying in `rows`, as decoding reads them,
+/// and the rows drawn, as `MuPDF` reads data that ends early (observed through `PyMuPDF`
+/// 1.28.2): the image keeps its declared rows, and a sample the data does not hold
+/// reads as stored zero, which then maps as a stored one does (black gray or RGB,
+/// white CMYK, a palette's first entry, white under an inverted decode array, a
+/// stencil mask painted). Of 8-bit samples, every byte held counts; of samples of
+/// other depths, only whole rows do, a row the data ends within reading as zero.
+/// The rows held are kept, and after them one row of stored zero, which the rows past
+/// it repeat ([`Rows`]): data of a few bytes declaring a huge image costs little.
+/// Where short rows are `transparent`, only whole rows count at every depth and the
+/// rows past them are transparent. Data past the declared rows is dropped. `None`
+/// once the meter's hook asks to stop.
+fn fit_rows<'a>(
+    data: Cow<'a, [u8]>,
+    rows: SampleRows,
+    transparent: bool,
     meter: &Meter<'_>,
-) -> Option<()> {
-    let row_len = (width as usize).saturating_mul(num_components);
-    // Too much data (or just the right amount) is truncated; too little adapts the
-    // height and pads the last row.
-    *height = rows_present(image.len(), row_len, *height);
-    let len = row_len * *height as usize;
-    image.truncate(len);
-    while image.len() < len {
-        let n = (len - image.len()).min(POLL_BYTES);
-        image.resize(image.len() + n, filler);
-        meter.work(n).ok()?;
+) -> Option<(Cow<'a, [u8]>, u32)> {
+    let row_bytes = rows.row_bytes();
+    let held = rows.bytes_held(data.len(), transparent);
+    let mut data = match data {
+        Cow::Borrowed(d) => Cow::Borrowed(&d[..held]),
+        Cow::Owned(mut d) => {
+            d.truncate(held);
+            Cow::Owned(d)
+        }
+    };
+    if transparent {
+        return Some((data, (held / row_bytes) as u32));
     }
+    let kept = held
+        .div_ceil(row_bytes)
+        .saturating_add(1)
+        .min(rows.height as usize);
+    let padded_len = kept * row_bytes;
+    if held < padded_len {
+        let padded = data.to_mut();
+        padded.resize(padded_len, 0);
+        meter.work(padded_len - held).ok()?;
+    }
+    Some((data, kept as u32))
+}
 
-    if width == 0 || *height == 0 {
-        None
-    } else {
-        Some(())
+/// Whether the rows of `obj`'s colour that its data does not hold are transparent,
+/// not stored zero ([`fit_rows`]): as `MuPDF` draws them (observed through `PyMuPDF`
+/// 1.28.2) where the image has a colour-key mask, or its mask stream (`/SMask`, else
+/// a stream `/Mask`) has a `/Matte` array.
+pub(crate) fn short_rows_transparent(obj: &ImageXObject<'_>) -> bool {
+    if obj.kind != ImageKind::Image {
+        return false;
+    }
+    let dict = obj.stream.dict();
+    match dict
+        .get::<Stream<'_>>(SMASK)
+        .or_else(|| dict.get::<Stream<'_>>(MASK))
+    {
+        Some(mask) => mask.dict().get::<Array<'_>>(MATTE).is_some(),
+        None => dict.get::<SmallVec<[u16; 4]>>(MASK).is_some(),
     }
 }
 
@@ -255,28 +345,6 @@ fn invert(data: &mut [u8], meter: &Meter<'_>) -> Option<()> {
         Some(())
     })
 }
-
-/// The rows of `row_len` samples, at most `height`, that `samples` decoded samples
-/// fill. A last row they fill in part counts, to be padded, unless padding it would
-/// take more than the samples present (and more than `MIN_ROW_PAD`): data cut short
-/// costs memory in proportion to what it holds, never to what the image declares.
-pub(crate) fn rows_present(samples: usize, row_len: usize, height: u32) -> u32 {
-    if row_len == 0 {
-        return 0;
-    }
-    let (full, part) = (samples / row_len, samples % row_len);
-    let pad = row_len - part;
-    let rows = if part > 0 && (pad <= samples || pad <= MIN_ROW_PAD) {
-        full + 1
-    } else {
-        full
-    };
-    rows.min(height as usize) as u32
-}
-
-/// A short last row is padded up to this many samples even when the data before it
-/// holds fewer.
-const MIN_ROW_PAD: usize = 1 << 16;
 
 /// What each stored sample value becomes: the decode array maps it onto the colour
 /// space's range, scaled to a byte, or onto a palette index.
@@ -358,7 +426,7 @@ fn decode_u8_samples(
         1..8 => {
             let lut = sample_lut(color_space, bits_per_component, decode)?;
             let rows = SampleRows::new(width, num_components, bits_per_component, height);
-            let mut buf = Vec::with_capacity(rows.row_len * rows.rows_kept(data.len()) as usize);
+            let mut buf = Vec::with_capacity(rows.row_len * height as usize);
             for_each_packed_row(data, rows, meter, |first, samples| {
                 if let [lut] = &lut[..] {
                     buf.extend(samples.iter().map(|&v| lut[usize::from(v)]));
@@ -376,8 +444,6 @@ fn decode_u8_samples(
         }
         9..16 => {
             let map = SampleMap::new(color_space, bits_per_component, decode);
-            let height = SampleRows::new(width, num_components, bits_per_component, height)
-                .rows_kept(data.len());
             let mut buf = Vec::with_capacity(width as usize * num_components * height as usize);
             for_each_sample(
                 data,
@@ -421,7 +487,7 @@ fn unpack_samples(
     match bits_per_component {
         1..8 => {
             let rows = SampleRows::new(width, num_components, bits_per_component, height);
-            let mut buf = Vec::with_capacity(rows.row_len * rows.rows_kept(data.len()) as usize);
+            let mut buf = Vec::with_capacity(rows.row_len * height as usize);
             for_each_packed_row(data, rows, meter, |_, samples| {
                 buf.extend(samples.iter().map(|&v| u16::from(v)));
             })?;
@@ -429,7 +495,6 @@ fn unpack_samples(
         }
         9..16 => {
             let rows = SampleRows::new(width, num_components, bits_per_component, height);
-            let height = rows.rows_kept(data.len());
             let mut buf = Vec::with_capacity(rows.row_len * height as usize);
             for_each_sample(
                 data,
@@ -462,8 +527,8 @@ fn unpack_samples(
 }
 
 /// How stored samples lie in an image's rows, each row starting on a byte: the one
-/// source of the samples and rows that both decoding an image whole and streaming
-/// it keep of data that ends early.
+/// source of the samples that both decoding an image whole and streaming it keep of
+/// data that ends early.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SampleRows {
     /// Samples per row, over components.
@@ -490,21 +555,23 @@ impl SampleRows {
             .max(1)
     }
 
-    /// The samples whose bits the first `bytes` stored bytes hold whole.
-    pub(crate) fn samples_held(&self, bytes: usize) -> usize {
+    /// Of data of `len` stored bytes, those [`fit_rows`] keeps: at most the rows
+    /// declared, and of samples of other depths than eight, or `whole_rows`, only
+    /// whole rows.
+    pub(crate) fn bytes_held(&self, len: usize, whole_rows: bool) -> usize {
         let row_bytes = self.row_bytes();
-        (bytes / row_bytes).saturating_mul(self.row_len)
-            + (bytes % row_bytes * 8 / usize::from(self.bits)).min(self.row_len)
+        let len = len.min(row_bytes.saturating_mul(self.height as usize));
+        if whole_rows || !self.byte_granular() {
+            len / row_bytes * row_bytes
+        } else {
+            len
+        }
     }
 
-    /// The rows kept of data of `bytes` stored bytes (see `rows_present`).
-    pub(crate) fn rows_kept(&self, bytes: usize) -> u32 {
-        rows_present(self.samples_held(bytes), self.row_len, self.height)
-    }
-
-    /// Whether the row data of `bytes` stored bytes ends within is kept, padded.
-    pub(crate) fn keeps_row_cut_at(&self, bytes: usize) -> bool {
-        self.rows_kept(bytes) as usize > bytes / self.row_bytes()
+    /// Whether every stored byte of a row the data ends within counts: for 8-bit
+    /// samples.
+    pub(crate) fn byte_granular(&self) -> bool {
+        self.bits == 8
     }
 }
 
@@ -539,16 +606,16 @@ pub(crate) fn unpack_packed(bits: u8, bytes: &[u8], out: &mut [u8], fill: u8) {
     }
 }
 
-/// Visits the stored values of the rows `rows` keeps of `data`, unpacked
-/// ([`unpack_packed`], those the data does not hold whole zero), a counted piece at
-/// a time, each with the index in its row of its first sample.
+/// Visits the stored values of the rows of `data` (`rows.height` whole rows),
+/// unpacked ([`unpack_packed`]), a counted piece at a time, each with the index in its
+/// row of its first sample.
 fn for_each_packed_row(
     data: &[u8],
     rows: SampleRows,
     meter: &Meter<'_>,
     mut visit: impl FnMut(usize, &[u8]),
 ) -> Option<()> {
-    let kept = rows.rows_kept(data.len()) as usize;
+    let kept = rows.height as usize;
     if kept == 0 {
         return Some(());
     }
@@ -590,8 +657,6 @@ fn for_each_sample(
     for _ in 0..height {
         for _ in 0..width {
             for _ in 0..num_components {
-                // Some images seemingly don't have enough data for their last row,
-                // so we just pad it with zeroes.
                 visit(reader.read(bits_per_component).unwrap_or(0), index)?;
                 index += 1;
             }

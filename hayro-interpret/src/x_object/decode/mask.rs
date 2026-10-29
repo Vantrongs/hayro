@@ -1,6 +1,6 @@
 use super::{
-    DecodeContext, decode_context, fix_image_length, into_owned, invert as invert_bytes,
-    pixel_piece, unpack_samples,
+    DecodeContext, Rows, decode_context, into_owned, invert as invert_bytes, pixel_piece,
+    repeat_last_row, unpack_samples,
 };
 use crate::LumaData;
 use crate::color::ColorSpace;
@@ -22,7 +22,25 @@ pub(crate) static BILEVEL_MASK_LUT: LazyLock<Box<[u64; 256]>> = LazyLock::new(||
 });
 
 pub(crate) struct DecodedMask {
+    /// The alpha: the rows its data holds, and those `rows` covers past them.
     pub(crate) luma: LumaData,
+    pub(crate) rows: Rows,
+}
+
+impl DecodedMask {
+    /// The alpha with every row it covers, the last it holds repeated: as large as
+    /// the mask intact.
+    pub(crate) fn into_whole(self) -> LumaData {
+        let mut luma = self.luma;
+        repeat_last_row(
+            &mut luma.data,
+            luma.width as usize,
+            self.rows.declared,
+            &Meter::default(),
+        );
+        luma.height = self.rows.declared;
+        luma
+    }
 }
 
 /// The mask decoded whole, its work counted on `meter`; `None` also once the meter's
@@ -32,8 +50,8 @@ pub(crate) fn decode_mask(
     target_dimension: Option<(u32, u32)>,
     meter: &Meter<'_>,
 ) -> Option<DecodedMask> {
-    let ctx = decode_context(obj, target_dimension, meter)?;
-    let width = ctx.width;
+    let ctx = decode_context(obj, target_dimension, false, meter)?;
+    let (width, rows) = (ctx.width, ctx.rows);
     let scale_factors = ctx.scale_factors;
 
     // Note: The semantics between "normal" soft masks (i.e. masks defined in
@@ -53,6 +71,7 @@ pub(crate) fn decode_mask(
             interpolate: obj.interpolate,
             scale_factors,
         },
+        rows,
     })
 }
 
@@ -121,7 +140,7 @@ pub(crate) fn mask_lut(bits: u8, decode_arr: &[(f32, f32)], invert: bool) -> Opt
 }
 
 fn decode_mask_data(
-    mut ctx: DecodeContext<'_>,
+    ctx: DecodeContext<'_>,
     invert: bool,
     meter: &Meter<'_>,
 ) -> Option<(Vec<u8>, u32)> {
@@ -132,7 +151,7 @@ fn decode_mask_data(
         invert,
     );
 
-    let mut data = match path {
+    let data = match path {
         MaskPath::Bilevel { invert } => decode_bilevel_mask_data(&ctx, invert, meter)?,
         MaskPath::Bytes { invert } => {
             let mut decoded = into_owned(ctx.decoded.data, meter)?;
@@ -175,15 +194,6 @@ fn decode_mask_data(
         }
     };
 
-    fix_image_length(
-        &mut data,
-        ctx.width,
-        &mut ctx.height,
-        0,
-        ctx.color_space.num_components() as usize,
-        meter,
-    )?;
-
     Some((data, ctx.height))
 }
 
@@ -201,12 +211,7 @@ fn decode_bilevel_mask_data(
     let full_bytes = width / 8;
     let tail_bits = width % 8;
     let lut = &**BILEVEL_MASK_LUT;
-    // Rows the data holds; `fix_image_length` pads a short last one.
-    let mut out = Vec::with_capacity(
-        width
-            .saturating_mul(height)
-            .min(data.len().saturating_mul(8)),
-    );
+    let mut out = Vec::with_capacity(width.saturating_mul(height));
     // To avoid repeatedly calling `extend`, which turns out to be very
     // expensive.
     let mut buffer = [[0; 8]; 32];

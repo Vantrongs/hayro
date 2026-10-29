@@ -38,9 +38,6 @@ fn grow_to(output: &mut Vec<u8>, needed: usize, declared: usize) {
     output.reserve_exact(target - output.len());
 }
 
-/// White pixels a stream that ends early is padded with whatever it decoded.
-const MIN_WHITE_PAD: usize = 1 << 16;
-
 /// How a stream's CCITT data decodes: its settings, and the byte its white pixels
 /// are written as, black ones being its complement.
 #[derive(Clone, Copy)]
@@ -99,24 +96,13 @@ impl Setup {
         let columns = self.settings.columns as usize;
         if packed { columns.div_ceil(8) } else { columns }
     }
-
-    /// Whether 8-bit rows left out after the `decoded` rows of data that decoded
-    /// through (`complete`) are padded white: while padding them takes no more than
-    /// the rows decoded (or a small image); otherwise the image ends with the rows
-    /// decoded, as one whose data breaks off does.
-    fn pads(&self, decoded: u32, complete: bool) -> bool {
-        let (columns, rows) = (self.settings.columns as usize, self.settings.rows as usize);
-        let len = decoded as usize * columns;
-        let missing = (columns * rows).saturating_sub(len);
-        complete && rows != 0 && missing <= len.max(MIN_WHITE_PAD)
-    }
 }
 
 /// An image's CCITT data, read as the bytes [`decode`] makes of it, a piece at a time
-/// as rows decode: 8-bit gray rows, or rows of a bit a pixel for an indexed image,
-/// those of 8-bit data that ends early padded white as `decode` pads them. It holds
-/// the decoder's state and a row's colour changes, not the rows, and of encrypted data
-/// a window of it decrypted.
+/// as rows decode: 8-bit gray rows, or rows of a bit a pixel for an indexed image, as
+/// many as decode before the data ends or breaks off (the image pads the rest as it
+/// pads any data that ends early). It holds the decoder's state and a row's colour
+/// changes, not the rows, and of encrypted data a window of it decrypted.
 pub(crate) struct CcittBytes<'a> {
     data: Encoded<'a>,
     setup: Setup,
@@ -124,13 +110,10 @@ pub(crate) struct CcittBytes<'a> {
     packed: bool,
     /// Made at the first read, and again after a rewind.
     decoder: Option<Decoding<'a>>,
-    /// The bytes of the row being read (the decoder's last row, or a white one) that
-    /// were read, and those left.
+    /// The bytes of the decoder's last row that were read, and those left.
     at: usize,
     left: usize,
     state: State,
-    /// Whether the data broke off before its end.
-    broken: bool,
     /// Whether a meter's hook asked to stop, after which reads fail until a rewind.
     stopped: bool,
 }
@@ -152,9 +135,7 @@ struct Decoding<'a> {
 enum State {
     /// A decoded row is being read, or none before the first.
     Row,
-    /// The data ended, and white rows are read after it, this many more.
-    Padding(u32),
-    /// The data ended, and the bytes with it.
+    /// The data ended or broke off, and the bytes with it.
     Done,
 }
 
@@ -185,7 +166,6 @@ impl<'a> CcittBytes<'a> {
             at: 0,
             left: 0,
             state: State::Row,
-            broken: false,
             stopped: false,
         }
     }
@@ -201,7 +181,6 @@ impl<'a> CcittBytes<'a> {
         self.at = 0;
         self.left = 0;
         self.state = State::Row;
-        self.broken = false;
         self.stopped = false;
     }
 
@@ -293,8 +272,7 @@ impl<'a> CcittBytes<'a> {
         }
     }
 
-    /// Moves to the next row: one decoded, or a white one past the end of the data
-    /// where `decode` pads it; false at the end.
+    /// Moves to the next row decoded; false at the end.
     fn next_row(&mut self, meter: &Meter<'_>) -> Result<bool, Cancelled> {
         if self.stopped {
             return Err(Cancelled);
@@ -308,15 +286,6 @@ impl<'a> CcittBytes<'a> {
                 return Ok(false);
             }
             State::Done => return Ok(false),
-            State::Padding(0) => {
-                self.state = State::Done;
-                return Ok(false);
-            }
-            State::Padding(rows) => {
-                self.state = State::Padding(rows - 1);
-                self.left = row_len;
-                return Ok(true);
-            }
             State::Row => {}
         }
         let (data, settings) = (&self.data, self.setup.settings);
@@ -331,25 +300,14 @@ impl<'a> CcittBytes<'a> {
             self.stopped = true;
             return Err(Cancelled);
         }
-        let complete = match result {
-            Ok(true) => {
-                self.left = row_len;
-                return Ok(true);
-            }
-            Ok(false) => true,
-            Err(_) => false,
-        };
-        self.broken = !complete;
-        let decoded = decoding.rows.decoded_rows();
-        let rows = self.setup.settings.rows;
-        // `decode` fails where the data breaks off before a row, and pads 8-bit rows.
-        self.state =
-            if (complete || decoded > 0) && !self.packed && self.setup.pads(decoded, complete) {
-                State::Padding(rows - decoded)
-            } else {
-                State::Done
-            };
-        self.next_row(meter)
+        // The rows decoded before data that breaks off are kept, as those before its
+        // end are.
+        if let Ok(true) = result {
+            self.left = row_len;
+            return Ok(true);
+        }
+        self.state = State::Done;
+        Ok(false)
     }
 }
 
@@ -482,11 +440,6 @@ pub(crate) fn decode(
     let declared = bytes.row_len().checked_mul(setup.settings.rows as usize)?;
     let mut decoded = Vec::new();
     bytes.read_to_end(&mut decoded, declared, meter)?;
-    // If we decoded at least one row, let's be lenient and return what we got.
-    // See also 0001763.pdf.
-    if bytes.broken && decoded.is_empty() {
-        return None;
-    }
     if image_data.height == 0 {
         image_data.height = decoded.len().checked_div(bytes.row_len()).unwrap_or(0) as u32;
     }

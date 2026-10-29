@@ -1,0 +1,1579 @@
+# Images whose data ends early, as PyMuPDF 1.28.2 draws them: each case's
+# image (object 3) and mask (object 4) dictionaries and stored data in hex, and
+# the colour at the centre of each cell of a grid over the image, drawn over a
+# red page (R), a stencil painted blue; * where the colour is not compared
+# (a colour space MuPDF converts through a profile). Written by observing
+# PyMuPDF; regenerate rather than edit.
+case gray 1-bit, 3.5 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1
+data ffffffffffffff
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case gray 4-bit, 3.5 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 4
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case gray 8-bit, 3.5 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case rgb 1-bit, 3.5 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 1
+data 492492492492492492492492492492492492492492
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case rgb 4-bit, 3.5 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 4
+data 0f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f0
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case rgb 8-bit, 3.5 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8
+data 00ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff00
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case indexed 1-bit, 3.5 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace [/Indexed /DeviceRGB 1 <0000FF00FF00>] /BitsPerComponent 1
+data ffffffffffffff
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect B B B B B B B B B B B B B B B B
+expect B B B B B B B B B B B B B B B B
+expect B B B B B B B B B B B B B B B B
+expect B B B B B B B B B B B B B B B B
+expect B B B B B B B B B B B B B B B B
+case indexed 4-bit, 3.5 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace [/Indexed /DeviceRGB 15 <0000FF00FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF00>] /BitsPerComponent 4
+data 11111111111111111111111111111111111111111111111111111111
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect B B B B B B B B B B B B B B B B
+expect B B B B B B B B B B B B B B B B
+expect B B B B B B B B B B B B B B B B
+expect B B B B B B B B B B B B B B B B
+expect B B B B B B B B B B B B B B B B
+case indexed 8-bit, 3.5 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace [/Indexed /DeviceRGB 255 <0000FF00FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF00>] /BitsPerComponent 8
+data 0101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G B B B B B B B B
+expect B B B B B B B B B B B B B B B B
+expect B B B B B B B B B B B B B B B B
+expect B B B B B B B B B B B B B B B B
+expect B B B B B B B B B B B B B B B B
+case cmyk 1-bit, 3.5 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceCMYK /BitsPerComponent 1
+data 88888888888888888888888888888888888888888888888888888888
+expect * * * * * * * * * * * * * * * *
+expect * * * * * * * * * * * * * * * *
+expect * * * * * * * * * * * * * * * *
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+case cmyk 4-bit, 3.5 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceCMYK /BitsPerComponent 4
+data f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000
+expect * * * * * * * * * * * * * * * *
+expect * * * * * * * * * * * * * * * *
+expect * * * * * * * * * * * * * * * *
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+case cmyk 8-bit, 3.5 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceCMYK /BitsPerComponent 8
+data ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000
+expect * * * * * * * * * * * * * * * *
+expect * * * * * * * * * * * * * * * *
+expect * * * * * * * * * * * * * * * *
+expect * * * * * * * * W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+case gray 1-bit inverted, 3.5 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [1 0]
+data ffffffffffffff
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+case gray 8-bit inverted, 3.5 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [1 0]
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+case rgb 1-bit inverted, 3.5 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 1 /Decode [1 0 1 0 1 0]
+data 492492492492492492492492492492492492492492
+expect ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+expect ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+expect ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+case rgb 8-bit inverted, 3.5 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Decode [1 0 1 0 1 0]
+data 00ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff00
+expect ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+expect ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+expect ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff
+expect ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff ff00ff W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+case gray 8-bit, 3.5 rows, Flate
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode
+data 789cfbff9f3c0000365637c9
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case gray 1-bit, 3.5 rows, Flate
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /FlateDecode
+data 789cfbff1f0c001beb06fa
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case gray 8-bit, no data
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8
+data 
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case gray 2-bit, no data, Flate
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 2 /Filter /FlateDecode
+data 789c030000000001
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case rgb 2-bit 5 wide, 1.5 rows
+grid 5 2
+image /Width 5 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 2
+data 30c30c3030c3
+expect G G G G G
+expect K K K K K
+case gray 16-bit, 1.5 rows
+grid 4 2
+image /Width 4 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 16
+data ffffffffffffffffffffffff
+expect W W W W
+expect K K K K
+case rgb 8-bit 4 wide, cut after 5 bytes
+grid 4 2
+image /Width 4 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8
+data 00ff0000ff
+expect G G K K
+expect K K K K
+case gray 1-bit, 3 rows, soft mask
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /SMask 4 0 R
+data ffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case gray 4-bit, 3 rows, soft mask
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 4 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case gray 8-bit, 3 rows, soft mask
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case rgb 1-bit, 3 rows, soft mask
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 1 /SMask 4 0 R
+data 492492492492492492492492492492492492
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case rgb 4-bit, 3 rows, soft mask
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 4 /SMask 4 0 R
+data 0f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f00f0
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case rgb 8-bit, 3 rows, soft mask
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 4 0 R
+data 00ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff00
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case indexed 1-bit, 3 rows, soft mask
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace [/Indexed /DeviceRGB 1 <0000FF00FF00>] /BitsPerComponent 1 /SMask 4 0 R
+data ffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect B B B B B B B B B B B B B B B B
+expect B B B B B B B B B B B B B B B B
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case indexed 4-bit, 3 rows, soft mask
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace [/Indexed /DeviceRGB 15 <0000FF00FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF00>] /BitsPerComponent 4 /SMask 4 0 R
+data 111111111111111111111111111111111111111111111111
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect B B B B B B B B B B B B B B B B
+expect B B B B B B B B B B B B B B B B
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case indexed 8-bit, 3 rows, soft mask
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace [/Indexed /DeviceRGB 255 <0000FF00FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF00>] /BitsPerComponent 8 /SMask 4 0 R
+data 010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect B B B B B B B B B B B B B B B B
+expect B B B B B B B B B B B B B B B B
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case cmyk 1-bit, 3 rows, soft mask
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceCMYK /BitsPerComponent 1 /SMask 4 0 R
+data 888888888888888888888888888888888888888888888888
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000
+expect * * * * * * * * * * * * * * * *
+expect * * * * * * * * * * * * * * * *
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case cmyk 4-bit, 3 rows, soft mask
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceCMYK /BitsPerComponent 4 /SMask 4 0 R
+data f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000f000
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000
+expect * * * * * * * * * * * * * * * *
+expect * * * * * * * * * * * * * * * *
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case cmyk 8-bit, 3 rows, soft mask
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceCMYK /BitsPerComponent 8 /SMask 4 0 R
+data ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000
+expect * * * * * * * * * * * * * * * *
+expect * * * * * * * * * * * * * * * *
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case soft mask 1-bit, 3 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1
+data ffffffffffff
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case soft mask 1-bit inverted, 3 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [1 0]
+data 000000000000
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+case soft mask 4-bit, 3 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 4
+data ffffffffffffffffffffffffffffffffffffffffffffffff
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case soft mask 4-bit inverted, 3 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 4 /Decode [1 0]
+data 000000000000000000000000000000000000000000000000
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+case soft mask 8-bit, 3 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case soft mask 8-bit inverted, 3 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [1 0]
+data 000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+case soft mask 8-bit 4 wide, cut after 3 bytes
+grid 4 2
+image /Width 4 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffff
+mask /Width 4 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8
+data ffffff
+expect W W W R
+expect R R R R
+case 3 rows, soft mask 8 x 4
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 8 /Height 4 /ColorSpace /DeviceGray /BitsPerComponent 8
+data ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case 3 rows, soft mask 32 x 16
+grid 16 16
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 32 /Height 16 /ColorSpace /DeviceGray /BitsPerComponent 8
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case soft mask 32 x 16, 5 rows
+grid 16 16
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 32 /Height 16 /ColorSpace /DeviceGray /BitsPerComponent 8
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case 1-bit, 3 rows, 4-bit soft mask 8 x 4
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /SMask 4 0 R
+data ffffffffffff
+mask /Width 8 /Height 4 /ColorSpace /DeviceGray /BitsPerComponent 4
+data ffffffff00000000ffffffff00000000
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case gray 1-bit, 3 rows, mask stream
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Mask 4 0 R
+data ffffffffffff
+mask /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1
+data 00000000ffffffff00000000ffffffff
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case gray 8-bit, 3 rows, mask stream
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Mask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1
+data 00000000ffffffff00000000ffffffff
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case cmyk 1-bit, 3 rows, mask stream
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceCMYK /BitsPerComponent 1 /Mask 4 0 R
+data 888888888888888888888888888888888888888888888888
+mask /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1
+data 00000000ffffffff00000000ffffffff
+expect * * * * * * * * * * * * * * * *
+expect * * * * * * * * * * * * * * * *
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case cmyk 8-bit, 3 rows, mask stream
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceCMYK /BitsPerComponent 8 /Mask 4 0 R
+data ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000
+mask /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1
+data 00000000ffffffff00000000ffffffff
+expect * * * * * * * * * * * * * * * *
+expect * * * * * * * * * * * * * * * *
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case mask stream, 3 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Mask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1
+data 000000000000
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+case mask stream inverted, 3 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Mask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Decode [1 0]
+data ffffffffffff
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case 3 rows, mask stream 8 x 4
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Mask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 8 /Height 4 /ImageMask true /BitsPerComponent 1
+data 00ff00ff
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case stencil, 3 rows
+grid 16 8
+image /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1
+data 000000000000
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+case stencil inverted, 3 rows
+grid 16 8
+image /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Decode [1 0]
+data ffffffffffff
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case stencil, 3.5 rows
+grid 16 8
+image /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1
+data 00000000000000
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+case stencil inverted, 3.5 rows
+grid 16 8
+image /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Decode [1 0]
+data ffffffffffffff
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case gray 8-bit, 3.5 rows, colour key [0 0]
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Mask [0 0]
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case gray 8-bit, 3.5 rows, colour key [5 10]
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Mask [5 10]
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case gray 1-bit, 3.5 rows, colour key [0 0]
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Mask [0 0]
+data ffffffffffffff
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case gray 4-bit, 3.5 rows, colour key [0 3]
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 4 /Mask [0 3]
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case rgb 8-bit, 3.5 rows, colour key [0 0 0 0 0 0]
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Mask [0 0 0 0 0 0]
+data 00ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff00
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case rgb 8-bit, 3.5 rows, colour key [0 0 1 255 0 0]
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Mask [0 0 1 255 0 0]
+data 00ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff00
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case indexed 4-bit, 3.5 rows, colour key [0 0]
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace [/Indexed /DeviceRGB 15 <0000FF00FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF0000FF00>] /BitsPerComponent 4 /Mask [0 0]
+data 11111111111111111111111111111111111111111111111111111111
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case cmyk 8-bit, 3.5 rows, colour key [0 0 0 0 0 0 0 0]
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceCMYK /BitsPerComponent 8 /Mask [0 0 0 0 0 0 0 0]
+data ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000
+expect * * * * * * * * * * * * * * * *
+expect * * * * * * * * * * * * * * * *
+expect * * * * * * * * * * * * * * * *
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case 3 rows, soft mask alpha 255 /Matte [0]
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [0.5 1] /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Matte [0]
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case 3 rows, soft mask alpha 255 
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [0.5 1] /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect W W W W W W W W W W W W W W W W
+expect 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f
+expect 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f
+expect 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f
+expect 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f
+expect 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f
+case 3 rows, soft mask alpha 192 /Matte [0]
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [0.5 1] /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Matte [0]
+data c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0
+expect ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0
+expect ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0
+expect ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case 3 rows, soft mask alpha 192 
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [0.5 1] /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8
+data c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0
+expect ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0
+expect ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0
+expect ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0
+expect 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f
+expect 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f
+expect 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f
+expect 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f
+expect 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f 9e5f5f
+case 3 rows, soft mask alpha 128 /Matte [0]
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [0.5 1] /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Matte [0]
+data 8080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080
+expect ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080
+expect ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080
+expect ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case 3 rows, soft mask alpha 128 
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [0.5 1] /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8
+data 8080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080
+expect ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080
+expect ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080
+expect ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080 ff8080
+expect be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f
+expect be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f
+expect be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f
+expect be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f
+expect be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f be3f3f
+case soft mask with /Matte, 3 rows
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [0.5 1] /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Matte [0]
+data c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0
+expect ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0
+expect ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0
+expect ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case 3 rows, soft mask 8 x 4 with /Matte
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [0.5 1] /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 8 /Height 4 /ColorSpace /DeviceGray /BitsPerComponent 8 /Matte [0]
+data c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0
+expect ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0
+expect ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0
+expect ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0 ffc0c0
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case 1 row, soft mask with /Matte [0 0]
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Matte [0 0]
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case 1 row, mask stream with /Matte
+grid 16 8
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Mask 4 0 R
+data ffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Matte [0]
+data 00000000000000000000000000000000
+expect W W W W W W W W W W W W W W W W
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case 4 wide 8-bit, 1.75 rows, soft mask with /Matte
+grid 4 3
+image /Width 4 /Height 3 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffff
+mask /Width 4 /Height 3 /ColorSpace /DeviceGray /BitsPerComponent 8 /Matte [0]
+data ffffffffffffffffffffffff
+expect W W W W
+expect R R R R
+expect R R R R
+case CCITT G4 of 96 rows, 192 declared, 1083 bytes
+grid 1 192
+image /Width 211 /Height 192 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 211  >>
+data 26a19219f9d7d7fffffffffff91209e40808f0832342998a662f841fe557f083fff4ff4fd3fff4ff4fd3fff4ff4fd10626c810a662998bfa040dfe9fc20fffe937fa7f4fffe937fa7f4fffe937fa7fe6b14cc53317fa7fd3fffff5bfd3fa7fffffd3fffffffd3ff2a053314cc5ffff4ffffffff4fed7ffdebf4fffffed7f4ffcd62998a662feda5fa7f6bffeda5fa7f6bffeda5fa7f0c2fffb06097e9fb1440c53314cc5fdafd3f6bffdafd3f6bffdafd3f0c2fff0c2fd3f0c21111f22413c7fffffffc8da308c2308c23088e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88f11e23c4788f11c0afc44444444444444445a69a69a69249249249249249020490204902049020490204914394394394394394394394394394394394394394398730e61cc3987f9068c2308c2308c223a23a23a23a23a23a23a23a23a23a23a23a23a23a23a0409204092040920409204092040924924924924d34d34d08888888888888888888888fc44444444444444445a69a69a69249249249249249020490204902049020490204914394394394394394394394394394394394394394398730e61cc3987f91b461184611846111d11d11d11d11d020490204902049020490204902049249249249249249249249249269a69a684444444444447e22222222222222222d34d34d3492492492492492481024810248102481024810248a1ca1ca1ca1ca1ca1ca1ca1ca1ca1ca1ca1ca1ca1cc398730e61cc3fc83461184611846111d11d11d11d11d11d11d11d11d11d11d11d11d11d11d020490204902049020490204902049249249249269a69a6844444444444444444444447e22222222222222222d34d34d3492492492492492481024810248102481024810248a1ca1ca1ca1ca1ca1ca1ca1ca1ca1ca1ca1ca1ca1cc398730e61cc3fc8da308c2308c23088e88e88e88e88e810248102481024810248102481024924924924924924924924924934d34d342222222222223f1111111111111111169a69a69a4924924924924924081240812408124081240812450e50e50e50e50e50e50e50e50e50e50e50e50e50e61cc398730e61fe41a308c2308c23088e88e88e88e88e88e88e88e88e88e88e88e88e88e88e810248102481024810248102481024924924924934d34d3422222222222222222222223f1111111111111111169a69a69a4924924924924924081240812408124081240812450e50e50e50e50e50e50e50e50e50e50e50e50e50e61cc398730e61fe46d18461184611844744744744744740812408124081240812408124081249249249249249249249249249a69a69a1111111111111f88888888888888888b4d34d34d2492492492492492040920409204092040920409228728728728728728728728728728728728728728730e61cc398730ff1111111111111111111111111111111111111111111111fffffe3c0
+expect K
+expect K
+expect W
+expect W
+expect W
+expect W
+expect W
+expect W
+expect W
+expect W
+expect W
+expect W
+expect W
+expect W
+expect W
+expect W
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect W
+expect W
+expect W
+expect W
+expect W
+expect W
+expect W
+expect W
+expect W
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect W
+expect W
+expect W
+expect W
+expect W
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+case CCITT G4 of 96 rows, 192 declared, 1083 bytes /BlackIs1 true
+grid 1 192
+image /Width 211 /Height 192 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 211 /BlackIs1 true >>
+data 26a19219f9d7d7fffffffffff91209e40808f0832342998a662f841fe557f083fff4ff4fd3fff4ff4fd3fff4ff4fd10626c810a662998bfa040dfe9fc20fffe937fa7f4fffe937fa7f4fffe937fa7fe6b14cc53317fa7fd3fffff5bfd3fa7fffffd3fffffffd3ff2a053314cc5ffff4ffffffff4fed7ffdebf4fffffed7f4ffcd62998a662feda5fa7f6bffeda5fa7f6bffeda5fa7f0c2fffb06097e9fb1440c53314cc5fdafd3f6bffdafd3f6bffdafd3f0c2fff0c2fd3f0c21111f22413c7fffffffc8da308c2308c23088e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88e88f11e23c4788f11c0afc44444444444444445a69a69a69249249249249249020490204902049020490204914394394394394394394394394394394394394394398730e61cc3987f9068c2308c2308c223a23a23a23a23a23a23a23a23a23a23a23a23a23a23a0409204092040920409204092040924924924924d34d34d08888888888888888888888fc44444444444444445a69a69a69249249249249249020490204902049020490204914394394394394394394394394394394394394394398730e61cc3987f91b461184611846111d11d11d11d11d020490204902049020490204902049249249249249249249249249269a69a684444444444447e22222222222222222d34d34d3492492492492492481024810248102481024810248a1ca1ca1ca1ca1ca1ca1ca1ca1ca1ca1ca1ca1ca1cc398730e61cc3fc83461184611846111d11d11d11d11d11d11d11d11d11d11d11d11d11d11d020490204902049020490204902049249249249269a69a6844444444444444444444447e22222222222222222d34d34d3492492492492492481024810248102481024810248a1ca1ca1ca1ca1ca1ca1ca1ca1ca1ca1ca1ca1ca1cc398730e61cc3fc8da308c2308c23088e88e88e88e88e810248102481024810248102481024924924924924924924924924934d34d342222222222223f1111111111111111169a69a69a4924924924924924081240812408124081240812450e50e50e50e50e50e50e50e50e50e50e50e50e50e61cc398730e61fe41a308c2308c23088e88e88e88e88e88e88e88e88e88e88e88e88e88e88e810248102481024810248102481024924924924934d34d3422222222222222222222223f1111111111111111169a69a69a4924924924924924081240812408124081240812450e50e50e50e50e50e50e50e50e50e50e50e50e50e61cc398730e61fe46d18461184611844744744744744740812408124081240812408124081249249249249249249249249249a69a69a1111111111111f88888888888888888b4d34d34d2492492492492492040920409204092040920409228728728728728728728728728728728728728728730e61cc398730ff1111111111111111111111111111111111111111111111fffffe3c0
+expect W
+expect W
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect *
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect *
+expect *
+expect *
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+case CCITT G4 of 96 rows, 96 declared, 0 bytes
+grid 1 96
+image /Width 211 /Height 96 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 211  >>
+data 
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+case CCITT G4 of 96 rows, 96 declared, 0 bytes /BlackIs1 true
+grid 1 96
+image /Width 211 /Height 96 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 211 /BlackIs1 true >>
+data 
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
+expect K
