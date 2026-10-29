@@ -86,19 +86,24 @@ pub(super) fn asset(pdf: &Pdf) -> ImageAsset {
 /// The image decoded whole, as images that are not streamed are; a stencil mask as
 /// its alpha.
 pub(super) fn whole(asset: &ImageAsset) -> ImageSource<'_> {
+    try_whole(asset).unwrap()
+}
+
+/// [`whole`]; `None` where decoding the image whole fails.
+pub(super) fn try_whole(asset: &ImageAsset) -> Option<ImageSource<'_>> {
     let meter = Meter::default();
     let obj = asset.xobject().unwrap();
     let decoded = if obj.kind == ImageKind::StencilMask {
-        Decoded::stencil(decode_mask(&obj, None, &meter).unwrap().luma)
+        Decoded::stencil(decode_mask(&obj, None, &meter)?.luma)
     } else {
-        let decoded = decode_image(&obj, None, &meter).unwrap();
+        let decoded = decode_image(&obj, None, &meter)?;
         Decoded::new(decoded.image, decoded.alpha, &meter).unwrap()
     };
-    ImageSource::new(
+    Some(ImageSource::new(
         decoded.layout(),
         Inner::Decoded(decoded),
         DecodeWork::default(),
-    )
+    ))
 }
 
 pub(super) fn request(
@@ -676,35 +681,41 @@ fn rows_wider_than_a_piece_stream_as_decoded() {
     )]);
 }
 
-/// A first row too short to pad, read in pieces, is dropped from texels kept whole
-/// and from sums in either order, also after pieces of it were pushed, and when its
-/// data ends past the window.
+/// Data whose first row is too short to pad holds no row: requests fail, as decoding
+/// it whole does, whether the row is read in pieces into texels kept whole or into
+/// sums, also after pieces of it were pushed, and when its data ends past the window.
 #[test]
-fn a_short_wide_row_is_dropped() {
+fn a_short_wide_first_row_fails() {
     let (w, h) = (300_000_u32, 3_u32);
     let pdf = pdf(&[(
         image("/ColorSpace /DeviceGray /BitsPerComponent 8", w, h),
         noise(70_000, 16),
     )]);
     let asset = asset(&pdf);
+    assert!(try_whole(&asset).is_none());
     let mut streamed = asset.open(None, None).unwrap();
     for grid in [(w, h), (w / 2, 2), (70, 2)] {
         for window in [[0, 0, grid.0, grid.1], [0, 0, grid.0 / 70, 1]] {
-            let a = request(&mut streamed, Plane::Image, grid, window);
+            let result = streamed.request(&ImageRequest {
+                plane: Plane::Image,
+                grid,
+                window,
+                cancel: None,
+            });
             assert_eq!(
-                a.data.len(),
-                ((window[2] - window[0]) * (window[3] - window[1]) * 2) as usize
+                result.err(),
+                Some(RequestError::Failed),
+                "{grid:?} {window:?}"
             );
-            assert!(a.data.iter().all(|&v| v == 0), "{grid:?} {window:?}");
         }
     }
     assert_eq!(streamed.work().rows_decoded, 0);
 }
 
 /// A row the data ends within pushes the texels its data holds, not the texels the
-/// row's width declares: one byte of a row 20 million samples wide is dropped before
-/// any texel is pushed, and the padding of a row kept, whose padded samples are not
-/// zero once inverted, is pushed at once.
+/// row's width declares: one byte of a row 20 million samples wide fails the request
+/// before any texel is pushed, and the padding of a row kept, whose padded samples
+/// are not zero once inverted, is pushed at once.
 #[test]
 fn a_row_cut_short_pushes_the_texels_it_holds() {
     let gray = "/ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [1 0]";
@@ -713,14 +724,20 @@ fn a_row_cut_short_pushes_the_texels_it_holds() {
         let asset = asset(&pdf);
         let mut streamed = asset.open(None, None).unwrap();
         crate::x_object::area::PUSHED.set(0);
-        let a = request(&mut streamed, Plane::Image, (2, 2), [1, 0, 2, 1]);
+        let a = streamed.request(&ImageRequest {
+            plane: Plane::Image,
+            grid: (2, 2),
+            window: [1, 0, 2, 1],
+            cancel: None,
+        });
         let pushed = crate::x_object::area::PUSHED.get();
         assert!(pushed <= PIECE_BYTES as u64, "{w}: {pushed} texels pushed");
         assert_eq!(streamed.work().rows_decoded, kept);
         if kept == 0 {
-            assert_eq!(a.data, [0, 0]);
+            assert_eq!(a.err(), Some(RequestError::Failed));
         } else {
             // Whole decoding keeps the rows present.
+            let a = a.unwrap();
             let b = request(&mut whole(&asset), Plane::Image, (2, 1), [1, 0, 2, 1]);
             assert_eq!((a.format, a.data), (b.format, b.data));
         }
@@ -977,21 +994,23 @@ fn a_first_open_is_cancelled_within_bounded_work() {
 }
 
 /// Rows missing from the data are padded a piece at a time: a request of a huge grid
-/// whose data is empty is cancelled within three polls' worth of work.
+/// whose data holds one byte, of a first row kept, is cancelled within three polls'
+/// worth of work.
 #[test]
 #[cfg(debug_assertions)]
 fn padding_missing_rows_is_cancelled_within_bounded_work() {
-    let w = 2_000_000;
+    // Padding the first row takes no more than `MIN_ROW_PAD`, so it is kept.
+    let (w, h) = (65_537, 40);
     let pdf = pdf(&[(
-        image("/ColorSpace /DeviceGray /BitsPerComponent 8", w, 2),
-        vec![],
+        image("/ColorSpace /DeviceGray /BitsPerComponent 8", w, h),
+        vec![7],
     )]);
     let asset = asset(&pdf);
     let mut source = asset.open(None, None).unwrap();
     let request_of = |cancel| ImageRequest {
         plane: Plane::Image,
-        grid: (w, 2),
-        window: [0, 0, w, 2],
+        grid: (w, h),
+        window: [0, 0, w, h],
         cancel,
     };
     let polls = Cell::new(0);
@@ -1007,7 +1026,8 @@ fn padding_missing_rows_is_cancelled_within_bounded_work() {
     let told = TOLD.get();
     assert!(told < 3 * POLL_BYTES, "{told} bytes of work");
     let region = source.request(&request_of(None)).unwrap();
-    assert_eq!(region.data.len(), 2 * w as usize * 2);
+    assert_eq!(region.data.len(), 2 * (w * h) as usize);
+    assert_eq!(region.data[..2], [7, 255]);
 }
 
 /// Rows of a mask decoded whole are skipped without work: a request of the last row of

@@ -147,7 +147,7 @@ impl<'a> JpegStreamed<'a> {
 
     pub(super) fn layout(&self) -> ImageLayout {
         ImageLayout {
-            image: self.colour.plane(&self.obj, false),
+            image: self.colour.plane(&self.obj, self.obj.height(), false),
             mask: None,
         }
     }

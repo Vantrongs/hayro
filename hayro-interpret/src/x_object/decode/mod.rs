@@ -357,26 +357,27 @@ fn decode_u8_samples(
     match bits_per_component {
         1..8 => {
             let lut = sample_lut(color_space, bits_per_component, decode)?;
-            let height = sample_rows(data, width, height, num_components, bits_per_component);
-            let mut buf = Vec::with_capacity(width as usize * num_components * height as usize);
-            for_each_sample(
-                data,
-                width,
-                height,
-                num_components,
-                bits_per_component,
-                meter,
-                |value, index| {
-                    buf.push(lut[index % num_components][value as usize]);
-                    Some(())
-                },
-            )?;
-
+            let rows = SampleRows::new(width, num_components, bits_per_component, height);
+            let mut buf = Vec::with_capacity(rows.row_len * rows.rows_kept(data.len()) as usize);
+            for_each_packed_row(data, rows, meter, |first, samples| {
+                if let [lut] = &lut[..] {
+                    buf.extend(samples.iter().map(|&v| lut[usize::from(v)]));
+                } else {
+                    let components = (first..).map(|i| &lut[i % num_components]);
+                    buf.extend(
+                        samples
+                            .iter()
+                            .zip(components)
+                            .map(|(&v, lut)| lut[usize::from(v)]),
+                    );
+                }
+            })?;
             Some(buf)
         }
         9..16 => {
             let map = SampleMap::new(color_space, bits_per_component, decode);
-            let height = sample_rows(data, width, height, num_components, bits_per_component);
+            let height = SampleRows::new(width, num_components, bits_per_component, height)
+                .rows_kept(data.len());
             let mut buf = Vec::with_capacity(width as usize * num_components * height as usize);
             for_each_sample(
                 data,
@@ -418,9 +419,18 @@ fn unpack_samples(
     meter: &Meter<'_>,
 ) -> Option<Vec<u16>> {
     match bits_per_component {
-        1..8 | 9..16 => {
-            let height = sample_rows(data, width, height, num_components, bits_per_component);
-            let mut buf = Vec::with_capacity(width as usize * num_components * height as usize);
+        1..8 => {
+            let rows = SampleRows::new(width, num_components, bits_per_component, height);
+            let mut buf = Vec::with_capacity(rows.row_len * rows.rows_kept(data.len()) as usize);
+            for_each_packed_row(data, rows, meter, |_, samples| {
+                buf.extend(samples.iter().map(|&v| u16::from(v)));
+            })?;
+            Some(buf)
+        }
+        9..16 => {
+            let rows = SampleRows::new(width, num_components, bits_per_component, height);
+            let height = rows.rows_kept(data.len());
+            let mut buf = Vec::with_capacity(rows.row_len * height as usize);
             for_each_sample(
                 data,
                 width,
@@ -451,23 +461,116 @@ fn unpack_samples(
     }
 }
 
-/// The rows of packed samples, at most `height`, that `data` holds (see
-/// `rows_present`); each row starts on a byte.
-fn sample_rows(
+/// How stored samples lie in an image's rows, each row starting on a byte: the one
+/// source of the samples and rows that both decoding an image whole and streaming
+/// it keep of data that ends early.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SampleRows {
+    /// Samples per row, over components.
+    pub(crate) row_len: usize,
+    pub(crate) bits: u8,
+    /// The rows the image declares.
+    pub(crate) height: u32,
+}
+
+impl SampleRows {
+    pub(crate) fn new(width: u32, components: usize, bits: u8, height: u32) -> Self {
+        Self {
+            row_len: (width as usize).saturating_mul(components),
+            bits: bits.max(1),
+            height,
+        }
+    }
+
+    /// Stored bytes per row, at least one.
+    pub(crate) fn row_bytes(&self) -> usize {
+        self.row_len
+            .saturating_mul(usize::from(self.bits))
+            .div_ceil(8)
+            .max(1)
+    }
+
+    /// The samples whose bits the first `bytes` stored bytes hold whole.
+    pub(crate) fn samples_held(&self, bytes: usize) -> usize {
+        let row_bytes = self.row_bytes();
+        (bytes / row_bytes).saturating_mul(self.row_len)
+            + (bytes % row_bytes * 8 / usize::from(self.bits)).min(self.row_len)
+    }
+
+    /// The rows kept of data of `bytes` stored bytes (see `rows_present`).
+    pub(crate) fn rows_kept(&self, bytes: usize) -> u32 {
+        rows_present(self.samples_held(bytes), self.row_len, self.height)
+    }
+
+    /// Whether the row data of `bytes` stored bytes ends within is kept, padded.
+    pub(crate) fn keeps_row_cut_at(&self, bytes: usize) -> bool {
+        self.rows_kept(bytes) as usize > bytes / self.row_bytes()
+    }
+}
+
+/// The stored values of the samples of `bits` each (at most eight) that `bytes`
+/// starts with, a byte each, into `out`: a sample whose bits `bytes` does not hold
+/// whole, and every one after it, is `fill`.
+pub(crate) fn unpack_packed(bits: u8, bytes: &[u8], out: &mut [u8], fill: u8) {
+    let bits = usize::from(bits);
+    let held = (bytes.len() * 8 / bits).min(out.len());
+    let (out, rest) = out.split_at_mut(held);
+    rest.fill(fill);
+    match bits {
+        8 => out.copy_from_slice(&bytes[..held]),
+        1 => {
+            let lut = &**BILEVEL_MASK_LUT;
+            for (texels, &byte) in out.chunks_mut(8).zip(bytes) {
+                let expanded = (lut[byte as usize] & 0x0101_0101_0101_0101).to_ne_bytes();
+                texels.copy_from_slice(&expanded[..texels.len()]);
+            }
+        }
+        _ => {
+            let mask = (1_u16 << bits) - 1;
+            for (i, sample) in out.iter_mut().enumerate() {
+                let at = i * bits;
+                let window = u16::from_be_bytes([
+                    bytes[at / 8],
+                    bytes.get(at / 8 + 1).copied().unwrap_or(0),
+                ]);
+                *sample = ((window >> (16 - bits - at % 8)) & mask) as u8;
+            }
+        }
+    }
+}
+
+/// Visits the stored values of the rows `rows` keeps of `data`, unpacked
+/// ([`unpack_packed`], those the data does not hold whole zero), a counted piece at
+/// a time, each with the index in its row of its first sample.
+fn for_each_packed_row(
     data: &[u8],
-    width: u32,
-    height: u32,
-    num_components: usize,
-    bits_per_component: u8,
-) -> u32 {
-    let row_len = (width as usize).saturating_mul(num_components);
-    let row_bytes = row_len
-        .saturating_mul(bits_per_component as usize)
-        .div_ceil(8)
-        .max(1);
-    let samples = (data.len() / row_bytes).saturating_mul(row_len)
-        + (data.len() % row_bytes * 8 / bits_per_component.max(1) as usize).min(row_len);
-    rows_present(samples, row_len, height)
+    rows: SampleRows,
+    meter: &Meter<'_>,
+    mut visit: impl FnMut(usize, &[u8]),
+) -> Option<()> {
+    let kept = rows.rows_kept(data.len()) as usize;
+    if kept == 0 {
+        return Some(());
+    }
+    let row_bytes = rows.row_bytes();
+    let bits = usize::from(rows.bits);
+    // Whole bytes of samples.
+    let piece = rows.row_len.clamp(1, POLL_BYTES / 8 * 8);
+    let mut samples = vec![0; piece];
+    for r in 0..kept {
+        let row = data.get(r * row_bytes..).unwrap_or_default();
+        let row = &row[..row.len().min(row_bytes)];
+        for first in (0..rows.row_len).step_by(piece) {
+            let len = piece.min(rows.row_len - first);
+            let start = (first * bits / 8).min(row.len());
+            let end = ((first + len) * bits).div_ceil(8).min(row.len());
+            let samples = &mut samples[..len];
+            unpack_packed(rows.bits, &row[start..end], samples, 0);
+            visit(first, samples);
+            meter.work(len).ok()?;
+        }
+    }
+    Some(())
 }
 
 fn for_each_sample(

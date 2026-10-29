@@ -24,9 +24,9 @@ use hayro_syntax::work::{Cancelled, Meter};
 use index::Checkpoints;
 use jpeg::JpegStreamed;
 use kurbo::Affine;
-use rows::{MaskHeight, PIECE_BYTES};
+use rows::PIECE_BYTES;
 use std::sync::Arc;
-use streamed::Streamed;
+use streamed::{HeldRows, Streamed};
 
 /// A raster image's source, owned: its stream (by object identifier, or a copy of an
 /// inline image's bytes), resolved colour space, transfer function, interpolation
@@ -38,7 +38,7 @@ pub struct ImageAsset(Arc<AssetData>);
 struct AssetData {
     stream: OwnedStream,
     checkpoints: Checkpoints,
-    mask_height: MaskHeight,
+    held_rows: HeldRows,
     ccitt_height: CcittHeight,
     width: u32,
     height: u32,
@@ -57,7 +57,7 @@ impl ImageXObject<'_> {
         ImageAsset(Arc::new(AssetData {
             stream: self.stream.to_owned_stream(),
             checkpoints: Checkpoints::default(),
-            mask_height: MaskHeight::new(),
+            held_rows: HeldRows::default(),
             ccitt_height: CcittHeight::new(),
             width: self.width(),
             height: self.height(),
@@ -120,10 +120,12 @@ impl ImageAsset {
     /// are `DeviceGray`, `DeviceRGB` or `Indexed`, of at most eight bits (of eight,
     /// used as stored or inverted), with masks of the same kinds or decoded whole,
     /// and stencil masks with no filter or Flate whose samples are used as stored or
-    /// inverted, only read their dictionaries here (and, the first time, read such a
-    /// mask's data through to count its rows); requests read their data and keep a
-    /// piece of a row and a few sums per bin, the rows the data does not reach being
-    /// transparent. A request of such a Flate image without a mask read alongside
+    /// inverted, only read their dictionaries here (and, the first time, read the
+    /// data of an image with a mask stream and of its mask through, to count the
+    /// rows decoding them whole keeps, on which the mask's grid depends); requests
+    /// read their data and keep a piece of a row and a few sums per bin, the rows the
+    /// data does not reach being transparent, and fail where the data holds no row,
+    /// as decoding it whole does. A request of such a Flate image without a mask read alongside
     /// resumes from the nearest decoder state an earlier request of the asset saved,
     /// instead of from the start. So does a request of a single-scan baseline
     /// grayscale JPEG of its declared size without masks, read in bands of eight
@@ -145,7 +147,7 @@ impl ImageAsset {
         meter.poll()?;
         let obj = self.xobject().ok_or(RequestError::Failed)?;
         let a = &*self.0;
-        let streamed = Streamed::new(&obj, &a.stream, &a.checkpoints, &a.mask_height, &meter)?;
+        let streamed = Streamed::new(&obj, &a.stream, &a.checkpoints, &a.held_rows, &meter)?;
         if let Some(streamed) = streamed {
             let (layout, opened) = (streamed.layout(), streamed.opened);
             return Ok(ImageSource::new(
@@ -511,5 +513,7 @@ fn interleave(texels: &[u8], channels: usize, alpha: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+#[cfg(test)]
+mod differential;
 #[cfg(test)]
 mod tests;
