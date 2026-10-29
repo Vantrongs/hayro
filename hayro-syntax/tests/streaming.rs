@@ -3,7 +3,6 @@
 
 use hayro_syntax::Pdf;
 use hayro_syntax::object::stream::DecodedReader;
-use hayro_syntax::object::stream::{DecodeFailure, ImageDecodeParams};
 use hayro_syntax::object::{ObjectIdentifier, Stream};
 use hayro_syntax::work::{Cancelled, Meter, POLL_BYTES};
 use std::cell::Cell;
@@ -381,464 +380,474 @@ fn a_checkpoint_belongs_to_the_bytes_it_was_taken_from() {
     assert_eq!(read_up_to(&mut other, usize::MAX, 997), data);
 }
 
-/// A CCITT stream that ends at once holds about as much whatever its dictionary
-/// declares: its output grows with the rows decoded, not with `Rows` or `Columns`.
-#[test]
-fn a_declared_ccitt_size_is_not_allocated_before_rows_are_decoded() {
-    // Two EOL codes: the end of the data in Group 4.
-    let eofb = [0x00, 0x10, 0x01];
-    for is_indexed in [false, true] {
-        let peak = |columns: u32, rows: u32| {
+/// Image data CCITT decoding reads, which needs the `images` feature.
+#[cfg(feature = "images")]
+mod ccitt {
+    use super::*;
+    use hayro_syntax::object::stream::{DecodeFailure, ImageDecodeParams};
+
+    /// A CCITT stream that ends at once holds about as much whatever its dictionary
+    /// declares: its output grows with the rows decoded, not with `Rows` or `Columns`.
+    #[test]
+    fn a_declared_ccitt_size_is_not_allocated_before_rows_are_decoded() {
+        // Two EOL codes: the end of the data in Group 4.
+        let eofb = [0x00, 0x10, 0x01];
+        for is_indexed in [false, true] {
+            let peak = |columns: u32, rows: u32| {
+                let pdf = stream_file(
+                    &format!(
+                        "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns {columns} /Rows {rows} >>"
+                    ),
+                    &eofb,
+                );
+                let stream = object_3(&pdf);
+                let params = ImageDecodeParams {
+                    is_indexed,
+                    ..Default::default()
+                };
+                let (_, decoded) = measure(|| stream.decoded_image(&params));
+                decoded.peak
+            };
+            let small = peak(8, 1);
+            for (columns, rows) in [(8, 65_535), (1 << 20, 65_535), (u32::MAX, 65_535)] {
+                let large = peak(columns, rows);
+                assert!(
+                    large < small + 4096,
+                    "{columns} x {rows}: {large} vs {small}"
+                );
+            }
+        }
+    }
+
+    /// The image bytes an image reader yields, read in pieces of `chunk` bytes, read
+    /// twice with a rewind between.
+    fn read_image_twice(stream: &Stream<'_>, params: &ImageDecodeParams, chunk: usize) -> Vec<u8> {
+        let mut reader = stream.image_reader(params).unwrap();
+        let first = read_up_to(&mut reader, usize::MAX, chunk);
+        reader.rewind();
+        let second = read_up_to(&mut reader, usize::MAX, chunk);
+        assert!(second == first, "a rewound reader reads the same");
+        first
+    }
+
+    /// The bytes an image reader yields where it reads every other piece of `chunk`
+    /// bytes and skips the rest, each skipped byte zero, and the bytes it held.
+    fn read_skipping(stream: &Stream<'_>, params: &ImageDecodeParams, chunk: usize) -> Vec<u8> {
+        let meter = Meter::new(None);
+        let mut reader = stream.image_reader(params).unwrap();
+        let mut out = Vec::new();
+        let mut buf = vec![0; chunk];
+        for k in 0.. {
+            let got = if k % 2 == 0 {
+                reader.read(&mut buf, &meter).unwrap()
+            } else {
+                let got = reader.skip(chunk, &meter).unwrap();
+                buf[..got].fill(0);
+                got
+            };
+            out.extend_from_slice(&buf[..got]);
+            if got == 0 {
+                return out;
+            }
+        }
+        unreachable!()
+    }
+
+    /// CCITT data read through an image reader yields what decoding the image whole
+    /// returns, as it decodes: data of every encoding, gray and indexed, with
+    /// `BlackIs1`, a `/Width` other than its columns, ending before the rows declared,
+    /// breaking off, and holding no row.
+    #[test]
+    fn ccitt_image_bytes_read_as_whole_decoding_returns_them() {
+        let streams = [
+            (
+                "-1",
+                &include_bytes!("../../hayro-ccitt/tests/streams/g4.bin")[..],
+            ),
+            (
+                "0",
+                &include_bytes!("../../hayro-ccitt/tests/streams/g3_1d.bin")[..],
+            ),
+            (
+                "1",
+                &include_bytes!("../../hayro-ccitt/tests/streams/g3_2d.bin")[..],
+            ),
+        ];
+        let mut cases = 0;
+        for (k, data) in streams {
+            for cut in [data.len(), data.len() / 2, 3, 0] {
+                for (height, black_is_1, indexed) in [
+                    (96, "", false),
+                    (96, "/BlackIs1 true", true),
+                    (150, "", false),
+                    (150, "", true),
+                    (5000, "", false),
+                    (90, "/BlackIs1 true", false),
+                ] {
+                    let dict = format!(
+                        "/Filter /CCITTFaxDecode /DecodeParms << /K {k} /Columns 211 {black_is_1} >>"
+                    );
+                    let pdf = stream_file(&dict, &data[..cut]);
+                    let stream = object_3(&pdf);
+                    let params = ImageDecodeParams {
+                        is_indexed: indexed,
+                        width: 100,
+                        height,
+                        ..Default::default()
+                    };
+                    let whole = stream.decoded_image(&params);
+                    let reported = stream.ccitt_image_data(&params).unwrap();
+                    for chunk in [1, 7, 4096] {
+                        let read = read_image_twice(&stream, &params, chunk);
+                        let case =
+                            format!("K {k}, cut {cut}, {height} rows, {indexed}, chunk {chunk}");
+                        let skipping = read_skipping(&stream, &params, chunk);
+                        assert_eq!(skipping.len(), read.len(), "{case}: skipping");
+                        for (i, (a, b)) in
+                            skipping.chunks(chunk).zip(read.chunks(chunk)).enumerate()
+                        {
+                            assert!(i % 2 == 1 || a == b, "{case}: skipping, piece {i}");
+                        }
+                        match &whole {
+                            Ok(whole) => {
+                                assert!(read == whole.data.as_ref(), "{case}");
+                                let image = whole.image_data.as_ref().unwrap();
+                                assert_eq!(
+                                    (reported.width, reported.height, reported.bits_per_component),
+                                    (image.width, image.height, image.bits_per_component),
+                                    "{case}"
+                                );
+                            }
+                            Err(_) => assert!(read.is_empty(), "{case}"),
+                        }
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 3 * 4 * 6 * 3);
+    }
+
+    /// Encrypted CCITT data is decrypted as its rows are read, through a window: reading
+    /// all rows of AES-encrypted Group 4 data holds about as much whatever the data's
+    /// size, and yields the rows of the same data stored plain. Making the reader
+    /// decrypts nothing.
+    #[test]
+    fn encrypted_ccitt_rows_hold_a_window_whatever_the_data_size() {
+        let columns = 64;
+        let dict = format!("/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns {columns} >>");
+        let mut peaks = Vec::new();
+        for bytes in [1 << 18, 1 << 20, 1 << 22] {
+            // White rows, a bit each against the white row above.
+            let data = vec![0xFF; bytes];
+            let rows = 8 * bytes as u32;
+            let params = ImageDecodeParams {
+                width: columns,
+                height: rows,
+                ..Default::default()
+            };
+            // The rows read, and a sum of their bytes.
+            let count = |stream: &Stream<'_>| {
+                let mut reader = stream.image_reader(&params).unwrap();
+                let (mut buf, mut read, mut sum) = (vec![0; 1000], 0, 0_u64);
+                loop {
+                    match reader.read(&mut buf, &Meter::default()).unwrap() {
+                        0 => break,
+                        n => {
+                            read += n;
+                            sum += buf[..n].iter().map(|&b| u64::from(b)).sum::<u64>();
+                        }
+                    }
+                }
+                (read / columns as usize, sum)
+            };
+            let plain = stream_file(&dict, &data);
+            let expected = count(&object_3(&plain));
+            assert_eq!(expected.0, rows as usize);
+            let encrypted = encrypted_file(&dict, &data);
+            let stream = object_3(&encrypted);
+            let (made, making) = measure(|| stream.image_reader(&params).is_some());
+            assert!(made);
+            assert!(
+                making.largest < 1024,
+                "making the reader allocated {making:?}"
+            );
+            let (read, reading) = measure(|| count(&stream));
+            assert_eq!(read, expected, "{bytes} bytes");
+            peaks.push(reading.peak);
+        }
+        assert!(peaks[0] < 160 * 1024, "{peaks:?}");
+        assert!(peaks.iter().all(|&p| p <= peaks[0] + 4096), "{peaks:?}");
+    }
+
+    /// Bits written most significant first.
+    #[derive(Default)]
+    struct Bits {
+        bytes: Vec<u8>,
+        len: usize,
+    }
+
+    impl Bits {
+        fn push(&mut self, code: &str) {
+            for bit in code.bytes() {
+                if self.len.is_multiple_of(8) {
+                    self.bytes.push(0);
+                }
+                if bit == b'1' {
+                    *self.bytes.last_mut().unwrap() |= 0x80 >> (self.len % 8);
+                }
+                self.len += 1;
+            }
+        }
+    }
+
+    /// Encrypted Group 3 data whose damaged lines are each longer than the window of
+    /// decrypted bytes the CCITT decoder reads in: going back to the start of each, to
+    /// find the EOL after it, decrypts a bounded amount, not the data before it again,
+    /// so the bytes decrypted grow with the data, under AES and RC4 alike, and the rows
+    /// are those of the same data stored plain.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn going_back_in_encrypted_ccitt_data_decrypts_a_bounded_amount() {
+        use common::rc4::{self, Part};
+        use hayro_syntax::work::TOLD;
+        const EOL: &str = "000000000001";
+        // Runs of no white and no black pixels: a line that never ends, to its EOL.
+        const NOTHING: &str = "001101010000110111";
+        let line_bytes = 160 * 1024;
+        let dict = "/Filter /CCITTFaxDecode /DecodeParms << /K 0 /Columns 8 >>";
+        for lines in [3, 12] {
+            let mut bits = Bits::default();
+            bits.push(EOL);
+            for _ in 0..lines {
+                for _ in 0..line_bytes * 8 / NOTHING.len() {
+                    bits.push(NOTHING);
+                }
+                bits.push(EOL);
+            }
+            for _ in 0..5 {
+                bits.push(EOL);
+            }
+            let data = bits.bytes;
+            let params = ImageDecodeParams {
+                width: 8,
+                height: lines,
+                ..Default::default()
+            };
+            // The bytes read and the work counted reading them.
+            let read = |stream: &Stream<'_>| {
+                let mut reader = stream.image_reader(&params).unwrap();
+                let before = TOLD.get();
+                let bytes = read_up_to(&mut reader, usize::MAX, 4096);
+                (bytes, TOLD.get() - before)
+            };
+            let plain = stream_file(dict, &data);
+            let (expected, plain_work) = read(&object_3(&plain));
+            assert_eq!(expected.len(), 8 * lines as usize);
+            let aes = encrypted_file(dict, &data);
+            let rc4 = Pdf::new(rc4::file(
+                &[
+                    Part::Object("<< /Type /Catalog /Pages 2 0 R >>", b""),
+                    Part::Object("<< /Type /Pages /Kids [] /Count 0 >>", b""),
+                    Part::StreamWith(dict, &data),
+                ],
+                &[],
+            ))
+            .unwrap();
+            for (cipher, pdf) in [("AES", aes), ("RC4", rc4)] {
+                let (rows, work) = read(&object_3(&pdf));
+                assert!(rows == expected, "{cipher}, {lines} lines: other rows");
+                let decrypted = work - plain_work;
+                // Each byte decrypted once going forward and once going back, and a
+                // bounded amount for each line gone back to.
+                let bound = 2 * data.len() + lines as usize * 128 * 1024;
+                println!(
+                    "{cipher}, {lines} lines, {} bytes: {decrypted} decrypted",
+                    data.len()
+                );
+                assert!(
+                    decrypted <= bound,
+                    "{cipher}, {lines} lines of {line_bytes} bytes: {decrypted} bytes \
+                     decrypted, over {bound}"
+                );
+            }
+        }
+    }
+
+    /// A Group 3 row followed by EOLs is read before them, plain or encrypted: reading
+    /// the first row of a line of eight white pixels followed by 256 KiB to 4 MiB of EOLs
+    /// counts the same few bytes of work (bits read, bytes decrypted), whether the image
+    /// declares that row alone or two, and gives the row.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_ccitt_row_is_read_before_the_eols_after_it() {
+        use hayro_syntax::work::TOLD;
+        // A white run of eight, then a pair of EOLs each three bytes.
+        const LINE: u8 = 0x98;
+        const EOLS: [u8; 3] = [0x00, 0x10, 0x01];
+        let dict = "/Filter /CCITTFaxDecode /DecodeParms << /K 0 /Columns 8 >>";
+        for height in [1, 2] {
+            let params = ImageDecodeParams {
+                width: 8,
+                height,
+                ..Default::default()
+            };
+            let mut works = Vec::new();
+            for len in [1 << 18, 1 << 20, 4 << 20] {
+                let mut data = vec![LINE];
+                for _ in 0..len / 3 {
+                    data.extend(EOLS);
+                }
+                for (cipher, pdf) in [
+                    ("plain", stream_file(dict, &data)),
+                    ("AES", encrypted_file(dict, &data)),
+                ] {
+                    let stream = object_3(&pdf);
+                    let mut reader = stream.image_reader(&params).unwrap();
+                    TOLD.set(0);
+                    let row = read_up_to(&mut reader, 8, 8);
+                    let work = TOLD.get();
+                    assert_eq!(
+                        row,
+                        [0xFF; 8],
+                        "{cipher}, {height} rows, {} bytes",
+                        data.len()
+                    );
+                    println!("{cipher}, {height} rows, {} bytes: {work} work", data.len());
+                    works.push((cipher, data.len(), work));
+                }
+            }
+            for cipher in ["plain", "AES"] {
+                let works: Vec<_> = works.iter().filter(|w| w.0 == cipher).collect();
+                assert!(
+                    works.iter().all(|w| w.2 == works[0].2 && w.2 < 64 * 1024),
+                    "{cipher}, {height} rows: {works:?}"
+                );
+            }
+        }
+    }
+
+    /// A CCITT stream that decodes a few rows of many declared holds at most eight
+    /// times what it decoded: room is made ahead of the rows, but not for all of them.
+    #[test]
+    fn a_ccitt_stream_cut_short_holds_a_multiple_of_its_rows() {
+        // Eight white rows, a bit each against the white row above, then the end of data.
+        let data = [0xFF, 0x00, 0x10, 0x01];
+        let columns = 1 << 16;
+        for is_indexed in [false, true] {
+            let row = if is_indexed { columns / 8 } else { columns };
             let pdf = stream_file(
                 &format!(
-                    "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns {columns} /Rows {rows} >>"
+                    "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns {columns} /Rows 65535 >>"
                 ),
-                &eofb,
+                &data,
             );
             let stream = object_3(&pdf);
             let params = ImageDecodeParams {
                 is_indexed,
                 ..Default::default()
             };
-            let (_, decoded) = measure(|| stream.decoded_image(&params));
-            decoded.peak
-        };
-        let small = peak(8, 1);
-        for (columns, rows) in [(8, 65_535), (1 << 20, 65_535), (u32::MAX, 65_535)] {
-            let large = peak(columns, rows);
-            assert!(
-                large < small + 4096,
-                "{columns} x {rows}: {large} vs {small}"
+            let (decoded, held) = measure(|| stream.decoded_image(&params).unwrap().data.len());
+            assert_eq!(decoded, 8 * row);
+            assert!(held.peak <= 8 * 9 * row, "{held:?}");
+        }
+    }
+
+    /// A CCITT stream that decodes a few rows of many declared whitens and counts at
+    /// most [`POLL_BYTES`] past its rows: room is made ahead by steps of up to eight
+    /// times what was decoded, but not written until rows come.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_ccitt_stream_cut_short_whitens_little_past_its_rows() {
+        use hayro_syntax::work::TOLD;
+        // 200 white rows, a bit each against the white row above, then the end of data.
+        let mut data = vec![0xFF; 25];
+        data.extend([0x00, 0x10, 0x01]);
+        let columns = 1024;
+        for is_indexed in [false, true] {
+            let row = if is_indexed { columns / 8 } else { columns };
+            let pdf = stream_file(
+                &format!(
+                    "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns {columns} /Rows 65535 >>"
+                ),
+                &data,
             );
+            let stream = object_3(&pdf);
+            let params = ImageDecodeParams {
+                is_indexed,
+                ..Default::default()
+            };
+            TOLD.set(0);
+            let decoded = stream.decoded_image(&params).unwrap().data.len();
+            let told = TOLD.get();
+            assert_eq!(decoded, 200 * row);
+            // The white written ahead, each row's bytes once more as it is written, and
+            // a step per bit read.
+            let bound = decoded + POLL_BYTES + decoded + 8 * data.len();
+            assert!(told <= bound, "indexed {is_indexed}: {told} > {bound}");
         }
     }
-}
 
-/// The image bytes an image reader yields, read in pieces of `chunk` bytes, read
-/// twice with a rewind between.
-fn read_image_twice(stream: &Stream<'_>, params: &ImageDecodeParams, chunk: usize) -> Vec<u8> {
-    let mut reader = stream.image_reader(params).unwrap();
-    let first = read_up_to(&mut reader, usize::MAX, chunk);
-    reader.rewind();
-    let second = read_up_to(&mut reader, usize::MAX, chunk);
-    assert!(second == first, "a rewound reader reads the same");
-    first
-}
-
-/// The bytes an image reader yields where it reads every other piece of `chunk`
-/// bytes and skips the rest, each skipped byte zero, and the bytes it held.
-fn read_skipping(stream: &Stream<'_>, params: &ImageDecodeParams, chunk: usize) -> Vec<u8> {
-    let meter = Meter::new(None);
-    let mut reader = stream.image_reader(params).unwrap();
-    let mut out = Vec::new();
-    let mut buf = vec![0; chunk];
-    for k in 0.. {
-        let got = if k % 2 == 0 {
-            reader.read(&mut buf, &meter).unwrap()
-        } else {
-            let got = reader.skip(chunk, &meter).unwrap();
-            buf[..got].fill(0);
-            got
-        };
-        out.extend_from_slice(&buf[..got]);
-        if got == 0 {
-            return out;
+    /// A CCITT row declared as wide as `Columns` allows is written a counted piece at a
+    /// time, with room made for what was written: a stop asked for at the first poll
+    /// ends it holding a few pieces, not the row.
+    #[test]
+    fn a_wide_ccitt_row_is_stopped_before_room_is_made_for_it() {
+        // One white row, a bit against the white row above, then the end of data.
+        let data = [0x80, 0x00, 0x10, 0x01];
+        let stop = || true;
+        for is_indexed in [false, true] {
+            let pdf = stream_file(
+                "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 4294967294 /Rows 65535 >>",
+                &data,
+            );
+            let stream = object_3(&pdf);
+            let params = ImageDecodeParams {
+                is_indexed,
+                ..Default::default()
+            };
+            let meter = Meter::new(Some(&stop));
+            let (result, held) = measure(|| stream.decoded_image_metered(&params, &meter).err());
+            assert!(
+                matches!(result, Some(DecodeFailure::Cancelled)),
+                "{result:?}"
+            );
+            assert!(held.peak <= 8 * POLL_BYTES + 4096, "{held:?}");
         }
     }
-    unreachable!()
-}
 
-/// CCITT data read through an image reader yields what decoding the image whole
-/// returns, as it decodes: data of every encoding, gray and indexed, with
-/// `BlackIs1`, a `/Width` other than its columns, ending before the rows declared,
-/// breaking off, and holding no row.
-#[test]
-fn ccitt_image_bytes_read_as_whole_decoding_returns_them() {
-    let streams = [
-        (
-            "-1",
-            &include_bytes!("../../hayro-ccitt/tests/streams/g4.bin")[..],
-        ),
-        (
-            "0",
-            &include_bytes!("../../hayro-ccitt/tests/streams/g3_1d.bin")[..],
-        ),
-        (
-            "1",
-            &include_bytes!("../../hayro-ccitt/tests/streams/g3_2d.bin")[..],
-        ),
-    ];
-    let mut cases = 0;
-    for (k, data) in streams {
-        for cut in [data.len(), data.len() / 2, 3, 0] {
-            for (height, black_is_1, indexed) in [
-                (96, "", false),
-                (96, "/BlackIs1 true", true),
-                (150, "", false),
-                (150, "", true),
-                (5000, "", false),
-                (90, "/BlackIs1 true", false),
-            ] {
-                let dict = format!(
-                    "/Filter /CCITTFaxDecode /DecodeParms << /K {k} /Columns 211 {black_is_1} >>"
-                );
-                let pdf = stream_file(&dict, &data[..cut]);
-                let stream = object_3(&pdf);
-                let params = ImageDecodeParams {
-                    is_indexed: indexed,
-                    width: 100,
-                    height,
-                    ..Default::default()
-                };
-                let whole = stream.decoded_image(&params);
-                let reported = stream.ccitt_image_data(&params).unwrap();
-                for chunk in [1, 7, 4096] {
-                    let read = read_image_twice(&stream, &params, chunk);
-                    let case = format!("K {k}, cut {cut}, {height} rows, {indexed}, chunk {chunk}");
-                    let skipping = read_skipping(&stream, &params, chunk);
-                    assert_eq!(skipping.len(), read.len(), "{case}: skipping");
-                    for (i, (a, b)) in skipping.chunks(chunk).zip(read.chunks(chunk)).enumerate() {
-                        assert!(i % 2 == 1 || a == b, "{case}: skipping, piece {i}");
-                    }
-                    match &whole {
-                        Ok(whole) => {
-                            assert!(read == whole.data.as_ref(), "{case}");
-                            let image = whole.image_data.as_ref().unwrap();
-                            assert_eq!(
-                                (reported.width, reported.height, reported.bits_per_component),
-                                (image.width, image.height, image.bits_per_component),
-                                "{case}"
-                            );
-                        }
-                        Err(_) => assert!(read.is_empty(), "{case}"),
-                    }
-                    cases += 1;
-                }
-            }
-        }
-    }
-    assert_eq!(cases, 3 * 4 * 6 * 3);
-}
-
-/// Encrypted CCITT data is decrypted as its rows are read, through a window: reading
-/// all rows of AES-encrypted Group 4 data holds about as much whatever the data's
-/// size, and yields the rows of the same data stored plain. Making the reader
-/// decrypts nothing.
-#[test]
-fn encrypted_ccitt_rows_hold_a_window_whatever_the_data_size() {
-    let columns = 64;
-    let dict = format!("/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns {columns} >>");
-    let mut peaks = Vec::new();
-    for bytes in [1 << 18, 1 << 20, 1 << 22] {
-        // White rows, a bit each against the white row above.
-        let data = vec![0xFF; bytes];
-        let rows = 8 * bytes as u32;
-        let params = ImageDecodeParams {
-            width: columns,
-            height: rows,
-            ..Default::default()
-        };
-        // The rows read, and a sum of their bytes.
-        let count = |stream: &Stream<'_>| {
-            let mut reader = stream.image_reader(&params).unwrap();
-            let (mut buf, mut read, mut sum) = (vec![0; 1000], 0, 0_u64);
-            loop {
-                match reader.read(&mut buf, &Meter::default()).unwrap() {
-                    0 => break,
-                    n => {
-                        read += n;
-                        sum += buf[..n].iter().map(|&b| u64::from(b)).sum::<u64>();
-                    }
-                }
-            }
-            (read / columns as usize, sum)
-        };
-        let plain = stream_file(&dict, &data);
-        let expected = count(&object_3(&plain));
-        assert_eq!(expected.0, rows as usize);
-        let encrypted = encrypted_file(&dict, &data);
-        let stream = object_3(&encrypted);
-        let (made, making) = measure(|| stream.image_reader(&params).is_some());
-        assert!(made);
-        assert!(
-            making.largest < 1024,
-            "making the reader allocated {making:?}"
+    /// A small CCITT image is decoded into an output allocated once, at its declared
+    /// size, with lists of color changes that do not grow line by line, as images drawn
+    /// by the thousand are: the allocations of a decode are counted exactly.
+    #[test]
+    fn a_small_ccitt_image_allocates_its_output_once() {
+        // Sixteen rows of 80 pixels, each 20 white and black runs of 2: the first in
+        // horizontal mode (`001`, `0111`, `11`), the others as vertical codes that follow
+        // the row above; then an EOFB.
+        let bits = format!(
+            "{}{}{}",
+            "001011111".repeat(20),
+            "1".repeat(40 * 15),
+            "000000000001".repeat(2)
         );
-        let (read, reading) = measure(|| count(&stream));
-        assert_eq!(read, expected, "{bytes} bytes");
-        peaks.push(reading.peak);
-    }
-    assert!(peaks[0] < 160 * 1024, "{peaks:?}");
-    assert!(peaks.iter().all(|&p| p <= peaks[0] + 4096), "{peaks:?}");
-}
-
-/// Bits written most significant first.
-#[derive(Default)]
-struct Bits {
-    bytes: Vec<u8>,
-    len: usize,
-}
-
-impl Bits {
-    fn push(&mut self, code: &str) {
-        for bit in code.bytes() {
-            if self.len.is_multiple_of(8) {
-                self.bytes.push(0);
-            }
-            if bit == b'1' {
-                *self.bytes.last_mut().unwrap() |= 0x80 >> (self.len % 8);
-            }
-            self.len += 1;
-        }
-    }
-}
-
-/// Encrypted Group 3 data whose damaged lines are each longer than the window of
-/// decrypted bytes the CCITT decoder reads in: going back to the start of each, to
-/// find the EOL after it, decrypts a bounded amount, not the data before it again,
-/// so the bytes decrypted grow with the data, under AES and RC4 alike, and the rows
-/// are those of the same data stored plain.
-#[test]
-#[cfg(debug_assertions)]
-fn going_back_in_encrypted_ccitt_data_decrypts_a_bounded_amount() {
-    use common::rc4::{self, Part};
-    use hayro_syntax::work::TOLD;
-    const EOL: &str = "000000000001";
-    // Runs of no white and no black pixels: a line that never ends, to its EOL.
-    const NOTHING: &str = "001101010000110111";
-    let line_bytes = 160 * 1024;
-    let dict = "/Filter /CCITTFaxDecode /DecodeParms << /K 0 /Columns 8 >>";
-    for lines in [3, 12] {
-        let mut bits = Bits::default();
-        bits.push(EOL);
-        for _ in 0..lines {
-            for _ in 0..line_bytes * 8 / NOTHING.len() {
-                bits.push(NOTHING);
-            }
-            bits.push(EOL);
-        }
-        for _ in 0..5 {
-            bits.push(EOL);
-        }
-        let data = bits.bytes;
-        let params = ImageDecodeParams {
-            width: 8,
-            height: lines,
-            ..Default::default()
-        };
-        // The bytes read and the work counted reading them.
-        let read = |stream: &Stream<'_>| {
-            let mut reader = stream.image_reader(&params).unwrap();
-            let before = TOLD.get();
-            let bytes = read_up_to(&mut reader, usize::MAX, 4096);
-            (bytes, TOLD.get() - before)
-        };
-        let plain = stream_file(dict, &data);
-        let (expected, plain_work) = read(&object_3(&plain));
-        assert_eq!(expected.len(), 8 * lines as usize);
-        let aes = encrypted_file(dict, &data);
-        let rc4 = Pdf::new(rc4::file(
-            &[
-                Part::Object("<< /Type /Catalog /Pages 2 0 R >>", b""),
-                Part::Object("<< /Type /Pages /Kids [] /Count 0 >>", b""),
-                Part::StreamWith(dict, &data),
-            ],
-            &[],
-        ))
-        .unwrap();
-        for (cipher, pdf) in [("AES", aes), ("RC4", rc4)] {
-            let (rows, work) = read(&object_3(&pdf));
-            assert!(rows == expected, "{cipher}, {lines} lines: other rows");
-            let decrypted = work - plain_work;
-            // Each byte decrypted once going forward and once going back, and a
-            // bounded amount for each line gone back to.
-            let bound = 2 * data.len() + lines as usize * 128 * 1024;
-            println!(
-                "{cipher}, {lines} lines, {} bytes: {decrypted} decrypted",
-                data.len()
-            );
-            assert!(
-                decrypted <= bound,
-                "{cipher}, {lines} lines of {line_bytes} bytes: {decrypted} bytes \
-                 decrypted, over {bound}"
-            );
-        }
-    }
-}
-
-/// A Group 3 row followed by EOLs is read before them, plain or encrypted: reading
-/// the first row of a line of eight white pixels followed by 256 KiB to 4 MiB of EOLs
-/// counts the same few bytes of work (bits read, bytes decrypted), whether the image
-/// declares that row alone or two, and gives the row.
-#[test]
-#[cfg(debug_assertions)]
-fn a_ccitt_row_is_read_before_the_eols_after_it() {
-    use hayro_syntax::work::TOLD;
-    // A white run of eight, then a pair of EOLs each three bytes.
-    const LINE: u8 = 0x98;
-    const EOLS: [u8; 3] = [0x00, 0x10, 0x01];
-    let dict = "/Filter /CCITTFaxDecode /DecodeParms << /K 0 /Columns 8 >>";
-    for height in [1, 2] {
-        let params = ImageDecodeParams {
-            width: 8,
-            height,
-            ..Default::default()
-        };
-        let mut works = Vec::new();
-        for len in [1 << 18, 1 << 20, 4 << 20] {
-            let mut data = vec![LINE];
-            for _ in 0..len / 3 {
-                data.extend(EOLS);
-            }
-            for (cipher, pdf) in [
-                ("plain", stream_file(dict, &data)),
-                ("AES", encrypted_file(dict, &data)),
-            ] {
-                let stream = object_3(&pdf);
-                let mut reader = stream.image_reader(&params).unwrap();
-                TOLD.set(0);
-                let row = read_up_to(&mut reader, 8, 8);
-                let work = TOLD.get();
-                assert_eq!(
-                    row,
-                    [0xFF; 8],
-                    "{cipher}, {height} rows, {} bytes",
-                    data.len()
-                );
-                println!("{cipher}, {height} rows, {} bytes: {work} work", data.len());
-                works.push((cipher, data.len(), work));
-            }
-        }
-        for cipher in ["plain", "AES"] {
-            let works: Vec<_> = works.iter().filter(|w| w.0 == cipher).collect();
-            assert!(
-                works.iter().all(|w| w.2 == works[0].2 && w.2 < 64 * 1024),
-                "{cipher}, {height} rows: {works:?}"
-            );
-        }
-    }
-}
-
-/// A CCITT stream that decodes a few rows of many declared holds at most eight
-/// times what it decoded: room is made ahead of the rows, but not for all of them.
-#[test]
-fn a_ccitt_stream_cut_short_holds_a_multiple_of_its_rows() {
-    // Eight white rows, a bit each against the white row above, then the end of data.
-    let data = [0xFF, 0x00, 0x10, 0x01];
-    let columns = 1 << 16;
-    for is_indexed in [false, true] {
-        let row = if is_indexed { columns / 8 } else { columns };
+        let data: Vec<u8> = bits
+            .as_bytes()
+            .chunks(8)
+            .map(|byte| (0..8).fold(0, |acc, i| acc << 1 | u8::from(byte.get(i) == Some(&b'1'))))
+            .collect();
         let pdf = stream_file(
-            &format!(
-                "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns {columns} /Rows 65535 >>"
-            ),
+            "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 80 /Rows 16 >>",
             &data,
         );
         let stream = object_3(&pdf);
-        let params = ImageDecodeParams {
-            is_indexed,
-            ..Default::default()
-        };
-        let (decoded, held) = measure(|| stream.decoded_image(&params).unwrap().data.len());
-        assert_eq!(decoded, 8 * row);
-        assert!(held.peak <= 8 * 9 * row, "{held:?}");
+        let params = ImageDecodeParams::default();
+        let (decoded, used) = measure(|| stream.decoded_image(&params).unwrap().data.into_owned());
+        assert_eq!(decoded, [0xFF, 0xFF, 0x00, 0x00].repeat(20 * 16));
+        // The output and the two lists of changes, the parameters being read where the
+        // stream's dictionary was; 13 when the output grew from an eighth of its size and
+        // the lists change by change.
+        assert_eq!(used.count, 3, "{used:?}");
     }
-}
-
-/// A CCITT stream that decodes a few rows of many declared whitens and counts at
-/// most [`POLL_BYTES`] past its rows: room is made ahead by steps of up to eight
-/// times what was decoded, but not written until rows come.
-#[cfg(debug_assertions)]
-#[test]
-fn a_ccitt_stream_cut_short_whitens_little_past_its_rows() {
-    use hayro_syntax::work::TOLD;
-    // 200 white rows, a bit each against the white row above, then the end of data.
-    let mut data = vec![0xFF; 25];
-    data.extend([0x00, 0x10, 0x01]);
-    let columns = 1024;
-    for is_indexed in [false, true] {
-        let row = if is_indexed { columns / 8 } else { columns };
-        let pdf = stream_file(
-            &format!(
-                "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns {columns} /Rows 65535 >>"
-            ),
-            &data,
-        );
-        let stream = object_3(&pdf);
-        let params = ImageDecodeParams {
-            is_indexed,
-            ..Default::default()
-        };
-        TOLD.set(0);
-        let decoded = stream.decoded_image(&params).unwrap().data.len();
-        let told = TOLD.get();
-        assert_eq!(decoded, 200 * row);
-        // The white written ahead, each row's bytes once more as it is written, and
-        // a step per bit read.
-        let bound = decoded + POLL_BYTES + decoded + 8 * data.len();
-        assert!(told <= bound, "indexed {is_indexed}: {told} > {bound}");
-    }
-}
-
-/// A CCITT row declared as wide as `Columns` allows is written a counted piece at a
-/// time, with room made for what was written: a stop asked for at the first poll
-/// ends it holding a few pieces, not the row.
-#[test]
-fn a_wide_ccitt_row_is_stopped_before_room_is_made_for_it() {
-    // One white row, a bit against the white row above, then the end of data.
-    let data = [0x80, 0x00, 0x10, 0x01];
-    let stop = || true;
-    for is_indexed in [false, true] {
-        let pdf = stream_file(
-            "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 4294967294 /Rows 65535 >>",
-            &data,
-        );
-        let stream = object_3(&pdf);
-        let params = ImageDecodeParams {
-            is_indexed,
-            ..Default::default()
-        };
-        let meter = Meter::new(Some(&stop));
-        let (result, held) = measure(|| stream.decoded_image_metered(&params, &meter).err());
-        assert!(
-            matches!(result, Some(DecodeFailure::Cancelled)),
-            "{result:?}"
-        );
-        assert!(held.peak <= 8 * POLL_BYTES + 4096, "{held:?}");
-    }
-}
-
-/// A small CCITT image is decoded into an output allocated once, at its declared
-/// size, with lists of color changes that do not grow line by line, as images drawn
-/// by the thousand are: the allocations of a decode are counted exactly.
-#[test]
-fn a_small_ccitt_image_allocates_its_output_once() {
-    // Sixteen rows of 80 pixels, each 20 white and black runs of 2: the first in
-    // horizontal mode (`001`, `0111`, `11`), the others as vertical codes that follow
-    // the row above; then an EOFB.
-    let bits = format!(
-        "{}{}{}",
-        "001011111".repeat(20),
-        "1".repeat(40 * 15),
-        "000000000001".repeat(2)
-    );
-    let data: Vec<u8> = bits
-        .as_bytes()
-        .chunks(8)
-        .map(|byte| (0..8).fold(0, |acc, i| acc << 1 | u8::from(byte.get(i) == Some(&b'1'))))
-        .collect();
-    let pdf = stream_file(
-        "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 80 /Rows 16 >>",
-        &data,
-    );
-    let stream = object_3(&pdf);
-    let params = ImageDecodeParams::default();
-    let (decoded, used) = measure(|| stream.decoded_image(&params).unwrap().data.into_owned());
-    assert_eq!(decoded, [0xFF, 0xFF, 0x00, 0x00].repeat(20 * 16));
-    // The output and the two lists of changes, the parameters being read where the
-    // stream's dictionary was; 13 when the output grew from an eighth of its size and
-    // the lists change by change.
-    assert_eq!(used.count, 3, "{used:?}");
 }
 
 /// The decoded data of `stream` read in pieces of random sizes, then again after a
