@@ -44,6 +44,11 @@ pub(crate) fn sample_format(
     sample_format_with(obj, image_data, dict_bpc(obj))
 }
 
+/// The parameters `obj`'s filters decode with, at its own size.
+pub(crate) fn image_decode_params(obj: &ImageXObject<'_>) -> ImageDecodeParams {
+    decode_params(obj, None, dict_bpc(obj))
+}
+
 /// The bits per component the image's dictionary gives.
 fn dict_bpc(obj: &ImageXObject<'_>) -> Option<u8> {
     let dict = obj.stream.dict();
@@ -273,6 +278,71 @@ pub(crate) fn rows_present(samples: usize, row_len: usize, height: u32) -> u32 {
 /// holds fewer.
 const MIN_ROW_PAD: usize = 1 << 16;
 
+/// What each stored sample value becomes: the decode array maps it onto the colour
+/// space's range, scaled to a byte, or onto a palette index.
+struct SampleMap<'a> {
+    source_max: f32,
+    decode: &'a [(f32, f32)],
+    ranges: SmallVec<[(f32, f32); 4]>,
+    indexed_hival: Option<u8>,
+    num_components: usize,
+}
+
+impl<'a> SampleMap<'a> {
+    fn new(color_space: &ColorSpace, bits_per_component: u8, decode: &'a [(f32, f32)]) -> Self {
+        Self {
+            source_max: 2.0_f32.powi(bits_per_component as i32) - 1.0,
+            decode,
+            ranges: color_space.component_ranges(),
+            indexed_hival: color_space.indexed_hival(),
+            num_components: color_space.num_components() as usize,
+        }
+    }
+
+    /// The byte stored `value` of the sample at `index` (counted over components)
+    /// becomes; `None` when the decode array has no entry for its component.
+    fn map(&self, value: u32, index: usize) -> Option<u8> {
+        let component_index = index % self.num_components;
+        let (decode_min, decode_max) = *self.decode.get(component_index)?;
+        let decoded = interpolate(value as f32, 0.0, self.source_max, decode_min, decode_max);
+
+        if let Some(hival) = self.indexed_hival {
+            Some((decoded + 0.5).clamp(0.0, hival as f32) as u8)
+        } else {
+            let (range_min, range_max) = *self.ranges.get(component_index)?;
+            let normalized = if range_min == range_max {
+                0.0
+            } else {
+                (decoded - range_min) / (range_max - range_min)
+            };
+            Some((normalized * 255.0 + 0.5) as u8)
+        }
+    }
+}
+
+/// For samples of fewer than eight bits, the byte each stored value becomes, per
+/// component: `lut[c][v]` for value `v` of component `c`. `None` when the decode
+/// array lacks a component, as decoding the samples whole then fails.
+pub(crate) fn sample_lut(
+    color_space: &ColorSpace,
+    bits_per_component: u8,
+    decode: &[(f32, f32)],
+) -> Option<Vec<[u8; 256]>> {
+    if !(1..8).contains(&bits_per_component) {
+        return None;
+    }
+    let map = SampleMap::new(color_space, bits_per_component, decode);
+    (0..map.num_components)
+        .map(|c| {
+            let mut lut = [0; 256];
+            for (v, out) in lut.iter_mut().enumerate().take(1 << bits_per_component) {
+                *out = map.map(v as u32, c)?;
+            }
+            Some(lut)
+        })
+        .collect()
+}
+
 fn decode_u8_samples(
     data: &[u8],
     width: u32,
@@ -282,31 +352,11 @@ fn decode_u8_samples(
     decode: &[(f32, f32)],
     meter: &Meter<'_>,
 ) -> Option<Vec<u8>> {
-    let source_max = 2.0_f32.powi(bits_per_component as i32) - 1.0;
     let num_components = color_space.num_components() as usize;
-    let ranges = color_space.component_ranges();
-    let indexed_hival = color_space.indexed_hival();
-
-    let decode_component = |value: u32, index: usize| {
-        let component_index = index % num_components;
-        let (decode_min, decode_max) = *decode.get(component_index)?;
-        let decoded = interpolate(value as f32, 0.0, source_max, decode_min, decode_max);
-
-        if let Some(hival) = indexed_hival {
-            Some((decoded + 0.5).clamp(0.0, hival as f32) as u8)
-        } else {
-            let (range_min, range_max) = *ranges.get(component_index)?;
-            let normalized = if range_min == range_max {
-                0.0
-            } else {
-                (decoded - range_min) / (range_max - range_min)
-            };
-            Some((normalized * 255.0 + 0.5) as u8)
-        }
-    };
 
     match bits_per_component {
-        1..8 | 9..16 => {
+        1..8 => {
+            let lut = sample_lut(color_space, bits_per_component, decode)?;
             let height = sample_rows(data, width, height, num_components, bits_per_component);
             let mut buf = Vec::with_capacity(width as usize * num_components * height as usize);
             for_each_sample(
@@ -317,7 +367,26 @@ fn decode_u8_samples(
                 bits_per_component,
                 meter,
                 |value, index| {
-                    buf.push(decode_component(value, index)?);
+                    buf.push(lut[index % num_components][value as usize]);
+                    Some(())
+                },
+            )?;
+
+            Some(buf)
+        }
+        9..16 => {
+            let map = SampleMap::new(color_space, bits_per_component, decode);
+            let height = sample_rows(data, width, height, num_components, bits_per_component);
+            let mut buf = Vec::with_capacity(width as usize * num_components * height as usize);
+            for_each_sample(
+                data,
+                width,
+                height,
+                num_components,
+                bits_per_component,
+                meter,
+                |value, index| {
+                    buf.push(map.map(value, index)?);
                     Some(())
                 },
             )?;
@@ -325,9 +394,10 @@ fn decode_u8_samples(
             Some(buf)
         }
         8 | 16 => {
+            let map = SampleMap::new(color_space, bits_per_component, decode);
             let mut buf = Vec::with_capacity(data.len() / (bits_per_component as usize / 8));
             for_each_whole_sample(data, bits_per_component, meter, |value, index| {
-                buf.push(decode_component(value, index)?);
+                buf.push(map.map(value, index)?);
                 Some(())
             })?;
             Some(buf)

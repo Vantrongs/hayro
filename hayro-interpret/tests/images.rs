@@ -13,6 +13,8 @@ use kurbo::BezPath;
 
 #[path = "../../hayro-syntax/tests/common/allocations.rs"]
 mod allocations;
+#[path = "../../hayro-syntax/tests/common/ceilings.rs"]
+mod ceilings;
 mod common;
 
 /// The width and height of each colour plane, alpha plane and stencil decoded.
@@ -205,12 +207,15 @@ fn pixels_keys_tell_documents_apart() {
     assert_ne!(a[0].1, b[0].1);
 }
 
-/// What a region request of each raster image drawn allocated at most, and its
-/// pixels: of `plane`, the grid and window `bins` gives for the plane's size.
+/// What a region request of each image drawn, raster or stencil mask, allocated at
+/// most, and its pixels: of `plane`, the grid and window `bins` gives for the plane's
+/// size.
 struct Requested {
     plane: Plane,
     bins: Bins,
     regions: Vec<(usize, Vec<u8>)>,
+    /// The bytes of decoder states each asset saved for later requests.
+    saved: Vec<usize>,
 }
 
 /// The grid and window to request of a plane of a width and height.
@@ -222,6 +227,7 @@ impl Requested {
             plane,
             bins,
             regions: Vec::new(),
+            saved: Vec::new(),
         }
     }
 }
@@ -232,8 +238,10 @@ impl<'a> Device<'a> for Requested {
     fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
     fn draw_glyph_run(&mut self, _: &GlyphRun<'_, 'a>, _: DrawProps<'a>, _: &DrawMode) {}
     fn draw_image(&mut self, image: Image<'a, '_>, _: ImageDrawProps<'a>) {
-        let Image::Raster(r) = image else { return };
-        let asset = r.asset();
+        let asset = match image {
+            Image::Raster(r) => r.asset(),
+            Image::Stencil(s) => s.asset(),
+        };
         let (data, used) = allocations::measure(|| {
             let mut source = asset.open(None, None).expect("streamed");
             let plane = *source.layout().plane(self.plane).expect("the plane");
@@ -247,6 +255,8 @@ impl<'a> Device<'a> for Requested {
             source.request(&request).expect("a region").data
         });
         self.regions.push((used.peak, data));
+        self.saved
+            .push(asset.checkpoint_bytes().expect("saved states"));
     }
     fn pop_clip(&mut self) {}
     fn pop_transparency_group(&mut self) {}
@@ -276,6 +286,99 @@ fn a_region_of_wide_rows_holds_pieces_of_them() {
     };
     assert_eq!(data, &[200, 255]);
     assert!(*peak < 1 << 20, "peak {peak} bytes");
+}
+
+/// The peak bytes of opening the image `dict` with `data` and requesting the bins
+/// `bins` gives, and the bytes of the decoder states the request saved.
+fn region_cost(dict: &str, data: &[u8], bins: Bins) -> (usize, usize) {
+    let pdf = page(
+        "q 100 0 0 100 0 0 cm /Im Do Q",
+        "/XObject << /Im 5 0 R >>",
+        vec![image(dict, data)],
+    );
+    let mut requested = Requested::new(Plane::Image, bins);
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+    let [(peak, _)] = requested.regions[..] else {
+        panic!("one image")
+    };
+    (peak, requested.saved[0])
+}
+
+/// A small region of a large bilevel image or stencil mask with Flate data, or of a
+/// CCITT image, costs memory in proportion to the region, not to the image (whose
+/// decoding whole held a byte per pixel, 64 MiB for the larger): opening it and
+/// requesting a tile at full size or a thumbnail holds pieces of rows (a CCITT row's
+/// colour changes) and the bins, besides the Flate decoder states a request saves
+/// for later ones (at most 2 MiB); a tile of an image four times as large holds the
+/// same, but for a piece of a row twice as wide. Each peak stays under its ceiling.
+#[test]
+fn a_small_region_of_a_large_bilevel_image_costs_the_region() {
+    let tile: Bins = |w, h| ((w, h), [w / 2, h - 64, w / 2 + 64, h]);
+    let thumbnail: Bins = |_, _| ((64, 64), [0, 0, 64, 64]);
+    let gray = "/ColorSpace /DeviceGray /BitsPerComponent 1";
+    // What a thread allocates once, before the first image is measured, is not
+    // counted.
+    region_cost(
+        &format!("{gray} /Width 16 /Height 16 /Filter /FlateDecode"),
+        &common::stored_zlib(&[0; 32], 1000),
+        |w, h| ((w, h), [0, 0, 1, 1]),
+    );
+    let mut measured = Vec::new();
+    /// The data of an image `side` pixels square.
+    type Data = fn(u32) -> Vec<u8>;
+    let flate = |side: u32| {
+        let packed = common::noise((side / 8 * side) as usize, side);
+        common::stored_zlib(&packed, 65_535)
+    };
+    // Group 4 rows, each white like the one above (vertical mode, no offset): a
+    // bit each.
+    let white_g4 = |side: u32| vec![0xFF; side as usize / 8];
+    let kinds: [(&str, String, Data); 3] = [
+        ("image", format!("{gray} /Filter /FlateDecode"), flate),
+        (
+            "stencil",
+            "/ImageMask true /Filter /FlateDecode".into(),
+            flate,
+        ),
+        (
+            "ccitt",
+            format!("{gray} /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns COLUMNS >>"),
+            white_g4,
+        ),
+    ];
+    for (name, kind, data) in kinds {
+        let mut working = Vec::new();
+        for side in [4096_u32, 8192] {
+            let data = data(side);
+            let kind = kind.replace("COLUMNS", &side.to_string());
+            let dict = format!("{kind} /Width {side} /Height {side}");
+            let (peak, saved) = region_cost(&dict, &data, tile);
+            assert!(saved <= 2 << 20, "{name} {side}: {saved} bytes saved");
+            working.push(peak - saved);
+            measured.push((format!("{name}_{side}_tile_peak"), peak));
+            if side == 4096 {
+                let (peak, _) = region_cost(&dict, &data, thumbnail);
+                measured.push((format!("{name}_{side}_thumbnail_peak"), peak));
+            }
+        }
+        // The larger image's rows are 512 bytes wider, which a skipped piece holds.
+        assert!(
+            working[1] <= working[0] + 512,
+            "{name}: {} bytes besides saved states for 4096, {} for 8192",
+            working[0],
+            working[1]
+        );
+        assert!(working[1] < 1 << 20, "{name}: {} bytes", working[1]);
+    }
+    let measured: Vec<_> = measured.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    ceilings::check_ceilings(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/ceilings/bilevel_regions.txt"
+        ),
+        "WRITE_CEILINGS=1 cargo test -p hayro-interpret --test images",
+        &measured,
+    );
 }
 
 /// The last texel of a bilevel mask 40 million samples wide whose data ends halfway

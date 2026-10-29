@@ -83,11 +83,17 @@ pub(super) fn asset(pdf: &Pdf) -> ImageAsset {
         .asset(None)
 }
 
-/// The image decoded whole, as images that are not streamed are.
+/// The image decoded whole, as images that are not streamed are; a stencil mask as
+/// its alpha.
 pub(super) fn whole(asset: &ImageAsset) -> ImageSource<'_> {
     let meter = Meter::default();
-    let decoded = decode_image(&asset.xobject().unwrap(), None, &meter).unwrap();
-    let decoded = Decoded::new(decoded.image, decoded.alpha, &meter).unwrap();
+    let obj = asset.xobject().unwrap();
+    let decoded = if obj.kind == ImageKind::StencilMask {
+        Decoded::stencil(decode_mask(&obj, None, &meter).unwrap().luma)
+    } else {
+        let decoded = decode_image(&obj, None, &meter).unwrap();
+        Decoded::new(decoded.image, decoded.alpha, &meter).unwrap()
+    };
     ImageSource::new(
         decoded.layout(),
         Inner::Decoded(decoded),
@@ -205,6 +211,17 @@ fn gray_and_rgb_stream_as_decoded() {
             "/ColorSpace /DeviceRGB /BitsPerComponent 8 /Decode [1 0 1 0 1 0]",
             noise(w * h * 3, 2),
         ),
+        (
+            &format!("/ColorSpace {} /BitsPerComponent 8", indexed(255)),
+            noise(w * h, 3),
+        ),
+        (
+            &format!(
+                "/ColorSpace {} /BitsPerComponent 8 /Decode [255 0]",
+                indexed(255)
+            ),
+            noise(w * h, 3),
+        ),
     ] {
         let (iw, ih) = (w as u32, h as u32);
         assert_streams_as_decoded(&[(image(dict, iw, ih), data.clone())]);
@@ -218,6 +235,222 @@ fn gray_and_rgb_stream_as_decoded() {
             image(&predicted, iw, ih),
             zlib(&png_filter(&data, w * n, n)),
         )]);
+    }
+}
+
+/// An `Indexed` colour space over `DeviceRGB` of `hival + 1` colours.
+fn indexed(hival: usize) -> String {
+    let palette: String = noise(3 * (hival + 1), 40)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("[/Indexed /DeviceRGB {hival} <{palette}>]")
+}
+
+/// Samples of 1, 2 and 4 bits (and 3, outside the specification), in rows of a
+/// width that does not fill their last byte, stream as they decode whole: gray, RGB
+/// and indexed, through default, inverted and other decode arrays, stored, Flate, and
+/// Flate with a predictor (which takes no 3-bit samples).
+#[test]
+fn low_bit_samples_stream_as_decoded() {
+    let (w, h) = (13_u32, 9_u32);
+    for bits in [1_usize, 2, 3, 4] {
+        let max = (1 << bits) - 1;
+        let spaces = [
+            ("/DeviceGray".to_string(), 1, String::new()),
+            ("/DeviceGray".into(), 1, "/Decode [1 0]".into()),
+            ("/DeviceGray".into(), 1, "/Decode [0.2 0.7]".into()),
+            ("/DeviceRGB".into(), 3, String::new()),
+            ("/DeviceRGB".into(), 3, "/Decode [1 0 0 1 0.5 0.25]".into()),
+            (indexed(max), 1, String::new()),
+            (indexed(max), 1, format!("/Decode [{max} 0]")),
+        ];
+        for (space, n, decode) in spaces {
+            let row = (w as usize * n * bits).div_ceil(8);
+            let data = noise(row * h as usize, (bits + n) as u32);
+            let dict = format!("/ColorSpace {space} /BitsPerComponent {bits} {decode}");
+            let name = format!("{bits} bits, {space} {decode}");
+            named(&name, || {
+                assert_streams_as_decoded(&[(image(&dict, w, h), data.clone())]);
+            });
+            let flate = format!("{dict} /Filter /FlateDecode");
+            named(&name, || {
+                assert_streams_as_decoded(&[(image(&flate, w, h), zlib(&data))]);
+            });
+            if bits == 3 {
+                continue;
+            }
+            let predicted = format!(
+                "{dict} /Filter /FlateDecode /DecodeParms << /Predictor 15 /Colors {n} \
+                 /BitsPerComponent {bits} /Columns {w} >>"
+            );
+            let filtered = zlib(&png_filter(&data, row, (n * bits).div_ceil(8)));
+            named(&name, || {
+                assert_streams_as_decoded(&[(image(&predicted, w, h), filtered)]);
+            });
+        }
+    }
+}
+
+/// Runs `check`, naming `case` when it fails.
+pub(super) fn named(case: &str, check: impl FnOnce()) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(check));
+    assert!(result.is_ok(), "{case}");
+}
+
+/// Packed samples under every kind of alpha and a transfer function stream as they
+/// decode whole: a colour key compares stored values.
+#[test]
+fn low_bit_samples_with_masks_stream_as_decoded() {
+    let (w, h) = (13_u32, 9_u32);
+    for (space, n, bits, key) in [
+        ("/DeviceGray", 1, 2, "1 2"),
+        ("/DeviceRGB", 3, 4, "0 7 3 9 8 15"),
+        ("/DeviceGray", 1, 1, "1 1"),
+    ] {
+        for four in [false, true] {
+            for mask in [
+                String::new(),
+                format!("/Mask [{key}]"),
+                "/SMask 4 0 R".into(),
+                "/SMask 5 0 R".into(),
+                "/Mask 6 0 R".into(),
+            ] {
+                let row = (w as usize * n * bits).div_ceil(8);
+                let pdf = pdf(&[
+                    (
+                        image(
+                            &format!(
+                                "/ColorSpace {space} /BitsPerComponent {bits} \
+                                 /Filter /FlateDecode {mask}"
+                            ),
+                            w,
+                            h,
+                        ),
+                        zlib(&noise(row * h as usize, 41)),
+                    ),
+                    (
+                        image("/ColorSpace /DeviceGray /BitsPerComponent 8", w, h),
+                        noise((w * h) as usize, 42),
+                    ),
+                    (
+                        image(
+                            &format!(
+                                "/ColorSpace /DeviceGray /BitsPerComponent 8 /Matte [{}]",
+                                "0.5 ".repeat(n)
+                            ),
+                            w,
+                            h,
+                        ),
+                        noise((w * h) as usize, 43),
+                    ),
+                    (
+                        image("/ImageMask true", w, h),
+                        noise((w.div_ceil(8) * h) as usize, 44),
+                    ),
+                ]);
+                let mut asset = asset(&pdf);
+                Arc::get_mut(&mut asset.0).unwrap().transfer_function = Some(transfer(four));
+                named(&format!("{space} {bits} bits {mask} four {four}"), || {
+                    assert_asset_streams_as_decoded(&asset);
+                });
+            }
+        }
+    }
+}
+
+/// Stencil masks with no filter or Flate stream as they decode whole, as the alpha
+/// the paint is drawn through, whatever their `/Decode` and width: rows of a width
+/// not filling their last byte, and rows read in pieces from windows that start
+/// within a byte.
+#[test]
+fn stencil_masks_stream_as_decoded() {
+    for (w, h) in [(13_u32, 9_u32), (8, 3), (150_001, 2)] {
+        let data = noise((w.div_ceil(8) * h) as usize, w);
+        for decode in ["", "/Decode [1 0]", "/BitsPerComponent 1 /Decode [0 1]"] {
+            let dict = format!("/ImageMask true {decode}");
+            named(&format!("{w} {decode}"), || {
+                assert_streams_as_decoded(&[(image(&dict, w, h), data.clone())]);
+            });
+            let flate = format!("{dict} /Filter /FlateDecode");
+            named(&format!("{w} {decode} Flate"), || {
+                assert_streams_as_decoded(&[(image(&flate, w, h), zlib(&data))]);
+            });
+        }
+    }
+}
+
+/// A stencil mask whose `/Decode` maps its bits through other values than 0 and 1
+/// is decoded whole, as before.
+#[test]
+fn a_stencil_with_another_decode_is_decoded_whole() {
+    let pdf = pdf(&[(
+        image("/ImageMask true /Decode [0.2 0.8]", 13, 9),
+        noise(18, 45),
+    )]);
+    let asset = asset(&pdf);
+    let source = asset.open(None, None).unwrap();
+    assert!(!is_streamed(&source));
+}
+
+/// Rows of packed samples the data ends within stream as they decode whole: padded
+/// with samples whose value is not zero once decoded, with the texel the data ends
+/// within split, and a stencil mask's padding transparent whatever its `/Decode`.
+#[test]
+fn packed_rows_cut_short_stream_as_decoded() {
+    for w in [13_u32, 150_001] {
+        for (dict, n, bits) in [
+            (
+                "/ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [1 0]",
+                1,
+                1,
+            ),
+            (
+                "/ColorSpace /DeviceRGB /BitsPerComponent 4 /Decode [1 0 1 0 1 0]",
+                3,
+                4,
+            ),
+            ("/ImageMask true", 1, 1),
+            ("/ImageMask true /Decode [1 0]", 1, 1),
+            ("/ImageMask true /BitsPerComponent 8", 1, 8),
+        ] {
+            let row = (w as usize * n * bits).div_ceil(8);
+            let data = noise(2 * row, 46);
+            // Into the last row, the first or the second; whole decoding keeps the
+            // rows present.
+            let half = row.div_ceil(2);
+            for (rows, cut) in [(1, half), (2, row + half), (2, row + 1)] {
+                named(&format!("{w} {dict} {cut}"), || {
+                    assert_streams_as_decoded(&[(image(dict, w, rows), data[..cut].to_vec())]);
+                });
+            }
+        }
+    }
+}
+
+/// A stencil mask's rows its data does not reach are transparent; whole decoding
+/// leaves them out.
+#[test]
+fn a_stencil_that_ends_early_leaves_the_rest_transparent() {
+    let (w, h) = (10_u32, 8_u32);
+    let row = w.div_ceil(8);
+    let bits = noise((row * h) as usize, 47);
+    for decode in ["", "/Decode [1 0]"] {
+        let pdf = pdf(&[(
+            image(&format!("/ImageMask true {decode}"), w, h),
+            bits[..(row * 3 + 1) as usize].to_vec(),
+        )]);
+        let asset = asset(&pdf);
+        let mut streamed = asset.open(None, None).unwrap();
+        assert!(is_streamed(&streamed));
+        let mut decoded = whole(&asset);
+        assert_eq!(decoded.layout().image.height, 4);
+        let a = request(&mut streamed, Plane::Image, (w, h), [0, 0, w, h]);
+        let b = request(&mut decoded, Plane::Image, (w, 4), [0, 0, w, 4]);
+        assert_eq!(a.format, PixelFormat::Alpha);
+        let (present, missing) = a.data.split_at((w * 4) as usize);
+        assert_eq!(present, b.data, "{decode}");
+        assert!(missing.iter().all(|&v| v == 0), "{decode}");
     }
 }
 
@@ -588,9 +821,10 @@ fn colour_and_mask_that_both_restart_finish() {
 
 /// A request polls its hook as it starts, and is cancelled within two pieces of
 /// work of the hook asking, wherever the work is: reading the columns asked for,
-/// skipping to them, past the rest of the row or past rows before them, of the colour
-/// or of a mask on its own grid, or pushing decoded texels. The source stays usable:
-/// the same request then returns what decoding the image whole does.
+/// skipping to them, past the rest of the row or past rows before them, of the
+/// colour, of a stencil mask's bits or of a mask on its own grid, or pushing decoded
+/// texels. The source stays usable: the same request then returns what decoding the
+/// image whole does.
 #[test]
 fn a_request_is_cancelled_within_two_pieces() {
     let w = 2_000_000_u32;
@@ -610,6 +844,15 @@ fn a_request_is_cancelled_within_two_pieces() {
             (w, 2),
             // Row 1 first: once row 0 is read whole, a state saved at row 1 skips it.
             vec![[0, 1, 1, 2], [0, 0, 1, 1], [w - 1, 0, w, 1], [0, 0, w, 1]],
+        ),
+        (
+            vec![(
+                image("/ImageMask true /Filter /FlateDecode", w, 2),
+                zlib(&noise(2 * w as usize / 8, 24)),
+            )],
+            Plane::Image,
+            (w, 2),
+            vec![[0, 1, 1, 2], [w - 1, 0, w, 1], [0, 0, w, 1]],
         ),
         (masked("SMask", gray, w), Plane::Mask, (w, 1), streamed_mask),
         (

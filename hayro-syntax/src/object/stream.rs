@@ -3,6 +3,8 @@
 use crate::crypto::DecryptionTarget;
 use crate::crypto::reader::DecryptedReader;
 use crate::filter::Filter;
+#[cfg(feature = "images")]
+pub use crate::filter::ccitt::{CcittEnd, CcittRows};
 use crate::filter::chain::Layer;
 pub use crate::filter::chain::StrictReader;
 use crate::filter::lzw_flate::{PredictorParams, Unpredictor};
@@ -560,6 +562,28 @@ impl<'a> Stream<'a> {
         }
         let data = self.raw_data_metered(meter, true)?;
         Ok(Some(StrictReader::new(data, layers)))
+    }
+
+    /// The stream's image data read row by row, when its one filter (besides
+    /// `/Crypt`) is `CCITTFaxDecode` and the image is not indexed (whose samples it
+    /// decodes to bits); `None` otherwise, and where the hook of `meter`, which
+    /// decryption counts on, asks to stop.
+    #[cfg(feature = "images")]
+    pub fn ccitt_rows(
+        &self,
+        image_params: &ImageDecodeParams,
+        meter: &Meter<'_>,
+    ) -> Option<CcittRows<'a>> {
+        let filters = self.filter_entries();
+        let mut applied = filters.applied().filter(|(f, _)| *f != Filter::Crypt);
+        let (Some((Filter::CcittFaxDecode, entry)), None) = (applied.next(), applied.next()) else {
+            return None;
+        };
+        if image_params.is_indexed {
+            return None;
+        }
+        let data = self.raw_data_metered(meter, false).ok()?;
+        Some(CcittRows::new(data, &entry.params, image_params))
     }
 
     /// The decoded data, read incrementally, when the stream's filters allow it: no

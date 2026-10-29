@@ -2,6 +2,7 @@
 //! density, so a renderer keeps a handle instead of decoded pixels and asks for what a
 //! view shows.
 
+mod ccitt;
 mod decoded;
 mod index;
 mod jpeg;
@@ -16,6 +17,7 @@ use crate::WarningSinkFn;
 use crate::cache::Cache;
 use crate::color::ColorSpace;
 use crate::interpret::state::ActiveTransferFunction;
+use ccitt::{CcittHeight, CcittStreamed};
 use decoded::Decoded;
 use hayro_syntax::object::stream::OwnedStream;
 use hayro_syntax::work::{Cancelled, Meter};
@@ -37,6 +39,7 @@ struct AssetData {
     stream: OwnedStream,
     checkpoints: Checkpoints,
     mask_height: MaskHeight,
+    ccitt_height: CcittHeight,
     width: u32,
     height: u32,
     kind: ImageKind,
@@ -55,6 +58,7 @@ impl ImageXObject<'_> {
             stream: self.stream.to_owned_stream(),
             checkpoints: Checkpoints::default(),
             mask_height: MaskHeight::new(),
+            ccitt_height: CcittHeight::new(),
             width: self.width(),
             height: self.height(),
             kind: self.kind,
@@ -112,20 +116,26 @@ impl ImageAsset {
         })
     }
 
-    /// Opens the image for requests. Images with no filter or Flate, 8-bit
-    /// `DeviceGray` or `DeviceRGB` samples used as stored or inverted, and masks of the
-    /// same kinds or decoded whole, only read their dictionaries here (and, the first
-    /// time, read such a mask's data through to count its rows); requests read their
-    /// data and keep a piece of a row and a few sums per bin. A request of such a Flate
-    /// image without a mask read alongside resumes from the nearest decoder state an
-    /// earlier request of the asset saved, instead of from the start. So does a request
-    /// of a single-scan baseline grayscale JPEG of its declared size without masks,
-    /// read in bands of eight rows; once its data fails to decode, it is decoded whole
-    /// like other images. Other images are decoded whole here (with `hint`, the size
-    /// they are wanted at, for decoders that can reduce), and requests read the decoded
-    /// planes, which the source holds until it is dropped. `cancel` is polled as
-    /// [`ImageRequest::cancel`] is; a cancelled open leaves the asset as it was, to be
-    /// opened again.
+    /// Opens the image for requests. Images with no filter or Flate whose samples
+    /// are `DeviceGray`, `DeviceRGB` or `Indexed`, of at most eight bits (of eight,
+    /// used as stored or inverted), with masks of the same kinds or decoded whole,
+    /// and stencil masks with no filter or Flate whose samples are used as stored or
+    /// inverted, only read their dictionaries here (and, the first time, read such a
+    /// mask's data through to count its rows); requests read their data and keep a
+    /// piece of a row and a few sums per bin, the rows the data does not reach being
+    /// transparent. A request of such a Flate image without a mask read alongside
+    /// resumes from the nearest decoder state an earlier request of the asset saved,
+    /// instead of from the start. So does a request of a single-scan baseline
+    /// grayscale JPEG of its declared size without masks, read in bands of eight
+    /// rows; once its data fails to decode, it is decoded whole like other images.
+    /// A gray image or stencil mask without masks whose one filter is
+    /// `CCITTFaxDecode` has its data decoded through once, the first time, to count
+    /// its rows, and each request decodes it from the start through its last row,
+    /// keeping a row's colour changes. Other images are decoded whole here (with
+    /// `hint`, the size they are wanted at, for decoders that can reduce), and
+    /// requests read the decoded planes, which the source holds until it is dropped.
+    /// `cancel` is polled as [`ImageRequest::cancel`] is; a cancelled open leaves the
+    /// asset as it was, to be opened again.
     pub fn open(
         &self,
         hint: Option<(u32, u32)>,
@@ -135,6 +145,23 @@ impl ImageAsset {
         meter.poll()?;
         let obj = self.xobject().ok_or(RequestError::Failed)?;
         let a = &*self.0;
+        let streamed = Streamed::new(&obj, &a.stream, &a.checkpoints, &a.mask_height, &meter)?;
+        if let Some(streamed) = streamed {
+            let (layout, opened) = (streamed.layout(), streamed.opened);
+            return Ok(ImageSource::new(
+                layout,
+                Inner::Streamed(Box::new(streamed)),
+                opened,
+            ));
+        }
+        if let Some(ccitt) = CcittStreamed::new(&obj, &a.ccitt_height, &meter)? {
+            let layout = ccitt.layout();
+            return Ok(ImageSource::new(
+                layout,
+                Inner::Ccitt(Box::new(ccitt)),
+                DecodeWork::default(),
+            ));
+        }
         if a.kind == ImageKind::StencilMask {
             let decoded = decode_mask(&obj, hint, &meter);
             meter.poll()?;
@@ -143,15 +170,6 @@ impl ImageAsset {
                 decoded.layout(),
                 Inner::Decoded(decoded),
                 DecodeWork::default(),
-            ));
-        }
-        let streamed = Streamed::new(&obj, &a.stream, &a.checkpoints, &a.mask_height, &meter)?;
-        if let Some(streamed) = streamed {
-            let (layout, opened) = (streamed.layout(), streamed.opened);
-            return Ok(ImageSource::new(
-                layout,
-                Inner::Streamed(Box::new(streamed)),
-                opened,
             ));
         }
         if let Some(jpeg) = JpegStreamed::new(&obj, &a.stream, &a.checkpoints.jpeg, &meter)? {
@@ -348,6 +366,7 @@ pub struct ImageSource<'a> {
 enum Inner<'a> {
     Streamed(Box<Streamed<'a>>),
     Jpeg(Box<JpegStreamed<'a>>),
+    Ccitt(Box<CcittStreamed<'a>>),
     Decoded(Decoded),
 }
 
@@ -399,6 +418,8 @@ impl<'a> ImageSource<'a> {
             Inner::Streamed(s) => s.run(request.plane, &mut area, &meter),
             // Its layout has no mask plane.
             Inner::Jpeg(j) => j.run(&mut area, &meter),
+            // Its layout has no mask plane.
+            Inner::Ccitt(c) => c.run(&mut area, &meter),
             Inner::Decoded(d) => d.run(request.plane, &mut area).map(|rows| DecodeWork {
                 rows_decoded: u64::from(rows),
                 bytes_inflated: 0,

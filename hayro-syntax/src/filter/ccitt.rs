@@ -96,6 +96,167 @@ fn row_work(bytes: usize, changes: &[u32]) -> usize {
     bytes + changes.len().div_ceil(2)
 }
 
+/// How a stream's CCITT data decodes: its settings, and the byte its white pixels
+/// are written as, black ones being its complement.
+#[derive(Clone, Copy)]
+struct Setup {
+    settings: DecodeSettings,
+    white: u8,
+}
+
+impl Setup {
+    fn new(params: &Dict<'_>, image_params: &ImageDecodeParams) -> Self {
+        let k = params.get::<i32>(K).unwrap_or(0);
+
+        let columns = params.get::<usize>(COLUMNS).unwrap_or(1728) as u32;
+        // `Rows` should match the height of the image, but in case it doesn't,
+        // the image height takes precedence (as in other viewers).
+        let rows = if image_params.height > 0 {
+            image_params.height
+        } else {
+            params.get::<u32>(ROWS).unwrap_or(0)
+        };
+
+        let mut settings = DecodeSettings::new(columns, rows);
+        settings.end_of_block = params.get::<bool>(END_OF_BLOCK).unwrap_or(true);
+        settings.end_of_line = params.get::<bool>(END_OF_LINE).unwrap_or(false);
+        settings.rows_are_byte_aligned = params.get::<bool>(ENCODED_BYTE_ALIGN).unwrap_or(false);
+        settings.encoding = if k < 0 {
+            EncodingMode::Group4
+        } else if k == 0 {
+            EncodingMode::Group3_1D
+        } else {
+            EncodingMode::Group3_2D
+        };
+        // The value that pixels which are white in the encoding are written as.
+        let white: u8 = if params.get::<bool>(BLACK_IS_1).unwrap_or(false) {
+            0x00
+        } else {
+            0xFF
+        };
+        Self { settings, white }
+    }
+
+    /// Whether 8-bit rows left out after the `decoded` rows of data that decoded
+    /// through (`complete`) are padded white: while padding them takes no more than
+    /// the rows decoded (or a small image); otherwise the image ends with the rows
+    /// decoded, as one whose data breaks off does.
+    fn pads(&self, decoded: u32, complete: bool) -> bool {
+        let (columns, rows) = (self.settings.columns as usize, self.settings.rows as usize);
+        let len = decoded as usize * columns;
+        let missing = (columns * rows).saturating_sub(len);
+        complete && rows != 0 && missing <= len.max(MIN_WHITE_PAD)
+    }
+}
+
+/// An image's CCITT data, read as 8-bit rows (gray, not indexed) that are handed
+/// over one at a time as they decode and not kept, so that reading it holds a row's
+/// colour changes rather than the image ([`Stream::ccitt_rows`]).
+///
+/// [`Stream::ccitt_rows`]: crate::object::Stream::ccitt_rows
+pub struct CcittRows<'a> {
+    data: Cow<'a, [u8]>,
+    setup: Setup,
+}
+
+/// How a pass over [`CcittRows`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CcittEnd {
+    /// The data decoded through, or up to the rows the image has.
+    Complete,
+    /// The data failed to decode after the rows handed over.
+    Broken,
+    /// The reader of the rows asked to stop.
+    Stopped,
+    /// The meter's hook asked to stop.
+    Cancelled,
+}
+
+impl<'a> CcittRows<'a> {
+    pub(crate) fn new(
+        data: Cow<'a, [u8]>,
+        params: &Dict<'_>,
+        image_params: &ImageDecodeParams,
+    ) -> Self {
+        Self {
+            data,
+            setup: Setup::new(params, image_params),
+        }
+    }
+
+    /// The pixels of a row.
+    pub fn columns(&self) -> u32 {
+        self.setup.settings.columns
+    }
+
+    /// The byte a white pixel decodes to (`0xFF`, or `0x00` with `BlackIs1`); a black
+    /// one decodes to its complement.
+    pub fn white(&self) -> u8 {
+        self.setup.white
+    }
+
+    /// The rows the image decoded whole ([`Stream::decoded_image`]) has when a pass
+    /// over all of the data hands over `decoded` rows and ends with `end`: those rows,
+    /// and white ones up to the rows the image declares where the data decoded
+    /// through and padding them takes little. `None` where decoding whole fails: data
+    /// that breaks off before a row, or no row at all.
+    ///
+    /// [`Stream::decoded_image`]: crate::object::Stream::decoded_image
+    pub fn rows_kept(&self, decoded: u32, end: CcittEnd) -> Option<u32> {
+        let complete = end == CcittEnd::Complete;
+        if !complete && decoded == 0 {
+            return None;
+        }
+        let rows = if self.setup.pads(decoded, complete) {
+            self.setup.settings.rows
+        } else {
+            decoded
+        };
+        (rows > 0).then_some(rows)
+    }
+
+    /// Decodes the rows from the first, handing each to `row` as the columns where
+    /// its colour changes, in ascending order: black from the first, white from the
+    /// second, and so on (as `hayro_ccitt::Decoder::push_row`), until `row` returns
+    /// `false`. The decoding counts on `meter` a step per bit read.
+    pub fn decode(&self, row: impl FnMut(&[u32]) -> bool, meter: &Meter<'_>) -> CcittEnd {
+        struct Rows<'m, F> {
+            row: F,
+            stopped: bool,
+            meter: &'m Meter<'m>,
+        }
+
+        impl<F: FnMut(&[u32]) -> bool> Decoder for Rows<'_, F> {
+            fn push_row(&mut self, changes: &[u32]) {
+                if !self.stopped {
+                    self.stopped = !(self.row)(changes);
+                }
+            }
+
+            fn stop(&mut self, bits: usize) -> bool {
+                self.stopped || self.meter.work(bits).is_err()
+            }
+        }
+
+        let mut rows = Rows {
+            row,
+            stopped: false,
+            meter,
+        };
+        let mut context = DecoderContext::new(self.setup.settings);
+        let result = hayro_ccitt::decode(&self.data, &mut rows, &mut context);
+        if meter.cancelled() {
+            CcittEnd::Cancelled
+        } else if rows.stopped {
+            CcittEnd::Stopped
+        } else if result.is_ok() {
+            CcittEnd::Complete
+        } else {
+            CcittEnd::Broken
+        }
+    }
+}
+
 /// The data decoded, its work counted on `meter`; `None` once its hook asks to stop.
 pub(crate) fn decode(
     data: &[u8],
@@ -103,35 +264,10 @@ pub(crate) fn decode(
     image_params: &ImageDecodeParams,
     meter: &Meter<'_>,
 ) -> Option<FilterResult<'static>> {
-    let k = params.get::<i32>(K).unwrap_or(0);
-
-    let columns = params.get::<usize>(COLUMNS).unwrap_or(1728) as u32;
-    // `Rows` should match the height of the image, but in case it doesn't,
-    // the image height takes precedence (as in other viewers).
-    let rows = if image_params.height > 0 {
-        image_params.height
-    } else {
-        params.get::<u32>(ROWS).unwrap_or(0)
-    };
+    let setup = Setup::new(params, image_params);
+    let (settings, white) = (setup.settings, setup.white);
+    let (columns, rows) = (settings.columns, settings.rows);
     let output_len = (columns as usize).checked_mul(rows as usize)?;
-
-    let mut settings = DecodeSettings::new(columns, rows);
-    settings.end_of_block = params.get::<bool>(END_OF_BLOCK).unwrap_or(true);
-    settings.end_of_line = params.get::<bool>(END_OF_LINE).unwrap_or(false);
-    settings.rows_are_byte_aligned = params.get::<bool>(ENCODED_BYTE_ALIGN).unwrap_or(false);
-    settings.encoding = if k < 0 {
-        EncodingMode::Group4
-    } else if k == 0 {
-        EncodingMode::Group3_1D
-    } else {
-        EncodingMode::Group3_2D
-    };
-    // The value that pixels which are white in the encoding are written as.
-    let white: u8 = if params.get::<bool>(BLACK_IS_1).unwrap_or(false) {
-        0x00
-    } else {
-        0xFF
-    };
 
     // Whenever possible (if we don't have an indexed color space), we convert
     // the data as 8-bit instead of 1-bit, so that it can be easier converted
@@ -344,11 +480,8 @@ pub(crate) fn decode(
             .output
             .truncate(decoder.decoded_rows as usize * columns as usize);
 
-        // Rows a stream that ends early leaves out are white, while padding them takes
-        // no more than the rows decoded (or a small image); otherwise the image ends
-        // with the rows decoded, as one whose data breaks off does.
-        let missing = output_len.saturating_sub(decoder.output.len());
-        if result.is_ok() && rows != 0 && missing <= decoder.output.len().max(MIN_WHITE_PAD) {
+        if setup.pads(decoder.decoded_rows, result.is_ok()) {
+            let missing = output_len - decoder.output.len();
             push_counted(&mut decoder.output, white, missing, output_len, meter);
             if meter.cancelled() {
                 return None;
