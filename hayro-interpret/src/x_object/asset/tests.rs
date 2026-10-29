@@ -591,6 +591,75 @@ fn masks_that_end_early_stream_as_decoded() {
     }
 }
 
+/// Requests of every window at full size and of a few at half size equal the same
+/// requests of the image decoded whole, for every plane.
+fn every_window_streams_as_decoded(objects: &[(String, Vec<u8>)]) {
+    let asset = asset(&pdf(objects));
+    let mut streamed = asset.open(None, None).unwrap();
+    assert!(is_streamed(&streamed));
+    let mut decoded = whole(&asset);
+    let layout = *streamed.layout();
+    assert_eq!(layout, *decoded.layout());
+    for plane in [Plane::Image, Plane::Mask] {
+        let Some(p) = layout.plane(plane) else {
+            continue;
+        };
+        for grid in [(p.width, p.height), (p.width.div_ceil(2), p.height.div_ceil(2))] {
+            for (x0, x1) in (0..grid.0).flat_map(|a| (a + 1..=grid.0).map(move |b| (a, b))) {
+                for (y0, y1) in (0..grid.1).flat_map(|a| (a + 1..=grid.1).map(move |b| (a, b))) {
+                    let window = [x0, y0, x1, y1];
+                    let a = request(&mut streamed, plane, grid, window);
+                    let b = request(&mut decoded, plane, grid, window);
+                    assert_eq!(
+                        (a.format, &a.data),
+                        (b.format, &b.data),
+                        "{plane:?} grid {grid:?} window {window:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A mask decoded whole (16-bit samples, or data under TIFF prediction of 16 bits)
+/// whose data holds fewer texels than it covers, none, part of a row or a row, read
+/// alongside the colour or on its own grid: every window, those right of the texels
+/// held and those within the rows past them included, reads its fill there, as
+/// decoding the image whole does.
+#[test]
+fn masks_decoded_whole_that_hold_few_texels_read_their_fill_past_them() {
+    let gray8 = "/ColorSpace /DeviceGray /BitsPerComponent 8";
+    let mask16 = "/ColorSpace /DeviceGray /BitsPerComponent 16";
+    let tiff16 = "/Filter /FlateDecode /DecodeParms << /Predictor 2 /BitsPerComponent 16 /Columns 2 >>";
+    let bits = vec![0b1010_0000, 0b0110_0000, 0b1111_0000, 0b0001_0000];
+    let colour = |w: u32, h: u32| {
+        (
+            image("/ColorSpace /DeviceGray /BitsPerComponent 1 /SMask 4 0 R", w, h),
+            bits.clone(),
+        )
+    };
+    for held in [0, 3, 8] {
+        let data = noise(held, 5);
+        // On the colour's grid, and on its own.
+        for (mw, mh) in [(4, 4), (3, 5)] {
+            named(&format!("16-bit {mw}x{mh}, {held} bytes"), || {
+                every_window_streams_as_decoded(&[
+                    colour(4, 4),
+                    (image(mask16, mw, mh), data.clone()),
+                ]);
+            });
+        }
+    }
+    for held in [&[0, 1][..], &[], &[0, 1, 2, 3, 4, 5]] {
+        named(&format!("TIFF-16, {} bytes", held.len()), || {
+            every_window_streams_as_decoded(&[
+                (image(&format!("{gray8} /SMask 4 0 R"), 4, 2), noise(8, 6)),
+                (image(&format!("{gray8} {tiff16}"), 4, 2), zlib(held)),
+            ]);
+        });
+    }
+}
+
 /// 8-bit samples the data does not hold are stored zero: the short last row keeps
 /// the bytes it holds, and the rows after it are black.
 #[test]

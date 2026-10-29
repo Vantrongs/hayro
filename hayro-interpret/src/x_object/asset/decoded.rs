@@ -3,7 +3,7 @@
 use super::rows::{PIECE_BYTES, piece_texels};
 use super::{ImageLayout, PixelFormat, Plane, PlaneLayout, Stop, interleave, premultiply};
 use crate::x_object::area::Area;
-use crate::x_object::decode::{DecodedImage, DecodedMask, Rows};
+use crate::x_object::decode::{DecodedImage, DecodedMask, Held, Rows};
 use crate::{ImageData, LumaData};
 use hayro_syntax::work::{Cancelled, Meter};
 
@@ -113,55 +113,50 @@ impl Decoded {
     pub(super) fn run(&self, plane: Plane, area: &mut Area<'_>) -> Result<u32, Stop> {
         let (rows, cols) = (area.rows(), area.columns());
         let (c0, c1) = (cols.start as usize, cols.end as usize);
-        let (data, c, w, held, fill) = match (plane, &self.image) {
+        let alpha_fill = self.alpha_rows.fill.map(|f| [f[0]]);
+        let (held, c) = match (plane, &self.image) {
             (Plane::Mask, _) => {
                 let a = self.alpha.as_ref().ok_or(Stop::Failed)?;
-                let fill = self.alpha_rows.fill.map(|f| vec![f[0]]);
-                (&a.data, 1, a.width as usize, a.height, fill)
+                let fill = alpha_fill.as_ref().map(|f| &f[..]);
+                (Held::new(&a.data, a.width, 1, fill), 1)
             }
             (Plane::Image, ImageData::Rgb(d)) => {
-                (&d.data, 3, d.width as usize, d.height, self.fill.clone())
+                (Held::new(&d.data, d.width, 3, self.fill.as_deref()), 3)
             }
             (Plane::Image, ImageData::Luma(d)) => {
-                (&d.data, 1, d.width as usize, d.height, self.fill.clone())
-            }
-        };
-        // Rows past those held that are transparent are not pushed.
-        let rows = match fill {
-            Some(_) => rows,
-            None => {
-                let end = rows.end.min(held);
-                rows.start.min(end)..end
+                (Held::new(&d.data, d.width, 1, self.fill.as_deref()), 1)
             }
         };
         let alpha = (plane == Plane::Image && self.same_grid)
-            .then_some(self.alpha.as_ref())
+            .then(|| self.alpha.as_ref().map(|a| Held::new(&a.data, a.width, 1, None)))
             .flatten();
-        let texels_held = data.len() / c;
         let piece = piece_texels(c1 - c0, c + 1);
         let mut texels_with_alpha = Vec::with_capacity(piece * (c + 1));
+        let mut pushed = rows.start;
         for y in rows.clone() {
-            let at = y as usize * w;
-            if at >= texels_held {
+            if held.past(y) {
                 // The texels past those held are the fill: their rows added at once,
-                // in time the bins bound.
-                let fill = fill.as_deref().ok_or(Stop::Failed)?;
-                area.push_rows(rows.end - y, fill)?;
+                // in time the bins bound; rows past those held that are transparent
+                // are not pushed.
+                if let Some(fill) = held.fill {
+                    area.push_rows(rows.end - y, fill)?;
+                    pushed = rows.end;
+                }
                 break;
             }
             // Of a row held in part, the columns past those held are the fill.
-            let end_held = (texels_held - at).min(w);
-            for col in (c0..c1.min(end_held)).step_by(piece) {
-                let end = (col + piece).min(c1.min(end_held));
-                let texels = &data[(at + col) * c..(at + end) * c];
-                let texels = match alpha {
+            let row = held.row(y, c0..c1);
+            let end_held = c0 + row.len() / c;
+            for col in (c0..end_held).step_by(piece) {
+                let end = (col + piece).min(end_held);
+                let texels = &row[(col - c0) * c..(end - c0) * c];
+                let texels = match &alpha {
                     Some(a) => {
-                        interleave(
-                            texels,
-                            c,
-                            &a.data[at + col..at + end],
-                            &mut texels_with_alpha,
-                        );
+                        let a = a.row(y, col..end);
+                        if a.len() != end - col {
+                            return Err(Stop::Failed);
+                        }
+                        interleave(texels, c, a, &mut texels_with_alpha);
                         &texels_with_alpha
                     }
                     None => texels,
@@ -169,11 +164,12 @@ impl Decoded {
                 area.push_texels(col as u32, texels)?;
             }
             if end_held < c1 {
-                let fill = fill.as_deref().ok_or(Stop::Failed)?;
-                area.push_rest(end_held.max(c0) as u32, fill)?;
+                let fill = held.fill.ok_or(Stop::Failed)?;
+                area.push_rest(end_held as u32, fill)?;
             }
             area.end_row()?;
+            pushed = y + 1;
         }
-        Ok(rows.end - rows.start)
+        Ok(pushed - rows.start)
     }
 }

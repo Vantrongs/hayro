@@ -1,5 +1,5 @@
 use super::{
-    DecodeContext, Rows, complete, decode_context, into_owned, invert as invert_bytes, pixel_piece,
+    DecodeContext, Held, Rows, complete, decode_context, into_owned, invert as invert_bytes, pixel_piece,
     unpack_samples,
 };
 use crate::LumaData;
@@ -39,6 +39,12 @@ impl DecodedMask {
 
     pub(crate) fn luma(&self) -> &LumaData {
         &self.luma
+    }
+
+    /// The alpha held, and its fill past it.
+    pub(crate) fn held(&self) -> Held<'_> {
+        let fill = self.rows.fill.as_ref().map(|f| &f[..1]);
+        Held::new(&self.luma.data, self.luma.width, 1, fill)
     }
 
     pub(crate) fn rows(&self) -> Rows {

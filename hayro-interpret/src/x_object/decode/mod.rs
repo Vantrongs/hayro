@@ -17,6 +17,7 @@ use hayro_syntax::object::stream::{
 };
 use hayro_syntax::object::{Array, Object};
 use hayro_syntax::work::{Meter, POLL_BYTES};
+use core::ops::Range;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 
@@ -67,6 +68,49 @@ impl Rows {
                 Some(_) => len.div_ceil(row) == height as usize,
                 None => height > 0 && Some(len) == row.checked_mul(height as usize),
             }
+    }
+}
+
+/// A decoded plane as its readers take it: the texels its data holds, the first of
+/// rows `width` texels of `channels` bytes in row order, and past them its fill. The
+/// one way to read a plane's rows, so that no reader reaches past the texels held.
+#[derive(Clone, Copy)]
+pub(crate) struct Held<'p> {
+    data: &'p [u8],
+    width: usize,
+    channels: usize,
+    /// The texel past those held; `None` where those are transparent.
+    pub(crate) fill: Option<&'p [u8]>,
+}
+
+impl<'p> Held<'p> {
+    pub(crate) fn new(
+        data: &'p [u8],
+        width: u32,
+        channels: usize,
+        fill: Option<&'p [u8]>,
+    ) -> Self {
+        Self {
+            data,
+            width: width as usize,
+            channels: channels.max(1),
+            fill,
+        }
+    }
+
+    /// The texels held of columns `cols` of row `y`: those from `cols.start` up to
+    /// `cols.end` or the last one held, perhaps none; the rest of `cols` are the fill.
+    pub(crate) fn row(&self, y: u32, cols: Range<usize>) -> &'p [u8] {
+        let texels = self.data.len() / self.channels;
+        let at = (y as usize).saturating_mul(self.width);
+        let end = at.saturating_add(cols.end.min(self.width)).min(texels);
+        let start = at.saturating_add(cols.start).min(end);
+        &self.data[start * self.channels..end * self.channels]
+    }
+
+    /// Whether row `y` and every row after it hold no texel: they are all the fill.
+    pub(crate) fn past(&self, y: u32) -> bool {
+        (y as usize).saturating_mul(self.width) >= self.data.len() / self.channels
     }
 }
 
