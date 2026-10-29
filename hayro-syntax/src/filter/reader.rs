@@ -8,6 +8,7 @@ use crate::filter::lzw_flate::{PredictorParams, Unpredictor, flate};
 use crate::object::stream::OwnedStream;
 use crate::work::{Cancelled, Meter, POLL_BYTES};
 use alloc::borrow::Cow;
+#[cfg(feature = "unsafe")]
 use alloc::vec::Vec;
 
 /// How many decrypted encoded bytes the Flate decoder is given at a time.
@@ -103,13 +104,11 @@ pub struct DecodedCheckpoint {
     predictor: Option<Predicted>,
 }
 
-/// A predictor reversed row by row on top of the source.
+/// A predictor reversed on top of the source.
 #[derive(Clone)]
 struct Predicted {
-    /// Holds the last decoded row, of which `taken` bytes were handed out.
+    /// Holds the bytes decoded last, of which `taken` were handed out.
     unpredictor: Unpredictor,
-    /// The encoded row being read, reversed as far as its bytes allow.
-    input: Vec<u8>,
     taken: usize,
 }
 
@@ -130,7 +129,6 @@ impl<'a> DecodedReader<'a> {
             1 => None,
             _ => Some(Predicted {
                 unpredictor: Unpredictor::new(params)?,
-                input: Vec::new(),
                 taken: 0,
             }),
         };
@@ -267,12 +265,12 @@ impl<'a> DecodedReader<'a> {
         let Some(p) = &mut self.predictor else {
             return self.source.read(buf, &mut self.inflated, meter);
         };
-        while p.taken == p.unpredictor.row().len() {
+        while p.taken == p.unpredictor.ready().len() {
             if !p.fill(&mut self.source, &mut self.inflated, meter)? {
                 return Ok(0);
             }
         }
-        let row = &p.unpredictor.row()[p.taken..];
+        let row = &p.unpredictor.ready()[p.taken..];
         let n = buf.len().min(row.len());
         meter.work(n)?;
         buf[..n].copy_from_slice(&row[..n]);
@@ -302,57 +300,30 @@ fn address(data: &[u8]) -> (usize, usize) {
 impl Predicted {
     #[cfg(feature = "unsafe")]
     fn heap_bytes(&self) -> usize {
-        self.input.capacity() + self.unpredictor.heap_bytes()
+        self.unpredictor.heap_bytes()
     }
 
-    /// The most a copy of these rows holds: the encoded row being read and the last
-    /// one decoded (a copy's capacities are its lengths).
+    /// The most a copy of it holds.
     #[cfg(feature = "unsafe")]
     fn heap_bound(&self) -> Option<usize> {
-        self.unpredictor.input_len().checked_mul(2)
+        self.unpredictor.heap_bound()
     }
 
     fn reset(&mut self) {
-        self.input.clear();
         self.taken = 0;
         self.unpredictor.reset();
     }
 
-    /// Reads the rest of the next row, reversing the predictor as its bytes arrive;
-    /// false if the data end before it (a last row cut short is kept, as
-    /// `apply_predictor` keeps it). The row grows with the bytes read, so a declared
-    /// width alone allocates nothing.
+    /// Decodes the next bytes; false at the end of the data.
     fn fill(
         &mut self,
         source: &mut Source<'_>,
         inflated: &mut u64,
         meter: &Meter<'_>,
     ) -> Result<bool, Cancelled> {
-        let mut chunk = [0; 8192];
-        let len = self.unpredictor.input_len();
-        while self.input.len() < len {
-            let wanted = (len - self.input.len()).min(chunk.len());
-            match source.read(&mut chunk[..wanted], inflated, meter) {
-                Ok(0) => {
-                    let cut = self.unpredictor.finish_cut_row(&mut self.input);
-                    if cut {
-                        self.taken = 0;
-                    }
-                    return Ok(cut);
-                }
-                Ok(n) => {
-                    self.input.extend_from_slice(&chunk[..n]);
-                    self.unpredictor.advance(&mut self.input, POLL_BYTES);
-                }
-                Err(e) => {
-                    self.reset();
-                    return Err(e);
-                }
-            }
-        }
-        self.unpredictor.finish_row(&mut self.input);
         self.taken = 0;
-        Ok(true)
+        self.unpredictor
+            .fill(|buf| source.read(buf, inflated, meter), meter)
     }
 }
 

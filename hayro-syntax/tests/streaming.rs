@@ -64,6 +64,71 @@ fn zlib(data: &[u8]) -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
+/// TIFF prediction is reversed in pieces as the data arrive, by both readers: a row
+/// of any width costs no memory that grows with it, at every depth the readers take,
+/// and the bytes are those whole decoding makes, a last row cut short included.
+#[test]
+fn a_wide_tiff_predictor_row_is_reversed_in_bounded_pieces() {
+    const ROW: usize = 1 << 20;
+    for bpc in [1, 2, 4, 8] {
+        for colors in [1, 3] {
+            let columns = ROW * 8 / (bpc * colors) + 5;
+            let row = (columns * bpc * colors).div_ceil(8);
+            let data = common::noise(2 * row + row / 3, (bpc * colors) as u32);
+            let pdf = stream_file(
+                &format!(
+                    "/Filter /FlateDecode /DecodeParms << /Predictor 2 /Colors {colors} \
+                     /BitsPerComponent {bpc} /Columns {columns} >>"
+                ),
+                &common::stored_zlib(&data, usize::from(u16::MAX)),
+            );
+            let stream = object_3(&pdf);
+            let whole = stream.decoded().unwrap();
+            assert_eq!(whole.len(), data.len());
+            // Each piece is compared as it is read, so that only the readers allocate.
+            let matches = |at: &mut usize, piece: &[u8]| {
+                let same = whole.get(*at..*at + piece.len()) == Some(piece);
+                *at += piece.len();
+                same
+            };
+            let ((), lenient) = measure(|| {
+                let mut reader = stream.decoded_reader().unwrap();
+                let (mut buf, mut at) = (vec![0; 1 << 16], 0);
+                loop {
+                    match reader.read(&mut buf, &Meter::default()).unwrap() {
+                        0 => break,
+                        n => assert!(matches(&mut at, &buf[..n]), "{bpc} {colors}: at {at}"),
+                    }
+                }
+                assert_eq!(at, whole.len(), "{bpc} {colors}");
+            });
+            // Without `unsafe`, the lenient reader inflates the data whole.
+            if cfg!(feature = "unsafe") {
+                assert!(
+                    lenient.peak < 256 * 1024,
+                    "{bpc} {colors}: lenient {lenient:?}"
+                );
+            }
+            let ((), strict) = measure(|| {
+                let meter = Meter::default();
+                let mut reader = stream.decoded_strict_reader(&meter).unwrap().unwrap();
+                let (mut buf, mut at) = (vec![0; 1 << 16], 0);
+                loop {
+                    match reader.read(&mut buf, &meter).unwrap() {
+                        0 => break,
+                        n => assert!(matches(&mut at, &buf[..n]), "{bpc} {colors}: at {at}"),
+                    }
+                }
+                assert_eq!(at, whole.len(), "{bpc} {colors}");
+            });
+            assert!(
+                strict.peak < 256 * 1024,
+                "{bpc} {colors}: strict {strict:?}"
+            );
+        }
+    }
+}
+
 /// A row declared far longer than the data allocates nothing for its length: the
 /// data are a first row cut short, which is kept (its filter byte, then `1 2 3`).
 #[test]

@@ -1,7 +1,7 @@
 use crate::filter::png::{self, RowFilter};
 use crate::object::dict::keys::{BITS_PER_COMPONENT, COLORS, COLUMNS, EARLY_CHANGE, PREDICTOR};
 use crate::object::{Dict, Object};
-use crate::work::{Meter, POLL_BYTES};
+use crate::work::{Cancelled, Meter, POLL_BYTES};
 use alloc::vec::Vec;
 use core::ops::Range;
 
@@ -1432,26 +1432,52 @@ fn clear_tiff_bits_tail(row: &mut [u8], bpc: u8, n: usize) {
     }
 }
 
-/// Reverses a predictor row by row, as `apply_predictor` does for the whole data at
-/// once: for PNG prediction and TIFF prediction of components of 1, 2, 4 or 8 bits.
-/// A row of a predictor that unfilters a byte at a time is reversed in parts, as its
-/// bytes arrive; a row of TIFF prediction of fewer bits once it is read.
+/// The most bytes of TIFF prediction an [`Unpredictor`] reads and reverses at a time.
+const TIFF_PIECE: usize = 8192;
+
+/// Reverses a predictor as the data are read, as `apply_predictor` reverses it for
+/// the whole data at once. PNG prediction is reversed row by row, each row in parts
+/// as its bytes arrive and held whole for the next one to read from. TIFF prediction
+/// of components of 1, 2, 4 or 8 bits is reversed a piece of at most [`TIFF_PIECE`]
+/// bytes at a time, holding only the last component of each colour, so neither the
+/// work between two counts on the meter nor the memory grows with a row.
 #[derive(Clone)]
-pub(crate) struct Unpredictor {
-    is_png_predictor: bool,
-    /// The bytes of a pixel for PNG prediction, of the components of one for TIFF.
+pub(crate) enum Unpredictor {
+    Png(PngRows),
+    Tiff(TiffPieces),
+}
+
+#[derive(Clone)]
+pub(crate) struct PngRows {
+    /// The bytes of a pixel.
     bpp: usize,
-    /// For TIFF prediction of components of fewer than eight bits, their bits, else
-    /// zero; with `components`, those of a row (which fit the padding after
-    /// `is_png_predictor`, so a saved state grows by nothing).
-    tiff_bpc: u8,
-    components: u32,
-    /// The previous row, decoded after its predictor byte for PNG predictors; empty
-    /// before the first, as `apply_predictor` passes it.
-    prev: Vec<u8>,
+    /// The bytes of a decoded row, after its filter byte.
     row_len: usize,
-    /// The bytes of the row being read that are reversed.
+    /// The encoded row being read, its filter byte first, of which the `done` bytes
+    /// after the filter byte are reversed.
+    input: Vec<u8>,
     done: usize,
+    /// The last row decoded, after its filter byte; empty before the first, as
+    /// `apply_predictor` passes it.
+    prev: Vec<u8>,
+}
+
+#[derive(Clone)]
+pub(crate) struct TiffPieces {
+    /// The bits of a component: 1, 2, 4 or 8.
+    bpc: u8,
+    /// The components of a pixel: 1 to 32.
+    colors: u8,
+    /// The components of a row, and its bytes.
+    components: u32,
+    row_len: u32,
+    /// The bytes of the row being read that were reversed.
+    at: u32,
+    /// The last piece reversed.
+    piece: Vec<u8>,
+    /// The last component of each colour reversed in the row being read; zero before
+    /// its first, which adds nothing to the first component of each colour.
+    last: [u8; 32],
 }
 
 impl Unpredictor {
@@ -1459,110 +1485,208 @@ impl Unpredictor {
     /// 16-bit components, which only `apply_predictor` reverses.
     pub(crate) fn new(params: &PredictorParams) -> Option<Self> {
         let rows = Rows::of(params)?;
-        let (is_png_predictor, bpp, tiff_bpc, components) = match rows.kind {
-            Kind::Png { bpp } => (true, bpp, 0, 0),
-            Kind::Tiff8 { colors } => (false, colors, 0, 0),
-            Kind::Tiff { bpc: 16, .. } => return None,
-            Kind::Tiff { colors, bpc } => {
-                let components = colors.checked_mul(params.columns)?.try_into().ok()?;
-                (false, colors, bpc, components)
-            }
+        let tiff = |colors: usize, bpc: u8| {
+            Some(Self::Tiff(TiffPieces {
+                bpc,
+                colors: colors.try_into().ok()?,
+                components: colors.checked_mul(params.columns)?.try_into().ok()?,
+                row_len: rows.len.try_into().ok()?,
+                at: 0,
+                piece: Vec::new(),
+                last: [0; 32],
+            }))
         };
-        Some(Self {
-            is_png_predictor,
-            bpp,
-            tiff_bpc,
-            components,
-            prev: Vec::new(),
-            row_len: rows.len,
-            done: 0,
-        })
-    }
-
-    /// The bytes of one encoded row (with its predictor byte for PNG predictors).
-    pub(crate) fn input_len(&self) -> usize {
-        self.row_len + usize::from(self.is_png_predictor)
-    }
-
-    /// The filter of the encoded row read so far, and its bytes after the filter byte.
-    fn split<'b>(&self, input: &'b mut [u8]) -> Option<(Option<RowFilter>, &'b mut [u8])> {
-        if self.is_png_predictor {
-            let (&mut filter, row) = input.split_first_mut()?;
-            Some((RowFilter::from_u8(filter), row))
-        } else {
-            Some((Some(RowFilter::Sub), input))
+        match rows.kind {
+            Kind::Png { bpp } => Some(Self::Png(PngRows {
+                bpp,
+                row_len: rows.len,
+                input: Vec::new(),
+                done: 0,
+                prev: Vec::new(),
+            })),
+            Kind::Tiff8 { colors } => tiff(colors, 8),
+            Kind::Tiff { bpc: 16, .. } => None,
+            Kind::Tiff { colors, bpc } => tiff(colors, bpc),
         }
     }
 
-    /// Reverses the predictor over the bytes of `input`, the encoded row read so far,
-    /// that make whole pixels and were not reversed before, once there are at least
-    /// `min` of them.
-    pub(crate) fn advance(&mut self, input: &mut [u8], min: usize) {
-        let (bpp, done) = (self.bpp, self.done);
-        if self.tiff_bpc != 0 {
-            return;
-        }
-        let Some((filter, row)) = self.split(input) else {
-            return;
+    /// Reads the next bytes through `read`, which fills a buffer and returns how many
+    /// bytes it put there (0 at the end of the data), and reverses them: true with
+    /// them in [`Self::ready`], false at the end of the data, with nothing there. A
+    /// last row cut short is kept, as `apply_predictor` keeps it. The work of
+    /// reversing counts on `meter`; after an error, reading starts again from the
+    /// first row.
+    pub(crate) fn fill<E: From<Cancelled>>(
+        &mut self,
+        mut read: impl FnMut(&mut [u8]) -> Result<usize, E>,
+        meter: &Meter<'_>,
+    ) -> Result<bool, E> {
+        let filled = match self {
+            Self::Png(rows) => rows.fill(&mut read, meter),
+            Self::Tiff(pieces) => pieces.fill(&mut read, meter),
         };
-        let end = row.len() / bpp * bpp;
-        if end <= done || end - done < min {
-            return;
+        if filled.is_err() {
+            self.reset();
         }
-        if let Some(filter) = filter {
-            png::unfilter_part(filter, bpp, self.row(), row, done..end);
-        }
-        self.done = end;
+        filled
     }
 
-    /// Decodes the rest of `input`, which holds the encoded row, whole or the last
-    /// one cut short, and takes it as the previous row ([`Self::row`]), leaving
-    /// `input` empty.
-    pub(crate) fn finish_row(&mut self, input: &mut Vec<u8>) {
-        let (bpp, done) = (self.bpp, self.done);
-        if self.tiff_bpc != 0 {
-            let bpc = self.tiff_bpc;
-            let n = tiff_bits_held(input, bpc, self.components as usize);
-            unpredict_tiff_bits_part(input, bpp, bpc, bpp.min(n)..n);
-            clear_tiff_bits_tail(input, bpc, n);
-        } else if let Some((Some(filter), row)) = self.split(input) {
-            let end = row.len();
-            png::unfilter_part(filter, bpp, self.row(), row, done.min(end)..end);
+    /// The bytes the last [`Self::fill`] decoded: a row for PNG prediction, a piece
+    /// of rows for TIFF prediction; empty before the first.
+    pub(crate) fn ready(&self) -> &[u8] {
+        match self {
+            Self::Png(rows) => rows.prev.get(1..).unwrap_or_default(),
+            Self::Tiff(pieces) => &pieces.piece,
         }
-        core::mem::swap(&mut self.prev, input);
-        input.clear();
-        self.done = 0;
     }
 
-    /// At the end of the data, decodes the last row cut short that `input` holds, as
-    /// `apply_predictor` keeps it: true where it holds a byte of data.
-    pub(crate) fn finish_cut_row(&mut self, input: &mut Vec<u8>) -> bool {
-        if input.len() <= usize::from(self.is_png_predictor) {
-            input.clear();
-            self.done = 0;
-            return false;
-        }
-        self.finish_row(input);
-        true
-    }
-
-    /// The last row decoded; empty before the first.
-    pub(crate) fn row(&self) -> &[u8] {
-        self.prev
-            .get(usize::from(self.is_png_predictor)..)
-            .unwrap_or_default()
-    }
-
-    /// The heap bytes the previous row holds.
+    /// The heap bytes it holds.
     #[cfg(feature = "unsafe")]
     pub(crate) fn heap_bytes(&self) -> usize {
-        self.prev.capacity()
+        match self {
+            Self::Png(rows) => rows.input.capacity() + rows.prev.capacity(),
+            Self::Tiff(pieces) => pieces.piece.capacity(),
+        }
+    }
+
+    /// The most heap bytes a copy holds, at any position (a copy's capacities are its
+    /// lengths): for PNG prediction the encoded row being read and the last one
+    /// decoded, for TIFF prediction a piece.
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn heap_bound(&self) -> Option<usize> {
+        match self {
+            Self::Png(rows) => rows.row_len.checked_add(1)?.checked_mul(2),
+            Self::Tiff(_) => Some(TIFF_PIECE),
+        }
     }
 
     /// Back to the first row.
     pub(crate) fn reset(&mut self) {
-        self.prev.clear();
+        match self {
+            Self::Png(rows) => {
+                rows.input.clear();
+                rows.prev.clear();
+                rows.done = 0;
+            }
+            Self::Tiff(pieces) => {
+                pieces.piece.clear();
+                pieces.at = 0;
+                pieces.last = [0; 32];
+            }
+        }
+    }
+}
+
+impl PngRows {
+    /// Reads the rest of the next row, reversing it as its bytes arrive; false if the
+    /// data end before it, where a last row cut short is kept if it holds a byte
+    /// after its filter byte. The row grows with the bytes read, so a declared width
+    /// alone allocates nothing.
+    fn fill<E: From<Cancelled>>(
+        &mut self,
+        read: &mut impl FnMut(&mut [u8]) -> Result<usize, E>,
+        meter: &Meter<'_>,
+    ) -> Result<bool, E> {
+        let len = self.row_len + 1;
+        while self.input.len() < len {
+            let have = self.input.len();
+            self.input.resize(len.min(have + TIFF_PIECE), 0);
+            let read = read(&mut self.input[have..]);
+            self.input.truncate(have + *read.as_ref().unwrap_or(&0));
+            if read? == 0 {
+                if self.input.len() <= 1 {
+                    self.input.clear();
+                    self.prev.clear();
+                    self.done = 0;
+                    return Ok(false);
+                }
+                break;
+            }
+            self.advance(POLL_BYTES, meter)?;
+        }
+        self.advance(0, meter)?;
+        core::mem::swap(&mut self.prev, &mut self.input);
+        self.input.clear();
         self.done = 0;
+        Ok(true)
+    }
+
+    /// Reverses the bytes of the row read so far that were not reversed before, once
+    /// there are at least `min` of them: those that make whole pixels, or all of them
+    /// for `min` 0, where the row is read.
+    fn advance(&mut self, min: usize, meter: &Meter<'_>) -> Result<(), Cancelled> {
+        let (bpp, done) = (self.bpp, self.done);
+        let Some((&mut filter, row)) = self.input.split_first_mut() else {
+            return Ok(());
+        };
+        let end = match min {
+            0 => row.len(),
+            _ => row.len() / bpp * bpp,
+        };
+        if end <= done || end - done < min {
+            return Ok(());
+        }
+        if let Some(filter) = RowFilter::from_u8(filter) {
+            let previous = self.prev.get(1..).unwrap_or_default();
+            png::unfilter_part(filter, bpp, previous, row, done..end);
+        }
+        self.done = end;
+        meter.work(end - done)
+    }
+}
+
+impl TiffPieces {
+    /// Reads the next piece and reverses it; false at the end of the data.
+    fn fill<E: From<Cancelled>>(
+        &mut self,
+        read: &mut impl FnMut(&mut [u8]) -> Result<usize, E>,
+        meter: &Meter<'_>,
+    ) -> Result<bool, E> {
+        self.piece.resize(TIFF_PIECE, 0);
+        let read = read(&mut self.piece);
+        self.piece.truncate(*read.as_ref().unwrap_or(&0));
+        if read? == 0 {
+            return Ok(false);
+        }
+        self.reverse();
+        meter.work(self.piece.len())?;
+        Ok(true)
+    }
+
+    /// Reverses the piece, which continues the row being read, and may hold the rows
+    /// after it: each component, `bpc` bits from the most significant, adds the last
+    /// one of its colour modulo 2^bpc. Bits after the last component of a row are
+    /// cleared, as `apply_predictor` clears them.
+    fn reverse(&mut self) {
+        let bpc = usize::from(self.bpc);
+        let per_byte = 8 / bpc;
+        let mask = u8::MAX >> (8 - bpc);
+        let colors = usize::from(self.colors);
+        let (components, row_len) = (self.components as usize, self.row_len as usize);
+        let mut at = self.at as usize;
+        let mut colour = at * per_byte % colors;
+        for byte in &mut self.piece {
+            if at == row_len {
+                at = 0;
+                colour = 0;
+                self.last = [0; 32];
+            }
+            let held = (components - at * per_byte).min(per_byte);
+            let mut out = 0;
+            for k in 0..held {
+                let shift = 8 - bpc * (k + 1);
+                let v = ((*byte >> shift) & mask).wrapping_add(self.last[colour]) & mask;
+                self.last[colour] = v;
+                out |= v << shift;
+                colour += 1;
+                if colour == colors {
+                    colour = 0;
+                }
+            }
+            *byte = out;
+            at += 1;
+        }
+        self.at = at as u32;
     }
 }
 
@@ -1622,6 +1746,38 @@ mod tests {
         followed.extend(b"more");
         let decoded = flate::decode(&followed, &PredictorParams::default(), &Meter::default(), false, 0);
         assert_eq!(decoded, Some(data));
+    }
+
+    /// TIFF prediction of a row of any width is reversed a bounded piece at a time,
+    /// each piece counted on the meter before the next is read, at every depth.
+    #[test]
+    fn tiff_prediction_is_reversed_in_counted_pieces() {
+        use super::{TIFF_PIECE, Unpredictor};
+        use core::cell::Cell;
+        for bpc in [1, 2, 4, 8] {
+            let columns = (4 * POLL_BYTES * 8) / bpc + 3;
+            let p = PredictorParams { predictor: 2, colors: 1, bits_per_component: bpc as u8, columns, early_change: true };
+            let data: Vec<u8> = (0..columns * bpc / 8 + 1).map(|i| (i * 37 % 251) as u8).collect();
+            let polls = Cell::new(0);
+            let hook = || { polls.set(polls.get() + 1); false };
+            let meter = Meter::new(Some(&hook));
+            let mut unpredictor = Unpredictor::new(&p).unwrap();
+            let (mut at, mut out) = (0, Vec::new());
+            // Reading from a slice counts nothing, so every count is the reversal's.
+            let mut read = |buf: &mut [u8]| -> Result<usize, crate::work::Cancelled> {
+                let n = buf.len().min(data.len() - at);
+                buf[..n].copy_from_slice(&data[at..at + n]);
+                at += n;
+                Ok(n)
+            };
+            while unpredictor.fill(&mut read, &meter).unwrap() {
+                let piece = unpredictor.ready();
+                assert!(piece.len() <= TIFF_PIECE, "{bpc}: a piece of {}", piece.len());
+                out.extend_from_slice(piece);
+            }
+            assert_eq!(polls.get(), data.len() / POLL_BYTES, "{bpc}: the reversal is counted");
+            assert_eq!(Some(out), apply_predictor(data.clone(), &p, &Meter::default()), "{bpc}");
+        }
     }
 
     fn predictor_expected() -> Vec<u8> {

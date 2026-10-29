@@ -108,8 +108,6 @@ impl Layer {
                 Some(unpredictor) => Box::new(Predict {
                     from: stage,
                     unpredictor: Unpredictor::clone(unpredictor),
-                    input: Vec::new(),
-                    chunk: Vec::new(),
                     taken: 0,
                 }) as Box<dyn Stage + 'a>,
             }
@@ -749,57 +747,13 @@ impl Stage for Flate<'_> {
     }
 }
 
-/// A predictor reversed row by row, as `apply_predictor` reverses it, which never
-/// fails where [`Unpredictor`] takes its parameters.
+/// A predictor reversed as `apply_predictor` reverses it, which never fails where
+/// [`Unpredictor`] takes its parameters.
 struct Predict<'a> {
     from: Box<dyn Stage + 'a>,
+    /// Holds the bytes decoded last, of which `taken` were handed out.
     unpredictor: Unpredictor,
-    /// The encoded row being read, reversed as far as its bytes allow.
-    input: Vec<u8>,
-    /// Room for the bytes read from the stage before, cleared once.
-    chunk: Vec<u8>,
-    /// The bytes of the last row decoded that were handed out.
     taken: usize,
-}
-
-impl Predict<'_> {
-    fn start_over(&mut self) {
-        self.input.clear();
-        self.unpredictor.reset();
-        self.taken = 0;
-    }
-
-    /// Reads the next row: false where the data end before it (a last row cut short
-    /// is kept, as `apply_predictor` keeps it).
-    fn fill(&mut self, meter: &Meter<'_>) -> Result<bool, ReadError> {
-        let len = self.unpredictor.input_len();
-        if self.chunk.is_empty() {
-            self.chunk.resize(len.clamp(1, 8192), 0);
-        }
-        while self.input.len() < len {
-            let wanted = (len - self.input.len()).min(self.chunk.len());
-            match self.from.read(&mut self.chunk[..wanted], meter) {
-                Ok(0) => {
-                    let cut = self.unpredictor.finish_cut_row(&mut self.input);
-                    if cut {
-                        self.taken = 0;
-                    }
-                    return Ok(cut);
-                }
-                Ok(n) => {
-                    self.input.extend_from_slice(&self.chunk[..n]);
-                    self.unpredictor.advance(&mut self.input, POLL_BYTES);
-                }
-                Err(e) => {
-                    self.start_over();
-                    return Err(e);
-                }
-            }
-        }
-        self.unpredictor.finish_row(&mut self.input);
-        self.taken = 0;
-        Ok(true)
-    }
 }
 
 impl Stage for Predict<'_> {
@@ -807,13 +761,15 @@ impl Stage for Predict<'_> {
     fn read(&mut self, buf: &mut [u8], meter: &Meter<'_>) -> Result<usize, ReadError> {
         let mut n = 0;
         while n < buf.len() {
-            if self.taken == self.unpredictor.row().len() {
-                if !self.fill(meter)? {
+            if self.taken == self.unpredictor.ready().len() {
+                self.taken = 0;
+                let from = &mut self.from;
+                if !self.unpredictor.fill(|buf| from.read(buf, meter), meter)? {
                     break;
                 }
                 continue;
             }
-            let row = &self.unpredictor.row()[self.taken..];
+            let row = &self.unpredictor.ready()[self.taken..];
             let k = (buf.len() - n).min(row.len());
             meter.work(k)?;
             buf[n..n + k].copy_from_slice(&row[..k]);
@@ -825,7 +781,8 @@ impl Stage for Predict<'_> {
 
     fn rewind(&mut self) {
         self.from.rewind();
-        self.start_over();
+        self.unpredictor.reset();
+        self.taken = 0;
     }
 }
 
