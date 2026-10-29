@@ -1,12 +1,14 @@
 use super::{
-    DecodeContext, Rows, decode_context, into_owned, invert as invert_bytes, pixel_piece,
-    repeat_last_row, unpack_samples,
+    DecodeContext, Rows, complete, decode_context, into_owned, invert as invert_bytes, pixel_piece,
+    unpack_samples,
 };
 use crate::LumaData;
 use crate::color::ColorSpace;
 use crate::function::interpolate;
 use crate::x_object::image::{ImageKind, ImageXObject};
+use hayro_syntax::object::stream::FilterResult;
 use hayro_syntax::work::{Meter, POLL_BYTES};
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 pub(crate) static BILEVEL_MASK_LUT: LazyLock<Box<[u64; 256]>> = LazyLock::new(|| {
@@ -22,13 +24,14 @@ pub(crate) static BILEVEL_MASK_LUT: LazyLock<Box<[u64; 256]>> = LazyLock::new(||
 });
 
 pub(crate) struct DecodedMask {
-    /// The alpha: the rows its data holds, and those `rows` covers past them.
+    /// The alpha: the texels its data holds, and past them what `rows` says.
     luma: LumaData,
     rows: Rows,
 }
 
 impl DecodedMask {
-    /// `luma` covering `rows`; `None` unless it holds whole rows ([`Rows::hold`]).
+    /// `luma` covering `rows`; `None` unless it holds the texels of the rows it says
+    /// ([`Rows::hold`]).
     fn new(luma: LumaData, rows: Rows) -> Option<Self> {
         rows.hold(luma.data.len(), luma.width, luma.height, 1)
             .then_some(Self { luma, rows })
@@ -46,17 +49,15 @@ impl DecodedMask {
         (self.luma, self.rows)
     }
 
-    /// The alpha with every row it covers, the last it holds repeated: as large as
-    /// the mask intact.
+    /// The alpha with every texel of the rows it covers, those past the texels held
+    /// its fill: as large as the mask intact.
     pub(crate) fn into_whole(self) -> LumaData {
         let mut luma = self.luma;
-        repeat_last_row(
-            &mut luma.data,
-            luma.width as usize,
-            self.rows.declared,
-            &Meter::default(),
-        );
-        luma.height = self.rows.declared;
+        if let Some(fill) = self.rows.fill {
+            let texels = luma.width as usize * self.rows.declared as usize;
+            complete(&mut luma.data, texels, &fill[..1], &Meter::default());
+            luma.height = self.rows.declared;
+        }
         luma
     }
 }
@@ -69,7 +70,7 @@ pub(crate) fn decode_mask(
     meter: &Meter<'_>,
 ) -> Option<DecodedMask> {
     let ctx = decode_context(obj, target_dimension, meter)?;
-    let (width, rows) = (ctx.width, ctx.rows);
+    let width = ctx.width;
     let scale_factors = ctx.scale_factors;
 
     // Note: The semantics between "normal" soft masks (i.e. masks defined in
@@ -79,6 +80,34 @@ pub(crate) fn decode_mask(
     // fully opaque. For stencil masks, it's the other way around: 1 means the
     // paint is visible, while 0 means it's invisible.
     let invert = obj.kind == ImageKind::StencilMask;
+    // The alpha of a sample the data does not hold: a stored zero sample's.
+    let fill = match ctx.transparent {
+        true => None,
+        false => {
+            let n = ctx.color_space.num_components() as usize;
+            let bytes = (n * usize::from(ctx.bits_per_component)).div_ceil(8);
+            let one = DecodeContext {
+                decoded: FilterResult {
+                    data: Cow::Owned(vec![0; bytes]),
+                    image_data: None,
+                },
+                width: 1,
+                height: 1,
+                declared: 1,
+                transparent: false,
+                scale_factors,
+                color_space: ctx.color_space.clone(),
+                bits_per_component: ctx.bits_per_component,
+                decode_arr: ctx.decode_arr.clone(),
+            };
+            let (alpha, _) = decode_mask_data(one, invert, meter)?;
+            Some([*alpha.first()?, 0, 0])
+        }
+    };
+    let rows = Rows {
+        declared: ctx.declared,
+        fill,
+    };
     let (data, height) = decode_mask_data(ctx, invert, meter)?;
 
     DecodedMask::new(
@@ -264,8 +293,9 @@ fn decode_bilevel_mask_data(
 mod tests {
     use super::*;
 
-    /// A decoded mask holds a byte for each texel of the rows it says it holds: one of
-    /// no bytes claiming a row, or holding more rows than it covers, is never made.
+    /// A decoded mask holds a byte for each texel of the rows it says it holds, the
+    /// last held in part only where a fill stands for the texels past it: one of no
+    /// bytes claiming a row, or holding more rows than it covers, is never made.
     #[test]
     fn a_mask_holding_other_rows_than_it_claims_is_not_made() {
         let luma = |data: Vec<u8>, height| LumaData {
@@ -277,12 +307,20 @@ mod tests {
         };
         let rows = |declared| Rows {
             declared,
-            repeat: true,
+            fill: None,
         };
         assert!(DecodedMask::new(luma(vec![], 1), rows(1)).is_none());
         assert!(DecodedMask::new(luma(vec![0; 3], 2), rows(2)).is_none());
         assert!(DecodedMask::new(luma(vec![0; 4], 2), rows(1)).is_none());
         assert!(DecodedMask::new(luma(vec![], 0), rows(1)).is_none());
         assert!(DecodedMask::new(luma(vec![0; 2], 1), rows(5)).is_some());
+        let filled = |declared| Rows {
+            declared,
+            fill: Some([0; 3]),
+        };
+        assert!(DecodedMask::new(luma(vec![0; 3], 2), filled(2)).is_some());
+        assert!(DecodedMask::new(luma(vec![], 0), filled(1)).is_some());
+        assert!(DecodedMask::new(luma(vec![0; 3], 1), filled(2)).is_none());
+        assert!(DecodedMask::new(luma(vec![0; 3], 2), filled(1)).is_none());
     }
 }

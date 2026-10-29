@@ -15,9 +15,12 @@ pub(super) struct Decoded {
     same_grid: bool,
     /// Whether `image` is a stencil mask's alpha, drawn as a mask is.
     stencil: bool,
-    /// The rows `image`'s plane covers, and `alpha`'s, past the rows they hold.
+    /// The rows `image`'s plane covers, and `alpha`'s, and their texels past those
+    /// they hold: the colour's premultiplied, and with its alpha on the same grid.
     rows: Rows,
     alpha_rows: Rows,
+    /// The texel past those the colour holds, as its plane is pushed.
+    fill: Option<Vec<u8>>,
 }
 
 impl Decoded {
@@ -28,17 +31,21 @@ impl Decoded {
         let (w, h) = (image.width(), image.height());
         // Alpha on the colour's grid holds the colour's rows (`DecodedImage`).
         let same_grid = alpha.as_ref().is_some_and(|a| {
-            (a.width, a.height, alpha_rows) == (w, h, rows) && a.interpolate == image.interpolate()
+            (a.width, a.height, alpha_rows.declared) == (w, h, rows.declared)
+                && a.interpolate == image.interpolate()
         });
+        let c = image.channels();
+        let mut fill = rows.fill.map(|f| f[..c].to_vec());
         if same_grid && let Some(a) = &alpha {
-            let (data, c) = match &mut image {
-                ImageData::Rgb(d) => (&mut d.data, 3),
-                ImageData::Luma(d) => (&mut d.data, 1),
-            };
+            let (data, _, _) = image.rows_mut();
             let texels = PIECE_BYTES / c;
             for (data, a) in data.chunks_mut(texels * c).zip(a.data.chunks(texels)) {
                 premultiply(data, c, a);
                 meter.work(data.len())?;
+            }
+            if let (Some(colour), Some(alpha)) = (&mut fill, alpha_rows.fill) {
+                premultiply(colour, c, &alpha[..1]);
+                colour.push(alpha[0]);
             }
         }
         Ok(Self {
@@ -48,6 +55,7 @@ impl Decoded {
             stencil: false,
             rows,
             alpha_rows,
+            fill,
         })
     }
 
@@ -61,6 +69,7 @@ impl Decoded {
             alpha: None,
             same_grid: false,
             stencil: true,
+            fill: rows.fill.map(|f| vec![f[0]]),
         }
     }
 
@@ -104,45 +113,46 @@ impl Decoded {
     pub(super) fn run(&self, plane: Plane, area: &mut Area<'_>) -> Result<u32, Stop> {
         let (rows, cols) = (area.rows(), area.columns());
         let (c0, c1) = (cols.start as usize, cols.end as usize);
-        let (data, c, w, held, covers) = match (plane, &self.image) {
+        let (data, c, w, held, fill) = match (plane, &self.image) {
             (Plane::Mask, _) => {
                 let a = self.alpha.as_ref().ok_or(Stop::Failed)?;
-                (&a.data, 1, a.width as usize, a.height, self.alpha_rows)
+                let fill = self.alpha_rows.fill.map(|f| vec![f[0]]);
+                (&a.data, 1, a.width as usize, a.height, fill)
             }
             (Plane::Image, ImageData::Rgb(d)) => {
-                (&d.data, 3, d.width as usize, d.height, self.rows)
+                (&d.data, 3, d.width as usize, d.height, self.fill.clone())
             }
             (Plane::Image, ImageData::Luma(d)) => {
-                (&d.data, 1, d.width as usize, d.height, self.rows)
+                (&d.data, 1, d.width as usize, d.height, self.fill.clone())
             }
         };
         // Rows past those held that are transparent are not pushed.
-        let rows = if covers.repeat {
-            rows
-        } else {
-            let end = rows.end.min(held);
-            rows.start.min(end)..end
+        let rows = match fill {
+            Some(_) => rows,
+            None => {
+                let end = rows.end.min(held);
+                rows.start.min(end)..end
+            }
         };
         let alpha = (plane == Plane::Image && self.same_grid)
             .then_some(self.alpha.as_ref())
             .flatten();
+        let texels_held = data.len() / c;
         let piece = piece_texels(c1 - c0, c + 1);
         let mut texels_with_alpha = Vec::with_capacity(piece * (c + 1));
         for y in rows.clone() {
-            if y >= held {
-                // The rows past those held repeat the last, all stored zero: added at
-                // once, in time the bins bound.
-                let at = (held - 1) as usize * w;
-                let mut texel = data[at * c..(at + 1) * c].to_vec();
-                if let Some(a) = alpha {
-                    texel.push(a.data[at]);
-                }
-                area.push_rows(rows.end - y, &texel)?;
+            let at = y as usize * w;
+            if at >= texels_held {
+                // The texels past those held are the fill: their rows added at once,
+                // in time the bins bound.
+                let fill = fill.as_deref().ok_or(Stop::Failed)?;
+                area.push_rows(rows.end - y, fill)?;
                 break;
             }
-            let at = y as usize * w;
-            for col in (c0..c1).step_by(piece) {
-                let end = (col + piece).min(c1);
+            // Of a row held in part, the columns past those held are the fill.
+            let end_held = (texels_held - at).min(w);
+            for col in (c0..c1.min(end_held)).step_by(piece) {
+                let end = (col + piece).min(c1.min(end_held));
                 let texels = &data[(at + col) * c..(at + end) * c];
                 let texels = match alpha {
                     Some(a) => {
@@ -157,6 +167,10 @@ impl Decoded {
                     None => texels,
                 };
                 area.push_texels(col as u32, texels)?;
+            }
+            if end_held < c1 {
+                let fill = fill.as_deref().ok_or(Stop::Failed)?;
+                area.push_rest(end_held.max(c0) as u32, fill)?;
             }
             area.end_row()?;
         }

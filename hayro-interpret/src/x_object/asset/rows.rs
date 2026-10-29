@@ -409,11 +409,8 @@ impl MaskRows<'_> {
     pub(super) fn fill(&self) -> u8 {
         match self {
             MaskRows::Streamed { path, .. } => path.fill(),
-            // The rows past those held repeat the last, of stored zero.
-            MaskRows::Decoded { mask, .. } => {
-                let luma = mask.luma();
-                luma.data[(luma.height as usize - 1) * luma.width as usize]
-            }
+            // A mask's samples the data does not hold read as stored zero.
+            MaskRows::Decoded { mask, .. } => mask.rows().fill.map_or(0, |f| f[0]),
         }
     }
 
@@ -421,7 +418,7 @@ impl MaskRows<'_> {
     pub(super) fn fills_row(&self) -> bool {
         match self {
             MaskRows::Streamed { fill, .. } => *fill,
-            MaskRows::Decoded { mask, row } => *row >= mask.luma().height,
+            MaskRows::Decoded { mask, row } => decoded_past(mask, *row),
         }
     }
 
@@ -430,7 +427,7 @@ impl MaskRows<'_> {
     pub(super) fn fills_rest(&self) -> bool {
         match self {
             MaskRows::Streamed { raw, path, row, .. } => !reads_row(raw, path.bits(), *row),
-            MaskRows::Decoded { mask, row } => *row >= mask.luma().height,
+            MaskRows::Decoded { mask, row } => decoded_past(mask, *row),
         }
     }
 
@@ -459,13 +456,13 @@ impl MaskRows<'_> {
         match self {
             MaskRows::Decoded { mask, row } => {
                 let luma = mask.luma();
-                if *row >= luma.height {
-                    out.fill(self.fill());
-                    return Ok(false);
-                }
                 let at = *row as usize * luma.width as usize;
-                out.copy_from_slice(&luma.data[at + cols.start..at + cols.end]);
-                Ok(true)
+                // Of a row held in part, the columns past those held are the fill.
+                let held = luma.data.len().saturating_sub(at).min(luma.width as usize);
+                let end = cols.end.min(held).max(cols.start);
+                out[..end - cols.start].copy_from_slice(&luma.data[at + cols.start..at + end]);
+                out[end - cols.start..].fill(self.fill());
+                Ok(end == cols.end)
             }
             MaskRows::Streamed {
                 raw,
@@ -573,6 +570,11 @@ impl MaskRows<'_> {
         }
         Ok(())
     }
+}
+
+/// Whether row `y` and every row after it lie past the texels `mask` holds.
+fn decoded_past(mask: &DecodedMask, y: u32) -> bool {
+    y as usize * mask.luma().width as usize >= mask.luma().data.len()
 }
 
 /// Whether a row reader whose samples are of `bits` reads the bytes of row `y`: all

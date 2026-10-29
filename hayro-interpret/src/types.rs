@@ -304,6 +304,22 @@ impl ImageData {
             Self::Luma(d) => (&mut d.data, &mut d.height, 1),
         }
     }
+
+    /// Bytes per texel.
+    pub(crate) fn channels(&self) -> usize {
+        match self {
+            Self::Rgb(_) => 3,
+            Self::Luma(_) => 1,
+        }
+    }
+
+    /// The texels its data holds.
+    pub(crate) fn texels(&self) -> usize {
+        match self {
+            Self::Rgb(d) => d.data.len() / 3,
+            Self::Luma(d) => d.data.len(),
+        }
+    }
 }
 
 /// A type of paint.

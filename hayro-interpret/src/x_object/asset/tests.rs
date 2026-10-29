@@ -1075,6 +1075,53 @@ fn padding_missing_rows_is_cancelled_within_bounded_work() {
     assert_eq!(region.data[..2], [7, 0]);
 }
 
+/// Opening an image decoded whole whose rows are 2^30 samples wide and whose data holds
+/// a few bytes, and requesting a few bins of it, counts work of the bytes held, not
+/// of the width: samples of 16 bits, and of one bit in a filter only whole decoding
+/// reads (Flate under a predictor of 16-bit components), are not padded to a row.
+#[test]
+#[cfg(debug_assertions)]
+fn very_wide_images_decoded_whole_count_the_data() {
+    let w = 1 << 30;
+    let whole = "/Filter /FlateDecode /DecodeParms << /Predictor 2 /BitsPerComponent 16 >>";
+    for (dict, data) in [
+        (
+            "/ColorSpace /DeviceGray /BitsPerComponent 16".to_string(),
+            vec![1, 2],
+        ),
+        (
+            format!("/ColorSpace /DeviceGray /BitsPerComponent 1 {whole}"),
+            stored_zlib(&[0, 0], 100),
+        ),
+        (
+            format!("/ImageMask true {whole}"),
+            stored_zlib(&[0, 0], 100),
+        ),
+    ] {
+        let pdf = pdf(&[(image(&dict, w, 3), data)]);
+        let asset = asset(&pdf);
+        let polls = Cell::new(0);
+        let hook = || {
+            polls.set(polls.get() + 1);
+            polls.get() > 1
+        };
+        TOLD.set(0);
+        let opened = asset.open(None, Some(&hook));
+        let told = TOLD.get();
+        assert!(told < 3 * POLL_BYTES, "{dict}: {told} bytes of work");
+        let mut source = match opened {
+            Ok(source) => source,
+            Err(RequestError::Cancelled) => asset.open(None, None).unwrap(),
+            Err(e) => panic!("{dict}: {e:?}"),
+        };
+        assert!(!is_streamed(&source), "{dict}");
+        TOLD.set(0);
+        request(&mut source, Plane::Image, (100, 3), [0, 0, 100, 3]);
+        let told = TOLD.get();
+        assert!(told < 3 * POLL_BYTES, "{dict}: {told} bytes of work");
+    }
+}
+
 /// Rows of a mask decoded whole are skipped without work: a request of the last row of
 /// a mask twenty million rows high counts next to nothing.
 #[test]

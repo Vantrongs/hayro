@@ -1,7 +1,7 @@
 use super::mask::{DecodedMask, decode_mask};
 use super::{
-    DecodeContext, Rows, colour_key, decode_context, decode_u8_samples, in_pieces, into_owned,
-    pixel_piece, repeat_last_row, unpack_samples,
+    DecodeContext, Rows, Texel, colour_key, complete, decode_context, decode_u8_samples, in_pieces,
+    into_owned, pixel_piece, unpack_samples,
 };
 use crate::color::{ColorComponents, ColorSpace, ToLuma, ToRgb};
 use crate::interpret::state::ActiveTransferFunction;
@@ -9,8 +9,10 @@ use crate::x_object::image::ImageXObject;
 use crate::{ImageData, LumaData, RgbData};
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::*;
+use hayro_syntax::object::stream::FilterResult;
 use hayro_syntax::work::{Meter, POLL_BYTES};
 use smallvec::SmallVec;
+use std::borrow::Cow;
 
 /// Whether 8-bit samples are used as they are (`Some(false)`), inverted
 /// (`Some(true)`), or go through the decode array (`None`): the decode array maps them
@@ -46,17 +48,17 @@ pub(crate) fn direct_invert(
 }
 
 pub(crate) struct DecodedImage {
-    /// The colour: the rows its data holds, and those `rows` covers past them.
+    /// The colour: the texels its data holds, and past them what `rows` says.
     image: ImageData,
     rows: Rows,
-    /// Alpha on the grid the colour declares holds the colour's rows and covers
-    /// `rows`; a mask on another grid lies on the rows the colour declares.
+    /// Alpha on the grid the colour declares holds the colour's texels and covers
+    /// its rows; a mask on another grid lies on the rows the colour declares.
     alpha: Option<(LumaData, Rows)>,
 }
 
 impl DecodedImage {
-    /// `image` covering `rows`, with `alpha`; `None` unless each holds whole rows
-    /// ([`Rows::hold`]).
+    /// `image` covering `rows`, with `alpha`; `None` unless each holds the texels of
+    /// the rows it says ([`Rows::hold`]).
     fn new(image: ImageData, rows: Rows, alpha: Option<(LumaData, Rows)>) -> Option<Self> {
         let (len, channels) = match &image {
             ImageData::Rgb(d) => (d.data.len(), 3),
@@ -69,7 +71,7 @@ impl DecodedImage {
         holds.then_some(Self { image, rows, alpha })
     }
 
-    /// The rows the colour holds.
+    /// The rows the colour's texels lie in.
     pub(crate) fn height(&self) -> u32 {
         self.image.height()
     }
@@ -78,20 +80,26 @@ impl DecodedImage {
         (self.image, self.rows, self.alpha)
     }
 
-    /// The colour and alpha with every row they cover, the last row each holds
-    /// repeated: as large as the image intact.
+    /// The colour and alpha with every texel of the rows they cover, those past the
+    /// texels held each plane's fill: as large as the image intact.
     pub(crate) fn into_whole(self) -> (ImageData, Option<LumaData>) {
         let meter = Meter::default();
         let mut image = self.image;
         let width = image.width() as usize;
         let (data, height, channels) = image.rows_mut();
-        if self.rows.repeat {
-            repeat_last_row(data, width * channels, self.rows.declared, &meter);
+        if let Some(fill) = self.rows.fill {
+            complete(
+                data,
+                width * self.rows.declared as usize,
+                &fill[..channels],
+                &meter,
+            );
             *height = self.rows.declared;
         }
         let alpha = self.alpha.map(|(mut a, rows)| {
-            if rows.repeat {
-                repeat_last_row(&mut a.data, a.width as usize, rows.declared, &meter);
+            if let Some(fill) = rows.fill {
+                let texels = a.width as usize * rows.declared as usize;
+                complete(&mut a.data, texels, &fill[..1], &meter);
                 a.height = rows.declared;
             }
             a
@@ -141,8 +149,12 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
     }
 
     fn decode(mut self) -> Option<DecodedImage> {
+        let fill = self.fill()?;
         let mut image = self.decode_image()?;
-        let mut rows = self.ctx.rows;
+        let mut rows = Rows {
+            declared: self.ctx.declared,
+            fill: fill.map(|f| f.colour),
+        };
         let matte = self.resolve_matte();
         let on_grid = |(a, a_rows): &(LumaData, Rows)| {
             (a.width, a_rows.declared) == (self.ctx.width, rows.declared)
@@ -150,18 +162,74 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
         // A mask lies on the grid the colour declares.
         let (mut alpha, matte) = match matte {
             Some((alpha, matte_rgb)) if on_grid(&alpha) => (Some(alpha), Some(matte_rgb)),
-            _ => (self.decode_alpha(), None),
+            _ => {
+                let texels = image.texels();
+                (self.decode_alpha(texels, fill), None)
+            }
         };
         if let Some((a, a_rows)) = &mut alpha
             && (a.width, a_rows.declared) == (self.ctx.width, rows.declared)
         {
-            share_rows(&mut image, &mut rows, a, a_rows, self.meter)?;
+            share_rows(&mut image, &rows, a, a_rows, self.meter)?;
             if let Some(matte_rgb) = matte {
                 unpremultiply(&mut image, &a.data, &matte_rgb, self.meter)?;
+                if let (Some(colour), Some(alpha)) = (&mut rows.fill, a_rows.fill) {
+                    let channels = image.channels();
+                    unpremultiply_samples(
+                        &mut colour[..channels],
+                        channels,
+                        &alpha[..1],
+                        &matte_rgb,
+                    );
+                }
             }
         }
 
         DecodedImage::new(image, rows, alpha)
+    }
+
+    /// What the samples the data does not hold become, decoded as a stored zero sample
+    /// is: its colour, and its alpha under a colour key; `None` inside where they are
+    /// transparent instead.
+    fn fill(&self) -> Option<Option<Fill>> {
+        if self.ctx.transparent {
+            return Some(None);
+        }
+        let n = self.ctx.color_space.num_components() as usize;
+        let bytes = (n * usize::from(self.ctx.bits_per_component)).div_ceil(8);
+        let mut one = ImageDecoder {
+            obj: self.obj,
+            ctx: DecodeContext {
+                decoded: FilterResult {
+                    data: Cow::Owned(vec![0; bytes]),
+                    image_data: None,
+                },
+                width: 1,
+                height: 1,
+                declared: 1,
+                transparent: false,
+                scale_factors: self.ctx.scale_factors,
+                color_space: self.ctx.color_space.clone(),
+                bits_per_component: self.ctx.bits_per_component,
+                decode_arr: self.ctx.decode_arr.clone(),
+            },
+            target_dimension: None,
+            color_key_mask: self.color_key_mask.clone(),
+            decoded_color_key_mask: None,
+            meter: self.meter,
+        };
+        let key = match one.color_key_mask {
+            Some(_) => Some(one.decode_color_key_mask()?.data[0]),
+            None => None,
+        };
+        let image = one.decode_image()?;
+        let mut colour = [0; 3];
+        let data = match &image {
+            ImageData::Rgb(d) => &d.data,
+            ImageData::Luma(d) => &d.data,
+        };
+        colour[..data.len()].copy_from_slice(data);
+        Some(Some(Fill { colour, key }))
     }
 
     fn decode_image(&mut self) -> Option<ImageData> {
@@ -265,7 +333,7 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
                 color_space.convert_in_place(piece)
             })?;
         } else {
-            let mut output = vec![0; self.ctx.width as usize * self.ctx.height as usize * 3];
+            let mut output = vec![0; decoded.len() / n * 3];
             for (input, output) in decoded
                 .chunks(pixels * n)
                 .zip(output.chunks_mut(pixels * 3))
@@ -295,10 +363,16 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
         Some(())
     }
 
-    fn decode_alpha(&mut self) -> Option<(LumaData, Rows)> {
+    /// The alpha of the colour, which holds `texels`, whose samples the data does not
+    /// hold become `fill`.
+    fn decode_alpha(&mut self, texels: usize, fill: Option<Fill>) -> Option<(LumaData, Rows)> {
         // If the alpha channel is invalid, return no alpha so the main image can
         // still be returned (see PDFJS-19611).
         let dict = self.obj.stream.dict();
+        let rows = |alpha: Option<u8>| Rows {
+            declared: self.ctx.declared,
+            fill: fill.map(|_| [alpha.unwrap_or(0), 0, 0]),
+        };
 
         if let Some(1) = dict.get::<u8>(SMASK_IN_DATA) {
             let mut data = self
@@ -307,7 +381,7 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
                 .image_data
                 .as_mut()
                 .and_then(|image| image.alpha.take())?;
-            data.resize(self.ctx.width as usize * self.ctx.height as usize, 0);
+            data.resize(texels, 0);
 
             Some((
                 LumaData {
@@ -317,7 +391,7 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
                     interpolate: self.obj.interpolate,
                     scale_factors: self.ctx.scale_factors,
                 },
-                self.ctx.rows,
+                rows(None),
             ))
             // Note: `SMASK` field takes precedence over `MASK`, so order matters here.
         } else if let Some(s_mask) = dict
@@ -331,7 +405,7 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
             let mask = self.decoded_color_key_mask.take();
             Some((
                 mask.or_else(|| self.decode_color_key_mask())?,
-                self.ctx.rows,
+                rows(fill.and_then(|f| f.key)),
             ))
         } else {
             None
@@ -368,7 +442,7 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
             self.ctx.bits_per_component,
             self.meter,
         )?;
-        let mut data = Vec::with_capacity(self.ctx.width as usize * self.ctx.height as usize);
+        let mut data = Vec::with_capacity(components.len() / num_components);
 
         for piece in components.chunks(pixel_piece(num_components) * num_components) {
             for pixel in piece.chunks_exact(num_components) {
@@ -395,29 +469,42 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
     }
 }
 
-/// The colour and alpha on its grid made to hold the same rows, which both then
-/// cover: the alpha's rows past the colour's dropped where those are transparent, and
-/// otherwise the plane holding fewer rows given the other's by repeating its last.
+/// What the samples the data does not hold become (`ImageDecoder::fill`).
+#[derive(Clone, Copy)]
+struct Fill {
+    colour: Texel,
+    /// The alpha a colour key gives them.
+    key: Option<u8>,
+}
+
+/// The colour and alpha on its grid made to hold the same texels: the alpha's past
+/// the colour's dropped where those are transparent, and otherwise the plane holding
+/// fewer completed with its fill up to the other's. Past them, the alpha is
+/// transparent where the colour is.
 fn share_rows(
     image: &mut ImageData,
-    rows: &mut Rows,
+    rows: &Rows,
     alpha: &mut LumaData,
     alpha_rows: &mut Rows,
     meter: &Meter<'_>,
 ) -> Option<()> {
+    let width = alpha.width as usize;
     let (data, height, channels) = image.rows_mut();
-    let held = if rows.repeat {
-        (*height).max(alpha.height)
-    } else {
-        *height
+    let held = data.len() / channels;
+    let texels = match rows.fill {
+        Some(fill) => {
+            let texels = held.max(alpha.data.len());
+            complete(data, texels, &fill[..channels], meter)?;
+            texels
+        }
+        None => held,
     };
-    let row_len = alpha.width as usize * channels;
-    repeat_last_row(data, row_len, held, meter)?;
-    *height = held;
-    alpha.data.truncate(alpha.width as usize * held as usize);
-    repeat_last_row(&mut alpha.data, alpha.width as usize, held, meter)?;
-    alpha.height = held;
-    *alpha_rows = *rows;
+    *height = texels.div_ceil(width) as u32;
+    alpha.data.truncate(texels);
+    let alpha_fill = alpha_rows.fill.unwrap_or_default();
+    complete(&mut alpha.data, texels, &alpha_fill[..1], meter)?;
+    alpha.height = *height;
+    alpha_rows.fill = rows.fill.map(|_| alpha_fill);
     Some(())
 }
 

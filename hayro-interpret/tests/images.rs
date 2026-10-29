@@ -89,6 +89,19 @@ const HUGE: &str = "/Width 100000 /Height 100000";
 /// (object 5), `extra` being object 6 (a mask, say), asserting that opening and
 /// requesting it stayed under 64 MiB.
 fn huge_region(dict: &str, data: &[u8], extra: Option<(&str, &[u8])>, plane: Plane) -> Vec<u8> {
+    region_of(dict, data, extra, plane, |_, _| {
+        ((100, 100), [0, 0, 100, 100])
+    })
+}
+
+/// [`huge_region`], of the bins `bins` gives.
+fn region_of(
+    dict: &str,
+    data: &[u8],
+    extra: Option<(&str, &[u8])>,
+    plane: Plane,
+    bins: Bins,
+) -> Vec<u8> {
     let mut objects = vec![image(dict, data)];
     objects.extend(extra.map(|(dict, data)| image(dict, data)));
     let pdf = page(
@@ -96,7 +109,7 @@ fn huge_region(dict: &str, data: &[u8], extra: Option<(&str, &[u8])>, plane: Pla
         "/XObject << /Im 5 0 R >>",
         objects,
     );
-    let mut requested = Requested::new(plane, |_, _| ((100, 100), [0, 0, 100, 100]));
+    let mut requested = Requested::new(plane, bins);
     common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
     let [(peak, data)] = requested.regions.try_into().expect("one image");
     assert!(peak < 64 << 20, "{dict}: peak {peak} bytes");
@@ -137,8 +150,8 @@ fn huge_soft_masks_with_one_byte_cost_little() {
     }
 }
 
-/// Images decoded whole hold the rows their data holds and one of stored zero, which
-/// the rows past it repeat: 16-bit samples, a filter that is not streamed, and a soft
+/// Images decoded whole hold the samples their data holds and one texel of stored zero
+/// for the rest: 16-bit samples, a filter that is not streamed, and a soft
 /// mask through one.
 #[test]
 fn huge_images_decoded_whole_with_little_data_cost_little() {
@@ -162,6 +175,58 @@ fn huge_images_decoded_whole_with_little_data_cost_little() {
     let mask = gray(8, "/Filter /ASCIIHexDecode");
     let region = huge_region(image, &[255, 0, 0], Some((&mask, b"ff>")), Plane::Mask);
     assert_eq!(region, vec![0; 100 * 100]);
+}
+
+/// Rows 2^30 samples wide of which the data holds a few bytes cost those bytes, not
+/// the width, whether decoded whole or streamed: 16-bit and 8-bit CMYK samples, which
+/// are decoded whole, and one-bit samples, a stencil and a soft mask in a filter only
+/// whole decoding reads (Flate under a predictor of 16-bit components) or in one read
+/// as it is streamed. Every bin of 100 × 3 is the fill, stored zero's colour.
+#[test]
+fn very_wide_images_with_little_data_cost_little() {
+    let bins: Bins = |_, h| ((100, h), [0, 0, 100, h]);
+    let wide = "/Width 1073741824 /Height 3";
+    let whole = "/Filter /FlateDecode /DecodeParms << /Predictor 2 /BitsPerComponent 16 >>";
+    let gray = |bits: u8, extra: &str| {
+        format!("{wide} /ColorSpace /DeviceGray /BitsPerComponent {bits} {extra}")
+    };
+    let flate = common::stored_zlib(&[0, 0], 100);
+    for (dict, data, fill) in [
+        (gray(16, "/Decode [1 0]"), &b"\0\0"[..], vec![255; 100 * 3]),
+        (
+            format!("{wide} /ColorSpace /DeviceCMYK /BitsPerComponent 8"),
+            &[0; 5][..],
+            vec![255; 3 * 100 * 3],
+        ),
+        (
+            gray(1, &format!("{whole} /Decode [1 0]")),
+            &flate,
+            vec![255; 100 * 3],
+        ),
+        (
+            gray(1, "/Filter /ASCIIHexDecode /Decode [1 0]"),
+            b"00>",
+            vec![255; 100 * 3],
+        ),
+        (
+            format!("{wide} /ImageMask true {whole}"),
+            &flate,
+            vec![255; 100 * 3],
+        ),
+    ] {
+        let region = region_of(&dict, data, None, Plane::Image, bins);
+        assert!(region == fill, "{dict}");
+    }
+    let image = "/Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R";
+    for mask in [gray(1, whole), gray(1, "/Filter /ASCIIHexDecode")] {
+        let data = if mask.contains("Flate") {
+            &flate[..]
+        } else {
+            b"ff>"
+        };
+        let region = region_of(image, &[255, 0, 0], Some((&mask, data)), Plane::Mask, bins);
+        assert!(region == vec![0; 100 * 3], "{mask}");
+    }
 }
 
 /// Whatever one byte decodes to, it is at most a few rows; the rest are black.

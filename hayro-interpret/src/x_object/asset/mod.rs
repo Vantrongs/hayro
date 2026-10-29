@@ -133,8 +133,8 @@ impl ImageAsset {
     /// masks, read in bands of eight rows; once its data fails to decode, it is decoded
     /// whole like other images. Other images are decoded whole here (with `hint`, the
     /// size they are wanted at, for decoders that can reduce), and requests read the
-    /// decoded planes, which the source holds until it is dropped: the rows their data
-    /// holds and one of stored zero, which the rows past it repeat. `cancel` is polled as
+    /// decoded planes, which the source holds until it is dropped: the samples their
+    /// data holds, and one texel of stored zero for the rest. `cancel` is polled as
     /// [`ImageRequest::cancel`] is; a cancelled open leaves the asset as it was, to be
     /// opened again.
     pub fn open(

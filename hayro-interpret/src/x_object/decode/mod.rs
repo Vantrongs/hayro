@@ -21,60 +21,74 @@ use smallvec::SmallVec;
 use std::borrow::Cow;
 
 struct DecodeContext<'a> {
-    /// The stored samples, as many as the rows `height` hold ([`fit_rows`]).
+    /// The stored samples held ([`fit_rows`]).
     decoded: FilterResult<'a>,
     width: u32,
-    /// The rows of samples decoded ([`fit_rows`]).
+    /// The rows the samples held lie in, the last perhaps in part ([`fit_rows`]).
     height: u32,
-    /// The rows the plane covers past those decoded.
-    rows: Rows,
+    /// The rows the image declares.
+    declared: u32,
+    /// Whether the samples the data does not hold are transparent, not stored zero
+    /// ([`short_rows_transparent`]).
+    transparent: bool,
     scale_factors: (f32, f32),
     color_space: ColorSpace,
     bits_per_component: u8,
     decode_arr: SmallVec<[(f32, f32); 4]>,
 }
 
-/// The rows a decoded plane covers: those its image declares (or its filter reports).
-/// Past the rows the plane holds, its last row repeats, or they are transparent.
+/// The rows a decoded plane covers, those its image declares (or its filter
+/// reports), and what lies past the texels it holds, which are the first of them in
+/// row order: the texel of a sample the data does not hold, or nothing where those
+/// are transparent (the plane then holds whole rows). So a plane costs the data it
+/// holds, not the size the image declares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Rows {
     pub(crate) declared: u32,
-    /// Whether the plane's last row repeats past the rows it holds.
-    pub(crate) repeat: bool,
+    /// The texel past those held, its first bytes as many as the plane's channels.
+    pub(crate) fill: Option<Texel>,
 }
+
+/// A texel of up to three bytes: luma or alpha in its first, RGB in all three.
+pub(crate) type Texel = [u8; 3];
 
 impl Rows {
     /// Whether a plane of `len` bytes, of rows `width` texels of `channels` bytes wide,
-    /// holds `height` whole rows, at least one and at most those it covers: as every
-    /// reader of a decoded plane takes it to.
+    /// holds the texels of `height` rows, at most those it covers, all of the last one
+    /// too where the texels past those held are transparent: as every reader of a
+    /// decoded plane takes it to.
     fn hold(self, len: usize, width: u32, height: u32, channels: usize) -> bool {
-        let whole = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|texels| texels.checked_mul(channels));
-        width > 0 && height > 0 && height <= self.declared && whole == Some(len)
+        let Some(row) = (width as usize).checked_mul(channels) else {
+            return false;
+        };
+        let fits = width > 0 && channels > 0 && height <= self.declared;
+        fits && len.is_multiple_of(channels)
+            && match self.fill {
+                Some(_) => len.div_ceil(row) == height as usize,
+                None => height > 0 && Some(len) == row.checked_mul(height as usize),
+            }
     }
 }
 
-/// `data`, rows of `row_len` bytes, with its last row repeated up to `rows`, a piece
-/// at a time; `None` once the meter's hook asks to stop.
-pub(crate) fn repeat_last_row(
+/// `data`, texels of `texel.len()` bytes, completed with `texel` up to `texels` of
+/// them, a counted piece at a time; `None` once the meter's hook asks to stop.
+pub(crate) fn complete(
     data: &mut Vec<u8>,
-    row_len: usize,
-    rows: u32,
+    texels: usize,
+    texel: &[u8],
     meter: &Meter<'_>,
 ) -> Option<()> {
-    let want = row_len * rows as usize;
-    if row_len == 0 || data.len() >= want {
+    let want = texels * texel.len();
+    if data.len() >= want {
         return Some(());
     }
-    let last = data.len() - row_len;
     data.reserve_exact(want - data.len());
-    let rows_per_piece = (POLL_BYTES / row_len).max(1);
     while data.len() < want {
-        for _ in 0..rows_per_piece.min((want - data.len()) / row_len) {
-            data.extend_from_within(last..last + row_len);
+        let n = (want - data.len()).min(POLL_BYTES / texel.len() * texel.len());
+        for _ in 0..n / texel.len() {
+            data.extend_from_slice(texel);
         }
-        meter.work(rows_per_piece * row_len).ok()?;
+        meter.work(n).ok()?;
     }
     Some(())
 }
@@ -253,20 +267,24 @@ fn decode_context<'a>(
     let components = color_space.num_components() as usize;
     let rows = SampleRows::new(width, components, bits_per_component, height);
     let transparent = short_rows_transparent(obj, components);
-    let (data, kept) = fit_rows(core::mem::take(&mut decoded.data), rows, transparent, meter)?;
+    let (data, held) = fit_rows(
+        core::mem::take(&mut decoded.data),
+        rows,
+        components,
+        transparent,
+    );
     decoded.data = data;
-    if width == 0 || kept == 0 {
+    // Data that holds no whole row of an image whose short rows are transparent fails.
+    if width == 0 || components == 0 || transparent && held == 0 {
         return None;
     }
 
     Some(DecodeContext {
         decoded,
         width,
-        height: kept,
-        rows: Rows {
-            declared: height,
-            repeat: !transparent,
-        },
+        height: held,
+        declared: height,
+        transparent,
         scale_factors: (scale_x, scale_y),
         color_space,
         bits_per_component,
@@ -274,25 +292,24 @@ fn decode_context<'a>(
     })
 }
 
-/// `data`, the stored samples of an image lying in `rows`, as decoding reads them,
-/// and the rows drawn, as `MuPDF` reads data that ends early (observed through `PyMuPDF`
-/// 1.28.2): the image keeps its declared rows, and a sample the data does not hold
-/// reads as stored zero, which then maps as a stored one does (black gray or RGB,
-/// white CMYK, a palette's first entry, white under an inverted decode array, a
-/// stencil mask painted). Of 8-bit samples, every byte held counts; of samples of
+/// `data`, the stored samples of an image of `components` lying in `rows`, as
+/// decoding reads them, and the rows they lie in, as `MuPDF` reads data that ends
+/// early (observed through `PyMuPDF` 1.28.2): the image keeps its declared rows, and a
+/// sample the data does not hold reads as stored zero, which then maps as a stored
+/// one does (black gray or RGB, white CMYK, a palette's first entry, white under an
+/// inverted decode array, a stencil mask painted). Of 8-bit samples, every byte held
+/// counts, a texel the data ends within holding stored zero past it; of samples of
 /// other depths, only whole rows do, a row the data ends within reading as zero.
-/// The rows held are kept, and after them one row of stored zero, which the rows past
-/// it repeat ([`Rows`]): data of a few bytes declaring a huge image costs little.
+/// Only the samples held are kept: the texel stored zero makes stands for the rest
+/// ([`Rows::fill`]), so data of a few bytes declaring a huge image costs little.
 /// Where short rows are `transparent`, only whole rows count at every depth and the
-/// rows past them are transparent. Data past the declared rows is dropped. `None`
-/// once the meter's hook asks to stop.
-fn fit_rows<'a>(
-    data: Cow<'a, [u8]>,
+/// rows past them are transparent. Data past the declared rows is dropped.
+fn fit_rows(
+    data: Cow<'_, [u8]>,
     rows: SampleRows,
+    components: usize,
     transparent: bool,
-    meter: &Meter<'_>,
-) -> Option<(Cow<'a, [u8]>, u32)> {
-    let row_bytes = rows.row_bytes();
+) -> (Cow<'_, [u8]>, u32) {
     let held = rows.bytes_held(data.len(), transparent);
     let mut data = match data {
         Cow::Borrowed(d) => Cow::Borrowed(&d[..held]),
@@ -301,20 +318,15 @@ fn fit_rows<'a>(
             Cow::Owned(d)
         }
     };
-    if transparent {
-        return Some((data, (held / row_bytes) as u32));
+    // 8-bit samples of a texel the data ends within; rows of them hold whole texels.
+    let len = match rows.byte_granular() {
+        true => held.div_ceil(components.max(1)) * components,
+        false => held,
+    };
+    if len > held {
+        data.to_mut().resize(len, 0);
     }
-    let kept = held
-        .div_ceil(row_bytes)
-        .saturating_add(1)
-        .min(rows.height as usize);
-    let padded_len = kept * row_bytes;
-    if held < padded_len {
-        let padded = data.to_mut();
-        padded.resize(padded_len, 0);
-        meter.work(padded_len - held).ok()?;
-    }
-    Some((data, kept as u32))
+    (data, len.div_ceil(rows.row_bytes()) as u32)
 }
 
 /// Whether the rows of `obj`'s colour that its data does not hold are transparent,
