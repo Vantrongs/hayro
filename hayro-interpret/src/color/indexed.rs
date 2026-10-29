@@ -1,5 +1,5 @@
 use super::{ColorSpace, ToLuma, ToRgb, U8Lookup};
-use crate::cache::Cache;
+use crate::cache::Building;
 use hayro_syntax::object::{self, Array, Name, Object, Stream};
 use std::borrow::Cow;
 
@@ -13,11 +13,11 @@ pub(crate) struct Indexed {
 }
 
 impl Indexed {
-    pub(super) fn new(array: &Array<'_>, cache: &Cache) -> Option<Self> {
+    pub(super) fn new(array: &Array<'_>, cache: &Building<'_>) -> Option<Self> {
         let mut iter = array.flex_iter();
         // Skip name
         let _ = iter.next::<Name<'_>>()?;
-        let base_color_space = ColorSpace::new(iter.next::<Object<'_>>()?, cache)?;
+        let base_color_space = ColorSpace::build(iter.next::<Object<'_>>()?, cache)?;
         let hival = iter.next::<u32>()?.min(u8::MAX as u32) as u8;
 
         let values = {

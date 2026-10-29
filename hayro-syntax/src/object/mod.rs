@@ -253,6 +253,17 @@ impl Display for Object<'_> {
 }
 
 impl<'a> Object<'a> {
+    /// The object read as where a resolution of references starts
+    /// ([`Dict::as_root`]).
+    pub fn as_root(&self) -> Self {
+        match self {
+            Self::Dict(dict) => Self::Dict(dict.as_root()),
+            Self::Array(array) => Self::Array(array.as_root()),
+            Self::Stream(stream) => Self::Stream(stream.as_root()),
+            other => other.clone(),
+        }
+    }
+
     /// Try casting the object to a specific subtype.
     pub(crate) fn cast<T>(self) -> Option<T>
     where

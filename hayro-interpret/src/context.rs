@@ -33,7 +33,7 @@ pub(crate) const MAX_NESTED_INTERPRETATION_DEPTH: u32 = 50;
 /// multiple interpreter invocations on the same document.
 #[derive(Clone)]
 pub struct InterpreterCache<'a> {
-    pub(crate) font_cache: Rc<RefCell<hash::Map<u128, Option<Font<'a>>>>>,
+    pub(crate) font_cache: FontCache<'a>,
     pub(crate) object_cache: Cache,
     /// The form fields read for the annotations of the document's pages.
     pub(crate) annotation_fields: crate::interpret::annotation::Fields<'a>,
@@ -49,10 +49,34 @@ impl<'a> InterpreterCache<'a> {
     /// Create a new interpreter cache.
     pub fn new() -> Self {
         Self {
-            font_cache: Rc::new(RefCell::new(hash::Map::default())),
+            font_cache: FontCache::default(),
             object_cache: Cache::new(),
             annotation_fields: crate::interpret::annotation::Fields::default(),
         }
+    }
+}
+
+/// The fonts interpreting a document keeps for all its pages, each built from its
+/// dictionary alone, read as where a resolution starts, as [`Cache::rooted`] builds a
+/// value: so that a font is the same whichever page, and whichever chain of
+/// references, read it first.
+#[derive(Clone, Default)]
+pub(crate) struct FontCache<'a>(Rc<RefCell<hash::Map<u128, Option<Font<'a>>>>>);
+
+impl<'a> FontCache<'a> {
+    /// The font `dict` is, kept for it.
+    fn get(&self, dict: &Dict<'a>, settings: &InterpreterSettings) -> Option<Font<'a>> {
+        self.0
+            .borrow_mut()
+            .entry(dict.cache_key())
+            .or_insert_with(|| {
+                Font::new(
+                    &dict.as_root(),
+                    &settings.font_resolver,
+                    &settings.cmap_resolver,
+                )
+            })
+            .clone()
     }
 }
 
@@ -414,11 +438,7 @@ impl<'a> Context<'a> {
         name: &Name<'_>,
     ) -> Option<ColorSpace> {
         let cs_object = resources.get_color_space(name)?;
-        self.interpreter_cache
-            .object_cache
-            .get_or_insert_with(cs_object.cache_key(), || {
-                ColorSpace::new(cs_object.clone(), &self.interpreter_cache.object_cache)
-            })
+        ColorSpace::new(cs_object, &self.interpreter_cache.object_cache)
     }
 
     pub(crate) fn num_states(&self) -> usize {
@@ -445,30 +465,10 @@ impl<'a> Context<'a> {
         self.nesting_depth = self.nesting_depth.saturating_sub(1);
     }
     pub(crate) fn resolve_font(&mut self, font_dict: &Dict<'a>) -> Option<TextStateFont<'a>> {
-        let cache_key = font_dict.cache_key();
-
-        let resolved = {
-            let mut font_cache = self.interpreter_cache.font_cache.borrow_mut();
-            font_cache
-                .entry(cache_key)
-                .or_insert_with(|| {
-                    // Kept for every page, the font is made from its dictionary read as
-                    // the object it is, not through the references this page reached
-                    // it by: what the font looks up later (a Type 3 font's resources)
-                    // would be refused where it leads back to one of them, for every
-                    // page drawn after this one, which drawn alone reads it.
-                    let rooted = font_dict
-                        .obj_id()
-                        .and_then(|id| self.xref.get::<Dict<'a>>(id))
-                        .filter(|read| core::ptr::eq(read.data(), font_dict.data()));
-                    Font::new(
-                        rooted.as_ref().unwrap_or(font_dict),
-                        &self.settings.font_resolver,
-                        &self.settings.cmap_resolver,
-                    )
-                })
-                .clone()
-        };
+        let resolved = self
+            .interpreter_cache
+            .font_cache
+            .get(font_dict, &self.settings);
 
         if let Some(resolved) = resolved {
             Some(TextStateFont::Font(resolved))

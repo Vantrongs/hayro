@@ -1,12 +1,19 @@
 use crate::util::hash128;
+use core::hash::Hash;
 use hayro_syntax::hash;
 use hayro_syntax::object::{Array, Dict, Name, Null, Object, Stream};
 use kurbo::{Affine, Rect};
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex};
 
 type CacheMap = hash::Map<u128, Option<Box<dyn Any + Send + Sync>>>;
+
+/// The values interpreting a document keeps for all its pages, so that each is the
+/// same whichever page, and whichever chain of references, read it first: a value
+/// read from objects is built from the object it is kept for alone, read as where a
+/// resolution starts ([`Self::rooted`]), and what its build keeps besides is made
+/// from bytes alone ([`Building::of_bytes`]).
 #[derive(Clone)]
 pub(crate) struct Cache(Arc<Mutex<CacheMap>>);
 
@@ -21,11 +28,30 @@ impl Cache {
         Self(Arc::new(Mutex::new(hash::Map::default())))
     }
 
-    pub(crate) fn get_or_insert_with<T: Clone + Send + Sync + 'static>(
+    /// The value `build` makes of `object`, kept for it: `build` is given the object
+    /// read as where a resolution starts ([`Root::as_root`]) and nothing else read,
+    /// so the value is what the object, which its key names, holds, not what the
+    /// chain of references the first caller reached it by lets a resolution read
+    /// (a reference back into that chain is refused as a cycle). Nor may `build`
+    /// keep a value of its own in the cache that depends on how it was reached: it
+    /// sees the cache as [`Building`].
+    pub(crate) fn rooted<O: Root, T: Clone + Send + Sync + 'static>(
         &self,
-        id: u128,
+        object: &O,
+        build: fn(O, &Building<'_>) -> Option<T>,
+    ) -> Option<T> {
+        self.get_or_insert_with::<T>(object.cache_key(), || {
+            build(object.as_root(), &Building(self))
+        })
+    }
+
+    fn get_or_insert_with<T: Clone + Send + Sync + 'static>(
+        &self,
+        key: u128,
         f: impl FnOnce() -> Option<T>,
     ) -> Option<T> {
+        // Values of different types made of one object are kept apart.
+        let id = hash128(&(TypeId::of::<T>(), key));
         let mut locked = self.0.lock().unwrap();
 
         // We can't use `get_or_insert_with` here, because if the closure makes another access to the
@@ -47,6 +73,36 @@ impl Cache {
                 val
             }
         }
+    }
+}
+
+/// The cache as a value built for it ([`Cache::rooted`]) sees it: it keeps what is
+/// made of bytes alone, which no reference resolved while building decides.
+pub(crate) struct Building<'c>(&'c Cache);
+
+impl Building<'_> {
+    /// The value `build` makes of `bytes` and `with`, kept for them: `build` is given
+    /// them alone.
+    pub(crate) fn of_bytes<W: Hash + Copy, T: Clone + Send + Sync + 'static>(
+        &self,
+        bytes: &[u8],
+        with: W,
+        build: fn(&[u8], W) -> Option<T>,
+    ) -> Option<T> {
+        self.0
+            .get_or_insert_with::<T>(hash128(&(bytes, with)), || build(bytes, with))
+    }
+}
+
+/// An object a value is kept for by [`Cache::rooted`].
+pub(crate) trait Root: CacheKey {
+    /// The object read as where a resolution starts ([`Dict::as_root`]).
+    fn as_root(&self) -> Self;
+}
+
+impl Root for Object<'_> {
+    fn as_root(&self) -> Self {
+        Object::as_root(self)
     }
 }
 

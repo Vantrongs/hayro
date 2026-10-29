@@ -175,6 +175,18 @@ impl<'a> Array<'a> {
         ContentKey::new(self.data(), self.ctx())
     }
 
+    /// The array read as where a resolution of references starts
+    /// ([`Dict::as_root`](crate::object::Dict::as_root)).
+    pub fn as_root(&self) -> Self {
+        Self(match &self.0 {
+            Repr::Bytes { data, ctx } => Repr::Bytes {
+                data,
+                ctx: ctx.as_root(),
+            },
+            Repr::Parsed(part) => Repr::Parsed(part.as_root()),
+        })
+    }
+
     /// The context the array's items are read in.
     pub(crate) fn ctx(&self) -> &ReaderContext<'a> {
         match &self.0 {

@@ -215,6 +215,24 @@ impl<'a> Dict<'a> {
         ContentKey::new(self.data(), self.ctx())
     }
 
+    /// The dictionary read as where a resolution of references starts, none of the
+    /// references it was reached by being resolved: what it leads to is read alike
+    /// whichever chain of references reached it, as the bytes it is read from,
+    /// which its [`Self::content_key`] names, decide alone. A reference within
+    /// what it leads to back to what is being resolved is still refused as a cycle,
+    /// as from any chain.
+    pub fn as_root(&self) -> Self {
+        Self(match &self.0 {
+            Inner::Read(None) => Inner::Read(None),
+            Inner::Read(Some(repr)) => Inner::Read(Some(Arc::new(Repr {
+                data: repr.data,
+                offsets: repr.offsets.clone(),
+                ctx: repr.ctx.as_root(),
+            }))),
+            Inner::Parsed(part) => Inner::Parsed(part.as_root()),
+        })
+    }
+
     /// The dictionary `part` reads.
     pub(crate) fn parsed(part: Part<'a>) -> Self {
         Self(Inner::Parsed(part))

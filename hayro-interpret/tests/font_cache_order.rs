@@ -100,3 +100,87 @@ fn a_type3_font_draws_with_its_resources_whatever_page_came_before() {
     assert_eq!(fills(&pdf, &[0, 1]), [red.clone(), red.clone()]);
     assert_eq!(fills(&pdf, &[1, 0]), [red.clone(), red]);
 }
+
+/// The fills of each page of the two of `file` drawn alone, which drawing both with
+/// one cache, in either order, draws too.
+fn assert_drawn_as_alone(file: Vec<u8>) -> Vec<Vec<[u8; 4]>> {
+    let pdf = Pdf::new(file).expect("valid pdf");
+    let alone = [fills(&pdf, &[0]).remove(0), fills(&pdf, &[1]).remove(0)];
+    assert_eq!(fills(&pdf, &[0, 1]), alone, "the first page drawn first");
+    let mut reversed = fills(&pdf, &[1, 0]);
+    reversed.reverse();
+    assert_eq!(reversed, alone, "the second page drawn first");
+    alone.to_vec()
+}
+
+/// A Type 3 font given in place in each page's resources, the same bytes in both,
+/// whose own resources are the first page's: drawn after the first page, the second
+/// page's glyph took its resources from the second page, as the first page's chain
+/// of references, which held the first page's resources, refused them for the font
+/// kept for both.
+#[test]
+fn a_font_given_in_place_draws_with_its_resources_whatever_page_came_before() {
+    let page = |resources: u32| {
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources {resources} 0 R \
+             /Contents 7 0 R >>"
+        )
+        .into_bytes()
+    };
+    let font = "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 100 100] \
+                /FontMatrix [0.01 0 0 0.01 0 0] /CharProcs << /a 8 0 R >> \
+                /Encoding << /Type /Encoding /Differences [97 /a] >> /FirstChar 97 \
+                /LastChar 97 /Widths [100] /Resources 5 0 R >>";
+    let resources = |lookup: &str| {
+        format!(
+            "<< /Font << /F1 {font} >> /ColorSpace << /CS0 [/Indexed /DeviceRGB 0 <{lookup}>] >> >>"
+        )
+        .into_bytes()
+    };
+    let drawn = assert_drawn_as_alone(common::file(
+        &[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+            page(5),
+            page(6),
+            resources("FF0000"),
+            resources("0000FF"),
+            common::stream("", b"BT /F1 100 Tf 0 0 Td (a) Tj ET"),
+            common::stream("", b"100 0 d0 /CS0 cs 0 sc 0 0 100 100 re f"),
+        ],
+        "",
+    ));
+    let red = vec![[255, 0, 0, 255]];
+    assert_eq!(drawn, [red.clone(), red]);
+}
+
+/// A colour space whose parameters are the first page's resources dictionary: drawn
+/// first, the first page, whose chain of references held that dictionary, refused
+/// it, and the colour space kept for both pages was none, so the second page fell
+/// back to grey as well, which drawn alone reads its `CalGray`.
+#[test]
+fn a_colour_space_is_read_alike_whatever_page_came_before() {
+    let page = |resources: u32| {
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources {resources} 0 R \
+             /Contents 8 0 R >>"
+        )
+        .into_bytes()
+    };
+    let drawn = assert_drawn_as_alone(common::file(
+        &[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+            page(5),
+            page(6),
+            b"<< /Gamma 2 /WhitePoint [1 1 1] /ColorSpace << /CS0 7 0 R >> >>".to_vec(),
+            b"<< /ColorSpace << /CS0 7 0 R >> >>".to_vec(),
+            b"[/CalGray 5 0 R]".to_vec(),
+            common::stream("", b"/CS0 cs 0.5 sc 0 0 100 100 re f"),
+        ],
+        "",
+    ));
+    // Both draw the CalGray, not the grey of DeviceGray's 0.5.
+    assert_eq!(drawn[0], drawn[1]);
+    assert_ne!(drawn[0], [[128, 128, 128, 255]]);
+}

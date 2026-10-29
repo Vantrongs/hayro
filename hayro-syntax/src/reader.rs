@@ -370,6 +370,23 @@ impl<'a> ReaderContext<'a> {
         (value, least >= own)
     }
 
+    /// This context as where a resolution starts, no reference being resolved in
+    /// it ([`Dict::as_root`](crate::object::Dict::as_root)).
+    pub(crate) fn as_root(&self) -> Self {
+        match &self.0 {
+            ReaderContextInner::Shared(inner)
+                if !inner.parent_chain.is_empty() || inner.rejected.is_some() =>
+            {
+                Self(ReaderContextInner::Shared(Arc::new(ReaderContextData {
+                    parent_chain: smallvec![],
+                    rejected: None,
+                    ..(**inner).clone()
+                })))
+            }
+            _ => self.clone(),
+        }
+    }
+
     #[inline]
     pub(crate) fn parent_chain_push(&mut self, link: Link) {
         match &mut self.0 {

@@ -23,8 +23,7 @@ use self::indexed::Indexed;
 use self::lab::Lab;
 use self::pattern::Pattern;
 use self::separation::Separation;
-use crate::cache::{Cache, CacheKey};
-use crate::util::hash128;
+use crate::cache::{Building, Cache};
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
 use hayro_syntax::object::Object;
@@ -161,11 +160,7 @@ pub(crate) enum ColorSpaceType {
 }
 
 impl ColorSpaceType {
-    fn new(object: Object<'_>, cache: &Cache) -> Option<Self> {
-        Self::new_inner(object, cache)
-    }
-
-    fn new_inner(object: Object<'_>, cache: &Cache) -> Option<Self> {
+    fn new(object: Object<'_>, cache: &Building<'_>) -> Option<Self> {
         if let Object::Name(name) = object {
             return Self::new_from_name(&name);
         } else if let Object::Array(color_array) = object {
@@ -178,40 +173,32 @@ impl ColorSpaceType {
                     let dict = icc_stream.dict();
                     let num_components = dict.get::<usize>(N)?;
 
-                    return cache.get_or_insert_with(icc_stream.cache_key(), || {
-                        if let Some(decoded) = icc_stream.decoded().ok().as_ref() {
-                            // A profile is what its bytes hold: documents embed one
-                            // profile as many objects, each of which would build it.
-                            let key = hash128(&(b"icc", decoded.as_ref(), num_components));
-                            cache
-                                .get_or_insert_with(key, || {
-                                    ICCProfile::new(decoded, num_components)
-                                })
-                                .map(|icc| {
-                                    // TODO: For SVG and PNG we can assume that the output color space is
-                                    // sRGB. If we ever implement PDF-to-PDF, we probably want to
-                                    // let the user pass the native color type and don't make this optimization
-                                    // if it's not sRGB.
-                                    if icc.is_srgb() {
-                                        Self::DeviceRgb(DeviceRgb)
-                                    } else {
-                                        Self::ICCBased(icc)
-                                    }
-                                })
-                                .or_else(|| {
-                                    dict.get::<Object<'_>>(ALTERNATE)
-                                        .and_then(|o| Self::new(o, cache))
-                                })
-                                .or_else(|| match dict.get::<u8>(N) {
-                                    Some(1) => Some(Self::DeviceGray(DeviceGray)),
-                                    Some(3) => Some(Self::DeviceRgb(DeviceRgb)),
-                                    Some(4) => Some(Self::DeviceCmyk(DeviceCmyk)),
-                                    _ => None,
-                                })
-                        } else {
-                            None
-                        }
-                    });
+                    let decoded = icc_stream.decoded().ok()?;
+                    // A profile is what its bytes hold: documents embed one profile as
+                    // many objects, each of which would build it.
+                    return cache
+                        .of_bytes(&decoded, num_components, ICCProfile::new)
+                        .map(|icc| {
+                            // TODO: For SVG and PNG we can assume that the output color space is
+                            // sRGB. If we ever implement PDF-to-PDF, we probably want to
+                            // let the user pass the native color type and don't make this optimization
+                            // if it's not sRGB.
+                            if icc.is_srgb() {
+                                Self::DeviceRgb(DeviceRgb)
+                            } else {
+                                Self::ICCBased(icc)
+                            }
+                        })
+                        .or_else(|| {
+                            dict.get::<Object<'_>>(ALTERNATE)
+                                .and_then(|o| Self::new(o, cache))
+                        })
+                        .or_else(|| match dict.get::<u8>(N) {
+                            Some(1) => Some(Self::DeviceGray(DeviceGray)),
+                            Some(3) => Some(Self::DeviceRgb(DeviceRgb)),
+                            Some(4) => Some(Self::DeviceCmyk(DeviceCmyk)),
+                            _ => None,
+                        });
                 }
                 CALCMYK => return Some(Self::DeviceCmyk(DeviceCmyk)),
                 CALGRAY => {
@@ -242,7 +229,7 @@ impl ColorSpaceType {
                     let _ = iter.next::<Name<'_>>();
                     let cs = iter
                         .next::<Object<'_>>()
-                        .and_then(|o| ColorSpace::new(o, cache))
+                        .and_then(|o| ColorSpace::build(o, cache))
                         .unwrap_or(ColorSpace::device_rgb());
                     return Some(Self::Pattern(Pattern::new(cs)));
                 }
@@ -273,8 +260,19 @@ impl ColorSpaceType {
 pub struct ColorSpace(Arc<ColorSpaceType>);
 
 impl ColorSpace {
-    /// Create a new color space from the given object.
+    /// The colour space `object` is, kept in `cache` for every page of its document
+    /// (but for one given by name, which reads nothing): built from the object alone
+    /// ([`Cache::rooted`]), so that it is the same whichever page read it first.
     pub(crate) fn new(object: Object<'_>, cache: &Cache) -> Option<Self> {
+        match object {
+            Object::Name(name) => Self::new_from_name(&name),
+            object => cache.rooted(&object, Self::build),
+        }
+    }
+
+    /// The colour space `object` is, read in the chain of references it was reached
+    /// by: within the build of a colour space [`Self::new`] keeps.
+    fn build(object: Object<'_>, cache: &Building<'_>) -> Option<Self> {
         Some(Self(Arc::new(ColorSpaceType::new(object, cache)?)))
     }
 

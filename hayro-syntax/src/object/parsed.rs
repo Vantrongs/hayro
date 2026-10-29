@@ -1039,6 +1039,19 @@ impl<'a> Part<'a> {
         &self.held.ctx
     }
 
+    /// The same part read where a resolution starts ([`ReaderContext::as_root`]).
+    pub(crate) fn as_root(&self) -> Self {
+        Self {
+            held: Arc::new(Held {
+                data: self.held.data,
+                nodes: self.held.nodes.clone(),
+                ctx: self.held.ctx.as_root(),
+            }),
+            at: self.at,
+            offset: self.offset,
+        }
+    }
+
     /// The array's items, or the dictionary's values.
     pub(crate) fn items(&self) -> &[Node] {
         self.run().nodes(self.held.nodes.nodes())

@@ -420,6 +420,15 @@ impl<'a> Stream<'a> {
         }
     }
 
+    /// The stream read as where a resolution of references starts
+    /// ([`Dict::as_root`]).
+    pub fn as_root(&self) -> Self {
+        Self {
+            dict: self.dict.as_root(),
+            data: self.data,
+        }
+    }
+
     /// Identifies the stream among the streams of every document loaded in this
     /// process, by its body ([`StreamId`]): entries of a damaged table that lead to
     /// one body find one identity. `None` for a stream that is no object of a loaded
