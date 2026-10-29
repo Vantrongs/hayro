@@ -122,21 +122,26 @@ impl AesBlocks {
     }
 
     /// Decrypts the next whole block, without the padding if it is the last; false
-    /// at the end. A trailing partial block is ignored, as `decrypt_cbc` does.
+    /// at the end. A trailing partial block is ignored, as `decrypt_cbc` does, and so
+    /// is a last block of padding alone: [`DecryptedReader::at`] counts a block taken
+    /// as bytes read.
     fn next_block(&mut self, data: &[u8], pos: &mut usize) -> bool {
         let Some(block) = data.get(*pos..*pos + 16) else {
             return false;
         };
         let previous = &data[*pos - 16..*pos];
-        self.block = self
+        let block = self
             .aes
             .decrypt_cbc_block(block.try_into().unwrap(), previous.try_into().unwrap());
-        *pos += 16;
-        self.taken = 0;
-        self.end = 16;
-        if data.len() - *pos < 16 {
-            self.end -= padding_len(&self.block);
+        let mut end = 16;
+        if data.len() - (*pos + 16) < 16 {
+            end -= padding_len(&block);
         }
+        if end == 0 {
+            return false;
+        }
+        (self.block, self.taken, self.end) = (block, 0, end);
+        *pos += 16;
         true
     }
 }
@@ -578,6 +583,35 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// Data whose last block is all padding, read to its end or moved past to it,
+    /// stays at its end: moving past more moves past nothing.
+    #[test]
+    fn a_last_block_of_padding_alone_ends_the_data() {
+        let id = ObjectIdentifier::new(1234, 17);
+        let cipher = AES256Cipher::new(&[17; 32]).unwrap();
+        let decryptor = decryptor(DecryptorTag::Aes256);
+        for len in [0, 16, 32] {
+            let mut data = alloc::vec![9; 16];
+            data.extend(cipher.encrypt_cbc(&alloc::vec![42; len], &[9; 16]));
+            assert_eq!(data.len(), 16 + len + 16, "a block of padding alone");
+            let mut reader = decryptor
+                .reader(id, &data, DecryptionTarget::Stream)
+                .unwrap();
+            assert_eq!(reader.len(), len);
+            for skip_first in [false, true] {
+                reader.rewind();
+                match skip_first {
+                    true => assert_eq!(reader.skip(len, &Meter::default()), Ok(len)),
+                    false => assert_eq!(read_all(&mut reader, 7), alloc::vec![42; len]),
+                }
+                assert_eq!(reader.read(&mut [0; 4]), 0, "{len}");
+                assert_eq!(reader.skip(0, &Meter::default()), Ok(0), "{len}");
+                assert_eq!(reader.skip(1, &Meter::default()), Ok(0), "{len}");
+                assert_eq!(reader.read(&mut [0; 4]), 0, "{len}");
             }
         }
     }
