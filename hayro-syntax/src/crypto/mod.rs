@@ -48,8 +48,8 @@
 //!    filters, which decoding passes over. Its raw data
 //!    ([`crate::object::Stream::try_raw_data`]) are decrypted by the `/Crypt` filter
 //!    and not decoded, so that a writer copying them leaves every `/Crypt` filter out.
-//!    A stream with a `/Crypt` filter offers no reader of its decoded data a piece at a
-//!    time ([`crate::object::Stream::decoded_reader`]), but offers the strict one.
+//!    The readers of decoded data a piece at a time
+//!    ([`crate::object::Stream::decoded_reader`] and the strict one) pass over them too.
 //! 10. Every stream of an encrypted document read as an object is decrypted, except one
 //!     whose `/Type` is the string `(XRef)`: a cross-reference stream, whose `/Type` is
 //!     the name `/XRef`, is read as stored when the document's table is read from it,

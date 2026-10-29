@@ -10,6 +10,7 @@ use std::cell::Cell;
 
 mod common;
 use common::allocations::measure;
+use common::chains;
 
 /// A document whose object 3 is a stream with `dict` entries holding `data`.
 fn stream_file(dict: &str, data: &[u8]) -> Pdf {
@@ -838,4 +839,188 @@ fn a_small_ccitt_image_allocates_its_output_once() {
     // stream's dictionary was; 13 when the output grew from an eighth of its size and
     // the lists change by change.
     assert_eq!(used.count, 3, "{used:?}");
+}
+
+/// The decoded data of `stream` read in pieces of random sizes, then again after a
+/// rewind; `Err` once a read is cancelled.
+fn read_in_pieces(
+    reader: &mut DecodedReader<'_>,
+    rng: &mut chains::Rng,
+    meter: &Meter<'_>,
+) -> Result<Vec<u8>, Cancelled> {
+    let mut buf = vec![0; 70_000];
+    let mut out = Vec::new();
+    loop {
+        let len = 1 + rng.below(70_000);
+        match reader.read(&mut buf[..len], meter)? {
+            0 => return Ok(out),
+            n => {
+                assert!(n <= POLL_BYTES);
+                out.extend_from_slice(&buf[..n]);
+            }
+        }
+    }
+}
+
+/// The reader yields what lenient decoding returns for chains of up to three filters
+/// of every kind over data of every sort, whole, cut short, damaged or followed by
+/// garbage at any layer, plain or encrypted, read in pieces of every size; a rewound
+/// reader reads the same again. Only an image filter or a predictor only whole
+/// decoding reverses leaves a chain without a reader.
+#[test]
+fn the_reader_reads_what_lenient_decoding_returns() {
+    let mut rng = chains::Rng(0x51_7cc1_b727_220a);
+    let (mut read, mut damaged_somewhere) = (0, 0);
+    for case in 0..1500 {
+        let mut encoded = chains::data(&mut rng);
+        let intact = encoded.clone();
+        let (mut filters, mut params) = (Vec::new(), Vec::new());
+        for _ in 0..1 + rng.below(3) {
+            let (filter, param, layer) = chains::layer(&encoded, &mut rng);
+            encoded = chains::damaged(layer, &mut rng);
+            filters.insert(0, filter);
+            params.insert(0, param);
+        }
+        let dict = format!(
+            "/Filter [{}] /DecodeParms [{}]",
+            filters.join(" "),
+            params.join(" ")
+        );
+        let pdf = match case % 4 {
+            0 => encrypted_file(&dict, &encoded),
+            _ => stream_file(&dict, &encoded),
+        };
+        let stream = object_3(&pdf);
+        let whole = stream.decoded().map(|d| d.into_owned());
+        let Some(mut reader) = stream.decoded_reader() else {
+            assert!(
+                filters.iter().any(|f| f == "/Unknown")
+                    || params.iter().any(|p| p.starts_with("<< /Predictor 2 ")
+                        && p.contains("/BitsPerComponent 16 ")),
+                "case {case}: {dict}: no reader"
+            );
+            assert!(!stream.can_read_incrementally(), "case {case}: {dict}");
+            continue;
+        };
+        assert!(stream.can_read_incrementally(), "case {case}: {dict}");
+        let first = read_in_pieces(&mut reader, &mut rng, &Meter::default()).unwrap();
+        match &whole {
+            Ok(whole) => assert!(
+                *whole == first,
+                "case {case}: {dict}: {} vs {} bytes",
+                whole.len(),
+                first.len()
+            ),
+            Err(e) => panic!("case {case}: {dict}: {e:?}, read {} bytes", first.len()),
+        }
+        reader.rewind();
+        let again = read_in_pieces(&mut reader, &mut rng, &Meter::default()).unwrap();
+        assert!(again == first, "case {case}: {dict}: read again");
+        read += 1;
+        damaged_somewhere += usize::from(first != intact);
+    }
+    assert!(
+        read > 1000 && damaged_somewhere > 100,
+        "{read} read, {damaged_somewhere} damaged"
+    );
+}
+
+/// Each filter the reader decodes a byte or a few at a time, alone and under Flate,
+/// over data cut at every byte and with every byte changed: the reader yields what
+/// lenient decoding returns, the bytes it made before the damage.
+#[test]
+fn damage_at_every_byte_reads_as_lenient_decoding() {
+    let mut rng = chains::Rng(0x2545_f491_4f6c_dd1d);
+    let data: Vec<u8> = (0..1500_u32).map(|i| (i * 7 / 5 % 251) as u8).collect();
+    let flate = chains::zlib(&data, 6);
+    let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
+    for (inner, encoded) in [("", data.clone()), ("/FlateDecode", flate)] {
+        for (filter, layer) in [
+            ("/LZWDecode", chains::lzw(&encoded, true, &mut rng)),
+            ("/AHx", chains::ascii_hex(&encoded, &mut rng)),
+            ("/A85", chains::ascii_85(&encoded, &mut rng)),
+            ("/RunLengthDecode", chains::run_length(&encoded, &mut rng)),
+        ] {
+            cases.push((format!("/Filter [{filter} {inner}]"), layer));
+        }
+    }
+    for (dict, encoded) in cases {
+        let mut kept = std::collections::BTreeSet::new();
+        for at in 0..encoded.len() {
+            for damage in 0..3 {
+                let mut damaged = encoded.clone();
+                match damage {
+                    0 => damaged.truncate(at),
+                    1 => damaged[at] ^= 0xff,
+                    _ => damaged[at] = b"{z\x80"[at % 3],
+                }
+                let pdf = stream_file(&dict, &damaged);
+                let stream = object_3(&pdf);
+                let whole = stream.decoded().unwrap().into_owned();
+                for chunk in [1, 4096] {
+                    let mut reader = stream.decoded_reader().unwrap();
+                    let read = read_up_to(&mut reader, usize::MAX, chunk);
+                    assert!(
+                        read == whole,
+                        "{dict}: damage {damage} at {at}, chunk {chunk}"
+                    );
+                }
+                kept.insert(whole.len());
+            }
+        }
+        // The damage ends the data at many places, not only at its start or end.
+        assert!(kept.len() > 20, "{dict}: {} lengths kept", kept.len());
+    }
+}
+
+/// Decoding damaged ASCII base-85, ASCII hex, run length and LZW data keeps what comes
+/// before the damage, as `MuPDF` does (observed with `PyMuPDF` 1.28.2), and the reader
+/// reads the same.
+#[test]
+fn lenient_decoding_keeps_what_comes_before_damage() {
+    let eight: Vec<u8> = (1..=8).collect();
+    // The bytes 1 to 8, in two ASCII base-85 groups.
+    let groups = &b"!<N?+\"U52;"[..];
+    let mut wrapped = eight.clone();
+    wrapped.extend([0x08, 0x78, 0x0e, 0xc4]);
+    wrapped.extend(&eight);
+    let runs = [2, 1, 2, 3, 254, 9];
+    let lzw = {
+        // Clear, `A`, `B`, then code 300, past the table's 260 entries.
+        let bits = [256_u64, 65, 66, 300].iter().fold(0, |b, c| b << 9 | c);
+        (bits << 28).to_be_bytes()[..5].to_vec()
+    };
+    let cases: [(&str, Vec<u8>, Vec<u8>); 11] = [
+        ("ASCII85Decode", [groups, b"{"].concat(), eight.clone()),
+        ("ASCII85Decode", [groups, b"9j{"].concat(), eight.clone()),
+        ("ASCII85Decode", [groups, b"9jz"].concat(), eight.clone()),
+        ("ASCII85Decode", [groups, b"A~>"].concat(), eight.clone()),
+        (
+            "ASCII85Decode",
+            [groups, b"uuuuu", groups].concat(),
+            wrapped,
+        ),
+        ("ASCIIHexDecode", b"0102 0x03>".to_vec(), vec![1, 2]),
+        ("ASCIIHexDecode", b"01023x>".to_vec(), vec![1, 2]),
+        ("RunLengthDecode", runs.to_vec(), vec![1, 2, 3, 9, 9, 9]),
+        (
+            "RunLengthDecode",
+            [&runs[..], &[250]].concat(),
+            vec![1, 2, 3, 9, 9, 9],
+        ),
+        (
+            "RunLengthDecode",
+            [&runs[..], &[5, 7, 8]].concat(),
+            vec![1, 2, 3, 9, 9, 9, 7, 8],
+        ),
+        ("LZWDecode", lzw, b"AB".to_vec()),
+    ];
+    for (filter, data, expected) in cases {
+        let pdf = stream_file(&format!("/Filter /{filter}"), &data);
+        let stream = object_3(&pdf);
+        let decoded = stream.decoded().ok().map(|d| d.into_owned());
+        assert_eq!(decoded.as_ref(), Some(&expected), "{filter} {data:?}");
+        let mut reader = stream.decoded_reader().unwrap();
+        assert_eq!(read_up_to(&mut reader, usize::MAX, 3), expected, "{filter}");
+    }
 }

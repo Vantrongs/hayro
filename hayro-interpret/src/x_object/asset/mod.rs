@@ -114,21 +114,24 @@ impl ImageAsset {
         })
     }
 
-    /// Opens the image for requests. Images whose data has no filter, Flate (with any
-    /// predictor but TIFF prediction of 16 bits) or `CCITTFaxDecode` as its one
-    /// filter, and whose samples (as the filter makes them: CCITT data's are 8-bit
+    /// Opens the image for requests. Images whose data has no filter, or any chain of
+    /// Flate, LZW (with any predictor but TIFF prediction of 16 bits), ASCII hex,
+    /// ASCII base-85 and run length filters, optionally followed by `CCITTFaxDecode`,
+    /// and whose samples (as the filter makes them: CCITT data's are 8-bit
     /// gray, or of one bit for an `Indexed` image) have fewer than eight bits, in any
     /// colour space, or are 8-bit samples of one component, or 8-bit `DeviceRGB`
     /// samples used as stored or inverted, with masks of one component of the same
     /// kinds, or decoded whole, and stencil masks of the same kinds, only read their
     /// dictionaries here; requests read their data from the start and keep a piece of
-    /// a row and a few sums per bin (and a CCITT decoder's state and a row's colour
-    /// changes). Data that ends early reads as decoding it whole reads it (stored zero
-    /// past it, or transparent rows under a colour key or `/Matte`), and a request
-    /// that pushed part of a row the data ends within, which reads as stored zero,
-    /// reads the image again once, knowing where the data ends. A request of such a
-    /// Flate image without a mask read alongside resumes from the nearest decoder
-    /// state an earlier request of the asset saved, instead of from the start. So does
+    /// a row and a few sums per bin (and each filter's decoder state, and a CCITT
+    /// decoder's state and a row's colour changes). Data that ends early reads as
+    /// decoding it whole reads it (stored zero past it, or transparent rows under a
+    /// colour key or `/Matte`), and a request that pushed part of a row the data ends
+    /// within, which reads as stored zero, reads the image again once, knowing where
+    /// the data ends. A request of such an image without `CCITTFaxDecode`, with Flate
+    /// data that zlib decodes, and without a mask read alongside resumes from the
+    /// nearest decoder state an earlier request of the asset saved, instead of from
+    /// the start. So does
     /// a request of a single-scan baseline grayscale JPEG of its declared size without
     /// masks, read in bands of eight rows; once its data fails to decode, it is decoded
     /// whole like other images. Other images are decoded whole here (with `hint`, the
@@ -318,7 +321,7 @@ pub struct ImageRegion {
 pub struct DecodeWork {
     /// Source rows decoded, including those read through to reach a window.
     pub rows_decoded: u64,
-    /// Bytes the incremental Flate decoders produced (see
+    /// Bytes the incremental decoders of every filter produced (see
     /// [`DecodedReader::inflated_bytes`](hayro_syntax::object::stream::DecodedReader::inflated_bytes)).
     pub bytes_inflated: u64,
 }

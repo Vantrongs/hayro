@@ -151,29 +151,28 @@ fn huge_soft_masks_with_one_byte_cost_little() {
 }
 
 /// Images decoded whole hold the samples their data holds and one texel of stored zero
-/// for the rest: 16-bit samples, a filter that is not streamed, and a soft
-/// mask through one.
+/// for the rest: 16-bit samples, a filter only whole decoding reads (Flate under a
+/// predictor of 16-bit components), and a soft mask through one.
 #[test]
 fn huge_images_decoded_whole_with_little_data_cost_little() {
     let gray = |bits: u8, extra: &str| {
         format!("{HUGE} /ColorSpace /DeviceGray /BitsPerComponent {bits} {extra}")
     };
+    let whole = "/Filter /FlateDecode /DecodeParms << /Predictor 2 /BitsPerComponent 16 >>";
+    let ones = common::stored_zlib(&[0xff, 0xff], 100);
+    let zeros = common::stored_zlib(&[0, 0], 100);
     for (dict, data, fill) in [
         (gray(16, ""), &b"\xff\xff"[..], 0),
         (gray(16, "/Decode [1 0]"), b"\xff\xff", 255),
-        (gray(8, "/Filter /ASCIIHexDecode"), b"ff>", 0),
-        (
-            gray(8, "/Filter /ASCIIHexDecode /Decode [1 0]"),
-            b"00>",
-            255,
-        ),
+        (gray(8, whole), &ones, 0),
+        (gray(8, &format!("{whole} /Decode [1 0]")), &zeros, 255),
     ] {
         let region = huge_region(&dict, data, None, Plane::Image);
         assert_eq!(region, vec![fill; 100 * 100], "{dict}");
     }
     let image = "/Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R";
-    let mask = gray(8, "/Filter /ASCIIHexDecode");
-    let region = huge_region(image, &[255, 0, 0], Some((&mask, b"ff>")), Plane::Mask);
+    let mask = gray(8, whole);
+    let region = huge_region(image, &[255, 0, 0], Some((&mask, &ones)), Plane::Mask);
     assert_eq!(region, vec![0; 100 * 100]);
 }
 
@@ -744,6 +743,137 @@ fn a_small_region_of_an_indexed_or_masked_ccitt_image_costs_the_region() {
         assert!(
             working[1] <= working[0] + 512,
             "{name}: {} bytes besides saved states for 4096, {} for 8192",
+            working[0],
+            working[1]
+        );
+        assert!(working[1] < 1 << 20, "{name}: {} bytes", working[1]);
+    }
+}
+
+/// A small region of an image, stencil mask or soft mask stored through a chain of
+/// LZW, run length, ASCII and Flate filters, over CCITT data or not, costs memory in
+/// proportion to the region, as the same image stored through Flate alone does:
+/// decoding the larger whole held 4 MiB of samples (and each filter's output before
+/// that). A tile of an image four times as large holds the same, but for pieces of
+/// rows twice as wide.
+#[test]
+fn a_small_region_of_an_image_in_a_chain_of_filters_costs_the_region() {
+    use common::chains::{self, Rng};
+    let tile: Bins = |w, h| ((w, h), [w / 2, h - 64, w / 2 + 64, h]);
+    region_cost(
+        "/ColorSpace /DeviceGray /BitsPerComponent 1 /Width 16 /Height 16 /Filter /FlateDecode",
+        &common::stored_zlib(&[0; 32], 1000),
+        |w, h| ((w, h), [0, 0, 1, 1]),
+    );
+    let gray = "/ColorSpace /DeviceGray /BitsPerComponent 1";
+    /// Stored data of `side` × `side` samples of a bit each.
+    type Data = fn(u32) -> Vec<u8>;
+    fn packed(side: u32) -> Vec<u8> {
+        common::noise((side / 8 * side) as usize, side)
+    }
+    let lzw: Data = |side| chains::lzw(&packed(side), true, &mut Rng(side.into()));
+    let run_length: Data = |side| chains::run_length(&packed(side), &mut Rng(side.into()));
+    let a85_flate: Data = |side| {
+        chains::ascii_85(
+            &common::stored_zlib(&packed(side), 65_535),
+            &mut Rng(side.into()),
+        )
+    };
+    let hex_lzw: Data =
+        |side| chains::ascii_hex(&chains::lzw(&packed(side), true, &mut Rng(1)), &mut Rng(2));
+    // Group 4 rows, each white like the one above (vertical mode, no offset): a
+    // bit each.
+    let a85_g4: Data = |side| chains::ascii_85(&vec![0xFF; side as usize / 8], &mut Rng(3));
+    /// A kind: its dictionary and data, the plane requested, and its mask's
+    /// dictionary and data (object 6).
+    type Kind = (&'static str, String, Data, Plane, Option<(String, Data)>);
+    let raw: Data = packed;
+    let kinds: [Kind; 7] = [
+        (
+            "lzw",
+            format!("{gray} /Filter /LZWDecode"),
+            lzw,
+            Plane::Image,
+            None,
+        ),
+        (
+            "run_length",
+            format!("{gray} /Filter /RunLengthDecode"),
+            run_length,
+            Plane::Image,
+            None,
+        ),
+        (
+            "a85_flate",
+            format!("{gray} /Filter [/A85 /FlateDecode]"),
+            a85_flate,
+            Plane::Image,
+            None,
+        ),
+        (
+            "stencil_hex_lzw",
+            "/ImageMask true /Filter [/AHx /LZWDecode]".into(),
+            hex_lzw,
+            Plane::Image,
+            None,
+        ),
+        (
+            "smask_run_length",
+            format!("{gray} /SMask 6 0 R"),
+            raw,
+            Plane::Image,
+            Some((format!("{gray} /Filter /RunLengthDecode"), run_length)),
+        ),
+        (
+            "smask_a85_flate_own_plane",
+            format!("{gray} /SMask 6 0 R"),
+            raw,
+            Plane::Mask,
+            Some((format!("{gray} /Filter [/A85 /FlateDecode]"), a85_flate)),
+        ),
+        (
+            "a85_ccitt",
+            format!(
+                "{gray} /Filter [/A85 /CCITTFaxDecode] /DecodeParms [null << /K -1 /Columns SIDE >>]"
+            ),
+            a85_g4,
+            Plane::Image,
+            None,
+        ),
+    ];
+    for (name, dict, data, plane, mask) in kinds {
+        let mut working = Vec::new();
+        for side in [1024_u32, 2048] {
+            let size = format!("/Width {side} /Height {side}");
+            let dict = dict.replace("SIDE", &side.to_string());
+            let mut objects = vec![image(&format!("{dict} {size}"), &data(side))];
+            // A mask on its own grid is half the image's size.
+            let mask_side = if plane == Plane::Mask { side / 2 } else { side };
+            if let Some((mask, mask_data)) = &mask {
+                let size = format!("/Width {mask_side} /Height {mask_side}");
+                objects.push(image(&format!("{mask} {size}"), &mask_data(mask_side)));
+            }
+            let pdf = page(
+                "q 100 0 0 100 0 0 cm /Im Do Q",
+                "/XObject << /Im 5 0 R >>",
+                objects,
+            );
+            let mut requested = Requested::new(plane, tile);
+            common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+            let [(peak, _)] = requested.regions[..] else {
+                panic!("{name}: one image")
+            };
+            let saved = requested.saved[0];
+            assert!(saved <= 2 << 20, "{name} {side}: {saved} bytes saved");
+            working.push(peak - saved);
+        }
+        // The larger image's rows, and its mask's, are 128 bytes wider each, which a
+        // piece of a row read past holds; and what a decoder made ahead of the reads
+        // past a poll's worth, up to an LZW code's bytes, depends on where the rows
+        // fall in its output.
+        assert!(
+            working[1] <= working[0] + 1024,
+            "{name}: {} bytes besides saved states for 1024, {} for 2048",
             working[0],
             working[1]
         );

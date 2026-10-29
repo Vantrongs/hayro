@@ -1,36 +1,16 @@
 // Keep in sync with `hayro-postscript/src/string/ascii_hex.rs`.
 
+use crate::filter::bytewise::{self, Decoder};
 use crate::trivia::is_white_space_character;
 use crate::util::ByteBuf;
-use crate::work::{Meter, POLL_BYTES};
+use crate::work::Meter;
 use alloc::vec::Vec;
 
-/// The data decoded as [`decode_into`] does, in pieces whose work counts on `meter`;
-/// `None` once its hook asks to stop.
-pub(crate) fn decode(data: &[u8], meter: &Meter<'_>) -> Option<Vec<u8>> {
-    let mut decoded = Vec::new();
-    let mut high = None;
-    for piece in data.chunks(POLL_BYTES) {
-        let end = piece.iter().position(|&b| b == b'>');
-        for &byte in &piece[..end.unwrap_or(piece.len())] {
-            if is_white_space_character(byte) {
-                continue;
-            }
-            let digit = decode_hex_digit(byte)?;
-            match high.take() {
-                Some(high) => decoded.push(high << 4 | digit),
-                None => high = Some(digit),
-            }
-        }
-        meter.work(piece.len()).ok()?;
-        if end.is_some() {
-            break;
-        }
-    }
-    if let Some(high) = high {
-        decoded.push(high << 4);
-    }
-    Some(decoded)
+/// The data decoded as [`decode_into`] does, each byte read counted on `meter`;
+/// `None` once its hook asks to stop, or where a strict decoder finds a character
+/// that is no digit.
+pub(crate) fn decode(data: &[u8], meter: &Meter<'_>, strict: bool) -> Option<Vec<u8>> {
+    bytewise::decode(Decoder::ascii_hex(), data, strict, meter)
 }
 
 pub(crate) fn decode_into<B: ByteBuf>(data: &[u8]) -> Option<B> {
@@ -108,7 +88,7 @@ mod tests {
     use alloc::vec::Vec;
 
     fn decode(data: &[u8]) -> Option<Vec<u8>> {
-        let metered = super::decode(data, &Meter::default());
+        let metered = super::decode(data, &Meter::default(), true);
         assert_eq!(metered, decode_into(data));
         metered
     }

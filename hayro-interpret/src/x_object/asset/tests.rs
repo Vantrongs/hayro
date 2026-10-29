@@ -968,19 +968,17 @@ fn a_first_open_reads_no_data() {
 
 /// A first open stopped by its hook returns within three polls' worth of work, wherever
 /// the work is: decoding a mask whole, or decoding an image that is not streamed
-/// whole (through a filter, or converting 16-bit samples). The asset is left as it was: opening it again gives what decoding the
+/// whole (through a predictor only whole decoding reverses, or converting 16-bit
+/// samples). The asset is left as it was: opening it again gives what decoding the
 /// image whole does.
 #[test]
 #[cfg(debug_assertions)]
 fn a_first_open_is_cancelled_within_bounded_work() {
     let (w, h) = (2000_u32, 2000_u32);
     let gray = "/ColorSpace /DeviceGray /BitsPerComponent 8";
-    let hex = |data: &[u8]| {
-        data.iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-            .into_bytes()
-    };
+    // TIFF prediction of 16-bit components, which only whole decoding reverses, of
+    // rows of one component: the data as they are.
+    let whole_only = "/Filter /FlateDecode /DecodeParms << /Predictor 2 /BitsPerComponent 16 >>";
     let masked = |filter: &str, data: Vec<u8>| {
         vec![
             (image(&format!("{gray} /SMask 4 0 R"), 1, 1), vec![7]),
@@ -989,16 +987,10 @@ fn a_first_open_is_cancelled_within_bounded_work() {
     };
     let noise = noise((w * h) as usize, 31);
     for (name, objects) in [
+        ("decoded soft mask", masked(whole_only, zlib(&noise))),
         (
-            "decoded soft mask",
-            masked("/Filter /ASCIIHexDecode", hex(&noise)),
-        ),
-        (
-            "hex image",
-            vec![(
-                image(&format!("{gray} /Filter /ASCIIHexDecode"), w, h),
-                hex(&noise),
-            )],
+            "predicted image",
+            vec![(image(&format!("{gray} {whole_only}"), w, h), zlib(&noise))],
         ),
         (
             "16-bit image",
@@ -1129,16 +1121,18 @@ fn very_wide_images_decoded_whole_count_the_data() {
 fn rows_of_a_decoded_mask_are_skipped_without_work() {
     let h = 20_000_000_u32;
     let gray = "/ColorSpace /DeviceGray /BitsPerComponent 8";
-    let mut runs = Vec::new();
+    let mut rows = Vec::new();
     for run in 0..h / 128 {
-        runs.extend([129, (run % 251) as u8]);
+        rows.extend([(run % 251) as u8; 128]);
     }
-    runs.push(128);
+    // TIFF prediction of 16-bit components, which only whole decoding reverses, of
+    // rows of one component: the data as they are.
+    let whole_only = "/Filter /FlateDecode /DecodeParms << /Predictor 2 /BitsPerComponent 16 >>";
     let pdf = pdf(&[
         (image(&format!("{gray} /SMask 4 0 R"), 1, 1), vec![7]),
         (
-            image(&format!("{gray} /Filter /RunLengthDecode"), 1, h),
-            runs,
+            image(&format!("{gray} {whole_only}"), 1, h),
+            stored_zlib(&rows, 65_535),
         ),
     ]);
     let asset = asset(&pdf);
@@ -1522,5 +1516,66 @@ fn rc4_rows_before_a_request_resume_from_a_saved_state() {
     assert!(work[0] >= stored - index::MIN_CHECKPOINT_BYTES, "{work:?}");
     for &later in &work[1..] {
         assert!(later < index::MIN_CHECKPOINT_BYTES + 4096, "{work:?}");
+    }
+}
+
+/// Requests near the end of a large image stored through a chain of filters, whose
+/// decoders' states are saved along the rows (each filter's, a run length decoder's
+/// and an ASCII decoder's included): the first decodes the data up to its rows; later
+/// ones resume from the nearest state before theirs, and decode at most the rows
+/// between two states.
+#[test]
+#[cfg(debug_assertions)]
+fn chained_rows_before_a_request_resume_from_a_saved_state() {
+    use crate::chains::{self, Rng};
+    let n = 4096_u32;
+    let packed = noise((n * n / 8) as usize, 9);
+    let gray = "/ColorSpace /DeviceGray /BitsPerComponent 1";
+    let a85_flate = chains::ascii_85(&stored_zlib(&packed, 65_535), &mut Rng(1));
+    let lzw = chains::lzw(&packed[..packed.len() / 2], true, &mut Rng(4));
+    let hex_rl = chains::ascii_hex(&chains::run_length(&packed, &mut Rng(2)), &mut Rng(3));
+    for (name, objects) in [
+        (
+            "a85 flate",
+            vec![(
+                image(&format!("{gray} /Filter [/A85 /FlateDecode]"), n, n),
+                a85_flate,
+            )],
+        ),
+        (
+            "lzw",
+            vec![(image(&format!("{gray} /Filter /LZWDecode"), n, n / 2), lzw)],
+        ),
+        (
+            "hex run length",
+            vec![(
+                image(&format!("{gray} /Filter [/AHx /RunLengthDecode]"), n, n),
+                hex_rl,
+            )],
+        ),
+    ] {
+        let pdf = pdf(&objects);
+        let asset = asset(&pdf);
+        let mut source = asset.open(None, None).unwrap();
+        assert!(is_streamed(&source), "{name}");
+        let mut decoded = whole(&asset);
+        let h = source.layout().image.height;
+        let mut work = Vec::new();
+        for y in [h - 1, h - 2, h - 300, h - 1] {
+            let window = [n - 9, y, n, y + 1];
+            let expected = request(&mut decoded, Plane::Image, (n, h), window);
+            TOLD.set(0);
+            let got = request(&mut source, Plane::Image, (n, h), window);
+            assert_eq!(got.data, expected.data, "{name}: row {y}");
+            work.push(TOLD.get());
+        }
+        let decoded_bytes = (n * h / 8) as usize;
+        assert!(work[0] >= decoded_bytes, "{name}: {work:?}");
+        for &later in &work[1..] {
+            assert!(
+                later < 6 * index::MIN_CHECKPOINT_BYTES && later < work[0] / 3,
+                "{name}: {work:?}"
+            );
+        }
     }
 }

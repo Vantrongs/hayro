@@ -8,6 +8,7 @@ use crate::filter::ccitt::CcittBytes;
 use crate::filter::chain::Layer;
 pub use crate::filter::chain::StrictReader;
 use crate::filter::lzw_flate::{PredictorParams, Unpredictor};
+use crate::filter::reader::Codec;
 #[cfg(feature = "unsafe")]
 pub use crate::filter::reader::DecodedCheckpoint;
 pub use crate::filter::reader::{DecodedReader, ReadError};
@@ -566,29 +567,34 @@ impl<'a> Stream<'a> {
 
     /// The image data [`Self::decoded_image`] returns, read incrementally where the
     /// filters allow it: those [`Self::decoded_reader`] reads, and `CCITTFaxDecode` as
-    /// the one filter (besides `/Crypt`), whose rows decode as they are read, the
+    /// the last filter after any of those, whose rows decode as they are read, the
     /// reader holding the decoder's state and a row's colour changes, and of
-    /// encrypted data a window of it decrypted ([`Self::ccitt_image_data`] tells what
+    /// encrypted or decoded data a window of it ([`Self::ccitt_image_data`] tells what
     /// they are). `None` otherwise, or where decryption would fail.
     #[cfg(feature = "images")]
     pub fn image_reader(&self, image_params: &ImageDecodeParams) -> Option<DecodedReader<'a>> {
-        match self.ccitt_entry() {
-            Some(entry) => Some(DecodedReader::ccitt(CcittBytes::new(
-                self.decrypted()?,
+        let Some((entry, before)) = self.ccitt_filters() else {
+            return self.decoded_reader();
+        };
+        let data = self.decrypted()?;
+        let bytes = match before.is_empty() {
+            true => CcittBytes::new(data, &entry.params, image_params),
+            false => CcittBytes::decoded(
+                DecodedReader::decoding(data, &before)?,
                 &entry.params,
                 image_params,
-            ))),
-            None => self.decoded_reader(),
-        }
+            ),
+        };
+        Some(DecodedReader::ccitt(bytes))
     }
 
-    /// What [`Self::decoded_image`] reports of the samples of an image whose one
-    /// filter (besides `/Crypt`) is `CCITTFaxDecode`, from the dictionary alone:
-    /// 8-bit gray samples, or of a bit for an indexed image, in rows of its
-    /// `Columns`, as many as the image declares. `None` for other filters.
+    /// What [`Self::decoded_image`] reports of the samples of an image whose last
+    /// filter is `CCITTFaxDecode`, after filters [`Self::decoded_reader`] reads, from
+    /// the dictionary alone: 8-bit gray samples, or of a bit for an indexed image, in
+    /// rows of its `Columns`, as many as the image declares. `None` for other filters.
     #[cfg(feature = "images")]
     pub fn ccitt_image_data(&self, image_params: &ImageDecodeParams) -> Option<ImageData> {
-        let entry = self.ccitt_entry()?;
+        let (entry, _) = self.ccitt_filters()?;
         Some(crate::filter::ccitt::image_data(
             &entry.params,
             image_params,
@@ -599,31 +605,35 @@ impl<'a> Stream<'a> {
     /// alone: no data is read or decrypted.
     #[cfg(feature = "images")]
     pub fn image_reads_incrementally(&self) -> bool {
-        self.ccitt_entry().is_some() || self.can_read_incrementally()
+        self.ccitt_filters().is_some() || self.can_read_incrementally()
     }
 
-    /// The entry of the one filter (besides `/Crypt`), if it is `CCITTFaxDecode`.
+    /// The entry of the last filter (besides `/Crypt`), if it is `CCITTFaxDecode`
+    /// and [`DecodedReader`] reads the filters before it, and their decoders.
     #[cfg(feature = "images")]
-    fn ccitt_entry(&self) -> Option<FilterEntry<'a>> {
+    fn ccitt_filters(&self) -> Option<(FilterEntry<'a>, Vec<Codec>)> {
         let filters = self.filter_entries();
-        let mut applied = filters.applied().filter(|(f, _)| *f != Filter::Crypt);
-        match (applied.next(), applied.next()) {
-            (Some((Filter::CcittFaxDecode, entry)), None) => Some(entry),
+        let applied: SmallVec<[_; 2]> = filters
+            .applied()
+            .filter(|(f, _)| *f != Filter::Crypt)
+            .collect();
+        match applied.split_last()? {
+            ((Filter::CcittFaxDecode, entry), before) => {
+                Some((entry.clone(), Self::codecs(before.iter().cloned())?))
+            }
             _ => None,
         }
     }
 
-    /// The decoded data, read incrementally, when the stream's filters allow it: no
-    /// filter, or Flate with no predictor, a PNG predictor, or the TIFF predictor of
-    /// 8-bit components. It yields the bytes [`Stream::decoded`] returns, without
-    /// holding them all. `None` for other filters, or where decryption would fail.
+    /// The decoded data, read incrementally, when the stream's filters allow it: any
+    /// number of Flate, LZW, ASCII hex, ASCII base-85 and run length filters, each
+    /// read as the one before it decodes, with no predictor, a PNG predictor, or the
+    /// TIFF predictor of components of up to 8 bits. It yields the bytes
+    /// [`Stream::decoded`] returns, without holding them all. `None` for other
+    /// filters, or where decryption would fail.
     pub fn decoded_reader(&self) -> Option<DecodedReader<'a>> {
-        let filter = self.reader_filter()?;
-        let data = self.decrypted()?;
-        match filter {
-            None => Some(DecodedReader::raw(data)),
-            Some(params) => DecodedReader::flate(data, &params),
-        }
+        let codecs = Self::codecs(self.filter_entries().applied())?;
+        DecodedReader::decoding(self.decrypted()?, &codecs)
     }
 
     /// The stored data, decrypted as it is read, as lenient decoding decrypts it;
@@ -650,25 +660,37 @@ impl<'a> Stream<'a> {
     /// Whether the filters and predictor allow [`Stream::decoded_reader`], judged from
     /// the dictionary alone: no data is read or decrypted.
     pub fn can_read_incrementally(&self) -> bool {
-        self.reader_filter().is_some()
+        Self::codecs(self.filter_entries().applied()).is_some()
     }
 
-    /// The predictor of the one Flate filter, `Some(None)` for no filter, `None` when
-    /// the filters cannot be read incrementally.
-    fn reader_filter(&self) -> Option<Option<PredictorParams>> {
-        let filters = self.filter_entries();
-        let mut applied = filters.applied();
-        match (applied.next(), applied.next()) {
-            (None, _) => Some(None),
-            (Some((Filter::FlateDecode, entry)), None) => {
+    /// The decoders [`DecodedReader`] reads `filters` with, in turn, passing over
+    /// `/Crypt` as decoding does (rule 9 of the crypt filter rules, `crate::crypto`);
+    /// `None` where a filter is one only whole decoding decodes, an image filter or a
+    /// predictor only it reverses, or where it refuses a predictor's parameters.
+    fn codecs(filters: impl Iterator<Item = (Filter, FilterEntry<'a>)>) -> Option<Vec<Codec>> {
+        let mut codecs = Vec::new();
+        for (filter, entry) in filters {
+            let predicted = || {
                 let params = PredictorParams::from_params(&entry.params)?;
                 if params.predictor != 1 {
                     Unpredictor::new(&params)?;
                 }
-                Some(Some(params))
-            }
-            _ => None,
+                Some(params)
+            };
+            codecs.push(match filter {
+                Filter::Crypt => continue,
+                Filter::FlateDecode => Codec::Flate(predicted()?),
+                Filter::LzwDecode => Codec::Lzw(predicted()?),
+                Filter::AsciiHexDecode => Codec::AsciiHex,
+                Filter::Ascii85Decode => Codec::Ascii85,
+                Filter::RunLengthDecode => Codec::RunLength,
+                Filter::CcittFaxDecode
+                | Filter::Jbig2Decode
+                | Filter::DctDecode
+                | Filter::JpxDecode => return None,
+            });
         }
+        Some(codecs)
     }
 
     /// An owned handle to this stream, which [`OwnedStream::get`] turns back into it

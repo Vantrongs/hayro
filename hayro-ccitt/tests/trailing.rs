@@ -13,13 +13,12 @@ struct Counted {
 }
 
 impl Source for Counted {
-    fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    fn read_at(&self, pos: usize, out: &mut [u8]) {
-        out.copy_from_slice(&self.data[pos..pos + out.len()]);
-        self.read.set(self.read.get() + out.len());
+    fn read_at(&self, pos: usize, out: &mut [u8]) -> usize {
+        let held = self.data.get(pos..).unwrap_or_default();
+        let n = held.len().min(out.len());
+        out[..n].copy_from_slice(&held[..n]);
+        self.read.set(self.read.get() + n);
+        n
     }
 }
 

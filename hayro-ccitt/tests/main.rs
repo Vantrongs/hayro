@@ -13,8 +13,12 @@ mod settings;
 mod stop;
 mod trailing;
 
-use hayro_ccitt::{DecodeSettings, Decoder, DecoderContext, EncodingMode, RowDecoder, decode};
+use hayro_ccitt::{
+    DecodeSettings, Decoder, DecoderContext, EncodingMode, RowDecoder, Source, decode,
+};
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 const G3_1D: EncodingMode = EncodingMode::Group3_1D;
 const G3_2D: EncodingMode = EncodingMode::Group3_2D;
@@ -171,4 +175,54 @@ fn decodes_the_same_by_rows(stream: &str, data: &[u8], settings: DecodeSettings)
     );
     assert_eq!(ended_by_rows, ended, "{stream}: ends otherwise");
     assert!(by_rows.rows == whole.rows, "{stream}: other rows");
+
+    // Read through a source, which tells its end only as it is read there, no row's
+    // decoding reads before where it started.
+    let source = Rc::new(Floored {
+        data: data.to_vec(),
+        floor: Cell::new(0),
+        below: Cell::new(None),
+    });
+    let mut rows = RowDecoder::from_source(source.clone(), settings);
+    let mut by_source = Collector::new(settings.columns);
+    let ended_by_source = loop {
+        source.floor.set(rows.byte_position());
+        match rows.next_row(&mut by_source) {
+            Ok(true) => {}
+            Ok(false) => break Ok(()),
+            Err(e) => break Err(e),
+        }
+    };
+    assert_eq!(
+        ended_by_source, ended,
+        "{stream}: ends otherwise from a source"
+    );
+    assert!(
+        by_source.rows == whole.rows,
+        "{stream}: other rows from a source"
+    );
+    assert_eq!(
+        source.below.get(),
+        None,
+        "{stream}: read before a row's start"
+    );
+}
+
+/// Data that notes the first byte read before `floor`.
+struct Floored {
+    data: Vec<u8>,
+    floor: Cell<usize>,
+    below: Cell<Option<(usize, usize)>>,
+}
+
+impl Source for Floored {
+    fn read_at(&self, pos: usize, out: &mut [u8]) -> usize {
+        if pos < self.floor.get() && self.below.get().is_none() {
+            self.below.set(Some((pos, self.floor.get())));
+        }
+        let held = self.data.get(pos..).unwrap_or_default();
+        let n = held.len().min(out.len());
+        out[..n].copy_from_slice(&held[..n]);
+        n
+    }
 }

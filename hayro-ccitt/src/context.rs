@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 const MAX_RESERVED_CHANGES: usize = 1 << 8;
 
 /// A reusable context for decoding CCITT images.
+#[derive(Clone)]
 pub struct DecoderContext {
     /// Positions of the color changes in the reference line (previous line).
     ///

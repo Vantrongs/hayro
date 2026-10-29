@@ -4,10 +4,13 @@
 //! and decode arrays, on the image's grid and their own, mask streams,
 //! stencil masks and CCITT data, raw and Flate, each cut after every byte of its
 //! stored data, and of its data decoded. Flate data damaged at every byte, which
-//! zlib may find corrupt after making bytes, streams as it decodes whole too.
+//! zlib may find corrupt after making bytes, streams as it decodes whole too, as do
+//! images and masks through chains of LZW, run length, ASCII and Flate filters, over
+//! CCITT data or not, cut and damaged at every byte.
 
 use super::tests::{asset, image, is_streamed, pdf, request, try_whole};
 use super::{ImageAsset, ImageRequest, ImageSource, Plane, RequestError};
+use crate::chains;
 use crate::fixtures::{noise, stored_zlib};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
@@ -935,4 +938,103 @@ fn a_zlib_reading_that_breaks_late_streams_as_whole() {
         request(&mut source, Plane::Image, (8, 1), [0, 0, 8, 1]).data,
         [255; 8]
     );
+}
+
+/// Through what chain of filters data are stored: the filter entries, and the data
+/// encoded.
+fn chained(data: &[u8], rng: &mut chains::Rng) -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        ("/Filter /LZWDecode", chains::lzw(data, true, rng)),
+        ("/Filter /RunLengthDecode", chains::run_length(data, rng)),
+        (
+            "/Filter [/ASCII85Decode /FlateDecode]",
+            chains::ascii_85(&deflate(data), rng),
+        ),
+        (
+            "/Filter [/ASCIIHexDecode /LZWDecode] /DecodeParms [null << /EarlyChange 0 >>]",
+            chains::ascii_hex(&chains::lzw(data, false, rng), rng),
+        ),
+    ]
+}
+
+/// The stored data of each case: cut after every byte, and with every byte changed.
+fn cut_and_damaged(encoded: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let cuts = (0..=encoded.len()).map(|k| (format!("cut after {k}"), encoded[..k].to_vec()));
+    let damaged = (0..encoded.len()).map(|k| {
+        let mut damaged = encoded.to_vec();
+        damaged[k] = b"{z\x80~"[k % 4];
+        (format!("byte {k} changed"), damaged)
+    });
+    cuts.chain(damaged).collect()
+}
+
+/// Colour, a stencil mask and a soft mask on the colour's grid, each stored through a
+/// chain of filters the reader decodes a byte or a few at a time, alone or before
+/// Flate or other such filters, and cut after or changed at every byte: they stream
+/// as they decode whole, the bytes lenient decoding keeps before damage included.
+#[test]
+fn chained_filters_cut_and_damaged_stream_as_whole() {
+    let mut cases = Cases::default();
+    let mut rng = chains::Rng(0x7f4a_7c15_9e37_79b9);
+    let (w, h) = (61_u32, 40_u32);
+    let gray1 = "/ColorSpace /DeviceGray /BitsPerComponent 1";
+    let data = samples((w as usize).div_ceil(8) * h as usize, 81);
+    for (filters, encoded) in chained(&data, &mut rng) {
+        let intact = asset(&pdf(&[(
+            image(&format!("{gray1} {filters}"), w, h),
+            encoded.clone(),
+        )]));
+        assert!(is_streamed(&intact.open(None, None).unwrap()), "{filters}");
+        for (case, stored) in cut_and_damaged(&encoded) {
+            let colour = format!("{gray1} {filters}");
+            let file = pdf(&[(image(&colour, w, h), stored.clone())]);
+            cases.check(&asset(&file), &format!("{colour}: {case}"));
+            let stencil = format!("/ImageMask true {filters}");
+            let file = pdf(&[(image(&stencil, w, h), stored.clone())]);
+            cases.check(&asset(&file), &format!("{stencil}: {case}"));
+            let masked = format!("{gray1} /SMask 4 0 R");
+            let file = pdf(&[
+                (image(&masked, w, h), data.clone()),
+                (image(&colour, w, h), stored),
+            ]);
+            cases.check(&asset(&file), &format!("soft mask {colour}: {case}"));
+        }
+    }
+    cases.finish();
+}
+
+/// CCITT data in ASCII base-85 and in ASCII hex before it, as an image and as a
+/// stencil mask, cut after or changed at every byte (every fourth for the stencil):
+/// they stream as they decode whole.
+#[test]
+fn ccitt_after_other_filters_cut_and_damaged_streams_as_whole() {
+    let mut cases = Cases::default();
+    let mut rng = chains::Rng(0x2545_f491_4f6c_dd1d);
+    let (k, data) = CCITT[0];
+    let params = format!("<< /K {k} /Columns 211 >>");
+    for (filters, encoded) in [
+        (
+            format!("/Filter [/A85 /CCITTFaxDecode] /DecodeParms [null {params}]"),
+            chains::ascii_85(data, &mut rng),
+        ),
+        (
+            format!("/Filter [/AHx /CCITTFaxDecode] /DecodeParms [null {params}]"),
+            chains::ascii_hex(data, &mut rng),
+        ),
+    ] {
+        let dict = format!("/ColorSpace /DeviceGray /BitsPerComponent 1 {filters}");
+        let intact = asset(&pdf(&[(image(&dict, 211, 96), encoded.clone())]));
+        assert!(is_streamed(&intact.open(None, None).unwrap()), "{filters}");
+        for (i, (case, stored)) in cut_and_damaged(&encoded).into_iter().enumerate() {
+            let colour = format!("/ColorSpace /DeviceGray /BitsPerComponent 1 {filters}");
+            let file = pdf(&[(image(&colour, 211, 96), stored.clone())]);
+            cases.check(&asset(&file), &format!("{colour}: {case}"));
+            if i % 4 == 0 {
+                let stencil = format!("/ImageMask true {filters}");
+                let file = pdf(&[(image(&stencil, 211, 96), stored)]);
+                cases.check(&asset(&file), &format!("{stencil}: {case}"));
+            }
+        }
+    }
+    cases.finish();
 }

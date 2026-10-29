@@ -348,11 +348,6 @@ impl<'a> Seekable<'a> {
         }
     }
 
-    /// The bytes the data decrypts to (see [`DecryptedReader::len`]).
-    pub(crate) fn len(&self) -> usize {
-        self.reader.len()
-    }
-
     /// Fills `out` with the next decrypted bytes, or as many as reach the next
     /// multiple of [`RC4_MARK`] for RC4, and returns how many; 0 only at the end.
     pub(crate) fn read(&mut self, out: &mut [u8]) -> usize {
@@ -516,7 +511,7 @@ mod tests {
                     .reader(id, &data, DecryptionTarget::Stream)
                     .unwrap(),
             );
-            assert_eq!(reader.len(), expected.len());
+            assert_eq!(reader.reader.len(), expected.len());
             let mut buf = alloc::vec![0; 7000];
             // Read through the data first, so that RC4 marks every multiple of it.
             while reader.read(&mut buf) > 0 {}

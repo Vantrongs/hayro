@@ -13,7 +13,9 @@ pub(crate) enum Data<'a> {
 #[derive(Clone)]
 pub(crate) struct BitReader<'a> {
     data: Data<'a>,
-    /// The bytes of `data`.
+    /// The bytes of `data`, where known: a source tells where it ends only once read
+    /// there, so until then, `usize::MAX`, and the bytes up to 8 past the position
+    /// the buffer was last filled at are known to be there.
     len: usize,
     bit_offset: usize,
     /// The bits starting at `bit_offset`, with the next bit in the most
@@ -35,7 +37,7 @@ impl<'a> BitReader<'a> {
     pub(crate) fn new(data: Data<'a>) -> Self {
         let len = match &data {
             Data::Slice(bytes) => bytes.len(),
-            Data::Source(source) => source.len(),
+            Data::Source(_) => usize::MAX,
         };
         let mut reader = Self {
             data,
@@ -144,7 +146,9 @@ impl<'a> BitReader<'a> {
 
     #[inline(always)]
     fn consume_slow(&mut self, bit_offset: usize) -> Result<()> {
-        let end = self.len * 8;
+        // Where the end is not known, the data reach 64 bits past the byte the buffer
+        // was filled at, so they hold the up to 32 bits past `limit` consumed.
+        let end = self.len.saturating_mul(8);
         self.bit_offset = bit_offset.min(end);
         self.refill();
 
@@ -179,7 +183,11 @@ impl<'a> BitReader<'a> {
                 let mut bytes = [0; 8];
                 if byte_pos < self.len {
                     let n = (self.len - byte_pos).min(8);
-                    source.read_at(byte_pos, &mut bytes[..n]);
+                    let read = source.read_at(byte_pos, &mut bytes[..n]);
+                    if read < n {
+                        self.len = byte_pos + read;
+                        bytes[read..].fill(0);
+                    }
                 }
                 u64::from_be_bytes(bytes)
             }
@@ -188,6 +196,6 @@ impl<'a> BitReader<'a> {
         self.buffer = word << self.bit_pos();
         // The buffer contains bits up to `byte_pos * 8 + 64`. Refill once fewer
         // than 32 of them are left.
-        self.limit = (byte_pos * 8 + 32).min(self.len * 8);
+        self.limit = (byte_pos * 8 + 32).min(self.len.saturating_mul(8));
     }
 }

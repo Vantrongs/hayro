@@ -950,20 +950,21 @@ pub(crate) mod flate {
 }
 
 pub(crate) mod lzw {
-    use crate::filter::lzw_flate::flate::fallback::{Input, Slice};
+    use crate::filter::bytewise;
+    use crate::filter::lzw_flate::flate::fallback::Input;
     use crate::filter::lzw_flate::{PredictorParams, apply_predictor};
     use crate::work::Meter;
-    use alloc::vec;
     use alloc::vec::Vec;
 
     /// Decode a LZW-encoded stream, its work counted on `meter`; `None` once its hook
-    /// asks to stop.
+    /// asks to stop, or where a strict decoder finds an invalid code.
     pub(crate) fn decode(
         data: &[u8],
         params: &PredictorParams,
         meter: &Meter<'_>,
+        strict: bool,
     ) -> Option<Vec<u8>> {
-        decode_within(data, params, meter, usize::MAX).unwrap_or(None)
+        decode_within(data, params, meter, strict, usize::MAX).unwrap_or(None)
     }
 
     /// [`decode`], `Err` once it made more than `limit` bytes.
@@ -971,9 +972,11 @@ pub(crate) mod lzw {
         data: &[u8],
         params: &PredictorParams,
         meter: &Meter<'_>,
+        strict: bool,
         limit: usize,
     ) -> Result<Option<Vec<u8>>, ()> {
-        let Some(decoded) = decode_impl(data, params.early_change, meter, limit)? else {
+        let decoder = bytewise::Decoder::lzw(params.early_change);
+        let Some(decoded) = bytewise::decode_within(decoder, data, strict, meter, limit)? else {
             return Ok(None);
         };
 
@@ -983,32 +986,11 @@ pub(crate) mod lzw {
     const CLEAR_TABLE: usize = 256;
     const EOD: usize = 257;
     const MAX_ENTRIES: usize = 4096;
-    const INITIAL_SIZE: u16 = 258;
-
-    fn decode_impl(
-        data: &[u8],
-        early_change: bool,
-        meter: &Meter<'_>,
-        limit: usize,
-    ) -> Result<Option<Vec<u8>>, ()> {
-        let mut decoder = Decoder::new(early_change);
-        let mut input = Slice::new(data);
-        let mut decoded = vec![];
-        loop {
-            let step = decoder.step(&mut input, &mut decoded, meter);
-            if decoded.len() > limit {
-                return Err(());
-            }
-            match step {
-                Some(true) => {}
-                Some(false) => return Ok(Some(decoded)),
-                None => return Ok(None),
-            }
-        }
-    }
+    const INITIAL_SIZE: usize = 258;
 
     /// The decoder, a code at a time ([`Self::step`]), its codes read most
     /// significant bit first.
+    #[derive(Clone)]
     pub(crate) struct Decoder {
         table: Table,
         bit_size: u8,
@@ -1019,6 +1001,10 @@ pub(crate) mod lzw {
     }
 
     impl Decoder {
+        /// The most heap bytes a decoder holds: its table, full.
+        #[cfg(feature = "unsafe")]
+        pub(crate) const HEAP_BOUND: usize = MAX_ENTRIES * size_of::<Entry>();
+
         pub(crate) fn new(early_change: bool) -> Self {
             let table = Table::new(early_change);
             Self {
@@ -1028,6 +1014,16 @@ pub(crate) mod lzw {
                 buffer: 0,
                 bits: 0,
             }
+        }
+
+        pub(crate) fn early_change(&self) -> bool {
+            self.table.early_change
+        }
+
+        /// The heap bytes it holds.
+        #[cfg(feature = "unsafe")]
+        pub(crate) fn heap_bytes(&self) -> usize {
+            self.table.entries.capacity() * size_of::<Entry>()
         }
 
         /// The next `bit_size` bits; `None` where the input ends first.
@@ -1041,7 +1037,8 @@ pub(crate) mod lzw {
         }
 
         /// Decodes the next code into `decoded`: false at the end of the data,
-        /// `None` where it is invalid or the meter's hook asks to stop.
+        /// `None` where it is invalid or the meter's hook asks to stop, with nothing
+        /// appended.
         pub(crate) fn step(
             &mut self,
             input: &mut impl Input,
@@ -1072,23 +1069,16 @@ pub(crate) mod lzw {
                     }
 
                     if new < table.size() {
-                        let entry = table.get(new)?;
-                        let first_byte = entry[0];
-                        meter.work(entry.len()).ok()?;
-                        decoded.extend_from_slice(entry);
+                        meter.work(table.len(new)).ok()?;
+                        table.write(new, decoded);
 
                         if let Some(prev_code) = self.prev {
-                            table.register(prev_code, first_byte);
+                            table.register(prev_code, table.first(new));
                         }
-                    } else if new == table.size()
-                        && let Some(prev_code) = self.prev
-                    {
-                        let prev_entry = table.get(prev_code)?;
-                        let first_byte = prev_entry[0];
-
-                        let new_entry = table.register(prev_code, first_byte)?;
-                        meter.work(new_entry.len()).ok()?;
-                        decoded.extend_from_slice(new_entry);
+                    } else if let Some(prev_code) = self.prev {
+                        let new_entry = table.register(prev_code, table.first(prev_code))?;
+                        meter.work(table.len(new_entry)).ok()?;
+                        table.write(new_entry, decoded);
                     } else {
                         warn!("LZW decode error: code {new} not found and prev is None");
                         return None;
@@ -1102,53 +1092,88 @@ pub(crate) mod lzw {
         }
     }
 
+    /// The codes past the first 256 bytes and the clear and end codes, each the code
+    /// it extends by a byte.
+    #[derive(Clone)]
     struct Table {
         early_change: bool,
-        entries: Vec<Option<Vec<u8>>>,
+        /// Code `INITIAL_SIZE + i` is `entries[i]`.
+        entries: Vec<Entry>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct Entry {
+        prefix: u16,
+        last: u8,
+        first: u8,
+        len: u16,
     }
 
     impl Table {
         fn new(early_change: bool) -> Self {
-            let mut entries: Vec<_> = (0..=255).map(|b| Some(vec![b])).collect();
-
-            // Clear table and EOD don't have any data.
-            entries.push(None); // 256 = CLEAR_TABLE
-            entries.push(None); // 257 = EOD
-
             Self {
                 early_change,
-                entries,
+                entries: Vec::new(),
             }
         }
 
-        fn push(&mut self, entry: Vec<u8>) -> Option<&[u8]> {
-            if self.entries.len() >= MAX_ENTRIES {
-                None
-            } else {
-                self.entries.push(Some(entry));
-                self.entries.last()?.as_ref().map(|v| &**v)
+        /// The entry of code `code`, a valid one past the first 256.
+        fn entry(&self, code: usize) -> Entry {
+            self.entries[code - INITIAL_SIZE]
+        }
+
+        /// The bytes of valid code `code`.
+        fn len(&self, code: usize) -> usize {
+            match code {
+                0..=255 => 1,
+                _ => usize::from(self.entry(code).len),
             }
         }
 
-        fn register(&mut self, prev: usize, new_byte: u8) -> Option<&[u8]> {
-            let prev_entry = self.get(prev)?;
-
-            let mut new_entry = Vec::with_capacity(prev_entry.len() + 1);
-            new_entry.extend(prev_entry);
-            new_entry.push(new_byte);
-            self.push(new_entry)
+        /// The first byte of valid code `code`.
+        fn first(&self, code: usize) -> u8 {
+            match code {
+                0..=255 => code as u8,
+                _ => self.entry(code).first,
+            }
         }
 
-        fn get(&self, index: usize) -> Option<&[u8]> {
-            self.entries.get(index)?.as_ref().map(|v| &**v)
+        /// Appends the bytes of valid code `code` to `out`.
+        fn write(&self, code: usize, out: &mut Vec<u8>) {
+            let start = out.len();
+            out.resize(start + self.len(code), 0);
+            let mut code = code;
+            let mut at = out.len();
+            while code >= INITIAL_SIZE {
+                let entry = self.entry(code);
+                at -= 1;
+                out[at] = entry.last;
+                code = usize::from(entry.prefix);
+            }
+            out[start] = code as u8;
+        }
+
+        /// Adds the code of valid code `prev`'s bytes and `byte`, if the table has
+        /// room; returns it.
+        fn register(&mut self, prev: usize, byte: u8) -> Option<usize> {
+            if self.size() >= MAX_ENTRIES {
+                return None;
+            }
+            self.entries.push(Entry {
+                prefix: prev as u16,
+                last: byte,
+                first: self.first(prev),
+                len: self.len(prev) as u16 + 1,
+            });
+            Some(self.size() - 1)
         }
 
         fn clear(&mut self) {
-            self.entries.truncate(INITIAL_SIZE as usize);
+            self.entries.clear();
         }
 
         fn size(&self) -> usize {
-            self.entries.len()
+            INITIAL_SIZE + self.entries.len()
         }
 
         fn code_length(&self) -> u8 {
@@ -1156,7 +1181,7 @@ pub(crate) mod lzw {
             const ELEVEN: usize = 1024;
             const TWELVE: usize = 2048;
 
-            let adjusted = self.entries.len() + (if self.early_change { 1 } else { 0 });
+            let adjusted = self.size() + usize::from(self.early_change);
 
             if adjusted >= TWELVE {
                 12
@@ -1710,7 +1735,8 @@ mod tests {
     #[test]
     fn decode_lzw() {
         let input = [0x80, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01];
-        let decoded = lzw::decode(&input, &PredictorParams::default(), &Meter::default()).unwrap();
+        let decoded =
+            lzw::decode(&input, &PredictorParams::default(), &Meter::default(), false).unwrap();
 
         assert_eq!(decoded, vec![45, 45, 45, 45, 45, 65, 45, 45, 45, 66]);
     }

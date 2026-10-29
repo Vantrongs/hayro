@@ -2,6 +2,7 @@
 
 mod ascii_85;
 pub(crate) mod ascii_hex;
+pub(crate) mod bytewise;
 #[cfg(feature = "images")]
 pub(crate) mod ccitt;
 pub(crate) mod chain;
@@ -103,17 +104,17 @@ impl Filter {
             || lzw_flate::PredictorParams::from_params(params).ok_or(DecodeFailure::StreamDecode);
         let res =
             match self {
-                Self::AsciiHexDecode => ascii_hex::decode(data, meter)
+                Self::AsciiHexDecode => ascii_hex::decode(data, meter, strict)
                     .map(FilterResult::from_data)
                     .ok_or(DecodeFailure::StreamDecode),
-                Self::Ascii85Decode => ascii_85::decode(data, meter)
+                Self::Ascii85Decode => ascii_85::decode(data, meter, strict)
                     .map(FilterResult::from_data)
                     .ok_or(DecodeFailure::StreamDecode),
-                Self::RunLengthDecode => run_length::decode(data, meter)
+                Self::RunLengthDecode => run_length::decode(data, meter, strict)
                     .map(FilterResult::from_data)
                     .ok_or(DecodeFailure::StreamDecode),
                 Self::LzwDecode => predictor().and_then(|p| {
-                    lzw_flate::lzw::decode(data, &p, meter)
+                    lzw_flate::lzw::decode(data, &p, meter, strict)
                         .map(FilterResult::from_data)
                         .ok_or(DecodeFailure::StreamDecode)
                 }),

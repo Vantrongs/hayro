@@ -959,60 +959,32 @@ fn an_inline_image_is_never_decrypted() {
 }
 
 /// Rule 9: the filters a stream lists include its `/Crypt` filters, which decoding
-/// passes over; a stream with a `/Crypt` filter offers no incremental reader of its
-/// decoded data (`Stream::decoded_reader`), though it offers the strict one.
+/// passes over, as the incremental readers do: they read what decoding returns
+/// (`read` compares them), with the `/Crypt` filter before others or alone.
 #[test]
-fn crypt_filters_are_listed_and_have_no_incremental_reader() {
-    let pdf = open(
-        "listed",
-        one_stream(
-            Some(Handler::R4),
-            AESV2,
+fn crypt_filters_are_listed_and_passed_over_by_the_readers() {
+    for (name, filters, data) in [
+        (
+            "listed",
             "/Filter [/Crypt /FlateDecode] /DecodeParms [<< /Name /StdCF >> null]",
-            &zlib(CONTENT),
-            Cipher::Aes128,
+            zlib(CONTENT),
         ),
-    );
-    let stream = object(&pdf, 3);
-    assert_eq!(
-        stream.filters().as_slice(),
-        [Filter::Crypt, Filter::FlateDecode]
-    );
-    assert!(stream.decoded_reader().is_none());
-    assert!(!stream.can_read_incrementally());
-    assert!(
-        stream
-            .decoded_strict_reader(&Meter::default())
-            .unwrap()
-            .is_some()
-    );
-    // Without a /Crypt filter the reader is offered.
-    let pdf = open(
-        "listed_without_crypt",
-        one_stream(
-            Some(Handler::R4),
-            AESV2,
-            "/Filter /FlateDecode",
-            &zlib(CONTENT),
-            Cipher::Aes128,
-        ),
-    );
-    assert!(object(&pdf, 3).decoded_reader().is_some());
-    // Nor where the `/Crypt` filter is the only one.
-    let pdf = open(
-        "listed_alone",
-        one_stream(
-            Some(Handler::R4),
-            AESV2,
+        (
+            "listed_alone",
             "/Filter /Crypt /DecodeParms << /Name /StdCF >>",
-            CONTENT,
-            Cipher::Aes128,
+            CONTENT.to_vec(),
         ),
-    );
-    let stream = object(&pdf, 3);
-    assert_eq!(read(&stream), Ok(CONTENT.to_vec()));
-    assert!(stream.decoded_reader().is_none());
-    assert!(!stream.can_read_incrementally());
+    ] {
+        let pdf = open(
+            name,
+            one_stream(Some(Handler::R4), AESV2, filters, &data, Cipher::Aes128),
+        );
+        let stream = object(&pdf, 3);
+        assert_eq!(stream.filters().first(), Some(&Filter::Crypt), "{name}");
+        assert!(stream.can_read_incrementally(), "{name}");
+        assert!(stream.decoded_reader().is_some(), "{name}");
+        assert_eq!(read(&stream), Ok(CONTENT.to_vec()), "{name}");
+    }
 }
 
 /// Rule 10: of the streams of an encrypted document read as objects, only one whose

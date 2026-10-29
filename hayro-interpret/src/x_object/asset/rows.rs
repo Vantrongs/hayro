@@ -397,7 +397,7 @@ pub(super) enum MaskRows<'a> {
 }
 
 impl MaskRows<'_> {
-    /// The bytes the mask's incremental Flate decoder produced.
+    /// The bytes the mask's incremental decoders produced.
     pub(super) fn inflated_bytes(&self) -> u64 {
         match self {
             MaskRows::Streamed { raw, .. } => raw.reader.inflated_bytes(),

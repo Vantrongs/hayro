@@ -3,6 +3,7 @@
 #[cfg(feature = "unsafe")]
 use crate::crypto::reader::Cursor;
 use crate::crypto::reader::DecryptedReader;
+use crate::filter::bytewise::{Decoder, State};
 #[cfg(feature = "images")]
 use crate::filter::ccitt::CcittBytes;
 use crate::filter::lzw_flate::flate::fallback::{FlateStream, Input};
@@ -13,6 +14,8 @@ use crate::work::{Cancelled, Meter, POLL_BYTES};
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+#[cfg(feature = "unsafe")]
+use smallvec::SmallVec;
 
 /// How many decrypted encoded bytes the Flate decoders are given at a time.
 const INPUT_CHUNK: usize = 8192;
@@ -49,11 +52,14 @@ impl From<Cancelled> for ReadError {
 /// The decoded data of a stream, read from its start in pieces (see
 /// [`Stream::decoded_reader`](crate::object::Stream::decoded_reader)). It yields the
 /// bytes [`Stream::decoded`](crate::object::Stream::decoded) returns, but holds only
-/// the decoder's state, up to [`POLL_BYTES`] inflated ahead of the reads and a
-/// predictor row, not the whole result. A byte handed out is never taken back: the
-/// decoder is chosen before the first byte, as lenient whole decoding chooses it
-/// ([`flate::decode`](crate::filter::lzw_flate::flate::decode)). Every read counts its
-/// work on a [`Meter`], and stops when the meter's hook asks to.
+/// each filter's decoder state, up to [`POLL_BYTES`] it made ahead of the reads, a
+/// chunk of its input and a predictor row, not the whole result. A filter reads what
+/// the filters before it make as they make it. A byte handed out is never taken back:
+/// a Flate decoder is chosen before its first byte, as lenient whole decoding chooses
+/// it ([`flate::decode`](crate::filter::lzw_flate::flate::decode)), and other filters
+/// keep what they made before data they cannot read, as lenient whole decoding does
+/// ([`bytewise`](crate::filter::bytewise)). Every read counts its work on a [`Meter`],
+/// and stops when the meter's hook asks to.
 pub struct DecodedReader<'a> {
     source: Source<'a>,
     predictor: Option<Predicted>,
@@ -75,15 +81,37 @@ enum Source<'a> {
     /// Flate data read by the permissive decoder as it is read: data of which neither
     /// zlib nor raw deflate makes a byte, or, without the `unsafe` feature, any.
     Permissive(Box<FlateStream<Encoded<'a>>>),
+    /// Data of a filter whose decoder takes a byte or a few at a time.
+    Bytewise(Box<Stepping<'a>>),
     /// An image's CCITT data, decoded a row at a time.
     #[cfg(feature = "images")]
     Ccitt(Box<CcittBytes<'a>>),
 }
 
+/// What a filter decodes: the stored bytes, or what the filters before it make of
+/// them.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "every chain reads stored bytes, without an allocation; only a filter after another boxes its reader"
+)]
+enum Lower<'a> {
+    Stored(DecryptedReader<'a>),
+    Decoded(Box<DecodedReader<'a>>),
+}
+
+/// A filter a reader decodes, with its predictor's parameters.
+pub(crate) enum Codec {
+    Flate(PredictorParams),
+    Lzw(PredictorParams),
+    AsciiHex,
+    Ascii85,
+    RunLength,
+}
+
 /// Flate data inflated as it is read.
 #[cfg(feature = "unsafe")]
 struct Inflating<'a> {
-    data: DecryptedReader<'a>,
+    data: Lower<'a>,
     /// Decrypted encoded bytes, of which the decoder has taken `consumed`.
     input: Vec<u8>,
     consumed: usize,
@@ -100,10 +128,10 @@ struct Inflating<'a> {
 }
 
 /// A position in a stream's data to resume reading from (see
-/// [`DecodedReader::checkpoint`]): the decryption cursor, and for Flate data the
-/// decoder's state and history window and the input, output and predictor rows in
-/// flight. The stored bytes are not copied; the checkpoint keeps its stream, and with
-/// it those bytes, alive.
+/// [`DecodedReader::checkpoint`]): the decryption cursor, and for each filter its
+/// decoder's state (for Flate its history window) and the input, output and predictor
+/// rows in flight. The stored bytes are not copied; the checkpoint keeps its stream,
+/// and with it those bytes, alive.
 #[cfg(feature = "unsafe")]
 pub struct DecodedCheckpoint {
     /// Keeps the bytes at `data` alive, so no other bytes can take their address.
@@ -111,20 +139,37 @@ pub struct DecodedCheckpoint {
     /// The address and length of the stored bytes.
     data: (usize, usize),
     cursor: Cursor,
-    /// `None` for data stored without a filter.
-    inflating: Option<InflatingState>,
+    /// Where each filter was, the last one first; none for data stored without a
+    /// filter.
+    layers: SmallVec<[LayerState; 1]>,
 }
 
-/// Where a Flate decoder was.
+/// Where a filter's decoder was.
 #[cfg(feature = "unsafe")]
-struct InflatingState {
-    decoder: zlib_rs::Inflate,
-    zlib: bool,
-    /// Decrypted encoded bytes the decoder has not taken yet.
-    input: Vec<u8>,
-    /// Inflated bytes not read yet.
-    output: Vec<u8>,
+struct LayerState {
+    source: SourceState,
     predictor: Option<Predicted>,
+}
+
+#[cfg(feature = "unsafe")]
+enum SourceState {
+    Inflating {
+        decoder: zlib_rs::Inflate,
+        zlib: bool,
+        broken: bool,
+        /// Encoded bytes the decoder has not taken yet.
+        input: Vec<u8>,
+        /// Inflated bytes not read yet.
+        output: Vec<u8>,
+    },
+    Bytewise {
+        decoder: Decoder,
+        done: bool,
+        /// Encoded bytes the decoder has not taken yet.
+        input: Vec<u8>,
+        /// Decoded bytes not read yet.
+        made: Vec<u8>,
+    },
 }
 
 /// A predictor reversed on top of the source.
@@ -145,34 +190,49 @@ impl<'a> DecodedReader<'a> {
         }
     }
 
-    /// Flate data with its predictor `params`; `None` when the predictor is one only
-    /// the whole-data decoder handles.
-    pub(crate) fn flate(data: DecryptedReader<'a>, params: &PredictorParams) -> Option<Self> {
-        let predictor = match params.predictor {
-            1 => None,
-            _ => Some(Predicted {
+    /// `stored` decoded by `codecs` in turn; `None` when a predictor is one only the
+    /// whole-data decoder reverses.
+    pub(crate) fn decoding(stored: DecryptedReader<'a>, codecs: &[Codec]) -> Option<Self> {
+        let mut lower = Lower::Stored(stored);
+        for codec in codecs {
+            lower = Lower::Decoded(Box::new(Self::layer(lower, codec)?));
+        }
+        Some(match lower {
+            Lower::Stored(data) => Self::raw(data),
+            Lower::Decoded(reader) => *reader,
+        })
+    }
+
+    /// `lower` decoded by `codec`.
+    fn layer(lower: Lower<'a>, codec: &Codec) -> Option<Self> {
+        let (source, params) = match codec {
+            Codec::Flate(params) => (Source::flate(lower), Some(params)),
+            Codec::Lzw(params) => (
+                Source::bytewise(lower, Decoder::lzw(params.early_change)),
+                Some(params),
+            ),
+            Codec::AsciiHex => (Source::bytewise(lower, Decoder::ascii_hex()), None),
+            Codec::Ascii85 => (Source::bytewise(lower, Decoder::ascii_85()), None),
+            Codec::RunLength => (Source::bytewise(lower, Decoder::RunLength), None),
+        };
+        let predictor = match params {
+            Some(params) if params.predictor != 1 => Some(Predicted {
                 unpredictor: Unpredictor::new(params)?,
                 taken: 0,
             }),
+            _ => None,
         };
-        #[cfg(feature = "unsafe")]
-        let source = Source::Inflating(Inflating {
-            data,
-            input: Vec::new(),
-            consumed: 0,
-            output: Vec::new(),
-            handed: 0,
-            decoder: zlib_rs::Inflate::new(true, 15),
-            zlib: true,
-            broken: false,
-        });
-        #[cfg(not(feature = "unsafe"))]
-        let source = Source::permissive(data);
         Some(Self {
             source,
             predictor,
             inflated: 0,
         })
+    }
+
+    /// Flate data with its predictor `params` (see [`Self::decoding`]).
+    #[cfg(test)]
+    pub(crate) fn flate(data: DecryptedReader<'a>, params: &PredictorParams) -> Option<Self> {
+        Self::decoding(data, &[Codec::Flate(params.clone())])
     }
 
     /// The bytes the reader yields from its start, where it knows them without
@@ -195,9 +255,10 @@ impl<'a> DecodedReader<'a> {
         }
     }
 
-    /// The bytes this reader's Flate decoders produced, including those not read yet.
+    /// The bytes this reader's decoders produced, those of every filter and those not
+    /// read yet included.
     pub fn inflated_bytes(&self) -> u64 {
-        self.inflated
+        self.inflated + self.source.lower().map_or(0, Lower::inflated_bytes)
     }
 
     /// The most heap bytes a checkpoint of this reader holds
@@ -206,89 +267,229 @@ impl<'a> DecodedReader<'a> {
     #[cfg(feature = "unsafe")]
     pub fn checkpoint_heap_bound(&self) -> Option<usize> {
         self.checkpointable()?;
-        let Source::Inflating(inflating) = &self.source else {
-            return Some(0);
+        self.heap_bound()
+    }
+
+    /// The most heap bytes the states of this reader's filters hold.
+    #[cfg(feature = "unsafe")]
+    fn heap_bound(&self) -> Option<usize> {
+        let (own, lower) = match &self.source {
+            Source::Raw(_) => return Some(0),
+            Source::Inflating(inflating) => (
+                inflating.decoder.allocation_size() + INPUT_CHUNK + OUTPUT_CHUNK,
+                &inflating.data,
+            ),
+            Source::Bytewise(stepping) => (
+                stepping.decoder.heap_bound() + INPUT_CHUNK + MADE_AT_MOST,
+                &stepping.input.data,
+            ),
+            _ => return None,
         };
         let predictor = match &self.predictor {
             Some(p) => p.heap_bound()?,
             None => 0,
         };
-        (inflating.decoder.allocation_size() + INPUT_CHUNK + OUTPUT_CHUNK).checked_add(predictor)
+        let lower = match lower {
+            Lower::Stored(_) => 0,
+            Lower::Decoded(reader) => reader.heap_bound()?,
+        };
+        own.checked_add(predictor)?.checked_add(lower)
     }
 
     /// The reader's position, to resume from with [`Self::restore`] on a reader of the
-    /// same `stream`. `None` unless the reader inflates `stream`'s stored bytes
-    /// incrementally (not as stored, nor with the permissive decoder) or reads them
-    /// stored without a filter and decrypted with RC4 (which [`Self::skip`] otherwise
-    /// moves past from the start of its keystream), or when the decoder state cannot
-    /// be allocated.
+    /// same `stream`. `None` unless every filter is decoded incrementally (Flate by
+    /// zlib-rs, not by the permissive decoder; no image filter) over `stream`'s stored
+    /// bytes, or the reader reads them stored without a filter and decrypted with RC4
+    /// (which [`Self::skip`] otherwise moves past from the start of its keystream), or
+    /// when a decoder's state cannot be allocated.
     #[cfg(feature = "unsafe")]
     pub fn checkpoint(&self, stream: &OwnedStream) -> Option<DecodedCheckpoint> {
         let data = self.checkpointable()?;
         if !stream.holds(data) {
             return None;
         }
-        let (cursor, inflating) = match &self.source {
-            Source::Inflating(inflating) => (
-                inflating.data.cursor(),
-                Some(InflatingState {
-                    decoder: inflating.decoder.try_clone().ok()?,
-                    zlib: inflating.zlib,
-                    input: inflating.input[inflating.consumed..].to_vec(),
-                    output: inflating.output[inflating.handed..].to_vec(),
-                    predictor: self.predictor.clone(),
-                }),
-            ),
-            Source::Raw(data) => (data.cursor(), None),
-            _ => return None,
-        };
+        let mut layers = SmallVec::new();
+        let cursor = self.save(&mut layers)?;
         Some(DecodedCheckpoint {
             _stream: stream.clone(),
             data: address(data),
             cursor,
-            inflating,
+            layers,
         })
     }
 
+    /// Appends where this reader's filters are to `layers`, the last one first, and
+    /// returns where the stored bytes are read.
+    #[cfg(feature = "unsafe")]
+    fn save(&self, layers: &mut SmallVec<[LayerState; 1]>) -> Option<Cursor> {
+        let (source, lower) = match &self.source {
+            Source::Raw(data) => return Some(data.cursor()),
+            Source::Inflating(inflating) => (
+                SourceState::Inflating {
+                    decoder: inflating.decoder.try_clone().ok()?,
+                    zlib: inflating.zlib,
+                    broken: inflating.broken,
+                    input: inflating.input[inflating.consumed..].to_vec(),
+                    output: inflating.output[inflating.handed..].to_vec(),
+                },
+                &inflating.data,
+            ),
+            Source::Bytewise(stepping) => (
+                SourceState::Bytewise {
+                    decoder: stepping.decoder.clone(),
+                    done: stepping.done,
+                    input: stepping.input.buf[stepping.input.at..].to_vec(),
+                    made: stepping.made[stepping.handed..].to_vec(),
+                },
+                &stepping.input.data,
+            ),
+            _ => return None,
+        };
+        layers.push(LayerState {
+            source,
+            predictor: self.predictor.clone(),
+        });
+        match lower {
+            Lower::Stored(data) => Some(data.cursor()),
+            Lower::Decoded(reader) => reader.save(layers),
+        }
+    }
+
     /// Continues from `checkpoint`, as if the data before it had been read (with the
-    /// decoder chosen then). False, with the reader unchanged, when the checkpoint is
-    /// of other bytes or its decoder state cannot be allocated.
+    /// decoders chosen then). False, with the reader unchanged, when the checkpoint is
+    /// of other bytes or filters, or a decoder's state cannot be allocated.
     #[cfg(feature = "unsafe")]
     #[must_use]
     pub fn restore(&mut self, checkpoint: &DecodedCheckpoint) -> bool {
-        if self.checkpointable().map(address) != Some(checkpoint.data) {
+        if self.checkpointable().map(address) != Some(checkpoint.data)
+            || !self.fits(&checkpoint.layers)
+        {
             return false;
         }
-        match (&mut self.source, &checkpoint.inflating) {
-            (Source::Raw(data), None) => data.restore(&checkpoint.cursor),
-            (Source::Inflating(inflating), Some(state)) => {
-                let Ok(decoder) = state.decoder.try_clone() else {
+        let mut decoders = Vec::new();
+        for layer in &checkpoint.layers {
+            if let SourceState::Inflating { decoder, .. } = &layer.source {
+                let Ok(decoder) = decoder.try_clone() else {
                     return false;
                 };
-                inflating.decoder = decoder;
-                inflating.zlib = state.zlib;
-                inflating.broken = false;
-                inflating.data.restore(&checkpoint.cursor);
-                inflating.input.clone_from(&state.input);
-                inflating.consumed = 0;
-                inflating.output.clone_from(&state.output);
-                inflating.handed = 0;
-                self.predictor.clone_from(&state.predictor);
+                decoders.push(decoder);
             }
-            _ => return false,
         }
+        decoders.reverse();
+        self.load(&checkpoint.cursor, &checkpoint.layers, &mut decoders);
         true
     }
 
-    /// The document's bytes the reader reads, where it can be checkpointed: those the
-    /// incremental Flate decoder reads, or those stored without a filter and
+    /// Whether `layers` are the states of this reader's filters.
+    #[cfg(feature = "unsafe")]
+    fn fits(&self, layers: &[LayerState]) -> bool {
+        let (lower, rest) = match (&self.source, layers.split_first()) {
+            (Source::Raw(_), None) => return true,
+            (
+                Source::Inflating(inflating),
+                Some((
+                    LayerState {
+                        source: SourceState::Inflating { .. },
+                        ..
+                    },
+                    rest,
+                )),
+            ) => (&inflating.data, rest),
+            (
+                Source::Bytewise(stepping),
+                Some((
+                    LayerState {
+                        source: SourceState::Bytewise { .. },
+                        ..
+                    },
+                    rest,
+                )),
+            ) => (&stepping.input.data, rest),
+            _ => return false,
+        };
+        match lower {
+            Lower::Stored(_) => rest.is_empty(),
+            Lower::Decoded(reader) => reader.fits(rest),
+        }
+    }
+
+    /// Takes the state of [`Self::fits`] `layers`, the stored bytes read on from
+    /// `cursor`, with Flate decoders popped from `decoders`.
+    #[cfg(feature = "unsafe")]
+    fn load(
+        &mut self,
+        cursor: &Cursor,
+        layers: &[LayerState],
+        decoders: &mut Vec<zlib_rs::Inflate>,
+    ) {
+        let Some((layer, rest)) = layers.split_first() else {
+            if let Source::Raw(data) = &mut self.source {
+                data.restore(cursor);
+            }
+            return;
+        };
+        let lower = match (&mut self.source, &layer.source) {
+            (
+                Source::Inflating(inflating),
+                SourceState::Inflating {
+                    zlib,
+                    broken,
+                    input,
+                    output,
+                    ..
+                },
+            ) => {
+                if let Some(decoder) = decoders.pop() {
+                    inflating.decoder = decoder;
+                }
+                inflating.zlib = *zlib;
+                inflating.broken = *broken;
+                inflating.input.clone_from(input);
+                inflating.consumed = 0;
+                inflating.output.clone_from(output);
+                inflating.handed = 0;
+                &mut inflating.data
+            }
+            (
+                Source::Bytewise(stepping),
+                SourceState::Bytewise {
+                    decoder,
+                    done,
+                    input,
+                    made,
+                },
+            ) => {
+                stepping.decoder.clone_from(decoder);
+                stepping.done = *done;
+                stepping.input.buf.clone_from(input);
+                stepping.input.at = 0;
+                stepping.made.clone_from(made);
+                stepping.handed = 0;
+                &mut stepping.input.data
+            }
+            _ => return,
+        };
+        self.predictor.clone_from(&layer.predictor);
+        match lower {
+            Lower::Stored(data) => data.restore(cursor),
+            Lower::Decoded(reader) => reader.load(cursor, rest, decoders),
+        }
+    }
+
+    /// The document's bytes the reader reads, where it can be checkpointed: those
+    /// filters decoded incrementally read, or those stored without a filter and
     /// decrypted with RC4.
     #[cfg(feature = "unsafe")]
     fn checkpointable(&self) -> Option<&'a [u8]> {
-        match &self.source {
-            Source::Inflating(inflating) => inflating.data.borrowed_data(),
-            Source::Raw(data) if data.is_rc4() => data.borrowed_data(),
-            _ => None,
+        let lower = match &self.source {
+            Source::Raw(data) if data.is_rc4() => return data.borrowed_data(),
+            Source::Inflating(inflating) => &inflating.data,
+            Source::Bytewise(stepping) => &stepping.input.data,
+            _ => return None,
+        };
+        match lower {
+            Lower::Stored(data) => data.borrowed_data(),
+            Lower::Decoded(reader) => reader.checkpointable(),
         }
     }
 
@@ -297,11 +498,9 @@ impl<'a> DecodedReader<'a> {
     fn stored_read(&self) -> usize {
         match &self.source {
             Source::Raw(data) => data.position(),
-            Source::Permissive(stream) => stream.input.data.position(),
             #[cfg(feature = "images")]
             Source::Ccitt(_) => 0,
-            #[cfg(feature = "unsafe")]
-            Source::Inflating(inflating) => inflating.data.position(),
+            source => source.lower().map_or(0, Lower::stored_read),
         }
     }
 
@@ -381,15 +580,31 @@ impl<'a> DecodedReader<'a> {
 
 #[cfg(feature = "unsafe")]
 impl DecodedCheckpoint {
-    /// The bytes it holds on the heap: the decoder's state and window, and the input,
+    /// The bytes it holds on the heap: the decoders' state and windows, and the input,
     /// output and rows it copied.
     pub fn heap_bytes(&self) -> usize {
-        self.inflating.as_ref().map_or(0, |state| {
-            state.decoder.allocation_size()
-                + state.input.capacity()
-                + state.output.capacity()
-                + state.predictor.as_ref().map_or(0, Predicted::heap_bytes)
-        })
+        usize::from(self.layers.spilled()) * self.layers.capacity() * size_of::<LayerState>()
+            + self
+                .layers
+                .iter()
+                .map(|layer| {
+                    let source = match &layer.source {
+                        SourceState::Inflating {
+                            decoder,
+                            input,
+                            output,
+                            ..
+                        } => decoder.allocation_size() + input.capacity() + output.capacity(),
+                        SourceState::Bytewise {
+                            decoder,
+                            input,
+                            made,
+                            ..
+                        } => decoder.heap_bytes() + input.capacity() + made.capacity(),
+                    };
+                    source + layer.predictor.as_ref().map_or(0, Predicted::heap_bytes)
+                })
+                .sum::<usize>()
     }
 }
 
@@ -430,6 +645,48 @@ impl Predicted {
 }
 
 impl<'a> Source<'a> {
+    /// Flate data, inflated by zlib-rs, or without the `unsafe` feature by the
+    /// permissive decoder.
+    fn flate(data: Lower<'a>) -> Self {
+        #[cfg(feature = "unsafe")]
+        return Source::Inflating(Inflating {
+            data,
+            input: Vec::new(),
+            consumed: 0,
+            output: Vec::new(),
+            handed: 0,
+            decoder: zlib_rs::Inflate::new(true, 15),
+            zlib: true,
+            broken: false,
+        });
+        #[cfg(not(feature = "unsafe"))]
+        return Source::permissive(data);
+    }
+
+    fn bytewise(data: Lower<'a>, decoder: Decoder) -> Self {
+        Source::Bytewise(Box::new(Stepping {
+            input: Encoded::new(data),
+            decoder,
+            made: Vec::new(),
+            handed: 0,
+            done: false,
+        }))
+    }
+
+    /// What the filter decodes, where it is the output of other filters or stored
+    /// bytes it reads through a buffer.
+    fn lower(&self) -> Option<&Lower<'a>> {
+        match self {
+            Source::Raw(_) => None,
+            #[cfg(feature = "unsafe")]
+            Source::Inflating(inflating) => Some(&inflating.data),
+            Source::Permissive(stream) => Some(&stream.input.data),
+            Source::Bytewise(stepping) => Some(&stepping.input.data),
+            #[cfg(feature = "images")]
+            Source::Ccitt(_) => None,
+        }
+    }
+
     fn rewind(&mut self) {
         match self {
             Source::Raw(data) => data.rewind(),
@@ -440,13 +697,14 @@ impl<'a> Source<'a> {
                 input.rewind();
                 **stream = FlateStream::stepping(input, PERMISSIVE_STEP);
             }
+            Source::Bytewise(stepping) => stepping.rewind(),
             #[cfg(feature = "images")]
             Source::Ccitt(bytes) => bytes.rewind(),
         }
     }
 
     /// `data` read by the permissive Flate decoder from its start.
-    fn permissive(mut data: DecryptedReader<'a>) -> Self {
+    fn permissive(mut data: Lower<'a>) -> Self {
         data.rewind();
         Source::Permissive(Box::new(FlateStream::stepping(
             Encoded::new(data),
@@ -482,6 +740,10 @@ impl<'a> Source<'a> {
                 Source::Permissive(stream) => {
                     if stream.pending().is_empty() {
                         stream.step(meter, PERMISSIVE_STEP)?;
+                        // A filter before it may have stopped, which ends its input.
+                        if meter.cancelled() {
+                            return Err(Cancelled);
+                        }
                         *inflated += stream.pending().len() as u64;
                     }
                     // A step stops with nothing made only at the end.
@@ -491,6 +753,7 @@ impl<'a> Source<'a> {
                     stream.hand(n);
                     return Ok(n);
                 }
+                Source::Bytewise(stepping) => return stepping.read(buf, inflated, meter),
                 #[cfg(feature = "images")]
                 Source::Ccitt(bytes) => return bytes.read(buf, meter),
             }
@@ -520,14 +783,103 @@ impl<'a> Source<'a> {
 /// The bytes [`DecodedReader::skip`] reads at a time, on the stack.
 const SKIP_CHUNK: usize = 8 * 1024;
 
+/// The most bytes a decoder that takes a byte or a few at a time holds made: a poll's
+/// worth, and the most one step makes past it (an LZW code's bytes).
+#[cfg(feature = "unsafe")]
+const MADE_AT_MOST: usize = POLL_BYTES + 4096;
+
 /// No data.
-fn empty<'a>() -> DecryptedReader<'a> {
-    DecryptedReader::raw(Cow::Borrowed(&[]))
+fn empty<'a>() -> Lower<'a> {
+    Lower::Stored(DecryptedReader::raw(Cow::Borrowed(&[])))
 }
 
-/// Stored Flate data, decrypted as the permissive decoder takes it, a chunk at a time.
+impl<'a> Lower<'a> {
+    /// Fills `buf` with the next bytes and returns how many, 0 only at the end.
+    /// Stored bytes count nothing: the decoder that takes them counts them.
+    fn read(&mut self, buf: &mut [u8], meter: &Meter<'_>) -> Result<usize, Cancelled> {
+        match self {
+            Lower::Stored(data) => Ok(data.read(buf)),
+            Lower::Decoded(reader) => reader.read(buf, meter),
+        }
+    }
+
+    fn rewind(&mut self) {
+        match self {
+            Lower::Stored(data) => data.rewind(),
+            Lower::Decoded(reader) => reader.rewind(),
+        }
+    }
+
+    fn inflated_bytes(&self) -> u64 {
+        match self {
+            Lower::Stored(_) => 0,
+            Lower::Decoded(reader) => reader.inflated_bytes(),
+        }
+    }
+
+    #[cfg(all(test, feature = "unsafe"))]
+    fn stored_read(&self) -> usize {
+        match self {
+            Lower::Stored(data) => data.position(),
+            Lower::Decoded(reader) => reader.stored_read(),
+        }
+    }
+}
+
+/// Data of a filter whose decoder takes a byte or a few at a time, decoded a poll's
+/// worth at a time.
+struct Stepping<'a> {
+    input: Encoded<'a>,
+    decoder: Decoder,
+    /// Bytes made, of which `handed` were read.
+    made: Vec<u8>,
+    handed: usize,
+    /// Whether the decoder reached the end of the data, or data it cannot read, which
+    /// end them.
+    done: bool,
+}
+
+impl Stepping<'_> {
+    fn rewind(&mut self) {
+        self.input.rewind();
+        self.decoder.start_over();
+        self.made.clear();
+        self.handed = 0;
+        self.done = false;
+    }
+
+    fn read(
+        &mut self,
+        buf: &mut [u8],
+        inflated: &mut u64,
+        meter: &Meter<'_>,
+    ) -> Result<usize, Cancelled> {
+        if self.handed == self.made.len() {
+            if self.done {
+                return Ok(0);
+            }
+            self.made.clear();
+            self.handed = 0;
+            let state =
+                self.decoder
+                    .make(&mut self.input, &mut self.made, POLL_BYTES, false, meter);
+            // A stop ends the decoder's input or work as the end of the data would.
+            if meter.cancelled() {
+                return Err(Cancelled);
+            }
+            self.done = state != State::Going;
+            *inflated += self.made.len() as u64;
+        }
+        let n = buf.len().min(self.made.len() - self.handed);
+        buf[..n].copy_from_slice(&self.made[self.handed..][..n]);
+        self.handed += n;
+        Ok(n)
+    }
+}
+
+/// The data a decoder takes a few bytes at a time, read a chunk at a time.
 struct Encoded<'a> {
-    data: DecryptedReader<'a>,
+    data: Lower<'a>,
     /// Decrypted bytes, of which the decoder took those before `at`.
     buf: Vec<u8>,
     at: usize,
@@ -535,7 +887,7 @@ struct Encoded<'a> {
 }
 
 impl<'a> Encoded<'a> {
-    fn new(data: DecryptedReader<'a>) -> Self {
+    fn new(data: Lower<'a>) -> Self {
         Self {
             data,
             buf: Vec::new(),
@@ -551,14 +903,15 @@ impl<'a> Encoded<'a> {
         self.taken = 0;
     }
 
-    /// Makes `ahead` + 1 bytes available, if the data holds as many.
-    fn fill(&mut self, ahead: usize) -> bool {
+    /// Makes `ahead` + 1 bytes available, if the data holds as many. A stop ends
+    /// them, which the decoder's caller finds on the meter.
+    fn fill(&mut self, ahead: usize, meter: &Meter<'_>) -> bool {
         while self.buf.len() - self.at <= ahead {
             self.buf.drain(..self.at);
             self.at = 0;
             let len = self.buf.len();
             self.buf.resize(len + INPUT_CHUNK, 0);
-            let n = self.data.read(&mut self.buf[len..]);
+            let n = self.data.read(&mut self.buf[len..], meter).unwrap_or(0);
             self.buf.truncate(len + n);
             if n == 0 {
                 return false;
@@ -571,8 +924,8 @@ impl<'a> Encoded<'a> {
 /// The decoder counts the bytes it takes.
 impl Input for Encoded<'_> {
     #[inline]
-    fn next(&mut self, _: &Meter<'_>) -> Option<u8> {
-        if self.at == self.buf.len() && !self.fill(0) {
+    fn next(&mut self, meter: &Meter<'_>) -> Option<u8> {
+        if self.at == self.buf.len() && !self.fill(0, meter) {
             return None;
         }
         let byte = self.buf[self.at];
@@ -582,19 +935,19 @@ impl Input for Encoded<'_> {
     }
 
     #[inline]
-    fn peek(&mut self, ahead: usize, _: &Meter<'_>) -> Option<u8> {
+    fn peek(&mut self, ahead: usize, meter: &Meter<'_>) -> Option<u8> {
         if let Some(&byte) = self.buf.get(self.at + ahead) {
             return Some(byte);
         }
-        self.fill(ahead).then(|| self.buf[self.at + ahead])
+        self.fill(ahead, meter).then(|| self.buf[self.at + ahead])
     }
 
     fn taken(&self) -> usize {
         self.taken
     }
 
-    fn take(&mut self, max: usize, _: &Meter<'_>) -> &[u8] {
-        self.fill(0);
+    fn take(&mut self, max: usize, meter: &Meter<'_>) -> &[u8] {
+        self.fill(0, meter);
         let n = max.min(self.buf.len() - self.at);
         self.at += n;
         self.taken += n;
@@ -662,9 +1015,10 @@ impl Inflating<'_> {
         loop {
             if self.consumed == self.input.len() {
                 self.input.resize(INPUT_CHUNK, 0);
-                let n = self.data.read(&mut self.input);
-                self.input.truncate(n);
+                let read = self.data.read(&mut self.input, meter);
+                self.input.truncate(*read.as_ref().unwrap_or(&0));
                 self.consumed = 0;
+                read?;
             }
             let input = &self.input[self.consumed..];
             let flush = if input.is_empty() {

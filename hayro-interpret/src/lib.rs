@@ -51,6 +51,15 @@ mod fixtures;
 #[allow(dead_code)]
 mod rc4_fixtures;
 
+#[cfg(test)]
+#[path = "../../hayro-syntax/tests/common/chains.rs"]
+#[allow(dead_code)]
+mod chains;
+
+/// What the encoders of `chains` use.
+#[cfg(test)]
+use fixtures::{noise, stored_zlib};
+
 pub mod color;
 pub mod encode;
 pub mod font;

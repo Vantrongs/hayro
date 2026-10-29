@@ -14,6 +14,9 @@ pub(crate) use fixtures::{
     file, file_with_aliases, noise, one_page, one_page_objects, stored_zlib, stream,
 };
 
+#[path = "../../../hayro-syntax/tests/common/chains.rs"]
+pub(crate) mod chains;
+
 #[path = "../../../hayro-syntax/tests/common/cpu_time.rs"]
 mod cpu_time;
 pub(crate) use cpu_time::thread_cpu_time;

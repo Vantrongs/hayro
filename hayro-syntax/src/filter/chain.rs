@@ -29,11 +29,11 @@
 //! [`LIVE`] streamed layers and the one over them restarts at most `2 * LIVE + 2`
 //! times, however its layers are damaged.
 
+use crate::filter::bytewise::{Decoder, State};
 use crate::filter::lzw_flate::flate::fallback::{FlateStream, Input};
 use crate::filter::lzw_flate::{PredictorParams, Unpredictor, flate, lzw};
 use crate::filter::reader::ReadError;
 use crate::filter::{ascii_85, ascii_hex, run_length};
-use crate::trivia::is_white_space_character;
 use crate::work::{Meter, POLL_BYTES};
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
@@ -82,13 +82,15 @@ impl Layer {
                 flate::decode_within(data, params, meter, true, 0, limit).map_err(|l| l.tried)?
             }
             Self::Lzw(params, _) => {
-                lzw::decode_within(data, params, meter, limit).map_err(|()| 0_usize)?
+                lzw::decode_within(data, params, meter, true, limit).map_err(|()| 0_usize)?
             }
             // Each makes at most as many bytes as half, four times and 64 times the data.
-            Self::AsciiHex => ascii_hex::decode(data, meter),
-            Self::Ascii85 if data.len().saturating_mul(4) <= limit => ascii_85::decode(data, meter),
+            Self::AsciiHex => ascii_hex::decode(data, meter, true),
+            Self::Ascii85 if data.len().saturating_mul(4) <= limit => {
+                ascii_85::decode(data, meter, true)
+            }
             Self::RunLength if data.len().saturating_mul(64) <= limit => {
-                run_length::decode(data, meter)
+                run_length::decode(data, meter, true)
             }
             Self::Ascii85 | Self::RunLength => return Err(0),
         };
@@ -117,12 +119,12 @@ impl Layer {
                 predicted(Box::new(Flate::new(from, Which::after(tried))), unpredictor)
             }
             Self::Lzw(params, unpredictor) => predicted(
-                Box::new(Bytewise::lzw(from, params.early_change)),
+                Box::new(Bytewise::new(from, Decoder::lzw(params.early_change))),
                 unpredictor,
             ),
-            Self::AsciiHex => Box::new(Bytewise::ascii_hex(from)),
-            Self::Ascii85 => Box::new(Bytewise::ascii_85(from)),
-            Self::RunLength => Box::new(Bytewise::run_length(from)),
+            Self::AsciiHex => Box::new(Bytewise::new(from, Decoder::ascii_hex())),
+            Self::Ascii85 => Box::new(Bytewise::new(from, Decoder::ascii_85())),
+            Self::RunLength => Box::new(Bytewise::new(from, Decoder::RunLength)),
         }
     }
 }
@@ -512,16 +514,6 @@ impl Made {
     }
 }
 
-/// Where a stage's decoding is.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum State {
-    Going,
-    /// At the end of the data, the stages before read to their end.
-    Done,
-    /// At data that cannot be decoded, the stages before read to their end.
-    Failed,
-}
-
 /// What a Flate decoder found when it made bytes.
 enum Found {
     More,
@@ -786,29 +778,6 @@ impl Stage for Predict<'_> {
     }
 }
 
-/// The decoders that take a byte or a few at a time.
-enum Decoder {
-    Lzw(lzw::Decoder, bool),
-    /// The high digit of the byte being read.
-    AsciiHex(Option<u8>),
-    /// The digits of the group being read.
-    Ascii85(Vec<u8>),
-    RunLength,
-}
-
-impl Decoder {
-    fn start_over(&mut self) {
-        *self = match self {
-            Self::Lzw(_, early_change) => {
-                Self::Lzw(lzw::Decoder::new(*early_change), *early_change)
-            }
-            Self::AsciiHex(_) => Self::AsciiHex(None),
-            Self::Ascii85(_) => Self::Ascii85(Vec::new()),
-            Self::RunLength => Self::RunLength,
-        }
-    }
-}
-
 /// A stage of a decoder that takes a byte or a few at a time.
 struct Bytewise<'a> {
     input: Pulled<'a>,
@@ -827,23 +796,6 @@ impl<'a> Bytewise<'a> {
         }
     }
 
-    fn lzw(from: Box<dyn Stage + 'a>, early_change: bool) -> Self {
-        let decoder = Decoder::Lzw(lzw::Decoder::new(early_change), early_change);
-        Self::new(from, decoder)
-    }
-
-    fn ascii_hex(from: Box<dyn Stage + 'a>) -> Self {
-        Self::new(from, Decoder::AsciiHex(None))
-    }
-
-    fn ascii_85(from: Box<dyn Stage + 'a>) -> Self {
-        Self::new(from, Decoder::Ascii85(Vec::new()))
-    }
-
-    fn run_length(from: Box<dyn Stage + 'a>) -> Self {
-        Self::new(from, Decoder::RunLength)
-    }
-
     fn start_over(&mut self) {
         self.decoder.start_over();
         self.state = State::Going;
@@ -852,21 +804,8 @@ impl<'a> Bytewise<'a> {
 
     /// Decodes until a poll's worth is made or the data end or fail.
     fn make(&mut self, meter: &Meter<'_>) -> State {
-        let out = &mut self.made.buf;
-        let input = &mut self.input;
-        match &mut self.decoder {
-            Decoder::Lzw(decoder, _) => loop {
-                match decoder.step(input, out, meter) {
-                    Some(true) if out.len() < POLL_BYTES => {}
-                    Some(true) => break State::Going,
-                    Some(false) => break State::Done,
-                    None => break State::Failed,
-                }
-            },
-            Decoder::AsciiHex(high) => ascii_hex(input, high, out, meter),
-            Decoder::Ascii85(group) => ascii_85(input, group, out, meter),
-            Decoder::RunLength => run_length(input, out, meter),
-        }
+        self.decoder
+            .make(&mut self.input, &mut self.made.buf, POLL_BYTES, true, meter)
     }
 }
 
@@ -902,145 +841,4 @@ impl Stage for Bytewise<'_> {
         self.input.rewind();
         self.start_over();
     }
-}
-
-/// As `ascii_hex::decode` decodes the data: up to a `>`, white space skipped, a last
-/// digit alone taken as the high one.
-fn ascii_hex(
-    input: &mut Pulled<'_>,
-    high: &mut Option<u8>,
-    out: &mut Vec<u8>,
-    meter: &Meter<'_>,
-) -> State {
-    loop {
-        if out.len() >= POLL_BYTES {
-            return State::Going;
-        }
-        let available = input.available(meter);
-        if available.is_empty() {
-            break;
-        }
-        let end = available.iter().position(|&b| b == b'>');
-        let len = end.unwrap_or(available.len());
-        for &byte in &available[..len] {
-            if is_white_space_character(byte) {
-                continue;
-            }
-            let Some(digit) = ascii_hex::decode_hex_digit(byte) else {
-                return State::Failed;
-            };
-            match high.take() {
-                Some(high) => out.push(high << 4 | digit),
-                None => *high = Some(digit),
-            }
-        }
-        input.consume(len + usize::from(end.is_some()));
-        if meter.work(len + 1).is_err() {
-            return State::Failed;
-        }
-        if end.is_some() {
-            break;
-        }
-    }
-    if let Some(high) = high.take() {
-        out.push(high << 4);
-    }
-    State::Done
-}
-
-/// As `ascii_85::decode` decodes the data.
-fn ascii_85(
-    input: &mut Pulled<'_>,
-    group: &mut Vec<u8>,
-    out: &mut Vec<u8>,
-    meter: &Meter<'_>,
-) -> State {
-    const POW_85: [u32; 5] = [52200625, 614125, 7225, 85, 1];
-    let flush = |group: &mut Vec<u8>, out: &mut Vec<u8>| -> Option<()> {
-        let len = group.len();
-        match len {
-            0 => return Some(()),
-            // A single character is not valid.
-            1 => return None,
-            _ => {}
-        }
-        let mut digits = [u32::from(b'u' - b'!'); 5];
-        for (digit, b) in digits.iter_mut().zip(group.iter()) {
-            *digit = u32::from(b - b'!');
-        }
-        let value = digits[0]
-            .checked_mul(POW_85[0])?
-            .checked_add(digits[1].checked_mul(POW_85[1])?)?
-            .checked_add(digits[2].checked_mul(POW_85[2])?)?
-            .checked_add(digits[3].checked_mul(POW_85[3])?)?
-            .checked_add(digits[4])?;
-        out.extend_from_slice(&value.to_be_bytes()[..len - 1]);
-        group.clear();
-        Some(())
-    };
-    let end = |flushed: Option<()>| match flushed {
-        Some(()) => State::Done,
-        None => State::Failed,
-    };
-    while out.len() < POLL_BYTES {
-        let Some(b) = input.next(meter) else {
-            // Be lenient and accept what we have (see PDFBOX-5910).
-            return end(flush(group, out));
-        };
-        if meter.work(1).is_err() {
-            return State::Failed;
-        }
-        if is_white_space_character(b) {
-            continue;
-        }
-        match b {
-            b'!'..=b'u' => {
-                group.push(b);
-                if group.len() == 5 && flush(group, out).is_none() {
-                    return State::Failed;
-                }
-            }
-            b'z' => {
-                if flush(group, out).is_none() {
-                    return State::Failed;
-                }
-                out.extend_from_slice(&[0, 0, 0, 0]);
-            }
-            b'~' => return end(flush(group, out)),
-            _ => return State::Failed,
-        }
-    }
-    State::Going
-}
-
-/// As `run_length::decode` decodes the data: data that end without an end of data
-/// marker fail, unless they end in a run of bytes as they are that is cut short.
-fn run_length(input: &mut Pulled<'_>, out: &mut Vec<u8>, meter: &Meter<'_>) -> State {
-    while out.len() < POLL_BYTES {
-        let Some(length) = input.next(meter) else {
-            return State::Failed;
-        };
-        if meter.work(usize::from(length) + 1).is_err() {
-            return State::Failed;
-        }
-        match length {
-            128 => return State::Done,
-            0..=127 => {
-                let n = usize::from(length) + 1;
-                if input.peek(n - 1, meter).is_none() {
-                    return State::Done;
-                }
-                for _ in 0..n {
-                    out.extend(input.next(meter));
-                }
-            }
-            _ => {
-                let Some(byte) = input.next(meter) else {
-                    return State::Failed;
-                };
-                out.extend(core::iter::repeat_n(byte, 257 - usize::from(length)));
-            }
-        }
-    }
-    State::Going
 }

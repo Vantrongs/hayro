@@ -5,6 +5,7 @@
 
 pub(crate) mod allocations;
 pub(crate) mod ceilings;
+pub(crate) mod chains;
 pub(crate) mod cpu_time;
 mod fixtures;
 pub(crate) mod rc4;

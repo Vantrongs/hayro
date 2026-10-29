@@ -70,21 +70,19 @@ pub fn decode(data: &[u8], decoder: &mut impl Decoder, ctx: &mut DecoderContext)
 }
 
 /// Encoded data read a few bytes at a time ([`RowDecoder::from_source`]). Decoding
-/// reads it mostly forward, and after a damaged line in Group 3 data again from the
-/// line's start.
+/// reads it mostly forward, and again from where a row's decoding started (the
+/// start of a damaged line in Group 3 data, or after looking ahead for an EOL),
+/// never from before it ([`RowDecoder::byte_position`]).
 pub trait Source {
-    /// The bytes of the data.
-    fn len(&self) -> usize;
-    /// Whether the data is empty.
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-    /// Copies the bytes from `pos` on into `out`, which the data holds whole.
-    fn read_at(&self, pos: usize, out: &mut [u8]);
+    /// Copies the bytes from `pos` on into `out` and returns how many the data holds
+    /// there: fewer than `out` holds only at its end.
+    fn read_at(&self, pos: usize, out: &mut [u8]) -> usize;
 }
 
 /// Decodes CCITT data a row at a time, as its reader asks for rows, rather than
 /// pushing them all as [`decode`] does: it pushes the same rows and ends the same.
+/// A copy decodes on from where the original was.
+#[derive(Clone)]
 pub struct RowDecoder<'a> {
     reader: BitReader<'a>,
     ctx: DecoderContext,
@@ -127,6 +125,12 @@ impl<'a> RowDecoder<'a> {
     /// The rows pushed so far.
     pub fn decoded_rows(&self) -> u32 {
         self.ctx.decoded_rows
+    }
+
+    /// The byte of the data the next row's decoding starts in: it reads no byte
+    /// before it.
+    pub fn byte_position(&self) -> usize {
+        self.reader.byte_pos()
     }
 
     /// The colour changes of the last row pushed, as [`Decoder::push_row`] was given
