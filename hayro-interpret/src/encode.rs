@@ -458,6 +458,33 @@ impl EncodedShadingPattern {
         ))
     }
 
+    /// The shading at each of `points`, in the space of
+    /// [`sample_texture`](Self::sample_texture)'s `bbox`, passed to `f` in their
+    /// order as straight RGBA, its work and memory taken of `meter` first as
+    /// [`sample_texture_metered`](Self::sample_texture_metered) takes them.
+    /// `Exhausted`, with no point passed to `f`, when `meter` refuses. A mesh is
+    /// sampled at the pixels the points fall in, as its texture is.
+    pub fn sample_points_metered(
+        &self,
+        points: &[Point],
+        meter: &mut dyn Meter,
+        mut f: impl FnMut([f32; 4]),
+    ) -> Result<(), Exhausted> {
+        take(
+            meter,
+            self.setup_cost() + self.point_cost().times(points.len() as u64),
+        )?;
+        let samples = self.samples_at(meter, |reach| {
+            for point in points {
+                reach.add(self.base_transform * *point);
+            }
+        })?;
+        for point in points {
+            f(self.sample_in(self.base_transform * *point, samples.as_ref()));
+        }
+        Ok(())
+    }
+
     /// The first point [`sample_texture`](Self::sample_texture) samples, the steps to
     /// the next across and the next row, and how many across and rows.
     fn texture_grid(&self, bbox: Rect, scale: f32) -> (Point, Vec2, Vec2, u32, u32) {
@@ -1399,6 +1426,49 @@ mod tests {
             let asked: u64 = meter.asked.iter().sum();
             assert_eq!(*taken.get_or_insert(asked), asked, "{n} functions");
         }
+    }
+
+    /// Points sampled one by one are the colours a texture samples at the same
+    /// points, paid for as the texture's are, and a meter that refuses them
+    /// stops the sampling before any colour is passed on.
+    #[test]
+    fn points_are_sampled_as_a_texture_samples_them() {
+        let pattern = shading_pattern(&[
+            "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+            "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 10 3] \
+             /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0.5 1] /N 1 >> >>"
+                .to_string(),
+        ]);
+        let encoded = pattern.encode();
+        let bbox = Rect::new(0.0, 0.0, 10.0, 4.0);
+        let mut texture = vec![];
+        let (width, _, to_bbox) = encoded.sample_texture(bbox, 1.0, |c| texture.push(c));
+        let points: Vec<Point> = (0..texture.len())
+            .map(|i| {
+                let (x, y) = (i as u32 % width, i as u32 / width);
+                to_bbox * Point::new(f64::from(x) + 0.5, f64::from(y) + 0.5)
+            })
+            .collect();
+        let mut meter = Recording {
+            left: u64::MAX,
+            asked: vec![],
+            held: vec![],
+        };
+        let mut sampled = vec![];
+        encoded
+            .sample_points_metered(&points, &mut meter, |c| sampled.push(c))
+            .expect("given all it asks");
+        assert_eq!(sampled, texture);
+        let whole = encoded.setup_cost() + encoded.point_cost().times(points.len() as u64);
+        assert_eq!(meter.asked, vec![whole.steps()]);
+        let mut meter = Recording {
+            left: whole.steps() - 1,
+            asked: vec![],
+            held: vec![],
+        };
+        let mut passed = 0;
+        let refused = encoded.sample_points_metered(&points, &mut meter, |_| passed += 1);
+        assert_eq!((refused, passed), (Err(Exhausted), 0));
     }
 
     /// A patch mesh is sampled as the triangles it is cut into are, one patch
