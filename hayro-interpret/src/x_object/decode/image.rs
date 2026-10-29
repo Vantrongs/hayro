@@ -3,12 +3,10 @@ use super::{
     DecodeContext, decode_context, decode_u8_samples, fix_image_length, in_pieces, into_owned,
     pixel_piece, unpack_samples,
 };
-use crate::color::{ColorComponents, ColorSpace, ToLuma, ToRgb};
+use crate::color::{ColorSpace, ToLuma, ToRgb};
 use crate::interpret::state::ActiveTransferFunction;
-use crate::x_object::image::ImageXObject;
+use crate::x_object::image::SampledImage;
 use crate::{ImageData, LumaData, RgbData};
-use hayro_syntax::object::Stream;
-use hayro_syntax::object::dict::keys::*;
 use hayro_syntax::work::{Meter, POLL_BYTES};
 use smallvec::SmallVec;
 
@@ -53,7 +51,7 @@ pub(crate) struct DecodedImage {
 /// The image decoded whole, its work counted on `meter`; `None` also once the
 /// meter's hook asks to stop.
 pub(crate) fn decode_image(
-    obj: &ImageXObject<'_>,
+    obj: &SampledImage,
     target_dimension: Option<(u32, u32)>,
     meter: &Meter<'_>,
 ) -> Option<DecodedImage> {
@@ -62,23 +60,23 @@ pub(crate) fn decode_image(
     decoded.filter(|_| !meter.cancelled())
 }
 
-struct ImageDecoder<'a, 'b, 'm> {
-    obj: &'a ImageXObject<'b>,
-    ctx: DecodeContext<'b>,
+struct ImageDecoder<'a, 'm> {
+    obj: &'a SampledImage,
+    ctx: DecodeContext<'a>,
     target_dimension: Option<(u32, u32)>,
     color_key_mask: Option<SmallVec<[u16; 4]>>,
     decoded_color_key_mask: Option<LumaData>,
     meter: &'m Meter<'m>,
 }
 
-impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
+impl<'a, 'm> ImageDecoder<'a, 'm> {
     fn new(
-        obj: &'a ImageXObject<'b>,
+        obj: &'a SampledImage,
         target_dimension: Option<(u32, u32)>,
         meter: &'m Meter<'m>,
     ) -> Option<Self> {
         let ctx = decode_context(obj, target_dimension, meter)?;
-        let color_key_mask = obj.stream.dict().get::<SmallVec<[u16; 4]>>(MASK);
+        let color_key_mask = obj.masks.color_key.clone();
 
         Some(Self {
             obj,
@@ -259,9 +257,9 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
 
         // If the alpha channel is invalid, return no alpha so the main image can
         // still be returned (see PDFJS-19611).
-        let dict = self.obj.stream.dict();
+        let masks = &self.obj.masks;
 
-        if let Some(1) = dict.get::<u8>(SMASK_IN_DATA) {
+        if masks.in_data {
             let mut data = self
                 .ctx
                 .decoded
@@ -285,13 +283,10 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
                 scale_factors: self.ctx.scale_factors,
             })
             // Note: `SMASK` field takes precedence over `MASK`, so order matters here.
-        } else if let Some(s_mask) = dict
-            .get::<Stream<'_>>(SMASK)
-            .or_else(|| dict.get::<Stream<'_>>(MASK))
-        {
-            let obj = ImageXObject::new_mask(&s_mask, &self.obj.warning_sink, &self.obj.cache)?;
+        } else if let Some(s_mask) = masks.smask.as_ref().or(masks.mask.as_ref()) {
+            let obj = s_mask.as_deref()?;
 
-            decode_mask(&obj, self.target_dimension, self.meter).map(|decoded| decoded.luma)
+            decode_mask(obj, self.target_dimension, self.meter).map(|decoded| decoded.luma)
         } else if self.color_key_mask.is_some() {
             self.decoded_color_key_mask
                 .take()
@@ -302,8 +297,9 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
     }
 
     fn resolve_matte(&self) -> Option<(LumaData, [u8; 3])> {
-        let s_mask = self.obj.stream.dict().get::<Stream<'_>>(SMASK)?;
-        let matte = s_mask.dict().get::<ColorComponents>(MATTE)?;
+        let masks = &self.obj.masks;
+        let s_mask = masks.smask.as_ref()?;
+        let matte = masks.matte.as_ref()?;
 
         if matte.len() != self.ctx.color_space.num_components() as usize {
             return None;
@@ -312,10 +308,10 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
         // In theory, matte needs to be applied in the image's original color space,
         // but we always do it in RGB for now.
         let mut matte_rgb = [0_u8; 3];
-        self.ctx.color_space.convert_values(&matte, &mut matte_rgb);
+        self.ctx.color_space.convert_values(matte, &mut matte_rgb);
 
-        let mask_obj = ImageXObject::new_mask(&s_mask, &self.obj.warning_sink, &self.obj.cache)?;
-        let alpha = decode_mask(&mask_obj, self.target_dimension, self.meter)?.luma;
+        let mask_obj = s_mask.as_deref()?;
+        let alpha = decode_mask(mask_obj, self.target_dimension, self.meter)?.luma;
 
         Some((alpha, matte_rgb))
     }

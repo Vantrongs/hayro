@@ -1,5 +1,3 @@
-use crate::object::Dict;
-use crate::object::dict::keys::COLOR_TRANSFORM;
 use crate::object::stream::{FilterResult, ImageColorSpace, ImageData, ImageDecodeParams};
 use crate::work::{Meter, POLL_BYTES};
 use alloc::borrow::Cow;
@@ -12,7 +10,7 @@ use zune_jpeg::zune_core::options::DecoderOptions;
 
 pub(crate) fn decode(
     data: &[u8],
-    params: &Dict<'_>,
+    color_transform: Option<u8>,
     image_params: &ImageDecodeParams,
     meter: &Meter<'_>,
 ) -> Option<FilterResult<'static>> {
@@ -34,7 +32,6 @@ pub(crate) fn decode(
         zune_jpeg::JpegDecoder::new_with_options(ProgressCursor::new(&*data, meter), options);
     decoder.decode_headers().ok()?;
 
-    let color_transform = params.get::<u8>(COLOR_TRANSFORM);
     let input_color_space = decoder.input_colorspace().unwrap();
 
     let mut out_colorspace = if let Some(num_components) = image_params.num_components

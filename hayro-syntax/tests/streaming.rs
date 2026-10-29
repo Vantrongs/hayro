@@ -191,17 +191,15 @@ fn resume_at(encrypted: bool, params: &str, encoded: &[u8], offset: usize) {
         };
         let stream = object_3(&pdf);
         let expected = stream.decoded().unwrap().into_owned();
-        let owned = stream.to_owned_stream(None);
+        let owned = stream.to_owned_stream();
         let mut reader = stream.decoded_reader().unwrap();
         assert_eq!(read_up_to(&mut reader, offset, 4093).0, expected[..offset]);
-        let (checkpoint, taken) = measure(|| reader.checkpoint(&owned.reader()).unwrap());
+        let (checkpoint, taken) = measure(|| reader.checkpoint(&owned).unwrap());
         assert!(checkpoint.heap_bytes() <= reader.checkpoint_heap_bound().unwrap());
         assert!(taken.largest < encoded.len() / 2, "copied {taken:?}");
         (owned, checkpoint, expected)
     };
     for chunk in [7, 4093] {
-        let stream = stream.reader();
-        let stream = stream.stream().unwrap();
         let mut reader = stream.decoded_reader().unwrap();
         assert!(reader.restore(&checkpoint));
         let rest = read_up_to(&mut reader, usize::MAX, chunk);
@@ -244,9 +242,7 @@ fn a_stopped_meter_stops_every_later_read() {
     assert_eq!(reader.read(&mut buf[..1], &Meter::default()), Ok(1));
     #[cfg(feature = "unsafe")]
     let readers = {
-        let checkpoint = reader
-            .checkpoint(&stream.to_owned_stream(None).reader())
-            .unwrap();
+        let checkpoint = reader.checkpoint(&stream.to_owned_stream()).unwrap();
         let mut resumed = stream.decoded_reader().unwrap();
         assert!(resumed.restore(&checkpoint));
         [reader, resumed]
@@ -274,7 +270,7 @@ fn a_checkpoint_belongs_to_the_bytes_it_was_taken_from() {
     assert!(reader.checkpoint_heap_bound().is_none());
     assert!(
         reader
-            .checkpoint(&object_3(&stored).to_owned_stream(None).reader())
+            .checkpoint(&object_3(&stored).to_owned_stream())
             .is_none()
     );
 
@@ -286,14 +282,8 @@ fn a_checkpoint_belongs_to_the_bytes_it_was_taken_from() {
     let (a, b) = (object_3(&a), object_3(&b));
     let mut reader = a.decoded_reader().unwrap();
     read_up_to(&mut reader, 100, 100);
-    assert!(
-        reader
-            .checkpoint(&b.to_owned_stream(None).reader())
-            .is_none()
-    );
-    let checkpoint = reader
-        .checkpoint(&a.to_owned_stream(None).reader())
-        .unwrap();
+    assert!(reader.checkpoint(&b.to_owned_stream()).is_none());
+    let checkpoint = reader.checkpoint(&a.to_owned_stream()).unwrap();
     let mut other = b.decoded_reader().unwrap();
     assert!(!other.restore(&checkpoint));
     assert_eq!(read_up_to(&mut other, usize::MAX, 997), (data, 0));

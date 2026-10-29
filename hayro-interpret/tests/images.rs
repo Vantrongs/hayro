@@ -235,8 +235,7 @@ impl<'a> Device<'a> for Requested {
         let Image::Raster(r) = image else { return };
         let asset = r.asset();
         let (data, used) = allocations::measure(|| {
-            let reader = asset.reader();
-            let mut source = reader.open(None, None).expect("streamed");
+            let mut source = asset.open(None, None).expect("streamed");
             let plane = *source.layout().plane(self.plane).expect("the plane");
             let (grid, window) = (self.bins)(plane.width, plane.height);
             let request = ImageRequest {

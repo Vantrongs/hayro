@@ -7,11 +7,9 @@ pub(crate) use mask::{BILEVEL_MASK_LUT, DecodedMask, MaskPath, decode_mask};
 use crate::InterpreterWarning;
 use crate::color::ColorSpace;
 use crate::function::interpolate;
-use crate::x_object::image::{ImageKind, ImageXObject};
+use crate::x_object::image::{ImageKind, SampledImage};
 use hayro_syntax::Filter;
 use hayro_syntax::bit_reader::BitReader;
-use hayro_syntax::object::Array;
-use hayro_syntax::object::dict::keys::*;
 use hayro_syntax::object::stream::{
     DecodeFailure, FilterResult, ImageColorSpace, ImageData, ImageDecodeParams,
 };
@@ -37,27 +35,21 @@ pub(crate) struct SampleFormat {
     pub(crate) decode_arr: SmallVec<[(f32, f32); 4]>,
 }
 
-pub(crate) fn sample_format(
-    obj: &ImageXObject<'_>,
-    image_data: Option<&ImageData>,
-) -> SampleFormat {
+pub(crate) fn sample_format(obj: &SampledImage, image_data: Option<&ImageData>) -> SampleFormat {
     sample_format_with(obj, image_data, dict_bpc(obj))
 }
 
 /// The bits per component the image's dictionary gives.
-fn dict_bpc(obj: &ImageXObject<'_>) -> Option<u8> {
-    let dict = obj.stream.dict();
-    dict.get::<u8>(BPC)
-        .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT))
+fn dict_bpc(obj: &SampledImage) -> Option<u8> {
+    obj.bpc
 }
 
 /// [`sample_format`], with the bits per component of the dictionary already read.
 fn sample_format_with(
-    obj: &ImageXObject<'_>,
+    obj: &SampledImage,
     image_data: Option<&ImageData>,
     dict_bpc: Option<u8>,
 ) -> SampleFormat {
-    let dict = obj.stream.dict();
     let color_space = obj
         .color_space
         .clone()
@@ -78,13 +70,9 @@ fn sample_format_with(
         .or(dict_bpc)
         .unwrap_or_else(|| fallback_bpc(obj.kind));
 
-    let decode_arr = dict
-        .get::<Array<'_>>(D)
-        .or_else(|| dict.get::<Array<'_>>(DECODE))
-        .map(|a| {
-            let mut pairs = a.flex_iter();
-            core::iter::from_fn(|| pairs.next::<(f32, f32)>()).collect::<SmallVec<_>>()
-        })
+    let decode_arr = obj
+        .decode
+        .clone()
         .unwrap_or(color_space.default_decode_arr(bits_per_component as f32));
 
     SampleFormat {
@@ -100,15 +88,15 @@ fn sample_format_with(
 /// A JPX image's bits per component stay the dictionary's: its decoder scales its
 /// samples to the depth it is given and keeps their own without one.
 fn decode_params(
-    obj: &ImageXObject<'_>,
+    obj: &SampledImage,
     target_dimension: Option<(u32, u32)>,
     dict_bpc: Option<u8>,
 ) -> ImageDecodeParams {
     let bpc = dict_bpc.or_else(|| {
-        let filters = obj.stream.filter_entries();
-        let jpx = filters
-            .applied()
-            .any(|(filter, _)| filter == Filter::JpxDecode);
+        let jpx = obj
+            .stream
+            .filters()
+            .any(|filter| filter == Filter::JpxDecode);
         (!jpx).then(|| fallback_bpc(obj.kind))
     });
     let color_space = obj.color_space.as_ref();
@@ -130,7 +118,7 @@ fn fallback_bpc(kind: ImageKind) -> u8 {
 }
 
 fn decode_context<'a>(
-    obj: &ImageXObject<'a>,
+    obj: &'a SampledImage,
     target_dimension: Option<(u32, u32)>,
     meter: &Meter<'_>,
 ) -> Option<DecodeContext<'a>> {
@@ -468,6 +456,7 @@ mod tests {
     use crate::WarningSinkFn;
     use crate::cache::Cache;
     use crate::fixtures::{file, stream};
+    use crate::x_object::image::ImageXObject;
     use hayro_syntax::Pdf;
     use hayro_syntax::object::{ObjectIdentifier, Stream};
     use std::sync::Arc;
@@ -489,6 +478,7 @@ mod tests {
             .unwrap();
         let sink: WarningSinkFn = Arc::new(|_| {});
         let obj = ImageXObject::new(&stream, |_| None, &sink, &Cache::new(), None).unwrap();
+        let obj = SampledImage::read(&obj, true);
         let params = decode_params(&obj, None, dict_bpc(&obj));
         (params.bpc, params.num_components)
     }

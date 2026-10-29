@@ -1130,7 +1130,7 @@ pub(crate) mod lzw {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct PredictorParams {
     /// 1 for none, 2 for TIFF prediction, 10 to 15 for PNG prediction.
     pub(crate) predictor: u8,

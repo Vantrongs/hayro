@@ -3,7 +3,7 @@ use crate::color::Color;
 use crate::interpret::state::ActiveTransferFunction;
 use crate::pattern::Pattern;
 use crate::util::hash128;
-use crate::x_object::ImageXObject;
+use crate::x_object::SampledImage;
 use crate::x_object::soft_mask::SoftMask;
 use hayro_syntax::object::Stream;
 use kurbo::{Affine, BezPath, Cap, Join};
@@ -28,7 +28,8 @@ impl CacheKey for ClipPath {
 /// A stencil image.
 pub struct StencilImage<'a, 'b> {
     pub(crate) paint: Paint<'a>,
-    pub(crate) image_xobject: ImageXObject<'b>,
+    pub(crate) stream: Stream<'b>,
+    pub(crate) image: Arc<SampledImage>,
 }
 
 impl<'a, 'b> StencilImage<'a, 'b> {
@@ -44,7 +45,7 @@ impl<'a, 'b> StencilImage<'a, 'b> {
         func: impl FnOnce(LumaData, &Paint<'a>),
         target_dimension: Option<(u32, u32)>,
     ) {
-        if let Some(decoded) = self.image_xobject.decoded_mask(target_dimension) {
+        if let Some(decoded) = self.image.decoded_mask(target_dimension) {
             func(decoded.luma, &self.paint);
         }
     }
@@ -59,13 +60,13 @@ impl<'a, 'b> StencilImage<'a, 'b> {
     /// through ([`PixelFormat::Alpha`](crate::PixelFormat::Alpha)), decoded whole when
     /// opened.
     pub fn asset(&self) -> crate::ImageAsset {
-        self.image_xobject.asset(self.pixels_key())
+        crate::ImageAsset::new(self.image.clone(), self.pixels_key())
     }
 
     /// Identifies the alpha the mask decodes to, as [`RasterImage::pixels_key`]: its
     /// body, which no raster image's key names alone. `None` for an inline mask.
     pub fn pixels_key(&self) -> Option<u128> {
-        let id = self.image_xobject.stream.identity()?;
+        let id = self.stream.identity()?;
         Some(hash128(&(id, "stencil")))
     }
 
@@ -73,23 +74,29 @@ impl<'a, 'b> StencilImage<'a, 'b> {
     // width/height from `LumaData` instead.
     #[doc(hidden)]
     pub fn width(&self) -> u32 {
-        self.image_xobject.width()
+        self.image.width()
     }
 
     #[doc(hidden)]
     pub fn height(&self) -> u32 {
-        self.image_xobject.height()
+        self.image.height()
     }
 }
 
 impl CacheKey for StencilImage<'_, '_> {
     fn cache_key(&self) -> u128 {
-        self.image_xobject.cache_key()
+        self.stream.cache_key()
     }
 }
 
 /// A raster image.
-pub struct RasterImage<'a>(pub(crate) ImageXObject<'a>);
+pub struct RasterImage<'a> {
+    pub(crate) stream: Stream<'a>,
+    pub(crate) image: Arc<SampledImage>,
+    /// Whether the colour space is a name looked up in the resources where the
+    /// image is drawn.
+    pub(crate) cs_by_name: bool,
+}
 
 impl RasterImage<'_> {
     /// Perform some operation with the RGB and alpha channel of the image.
@@ -104,7 +111,7 @@ impl RasterImage<'_> {
         func: impl FnOnce(ImageData, Option<LumaData>),
         target_dimension: Option<(u32, u32)>,
     ) {
-        if let Some(decoded) = self.0.decoded_image(target_dimension) {
+        if let Some(decoded) = self.image.decoded_image(target_dimension) {
             func(decoded.image, decoded.alpha);
         }
     }
@@ -113,25 +120,25 @@ impl RasterImage<'_> {
     ///
     /// This allows you to get access to the raw encoded image data, without doing any decoding.
     pub fn stream(&self) -> &Stream<'_> {
-        self.0.stream()
+        &self.stream
     }
 
     // These are hidden since clients are supposed to call get the
     // width/height from `LumaData` instead.
     #[doc(hidden)]
     pub fn width(&self) -> u32 {
-        self.0.width()
+        self.image.width()
     }
 
     #[doc(hidden)]
     pub fn height(&self) -> u32 {
-        self.0.height()
+        self.image.height()
     }
 
     /// The image as an owned asset: a handle that outlives the content stream and
     /// decodes regions of the image on request, keyed by [`Self::pixels_key`].
     pub fn asset(&self) -> crate::ImageAsset {
-        self.0.asset(self.pixels_key())
+        crate::ImageAsset::new(self.image.clone(), self.pixels_key())
     }
 
     /// Identifies the pixels `with_rgba` decodes for a given `target_dimension`: the
@@ -141,11 +148,11 @@ impl RasterImage<'_> {
     /// when there is no object to identify (an inline image) or the colour space is a
     /// name looked up in the resources where the image is drawn.
     pub fn pixels_key(&self) -> Option<u128> {
-        let image = &self.0;
-        let id = image.stream.identity()?;
-        if image.cs_by_name {
+        let id = self.stream.identity()?;
+        if self.cs_by_name {
             return None;
         }
+        let image = &self.image;
         // Decoding applies the transfer function through these tables
         // (`decode_image`): a luma image the single one, an RGB one the first three.
         let tables: SmallVec<[&[u8; 256]; 3]> = match &image.transfer_function {
@@ -159,7 +166,7 @@ impl RasterImage<'_> {
 
 impl CacheKey for RasterImage<'_> {
     fn cache_key(&self) -> u128 {
-        self.0.cache_key()
+        self.stream.cache_key()
     }
 }
 

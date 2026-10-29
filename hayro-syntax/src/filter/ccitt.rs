@@ -1,7 +1,4 @@
-use crate::object::Dict;
-use crate::object::dict::keys::{
-    BLACK_IS_1, COLUMNS, ENCODED_BYTE_ALIGN, END_OF_BLOCK, END_OF_LINE, K, ROWS,
-};
+use crate::filter::CcittParams;
 use crate::object::stream::{FilterResult, ImageColorSpace, ImageData, ImageDecodeParams};
 use crate::work::{Meter, POLL_BYTES};
 use alloc::borrow::Cow;
@@ -99,26 +96,26 @@ fn row_work(bytes: usize, changes: &[u32]) -> usize {
 /// The data decoded, its work counted on `meter`; `None` once its hook asks to stop.
 pub(crate) fn decode(
     data: &[u8],
-    params: &Dict<'_>,
+    params: &CcittParams,
     image_params: &ImageDecodeParams,
     meter: &Meter<'_>,
 ) -> Option<FilterResult<'static>> {
-    let k = params.get::<i32>(K).unwrap_or(0);
+    let k = params.k;
 
-    let columns = params.get::<usize>(COLUMNS).unwrap_or(1728) as u32;
+    let columns = params.columns;
     // `Rows` should match the height of the image, but in case it doesn't,
     // the image height takes precedence (as in other viewers).
     let rows = if image_params.height > 0 {
         image_params.height
     } else {
-        params.get::<u32>(ROWS).unwrap_or(0)
+        params.rows
     };
     let output_len = (columns as usize).checked_mul(rows as usize)?;
 
     let mut settings = DecodeSettings::new(columns, rows);
-    settings.end_of_block = params.get::<bool>(END_OF_BLOCK).unwrap_or(true);
-    settings.end_of_line = params.get::<bool>(END_OF_LINE).unwrap_or(false);
-    settings.rows_are_byte_aligned = params.get::<bool>(ENCODED_BYTE_ALIGN).unwrap_or(false);
+    settings.end_of_block = params.end_of_block;
+    settings.end_of_line = params.end_of_line;
+    settings.rows_are_byte_aligned = params.encoded_byte_align;
     settings.encoding = if k < 0 {
         EncodingMode::Group4
     } else if k == 0 {
@@ -127,11 +124,7 @@ pub(crate) fn decode(
         EncodingMode::Group3_2D
     };
     // The value that pixels which are white in the encoding are written as.
-    let white: u8 = if params.get::<bool>(BLACK_IS_1).unwrap_or(false) {
-        0x00
-    } else {
-        0xFF
-    };
+    let white: u8 = if params.black_is_1 { 0x00 } else { 0xFF };
 
     // Whenever possible (if we don't have an indexed color space), we convert
     // the data as 8-bit instead of 1-bit, so that it can be easier converted
@@ -425,6 +418,7 @@ fn fill_short<T: Copy>(slice: &mut [T], value: T) {
 #[cfg(test)]
 mod tests {
     use super::decode;
+    use crate::filter::CcittParams;
     use crate::object::FromBytes;
     use crate::object::dict::Dict;
     use crate::object::stream::ImageDecodeParams;
@@ -432,7 +426,7 @@ mod tests {
 
     #[test]
     fn issue1258() {
-        let params = Dict::from_bytes(b"<< /K 0 /Columns 8 /Rows 1 >>").unwrap();
+        let params = CcittParams::of(&Dict::from_bytes(b"<< /K 0 /Columns 8 /Rows 1 >>").unwrap());
 
         let decoded = decode(
             &[0x35, 0x14],
@@ -448,7 +442,7 @@ mod tests {
 
     #[test]
     fn unknown_rows() {
-        let params = Dict::from_bytes(b"<< /K 0 /Columns 8 >>").unwrap();
+        let params = CcittParams::of(&Dict::from_bytes(b"<< /K 0 /Columns 8 >>").unwrap());
 
         let decoded = decode(
             &[0x35, 0x14],
@@ -480,7 +474,7 @@ mod tests {
         let pairs = 100_000;
         let data = [0x23, 0xA2, 0x3A].repeat(pairs / 2);
         let dict = format!("<< /K -1 /Columns {} /Rows 1 >>", 2 * pairs);
-        let params = Dict::from_bytes(dict.as_bytes()).unwrap();
+        let params = CcittParams::of(&Dict::from_bytes(dict.as_bytes()).unwrap());
         let told = |is_indexed| {
             let image_params = ImageDecodeParams {
                 is_indexed,

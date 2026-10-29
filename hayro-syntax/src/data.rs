@@ -91,24 +91,9 @@ impl Data {
         }
     }
 
-    /// How many object streams are kept decoded.
-    #[cfg(test)]
-    pub(crate) fn kept_streams(&self) -> usize {
-        self.map.get().len()
-    }
-
     /// Get access to the original data of the PDF.
     pub(crate) fn get(&self) -> &PdfData {
         &self.data
-    }
-
-    /// The object stream at `place`, if it is kept, and where, with what reading it
-    /// lost: found, never decoded, so that a reader apart from the table that keeps
-    /// it ([`crate::xref::XRef::detached`]) reads what the table read once, and
-    /// keeps nothing in it.
-    pub(crate) fn kept(&self, place: Place) -> Option<(usize, &(Option<ObjectStream>, Lost))> {
-        let idx = *self.map.get().get(&place)?;
-        Some((idx, self.decoded.get(idx)?))
     }
 
     /// The object stream `id` at `place`, decoded by `decode` from `ctx` once for

@@ -7,25 +7,20 @@ use super::rows::{
 use super::{
     DecodeWork, ImageLayout, PixelFormat, Plane, PlaneLayout, Stop, interleave, premultiply,
 };
-use crate::color::{ColorComponents, ColorSpace, ToLuma, ToRgb};
+use crate::color::{ColorSpace, ToLuma, ToRgb};
 use crate::interpret::state::ActiveTransferFunction;
 use crate::x_object::area::Area;
 use crate::x_object::decode::{SampleFormat, direct_invert, sample_format, unpremultiply_samples};
-use crate::x_object::image::ImageXObject;
+use crate::x_object::image::SampledImage;
 use core::ops::Range;
-use hayro_syntax::object::Stream;
-use hayro_syntax::object::dict::keys::{MASK, MATTE, SMASK, SMASK_IN_DATA};
-use hayro_syntax::object::stream::StreamReader;
 use hayro_syntax::work::{Cancelled, Meter};
 use smallvec::SmallVec;
 
 /// An image read incrementally.
 pub(super) struct Streamed<'a> {
-    obj: ImageXObject<'a>,
+    obj: &'a SampledImage,
     colour: Colour,
     alpha: Alpha<'a>,
-    /// `obj`'s stream, owned, which the decoder states saved in `checkpoints` keep.
-    stream: &'a StreamReader,
     checkpoints: &'a Checkpoints,
     /// The decoding opening the image did.
     pub(super) opened: DecodeWork,
@@ -59,7 +54,7 @@ enum Alpha<'a> {
 impl Colour {
     /// The conversion for `obj`'s samples, if they are 8-bit `DeviceGray` or
     /// `DeviceRGB` used as stored or inverted.
-    pub(super) fn new(obj: &ImageXObject<'_>) -> Option<Self> {
+    pub(super) fn new(obj: &SampledImage) -> Option<Self> {
         let SampleFormat {
             color_space,
             bits_per_component,
@@ -88,7 +83,7 @@ impl Colour {
     }
 
     /// The plane of `obj`'s colour, with alpha or not.
-    pub(super) fn plane(&self, obj: &ImageXObject<'_>, alpha: bool) -> PlaneLayout {
+    pub(super) fn plane(&self, obj: &SampledImage, alpha: bool) -> PlaneLayout {
         PlaneLayout {
             width: obj.width(),
             height: obj.height(),
@@ -135,40 +130,39 @@ impl<'a> Alpha<'a> {
     /// The alpha `decode_alpha` gives `obj`, a mask stream's rows counted into
     /// `height` once, adding to `work`.
     fn new(
-        obj: &ImageXObject<'a>,
+        obj: &'a SampledImage,
         colour: &Colour,
         height: &MaskHeight,
         work: &mut DecodeWork,
         meter: &Meter<'_>,
     ) -> Result<Self, Cancelled> {
-        let dict = obj.stream.dict();
-        let smask = dict.get::<Stream<'_>>(SMASK);
-        let matte = smask
+        let masks = &obj.masks;
+        let matte = masks
+            .matte
             .as_ref()
-            .and_then(|s| s.dict().get::<ColorComponents>(MATTE))
             .filter(|m| m.len() == colour.components);
-        let in_data = dict.get::<u8>(SMASK_IN_DATA) == Some(1);
+        let in_data = masks.in_data;
         // Only JPX data holds alpha; for other data there is none. `/Matte` takes
         // precedence when the soft mask has the image's size.
         let stream = if matte.is_some() || !in_data {
-            smask.or_else(|| dict.get::<Stream<'_>>(MASK))
+            masks.smask.as_ref().or(masks.mask.as_ref())
         } else {
             None
         };
         let Some(stream) = stream else {
-            return Ok(match dict.get::<SmallVec<[u16; 4]>>(MASK) {
-                Some(key) if !in_data => Alpha::ColourKey(key),
+            return Ok(match &masks.color_key {
+                Some(key) if !in_data => Alpha::ColourKey(key.clone()),
                 _ => Alpha::None,
             });
         };
-        let Some(mask) = MaskSource::new(&stream, obj, height, work, meter)? else {
+        let Some(mask) = MaskSource::new(stream.as_deref(), height, work, meter)? else {
             return Ok(Alpha::None);
         };
         let size = (obj.width(), obj.height());
         let matte = match matte {
             Some(m) if mask.size() == size => {
                 let mut rgb = [0; 3];
-                colour.color_space.convert_values(&m, &mut rgb);
+                colour.color_space.convert_values(m, &mut rgb);
                 Some(rgb)
             }
             _ if in_data => return Ok(Alpha::None),
@@ -198,8 +192,7 @@ impl<'a> Streamed<'a> {
     /// `obj` read incrementally, if its samples allow; its mask's rows are counted
     /// into `mask_height` once.
     pub(super) fn new(
-        obj: &ImageXObject<'a>,
-        stream: &'a StreamReader,
+        obj: &'a SampledImage,
         checkpoints: &'a Checkpoints,
         mask_height: &MaskHeight,
         meter: &Meter<'_>,
@@ -213,10 +206,9 @@ impl<'a> Streamed<'a> {
         let mut opened = DecodeWork::default();
         let alpha = Alpha::new(obj, &colour, mask_height, &mut opened, meter)?;
         Ok(Some(Self {
-            obj: obj.clone(),
+            obj,
             colour,
             alpha,
-            stream,
             checkpoints,
             opened,
         }))
@@ -242,7 +234,7 @@ impl<'a> Streamed<'a> {
             _ => None,
         };
         ImageLayout {
-            image: self.colour.plane(&self.obj, self.alpha.on_image_grid()),
+            image: self.colour.plane(self.obj, self.alpha.on_image_grid()),
             mask,
         }
     }
@@ -352,7 +344,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
         let resumed = match mask {
             Some(_) => None,
             None => image.checkpoints.checkpointer(
-                image.stream,
+                &image.obj.stream,
                 &mut raw,
                 row_bytes,
                 h,

@@ -1,8 +1,7 @@
 use crate::bit_reader::BitWriter;
-use crate::object::Dict;
-use crate::object::Stream;
-use crate::object::dict::keys::JBIG2_GLOBALS;
-use crate::object::stream::{FilterResult, ImageColorSpace, ImageData, ImageDecodeParams};
+use crate::object::stream::{
+    FilterResult, ImageColorSpace, ImageData, ImageDecodeParams, OwnedStream,
+};
 use crate::work::Meter;
 use alloc::borrow::Cow;
 use alloc::vec;
@@ -10,15 +9,15 @@ use alloc::vec::Vec;
 
 /// Decode JBIG2 data from a PDF stream.
 ///
-/// The `params` dictionary may contain a `JBIG2Globals` entry pointing to
-/// a stream with shared symbol dictionaries.
+/// `globals` is the stream with shared symbol dictionaries its parameters'
+/// `JBIG2Globals` names.
 pub(crate) fn decode(
     data: &[u8],
-    params: &Dict<'_>,
+    globals: Option<&OwnedStream>,
     image_params: &ImageDecodeParams,
     meter: &Meter<'_>,
 ) -> Option<FilterResult<'static>> {
-    let globals = params.get::<Stream<'_>>(JBIG2_GLOBALS).and_then(|g| {
+    let globals = globals.and_then(|g| {
         g.decoded_image_metered(&ImageDecodeParams::default(), meter)
             .map(|d| d.data)
             .ok()

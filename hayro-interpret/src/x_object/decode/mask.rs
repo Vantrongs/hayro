@@ -5,7 +5,7 @@ use super::{
 use crate::LumaData;
 use crate::color::ColorSpace;
 use crate::function::interpolate;
-use crate::x_object::image::{ImageKind, ImageXObject};
+use crate::x_object::image::{ImageKind, SampledImage};
 use hayro_syntax::work::{Meter, POLL_BYTES};
 use std::sync::LazyLock;
 
@@ -28,7 +28,7 @@ pub(crate) struct DecodedMask {
 /// The mask decoded whole, its work counted on `meter`; `None` also once the meter's
 /// hook asks to stop.
 pub(crate) fn decode_mask(
-    obj: &ImageXObject<'_>,
+    obj: &SampledImage,
     target_dimension: Option<(u32, u32)>,
     meter: &Meter<'_>,
 ) -> Option<DecodedMask> {

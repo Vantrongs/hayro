@@ -1,17 +1,19 @@
 use super::decode::{DecodedImage, DecodedMask, decode_image, decode_mask};
 use crate::WarningSinkFn;
 use crate::cache::Cache;
-use crate::color::ColorSpace;
+use crate::color::{ColorComponents, ColorSpace};
 use crate::context::Context;
 use crate::device::Device;
 use crate::interpret::state::ActiveTransferFunction;
 use crate::ocg::Kept;
 use crate::{BlendMode, CacheKey, Image, ImageDrawProps, RasterImage, StencilImage};
 use hayro_syntax::object::dict::keys::*;
-use hayro_syntax::object::{Dict, Name, Object, Stream};
+use hayro_syntax::object::stream::OwnedStream;
+use hayro_syntax::object::{Array, Dict, Name, Object, Stream};
 use hayro_syntax::work::Meter;
-use hayro_syntax::xref::{Detached, XRef};
 use kurbo::Affine;
+use smallvec::SmallVec;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub(crate) struct ImageXObject<'a> {
@@ -27,9 +29,6 @@ pub(crate) struct ImageXObject<'a> {
     /// Whether the colour space is a name looked up in the resources (which the spec
     /// allows only for inline images), so it depends on where the image is drawn.
     pub(crate) cs_by_name: bool,
-    /// Once it is drawn, what the readers its data are read through share with the
-    /// table the image was read through (`Context::reader`); without it, its own.
-    pub(crate) reader: Option<Detached>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -135,7 +134,6 @@ impl<'a> ImageXObject<'a> {
             stream: stream.clone(),
             kind,
             cs_by_name,
-            reader: None,
         })
     }
 
@@ -190,18 +188,20 @@ impl<'a> ImageXObject<'a> {
             blend_mode,
         );
 
-        self.read_decoding(context.xref);
-        let drawn = ImageXObject {
-            reader: Some(context.reader().clone()),
-            ..self.clone()
-        };
+        // Read here, through the document, which counts it, and not again.
+        let sampled = Arc::new(SampledImage::read(self, true));
         let image = if self.kind.is_mask() {
             Image::Stencil(StencilImage {
                 paint: context.get_paint(false),
-                image_xobject: drawn,
+                stream: self.stream.clone(),
+                image: sampled,
             })
         } else {
-            Image::Raster(RasterImage(drawn))
+            Image::Raster(RasterImage {
+                stream: self.stream.clone(),
+                image: sampled,
+                cs_by_name: self.cs_by_name,
+            })
         };
 
         device.draw_image(
@@ -221,63 +221,106 @@ impl<'a> ImageXObject<'a> {
         }
     }
 
-    /// Reads through `xref`, the table the image was read through, what decoding it
-    /// reads besides its data (`decode_image`, `decode_mask`, the streamed sources),
-    /// as decoding reads it: so that the decoding, through a reader apart from the
-    /// table (`Context::reader`), which reads what the table keeps and adds nothing
-    /// to it, finds it read once for the document, not again for each decoding. What
-    /// it misses, the decoding reads itself and does not keep past the decoding.
-    fn read_decoding(&self, xref: &XRef) {
-        // An inline image reads nothing but its own bytes.
-        if let Some(stream) = self
-            .stream
-            .dict()
-            .obj_id()
-            .and_then(|id| xref.get::<Stream<'_>>(id))
-        {
-            read_image_decoding(&stream, true);
-        }
+    fn has_mask(&self) -> bool {
+        let dict = self.stream.dict();
+
+        dict.contains_key(SMASK_IN_DATA) || dict.contains_key(SMASK) || dict.contains_key(MASK)
     }
+}
 
-    pub(crate) fn decoded_mask(&self, target_dimension: Option<(u32, u32)>) -> Option<DecodedMask> {
-        if !self.kind.is_mask() {
-            return None;
-        }
-
-        self.apart(|image| decode_mask(image, target_dimension, &Meter::default()))?
+impl CacheKey for ImageXObject<'_> {
+    fn cache_key(&self) -> u128 {
+        self.stream.cache_key()
     }
+}
 
-    pub(crate) fn decoded_image(
-        &self,
-        target_dimension: Option<(u32, u32)>,
-    ) -> Option<DecodedImage> {
-        if self.kind.is_mask() {
-            return None;
-        }
+/// What decoding an image reads, read from its dictionary once, as it is drawn
+/// ([`Self::read`]), through the document, which counts what that keeps: its stream
+/// owned ([`OwnedStream`]), with how its data decode, the entries of its dictionary
+/// decoding reads, and its masks, read alike. Decoding reads no object of the
+/// document, so it keeps nothing in the document, and what holds the image holds
+/// nothing decoding read, however often it decodes it.
+pub(crate) struct SampledImage {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) kind: ImageKind,
+    pub(crate) interpolate: bool,
+    pub(crate) color_space: Option<ColorSpace>,
+    pub(crate) transfer_function: Option<ActiveTransferFunction>,
+    pub(crate) warning_sink: WarningSinkFn,
+    pub(crate) stream: OwnedStream,
+    /// `/BitsPerComponent`.
+    pub(crate) bpc: Option<u8>,
+    /// The pairs of `/Decode`, where it is an array.
+    pub(crate) decode: Option<SmallVec<[(f32, f32); 4]>>,
+    pub(crate) masks: Masks,
+}
 
-        self.apart(|image| decode_image(image, target_dimension, &Meter::default()))?
-    }
+/// A mask stream as decoding reads it: `None` where it is no mask
+/// ([`ImageXObject::new_mask`] refuses it).
+pub(crate) type MaskImage = Option<Box<SampledImage>>;
 
-    /// `f` of the image read again through a reader of its own, made from
-    /// [`Self::reader`] and dropped after `f`, so that what decoding it reads is
-    /// kept neither in the table it was read through nor past the decoding; `None`
-    /// where it cannot be read again.
-    fn apart<R>(&self, f: impl FnOnce(&ImageXObject<'_>) -> R) -> Option<R> {
-        let reader = self.stream.to_owned_stream(self.reader.as_ref()).reader();
-        let image = ImageXObject {
-            width: self.width,
-            height: self.height,
-            color_space: self.color_space.clone(),
-            cache: self.cache.clone(),
-            interpolate: self.interpolate,
-            kind: self.kind,
-            stream: reader.stream()?,
-            transfer_function: self.transfer_function.clone(),
-            warning_sink: self.warning_sink.clone(),
-            cs_by_name: self.cs_by_name,
-            reader: None,
+/// What an image's dictionary says of its masks; nothing for a mask's own.
+#[derive(Default)]
+pub(crate) struct Masks {
+    /// `/SMask`, where it is a stream.
+    pub(crate) smask: Option<MaskImage>,
+    /// The soft mask's `/Matte`.
+    pub(crate) matte: Option<ColorComponents>,
+    /// `/Mask`, where it is a stream.
+    pub(crate) mask: Option<MaskImage>,
+    /// `/Mask`, where it is an array: a colour key.
+    pub(crate) color_key: Option<SmallVec<[u16; 4]>>,
+    /// Whether `/SMaskInData` is 1.
+    pub(crate) in_data: bool,
+    /// Whether the dictionary has `/SMask`, `/Mask` or `/SMaskInData`, of any value.
+    pub(crate) any: bool,
+}
+
+impl SampledImage {
+    /// What decoding `image` reads, with its masks if `masks`.
+    pub(crate) fn read(image: &ImageXObject<'_>, masks: bool) -> Self {
+        let dict = image.stream.dict();
+        let mask = |stream: Stream<'_>| -> MaskImage {
+            let mask = ImageXObject::new_mask(&stream, &image.warning_sink, &image.cache)?;
+            Some(Box::new(Self::read(&mask, false)))
         };
-        Some(f(&image))
+        let masks = if masks {
+            let smask = dict.get::<Stream<'_>>(SMASK);
+            Masks {
+                matte: smask
+                    .as_ref()
+                    .and_then(|s| s.dict().get::<ColorComponents>(MATTE)),
+                smask: smask.map(mask),
+                mask: dict.get::<Stream<'_>>(MASK).map(mask),
+                color_key: dict.get::<SmallVec<[u16; 4]>>(MASK),
+                in_data: dict.get::<u8>(SMASK_IN_DATA) == Some(1),
+                any: image.has_mask(),
+            }
+        } else {
+            Masks::default()
+        };
+        Self {
+            width: image.width,
+            height: image.height,
+            kind: image.kind,
+            interpolate: image.interpolate,
+            color_space: image.color_space.clone(),
+            transfer_function: image.transfer_function.clone(),
+            warning_sink: image.warning_sink.clone(),
+            stream: image.stream.to_owned_stream(),
+            bpc: dict
+                .get::<u8>(BPC)
+                .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT)),
+            decode: dict
+                .get::<Array<'_>>(D)
+                .or_else(|| dict.get::<Array<'_>>(DECODE))
+                .map(|a| {
+                    let mut pairs = a.flex_iter();
+                    core::iter::from_fn(|| pairs.next::<(f32, f32)>()).collect()
+                }),
+            masks,
+        }
     }
 
     pub(crate) fn width(&self) -> u32 {
@@ -288,53 +331,20 @@ impl<'a> ImageXObject<'a> {
         self.height
     }
 
-    pub(crate) fn stream(&self) -> &Stream<'a> {
-        &self.stream
+    pub(crate) fn decoded_mask(&self, target_dimension: Option<(u32, u32)>) -> Option<DecodedMask> {
+        if !self.kind.is_mask() {
+            return None;
+        }
+        decode_mask(self, target_dimension, &Meter::default())
     }
 
-    fn has_mask(&self) -> bool {
-        let dict = self.stream.dict();
-
-        dict.contains_key(SMASK_IN_DATA) || dict.contains_key(SMASK) || dict.contains_key(MASK)
-    }
-}
-
-/// Reads what decoding the image `stream` reads besides its data
-/// ([`ImageXObject::read_decoding`]): its filters' parameters, the entries of its
-/// dictionary decoding reads, and, if `masks`, its masks, read as images themselves.
-fn read_image_decoding(stream: &Stream<'_>, masks: bool) {
-    stream.read_decoding();
-    let dict = stream.dict();
-    let read = |key: &[u8]| match dict.get::<Object<'_>>(key) {
-        Some(Object::Array(array)) => array.iter::<Object<'_>>().for_each(drop),
-        Some(Object::Stream(mask)) if masks => read_image_decoding(&mask, false),
-        _ => {}
-    };
-    for key in [
-        TYPE,
-        BPC,
-        BITS_PER_COMPONENT,
-        D,
-        DECODE,
-        SMASK_IN_DATA,
-        MATTE,
-        W,
-        WIDTH,
-        H,
-        HEIGHT,
-        IM,
-        IMAGE_MASK,
-        I,
-        INTERPOLATE,
-        SMASK,
-        MASK,
-    ] {
-        read(key);
-    }
-}
-
-impl CacheKey for ImageXObject<'_> {
-    fn cache_key(&self) -> u128 {
-        self.stream.cache_key()
+    pub(crate) fn decoded_image(
+        &self,
+        target_dimension: Option<(u32, u32)>,
+    ) -> Option<DecodedImage> {
+        if self.kind.is_mask() {
+            return None;
+        }
+        decode_image(self, target_dimension, &Meter::default())
     }
 }

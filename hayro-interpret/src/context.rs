@@ -18,10 +18,10 @@ use hayro_syntax::hash;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
 use hayro_syntax::page::Resources;
-use hayro_syntax::xref::{Detached, XRef};
+use hayro_syntax::xref::XRef;
 use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape};
 use smallvec::smallvec;
-use std::cell::{Cell, OnceCell, RefCell};
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 /// Maximum nesting depth for interpreting `XObject`'s/patterns/streams.
@@ -106,9 +106,6 @@ pub struct Context<'a> {
     /// While a generated annotation appearance is drawn, the glyphs it draws as forms
     /// by name.
     pub(crate) generated_glyphs: hash::Map<Rc<str>, Rc<Glyph>>,
-    /// What the readers of the images drawn in the context share, once one is drawn
-    /// ([`Context::reader`]).
-    reader: OnceCell<Detached>,
 }
 
 impl<'a> Context<'a> {
@@ -164,18 +161,7 @@ impl<'a> Context<'a> {
             nesting_depth,
             glyph_scratch: Vec::new(),
             generated_glyphs: hash::Map::default(),
-            reader: OnceCell::new(),
         }
-    }
-
-    /// What readers of the document apart from `xref` share with it
-    /// ([`XRef::detached`]), for every image drawn in the context: decoding an image
-    /// reads what its dictionary names (its filters' parameters, its masks) through
-    /// a reader of its own made from it, which reads what `xref` keeps, as drawing
-    /// the image read it, and keeps what else it reads while the image is decoded,
-    /// adding nothing to what `xref` keeps for the document.
-    pub(crate) fn reader(&self) -> &Detached {
-        self.reader.get_or_init(|| self.xref.detached())
     }
 
     pub(crate) fn save_state(&mut self) {

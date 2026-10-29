@@ -11,13 +11,8 @@ mod streamed;
 use super::area::Area;
 use super::decode::decode_image;
 use super::decode::decode_mask;
-use super::image::{ImageKind, ImageXObject};
-use crate::WarningSinkFn;
-use crate::cache::Cache;
-use crate::color::ColorSpace;
-use crate::interpret::state::ActiveTransferFunction;
+use super::image::{ImageKind, SampledImage};
 use decoded::Decoded;
-use hayro_syntax::object::stream::{OwnedStream, StreamReader};
 use hayro_syntax::work::{Cancelled, Meter};
 use index::Checkpoints;
 use jpeg::JpegStreamed;
@@ -26,72 +21,45 @@ use rows::{MaskHeight, PIECE_BYTES};
 use std::sync::Arc;
 use streamed::Streamed;
 
-/// A raster image's source, owned: its stream (by object identifier, or a copy of an
-/// inline image's bytes), resolved colour space, transfer function, interpolation
-/// and masks, without the content stream or resources it was drawn from. It holds no
-/// decoded pixels, nor anything decoding it read; [`ImageReader::open`] reads it.
-/// Cheap to clone.
-///
-/// Its stream is read through a reader of the document of its own, apart from the
-/// table it was drawn from ([`XRef::detached`](hayro_syntax::xref::XRef::detached)),
-/// one for each [`ImageAsset::reader`]. What decoding it reads (its filters'
-/// parameters, its masks, the object streams they are in) drawing it read through
-/// the table, which keeps it for the document; the reader reads it there while the
-/// table is alive, without adding to it. What else it reads is kept while the image
-/// is read, neither in the document, which a renderer may keep open while it draws
-/// other pages, nor with the asset, which a display list may keep while the image
-/// is read again and again.
+/// A raster image's source, owned: what decoding it reads, read from its dictionary
+/// once, as it was drawn ([`SampledImage`]): its stored data (in the document's file,
+/// or a copy of those that lie elsewhere), how they decode, its resolved colour space,
+/// transfer function, interpolation and masks, without the content stream or
+/// resources it was drawn from. It holds no decoded pixels, nor anything decoding it
+/// read: decoding reads no object of the document, so it keeps nothing in the
+/// document, which a renderer may keep open while it draws other pages, nor with the
+/// asset, which a display list may keep while the image is read again and again, and
+/// costs the same however the document changed since. Cheap to clone.
 #[derive(Clone)]
 pub struct ImageAsset(Arc<AssetData>);
 
 struct AssetData {
-    stream: OwnedStream,
+    image: Arc<SampledImage>,
     checkpoints: Checkpoints,
     mask_height: MaskHeight,
-    width: u32,
-    height: u32,
-    kind: ImageKind,
-    color_space: Option<ColorSpace>,
-    interpolate: bool,
-    transfer_function: Option<ActiveTransferFunction>,
-    cache: Cache,
-    warning_sink: WarningSinkFn,
-    cs_by_name: bool,
     key: Option<u128>,
 }
 
-impl ImageXObject<'_> {
-    pub(crate) fn asset(&self, key: Option<u128>) -> ImageAsset {
-        ImageAsset(Arc::new(AssetData {
-            stream: self.stream.to_owned_stream(self.reader.as_ref()),
+impl ImageAsset {
+    /// The asset of `image`, keyed `key`.
+    pub(crate) fn new(image: Arc<SampledImage>, key: Option<u128>) -> Self {
+        Self(Arc::new(AssetData {
+            image,
             checkpoints: Checkpoints::default(),
             mask_height: MaskHeight::new(),
-            width: self.width(),
-            height: self.height(),
-            kind: self.kind,
-            color_space: self.color_space.clone(),
-            interpolate: self.interpolate,
-            transfer_function: self.transfer_function.clone(),
-            // The colour space is resolved; decoding uses a cache only to read masks
-            // (always `DeviceGray`), so the page's cache is not kept alive.
-            cache: Cache::new(),
-            warning_sink: self.warning_sink.clone(),
-            cs_by_name: self.cs_by_name,
             key,
         }))
     }
-}
 
-impl ImageAsset {
     /// The width of the image's pixel grid, as its dictionary declares it: the image's
     /// transform maps `0..width` × `0..height` onto the unit square.
     pub fn width(&self) -> u32 {
-        self.0.width
+        self.0.image.width
     }
 
     /// The height of the image's pixel grid, as its dictionary declares it.
     pub fn height(&self) -> u32 {
-        self.0.height
+        self.0.image.height
     }
 
     /// Identifies what the asset decodes to, as
@@ -107,43 +75,23 @@ impl ImageAsset {
         Ok(self.0.checkpoints.bytes()?)
     }
 
-    /// A reader of the image of its own, to open it with ([`ImageReader::open`]):
-    /// what reading it keeps, it keeps, and frees when it is dropped.
-    pub fn reader(&self) -> ImageReader {
-        ImageReader {
-            asset: self.clone(),
-            stream: self.0.stream.reader(),
-        }
-    }
-}
-
-/// An [`ImageAsset`] read through a reader of its own ([`ImageAsset::reader`]).
-pub struct ImageReader {
-    asset: ImageAsset,
-    stream: StreamReader,
-}
-
-impl ImageReader {
-    fn xobject(&self) -> Option<ImageXObject<'_>> {
-        let a = &*self.asset.0;
-        Some(ImageXObject {
-            width: a.width,
-            height: a.height,
-            color_space: a.color_space.clone(),
-            cache: a.cache.clone(),
-            interpolate: a.interpolate,
-            kind: a.kind,
-            stream: self.stream.stream()?,
-            transfer_function: a.transfer_function.clone(),
-            warning_sink: a.warning_sink.clone(),
-            cs_by_name: a.cs_by_name,
-            reader: None,
-        })
+    /// The bytes of the copies of stored data the asset holds: those of its image's
+    /// and masks' data that do not lie in the document's file (an inline image's, or
+    /// a stream's a damaged file keeps in an object stream), and of their JBIG2
+    /// globals'.
+    pub fn copied_bytes(&self) -> usize {
+        let image = &self.0.image;
+        let masks = [&image.masks.smask, &image.masks.mask]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|mask| mask.stream.copied_bytes());
+        image.stream.copied_bytes() + masks.sum::<usize>()
     }
 
     /// Opens the image for requests. Images with no filter or Flate, 8-bit
     /// `DeviceGray` or `DeviceRGB` samples used as stored or inverted, and masks of the
-    /// same kinds or decoded whole, only read their dictionaries here (and, the first
+    /// same kinds or decoded whole, read nothing here (and, the first
     /// time, read such a mask's data through to count its rows); requests read their
     /// data and keep a piece of a row and a few sums per bin. A request of such a Flate
     /// image without a mask read alongside resumes from the nearest decoder state an
@@ -162,10 +110,10 @@ impl ImageReader {
     ) -> Result<ImageSource<'_>, RequestError> {
         let meter = Meter::new(cancel);
         meter.poll()?;
-        let obj = self.xobject().ok_or(RequestError::Failed)?;
-        let a = &*self.asset.0;
-        if a.kind == ImageKind::StencilMask {
-            let decoded = decode_mask(&obj, hint, &meter);
+        let a = &*self.0;
+        let obj = &*a.image;
+        if obj.kind == ImageKind::StencilMask {
+            let decoded = decode_mask(obj, hint, &meter);
             meter.poll()?;
             let decoded = Decoded::stencil(decoded.ok_or(RequestError::Failed)?.luma);
             return Ok(ImageSource::new(
@@ -174,7 +122,7 @@ impl ImageReader {
                 DecodeWork::default(),
             ));
         }
-        let streamed = Streamed::new(&obj, &self.stream, &a.checkpoints, &a.mask_height, &meter)?;
+        let streamed = Streamed::new(obj, &a.checkpoints, &a.mask_height, &meter)?;
         if let Some(streamed) = streamed {
             let (layout, opened) = (streamed.layout(), streamed.opened);
             return Ok(ImageSource::new(
@@ -183,7 +131,7 @@ impl ImageReader {
                 opened,
             ));
         }
-        if let Some(jpeg) = JpegStreamed::new(&obj, &self.stream, &a.checkpoints.jpeg, &meter)? {
+        if let Some(jpeg) = JpegStreamed::new(obj, &a.checkpoints.jpeg, &meter)? {
             let layout = jpeg.layout();
             return Ok(ImageSource::new(
                 layout,
@@ -191,7 +139,7 @@ impl ImageReader {
                 DecodeWork::default(),
             ));
         }
-        let decoded = decode_image(&obj, hint, &meter);
+        let decoded = decode_image(obj, hint, &meter);
         meter.poll()?;
         let decoded = decoded.ok_or(RequestError::Failed)?;
         let decoded = Decoded::new(decoded.image, decoded.alpha, &meter)?;

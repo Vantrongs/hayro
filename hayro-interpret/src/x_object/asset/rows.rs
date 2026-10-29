@@ -6,10 +6,9 @@ use crate::LumaData;
 use crate::x_object::decode::{
     BILEVEL_MASK_LUT, MaskPath, SampleFormat, decode_mask, rows_present, sample_format,
 };
-use crate::x_object::image::{ImageKind, ImageXObject};
+use crate::x_object::image::{ImageKind, SampledImage};
 use core::ops::Range;
-use hayro_syntax::object::Stream;
-use hayro_syntax::object::stream::{DecodedCheckpoint, DecodedReader, ReadError};
+use hayro_syntax::object::stream::{DecodedCheckpoint, DecodedReader, OwnedStream, ReadError};
 use hayro_syntax::work::{Cancelled, Meter};
 use std::sync::OnceLock;
 
@@ -83,7 +82,11 @@ pub(super) enum RawRow {
 }
 
 impl<'a> RawRows<'a> {
-    pub(super) fn new(stream: &Stream<'a>, row_bytes: usize, meter: &'a Meter<'a>) -> Option<Self> {
+    pub(super) fn new(
+        stream: &'a OwnedStream,
+        row_bytes: usize,
+        meter: &'a Meter<'a>,
+    ) -> Option<Self> {
         Some(Self {
             reader: stream.decoded_reader()?,
             meter,
@@ -193,7 +196,7 @@ pub(super) fn keeps_partial_row(samples: usize, part: usize, row_len: usize) -> 
 /// with the rows its data holds, as `decode_mask` counts them.
 pub(super) enum MaskSource<'a> {
     Streamed {
-        obj: ImageXObject<'a>,
+        obj: &'a SampledImage,
         path: RowPath,
         height: u32,
     },
@@ -249,20 +252,19 @@ impl<'a> MaskSource<'a> {
     /// `height`, by reading its data through, which adds to `work`; a count `meter`
     /// cancelled is not kept.
     pub(super) fn new(
-        stream: &Stream<'a>,
-        image: &ImageXObject<'a>,
+        mask: Option<&'a SampledImage>,
         height: &MaskHeight,
         work: &mut DecodeWork,
         meter: &Meter<'_>,
     ) -> Result<Option<Self>, Cancelled> {
-        let Some(mask) = ImageXObject::new_mask(stream, &image.warning_sink, &image.cache) else {
+        let Some(mask) = mask else {
             return Ok(None);
         };
         let SampleFormat {
             color_space,
             bits_per_component,
             decode_arr,
-        } = sample_format(&mask, None);
+        } = sample_format(mask, None);
         let path = MaskPath::new(
             &color_space,
             bits_per_component,
@@ -275,7 +277,7 @@ impl<'a> MaskSource<'a> {
             let held = match height.get() {
                 Some(&held) => held,
                 None => {
-                    let held = rows_held(&mask, path, work, meter)?;
+                    let held = rows_held(mask, path, work, meter)?;
                     *height.get_or_init(|| held)
                 }
             };
@@ -285,7 +287,7 @@ impl<'a> MaskSource<'a> {
                 height,
             }));
         }
-        let decoded = decode_mask(&mask, None, meter);
+        let decoded = decode_mask(mask, None, meter);
         meter.poll()?;
         Ok(decoded.map(|m| Self::Decoded(m.luma)))
     }
@@ -325,7 +327,7 @@ impl<'a> MaskSource<'a> {
 /// The rows of `mask`'s data, as `decode_mask` counts them: its data read through,
 /// as whole decoding reads it, adding the bytes inflated to `work`.
 fn rows_held(
-    mask: &ImageXObject<'_>,
+    mask: &SampledImage,
     path: RowPath,
     work: &mut DecodeWork,
     meter: &Meter<'_>,

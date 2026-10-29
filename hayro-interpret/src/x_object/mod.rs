@@ -6,7 +6,7 @@ mod image;
 pub(crate) mod soft_mask;
 
 pub(crate) use form::{FormXObject, box_and_matrix};
-pub(crate) use image::ImageXObject;
+pub(crate) use image::{ImageXObject, SampledImage};
 
 use crate::WarningSinkFn;
 use crate::cache::Cache;

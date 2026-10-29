@@ -1,18 +1,18 @@
 //! Streams.
 
-use crate::crypto::DecryptionTarget;
+use crate::PdfData;
 use crate::crypto::reader::DecryptedReader;
-use crate::filter::Filter;
+use crate::crypto::{DecryptionTarget, Decryptor};
 use crate::filter::chain::Layer;
 pub use crate::filter::chain::StrictReader;
 use crate::filter::lzw_flate::{PredictorParams, Unpredictor};
 #[cfg(feature = "unsafe")]
 pub use crate::filter::reader::DecodedCheckpoint;
 pub use crate::filter::reader::{DecodedReader, ReadError};
+use crate::filter::{Filter, Step};
 use crate::object::Dict;
 use crate::object::Name;
 use crate::object::ObjectIdentifier;
-use crate::object::dict::InlineImageDict;
 use crate::object::dict::keys::{DECODE_PARMS, DP, F, FILTER, IDENTITY, LENGTH, NAME, TYPE, XREF};
 use crate::object::{Array, Object, ObjectLike, ObjectRefLike, Written};
 use crate::reader::Reader;
@@ -21,7 +21,7 @@ use crate::sync::Arc;
 use crate::trivia::is_white_space_character;
 use crate::util::{OptionLog, find_needle};
 use crate::work::Meter;
-use crate::xref::{Detached, StreamId, XRef};
+use crate::xref::StreamId;
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -288,6 +288,17 @@ impl<'a> Stream<'a> {
         FilterEntries::of(&self.dict)
     }
 
+    /// How the stream's data are decrypted and decoded, read from its dictionary
+    /// ([`Decoding::of`]).
+    fn decoding(&self) -> Decoding {
+        Decoding::of(&self.dict, true)
+    }
+
+    /// The decryptor of the stream's document.
+    fn decryptor(&self) -> Option<&Decryptor> {
+        self.dict.ctx().xref().decrypting()
+    }
+
     /// Return the raw, decrypted data of the stream, empty where decryption fails.
     ///
     /// Stream filters will not be applied.
@@ -302,89 +313,14 @@ impl<'a> Stream<'a> {
     /// decrypted with the crypt filter the first one names, and the others pass the
     /// data through, so the caller drops them all.
     pub fn try_raw_data(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
-        self.raw_data_metered(&Meter::default(), true)
-    }
-
-    /// [`Self::raw_data`], decrypted a counted piece at a time; if `strict`, data that
-    /// does not decrypt whole is a failure.
-    fn raw_data_metered(
-        &self,
-        meter: &Meter<'_>,
-        strict: bool,
-    ) -> Result<Cow<'a, [u8]>, DecodeFailure> {
-        let Some((id, name)) = self.decryption()? else {
-            return Ok(Cow::Borrowed(self.data));
-        };
-        let xref = self.dict.ctx().xref();
-        let target = Self::target(&name);
-        let whole = xref.decrypts_whole(self.data, target);
-        // Rule 11 of the crypt filter rules (`crate::crypto`): no data reads as empty
-        // wherever they decrypt at all.
-        if (strict || self.data.is_empty()) && !whole {
-            return Err(DecodeFailure::Decryption);
-        }
-        if self.data.is_empty() {
-            return Ok(Cow::Borrowed(self.data));
-        }
-        let mut reader = xref
-            .decrypted_reader(id, self.data, target)
-            .ok_or(DecodeFailure::Decryption)?;
-        if reader.plain().is_some() {
-            return Ok(Cow::Borrowed(self.data));
-        }
-        reader
-            .decrypt_all(meter)
-            .map(Cow::Owned)
-            .map_err(|_| DecodeFailure::Cancelled)
-    }
-
-    /// How the data are decrypted, by rules 5, 6, 8 and 10 of the crypt filter rules
-    /// (`crate::crypto`): `Ok(None)` where they are read as stored, else the object
-    /// whose key decrypts them and the name of the crypt filter that does, `None`
-    /// for the document's stream filter; [`DecodeFailure::Decryption`] where a named
-    /// `/Crypt` filter is not the first filter.
-    fn decryption(&self) -> Result<Option<(ObjectIdentifier, Option<Name<'a>>)>, DecodeFailure> {
-        // Rules 8 and 10: what the document does not decrypt, an inline image included.
-        let Some(id) = self.dict.ctx().decryption() else {
-            return Ok(None);
-        };
-        if self
-            .dict
-            .get::<crate::object::String<'_>>(TYPE)
-            .is_some_and(|ty| ty.as_ref() == XREF)
-        {
-            return Ok(None);
-        }
-        // Rules 5 and 6: the first filter may name a crypt filter; any /Crypt filter
-        // that names none leaves the data as stored, unless the first one names one.
-        let mut named = None;
-        let mut stored = false;
-        for (i, (filter, entry)) in self.filter_entries().applied().enumerate() {
-            if filter != Filter::Crypt {
-                continue;
-            }
-            match entry.params.get::<Name<'a>>(NAME) {
-                Some(name) if name.deref() != IDENTITY => {
-                    if i > 0 {
-                        return Err(DecodeFailure::Decryption);
-                    }
-                    named = Some(name);
-                }
-                _ => stored = true,
-            }
-        }
-        Ok(match named {
-            Some(name) => Some((id, Some(name))),
-            None if stored => None,
-            None => Some((id, None)),
-        })
-    }
-
-    fn target<'n>(name: &'n Option<Name<'_>>) -> DecryptionTarget<'n> {
-        match name {
-            None => DecryptionTarget::Stream,
-            Some(name) => DecryptionTarget::Named(name.deref()),
-        }
+        let decryption = Decoding::decryption_of(&self.dict, &self.filter_entries());
+        raw_data(
+            self.data,
+            self.decryptor(),
+            &decryption,
+            &Meter::default(),
+            true,
+        )
     }
 
     /// The stream's data as the file stores them, neither decrypted nor decoded.
@@ -395,29 +331,6 @@ impl<'a> Stream<'a> {
     /// Return the raw, underlying dictionary of the stream.
     pub fn dict(&self) -> &Dict<'a> {
         &self.dict
-    }
-
-    /// Reads what decoding the stream's data reads besides them: its filters'
-    /// parameters, each value in them, and a stream that one of them is (JBIG2
-    /// globals), with what decoding that reads. Read through a document's table,
-    /// what the table keeps of it, such as the object streams it is in, a reader
-    /// apart from the table reads there once for the document, rather than
-    /// decoding it again for each decoding ([`XRef::detached`]).
-    pub fn read_decoding(&self) {
-        self.read_decoding_naming(true);
-    }
-
-    /// [`Self::read_decoding`], and that of a stream a parameter is if `streams`.
-    fn read_decoding_naming(&self, streams: bool) {
-        for (_, entry) in self.filter_entries().applied() {
-            for key in entry.params.keys() {
-                if let Some(Object::Stream(named)) = entry.params.get::<Object<'_>>(&key)
-                    && streams
-                {
-                    named.read_decoding_naming(false);
-                }
-            }
-        }
     }
 
     /// The stream read as where a resolution of references starts
@@ -475,8 +388,7 @@ impl<'a> Stream<'a> {
     /// corrupt rather than what a lenient reading recovers of it: for a writer, which
     /// must not take part of the data for all of it. Data cut short is not corrupt.
     pub fn decoded_strict(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
-        self.decode(&ImageDecodeParams::default(), &Meter::default(), true)
-            .map(|r| r.data)
+        self.decoded_strict_metered(&Meter::default())
     }
 
     /// [`Self::decoded_strict`], its work counted on `meter`, a bounded amount at a
@@ -485,7 +397,14 @@ impl<'a> Stream<'a> {
         &self,
         meter: &Meter<'_>,
     ) -> Result<Cow<'a, [u8]>, DecodeFailure> {
-        self.decode(&ImageDecodeParams::default(), meter, true)
+        self.decoding()
+            .decode(
+                self.data,
+                self.decryptor(),
+                &ImageDecodeParams::default(),
+                meter,
+                true,
+            )
             .map(|r| r.data)
     }
 
@@ -496,46 +415,8 @@ impl<'a> Stream<'a> {
         image_params: &ImageDecodeParams,
         meter: &Meter<'_>,
     ) -> Result<FilterResult<'a>, DecodeFailure> {
-        self.decode(image_params, meter, false)
-    }
-
-    fn decode(
-        &self,
-        image_params: &ImageDecodeParams,
-        meter: &Meter<'_>,
-        strict: bool,
-    ) -> Result<FilterResult<'a>, DecodeFailure> {
-        let data = self.raw_data_metered(meter, strict)?;
-        let filters = self.filter_entries();
-
-        let mut current: Option<FilterResult<'a>> = None;
-
-        let mut applied = filters.applied().peekable();
-        while let Some((filter, entry)) = applied.next() {
-            if filter == Filter::Crypt {
-                // Rule 9 of the crypt filter rules (`crate::crypto`): decoding passes over /Crypt.
-                continue;
-            }
-            // The last filter makes the image's samples.
-            let expected = match applied.peek() {
-                None => image_params.expected_len(),
-                Some(_) => 0,
-            };
-            let new = filter.apply(
-                current.as_ref().map(|c| c.data.as_ref()).unwrap_or(&data),
-                &entry.params,
-                image_params,
-                meter,
-                strict,
-                expected,
-            )?;
-            current = Some(new);
-        }
-
-        Ok(current.unwrap_or(FilterResult {
-            data,
-            image_data: None,
-        }))
+        self.decoding()
+            .decode(self.data, self.decryptor(), image_params, meter, false)
     }
 
     /// The data [`Self::decoded_strict`] returns, read a piece at a time through all
@@ -552,45 +433,24 @@ impl<'a> Stream<'a> {
         &self,
         meter: &Meter<'_>,
     ) -> Result<Option<StrictReader<'a>>, DecodeFailure> {
-        let filters = self.filter_entries();
-        let mut layers = Vec::new();
-        for (filter, entry) in filters.applied() {
-            let params = &entry.params;
-            // The parameters and the reversal of the predictor; `None` where whole
-            // decoding refuses the parameters or only it reverses the predictor.
-            let predicted = || {
-                let predictor = PredictorParams::from_params(params)?;
-                let unpredictor = match predictor.predictor {
-                    1 => None,
-                    _ => Some(Box::new(Unpredictor::new(&predictor)?)),
-                };
-                Some((predictor, unpredictor))
-            };
-            layers.push(match filter {
-                // Rule 9 of the crypt filter rules (`crate::crypto`): decoding passes over /Crypt.
-                Filter::Crypt => continue,
-                Filter::FlateDecode => {
-                    let Some((predictor, unpredictor)) = predicted() else {
-                        return Ok(None);
-                    };
-                    Layer::Flate(predictor, unpredictor)
-                }
-                Filter::LzwDecode => {
-                    let Some((predictor, unpredictor)) = predicted() else {
-                        return Ok(None);
-                    };
-                    Layer::Lzw(predictor, unpredictor)
-                }
-                Filter::AsciiHexDecode => Layer::AsciiHex,
-                Filter::Ascii85Decode => Layer::Ascii85,
-                Filter::RunLengthDecode => Layer::RunLength,
-                Filter::CcittFaxDecode
-                | Filter::Jbig2Decode
-                | Filter::DctDecode
-                | Filter::JpxDecode => return Ok(None),
-            });
-        }
-        let data = self.raw_data_metered(meter, true)?;
+        // The filters are read one at a time, as they become layers, and kept no
+        // longer: what reading a chain of them holds is its layers alone.
+        let mut crypt = CryptFilters::of(&self.dict);
+        let filters = FilterEntries::of(&self.dict);
+        let steps = filters.applied().enumerate().map(|(i, (filter, entry))| {
+            crypt.read(i, filter, &entry.params);
+            Step::of(filter, &entry.params, true)
+        });
+        let Some(layers) = layers(steps) else {
+            return Ok(None);
+        };
+        let data = raw_data(
+            self.data,
+            self.decryptor(),
+            &crypt.decryption(),
+            meter,
+            true,
+        )?;
         Ok(Some(StrictReader::new(data, layers)))
     }
 
@@ -599,20 +459,247 @@ impl<'a> Stream<'a> {
     /// 8-bit components. It yields the bytes [`Stream::decoded`] returns, without
     /// holding them all. `None` for other filters, or where decryption would fail.
     pub fn decoded_reader(&self) -> Option<DecodedReader<'a>> {
+        self.decoding().reader(self.data, self.decryptor())
+    }
+
+    /// Whether the filters and predictor allow [`Stream::decoded_reader`], judged from
+    /// the dictionary alone: no data is read or decrypted.
+    pub fn can_read_incrementally(&self) -> bool {
+        self.decoding().reader_filter().is_some()
+    }
+
+    /// The stream owned ([`OwnedStream`]): its stored data, and how they decode,
+    /// read once from its dictionary, so that decoding it reads no object of its
+    /// document. The data are the document's file's where they lie in it, else (an
+    /// inline image's, or a stream's that a damaged file keeps in an object stream)
+    /// a copy of them.
+    pub fn to_owned_stream(&self) -> OwnedStream {
+        self.owned(true)
+    }
+
+    /// [`Self::to_owned_stream`], with JBIG2 globals if `globals`.
+    pub(crate) fn owned(&self, globals: bool) -> OwnedStream {
+        let decoding = Decoding::of(&self.dict, globals);
+        let xref = self.dict.ctx().xref();
+        let in_file = xref.file_data().and_then(|file| {
+            let all = file.as_ref();
+            let start = (self.data.as_ptr() as usize).checked_sub(all.as_ptr() as usize)?;
+            let range = start..start.checked_add(self.data.len())?;
+            // Data in a decoded object stream, or in a content stream, lie elsewhere.
+            core::ptr::eq(all.get(range.clone())?, self.data).then(|| (file.clone(), range))
+        });
+        let (bytes, range, copied) = match in_file {
+            Some((file, range)) => (file, range, false),
+            None => (PdfData::from(self.data.to_vec()), 0..self.data.len(), true),
+        };
+        OwnedStream(Arc::new(Owned {
+            bytes,
+            range,
+            copied,
+            decryptor: match decoding.decryption {
+                Ok(Some(_)) => xref.decrypting_shared(),
+                _ => None,
+            },
+            decoding,
+        }))
+    }
+}
+
+/// A stream owned ([`Stream::to_owned_stream`]): its stored data, which it holds
+/// (the document's file, or a copy of them), the decryptor of its document, and how
+/// the data decode, read from its dictionary once. Decoding it reads no object of
+/// its document, so it keeps nothing in the document and nothing of what it read,
+/// however often it is decoded. Cheap to clone.
+#[derive(Clone)]
+pub struct OwnedStream(Arc<Owned>);
+
+struct Owned {
+    /// The bytes the data lie in, and where.
+    bytes: PdfData,
+    range: core::ops::Range<usize>,
+    /// Whether `bytes` are a copy of the data, which this holds alone.
+    copied: bool,
+    /// Where the data are decrypted.
+    decryptor: Option<Arc<Decryptor>>,
+    decoding: Decoding,
+}
+
+impl Debug for OwnedStream {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        write!(f, "OwnedStream (len: {})", self.0.range.len())
+    }
+}
+
+impl OwnedStream {
+    /// The stored data.
+    pub(crate) fn data(&self) -> &[u8] {
+        &self.0.bytes.as_ref()[self.0.range.clone()]
+    }
+
+    fn decryptor(&self) -> Option<&Decryptor> {
+        self.0.decryptor.as_deref()
+    }
+
+    /// The filters applied, in order ([`Stream::filters`]).
+    pub fn filters(&self) -> impl Iterator<Item = Filter> + '_ {
+        self.0.decoding.steps.iter().map(Step::filter)
+    }
+
+    /// The decoded data ([`Stream::decoded`]).
+    pub fn decoded(&self) -> Result<Cow<'_, [u8]>, DecodeFailure> {
+        self.decoded_image_metered(&ImageDecodeParams::default(), &Meter::default())
+            .map(|r| r.data)
+    }
+
+    /// The decoded data and image metadata ([`Stream::decoded_image_metered`]).
+    pub fn decoded_image_metered(
+        &self,
+        image_params: &ImageDecodeParams,
+        meter: &Meter<'_>,
+    ) -> Result<FilterResult<'_>, DecodeFailure> {
+        self.0
+            .decoding
+            .decode(self.data(), self.decryptor(), image_params, meter, false)
+    }
+
+    /// The decoded data read incrementally ([`Stream::decoded_reader`]).
+    pub fn decoded_reader(&self) -> Option<DecodedReader<'_>> {
+        self.0.decoding.reader(self.data(), self.decryptor())
+    }
+
+    /// Whether [`Self::decoded_reader`] reads the data
+    /// ([`Stream::can_read_incrementally`]).
+    pub fn can_read_incrementally(&self) -> bool {
+        self.0.decoding.reader_filter().is_some()
+    }
+
+    /// The bytes this holds besides the document's file: a copy of the data, and
+    /// those its JBIG2 globals hold.
+    pub fn copied_bytes(&self) -> usize {
+        let globals = self.0.decoding.steps.iter().map(|step| match step {
+            Step::Jbig2(Some(globals)) => globals.copied_bytes(),
+            _ => 0,
+        });
+        let copy = if self.0.copied { self.0.range.len() } else { 0 };
+        copy + globals.sum::<usize>()
+    }
+
+    /// Whether `data` are this stream's stored bytes, not merely equal to them.
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn holds(&self, data: &[u8]) -> bool {
+        core::ptr::eq(self.data(), data)
+    }
+}
+
+/// How a stream's data are decrypted and decoded, read from its dictionary once
+/// ([`Self::of`]): decoding reads nothing else of the dictionary, nor any object of
+/// its document, so a key no filter reads is never resolved.
+#[derive(Clone, Debug)]
+pub(crate) struct Decoding {
+    /// [`Decoding::decryption_of`].
+    decryption: Decryption,
+    /// The filters, in order, each with what decoding it reads of its parameters.
+    steps: SmallVec<[Step; 2]>,
+}
+
+/// How a stream's data are decrypted, by rules 5, 6, 8 and 10 of the crypt filter
+/// rules (`crate::crypto`): `Ok(None)` where they are read as stored, else the object
+/// whose key decrypts them and the name of the crypt filter that does, `None` for the
+/// document's stream filter; [`DecodeFailure::Decryption`] where a named `/Crypt`
+/// filter is not the first filter.
+type Decryption = Result<Option<(ObjectIdentifier, Option<Box<[u8]>>)>, DecodeFailure>;
+
+impl Decoding {
+    /// How the data of a stream with dictionary `dict` decode: its filters, read
+    /// once ([`FilterEntries`]), each with the keys of its parameters it reads; the
+    /// JBIG2 globals only if `globals`, so that a stream's globals name none.
+    pub(crate) fn of(dict: &Dict<'_>, globals: bool) -> Self {
+        let mut crypt = CryptFilters::of(dict);
+        let steps = FilterEntries::of(dict)
+            .applied()
+            .enumerate()
+            .map(|(i, (filter, entry))| {
+                crypt.read(i, filter, &entry.params);
+                Step::of(filter, &entry.params, globals)
+            })
+            .collect();
+        Self {
+            decryption: crypt.decryption(),
+            steps,
+        }
+    }
+
+    /// How the data of a stream with dictionary `dict` and `filters` are decrypted
+    /// ([`Decryption`]).
+    fn decryption_of(dict: &Dict<'_>, filters: &FilterEntries<'_>) -> Decryption {
+        let mut crypt = CryptFilters::of(dict);
+        for (i, (filter, entry)) in filters.applied().enumerate() {
+            crypt.read(i, filter, &entry.params);
+        }
+        crypt.decryption()
+    }
+
+    /// The decoded data `data`, decrypted by `decryptor`, and their image metadata;
+    /// if `strict`, [`DecodeFailure::StreamDecode`] where they are corrupt.
+    fn decode<'d>(
+        &self,
+        data: &'d [u8],
+        decryptor: Option<&Decryptor>,
+        image_params: &ImageDecodeParams,
+        meter: &Meter<'_>,
+        strict: bool,
+    ) -> Result<FilterResult<'d>, DecodeFailure> {
+        let data = raw_data(data, decryptor, &self.decryption, meter, strict)?;
+
+        let mut current: Option<FilterResult<'d>> = None;
+
+        let mut applied = self
+            .steps
+            .iter()
+            // Rule 9 of the crypt filter rules (`crate::crypto`): decoding passes over /Crypt.
+            .filter(|step| !matches!(step, Step::Crypt))
+            .peekable();
+        while let Some(step) = applied.next() {
+            // The last filter makes the image's samples.
+            let expected = match applied.peek() {
+                None => image_params.expected_len(),
+                Some(_) => 0,
+            };
+            let new = step.apply(
+                current.as_ref().map(|c| c.data.as_ref()).unwrap_or(&data),
+                image_params,
+                meter,
+                strict,
+                expected,
+            )?;
+            current = Some(new);
+        }
+
+        Ok(current.unwrap_or(FilterResult {
+            data,
+            image_data: None,
+        }))
+    }
+
+    /// [`Stream::decoded_reader`] of `data`, decrypted by `decryptor`.
+    fn reader<'d>(
+        &self,
+        data: &'d [u8],
+        decryptor: Option<&Decryptor>,
+    ) -> Option<DecodedReader<'d>> {
         let filter = self.reader_filter()?;
         // Rules 5 to 11 of the crypt filter rules (`crate::crypto`): the data, decrypted, or `None`.
-        let data = match self.decryption().ok()? {
-            None => DecryptedReader::raw(Cow::Borrowed(self.data)),
+        let data = match self.decryption.as_ref().ok()? {
+            None => DecryptedReader::raw(Cow::Borrowed(data)),
             Some((id, name)) => {
-                let xref = self.dict.ctx().xref();
-                let target = Self::target(&name);
-                if self.data.is_empty() {
-                    if !xref.decrypts_whole(self.data, target) {
+                let target = target(name);
+                if data.is_empty() {
+                    if !decrypts_whole(decryptor, data, target) {
                         return None;
                     }
-                    DecryptedReader::raw(Cow::Borrowed(self.data))
+                    DecryptedReader::raw(Cow::Borrowed(data))
                 } else {
-                    xref.decrypted_reader(id, self.data, target)?
+                    decrypted_reader(decryptor, *id, data, target)?
                 }
             }
         };
@@ -622,21 +709,13 @@ impl<'a> Stream<'a> {
         }
     }
 
-    /// Whether the filters and predictor allow [`Stream::decoded_reader`], judged from
-    /// the dictionary alone: no data is read or decrypted.
-    pub fn can_read_incrementally(&self) -> bool {
-        self.reader_filter().is_some()
-    }
-
     /// The predictor of the one Flate filter, `Some(None)` for no filter, `None` when
     /// the filters cannot be read incrementally.
     fn reader_filter(&self) -> Option<Option<PredictorParams>> {
-        let filters = self.filter_entries();
-        let mut applied = filters.applied();
-        match (applied.next(), applied.next()) {
-            (None, _) => Some(None),
-            (Some((Filter::FlateDecode, entry)), None) => {
-                let params = PredictorParams::from_params(&entry.params)?;
+        match self.steps.as_slice() {
+            [] => Some(None),
+            [Step::Flate(params)] => {
+                let params = params.clone()?;
                 if params.predictor != 1 {
                     Unpredictor::new(&params)?;
                 }
@@ -646,112 +725,176 @@ impl<'a> Stream<'a> {
         }
     }
 
-    /// An owned handle to this stream, which [`OwnedStream::reader`] reads again
-    /// without borrowing the data it was read from: for an indirect object, its
-    /// identifier and `apart`, what readers of its document apart from the table it
-    /// was read through share ([`XRef::detached`](crate::xref::XRef::detached)), so
-    /// that reading it again keeps nothing in that table; without them for its
-    /// document, its own. For an inline image, a copy of the dictionary and data.
-    pub fn to_owned_stream(&self, apart: Option<&Detached>) -> OwnedStream {
-        OwnedStream(match self.dict.obj_id() {
-            Some(id) => OwnedInner::Indirect {
-                xref: match apart {
-                    Some(reader)
-                        if reader.document_id().is_some()
-                            && reader.document_id() == self.dict.ctx().xref().document_id() =>
-                    {
-                        reader.clone()
-                    }
-                    _ => self.dict.ctx().xref().detached(),
-                },
-                id,
-            },
-            None => OwnedInner::Inline {
-                dict: Arc::from(self.dict.data()),
-                data: Arc::from(self.data),
-            },
+    /// Whether the data are one JPEG, read as stored.
+    #[cfg(feature = "images")]
+    pub(crate) fn is_plain_jpeg(&self) -> bool {
+        matches!(self.decryption, Ok(None)) && matches!(self.steps.as_slice(), [Step::Dct(_)])
+    }
+}
+
+/// The layers [`StrictReader`] reads `steps` through, `None` where a filter has no
+/// decoder that reads a piece at a time, or whole decoding refuses its predictor's
+/// parameters.
+fn layers(steps: impl Iterator<Item = Step>) -> Option<Vec<Layer>> {
+    // The parameters and the reversal of the predictor; `None` where whole decoding
+    // refuses the parameters or only it reverses the predictor.
+    let predicted = |predictor: Option<PredictorParams>| {
+        let predictor = predictor?;
+        let unpredictor = match predictor.predictor {
+            1 => None,
+            _ => Some(Box::new(Unpredictor::new(&predictor)?)),
+        };
+        Some((predictor, unpredictor))
+    };
+    let mut layers = Vec::new();
+    for step in steps {
+        layers.push(match step {
+            // Rule 9 of the crypt filter rules (`crate::crypto`): decoding passes over /Crypt.
+            Step::Crypt => continue,
+            Step::Flate(predictor) => {
+                let (predictor, unpredictor) = predicted(predictor)?;
+                Layer::Flate(predictor, unpredictor)
+            }
+            Step::Lzw(predictor) => {
+                let (predictor, unpredictor) = predicted(predictor)?;
+                Layer::Lzw(predictor, unpredictor)
+            }
+            Step::AsciiHex => Layer::AsciiHex,
+            Step::Ascii85 => Layer::Ascii85,
+            Step::RunLength => Layer::RunLength,
+            Step::Ccitt(_) | Step::Jbig2(_) | Step::Dct(_) | Step::Jpx => return None,
+        });
+    }
+    Some(layers)
+}
+
+/// What decides how a stream's data are decrypted, read from its dictionary and
+/// filters one at a time ([`Decryption`]).
+struct CryptFilters {
+    /// The object whose key decrypts the data, by rules 8 and 10; `None` where the
+    /// document does not decrypt them (an inline image, an xref stream), and no
+    /// filter's `/Name` is read.
+    id: Option<ObjectIdentifier>,
+    /// The crypt filter the first filter names.
+    named: Option<Box<[u8]>>,
+    /// Whether a `/Crypt` filter names none.
+    stored: bool,
+    /// Whether a filter other than the first names a crypt filter.
+    misplaced: bool,
+}
+
+impl CryptFilters {
+    fn of(dict: &Dict<'_>) -> Self {
+        // Rules 8 and 10: what the document does not decrypt, an inline image included.
+        let id = dict.ctx().decryption().filter(|_| {
+            !dict
+                .get::<crate::object::String<'_>>(TYPE)
+                .is_some_and(|ty| ty.as_ref() == XREF)
+        });
+        Self {
+            id,
+            named: None,
+            stored: false,
+            misplaced: false,
+        }
+    }
+
+    /// Reads applied filter `i`, `filter` with `params`.
+    fn read(&mut self, i: usize, filter: Filter, params: &Dict<'_>) {
+        if self.id.is_none() || filter != Filter::Crypt {
+            return;
+        }
+        // Rules 5 and 6: the first filter may name a crypt filter; any /Crypt filter
+        // that names none leaves the data as stored, unless the first one names one.
+        match params.get::<Name<'_>>(NAME) {
+            Some(name) if name.deref() != IDENTITY => {
+                if i > 0 {
+                    self.misplaced = true;
+                } else {
+                    self.named = Some(Box::from(name.deref()));
+                }
+            }
+            _ => self.stored = true,
+        }
+    }
+
+    fn decryption(self) -> Decryption {
+        let Some(id) = self.id else {
+            return Ok(None);
+        };
+        if self.misplaced {
+            return Err(DecodeFailure::Decryption);
+        }
+        Ok(match self.named {
+            Some(name) => Some((id, Some(name))),
+            None if self.stored => None,
+            None => Some((id, None)),
         })
     }
 }
 
-/// A stream that owns what it needs to read it again (see [`Stream::to_owned_stream`]),
-/// and keeps nothing it read.
-#[derive(Clone)]
-pub struct OwnedStream(OwnedInner);
-
-#[derive(Clone)]
-enum OwnedInner {
-    Indirect {
-        xref: Detached,
-        id: ObjectIdentifier,
-    },
-    Inline {
-        dict: Arc<[u8]>,
-        data: Arc<[u8]>,
-    },
-}
-
-impl OwnedStream {
-    /// A reader of the stream of its own ([`StreamReader`]).
-    pub fn reader(&self) -> StreamReader {
-        StreamReader {
-            read: match &self.0 {
-                OwnedInner::Indirect { xref, id } => Read::Indirect {
-                    xref: xref.reader(),
-                    id: *id,
-                },
-                OwnedInner::Inline { dict, data } => Read::Inline {
-                    dict: dict.clone(),
-                    data: data.clone(),
-                },
-            },
-            owned: self.clone(),
-        }
+/// The crypt filter `name` names, `None` for the document's stream filter.
+fn target(name: &Option<Box<[u8]>>) -> DecryptionTarget<'_> {
+    match name {
+        None => DecryptionTarget::Stream,
+        Some(name) => DecryptionTarget::Named(name),
     }
 }
 
-/// The stream of an [`OwnedStream`] read through a reader of its own: what reading
-/// it and what its dictionary names (its filters' parameters, its masks) keeps, such
-/// as the object streams those are in, it keeps, and frees when it is dropped, but
-/// for what the table it was first read through keeps, which it reads there
-/// ([`XRef::detached`]). So what holds an [`OwnedStream`] holds nothing it read,
-/// however often it is read.
-pub struct StreamReader {
-    owned: OwnedStream,
-    pub(crate) read: Read,
+/// Whether `decryptor`, none for a document that is not read from a file, decrypts
+/// `data` whole.
+fn decrypts_whole(
+    decryptor: Option<&Decryptor>,
+    data: &[u8],
+    target: DecryptionTarget<'_>,
+) -> bool {
+    decryptor.is_none_or(|d| d.decrypts_whole(data, target))
 }
 
-/// What a [`StreamReader`] reads its stream from.
-pub(crate) enum Read {
-    /// An object, through a reader of the document of its own.
-    Indirect { xref: XRef, id: ObjectIdentifier },
-    /// An inline image's dictionary and data.
-    Inline { dict: Arc<[u8]>, data: Arc<[u8]> },
+/// A reader of `data` of object `id` decrypted by `decryptor`, as stored without one.
+fn decrypted_reader<'d>(
+    decryptor: Option<&Decryptor>,
+    id: ObjectIdentifier,
+    data: &'d [u8],
+    target: DecryptionTarget<'_>,
+) -> Option<DecryptedReader<'d>> {
+    match decryptor {
+        None => Some(DecryptedReader::raw(Cow::Borrowed(data))),
+        Some(d) => d.reader(id, data, target),
+    }
 }
 
-impl StreamReader {
-    /// The stream; `None` if it can no longer be read.
-    pub fn stream(&self) -> Option<Stream<'_>> {
-        match &self.read {
-            Read::Indirect { xref, id } => xref.get::<Stream<'_>>(*id),
-            Read::Inline { dict, data } => {
-                let dict = Reader::new(dict).read_without_context::<InlineImageDict<'_>>()?;
-                Some(Stream::new(data, dict.get_dict().clone()))
-            }
-        }
+/// The stored `data`, decrypted by `decryptor` as `decryption` says, a counted piece at
+/// a time; if `strict`, data that does not decrypt whole is a failure.
+fn raw_data<'d>(
+    data: &'d [u8],
+    decryptor: Option<&Decryptor>,
+    decryption: &Decryption,
+    meter: &Meter<'_>,
+    strict: bool,
+) -> Result<Cow<'d, [u8]>, DecodeFailure> {
+    let Some((id, name)) = decryption.as_ref().map_err(|e| *e)? else {
+        return Ok(Cow::Borrowed(data));
+    };
+    let target = target(name);
+    let whole = decrypts_whole(decryptor, data, target);
+    // Rule 11 of the crypt filter rules (`crate::crypto`): no data reads as empty
+    // wherever they decrypt at all.
+    if (strict || data.is_empty()) && !whole {
+        return Err(DecodeFailure::Decryption);
     }
-
-    /// The handle read.
-    pub fn owned(&self) -> &OwnedStream {
-        &self.owned
+    if data.is_empty() {
+        return Ok(Cow::Borrowed(data));
     }
-
-    /// Whether `data` are this stream's stored bytes, not merely equal to them.
-    #[cfg(feature = "unsafe")]
-    pub(crate) fn holds(&self, data: &[u8]) -> bool {
-        self.stream()
-            .is_some_and(|stream| core::ptr::eq(stream.data, data))
+    let mut reader =
+        decrypted_reader(decryptor, *id, data, target).ok_or(DecodeFailure::Decryption)?;
+    if reader.plain().is_some() {
+        return Ok(Cow::Borrowed(data));
     }
+    reader
+        .decrypt_all(meter)
+        .map(Cow::Owned)
+        .map_err(|_| DecodeFailure::Cancelled)
 }
 
 impl Debug for Stream<'_> {
