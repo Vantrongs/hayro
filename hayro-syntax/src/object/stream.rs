@@ -288,10 +288,10 @@ impl<'a> Stream<'a> {
         FilterEntries::of(&self.dict)
     }
 
-    /// How the stream's data are decrypted and decoded, read from its dictionary
-    /// ([`Decoding::of`]).
-    fn decoding(&self) -> Decoding {
-        Decoding::of(&self.dict, true)
+    /// How the stream's data are decrypted and decoded, for an image `height` rows
+    /// high, 0 where none is given, read from its dictionary ([`Decoding::of`]).
+    fn decoding(&self, height: u32) -> Decoding {
+        Decoding::of(&self.dict, true, height)
     }
 
     /// The decryptor of the stream's document.
@@ -397,7 +397,7 @@ impl<'a> Stream<'a> {
         &self,
         meter: &Meter<'_>,
     ) -> Result<Cow<'a, [u8]>, DecodeFailure> {
-        self.decoding()
+        self.decoding(0)
             .decode(
                 self.data,
                 self.decryptor(),
@@ -415,8 +415,13 @@ impl<'a> Stream<'a> {
         image_params: &ImageDecodeParams,
         meter: &Meter<'_>,
     ) -> Result<FilterResult<'a>, DecodeFailure> {
-        self.decoding()
-            .decode(self.data, self.decryptor(), image_params, meter, false)
+        self.decoding(image_params.height).decode(
+            self.data,
+            self.decryptor(),
+            image_params,
+            meter,
+            false,
+        )
     }
 
     /// The data [`Self::decoded_strict`] returns, read a piece at a time through all
@@ -434,23 +439,22 @@ impl<'a> Stream<'a> {
         meter: &Meter<'_>,
     ) -> Result<Option<StrictReader<'a>>, DecodeFailure> {
         // The filters are read one at a time, as they become layers, and kept no
-        // longer: what reading a chain of them holds is its layers alone.
-        let mut crypt = CryptFilters::of(&self.dict);
+        // longer: what reading a chain of them holds is its layers alone. The
+        // parameters of a filter no layer reads are not read, nor, where a filter has
+        // none, the decryption.
         let filters = FilterEntries::of(&self.dict);
-        let steps = filters.applied().enumerate().map(|(i, (filter, entry))| {
-            crypt.read(i, filter, &entry.params);
-            Step::of(filter, &entry.params, true)
+        let steps = filters.applied().map(|(filter, entry)| match filter {
+            Filter::CcittFaxDecode
+            | Filter::Jbig2Decode
+            | Filter::DctDecode
+            | Filter::JpxDecode => None,
+            _ => Some(Step::of(filter, &entry.params, true, 0)),
         });
         let Some(layers) = layers(steps) else {
             return Ok(None);
         };
-        let data = raw_data(
-            self.data,
-            self.decryptor(),
-            &crypt.decryption(),
-            meter,
-            true,
-        )?;
+        let decryption = Decoding::decryption_of(&self.dict, &filters);
+        let data = raw_data(self.data, self.decryptor(), &decryption, meter, true)?;
         Ok(Some(StrictReader::new(data, layers)))
     }
 
@@ -459,27 +463,42 @@ impl<'a> Stream<'a> {
     /// 8-bit components. It yields the bytes [`Stream::decoded`] returns, without
     /// holding them all. `None` for other filters, or where decryption would fail.
     pub fn decoded_reader(&self) -> Option<DecodedReader<'a>> {
-        self.decoding().reader(self.data, self.decryptor())
+        self.incremental_decoding()?
+            .reader(self.data, self.decryptor())
     }
 
     /// Whether the filters and predictor allow [`Stream::decoded_reader`], judged from
     /// the dictionary alone: no data is read or decrypted.
     pub fn can_read_incrementally(&self) -> bool {
-        self.decoding().reader_filter().is_some()
+        let filters = FilterEntries::of(&self.dict);
+        incremental(&filters).is_some_and(|steps| Decoding::reader_filter_of(&steps).is_some())
+    }
+
+    /// [`Self::decoding`] where the filters may allow [`Stream::decoded_reader`]: no
+    /// filter or one Flate filter; `None`, no parameters read, for others.
+    fn incremental_decoding(&self) -> Option<Decoding> {
+        let filters = FilterEntries::of(&self.dict);
+        let steps = incremental(&filters)?;
+        Some(Decoding {
+            decryption: Decoding::decryption_of(&self.dict, &filters),
+            steps,
+        })
     }
 
     /// The stream owned ([`OwnedStream`]): its stored data, and how they decode,
     /// read once from its dictionary, so that decoding it reads no object of its
     /// document. The data are the document's file's where they lie in it, else (an
     /// inline image's, or a stream's that a damaged file keeps in an object stream)
-    /// a copy of them.
-    pub fn to_owned_stream(&self) -> OwnedStream {
-        self.owned(true)
+    /// a copy of them. They decode as an image `height` rows high, 0 where none is
+    /// given, whatever height decoding them is given ([`ImageDecodeParams::height`]):
+    /// what of the parameters decoding reads depends on it.
+    pub fn to_owned_stream(&self, height: u32) -> OwnedStream {
+        self.owned(true, height)
     }
 
     /// [`Self::to_owned_stream`], with JBIG2 globals if `globals`.
-    pub(crate) fn owned(&self, globals: bool) -> OwnedStream {
-        let decoding = Decoding::of(&self.dict, globals);
+    pub(crate) fn owned(&self, globals: bool, height: u32) -> OwnedStream {
+        let decoding = Decoding::of(&self.dict, globals, height);
         let xref = self.dict.ctx().xref();
         let in_file = xref.file_data().and_then(|file| {
             let all = file.as_ref();
@@ -610,23 +629,25 @@ pub(crate) struct Decoding {
 type Decryption = Result<Option<(ObjectIdentifier, Option<Box<[u8]>>)>, DecodeFailure>;
 
 impl Decoding {
-    /// How the data of a stream with dictionary `dict` decode: its filters, read
-    /// once ([`FilterEntries`]), each with the keys of its parameters it reads; the
-    /// JBIG2 globals only if `globals`, so that a stream's globals name none.
-    pub(crate) fn of(dict: &Dict<'_>, globals: bool) -> Self {
-        let mut crypt = CryptFilters::of(dict);
-        let steps = FilterEntries::of(dict)
-            .applied()
-            .enumerate()
-            .map(|(i, (filter, entry))| {
-                crypt.read(i, filter, &entry.params);
-                Step::of(filter, &entry.params, globals)
-            })
-            .collect();
-        Self {
-            decryption: crypt.decryption(),
-            steps,
-        }
+    /// How the data of a stream with dictionary `dict` decode as an image `height`
+    /// rows high, 0 where none is given: its filters ([`FilterEntries`]), each with
+    /// the keys of its parameters it reads ([`Step::of`]); the JBIG2 globals only if
+    /// `globals`, so that a stream's globals name none. Where the dictionary leaves
+    /// the data no decryption, no filter's parameters are read. What the data decide
+    /// is not known here: the parameters of a filter after one that fails on the data,
+    /// and DCT's `/ColorTransform` of data whose JPEG header is broken, are read as
+    /// for data that decode, which read them.
+    pub(crate) fn of(dict: &Dict<'_>, globals: bool, height: u32) -> Self {
+        let filters = FilterEntries::of(dict);
+        let decryption = Self::decryption_of(dict, &filters);
+        let steps = match decryption {
+            Err(_) => SmallVec::new(),
+            Ok(_) => filters
+                .applied()
+                .map(|(filter, entry)| Step::of(filter, &entry.params, globals, height))
+                .collect(),
+        };
+        Self { decryption, steps }
     }
 
     /// How the data of a stream with dictionary `dict` and `filters` are decrypted
@@ -712,7 +733,12 @@ impl Decoding {
     /// The predictor of the one Flate filter, `Some(None)` for no filter, `None` when
     /// the filters cannot be read incrementally.
     fn reader_filter(&self) -> Option<Option<PredictorParams>> {
-        match self.steps.as_slice() {
+        Self::reader_filter_of(&self.steps)
+    }
+
+    /// [`Self::reader_filter`] of `steps`.
+    fn reader_filter_of(steps: &[Step]) -> Option<Option<PredictorParams>> {
+        match steps {
             [] => Some(None),
             [Step::Flate(params)] => {
                 let params = params.clone()?;
@@ -732,10 +758,26 @@ impl Decoding {
     }
 }
 
+/// The steps of `filters` where they may allow [`Stream::decoded_reader`]: none, or
+/// one Flate filter, whose parameters alone are read; `None`, none read, for others.
+fn incremental(filters: &FilterEntries<'_>) -> Option<SmallVec<[Step; 2]>> {
+    let mut applied = filters.applied();
+    match (applied.next(), applied.next()) {
+        (None, _) => Some(SmallVec::new()),
+        (Some((filter @ Filter::FlateDecode, entry)), None) => Some(smallvec::smallvec![Step::of(
+            filter,
+            &entry.params,
+            true,
+            0
+        )]),
+        _ => None,
+    }
+}
+
 /// The layers [`StrictReader`] reads `steps` through, `None` where a filter has no
-/// decoder that reads a piece at a time, or whole decoding refuses its predictor's
-/// parameters.
-fn layers(steps: impl Iterator<Item = Step>) -> Option<Vec<Layer>> {
+/// decoder that reads a piece at a time (a step `None`, whose parameters are not
+/// read), or whole decoding refuses its predictor's parameters.
+fn layers(steps: impl Iterator<Item = Option<Step>>) -> Option<Vec<Layer>> {
     // The parameters and the reversal of the predictor; `None` where whole decoding
     // refuses the parameters or only it reverses the predictor.
     let predicted = |predictor: Option<PredictorParams>| {
@@ -748,7 +790,7 @@ fn layers(steps: impl Iterator<Item = Step>) -> Option<Vec<Layer>> {
     };
     let mut layers = Vec::new();
     for step in steps {
-        layers.push(match step {
+        layers.push(match step? {
             // Rule 9 of the crypt filter rules (`crate::crypto`): decoding passes over /Crypt.
             Step::Crypt => continue,
             Step::Flate(predictor) => {
@@ -801,7 +843,8 @@ impl CryptFilters {
 
     /// Reads applied filter `i`, `filter` with `params`.
     fn read(&mut self, i: usize, filter: Filter, params: &Dict<'_>) {
-        if self.id.is_none() || filter != Filter::Crypt {
+        // A misplaced crypt filter decides the decryption: nothing after it is read.
+        if self.id.is_none() || self.misplaced || filter != Filter::Crypt {
             return;
         }
         // Rules 5 and 6: the first filter may name a crypt filter; any /Crypt filter

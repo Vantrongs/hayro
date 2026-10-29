@@ -308,7 +308,7 @@ impl SampledImage {
             color_space: image.color_space.clone(),
             transfer_function: image.transfer_function.clone(),
             warning_sink: image.warning_sink.clone(),
-            stream: image.stream.to_owned_stream(),
+            stream: image.stream.to_owned_stream(image.height),
             bpc: dict
                 .get::<u8>(BPC)
                 .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT)),

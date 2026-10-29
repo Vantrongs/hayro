@@ -112,22 +112,23 @@ pub(crate) enum Step {
 }
 
 impl Step {
-    /// `filter` with what decoding it reads of `params`; JBIG2 globals only if
-    /// `globals` (the globals of a JBIG2 image, not those of its globals).
-    pub(crate) fn of(filter: Filter, params: &Dict<'_>, globals: bool) -> Self {
+    /// `filter` with what decoding it reads of `params`, for an image `height` rows
+    /// high, 0 where none is given; JBIG2 globals only if `globals` (the globals of a
+    /// JBIG2 image, not those of its globals).
+    pub(crate) fn of(filter: Filter, params: &Dict<'_>, globals: bool, height: u32) -> Self {
         match filter {
             Filter::AsciiHexDecode => Self::AsciiHex,
             Filter::Ascii85Decode => Self::Ascii85,
             Filter::RunLengthDecode => Self::RunLength,
             Filter::LzwDecode => Self::Lzw(PredictorParams::from_params(params)),
             Filter::FlateDecode => Self::Flate(PredictorParams::from_params(params)),
-            Filter::CcittFaxDecode => Self::Ccitt(CcittParams::of(params)),
+            Filter::CcittFaxDecode => Self::Ccitt(CcittParams::of(params, height)),
             Filter::DctDecode => Self::Dct(params.get::<u8>(COLOR_TRANSFORM)),
             Filter::Jbig2Decode => Self::Jbig2(
                 globals
                     .then(|| params.get::<Stream<'_>>(JBIG2_GLOBALS))
                     .flatten()
-                    .map(|g| g.owned(false)),
+                    .map(|g| g.owned(false, 0)),
             ),
             Filter::JpxDecode => Self::Jpx,
             Filter::Crypt => Self::Crypt,
@@ -225,7 +226,9 @@ impl Step {
 pub(crate) struct CcittParams {
     pub(crate) k: i32,
     pub(crate) columns: u32,
-    /// The rows, read where the image's dictionary gives no height.
+    /// The image's height where it is given, else `/Rows`, which then alone is read:
+    /// `/Rows` should match the height, but where it does not, the height takes
+    /// precedence (as in other viewers).
     pub(crate) rows: u32,
     pub(crate) end_of_block: bool,
     pub(crate) end_of_line: bool,
@@ -234,11 +237,16 @@ pub(crate) struct CcittParams {
 }
 
 impl CcittParams {
-    pub(crate) fn of(params: &Dict<'_>) -> Self {
+    /// What decoding an image `height` rows high, 0 where none is given, reads of
+    /// `params`.
+    pub(crate) fn of(params: &Dict<'_>, height: u32) -> Self {
         Self {
             k: params.get::<i32>(K).unwrap_or(0),
             columns: params.get::<usize>(COLUMNS).unwrap_or(1728) as u32,
-            rows: params.get::<u32>(ROWS).unwrap_or(0),
+            rows: match height {
+                0 => params.get::<u32>(ROWS).unwrap_or(0),
+                height => height,
+            },
             end_of_block: params.get::<bool>(END_OF_BLOCK).unwrap_or(true),
             end_of_line: params.get::<bool>(END_OF_LINE).unwrap_or(false),
             encoded_byte_align: params.get::<bool>(ENCODED_BYTE_ALIGN).unwrap_or(false),

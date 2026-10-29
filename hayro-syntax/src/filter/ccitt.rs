@@ -103,13 +103,7 @@ pub(crate) fn decode(
     let k = params.k;
 
     let columns = params.columns;
-    // `Rows` should match the height of the image, but in case it doesn't,
-    // the image height takes precedence (as in other viewers).
-    let rows = if image_params.height > 0 {
-        image_params.height
-    } else {
-        params.rows
-    };
+    let rows = params.rows;
     let output_len = (columns as usize).checked_mul(rows as usize)?;
 
     let mut settings = DecodeSettings::new(columns, rows);
@@ -426,7 +420,10 @@ mod tests {
 
     #[test]
     fn issue1258() {
-        let params = CcittParams::of(&Dict::from_bytes(b"<< /K 0 /Columns 8 /Rows 1 >>").unwrap());
+        let params = CcittParams::of(
+            &Dict::from_bytes(b"<< /K 0 /Columns 8 /Rows 1 >>").unwrap(),
+            0,
+        );
 
         let decoded = decode(
             &[0x35, 0x14],
@@ -442,7 +439,7 @@ mod tests {
 
     #[test]
     fn unknown_rows() {
-        let params = CcittParams::of(&Dict::from_bytes(b"<< /K 0 /Columns 8 >>").unwrap());
+        let params = CcittParams::of(&Dict::from_bytes(b"<< /K 0 /Columns 8 >>").unwrap(), 0);
 
         let decoded = decode(
             &[0x35, 0x14],
@@ -474,7 +471,7 @@ mod tests {
         let pairs = 100_000;
         let data = [0x23, 0xA2, 0x3A].repeat(pairs / 2);
         let dict = format!("<< /K -1 /Columns {} /Rows 1 >>", 2 * pairs);
-        let params = CcittParams::of(&Dict::from_bytes(dict.as_bytes()).unwrap());
+        let params = CcittParams::of(&Dict::from_bytes(dict.as_bytes()).unwrap(), 0);
         let told = |is_indexed| {
             let image_params = ImageDecodeParams {
                 is_indexed,

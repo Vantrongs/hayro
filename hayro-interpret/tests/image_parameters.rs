@@ -18,11 +18,13 @@ use kurbo::{Affine, BezPath, Rect};
 
 mod common;
 
-/// The image assets drawn, and the grey of each image decoded as it is drawn.
+/// The image assets drawn, and the grey of each image decoded as it is drawn: of its
+/// first pixel, and of all.
 #[derive(Default)]
 struct Drawn {
     assets: Vec<ImageAsset>,
     decoded: Vec<u8>,
+    pixels: Vec<Vec<u8>>,
 }
 
 impl<'a> Device<'a> for Drawn {
@@ -39,6 +41,7 @@ impl<'a> Device<'a> for Drawn {
             |image, _| {
                 if let hayro_interpret::ImageData::Luma(luma) = image {
                     self.decoded.push(luma.data[0]);
+                    self.pixels.push(luma.data);
                 }
             },
             None,
@@ -211,4 +214,59 @@ fn ignored_parameters_are_not_resolved() {
     assert_eq!(drawn.decoded, [9]);
     decode_assets(&drawn.assets, &[9]);
     assert_eq!(OBJECT_STREAM_ENTRIES.get(), 0);
+}
+
+/// The greys of the `width` × 1 image `asset` decodes to.
+fn decode_row(asset: &ImageAsset, width: u32) -> Vec<u8> {
+    let mut source = asset.open(None, None).expect("the image opens");
+    let region = source
+        .request(&ImageRequest {
+            plane: Plane::Image,
+            grid: (width, 1),
+            window: [0, 0, width, 1],
+            cancel: None,
+        })
+        .expect("the image decodes");
+    region.data.to_vec()
+}
+
+/// The object stream entries read drawing, then decoding, an 8 × 1 CCITT image whose
+/// `/Rows` is `rows`, where object 6 lies in an object stream no other object uses;
+/// and the greys drawn and decoded.
+fn ccitt_image(rows: &str) -> (usize, Vec<u8>, Vec<u8>) {
+    let content = b"q 10 0 0 10 0 0 cm /Im Do Q";
+    let mut objects = common::one_page_objects(
+        10,
+        "/Contents 4 0 R /Resources << /XObject << /Im 5 0 R >> >>",
+    );
+    objects.push(common::stream("", content));
+    objects.push(common::stream(
+        &format!(
+            "/Type /XObject /Subtype /Image /Width 8 /Height 1 /ColorSpace /DeviceGray \
+             /BitsPerComponent 1 /Filter /CCITTFaxDecode \
+             /DecodeParms << /K 0 /Columns 8 /Rows {rows} >>"
+        ),
+        &[0x35, 0x14],
+    ));
+    let mut padding = vec![b"0".to_vec(); 1024];
+    padding[0] = b"1".to_vec();
+    let pdf = Pdf::new(common::file_with_object_stream(&objects, &padding)).expect("valid pdf");
+    OBJECT_STREAM_ENTRIES.set(0);
+    let mut drawn = Drawn::default();
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut drawn);
+    let [drawn_pixels] = <[Vec<u8>; 1]>::try_from(drawn.pixels).expect("one image drawn");
+    let decoded = decode_row(&drawn.assets[0], 8);
+    (OBJECT_STREAM_ENTRIES.get(), drawn_pixels, decoded)
+}
+
+/// The `/Rows` of a CCITT image's parameters is read only where its dictionary gives
+/// no height: an image with one draws reading no object stream its `/Rows` refers
+/// into, and the same pixels as with `/Rows` written in place.
+#[test]
+fn ccitt_rows_are_not_resolved_beside_a_height() {
+    let (entries, drawn, decoded) = ccitt_image("6 0 R");
+    let (_, expected_drawn, expected_decoded) = ccitt_image("1");
+    assert_eq!(expected_drawn.len(), 8);
+    assert_eq!((&drawn, &decoded), (&expected_drawn, &expected_decoded));
+    assert_eq!(entries, 0);
 }
