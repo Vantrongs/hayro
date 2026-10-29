@@ -247,7 +247,7 @@ impl<'a> JpegStreamed<'a> {
         let decoded = decode_image(&self.obj, None, meter);
         meter.poll()?;
         let decoded = decoded.ok_or(Stop::Failed)?;
-        let rows = decoded.image.height();
+        let rows = decoded.height();
         Decoded::new(decoded, meter)?.run(Plane::Image, area)?;
         Ok(rows)
     }

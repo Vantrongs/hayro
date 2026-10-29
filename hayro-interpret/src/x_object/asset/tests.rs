@@ -1287,7 +1287,7 @@ fn a_stencil_asset_is_the_alpha_the_paint_is_drawn_through() {
         .unwrap();
     let sink: WarningSinkFn = Arc::new(|_| {});
     let obj = ImageXObject::new(&stream, |_| None, &sink, &Cache::new(), None).unwrap();
-    let expected = obj.decoded_mask(None).unwrap().luma.data;
+    let expected = obj.decoded_mask(None).unwrap().luma().data.clone();
     assert_eq!(&expected[..10], &[0, 255, 0, 255, 0, 255, 0, 255, 0, 0]);
     let asset = obj.asset(None);
     let mut source = asset.open(None, None).unwrap();

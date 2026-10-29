@@ -10,12 +10,12 @@ use crate::function::interpolate;
 use crate::x_object::image::{ImageKind, ImageXObject};
 use hayro_syntax::Filter;
 use hayro_syntax::bit_reader::BitReader;
-use hayro_syntax::object::Array;
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::*;
 use hayro_syntax::object::stream::{
     DecodeFailure, FilterResult, ImageColorSpace, ImageData, ImageDecodeParams,
 };
+use hayro_syntax::object::{Array, Object};
 use hayro_syntax::work::{Meter, POLL_BYTES};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -41,6 +41,18 @@ pub(crate) struct Rows {
     pub(crate) declared: u32,
     /// Whether the plane's last row repeats past the rows it holds.
     pub(crate) repeat: bool,
+}
+
+impl Rows {
+    /// Whether a plane of `len` bytes, of rows `width` texels of `channels` bytes wide,
+    /// holds `height` whole rows, at least one and at most those it covers: as every
+    /// reader of a decoded plane takes it to.
+    fn hold(self, len: usize, width: u32, height: u32, channels: usize) -> bool {
+        let whole = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|texels| texels.checked_mul(channels));
+        width > 0 && height > 0 && height <= self.declared && whole == Some(len)
+    }
 }
 
 /// `data`, rows of `row_len` bytes, with its last row repeated up to `rows`, a piece
@@ -72,6 +84,7 @@ pub(crate) fn repeat_last_row(
 pub(crate) struct SampleFormat {
     pub(crate) color_space: ColorSpace,
     pub(crate) bits_per_component: u8,
+    /// A pair per component ([`decode_array`]).
     pub(crate) decode_arr: SmallVec<[(f32, f32); 4]>,
 }
 
@@ -121,20 +134,46 @@ fn sample_format_with(
         .or(dict_bpc)
         .unwrap_or_else(|| fallback_bpc(obj.kind));
 
-    let decode_arr = dict
-        .get::<Array<'_>>(D)
-        .or_else(|| dict.get::<Array<'_>>(DECODE))
-        .map(|a| {
-            let mut pairs = a.flex_iter();
-            core::iter::from_fn(|| pairs.next::<(f32, f32)>()).collect::<SmallVec<_>>()
-        })
-        .unwrap_or(color_space.default_decode_arr(bits_per_component as f32));
+    let decode_arr = decode_array(
+        dict.get::<Object<'_>>(D)
+            .or_else(|| dict.get::<Object<'_>>(DECODE)),
+        &color_space,
+        bits_per_component,
+    );
 
     SampleFormat {
         color_space,
         bits_per_component,
         decode_arr,
     }
+}
+
+/// The decode array of samples of `color_space` and `bits_per_component` that `entry`
+/// gives, one pair per component, as `MuPDF` reads it (observed through `PyMuPDF`
+/// 1.28.2): without an entry, or a null one, the colour space's default; an entry
+/// missing from the array or not a number is 0, and entries past the components'
+/// are ignored; an entry that is no array maps every sample to 0.
+fn decode_array(
+    entry: Option<Object<'_>>,
+    color_space: &ColorSpace,
+    bits_per_component: u8,
+) -> SmallVec<[(f32, f32); 4]> {
+    let pairs = color_space.num_components() as usize;
+    let values: SmallVec<[f32; 8]> = match entry {
+        None | Some(Object::Null(_)) => {
+            return color_space.default_decode_arr(f32::from(bits_per_component));
+        }
+        Some(Object::Array(array)) => array
+            .items::<f32>()
+            .take(2 * pairs)
+            .map(|v| v.unwrap_or(0.0))
+            .collect(),
+        Some(_) => SmallVec::new(),
+    };
+    let value = |i: usize| values.get(i).copied().unwrap_or(0.0);
+    (0..pairs)
+        .map(|c| (value(2 * c), value(2 * c + 1)))
+        .collect()
 }
 
 /// The parameters `obj`'s filters decode with: where its dictionary gives no bits

@@ -1,18 +1,22 @@
-//! Images whose data ends early draw as `MuPDF` draws them: the cases in `short.txt`,
-//! each image's colour, soft mask, mask stream, colour key or `/Matte` and its data
-//! cut short, with the colour `PyMuPDF` 1.28.2 drew at the centre of each cell of a grid
-//! over the image. The image keeps its declared grid and a mask lies on it; a sample
-//! the data does not hold reads as stored zero, past every byte held of 8-bit samples
-//! and past the whole rows held of other depths; under a colour key or `/Matte`, the
-//! rows not held whole are transparent. A colour key with fewer entries than two per
-//! component is no mask. CCITT data that breaks off within a row keeps the pixels
-//! decoded of it, the rest white.
+//! Images draw as `MuPDF` draws them: the cases in `short.txt` and `decode.txt`, with
+//! the colour `PyMuPDF` 1.28.2 drew at the centre of each cell of a grid over the image.
+//!
+//! In `short.txt`, each image's colour, soft mask, mask stream, colour key or `/Matte`
+//! has its data cut short. The image keeps its declared grid and a mask lies on it; a
+//! sample the data does not hold reads as stored zero, past every byte held of 8-bit
+//! samples and past the whole rows held of other depths; under a colour key or
+//! `/Matte`, the rows not held whole are transparent. A colour key with fewer entries
+//! than two per component is no mask. CCITT data that breaks off within a row keeps
+//! the pixels decoded of it, the rest white.
+//!
+//! In `decode.txt`, the decode arrays of images, soft masks, mask streams and stencil
+//! masks are short, empty, not arrays, hold non-numbers, or map 0 and 1 to values that
+//! do not sum to one: an entry missing or not a number reads as 0, and a stencil
+//! mask's sample is inverted before it is mapped.
 
 use super::differential::assert_streams_as_whole;
 use super::tests::{asset, pdf};
 use super::{ImageAsset, ImageRequest, PixelFormat, Plane};
-
-const CASES: &str = include_str!("short.txt");
 
 /// The colour of the page under the image.
 const PAGE: [f64; 3] = [255.0, 0.0, 0.0];
@@ -29,10 +33,10 @@ struct Case {
     expected: Vec<Vec<String>>,
 }
 
-fn cases() -> Vec<Case> {
+fn cases(text: &str) -> Vec<Case> {
     let mut cases: Vec<Case> = Vec::new();
     let mut dict = String::new();
-    for line in CASES
+    for line in text
         .lines()
         .filter(|l| !l.starts_with('#') && !l.is_empty())
     {
@@ -167,10 +171,11 @@ fn colour(token: &str) -> Option<[u8; 3]> {
 /// The most a channel may differ from `MuPDF`'s, which rounds compositing its own way.
 const TOLERANCE: u8 = 3;
 
-#[test]
-fn images_whose_data_ends_early_draw_as_mupdf_draws_them() {
-    let cases = cases();
-    assert_eq!(cases.len(), 92);
+/// The cases of `text`, `count` of them, draw as `MuPDF` drew them, streamed as decoded
+/// whole.
+fn assert_draw_as_mupdf(text: &str, count: usize) {
+    let cases = cases(text);
+    assert_eq!(cases.len(), count);
     let mut failed = Vec::new();
     for case in &cases {
         let pdf = pdf(&case.objects);
@@ -215,4 +220,14 @@ fn images_whose_data_ends_early_draw_as_mupdf_draws_them() {
         cases.len(),
         failed.join("\n")
     );
+}
+
+#[test]
+fn images_whose_data_ends_early_draw_as_mupdf_draws_them() {
+    assert_draw_as_mupdf(include_str!("short.txt"), 92);
+}
+
+#[test]
+fn decode_arrays_draw_as_mupdf_draws_them() {
+    assert_draw_as_mupdf(include_str!("decode.txt"), 55);
 }

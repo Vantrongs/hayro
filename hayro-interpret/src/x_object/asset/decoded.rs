@@ -23,11 +23,7 @@ pub(super) struct Decoded {
 impl Decoded {
     /// The colour and alpha of an image decoded whole.
     pub(super) fn new(decoded: DecodedImage, meter: &Meter<'_>) -> Result<Self, Cancelled> {
-        let DecodedImage {
-            mut image,
-            rows,
-            alpha,
-        } = decoded;
+        let (mut image, rows, alpha) = decoded.into_parts();
         let (alpha, alpha_rows) = alpha.map_or((None, rows), |(a, r)| (Some(a), r));
         let (w, h) = (image.width(), image.height());
         // Alpha on the colour's grid holds the colour's rows (`DecodedImage`).
@@ -57,10 +53,11 @@ impl Decoded {
 
     /// A stencil mask: its one plane is the alpha the paint is drawn through.
     pub(super) fn stencil(mask: DecodedMask) -> Self {
+        let (luma, rows) = mask.into_parts();
         Self {
-            rows: mask.rows,
-            alpha_rows: mask.rows,
-            image: ImageData::Luma(mask.luma),
+            rows,
+            alpha_rows: rows,
+            image: ImageData::Luma(luma),
             alpha: None,
             same_grid: false,
             stencil: true,

@@ -302,14 +302,14 @@ impl<'a> MaskSource<'a> {
     pub(super) fn size(&self) -> (u32, u32) {
         match self {
             Self::Streamed { width, height, .. } => (*width, *height),
-            Self::Decoded(m) => (m.luma.width, m.rows.declared),
+            Self::Decoded(m) => (m.luma().width, m.rows().declared),
         }
     }
 
     pub(super) fn interpolate(&self) -> bool {
         match self {
             Self::Streamed { obj, .. } => obj.interpolate,
-            Self::Decoded(m) => m.luma.interpolate,
+            Self::Decoded(m) => m.luma().interpolate,
         }
     }
 
@@ -387,7 +387,7 @@ impl MaskRows<'_> {
             MaskRows::Streamed { path, .. } => path.fill(),
             // The rows past those held repeat the last, of stored zero.
             MaskRows::Decoded { mask, .. } => {
-                let luma = &mask.luma;
+                let luma = mask.luma();
                 luma.data[(luma.height as usize - 1) * luma.width as usize]
             }
         }
@@ -397,7 +397,7 @@ impl MaskRows<'_> {
     pub(super) fn fills_row(&self) -> bool {
         match self {
             MaskRows::Streamed { fill, .. } => *fill,
-            MaskRows::Decoded { mask, row } => *row >= mask.luma.height,
+            MaskRows::Decoded { mask, row } => *row >= mask.luma().height,
         }
     }
 
@@ -425,7 +425,7 @@ impl MaskRows<'_> {
     pub(super) fn alpha(&mut self, cols: Range<usize>, out: &mut [u8]) -> Result<bool, Stop> {
         match self {
             MaskRows::Decoded { mask, row } => {
-                let luma = &mask.luma;
+                let luma = mask.luma();
                 if *row >= luma.height {
                     out.fill(self.fill());
                     return Ok(false);

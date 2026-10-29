@@ -23,11 +23,29 @@ pub(crate) static BILEVEL_MASK_LUT: LazyLock<Box<[u64; 256]>> = LazyLock::new(||
 
 pub(crate) struct DecodedMask {
     /// The alpha: the rows its data holds, and those `rows` covers past them.
-    pub(crate) luma: LumaData,
-    pub(crate) rows: Rows,
+    luma: LumaData,
+    rows: Rows,
 }
 
 impl DecodedMask {
+    /// `luma` covering `rows`; `None` unless it holds whole rows ([`Rows::hold`]).
+    fn new(luma: LumaData, rows: Rows) -> Option<Self> {
+        rows.hold(luma.data.len(), luma.width, luma.height, 1)
+            .then_some(Self { luma, rows })
+    }
+
+    pub(crate) fn luma(&self) -> &LumaData {
+        &self.luma
+    }
+
+    pub(crate) fn rows(&self) -> Rows {
+        self.rows
+    }
+
+    pub(crate) fn into_parts(self) -> (LumaData, Rows) {
+        (self.luma, self.rows)
+    }
+
     /// The alpha with every row it covers, the last it holds repeated: as large as
     /// the mask intact.
     pub(crate) fn into_whole(self) -> LumaData {
@@ -63,8 +81,8 @@ pub(crate) fn decode_mask(
     let invert = obj.kind == ImageKind::StencilMask;
     let (data, height) = decode_mask_data(ctx, invert, meter)?;
 
-    Some(DecodedMask {
-        luma: LumaData {
+    DecodedMask::new(
+        LumaData {
             data,
             width,
             height,
@@ -72,7 +90,7 @@ pub(crate) fn decode_mask(
             scale_factors,
         },
         rows,
-    })
+    )
 }
 
 /// How a mask's samples become alpha (`decode_mask_data`).
@@ -114,11 +132,17 @@ impl MaskPath {
 }
 
 /// The alpha a mask's stored sample `value` of `bits` becomes through the
-/// component's `decode` entry; `invert` for a stencil mask.
+/// component's `decode` entry; `invert` for a stencil mask, whose sample is inverted
+/// before it is mapped, as `MuPDF` maps it (observed through `PyMuPDF` 1.28.2): as
+/// inverting the value mapped where the entry's values sum to one.
 fn mask_alpha(value: u32, bits: u8, (decode_min, decode_max): (f32, f32), invert: bool) -> u8 {
     let source_max = 2.0_f32.powi(i32::from(bits)) - 1.0;
-    let value = interpolate(value as f32, 0.0, source_max, decode_min, decode_max);
-    let value = if invert { 1.0 - value } else { value };
+    let value = if invert {
+        source_max - value as f32
+    } else {
+        value as f32
+    };
+    let value = interpolate(value, 0.0, source_max, decode_min, decode_max);
     (value * 255.0 + 0.5) as u8
 }
 
@@ -234,4 +258,31 @@ fn decode_bilevel_mask_data(
         meter.work(1).ok()?;
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A decoded mask holds a byte for each texel of the rows it says it holds: one of
+    /// no bytes claiming a row, or holding more rows than it covers, is never made.
+    #[test]
+    fn a_mask_holding_other_rows_than_it_claims_is_not_made() {
+        let luma = |data: Vec<u8>, height| LumaData {
+            data,
+            width: 2,
+            height,
+            interpolate: false,
+            scale_factors: (1.0, 1.0),
+        };
+        let rows = |declared| Rows {
+            declared,
+            repeat: true,
+        };
+        assert!(DecodedMask::new(luma(vec![], 1), rows(1)).is_none());
+        assert!(DecodedMask::new(luma(vec![0; 3], 2), rows(2)).is_none());
+        assert!(DecodedMask::new(luma(vec![0; 4], 2), rows(1)).is_none());
+        assert!(DecodedMask::new(luma(vec![], 0), rows(1)).is_none());
+        assert!(DecodedMask::new(luma(vec![0; 2], 1), rows(5)).is_some());
+    }
 }

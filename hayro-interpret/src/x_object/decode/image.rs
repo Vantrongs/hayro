@@ -1,4 +1,4 @@
-use super::mask::decode_mask;
+use super::mask::{DecodedMask, decode_mask};
 use super::{
     DecodeContext, Rows, colour_key, decode_context, decode_u8_samples, in_pieces, into_owned,
     pixel_piece, repeat_last_row, unpack_samples,
@@ -47,14 +47,37 @@ pub(crate) fn direct_invert(
 
 pub(crate) struct DecodedImage {
     /// The colour: the rows its data holds, and those `rows` covers past them.
-    pub(crate) image: ImageData,
-    pub(crate) rows: Rows,
+    image: ImageData,
+    rows: Rows,
     /// Alpha on the grid the colour declares holds the colour's rows and covers
     /// `rows`; a mask on another grid lies on the rows the colour declares.
-    pub(crate) alpha: Option<(LumaData, Rows)>,
+    alpha: Option<(LumaData, Rows)>,
 }
 
 impl DecodedImage {
+    /// `image` covering `rows`, with `alpha`; `None` unless each holds whole rows
+    /// ([`Rows::hold`]).
+    fn new(image: ImageData, rows: Rows, alpha: Option<(LumaData, Rows)>) -> Option<Self> {
+        let (len, channels) = match &image {
+            ImageData::Rgb(d) => (d.data.len(), 3),
+            ImageData::Luma(d) => (d.data.len(), 1),
+        };
+        let holds = rows.hold(len, image.width(), image.height(), channels)
+            && alpha
+                .as_ref()
+                .is_none_or(|(a, r)| r.hold(a.data.len(), a.width, a.height, 1));
+        holds.then_some(Self { image, rows, alpha })
+    }
+
+    /// The rows the colour holds.
+    pub(crate) fn height(&self) -> u32 {
+        self.image.height()
+    }
+
+    pub(crate) fn into_parts(self) -> (ImageData, Rows, Option<(LumaData, Rows)>) {
+        (self.image, self.rows, self.alpha)
+    }
+
     /// The colour and alpha with every row they cover, the last row each holds
     /// repeated: as large as the image intact.
     pub(crate) fn into_whole(self) -> (ImageData, Option<LumaData>) {
@@ -138,7 +161,7 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
             }
         }
 
-        Some(DecodedImage { image, rows, alpha })
+        DecodedImage::new(image, rows, alpha)
     }
 
     fn decode_image(&mut self) -> Option<ImageData> {
@@ -303,7 +326,7 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
         {
             let obj = ImageXObject::new_mask(&s_mask, &self.obj.warning_sink, &self.obj.cache)?;
 
-            decode_mask(&obj, self.target_dimension, self.meter).map(|m| (m.luma, m.rows))
+            decode_mask(&obj, self.target_dimension, self.meter).map(DecodedMask::into_parts)
         } else if self.color_key_mask.is_some() {
             let mask = self.decoded_color_key_mask.take();
             Some((
@@ -331,7 +354,7 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
         let mask_obj = ImageXObject::new_mask(&s_mask, &self.obj.warning_sink, &self.obj.cache)?;
         let alpha = decode_mask(&mask_obj, self.target_dimension, self.meter)?;
 
-        Some(((alpha.luma, alpha.rows), matte_rgb))
+        Some((alpha.into_parts(), matte_rgb))
     }
 
     fn decode_color_key_mask(&self) -> Option<LumaData> {
