@@ -193,29 +193,35 @@ fn ignored_parameters_shared_by_every_page_cost_linear_work() {
 
 /// A key of an image's parameters that no filter reads is not resolved, nor is the
 /// object stream it refers into decoded, drawing the image or decoding it.
+/// A key the image's filter does not read, here one only other filters read
+/// (`/EarlyChange` is LZW's), is not resolved.
 #[test]
 fn ignored_parameters_are_not_resolved() {
-    let content = b"q 10 0 0 10 0 0 cm /Im Do Q";
-    let mut objects = common::one_page_objects(
-        10,
-        "/Contents 4 0 R /Resources << /XObject << /Im 5 0 R >> >>",
-    );
-    objects.push(common::stream("", content));
-    // The object stream holding object 6, which only the ignored key names, follows.
-    objects.push(common::stream(
-        "/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray \
-         /BitsPerComponent 8 /Filter /FlateDecode \
-         /DecodeParms << /Predictor 1 /Ignored 6 0 R >>",
-        &common::stored_zlib(&[9], 64),
-    ));
-    let padding = vec![b"0".to_vec(); 1024];
-    let pdf = Pdf::new(common::file_with_object_stream(&objects, &padding)).expect("valid pdf");
-    OBJECT_STREAM_ENTRIES.set(0);
-    let mut drawn = Drawn::default();
-    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut drawn);
-    assert_eq!(drawn.decoded, [9]);
-    decode_assets(&drawn.assets, &[9]);
-    assert_eq!(OBJECT_STREAM_ENTRIES.get(), 0);
+    for key in ["/Ignored", "/EarlyChange"] {
+        let content = b"q 10 0 0 10 0 0 cm /Im Do Q";
+        let mut objects = common::one_page_objects(
+            10,
+            "/Contents 4 0 R /Resources << /XObject << /Im 5 0 R >> >>",
+        );
+        objects.push(common::stream("", content));
+        // The object stream holding object 6, which only the ignored key names, follows.
+        objects.push(common::stream(
+            &format!(
+                "/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray \
+                 /BitsPerComponent 8 /Filter /FlateDecode \
+                 /DecodeParms << /Predictor 1 {key} 6 0 R >>"
+            ),
+            &common::stored_zlib(&[9], 64),
+        ));
+        let padding = vec![b"0".to_vec(); 1024];
+        let pdf = Pdf::new(common::file_with_object_stream(&objects, &padding)).expect("valid pdf");
+        OBJECT_STREAM_ENTRIES.set(0);
+        let mut drawn = Drawn::default();
+        common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut drawn);
+        assert_eq!(drawn.decoded, [9], "{key}");
+        decode_assets(&drawn.assets, &[9]);
+        assert_eq!(OBJECT_STREAM_ENTRIES.get(), 0, "{key}");
+    }
 }
 
 /// The greys of the `width` × 1 image `asset` decodes to.
@@ -358,8 +364,9 @@ impl<'a> Device<'a> for Pixels {
 /// image of greys 0x40 and 0xC0 or, if `stencil`, a stencil mask of bits 1 0, with
 /// `entries` in its dictionary; and its pixels drawn and from its asset. Object 6 is
 /// a 2 × 1 soft mask of greys 255 and 0; object 7, `[0 255]`, a colour key that masks
-/// every grey, lies in an object stream of 1024 objects no other object uses.
-fn masked_image(stencil: bool, entries: &str) -> (usize, Vec<Vec<u8>>) {
+/// every grey, lies in an object stream of 1024 objects no other object uses;
+/// `mask_entries` go into object 6's dictionary.
+fn masked_image(stencil: bool, entries: &str, mask_entries: &str) -> (usize, Vec<Vec<u8>>) {
     let content = b"q 10 0 0 10 0 0 cm /Im Do Q";
     let mut objects = common::one_page_objects(
         10,
@@ -375,7 +382,7 @@ fn masked_image(stencil: bool, entries: &str) -> (usize, Vec<Vec<u8>>) {
         ),
     });
     objects.push(common::stream(
-        &format!("{image} /ColorSpace /DeviceGray /BitsPerComponent 8"),
+        &format!("{image} /ColorSpace /DeviceGray /BitsPerComponent 8 {mask_entries}"),
         &[255, 0],
     ));
     let mut padding = vec![b"0".to_vec(); 1024];
@@ -409,8 +416,8 @@ fn masked_image(stencil: bool, entries: &str) -> (usize, Vec<Vec<u8>>) {
 #[test]
 fn masks_decoding_cannot_use_are_not_resolved() {
     // The colour key is used where nothing takes precedence: the fixture reads it.
-    let (entries, keyed) = masked_image(false, "/Mask 7 0 R");
-    let (_, plain) = masked_image(false, "");
+    let (entries, keyed) = masked_image(false, "/Mask 7 0 R", "");
+    let (_, plain) = masked_image(false, "", "");
     assert!(entries > 0 && keyed != plain, "{entries}, {keyed:?}");
     // Each case, the entries it read, and whether its pixels are those without the mask.
     let read: Vec<_> = [
@@ -421,11 +428,22 @@ fn masks_decoding_cannot_use_are_not_resolved() {
     ]
     .into_iter()
     .map(|(stencil, unused, beside)| {
-        let (entries, pixels) = masked_image(stencil, &format!("{beside} {unused}"));
-        let (_, expected) = masked_image(stencil, beside);
+        let (entries, pixels) = masked_image(stencil, &format!("{beside} {unused}"), "");
+        let (_, expected) = masked_image(stencil, beside, "");
         let case = format!("stencil {stencil}: {unused} beside {beside:?}");
         (case, entries, pixels == expected)
     })
     .collect();
     assert!(read.iter().all(|r| r.1 == 0 && r.2), "{read:#?}");
+}
+
+/// Under `/SMaskInData 1` a soft mask without `/Matte` serves no decoding: what its
+/// dictionary refers to, here a `/Decode` in an otherwise unused object stream, is
+/// not resolved, and the image draws as with a plain soft mask under the same flag.
+#[test]
+fn a_soft_mask_beside_alpha_in_the_data_is_not_read() {
+    let beside = "/SMaskInData 1 /SMask 6 0 R";
+    let (entries, pixels) = masked_image(false, beside, "/Decode 7 0 R");
+    let (_, expected) = masked_image(false, beside, "");
+    assert_eq!((entries, pixels), (0, expected));
 }

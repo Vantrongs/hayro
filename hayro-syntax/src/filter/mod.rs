@@ -126,8 +126,8 @@ impl Step {
             Filter::AsciiHexDecode => Self::AsciiHex,
             Filter::Ascii85Decode => Self::Ascii85,
             Filter::RunLengthDecode => Self::RunLength,
-            Filter::LzwDecode => Self::Lzw(PredictorParams::from_params(&params())),
-            Filter::FlateDecode => Self::Flate(PredictorParams::from_params(&params())),
+            Filter::LzwDecode => Self::Lzw(PredictorParams::from_params(&params(), true)),
+            Filter::FlateDecode => Self::Flate(PredictorParams::from_params(&params(), false)),
             Filter::CcittFaxDecode => Self::Ccitt(CcittParams::of(&params(), height)),
             Filter::DctDecode => Self::Dct(params().get::<u8>(COLOR_TRANSFORM)),
             Filter::Jbig2Decode => Self::Jbig2(

@@ -327,11 +327,17 @@ impl MasksRead {
             true => dict.get::<SmallVec<[u16; 4]>>(MASK),
             false => None,
         };
+        let matte = smask
+            .as_ref()
+            .and_then(|s| s.dict().get::<ColorComponents>(MATTE));
+        // Under `/SMaskInData 1` the soft mask serves only to remove its `/Matte`.
+        let soft = match matte.is_some() || !in_data {
+            true => smask.map(mask),
+            false => None,
+        };
         Some(Arc::new(Self {
-            matte: smask
-                .as_ref()
-                .and_then(|s| s.dict().get::<ColorComponents>(MATTE)),
-            soft: smask.map(mask),
+            matte,
+            soft,
             stencil: stencil.map(mask),
             color_key,
             in_data,

@@ -1163,14 +1163,14 @@ impl PredictorParams {
     /// refuses the stream: more than 32 colors, bits per component other than 1, 2,
     /// 4, 8 or 16, or so many columns that a row's bits come near 2^31; also where
     /// the reading of a number is not established.
-    pub(crate) fn from_params(dict: &Dict<'_>) -> Option<Self> {
+    pub(crate) fn from_params(dict: &Dict<'_>, lzw: bool) -> Option<Self> {
         let read = |key: &[u8], default: i32| match dict.get::<Object<'_>>(key) {
             Some(Object::Number(n)) => n.viewer_i32(),
             _ => Some(default),
         };
         let mut params = Self {
-            // Read by LZW alone, so a reading not established leaves it the default.
-            early_change: read(EARLY_CHANGE, 1).is_none_or(|e| e != 0),
+            // A reading not established leaves it the default.
+            early_change: !lzw || read(EARLY_CHANGE, 1).is_none_or(|e| e != 0),
             ..Self::default()
         };
         params.predictor = match read(PREDICTOR, 1)? {
