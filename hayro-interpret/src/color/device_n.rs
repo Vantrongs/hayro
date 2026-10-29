@@ -20,7 +20,8 @@ impl DeviceN {
         // Skip `Name`.
         let names = iter
             .next::<Array<'_>>()?
-            .iter::<Name<'_>>()
+            .items::<Name<'_>>()
+            .map_while(|n| n)
             .collect::<Vec<_>>();
         let num_components = u8::try_from(names.len()).ok()?;
         let all_none = names.iter().all(|n| n.as_str() == "None");

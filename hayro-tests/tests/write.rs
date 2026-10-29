@@ -351,5 +351,17 @@ fn write_null_objects() {
         .unwrap();
     let data = dict.data();
 
-    assert_eq!(data, b"<<\n      /F1 5 0 R\n      /F2 null\n    >>");
+    // `/F2 9 0 R` leads to no object: it is copied as a reference to an object that
+    // is `null`, which every reader reads as it reads the reference to nothing (PDF
+    // 32000-1 7.3.10), where a direct `null` would change what a reader that prefers
+    // one key's reference to another key makes of it (MuPDF takes `/DP 99 0 R` over
+    // `/DecodeParms`).
+    assert_eq!(data, b"<<\n  /F1 6 0 R\n  /F2 7 0 R\n>>");
+    let null = dict.get_ref("F2").unwrap();
+    assert!(matches!(
+        reread
+            .xref()
+            .get::<hayro_syntax::object::Object>(null.into()),
+        Some(hayro_syntax::object::Object::Null(_))
+    ));
 }

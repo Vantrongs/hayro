@@ -36,11 +36,11 @@ pub mod ops;
 use crate::content::ops::TypedInstruction;
 use crate::object;
 use crate::object::dict::InlineImageDict;
-use crate::object::name::{Name, skip_name_like};
+use crate::object::name::{Name, lex_name_like};
 use crate::object::{Array, Null, Number, Object, Stream};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
-use crate::trivia::{is_regular_character, is_white_space_character};
+use crate::trivia::is_white_space_character;
 use crate::util::find_needle;
 use core::array;
 use core::fmt::{Debug, Display, Formatter};
@@ -77,33 +77,16 @@ impl Deref for Operator<'_> {
     }
 }
 
+// Skipping an operator reads it as reading does.
 impl Skippable for Operator<'_> {
     fn skip(r: &mut Reader<'_>, _: bool) -> Option<()> {
-        skip_name_like(r, false).map(|_| ())
+        lex_name_like(r, false).map(|_| ())
     }
 }
 
 impl<'a> Readable<'a> for Operator<'a> {
     fn read(r: &mut Reader<'a>, _: &ReaderContext<'a>) -> Option<Self> {
-        let start = r.offset();
-        let mut escaped = false;
-        while let Some(b) = r.peek_byte().filter(|b| is_regular_character(*b)) {
-            escaped |= b == b'#';
-            r.forward();
-        }
-
-        let data = r.range(start..r.offset())?;
-        if data.is_empty() {
-            return None;
-        }
-
-        let name = if escaped {
-            Name::new_escaped(data)?
-        } else {
-            Name::new_unescaped(data)
-        };
-
-        Some(Self(name))
+        Some(Self(Name::new(lex_name_like(r, false)?)?))
     }
 }
 
@@ -164,7 +147,7 @@ fn read_instruction<'a>(r: &mut Reader<'a>, stack: &mut Stack<'a>) -> Option<Ope
             let start = cur.offset();
             match Number::read_simple(&mut cur) {
                 Some(number) => {
-                    if stack.push(Object::Number(number)).is_none() {
+                    if stack.push_number(number).is_none() {
                         *r = cur;
                         return None;
                     }
@@ -183,19 +166,24 @@ fn read_instruction<'a>(r: &mut Reader<'a>, stack: &mut Stack<'a>) -> Option<Ope
             }
             _ => {
                 *r = cur;
-                let Some(operator) = r.read_without_context::<Operator<'a>>() else {
-                    warn!("failed to read operator in content stream");
+                // Returned as it is read: unwrapping and rewrapping it copies the
+                // operator field by field, and the wider reloads of those narrow stores
+                // stall store forwarding.
+                let operator = r.read_without_context::<Operator<'a>>();
+                match &operator {
+                    None => {
+                        warn!("failed to read operator in content stream");
 
-                    r.jump_to_end();
-                    return None;
-                };
-
-                // Inline images need special casing...
-                if operator.as_ref() == b"BI" {
-                    read_inline_image(r, stack)?;
+                        r.jump_to_end();
+                    }
+                    // Inline images need special casing...
+                    Some(operator) if operator.as_ref() == b"BI" => {
+                        read_inline_image(r, stack)?;
+                    }
+                    Some(_) => {}
                 }
 
-                return Some(operator);
+                return operator;
             }
         }
     }
@@ -452,6 +440,25 @@ impl<'a> Stack<'a> {
 
         self.data[self.len] = operand;
         self.len += 1;
+        Some(())
+    }
+
+    /// [`Stack::push`] for a number.
+    #[inline(always)]
+    fn push_number(&mut self, number: Number) -> Option<()> {
+        // The number is written into the slot as the old object is moved out, and
+        // that is dropped after: dropping it first keeps the new object in memory
+        // across the call, and its copy into the slot waits for those stores.
+        let slot = self.data.get_mut(self.len)?;
+        let old = core::mem::replace(slot, Object::Number(number));
+        self.len += 1;
+        // Most often a number replaces a number, which owns nothing: no call to
+        // drop it.
+        if matches!(old, Object::Number(_)) {
+            core::mem::forget(old);
+        } else {
+            drop(old);
+        }
         Some(())
     }
 

@@ -101,7 +101,7 @@ impl TransferFunction {
         self.samples()[(value * 255.0 + 0.5) as u8 as usize] as f32 / 255.0
     }
 
-    fn samples(&self) -> &[u8; 256] {
+    pub(crate) fn samples(&self) -> &[u8; 256] {
         self.samples.get_or_init(|| {
             std::array::from_fn(|sample| {
                 self.function

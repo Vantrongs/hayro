@@ -24,6 +24,7 @@ use self::lab::Lab;
 use self::pattern::Pattern;
 use self::separation::Separation;
 use crate::cache::{Cache, CacheKey};
+use crate::util::hash128;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
 use hayro_syntax::object::Object;
@@ -176,7 +177,13 @@ impl ColorSpaceType {
 
                     return cache.get_or_insert_with(icc_stream.cache_key(), || {
                         if let Some(decoded) = icc_stream.decoded().ok().as_ref() {
-                            ICCProfile::new(decoded, num_components)
+                            // A profile is what its bytes hold: documents embed one
+                            // profile as many objects, each of which would build it.
+                            let key = hash128(&(b"icc", decoded.as_ref(), num_components));
+                            cache
+                                .get_or_insert_with(key, || {
+                                    ICCProfile::new(decoded, num_components)
+                                })
                                 .map(|icc| {
                                     // TODO: For SVG and PNG we can assume that the output color space is
                                     // sRGB. If we ever implement PDF-to-PDF, we probably want to
@@ -269,6 +276,14 @@ impl ColorSpace {
     }
 
     /// Create a new color space from the name.
+    #[cfg(test)]
+    pub(crate) fn icc(&self) -> Option<&ICCProfile> {
+        match &*self.0 {
+            ColorSpaceType::ICCBased(icc) => Some(icc),
+            _ => None,
+        }
+    }
+
     pub(crate) fn new_from_name(name: &Name<'_>) -> Option<Self> {
         ColorSpaceType::new_from_name(name).map(|c| Self(Arc::new(c)))
     }
@@ -305,6 +320,14 @@ impl ColorSpace {
     /// Return `true` if the current color space is the pattern color space.
     pub(crate) fn is_pattern(&self) -> bool {
         matches!(self.0.as_ref(), ColorSpaceType::Pattern(_))
+    }
+
+    /// Return `true` for `DeviceGray` and `DeviceRGB`.
+    pub(crate) fn is_device_gray_or_rgb(&self) -> bool {
+        matches!(
+            self.0.as_ref(),
+            ColorSpaceType::DeviceGray(_) | ColorSpaceType::DeviceRgb(_)
+        )
     }
 
     /// Return `true` if the current color space is an indexed color space.

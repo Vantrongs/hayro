@@ -1,0 +1,2 @@
+image_peak_bytes 8436160
+stream_peak_bytes 8436160

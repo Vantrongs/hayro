@@ -1,6 +1,7 @@
 use crate::bit_reader::BitWriter;
 use crate::filter::FilterResult;
 use crate::object::stream::{ImageColorSpace, ImageData, ImageDecodeParams};
+use crate::work::{Meter, POLL_BYTES};
 use alloc::borrow::Cow;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -17,7 +18,11 @@ impl ImageColorSpace {
     }
 }
 
-pub(crate) fn decode(data: &[u8], params: &ImageDecodeParams) -> Option<FilterResult<'static>> {
+pub(crate) fn decode(
+    data: &[u8],
+    params: &ImageDecodeParams,
+    meter: &Meter<'_>,
+) -> Option<FilterResult<'static>> {
     use crate::object::stream::ImageColorSpace;
 
     let settings = DecodeSettings {
@@ -48,7 +53,9 @@ pub(crate) fn decode(data: &[u8], params: &ImageDecodeParams) -> Option<FilterRe
     };
     let has_alpha = image.has_alpha();
     let mut decoder_context = hayro_jpeg2000::DecoderContext::default();
+    // The decoder takes no meter: its work is counted once it returns.
     let bitmap = image.decode(&mut decoder_context).ok()?.data_u8();
+    meter.work(bitmap.len()).ok()?;
 
     let (mut data, mut alpha) = if !has_alpha {
         (bitmap, None)
@@ -60,10 +67,14 @@ pub(crate) fn decode(data: &[u8], params: &ImageDecodeParams) -> Option<FilterRe
         );
         let mut alpha_channel = Vec::with_capacity(bitmap.len() / total_channels as usize);
 
-        for sample in bitmap.chunks_exact(total_channels as usize) {
-            let (alpha, color) = sample.split_last()?;
-            alpha_channel.push(*alpha);
-            color_channels.extend_from_slice(color);
+        let piece = POLL_BYTES / total_channels as usize * total_channels as usize;
+        for piece in bitmap.chunks(piece) {
+            for sample in piece.chunks_exact(total_channels as usize) {
+                let (alpha, color) = sample.split_last()?;
+                alpha_channel.push(*alpha);
+                color_channels.extend_from_slice(color);
+            }
+            meter.work(piece.len()).ok()?;
         }
 
         (color_channels, Some(alpha_channel))
@@ -72,8 +83,9 @@ pub(crate) fn decode(data: &[u8], params: &ImageDecodeParams) -> Option<FilterRe
     // The decoded image is always 8-bit, so if necessary we have to rescale
     // ourselves.
     if bpc != 8 {
-        data = scale(&data, bpc, cs.num_components(), width, height)?;
-        alpha = alpha.and_then(|alpha| scale(&alpha, bpc, cs.num_components(), width, height));
+        data = scale(&data, bpc, cs.num_components(), width, height, meter)?;
+        alpha =
+            alpha.and_then(|alpha| scale(&alpha, bpc, cs.num_components(), width, height, meter));
     }
 
     Some(FilterResult {
@@ -94,6 +106,7 @@ fn scale(
     num_components: u8,
     width: u32,
     height: u32,
+    meter: &Meter<'_>,
 ) -> Option<Vec<u8>> {
     if bit_per_component == 0 || bit_per_component > 32 {
         return None;
@@ -111,9 +124,12 @@ fn scale(
     let components_per_row = (num_components as usize).checked_mul(width as usize)?;
 
     for bytes in data.chunks_exact(components_per_row) {
-        for byte in bytes {
-            let scaled = ((*byte as f32 / div_factor) * mul_factor + 0.5) as u32;
-            writer.write(scaled)?;
+        for piece in bytes.chunks(POLL_BYTES) {
+            for byte in piece {
+                let scaled = ((*byte as f32 / div_factor) * mul_factor + 0.5) as u32;
+                writer.write(scaled)?;
+            }
+            meter.work(piece.len()).ok()?;
         }
 
         writer.align();

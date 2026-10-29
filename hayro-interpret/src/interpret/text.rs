@@ -46,7 +46,9 @@ pub(crate) fn append_text_string<'a>(
         let (code, adv) = font.read_code(bytes, cur_idx);
         cur_idx += adv;
 
-        if show_glyphs && ctx.ocg_state.is_visible() {
+        // Hidden text still clips, as `PDFium` adds its glyphs to the clip whatever
+        // its marks (`CPDF_RenderStatus::ProcessClipPath`).
+        if show_glyphs && (ctx.ocg_state.is_visible() || ctx.text_state().render_mode.clips()) {
             let origin_displacement = font.origin_displacement(code);
             let transform = ctx.text_state().full_transform()
                 * Affine::scale(1.0 / UNITS_PER_EM as f64)
@@ -85,13 +87,7 @@ pub(crate) fn show_glyph_run<'a>(ctx: &mut Context<'a>, device: &mut impl Device
             glyphs: &ctx.glyph_scratch,
         };
 
-        let clip_path = if matches!(
-            render_mode,
-            TextRenderingMode::Clip
-                | TextRenderingMode::FillAndClip
-                | TextRenderingMode::StrokeAndClip
-                | TextRenderingMode::FillAndStrokeAndClip
-        ) {
+        let clip_path = if render_mode.clips() {
             let mut clip_path = BezPath::new();
             for glyph in run.glyphs() {
                 clip_glyph(&mut clip_path, glyph);
@@ -102,6 +98,7 @@ pub(crate) fn show_glyph_run<'a>(ctx: &mut Context<'a>, device: &mut impl Device
         };
 
         match render_mode {
+            _ if !ctx.ocg_state.is_visible() => {}
             TextRenderingMode::Fill => {
                 device.draw_glyph_run(&run, fill_props, &DrawMode::Fill(FillRule::NonZero));
             }
@@ -134,7 +131,8 @@ pub(crate) fn show_glyph_run<'a>(ctx: &mut Context<'a>, device: &mut impl Device
     };
 
     if let Some(clip_path) = clip_path {
-        ctx.text_state_mut().clip_paths.extend(clip_path);
+        let clip_path = ctx.ctm() * clip_path;
+        ctx.text_clip.get_or_insert_default().extend(clip_path);
     }
 
     ctx.glyph_scratch.clear();
@@ -167,4 +165,14 @@ pub(crate) enum TextRenderingMode {
     StrokeAndClip,
     FillAndStrokeAndClip,
     Clip,
+}
+
+impl TextRenderingMode {
+    /// Whether text drawn so adds its glyphs to the clip.
+    pub(crate) fn clips(self) -> bool {
+        matches!(
+            self,
+            Self::Clip | Self::FillAndClip | Self::StrokeAndClip | Self::FillAndStrokeAndClip
+        )
+    }
 }

@@ -1,10 +1,10 @@
+use crate::hash;
+use crate::lost::{Lost, Watched};
 use crate::object::ObjectIdentifier;
-use crate::object::Stream;
 use crate::reader::ReaderContext;
-use crate::sync::FxHashMap;
 use crate::sync::{Arc, Mutex, MutexExt};
 use crate::util::SegmentList;
-use crate::xref::ObjectStream;
+use crate::xref::{ObjectStream, Place};
 use alloc::vec::Vec;
 use core::fmt::{Debug, Formatter};
 
@@ -65,8 +65,13 @@ impl From<Vec<u8>> for PdfData {
 pub(crate) struct Data {
     data: PdfData,
     // 32 segments are more than enough as we can't have more objects than this.
-    object_streams: SegmentList<ObjectStream, 32>,
-    map: Mutex<FxHashMap<ObjectIdentifier, usize>>,
+    // `None` for a stream that is no object stream, which is not read again; with
+    // what reading it lost.
+    decoded: SegmentList<(Option<ObjectStream>, Lost), 32>,
+    /// Where the object stream at each place is kept.
+    map: Mutex<hash::Map<Place, usize>>,
+    /// The computations being watched ([`crate::xref::XRef::watch`]).
+    pub(crate) watched: Watched,
 }
 
 impl Debug for Data {
@@ -80,8 +85,9 @@ impl Data {
     pub(crate) fn new(data: PdfData) -> Self {
         Self {
             data,
-            object_streams: SegmentList::new(),
-            map: Mutex::new(FxHashMap::default()),
+            decoded: SegmentList::new(),
+            map: Mutex::new(hash::Map::default()),
+            watched: Watched::default(),
         }
     }
 
@@ -90,29 +96,74 @@ impl Data {
         &self.data
     }
 
-    /// Get access to a decoded object stream.
-    pub(crate) fn object_stream(
+    /// The object stream `id` at `place`, decoded by `decode` from `ctx` once for
+    /// every entry and every read leading to the place, and where it is kept; what
+    /// reading it lost is told to every computation that asks for it
+    /// ([`crate::lost`]). Where it cannot be read as an object stream, the objects
+    /// the table puts in it are lost, and so is it.
+    pub(crate) fn object_stream<'c>(
         &self,
+        place: Place,
         id: ObjectIdentifier,
-        ctx: &ReaderContext<'_>,
-    ) -> Option<&ObjectStream> {
-        if let Some(&idx) = self.map.get().get(&id) {
-            return self.object_streams.get(idx);
+        ctx: &ReaderContext<'c>,
+        decode: impl FnOnce(&ReaderContext<'c>) -> Option<ObjectStream>,
+    ) -> Decoded<'_> {
+        let kept = |idx: usize| match self.decoded.get(idx) {
+            Some((stream, lost)) => {
+                self.watched.note(*lost);
+                match stream {
+                    Some(stream) => Decoded::Stream(idx, stream),
+                    None => Decoded::Lost(lost.unwrap_or(id)),
+                }
+            }
+            None => Decoded::Lost(id),
+        };
+        if let Some(&idx) = self.map.get().get(&place) {
+            return kept(idx);
         }
 
         // Decoding may resolve other objects, so do it without holding the cache lock.
-        let stream = ctx.xref().get_with::<Stream<'_>>(id, ctx)?;
-        let object_stream = ObjectStream::new(&stream)?;
+        // A stream that is read differently from another resolution chain, such as
+        // one rejected while it is being read already, is not kept, nor returned:
+        // what is read from it borrows from what is kept.
+        let ((stream, lost), shared) = ctx.shared(|ctx| {
+            self.watched.watch(true, || {
+                let objects = decode(ctx);
+                // Unless the chain being read rejects it, as a cycle.
+                if objects.is_none() && !ctx.rejects(&place.link()) {
+                    self.watched.note(Some(id));
+                }
+                objects
+            })
+        });
+        if !shared {
+            return Decoded::Rejected;
+        }
 
         let mut locked = self.map.get();
-        if let Some(&idx) = locked.get(&id) {
-            return self.object_streams.get(idx);
+        if let Some(&idx) = locked.get(&place) {
+            drop(locked);
+            return kept(idx);
         }
 
         let idx = locked.len();
-        let object_stream = self.object_streams.get_or_init(idx, || object_stream);
-        locked.insert(id, idx);
-
-        Some(object_stream)
+        self.decoded.get_or_init(idx, || (stream, lost));
+        locked.insert(place, idx);
+        drop(locked);
+        match self.decoded.get(idx) {
+            Some((Some(stream), _)) => Decoded::Stream(idx, stream),
+            _ => Decoded::Lost(lost.unwrap_or(id)),
+        }
     }
+}
+
+/// An object stream as [`Data::object_stream`] finds it.
+pub(crate) enum Decoded<'a> {
+    /// Read, and kept at an index.
+    Stream(usize, &'a ObjectStream),
+    /// It cannot be read: what reading it lost, it if nothing else.
+    Lost(ObjectIdentifier),
+    /// The chain reading it rejects what reading it needs as a cycle, so it is
+    /// neither read nor lost.
+    Rejected,
 }

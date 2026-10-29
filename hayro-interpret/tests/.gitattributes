@@ -1,0 +1,3 @@
+# LEB128 numbers: no NUL byte, so Git would take the file for text and could
+# convert its line feeds on checkout.
+*.bin binary

@@ -38,15 +38,18 @@ use hayro_interpret::Device;
 use hayro_interpret::FillRule;
 use hayro_interpret::InterpreterCache;
 use hayro_interpret::InterpreterSettings;
+use hayro_interpret::annotation::View;
 use hayro_interpret::font::GlyphRun;
 use hayro_interpret::hayro_syntax::Pdf;
+use hayro_interpret::hayro_syntax::hash;
 use hayro_interpret::hayro_syntax::page::Page;
-use hayro_interpret::util::{RectExt, TransformExt};
-use hayro_interpret::{BlendMode, Context, DrawMode, DrawProps, ImageDrawProps, SoftMask};
+use hayro_interpret::util::TransformExt;
+use hayro_interpret::{
+    BlendMode, Context, DrawMode, DrawProps, ImageDrawProps, Knockout, SoftMask, SoftMasks,
+};
 use hayro_interpret::{ClipPath, interpret_page};
 use kurbo::{Affine, BezPath, Rect, Shape};
 use pic_scale::Scaler;
-use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::ops::RangeInclusive;
 use std::rc::Rc;
@@ -70,7 +73,7 @@ mod path;
 
 pub(crate) struct GlobalState {
     level: Level,
-    outline_cache: Rc<RefCell<FxHashMap<u128, Rc<BezPath>>>>,
+    outline_cache: Rc<RefCell<hash::Map<u128, Rc<BezPath>>>>,
     scaler: Scaler,
     force_image_interpolation: bool,
 }
@@ -90,7 +93,7 @@ pub(crate) struct Renderer<'a> {
     global: &'a GlobalState,
     pub(crate) ctx: &'a mut RenderContext,
     pub(crate) inside_pattern: bool,
-    pub(crate) soft_mask_cache: FxHashMap<u128, Mask>,
+    pub(crate) soft_masks: SoftMasks<Mask>,
     pub(crate) in_type3_glyph: bool,
 }
 
@@ -100,7 +103,7 @@ impl<'r> Renderer<'r> {
             global,
             ctx,
             inside_pattern: false,
-            soft_mask_cache: FxHashMap::default(),
+            soft_masks: SoftMasks::default(),
             in_type3_glyph: false,
         }
     }
@@ -112,8 +115,12 @@ impl<'r> Renderer<'r> {
     fn apply_draw_props(&mut self, props: &DrawProps<'_>) {
         self.ctx.set_transform(props.transform);
         self.apply_soft_mask(props.soft_mask.as_ref());
-        self.ctx
-            .set_blend_mode(convert_blend_mode(props.blend_mode));
+        let mut blend_mode = convert_blend_mode(props.blend_mode);
+        if props.knockout == Knockout::Replace {
+            // `Copy` mixes the destination and the source by the coverage alone.
+            blend_mode.compose = Compose::Copy;
+        }
+        self.ctx.set_blend_mode(blend_mode);
     }
 
     fn apply_image_props(&mut self, props: &ImageDrawProps<'_>) {
@@ -155,10 +162,16 @@ impl<'a, 'r> Device<'a> for Renderer<'r> {
     }
 
     fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        if props.knockout == Knockout::ClearThenOver {
+            self.clear_under(path, props.transform, draw_mode);
+        }
         Self::draw_path(self, path, props, draw_mode);
     }
 
     fn draw_rect(&mut self, rect: &Rect, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        if props.knockout == Knockout::ClearThenOver {
+            self.clear_under(&rect.to_path(0.1), props.transform, draw_mode);
+        }
         Self::draw_rect(self, rect, props, draw_mode);
     }
 
@@ -179,7 +192,7 @@ impl<'a, 'r> Device<'a> for Renderer<'r> {
 #[derive(Clone, Default)]
 pub struct RenderCache<'a> {
     pub(crate) interpreter_cache: InterpreterCache<'a>,
-    pub(crate) outline_cache: Rc<RefCell<FxHashMap<u128, Rc<BezPath>>>>,
+    pub(crate) outline_cache: Rc<RefCell<hash::Map<u128, Rc<BezPath>>>>,
 }
 
 impl<'a> RenderCache<'a> {
@@ -187,7 +200,7 @@ impl<'a> RenderCache<'a> {
     pub fn new() -> Self {
         Self {
             interpreter_cache: InterpreterCache::new(),
-            outline_cache: Rc::new(RefCell::new(FxHashMap::default())),
+            outline_cache: Rc::new(RefCell::new(hash::Map::default())),
         }
     }
 }
@@ -291,14 +304,13 @@ pub fn render_into<'a>(
 
     let global = GlobalState::new(cache, render_settings);
     let mut device = Renderer::new(ctx, &global);
-    let mut clip_path = page.intersected_crop_box().to_kurbo().to_path(0.1);
+    // One view for the clip and the annotations: hayro's own page boxes.
+    let view = View::of(page);
+    let mut clip_path = view.visible().to_path(0.1);
     clip_path.apply_affine(transform);
-    device.push_clip_path(&ClipPath {
-        path: clip_path,
-        fill: FillRule::NonZero,
-    });
+    device.push_clip_path_inner(&clip_path, FillRule::NonZero);
 
-    interpret_page(page, &mut state, &mut device);
+    interpret_page(page, &view, &mut state, &mut device);
 
     device.pop_clip();
 }

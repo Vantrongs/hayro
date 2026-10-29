@@ -13,9 +13,11 @@ use hayro_syntax::content::ops::{LineCap, LineJoin};
 use hayro_syntax::object::dict::keys::{FONT, SMASK, TR, TR2};
 use hayro_syntax::object::{Array, Dict, Name, Number, Object};
 use hayro_syntax::page::Resources;
-use kurbo::{Affine, BezPath, Vec2};
-use smallvec::smallvec;
+use kurbo::{Affine, Vec2};
+use smallvec::{SmallVec, smallvec};
+use std::fmt::Debug;
 use std::ops::Deref;
+use std::sync::Arc;
 
 /// A transfer function.
 #[derive(Clone, Debug)]
@@ -24,6 +26,18 @@ pub enum ActiveTransferFunction {
     Single(TransferFunction),
     /// Four transfer functions, one for each component.
     Four([TransferFunction; 4]),
+}
+
+impl crate::CacheKey for ActiveTransferFunction {
+    /// What the functions map each 8-bit value to: functions that map alike apply
+    /// alike.
+    fn cache_key(&self) -> u128 {
+        let samples = |f: &TransferFunction| *f.samples();
+        match self {
+            Self::Single(f) => crate::util::hash128(&[samples(f)]),
+            Self::Four(fs) => crate::util::hash128(&fs.each_ref().map(samples)),
+        }
+    }
 }
 
 impl ActiveTransferFunction {
@@ -134,10 +148,6 @@ pub(crate) struct TextState<'a> {
 
     pub(crate) text_matrix: Affine,
     pub(crate) text_line_matrix: Affine,
-
-    // When setting the text rendering mode to `clip`, the glyphs should instead be collected
-    // as paths and then applied as 1 single clip path. This field stores those clip paths.
-    pub(crate) clip_paths: BezPath,
 }
 
 impl<'a> TextState<'a> {
@@ -233,7 +243,6 @@ impl Default for TextState<'_> {
             text_matrix: Affine::IDENTITY,
             text_line_matrix: Affine::IDENTITY,
             rise: 0.0,
-            clip_paths: BezPath::default(),
         }
     }
 }
@@ -313,12 +322,12 @@ pub(crate) fn handle_gs_single<'a>(
                 .or_else(|| dict.get::<Object<'_>>(TR))?
             {
                 Object::Array(array) => {
-                    let mut iter = array.iter::<Object<'_>>();
+                    let mut iter = array.items::<Object<'_>>();
                     let functions = [
-                        TransferFunction::new(Function::new(&iter.next()?)?),
-                        TransferFunction::new(Function::new(&iter.next()?)?),
-                        TransferFunction::new(Function::new(&iter.next()?)?),
-                        TransferFunction::new(Function::new(&iter.next()?)?),
+                        TransferFunction::new(Function::new(&iter.next()??)?),
+                        TransferFunction::new(Function::new(&iter.next()??)?),
+                        TransferFunction::new(Function::new(&iter.next()??)?),
+                        TransferFunction::new(Function::new(&iter.next()??)?),
                     ];
 
                     Some(ActiveTransferFunction::Four(functions))
@@ -351,6 +360,9 @@ pub(crate) fn handle_gs_single<'a>(
                     return Some(());
                 }
             } else if let Some(arr) = dict.get::<Array<'_>>(key) {
+                // The first mode recognized, as the PDF specification says; `MuPDF`
+                // (`PyMuPDF` 1.28.2) reads the first entry alone, so that
+                // `[null /Difference]` draws Normal there.
                 for name in arr.iter::<Name<'_>>() {
                     if let Some(bm) = convert_blend_mode(name.as_str()) {
                         context.compositing_mut().blend_mode = bm;
@@ -365,9 +377,9 @@ pub(crate) fn handle_gs_single<'a>(
         }
         "Font" => {
             let arr = dict.get::<Array<'_>>(FONT)?;
-            let mut iter = arr.iter::<Object<'_>>();
-            let font_dict = iter.next()?.into_dict()?;
-            let size = iter.next()?.into_number()?.as_f32();
+            let mut iter = arr.items::<Object<'_>>();
+            let font_dict = iter.next()??.into_dict()?;
+            let size = iter.next()??.into_number()?.as_f32();
 
             let font = context.resolve_font(&font_dict);
             context.text_state_mut().font_size = size;
@@ -375,22 +387,34 @@ pub(crate) fn handle_gs_single<'a>(
         }
         "D" => {
             let arr = dict.get::<Array<'_>>(key)?;
-            let mut iter = arr.iter::<Object<'_>>();
-            let dash_array = iter.next()?.into_array()?;
-            let dash_phase = iter.next()?.into_number()?.as_f32();
+            let mut iter = arr.items::<Object<'_>>();
+            let dash_array = iter.next()??.into_array()?;
+            let dash_phase = iter.next()??.into_number()?.as_f32();
 
             context.stroke_props_mut().dash_offset = dash_phase;
-            context.stroke_props_mut().dash_array = dash_array
-                .iter::<f32>()
-                // kurbo apparently cannot properly deal with offsets that are exactly 0.
-                .map(|n| if n == 0.0 { 0.01 } else { n })
-                .collect();
+            context.stroke_props_mut().dash_array = convert_dash_array(&dash_array);
         }
         "Type" => {}
         _ => {}
     }
 
     Some(())
+}
+
+/// The dash array of the `d` operator or the `D` entry of a graphics state.
+pub(crate) fn convert_dash_array(array: &Array<'_>) -> Arc<[f32]> {
+    let dashes: SmallVec<[f32; 4]> = array
+        .items::<f32>()
+        .map_while(|n| n)
+        // kurbo apparently cannot properly deal with offsets that are exactly 0.
+        .map(|n| if n == 0.0 { 0.01 } else { n })
+        .collect();
+    // An empty array shares one allocation for all; another is copied once.
+    if dashes.is_empty() {
+        Arc::default()
+    } else {
+        Arc::from(dashes.as_slice())
+    }
 }
 
 fn convert_blend_mode(name: &str) -> Option<BlendMode> {

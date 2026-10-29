@@ -1,23 +1,24 @@
-use crate::ExtractionContext;
+use crate::{ExtractionContext, ExtractionError};
+use hayro_syntax::Filter;
+use hayro_syntax::hash;
 use hayro_syntax::object;
 use hayro_syntax::object::dict::keys::{
-    AF, LAST_MODIFIED, LENGTH, METADATA, OC, OPI, PIECE_INFO, PT_DATA, REF, STRUCT_PARENT,
-    STRUCT_PARENTS,
+    AF, DECODE_PARMS, DP, FILTER, LAST_MODIFIED, LENGTH, METADATA, OPI, PIECE_INFO, PT_DATA, REF,
+    STRUCT_PARENT, STRUCT_PARENTS,
 };
-use hayro_syntax::object::{MaybeRef, Null, Number, ObjectIdentifier, Stream};
-use hayro_syntax::object::{Object, array, dict};
-use pdf_writer::{Chunk, Dict, Obj, Ref};
-use std::collections::HashSet;
+use hayro_syntax::object::{MaybeRef, ObjectIdentifier, Stream, Written};
+use hayro_syntax::object::{Object, dict};
+use pdf_writer::{Chunk, Dict, Finish, NumberToken, Obj, Ref};
+use std::hash::BuildHasher;
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::sync::LazyLock;
 
-static IGNORE_KEYS: LazyLock<HashSet<&'static [u8]>> = LazyLock::new(|| {
-    let mut m = HashSet::new();
+static IGNORE_KEYS: LazyLock<hash::Set<&'static [u8]>> = LazyLock::new(|| {
+    let mut m = hash::Set::default();
 
     m.insert(METADATA);
     m.insert(STRUCT_PARENT);
-    m.insert(OC);
     m.insert(AF);
     m.insert(PT_DATA);
     m.insert(REF);
@@ -29,167 +30,210 @@ static IGNORE_KEYS: LazyLock<HashSet<&'static [u8]>> = LazyLock::new(|| {
     m
 });
 
-pub(crate) trait WriteDirect {
-    fn write_direct(&self, obj: Obj<'_>, _: &mut ExtractionContext<'_>);
+/// What a reference to `source` is written as, queuing the body it leads to for
+/// copying the first time an entry leading there is referred to: one copy for every
+/// entry leading to the body ([`ExtractionContext::copies`]).
+///
+/// A reference to an object the file does not list is one to no object
+/// ([`ExtractionContext::nothing`]), as it reads: a reference all the same, which a
+/// reader may tell from a direct `null` (`MuPDF` takes `/DP` that is a reference to
+/// nothing over `/DecodeParms`, and drops a direct `null`, `PyMuPDF` 1.28.2), and
+/// from one to an object that is `null` (`PDFium` leaves an operand of a visibility
+/// expression that refers to nothing out, and reads one that is `null` as off).
+/// One the file lists but that cannot be read is lost,
+/// which fails the extraction ([`crate::extract`]). A stream whose dictionary refers
+/// to no other object is copied once for all streams with the same copied dictionary
+/// and data, its data hashed once, with its body.
+pub(crate) fn target<'a>(source: object::ObjRef, ctx: &mut ExtractionContext<'a>) -> Ref {
+    let pdf = ctx.pdf;
+    let id = ObjectIdentifier::new(source.obj_number, source.gen_number);
+    let Some(body) = pdf.xref().content_key(id) else {
+        return ctx.nothing();
+    };
+    if let Some(copy) = ctx.copies.get(&body) {
+        return *copy;
+    }
+    let copy = first_target(source, ctx).unwrap_or_else(|| ctx.null());
+    ctx.copies.insert(body, copy);
+    copy
 }
 
-impl WriteDirect for object::ObjRef {
-    fn write_direct(&self, obj: Obj<'_>, ctx: &mut ExtractionContext<'_>) {
-        // Check whether the object is actually valid/exists. Otherwise, we need to write a null
-        // object instead. If we don't, we might end up with dangling object references that
-        // don't actually exist in the PDF chunk, which will lead to a panic in krilla when renumbering.
-        let valid = *ctx.valid_ref_cache.entry(*self).or_insert_with(|| {
-            let id = ObjectIdentifier::new(self.obj_number, self.gen_number);
-            ctx.pdf.xref().get::<Object<'_>>(id).is_some()
-        });
+/// [`target`] for the first reference to an entry leading to its body.
+fn first_target(source: object::ObjRef, ctx: &mut ExtractionContext<'_>) -> Option<Ref> {
+    let pdf = ctx.pdf;
+    let id = ObjectIdentifier::new(source.obj_number, source.gen_number);
+    let object = pdf.xref().get::<Object<'_>>(id)?;
+    if let Object::Stream(stream) = &object
+        && !refers(stream.dict())
+    {
+        let data = match stream.try_raw_data() {
+            Ok(data) => data,
+            Err(failure) => {
+                ctx.fail(ExtractionError::StreamData(source, failure));
+                return None;
+            }
+        };
+        let mut scratch = Chunk::new();
+        let mut dict = scratch.indirect(Ref::new(1)).dict();
+        write_stream_dict(stream, &mut dict, ctx, &[]);
+        dict.finish();
+        let _ = ctx.meter.work(scratch.len() + data.len());
+        // Hashed with the map's random keys, as the key it is part of is.
+        let hashed = ctx.shared_streams.hasher().hash_one(&*data);
+        let key = (scratch.as_bytes().to_vec(), data.len(), hashed);
+        let copy = match ctx.shared_streams.get(&key) {
+            Some((other, copy)) => {
+                // One comparison for each stream, however many a file makes hash
+                // alike: one whose data differ is copied on its own.
+                let _ = ctx.meter.work(data.len());
+                let other = pdf.xref().get::<Stream<'_>>((*other).into());
+                if other.and_then(|o| o.try_raw_data().ok()).as_deref() == Some(&*data) {
+                    return Some(*copy);
+                }
+                ctx.new_ref()
+            }
+            None => {
+                let copy = ctx.new_ref();
+                ctx.shared_streams.insert(key, (source, copy));
+                copy
+            }
+        };
+        ctx.to_copy.push((source, copy, ctx.page));
+        return Some(copy);
+    }
+    let copy = ctx.new_ref();
+    ctx.to_copy.push((source, copy, ctx.page));
+    Some(copy)
+}
 
-        if valid {
-            ctx.to_visit_refs.push(*self);
-            let mapped_ref = ctx.map_ref(*self);
-            obj.primitive(mapped_ref);
-        } else {
-            obj.primitive(pdf_writer::Null);
+/// Whether the copy of `dict` would refer to another object.
+fn refers(dict: &dict::Dict<'_>) -> bool {
+    fn object_refers(object: &MaybeRef<Object<'_>>) -> bool {
+        match object {
+            MaybeRef::Ref(_) => true,
+            MaybeRef::NotRef(Object::Dict(dict)) => refers(dict),
+            MaybeRef::NotRef(Object::Array(array)) => array.raw_iter().any(|o| object_refers(&o)),
+            MaybeRef::NotRef(_) => false,
         }
     }
+
+    dict.entries().any(|(name, value)| {
+        !IGNORE_KEYS.contains(name.deref())
+            && !STREAM_KEYS.contains(&name.deref())
+            && object_refers(&value)
+    })
 }
 
-impl WriteDirect for Number {
-    fn write_direct(&self, obj: Obj<'_>, _: &mut ExtractionContext<'_>) {
-        let float_num = self.as_f64();
-
-        if float_num.fract() == 0.0 {
-            obj.primitive(float_num as i32);
-        } else {
-            obj.primitive(float_num as f32);
+/// Writes `value`, read from the source as the file writes it, into `obj`, so that
+/// a reader reads the copy as it reads the source: a number as its bytes
+/// ([`Written::Number`]), a string or name as the bytes it is read as, and a
+/// reference as one to the copy of what it leads to ([`target`]).
+pub(crate) fn write(value: &Written<'_>, obj: Obj<'_>, ctx: &mut ExtractionContext<'_>) {
+    match value {
+        Written::Ref(r) => obj.primitive(target(*r, ctx)),
+        Written::Null => obj.primitive(pdf_writer::Null),
+        Written::Boolean(b) => obj.primitive(*b),
+        Written::Number(token) => obj.primitive(
+            NumberToken::new(token).expect("a number is read from digits, signs and points"),
+        ),
+        Written::String(s) => obj.primitive(pdf_writer::Str(s.as_ref())),
+        Written::Name(n) => obj.primitive(pdf_writer::Name(n.deref())),
+        Written::Dict(d) => write_dict(d, &mut obj.dict(), ctx, &[]),
+        Written::Array(a) => {
+            let mut out = obj.array();
+            for item in a.written() {
+                write(&item, out.push(), ctx);
+            }
         }
+        // A stream is an object of its own (`write_indirect`): a dictionary in
+        // another object followed by `stream` is read as a dictionary.
+        Written::Stream(_) => unreachable!(),
     }
 }
 
-impl WriteDirect for bool {
-    fn write_direct(&self, obj: Obj<'_>, _: &mut ExtractionContext<'_>) {
-        obj.primitive(self);
-    }
-}
+/// The entries of a stream dictionary that its writer sets itself.
+pub(crate) const STREAM_KEYS: &[&[u8]] = &[LENGTH];
 
-impl WriteDirect for Null {
-    fn write_direct(&self, obj: Obj<'_>, _: &mut ExtractionContext<'_>) {
-        obj.primitive(pdf_writer::Null);
-    }
-}
-
-impl WriteDirect for object::String<'_> {
-    fn write_direct(&self, obj: Obj<'_>, _: &mut ExtractionContext<'_>) {
-        obj.primitive(pdf_writer::Str(self.as_ref()));
-    }
-}
-
-impl WriteDirect for object::Name<'_> {
-    fn write_direct(&self, obj: Obj<'_>, _: &mut ExtractionContext<'_>) {
-        obj.primitive(pdf_writer::Name(self.deref()));
-    }
-}
-
-impl WriteDirect for object::Array<'_> {
-    fn write_direct(&self, obj: Obj<'_>, ctx: &mut ExtractionContext<'_>) {
-        let mut arr = obj.array();
-        for item in self.raw_iter() {
-            let obj = arr.push();
-            item.write_direct(obj, ctx);
-        }
-    }
-}
-
-impl<T: WriteDirect> WriteDirect for MaybeRef<T> {
-    fn write_direct(&self, obj: Obj<'_>, ctx: &mut ExtractionContext<'_>) {
-        match self {
-            Self::Ref(r) => r.write_direct(obj, ctx),
-            Self::NotRef(o) => o.write_direct(obj, ctx),
-        }
-    }
-}
-
-fn write_dict(
+/// Copies `hayro_dict` into `pdf_dict`, leaving out the ignored keys and `skip`.
+pub(crate) fn write_dict(
     hayro_dict: &dict::Dict<'_>,
     pdf_dict: &mut Dict<'_>,
     ctx: &mut ExtractionContext<'_>,
-    is_stream: bool,
+    skip: &[&[u8]],
 ) {
-    for (name, val) in hayro_dict.entries() {
-        if is_stream && name.deref() == LENGTH {
-            continue;
-        }
-
-        if !IGNORE_KEYS.contains(name.deref()) {
-            val.write_direct(pdf_dict.insert(pdf_writer::Name(name.deref())), ctx);
+    for (name, val) in hayro_dict.written() {
+        if !IGNORE_KEYS.contains(name.deref()) && !skip.contains(&name.deref()) {
+            write(&val, pdf_dict.insert(pdf_writer::Name(name.deref())), ctx);
         }
     }
 }
 
-impl WriteDirect for object::Dict<'_> {
-    fn write_direct(&self, obj: Obj<'_>, ctx: &mut ExtractionContext<'_>) {
-        let mut dict = obj.dict();
-
-        write_dict(self, &mut dict, ctx, false);
-    }
-}
-
-impl WriteDirect for Object<'_> {
-    fn write_direct(&self, obj: Obj<'_>, ctx: &mut ExtractionContext<'_>) {
-        match self {
-            Object::Null(n) => n.write_direct(obj, ctx),
-            Object::Boolean(b) => b.write_direct(obj, ctx),
-            Object::Number(n) => n.write_direct(obj, ctx),
-            Object::String(s) => s.write_direct(obj, ctx),
-            Object::Name(n) => n.write_direct(obj, ctx),
-            Object::Dict(d) => d.write_direct(obj, ctx),
-            Object::Array(a) => a.write_direct(obj, ctx),
-            Object::Stream(_) => unreachable!(),
-        }
-    }
-}
-
-pub(crate) trait WriteIndirect {
-    fn write_indirect(&self, chunk: &mut Chunk, id: Ref, ctx: &mut ExtractionContext<'_>);
-}
-
-macro_rules! write_indirect {
-    ($name:ty) => {
-        impl WriteIndirect for $name {
-            fn write_indirect(&self, chunk: &mut Chunk, id: Ref, ctx: &mut ExtractionContext<'_>) {
-                self.write_direct(chunk.indirect(id), ctx);
-            }
+/// Writes `value`, an object of its own, as object `id` of `chunk` ([`write`]).
+pub(crate) fn write_indirect(
+    value: &Written<'_>,
+    chunk: &mut Chunk,
+    id: Ref,
+    ctx: &mut ExtractionContext<'_>,
+) {
+    let Written::Stream(stream) = value else {
+        write(value, chunk.indirect(id), ctx);
+        return;
+    };
+    let data = match stream.try_raw_data() {
+        Ok(data) => data,
+        Err(failure) => {
+            let id = stream.obj_id();
+            ctx.fail(ExtractionError::StreamData(id.into(), failure));
+            return;
         }
     };
+    let mut obj = chunk.stream(id, &data);
+    write_stream_dict(stream, obj.deref_mut(), ctx, &[]);
 }
 
-write_indirect!(Null);
-write_indirect!(bool);
-write_indirect!(Number);
-write_indirect!(object::String<'_>);
-write_indirect!(object::Name<'_>);
-write_indirect!(dict::Dict<'_>);
-write_indirect!(array::Array<'_>);
-
-impl WriteIndirect for Stream<'_> {
-    fn write_indirect(&self, chunk: &mut Chunk, id: Ref, ctx: &mut ExtractionContext<'_>) {
-        // TODO: Handle `Crypt` filter
-        let data = self.raw_data();
-        let mut obj = chunk.stream(id, &data);
-        write_dict(self.dict(), obj.deref_mut(), ctx, true);
+/// Copies the dictionary of `stream`, whose data is copied decrypted, leaving out
+/// `skip`, the length and any /Crypt filter with its parameters: the copy is not
+/// encrypted. Where a /Crypt filter is left out, the filters kept are written as
+/// /Filter and their parameters, each in its filter's place, as `/DecodeParms`, as the
+/// stream's own filters are read with theirs ([`Stream::filter_entries`]).
+pub(crate) fn write_stream_dict(
+    stream: &Stream<'_>,
+    pdf_dict: &mut Dict<'_>,
+    ctx: &mut ExtractionContext<'_>,
+    skip: &[&[u8]],
+) {
+    let hayro_dict = stream.dict();
+    let filters = stream.filter_entries();
+    let mut skipped = STREAM_KEYS.to_vec();
+    skipped.extend_from_slice(skip);
+    if !filters.applied().any(|(f, _)| f == Filter::Crypt) {
+        write_dict(hayro_dict, pdf_dict, ctx, &skipped);
+        return;
     }
-}
-
-impl WriteIndirect for Object<'_> {
-    fn write_indirect(&self, chunk: &mut Chunk, id: Ref, ctx: &mut ExtractionContext<'_>) {
-        match self {
-            Object::Null(n) => n.write_indirect(chunk, id, ctx),
-            Object::Boolean(b) => b.write_indirect(chunk, id, ctx),
-            Object::Number(n) => n.write_indirect(chunk, id, ctx),
-            Object::String(s) => s.write_indirect(chunk, id, ctx),
-            Object::Name(n) => n.write_indirect(chunk, id, ctx),
-            Object::Dict(d) => d.write_indirect(chunk, id, ctx),
-            Object::Array(a) => a.write_indirect(chunk, id, ctx),
-            Object::Stream(s) => s.write_indirect(chunk, id, ctx),
+    skipped.extend_from_slice(&[filters.key, FILTER, DECODE_PARMS, DP]);
+    write_dict(hayro_dict, pdf_dict, ctx, &skipped);
+    let kept = || {
+        filters
+            .entries()
+            .filter(|e| e.filter != Some(Filter::Crypt))
+    };
+    if kept().next().is_none() {
+        return;
+    }
+    let mut out = pdf_dict.insert(pdf_writer::Name(FILTER)).array();
+    for entry in kept() {
+        write(&entry.written, out.push(), ctx);
+    }
+    out.finish();
+    if kept().any(|e| e.params_written.is_some()) {
+        let mut out = pdf_dict.insert(pdf_writer::Name(DECODE_PARMS)).array();
+        for entry in kept() {
+            match &entry.params_written {
+                Some(params) => write(params, out.push(), ctx),
+                None => {
+                    out.push().primitive(pdf_writer::Null);
+                }
+            }
         }
     }
 }

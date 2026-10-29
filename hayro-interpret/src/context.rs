@@ -2,25 +2,26 @@ use crate::cache::{Cache, CacheKey};
 use crate::color::{Color, ColorSpace};
 use crate::convert::convert_transform;
 use crate::font::{Font, PositionedGlyph, StandardFont};
+use crate::interpret::annotation::Glyph;
 use crate::interpret::stack::StateStack;
 use crate::interpret::state::{
     ClipType, CompositingState, PaintData, PaintState, State, TextState, TextStateFont,
 };
-use crate::ocg::OcgState;
+use crate::ocg::{OcgState, OptionalContent};
 use crate::util::{BezPathExt, Float64Ext};
 use crate::{
-    ClipPath, Device, DrawProps, FillRule, InterpreterSettings, InterpreterWarning, Paint,
-    StrokeProps,
+    ClipPath, Device, DrawProps, FillRule, InterpreterSettings, InterpreterWarning, Knockout,
+    Paint, StrokeProps,
 };
 use hayro_syntax::content::ops::Transform;
+use hayro_syntax::hash;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
 use hayro_syntax::page::Resources;
 use hayro_syntax::xref::XRef;
 use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape};
-use rustc_hash::FxHashMap;
 use smallvec::smallvec;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 /// Maximum nesting depth for interpreting `XObject`'s/patterns/streams.
@@ -32,8 +33,10 @@ pub(crate) const MAX_NESTED_INTERPRETATION_DEPTH: u32 = 50;
 /// multiple interpreter invocations on the same document.
 #[derive(Clone)]
 pub struct InterpreterCache<'a> {
-    pub(crate) font_cache: Rc<RefCell<FxHashMap<u128, Option<Font<'a>>>>>,
+    pub(crate) font_cache: Rc<RefCell<hash::Map<u128, Option<Font<'a>>>>>,
     pub(crate) object_cache: Cache,
+    /// The form fields read for the annotations of the document's pages.
+    pub(crate) annotation_fields: crate::interpret::annotation::Fields<'a>,
 }
 
 impl<'a> Default for InterpreterCache<'a> {
@@ -46,8 +49,9 @@ impl<'a> InterpreterCache<'a> {
     /// Create a new interpreter cache.
     pub fn new() -> Self {
         Self {
-            font_cache: Rc::new(RefCell::new(FxHashMap::default())),
+            font_cache: Rc::new(RefCell::new(hash::Map::default())),
             object_cache: Cache::new(),
+            annotation_fields: crate::interpret::annotation::Fields::default(),
         }
     }
 }
@@ -61,12 +65,23 @@ pub struct Context<'a> {
     clip: Option<FillRule>,
     root_transforms: Vec<Affine>,
     bbox: Vec<Rect>,
+    /// Whether anything drawn read `bbox`, the box the context was made with as the
+    /// clips leave it: what is drawn from it then depends on that box.
+    bbox_read: Cell<bool>,
     pub(crate) settings: InterpreterSettings,
     pub(crate) interpreter_cache: InterpreterCache<'a>,
     pub(crate) xref: &'a XRef,
-    pub(crate) ocg_state: OcgState,
+    pub(crate) ocg_state: OcgState<'a>,
+    /// The outlines of the glyphs shown in a clipping mode since the last `ET` of the
+    /// content stream being drawn, in device space, if any were shown: `PDFium` keeps
+    /// them with the parser of each content stream, not in the graphics state, so `Q`
+    /// brings back none an `ET` has used, and glyphs without outlines clip all away.
+    pub(crate) text_clip: Option<BezPath>,
     nesting_depth: u32,
     pub(crate) glyph_scratch: Vec<PositionedGlyph<'a>>,
+    /// While a generated annotation appearance is drawn, the glyphs it draws as forms
+    /// by name.
+    pub(crate) generated_glyphs: hash::Map<Rc<str>, Rc<Glyph>>,
 }
 
 impl<'a> Context<'a> {
@@ -79,8 +94,18 @@ impl<'a> Context<'a> {
         settings: InterpreterSettings,
     ) -> Self {
         let state = State::new(initial_transform);
+        let optional_content = cache.annotation_fields.optional_content(xref);
 
-        Self::new_with(initial_transform, bbox, cache, xref, settings, state, 0)
+        Self::new_with(
+            initial_transform,
+            bbox,
+            cache,
+            xref,
+            settings,
+            state,
+            0,
+            Some(optional_content),
+        )
     }
 
     pub(crate) fn new_with(
@@ -91,13 +116,9 @@ impl<'a> Context<'a> {
         settings: InterpreterSettings,
         state: State<'a>,
         nesting_depth: u32,
+        optional_content: Option<Rc<OptionalContent<'a>>>,
     ) -> Self {
-        let ocg_state = {
-            let root_ref = xref.root_id();
-            xref.get::<Dict<'_>>(root_ref)
-                .map(|catalog| OcgState::from_catalog(&catalog))
-                .unwrap_or_default()
-        };
+        let ocg_state = OcgState::new(optional_content);
 
         Self {
             stack: StateStack::new(state),
@@ -108,11 +129,14 @@ impl<'a> Context<'a> {
             sub_path_start: Point::default(),
             clip: None,
             bbox: vec![bbox],
+            bbox_read: Cell::new(false),
             path: BezPath::new(),
             interpreter_cache: cache.clone(),
             ocg_state,
+            text_clip: None,
             nesting_depth,
             glyph_scratch: Vec::new(),
+            generated_glyphs: hash::Map::default(),
         }
     }
 
@@ -120,7 +144,19 @@ impl<'a> Context<'a> {
         self.stack.save();
     }
 
+    /// The box the context was made with, as the clips in effect leave it. What reads
+    /// it depends on the box: [`Context::bbox_read`].
     pub(crate) fn bbox(&self) -> Rect {
+        self.bbox_read.set(true);
+        self.current_bbox()
+    }
+
+    /// Whether anything drawn in the context read [`Context::bbox`].
+    pub(crate) fn bbox_read(&self) -> bool {
+        self.bbox_read.get()
+    }
+
+    fn current_bbox(&self) -> Rect {
         self.bbox.last().copied().unwrap_or_else(|| {
             warn!("failed to get a bbox");
 
@@ -128,8 +164,9 @@ impl<'a> Context<'a> {
         })
     }
 
+    /// Narrows the box by a clip's; only what reads the box narrowed reads it.
     fn push_bbox(&mut self, bbox: Rect) {
-        let new = self.bbox().intersect(bbox);
+        let new = self.current_bbox().intersect(bbox);
         self.bbox.push(new);
     }
 
@@ -215,6 +252,7 @@ impl<'a> Context<'a> {
             paint: self.get_paint(is_stroke),
             soft_mask: self.compositing().soft_mask.clone(),
             blend_mode: self.compositing().blend_mode,
+            knockout: Knockout::None,
         }
     }
 
@@ -234,6 +272,7 @@ impl<'a> Context<'a> {
 
         if data.color_space.is_pattern() || data.pattern.is_some() {
             if let Some(mut pattern) = data.pattern {
+                pattern.set_opacity(data.alpha);
                 if let Some(tf) = &data.transfer_function {
                     pattern.set_transfer_function(tf.clone());
                 }
@@ -261,6 +300,16 @@ impl<'a> Context<'a> {
     }
 
     pub(crate) fn path_mut(&mut self) -> &mut BezPath {
+        &mut self.path
+    }
+
+    /// The path, ready for a segment from the current point. After `h` (or `re`) PDF
+    /// continues from the start of the closed subpath; a `BezPath` subpath always
+    /// begins with a `MoveTo`, so one is added there.
+    pub(crate) fn path_for_segment(&mut self) -> &mut BezPath {
+        if self.path.elements().last() == Some(&PathEl::ClosePath) {
+            self.path.move_to(self.sub_path_start);
+        }
         &mut self.path
     }
 

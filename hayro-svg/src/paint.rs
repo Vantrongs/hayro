@@ -196,7 +196,13 @@ impl<'a> SvgRenderer<'a> {
                     }
                 };
 
-                (format!("url(#{id})"), 1.0)
+                // A shading's opacity is in its colours; a tiling pattern's cell is
+                // painted at its opacity as a whole.
+                let opacity = match p.as_ref() {
+                    Pattern::Shading(_) => 1.0,
+                    Pattern::Tiling(t) => t.opacity,
+                };
+                (format!("url(#{id})"), opacity)
             }
         }
     }

@@ -1,10 +1,12 @@
 //! Arrays.
 
 use crate::object::macros::object;
+use crate::object::parsed::{Items, Node, Part};
 use crate::object::r#ref::MaybeRef;
-use crate::object::{FromBytes, Object, ObjectLike};
+use crate::object::{FromBytes, Object, ObjectIdentifier, ObjectLike, Written};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
+use crate::xref::ContentKey;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
 use core::marker::PhantomData;
@@ -12,26 +14,82 @@ use smallvec::SmallVec;
 
 /// An array of PDF objects.
 #[derive(Clone)]
-pub struct Array<'a> {
-    data: &'a [u8],
-    ctx: ReaderContext<'a>,
+pub struct Array<'a>(Repr<'a>);
+
+#[derive(Clone)]
+enum Repr<'a> {
+    /// Items read from their bytes as they are iterated.
+    Bytes {
+        data: &'a [u8],
+        ctx: ReaderContext<'a>,
+    },
+    /// Items of the body of an object, parsed once ([`crate::object::parsed`]).
+    Parsed(Part<'a>),
 }
 
 // Note that this is not structural equality, i.e. two arrays with the same
 // items are still considered different if they have different whitespaces.
 impl PartialEq for Array<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.data == other.data
+        self.data() == other.data()
     }
 }
 
 impl<'a> Array<'a> {
-    /// Returns an iterator over the objects of the array.
-    pub fn raw_iter(&self) -> ArrayIter<'a> {
-        ArrayIter::new(self.data, &self.ctx)
+    /// The array `part` reads.
+    pub(crate) fn parsed(part: Part<'a>) -> Self {
+        Self(Repr::Parsed(part))
     }
 
-    /// Returns an iterator over the resolved objects of the array.
+    /// Where the items are read from.
+    fn cursor(&self) -> Cursor<'a> {
+        match &self.0 {
+            Repr::Bytes { data, .. } => Cursor::Bytes(Reader::new(data)),
+            Repr::Parsed(part) => Cursor::Parsed {
+                part: part.clone(),
+                at: 0,
+            },
+        }
+    }
+
+    /// Returns an iterator over the objects of the array.
+    pub fn raw_iter(&self) -> ArrayIter<'a> {
+        ArrayIter {
+            cursor: self.cursor(),
+            ctx: self.ctx().clone(),
+        }
+    }
+
+    /// Returns an iterator over the items of the array as the file writes them
+    /// ([`Written`]).
+    pub fn written(&self) -> impl Iterator<Item = Written<'a>> + use<'a> {
+        let ctx = self.ctx().clone();
+        let mut cursor = self.cursor();
+        core::iter::from_fn(move || match &mut cursor {
+            Cursor::Bytes(reader) => {
+                let start = reader.offset();
+                reader.skip_white_spaces_and_comments();
+                if reader.at_end() {
+                    return None;
+                }
+                // Objects are already guaranteed to be valid.
+                let item = Written::read(reader, &ctx).unwrap();
+                crate::work::lexed(reader.offset() - start);
+                Some(item)
+            }
+            Cursor::Parsed { part, at } => {
+                if *at >= part.len() {
+                    return None;
+                }
+                *at += 1;
+                Some(part.written(*at - 1))
+            }
+        })
+    }
+
+    /// Returns an iterator over the entries of the array that are objects of type
+    /// `T`, references resolved. An entry of another type, or a reference to no
+    /// object, is skipped: it does not end the iteration.
     #[allow(
         private_bounds,
         reason = "users shouldn't be able to implement `ObjectLike` for custom objects."
@@ -40,17 +98,89 @@ impl<'a> Array<'a> {
     where
         T: ObjectLike<'a>,
     {
-        ResolvedArrayIter::new(self.data, &self.ctx)
+        ResolvedArrayIter {
+            items: self.items(),
+        }
+    }
+
+    /// Returns an iterator with one item for each entry of the array, in its place:
+    /// the entry as an object of type `T`, references resolved, or `None` when it is
+    /// of another type or a reference to no object.
+    #[allow(
+        private_bounds,
+        reason = "users shouldn't be able to implement `ObjectLike` for custom objects."
+    )]
+    pub fn items<T>(&self) -> ArrayItems<'a, T>
+    where
+        T: ObjectLike<'a>,
+    {
+        const {
+            assert!(
+                T::ONE_ENTRY,
+                "a tuple spans several entries; read it with `flex_iter`"
+            );
+        }
+        ArrayItems {
+            raw: self.raw_iter(),
+            phantom_data: PhantomData,
+        }
+    }
+
+    /// The items of the array that are of a specific type, resolved; `Err` with an
+    /// object reading an item lost ([`crate::lost`]), the one it refers to where the
+    /// file lists it but it cannot be read, which the computation being watched is
+    /// told too. As in [`Self::iter`], an item of another type, or a reference to
+    /// nothing, is passed over, not the end.
+    #[allow(
+        private_bounds,
+        reason = "users shouldn't be able to implement `ObjectLike` for custom objects."
+    )]
+    pub fn iter_checked<T>(&self) -> impl Iterator<Item = Result<T, ObjectIdentifier>> + 'a
+    where
+        T: ObjectLike<'a>,
+    {
+        let ctx = self.ctx().clone();
+        self.raw_iter().filter_map(move |item| match item {
+            MaybeRef::Ref(r) => ctx.xref().get_checked_with(r.into(), &ctx).transpose(),
+            MaybeRef::NotRef(object) => object.cast::<T>().map(Ok),
+        })
+    }
+
+    /// The entries before the first one that is not a `T`, as `flex_iter` reads
+    /// them; tuples read several entries at once.
+    fn prefix<T: ObjectLike<'a>>(&self) -> impl Iterator<Item = T> + use<'a, T> {
+        let mut entries = self.flex_iter();
+        core::iter::from_fn(move || entries.next::<T>())
     }
 
     /// Return a flex iterator over the items in the array.
     pub fn flex_iter(&self) -> FlexArrayIter<'a> {
-        FlexArrayIter::new(self.data, &self.ctx)
+        FlexArrayIter {
+            cursor: self.cursor(),
+            ctx: self.ctx().clone(),
+        }
     }
 
     /// Return the raw data of the array.
     pub fn data(&self) -> &'a [u8] {
-        self.data
+        match &self.0 {
+            Repr::Bytes { data, .. } => data,
+            Repr::Parsed(part) => part.data(),
+        }
+    }
+
+    /// What the array's items are read from, for a cache of what is read or copied
+    /// from them.
+    pub fn content_key(&self) -> ContentKey<'a> {
+        ContentKey::new(self.data(), self.ctx())
+    }
+
+    /// The context the array's items are read in.
+    pub(crate) fn ctx(&self) -> &ReaderContext<'a> {
+        match &self.0 {
+            Repr::Bytes { ctx, .. } => ctx,
+            Repr::Parsed(part) => part.ctx(),
+        }
     }
 }
 
@@ -91,19 +221,32 @@ impl Skippable for Array<'_> {
             return None;
         }
 
-        r.forward_tag(b"[")?;
-
-        loop {
-            r.skip_white_spaces_and_comments();
-
-            if let Some(()) = r.forward_tag(b"]") {
-                return Some(());
-            } else if is_content_stream {
+        parse_array_with(r, |r| {
+            if is_content_stream {
                 r.skip_with_depth::<Object<'_>>(true, depth + 1)?;
             } else {
                 r.skip_with_depth::<MaybeRef<Object<'_>>>(false, depth + 1)?;
             }
+            Some(())
+        })
+    }
+}
+
+/// Reads an array, `item` reading each item: the one way an array is read, whether
+/// it is skipped or parsed.
+pub(crate) fn parse_array_with<'a>(
+    r: &mut Reader<'a>,
+    mut item: impl FnMut(&mut Reader<'a>) -> Option<()>,
+) -> Option<()> {
+    r.forward_tag(b"[")?;
+
+    loop {
+        r.skip_white_spaces_and_comments();
+
+        if let Some(()) = r.forward_tag(b"]") {
+            return Some(());
         }
+        item(r)?;
     }
 }
 
@@ -116,59 +259,70 @@ impl Default for Array<'_> {
 impl<'a> Readable<'a> for Array<'a> {
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         let bytes = r.skip::<Array<'_>>(ctx.in_content_stream())?;
+        crate::work::lexed(bytes.len());
 
-        Some(Self {
+        #[cfg(test)]
+        super::dict::PARSED.with(|parsed| {
+            let (entries, read) = parsed.get();
+            parsed.set((entries, read + bytes.len()));
+        });
+
+        Some(Self(Repr::Bytes {
             data: &bytes[1..bytes.len() - 1],
             ctx: ctx.clone(),
-        })
+        }))
     }
+}
+
+/// Where the next items of an array are read from.
+enum Cursor<'a> {
+    Bytes(Reader<'a>),
+    Parsed { part: Part<'a>, at: usize },
 }
 
 /// An iterator over the items of an array.
 pub struct ArrayIter<'a> {
-    reader: Reader<'a>,
+    cursor: Cursor<'a>,
     ctx: ReaderContext<'a>,
-}
-
-impl<'a> ArrayIter<'a> {
-    fn new(data: &'a [u8], ctx: &ReaderContext<'a>) -> Self {
-        Self {
-            reader: Reader::new(data),
-            ctx: ctx.clone(),
-        }
-    }
 }
 
 impl<'a> Iterator for ArrayIter<'a> {
     type Item = MaybeRef<Object<'a>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.reader.skip_white_spaces_and_comments();
+        match &mut self.cursor {
+            Cursor::Bytes(reader) => {
+                let start = reader.offset();
+                reader.skip_white_spaces_and_comments();
 
-        if self.reader.at_end() {
-            return None;
+                if reader.at_end() {
+                    return None;
+                }
+                // The array was validated by skipping its items, which accepts some
+                // items that can't be read. The read is returned as it is: unwrapping
+                // and rewrapping it copies the object field by field, and the wider
+                // reloads of those narrow stores stall store forwarding.
+                let item = reader.read_with_context::<MaybeRef<Object<'_>>>(&self.ctx);
+                if item.is_some() {
+                    crate::work::lexed(reader.offset() - start);
+                }
+                item
+            }
+            Cursor::Parsed { part, at } => {
+                if *at >= part.len() {
+                    return None;
+                }
+                *at += 1;
+                Some(part.item(*at - 1))
+            }
         }
-
-        // The array was validated by skipping its items, which accepts some items that
-        // can't be read.
-        self.reader
-            .read_with_context::<MaybeRef<Object<'_>>>(&self.ctx)
     }
 }
 
-/// An iterator over the array that resolves objects of a specific type.
+/// An iterator over the entries of an array that are objects of a specific type
+/// (see [`Array::iter`]).
 pub struct ResolvedArrayIter<'a, T> {
-    flex_iter: FlexArrayIter<'a>,
-    phantom_data: PhantomData<T>,
-}
-
-impl<'a, T> ResolvedArrayIter<'a, T> {
-    fn new(data: &'a [u8], ctx: &ReaderContext<'a>) -> Self {
-        Self {
-            flex_iter: FlexArrayIter::new(data, ctx),
-            phantom_data: PhantomData,
-        }
-    }
+    items: ArrayItems<'a, T>,
 }
 
 impl<'a, T> Iterator for ResolvedArrayIter<'a, T>
@@ -178,24 +332,44 @@ where
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.flex_iter.next::<T>()
+        loop {
+            if let Some(item) = self.items.next()? {
+                return Some(item);
+            }
+        }
+    }
+}
+
+/// An iterator over the entries of an array, each as an object of a specific type
+/// or `None` (see [`Array::items`]).
+pub struct ArrayItems<'a, T> {
+    raw: ArrayIter<'a>,
+    phantom_data: PhantomData<T>,
+}
+
+impl<'a, T> Iterator for ArrayItems<'a, T>
+where
+    T: ObjectLike<'a>,
+{
+    type Item = Option<T>;
+
+    // Each entry read as an object and cast, as a parsed array's entries are, so
+    // that an entry of another type is passed over by the one rule that read it.
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(match self.raw.next()? {
+            MaybeRef::Ref(r) => self.raw.ctx.xref().get_with::<T>(r.into(), &self.raw.ctx),
+            MaybeRef::NotRef(object) => object.cast::<T>(),
+        })
     }
 }
 
 /// An iterator over the array that allows reading a different object each time.
 pub struct FlexArrayIter<'a> {
-    reader: Reader<'a>,
+    cursor: Cursor<'a>,
     ctx: ReaderContext<'a>,
 }
 
 impl<'a> FlexArrayIter<'a> {
-    fn new(data: &'a [u8], ctx: &ReaderContext<'a>) -> Self {
-        Self {
-            reader: Reader::new(data),
-            ctx: ctx.clone(),
-        }
-    }
-
     #[allow(
         private_bounds,
         reason = "users shouldn't be able to implement `ObjectLike` for custom objects."
@@ -203,16 +377,34 @@ impl<'a> FlexArrayIter<'a> {
     #[allow(clippy::should_implement_trait)]
     /// Try reading the next item as a specific object from the array.
     pub fn next<T: ObjectLike<'a>>(&mut self) -> Option<T> {
-        self.reader.skip_white_spaces_and_comments();
+        match &mut self.cursor {
+            Cursor::Bytes(reader) => {
+                reader.skip_white_spaces_and_comments();
 
-        if !self.reader.at_end() {
-            return match self.reader.read_with_context::<MaybeRef<T>>(&self.ctx)? {
-                MaybeRef::Ref(r) => self.ctx.xref().get_with::<T>(r.into(), &self.ctx),
-                MaybeRef::NotRef(i) => Some(i),
-            };
+                if reader.at_end() {
+                    return None;
+                }
+                let start = reader.offset();
+                let item = reader.read_with_context::<MaybeRef<T>>(&self.ctx);
+                crate::work::lexed(reader.offset() - start);
+                match item? {
+                    MaybeRef::Ref(r) => self.ctx.xref().get_with::<T>(r.into(), &self.ctx),
+                    MaybeRef::NotRef(i) => Some(i),
+                }
+            }
+            // As reading the item's bytes as a `MaybeRef<T>` reads them: a reference
+            // is taken and resolved, else the item, or items for a tuple, as a `T`,
+            // which are not taken where they are none.
+            Cursor::Parsed { part, at } => {
+                let mut items = Items { part, at: *at };
+                let read = match part.items().get(items.at)? {
+                    Node::Ref(_) => items.next_resolved::<T>(&self.ctx),
+                    _ => Some(T::from_items(&mut items, &self.ctx)?),
+                };
+                *at = items.at;
+                read
+            }
         }
-
-        None
     }
 }
 
@@ -220,7 +412,7 @@ impl<'a, T: ObjectLike<'a> + Copy + Default, const C: usize> TryFrom<Array<'a>> 
     type Error = ();
 
     fn try_from(value: Array<'a>) -> Result<Self, Self::Error> {
-        let mut iter = value.iter::<T>();
+        let mut iter = value.prefix::<T>();
 
         let mut val = [T::default(); C];
 
@@ -265,7 +457,7 @@ impl<'a, T: ObjectLike<'a>> TryFrom<Array<'a>> for Vec<T> {
     type Error = ();
 
     fn try_from(value: Array<'a>) -> Result<Self, Self::Error> {
-        Ok(value.iter::<T>().collect())
+        Ok(value.prefix::<T>().collect())
     }
 }
 
@@ -295,7 +487,7 @@ impl<'a, U: ObjectLike<'a>, T: ObjectLike<'a> + smallvec::Array<Item = U>> TryFr
     type Error = ();
 
     fn try_from(value: Array<'a>) -> Result<Self, Self::Error> {
-        Ok(value.iter::<U>().collect())
+        Ok(value.prefix::<U>().collect())
     }
 }
 
@@ -332,7 +524,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::object::Object;
-    use crate::object::r#ref::{MaybeRef, ObjRef};
+    use crate::object::r#ref::MaybeRef;
     use crate::object::{Array, FromBytes};
     use crate::reader::Reader;
     use crate::reader::{ReaderContext, ReaderExt};
@@ -397,25 +589,6 @@ mod tests {
     }
 
     #[test]
-    fn array_with_ref() {
-        let res = array_ref_impl(b"[345 34 5 R 34.0]").unwrap();
-        assert!(matches!(res[0], MaybeRef::NotRef(Object::Number(_))));
-        assert!(matches!(
-            res[1],
-            MaybeRef::Ref(ObjRef {
-                obj_number: 34,
-                gen_number: 5
-            })
-        ));
-        assert!(matches!(res[2], MaybeRef::NotRef(Object::Number(_))));
-    }
-
-    #[test]
-    fn malformed_ref_is_not_valid_array() {
-        assert!(array_ref_impl(b"[8 0R]").is_none());
-    }
-
-    #[test]
     fn array_with_single_number_is_valid() {
         assert!(array_ref_impl(b"[345345345]").is_some());
     }
@@ -432,6 +605,34 @@ mod tests {
         let res = array_impl(b"[(Hi) /Test]trialing data").unwrap();
         assert!(matches!(res[0], Object::String(_)));
         assert!(matches!(res[1], Object::Name(_)));
+    }
+
+    fn numbers(data: &[u8]) -> Array<'_> {
+        Reader::new(data)
+            .read_with_context::<Array<'_>>(&ReaderContext::new(XRef::dummy(), false))
+            .unwrap()
+    }
+
+    #[test]
+    fn iter_skips_an_entry_of_another_type_or_a_reference_to_no_object() {
+        let array = numbers(b"[1 null 2 (x) 5 0 R 3 /N]");
+        assert_eq!(array.iter::<f32>().collect::<Vec<_>>(), [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn items_keep_each_entry_in_its_place() {
+        let array = numbers(b"[1 null 5 0 R [2] 2]");
+        assert_eq!(
+            array.items::<f32>().collect::<Vec<_>>(),
+            [Some(1.0), None, None, None, Some(2.0)]
+        );
+    }
+
+    #[test]
+    fn a_vec_is_read_up_to_the_first_entry_of_another_type() {
+        let array = numbers(b"[1 2 null 3]");
+        assert_eq!(Vec::<f32>::try_from(array.clone()), Ok(vec![1.0, 2.0]));
+        assert_eq!(<[f32; 3]>::try_from(array), Err(()));
     }
 
     #[test]

@@ -6,6 +6,7 @@ use crate::font::{
 };
 use crate::{CMapResolverFn, CacheKey, FontResolverFn};
 use hayro_cmap::{BfString, CMap, CharacterCollection, CidFamily, WritingMode};
+use hayro_syntax::hash;
 use hayro_syntax::object;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
@@ -13,7 +14,6 @@ use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::*;
 use hayro_syntax::object::{Array, Object};
 use kurbo::{BezPath, Vec2};
-use rustc_hash::FxHashMap;
 use skrifa::attribute::Style;
 use skrifa::raw::collections::int_set::Domain;
 use skrifa::{FontRef, GlyphId, MetadataProvider};
@@ -27,10 +27,10 @@ pub(crate) struct Type0Font {
     cache_key: u128,
     dw: f32,
     dw2: (f32, f32),
-    widths: FxHashMap<u32, f32>,
+    widths: hash::Map<u32, f32>,
     encoding: CMap,
     to_unicode: Option<CMap>,
-    widths2: FxHashMap<u32, [f32; 3]>,
+    widths2: hash::Map<u32, [f32; 3]>,
     cid_to_gid_map: CidToGIdMap,
     /// PostScript name from the PDF.
     postscript_name: Option<String>,
@@ -55,8 +55,8 @@ impl Type0Font {
 
         let descendant_font = dict
             .get::<Array<'_>>(DESCENDANT_FONTS)?
-            .iter::<Dict<'_>>()
-            .next()?;
+            .items::<Dict<'_>>()
+            .next()??;
         let font_descriptor = descendant_font
             .get::<Dict<'_>>(FONT_DESC)
             .unwrap_or_default();
@@ -460,8 +460,8 @@ enum CidToGIdMap {
     #[default]
     Identity,
     Mapped {
-        forward: FxHashMap<u16, GlyphId>,
-        inverse: FxHashMap<GlyphId, u16>,
+        forward: hash::Map<u16, GlyphId>,
+        inverse: hash::Map<GlyphId, u16>,
     },
 }
 
@@ -475,8 +475,8 @@ impl CidToGIdMap {
             }
         } else if let Some(stream) = dict.get::<Stream<'_>>(CID_TO_GID_MAP) {
             let decoded = stream.decoded().ok()?;
-            let mut forward = FxHashMap::default();
-            let mut inverse = FxHashMap::default();
+            let mut forward = hash::Map::default();
+            let mut inverse = hash::Map::default();
 
             for (cid, gid) in decoded.as_chunks::<2>().0.iter().enumerate() {
                 let gid = GlyphId::new(u16::from_be_bytes([gid[0], gid[1]]) as u32);
@@ -508,13 +508,13 @@ impl CidToGIdMap {
     }
 }
 
-fn read_widths(arr: &Array<'_>) -> Option<FxHashMap<u32, f32>> {
-    let mut map = FxHashMap::default();
+fn read_widths(arr: &Array<'_>) -> Option<hash::Map<u32, f32>> {
+    let mut map = hash::Map::default();
     let mut iter = arr.flex_iter();
 
     loop {
         if let Some((mut first, range)) = iter.next::<(u32, Array<'_>)>() {
-            for width in range.iter::<f32>() {
+            for width in range.items::<f32>().map_while(|w| w) {
                 map.insert(first, width);
                 first = first.checked_add(1)?;
             }
@@ -530,13 +530,13 @@ fn read_widths(arr: &Array<'_>) -> Option<FxHashMap<u32, f32>> {
     Some(map)
 }
 
-fn read_widths2(arr: &Array<'_>) -> Option<FxHashMap<u32, [f32; 3]>> {
-    let mut map = FxHashMap::default();
+fn read_widths2(arr: &Array<'_>) -> Option<hash::Map<u32, [f32; 3]>> {
+    let mut map = hash::Map::default();
     let mut iter = arr.flex_iter();
 
     loop {
         if let Some((mut first, range)) = iter.next::<(u32, Array<'_>)>() {
-            let mut iter = range.iter::<f32>();
+            let mut iter = range.items::<f32>().map_while(|w| w);
 
             while let Some(w) = iter.next() {
                 let v1 = iter.next()?;

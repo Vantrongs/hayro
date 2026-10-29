@@ -2,6 +2,7 @@
 
 use crate::object::Object;
 use crate::object::macros::object;
+use crate::object::name::skip_keyword;
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, Skippable};
 use core::fmt::{Display, Formatter};
@@ -20,7 +21,7 @@ object!(Null, Null);
 
 impl Skippable for Null {
     fn skip(r: &mut Reader<'_>, _: bool) -> Option<()> {
-        r.forward_tag(b"null")
+        skip_keyword(r, b"null")
     }
 }
 
@@ -53,13 +54,16 @@ mod tests {
         );
     }
 
+    /// `null` is the whole word: `nullabs` is another word.
     #[test]
     fn null_trailing() {
         assert_eq!(
-            Reader::new("nullabs".as_bytes())
-                .read_without_context::<Null>()
-                .unwrap(),
-            Null
+            Reader::new("nullabs".as_bytes()).read_without_context::<Null>(),
+            None
+        );
+        assert_eq!(
+            Reader::new("null]".as_bytes()).read_without_context::<Null>(),
+            Some(Null)
         );
     }
 }

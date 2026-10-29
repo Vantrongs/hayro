@@ -2,14 +2,15 @@
 
 use crate::object::Object;
 use crate::object::macros::object;
+use crate::object::name::skip_keyword;
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 
 impl Skippable for bool {
     fn skip(r: &mut Reader<'_>, _: bool) -> Option<()> {
         match r.peek_byte()? {
-            b't' => r.forward_tag(b"true"),
-            b'f' => r.forward_tag(b"false"),
+            b't' => skip_keyword(r, b"true"),
+            b'f' => skip_keyword(r, b"false"),
             _ => None,
         }
     }
@@ -50,12 +51,22 @@ mod tests {
         );
     }
 
+    /// A boolean is the whole word, as in `MuPDF`: `trueabdf` is another word.
     #[test]
     fn bool_trailing() {
-        assert!(
-            Reader::new("trueabdf".as_bytes())
-                .read_without_context::<bool>()
-                .unwrap()
-        );
+        for word in ["trueabdf", "falsefoo", "trust", "tru", "true_"] {
+            assert_eq!(
+                Reader::new(word.as_bytes()).read_without_context::<bool>(),
+                None,
+                "{word}"
+            );
+        }
+        for (word, value) in [("true]", true), ("false/A", false), ("true%c", true)] {
+            assert_eq!(
+                Reader::new(word.as_bytes()).read_without_context::<bool>(),
+                Some(value),
+                "{word}"
+            );
+        }
     }
 }

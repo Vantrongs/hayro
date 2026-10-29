@@ -53,7 +53,7 @@ it.
 
 For better performance, it is strongly recommended to enable the `unsafe` feature,
 which does result in slightly more unsafe code being, but does give better performance:
-- We will use the `flate2` crate for decoding flate streams.
+- We will use the `zlib-rs` crate for decoding flate streams.
 - SIMD will be enabled to accelerate decoding of images.
 - `memchr` will be used to accelerate some of the fallback parsing code.
 
@@ -93,10 +93,13 @@ pub(crate) mod util;
 
 pub mod content;
 mod crypto;
+pub mod hash;
+pub mod lost;
 pub mod metadata;
 pub mod object;
 pub mod page;
 pub mod transform;
+pub mod work;
 pub mod xref;
 
 // We only expose them so hayro-interpret can use them, but they are not intended

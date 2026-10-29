@@ -23,14 +23,14 @@ use crate::paint::{
     CachedNativeGradient, CachedShading, CachedShadingPattern, CachedTilingPattern,
 };
 use hayro_interpret::font::GlyphRun;
+use hayro_interpret::hayro_syntax::hash;
 use hayro_interpret::hayro_syntax::page::Page;
 use hayro_interpret::util::{Float32Ext, TransformExt};
 use hayro_interpret::{
     BlendMode, CacheKey, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps,
-    InterpreterCache, InterpreterSettings, SoftMask, StrokeProps, interpret_page,
+    InterpreterCache, InterpreterSettings, SoftMask, SoftMasks, StrokeProps, interpret_page,
 };
 use kurbo::{Affine, BezPath, Cap, Join, Rect};
-use rustc_hash::FxHashMap;
 use siphasher::sip128::{Hasher128, SipHasher13};
 use std::fmt;
 use std::fmt::{Display, Formatter};
@@ -87,7 +87,12 @@ pub fn convert<'a>(
     let mut device = SvgRenderer::new(page, render_settings.clone());
     device.write_header(page.render_dimensions());
 
-    interpret_page(page, &mut state, &mut device);
+    interpret_page(
+        page,
+        &hayro_interpret::annotation::View::of(page),
+        &mut state,
+        &mut device,
+    );
 
     device.finish()
 }
@@ -116,6 +121,8 @@ pub(crate) struct SvgRenderer<'a> {
     pub(crate) type3_glyphs: Deduplicator<CachedType3Glyph<'a>>,
     pub(crate) clip_paths: Deduplicator<CachedClipPath>,
     pub(crate) masks: Deduplicator<MaskKind<'a>>,
+    /// The ids of the soft masks in `masks`, each for the uses it serves.
+    pub(crate) soft_masks: SoftMasks<Id>,
     pub(crate) shadings: Deduplicator<CachedShading>,
     pub(crate) gradients: Deduplicator<CachedNativeGradient>,
     pub(crate) shading_patterns: Deduplicator<CachedShadingPattern>,
@@ -360,6 +367,9 @@ impl<'a> Device<'a> for SvgRenderer<'a> {
     fn pop_transparency_group(&mut self) {
         self.xml.end_element();
     }
+
+    // Not drawn: the fill is written by now, and SVG draws an element only over what
+    // is drawn before it, so the fill shows under a translucent stroke paint.
 }
 
 impl<'a> SvgRenderer<'a> {
@@ -371,6 +381,7 @@ impl<'a> SvgRenderer<'a> {
             type3_glyphs: Deduplicator::new('e'),
             clip_paths: Deduplicator::new('c'),
             masks: Deduplicator::new('m'),
+            soft_masks: SoftMasks::default(),
             shadings: Deduplicator::new('s'),
             gradients: Deduplicator::new('n'),
             shading_patterns: Deduplicator::new('v'),
@@ -443,7 +454,7 @@ pub(crate) fn convert_transform(transform: &Affine) -> String {
 pub(crate) struct Deduplicator<T> {
     kind: char,
     vec: Vec<T>,
-    present: FxHashMap<u128, Id>,
+    present: hash::Map<u128, Id>,
 }
 
 impl<T> Default for Deduplicator<T> {
@@ -457,7 +468,7 @@ impl<T> Deduplicator<T> {
         Self {
             kind,
             vec: Vec::new(),
-            present: FxHashMap::default(),
+            present: hash::Map::default(),
         }
     }
 

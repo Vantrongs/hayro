@@ -7,11 +7,11 @@ use crate::font::{
     strip_subset_prefix,
 };
 use hayro_cmap::BfString;
+use hayro_syntax::hash;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
 use hayro_syntax::object::dict::keys::{BASE_FONT, FONT_DESC, FONT_WEIGHT, ITALIC_ANGLE};
 use kurbo::BezPath;
-use rustc_hash::FxHashMap;
 use skrifa::GlyphId;
 use skrifa::raw::TableProvider;
 use std::cell::RefCell;
@@ -286,7 +286,7 @@ pub(crate) fn select_standard_font(
 #[derive(Debug)]
 pub(crate) enum StandardFontBlob {
     Cff(CffFontBlob),
-    Otf(OpenTypeFontBlob, FxHashMap<String, GlyphId>),
+    Otf(OpenTypeFontBlob, hash::Map<String, GlyphId>),
 }
 
 impl StandardFontBlob {
@@ -356,9 +356,9 @@ pub(crate) struct StandardKind {
     widths: Vec<Width>,
     missing_width: f32,
     fallback: bool,
-    code_to_glyph: RefCell<FxHashMap<u8, GlyphId>>,
-    glyph_to_code: RefCell<FxHashMap<GlyphId, u8>>,
-    encodings: FxHashMap<u8, String>,
+    code_to_glyph: RefCell<hash::Map<u8, GlyphId>>,
+    glyph_to_code: RefCell<hash::Map<GlyphId, u8>>,
+    encodings: hash::Map<u8, String>,
 }
 
 impl StandardKind {
@@ -393,8 +393,8 @@ impl StandardKind {
             widths,
             missing_width,
             encodings: encoding_map,
-            code_to_glyph: RefCell::new(FxHashMap::default()),
-            glyph_to_code: RefCell::new(FxHashMap::default()),
+            code_to_glyph: RefCell::new(hash::Map::default()),
+            glyph_to_code: RefCell::new(hash::Map::default()),
             fallback,
             encoding,
         })
@@ -481,7 +481,15 @@ impl StandardKind {
             Some(Width::Missing) => Some(self.missing_width),
             None => self
                 .code_to_ps_name(code)
-                .and_then(|c| self.base_font.get_width(c)),
+                .and_then(|c| self.base_font.get_width(c))
+                // A glyph the standard metrics lack, such as Cyrillic in a font that
+                // stands in for Helvetica, advances as wide as it is in that font.
+                .or_else(|| {
+                    let glyph = self.map_code(code);
+                    (glyph != GlyphId::NOTDEF)
+                        .then(|| self.base_font_blob.advance_width(glyph))
+                        .flatten()
+                }),
         }
     }
 

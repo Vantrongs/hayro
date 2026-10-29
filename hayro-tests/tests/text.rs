@@ -3,7 +3,7 @@ use hayro::hayro_interpret::hayro_cmap::BfString;
 use hayro::hayro_interpret::kurbo::{Affine, BezPath, Rect};
 use hayro::hayro_interpret::{
     BlendMode, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps,
-    InterpreterCache, MarkedContentProperties, SoftMask, interpret_page,
+    InterpreterCache, MarkedContentProperties, SoftMask, annotation::View, interpret_page,
 };
 use hayro_syntax::Pdf;
 use std::fmt::Write;
@@ -54,7 +54,8 @@ fn page_text(file: &[u8]) -> String {
         crate::interpreter_settings(),
     );
     let mut collector = TextCollector::default();
-    interpret_page(&pdf.pages()[0], &mut context, &mut collector);
+    let page = &pdf.pages()[0];
+    interpret_page(page, &View::of(page), &mut context, &mut collector);
 
     collector.0
 }

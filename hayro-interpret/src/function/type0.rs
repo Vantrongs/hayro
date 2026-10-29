@@ -41,7 +41,8 @@ impl Type0 {
 
         let sizes = dict
             .get::<Array<'_>>(SIZE)?
-            .iter::<u32>()
+            .items::<u32>()
+            .map_while(|n| n)
             .collect::<IntVec>();
 
         let encode = dict

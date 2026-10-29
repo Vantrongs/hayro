@@ -1,4 +1,3 @@
-use crate::FillRule;
 use crate::color::ColorSpace;
 use crate::context::Context;
 use crate::convert::{convert_line_cap, convert_line_join};
@@ -7,22 +6,25 @@ use crate::font::{Font, FontData, FontQuery, StandardFont};
 use crate::interpret::path::{
     close_path, end_path, fill_path, fill_path_impl, fill_stroke_path, stroke_path,
 };
-use crate::interpret::state::{TextStateFont, handle_gs};
+use crate::interpret::state::{TextStateFont, convert_dash_array, handle_gs};
 use crate::interpret::text::TextRenderingMode;
+use crate::ocg::Kept;
 use crate::pattern::{Pattern, ShadingPattern};
 use crate::shading::Shading;
-use crate::util::{OptionLog, RectExt};
+use crate::util::OptionLog;
 use crate::x_object::{FormXObject, ImageXObject, XObject};
+use crate::{FillRule, StrokeProps};
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
-use hayro_syntax::object::dict::keys::{ANNOTS, AP, AS, F, N, OC, RECT};
-use hayro_syntax::object::{Array, Dict, Name, Object, Rect, Stream, dict_or_stream};
+use hayro_syntax::hash;
+use hayro_syntax::object::dict::keys::{ANNOTS, OC};
+use hayro_syntax::object::{Dict, Name, Object, dict_or_stream};
 use hayro_syntax::page::{Page, Resources};
 use kurbo::{Affine, Point, Shape};
-use rustc_hash::FxHashMap;
 use smallvec::smallvec;
 use std::sync::Arc;
 
+pub mod annotation;
 pub(crate) mod path;
 pub(crate) mod stack;
 pub(crate) mod state;
@@ -101,6 +103,22 @@ pub struct InterpreterSettings {
     /// Note that this feature is currently not fully implemented yet, so some
     /// annotations might be missing.
     pub render_annotations: bool,
+    /// Which annotations are drawn.
+    pub annotations: AnnotationSelection,
+}
+
+/// Which annotations a page is drawn with (PDF 32000-1 12.5.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AnnotationSelection {
+    /// As for viewing: all but those flagged Hidden or `NoView`.
+    #[default]
+    View,
+    /// As for printing: those flagged Print, but not Hidden.
+    Print,
+    /// As when annotations are flattened into page content for printing what the
+    /// reader sees: all but links and those flagged Hidden or Invisible, whatever
+    /// their Print and `NoView` flags.
+    Flatten,
 }
 
 impl Default for InterpreterSettings {
@@ -109,16 +127,14 @@ impl Default for InterpreterSettings {
             #[cfg(not(feature = "embed-fonts"))]
             font_resolver: Arc::new(|_| None),
             #[cfg(feature = "embed-fonts")]
-            font_resolver: Arc::new(|query| match query {
-                FontQuery::Standard(s) => Some(s.get_font_data()),
-                FontQuery::Fallback(f) => Some(f.pick_standard_font().get_font_data()),
-            }),
+            font_resolver: Arc::new(|query| Some(query.standard_substitute().get_font_data())),
             #[cfg(feature = "embed-cmaps")]
             cmap_resolver: Arc::new(hayro_cmap::load_embedded),
             #[cfg(not(feature = "embed-cmaps"))]
             cmap_resolver: Arc::new(|_| None),
             warning_sink: Arc::new(|_| {}),
             render_annotations: true,
+            annotations: AnnotationSelection::View,
         }
     }
 }
@@ -131,99 +147,100 @@ pub enum InterpreterWarning {
     UnsupportedFont,
     /// An image failed to decode.
     ImageDecodeFailure,
-    /// An annotation has an `AP` dictionary, but its normal appearance could not
-    /// be selected or loaded, so the annotation was not drawn.
-    UnresolvedAnnotationAppearance,
+    /// An annotation has no usable appearance stream, and none could be generated
+    /// for it ([`annotation::Unsupported`]), so it was not drawn.
+    UnsupportedAnnotation,
 }
 
-/// interpret the contents of the page and render them into the device.
+/// interpret the contents of the page and render them into the device, with its
+/// annotations as they look on the page shown as `view` says: the view the caller
+/// clips the page to ([`annotation::View`]).
 pub fn interpret_page<'a>(
     page: &Page<'a>,
+    view: &annotation::View,
     context: &mut Context<'a>,
     device: &mut impl Device<'a>,
 ) {
     let resources = page.resources();
     interpret(page.typed_operations(), resources, context, device);
 
-    if context.settings.render_annotations
-        && let Some(annot_arr) = page.raw().get::<Array<'_>>(ANNOTS)
-    {
-        for annot in annot_arr.iter::<Dict<'_>>() {
-            let flags = annot.get::<u32>(F).unwrap_or(0);
+    if context.settings.render_annotations && page.raw().contains_key(ANNOTS) {
+        // The fields of the document's forms are read once for all its pages.
+        let appearances = annotation::Appearances::with_fields(
+            page.xref(),
+            context.settings.font_resolver.clone(),
+            context.interpreter_cache.annotation_fields.clone(),
+        );
+        let drawn = appearances.page(page, context.settings.annotations, view);
+        for annot in drawn.iter() {
+            match annot.look() {
+                annotation::Look::Stream { stream, placement } => {
+                    // The box and matrix as the placement reads them, as a writer
+                    // that copies the stream draws it.
+                    let Some(apx) = FormXObject::appearance(
+                        stream,
+                        Affine::new(placement.matrix().map(f64::from)),
+                        placement.bbox(),
+                    ) else {
+                        continue;
+                    };
 
-            // Annotation should be hidden.
-            if flags & 2 != 0 {
-                continue;
-            }
+                    context.save_state();
+                    context.pre_concat_affine(Affine::new(placement.transform().map(f64::from)));
+                    context.push_root_transform();
 
-            if let Some(apx) = appearance_stream(&annot).and_then(|o| FormXObject::new(&o)) {
-                let Some(rect) = annot.get::<Rect>(RECT) else {
-                    continue;
-                };
-
-                let annot_rect = rect.to_kurbo();
-                // 12.5.5. Appearance streams
-                // "The algorithm outlined in this subclause shall be used
-                // to map from the coordinate system of the appearance XObject."
-
-                // 1) The appearance’s bounding box (specified by its BBox entry)
-                // shall be transformed, using Matrix, to produce a
-                // quadrilateral with arbitrary orientation. The transformed
-                // appearance box is the smallest upright rectangle that
-                // encompasses this quadrilateral.
-                let transformed_rect = (apx.matrix
-                    * kurbo::Rect::new(
-                        apx.bbox[0] as f64,
-                        apx.bbox[1] as f64,
-                        apx.bbox[2] as f64,
-                        apx.bbox[3] as f64,
-                    )
-                    .to_path(0.1))
-                .bounding_box();
-
-                // 2) A matrix A shall be computed that scales and translates
-                // the transformed appearance box to align with the edges
-                // of the annotation’s rectangle (specified by the Rect entry).
-                // A maps the lower-left corner (the corner with the smallest
-                // x and y coordinates) and the upper-right corner (the
-                // corner with the greatest x and y coordinates) of the
-                // transformed appearance box to the corresponding corners
-                // of the annotation’s rectangle.
-                let affine = Affine::new([
-                    annot_rect.width() / transformed_rect.width(),
-                    0.0,
-                    0.0,
-                    annot_rect.height() / transformed_rect.height(),
-                    annot_rect.x0 - transformed_rect.x0,
-                    annot_rect.y0 - transformed_rect.y0,
-                ]);
-
-                // 3) Matrix shall be concatenated with A to form a matrix
-                // AA that maps from the appearance’s coordinate system to
-                // the annotation’s rectangle in default user space.
-                context.save_state();
-                context.pre_concat_affine(affine);
-                context.push_root_transform();
-
-                apx.draw(resources, context, device);
-                context.pop_root_transform();
-                context.restore_state(device);
-            } else if annot.get::<Dict<'_>>(AP).is_some() {
-                (context.settings.warning_sink)(InterpreterWarning::UnresolvedAnnotationAppearance);
+                    apx.draw(resources, context, device);
+                    context.pop_root_transform();
+                    context.restore_state(device);
+                }
+                annotation::Look::Generated(appearance) => {
+                    draw_generated(appearance, resources, context, device);
+                }
+                annotation::Look::Nothing => {}
+                annotation::Look::Unsupported(_) => {
+                    (context.settings.warning_sink)(InterpreterWarning::UnsupportedAnnotation);
+                }
             }
         }
     }
 }
 
-fn appearance_stream<'a>(annot: &Dict<'a>) -> Option<Stream<'a>> {
-    match annot.get::<Dict<'_>>(AP)?.get::<Object<'_>>(N)? {
-        Object::Stream(stream) => Some(stream),
-        Object::Dict(states) => annot
-            .get::<Name<'_>>(AS)
-            .and_then(|state| states.get::<Stream<'_>>(state))
-            .or_else(|| states.get::<Stream<'_>>(b"Off")),
-        _ => None,
-    }
+/// Draws an appearance generated for an annotation without one, from a fresh
+/// graphics state in default user space with its opacity and blend mode, which apply
+/// to each thing it paints.
+fn draw_generated<'a>(
+    appearance: &annotation::Appearance,
+    resources: &Resources<'a>,
+    context: &mut Context<'a>,
+    device: &mut impl Device<'a>,
+) {
+    context.path_mut().truncate(0);
+    context.save_state();
+    let paint = state::PaintState {
+        alpha: appearance.opacity,
+        ..Default::default()
+    };
+    *context.fill_paint_mut() = paint.clone();
+    *context.stroke_paint_mut() = paint;
+    *context.stroke_props_mut() = StrokeProps::default();
+    *context.compositing_mut() = state::CompositingState {
+        blend_mode: appearance.blend,
+        ..Default::default()
+    };
+    let glyphs = appearance
+        .glyphs
+        .iter()
+        .map(|g| (g.name_rc(), g.clone()))
+        .collect();
+    let outer = std::mem::replace(&mut context.generated_glyphs, glyphs);
+    interpret(
+        TypedIter::new(appearance.content.as_bytes()),
+        resources,
+        context,
+        device,
+    );
+    context.generated_glyphs = outer;
+    context.restore_state(device);
 }
 
 /// Interpret the instructions from `ops` and render them into the device.
@@ -234,7 +251,9 @@ pub fn interpret<'a>(
     device: &mut impl Device<'a>,
 ) {
     let num_states = context.num_states();
-    let mut font_dict_cache = FxHashMap::<Name<'a>, Dict<'a>>::default();
+    let floor = context.ocg_state.open();
+    let outer_text_clip = core::mem::take(&mut context.text_clip);
+    let mut font_dict_cache = hash::Map::<Name<'a>, Dict<'a>>::default();
 
     context.save_state();
 
@@ -282,6 +301,10 @@ pub fn interpret<'a>(
                 )
                 .to_path(0.1);
                 context.path_mut().extend(rect);
+                // `re` is `x y m ... h`: the current point is the rectangle's origin.
+                let origin = Point::new(r.0.as_f64(), r.1.as_f64());
+                *(context.last_point_mut()) = origin;
+                *(context.sub_path_start_mut()) = origin;
             }
             TypedInstruction::MoveTo(m) => {
                 let p = Point::new(m.0.as_f64(), m.1.as_f64());
@@ -343,7 +366,7 @@ pub fn interpret<'a>(
                         p.x += 0.0001;
                     }
 
-                    context.path_mut().line_to(p);
+                    context.path_for_segment().line_to(p);
                 }
             }
             TypedInstruction::CubicTo(c) => {
@@ -354,7 +377,7 @@ pub fn interpret<'a>(
 
                     *(context.last_point_mut()) = p3;
 
-                    context.path_mut().curve_to(p1, p2, p3);
+                    context.path_for_segment().curve_to(p1, p2, p3);
                 }
             }
             TypedInstruction::CubicStartTo(c) => {
@@ -365,7 +388,7 @@ pub fn interpret<'a>(
 
                     *(context.last_point_mut()) = p3;
 
-                    context.path_mut().curve_to(p1, p2, p3);
+                    context.path_for_segment().curve_to(p1, p2, p3);
                 }
             }
             TypedInstruction::CubicEndTo(c) => {
@@ -375,7 +398,7 @@ pub fn interpret<'a>(
 
                     *(context.last_point_mut()) = p3;
 
-                    context.path_mut().curve_to(p2, p3, p3);
+                    context.path_for_segment().curve_to(p2, p3, p3);
                 }
             }
             TypedInstruction::ClosePath(_) => {
@@ -445,11 +468,7 @@ pub fn interpret<'a>(
             }
             TypedInstruction::DashPattern(p) => {
                 context.stroke_props_mut().dash_offset = p.1.as_f32();
-                // kurbo apparently cannot properly deal with offsets that are exactly 0.
-                context.stroke_props_mut().dash_array =
-                    p.0.iter::<f32>()
-                        .map(|n| if n == 0.0 { 0.01 } else { n })
-                        .collect();
+                context.stroke_props_mut().dash_array = convert_dash_array(p.0);
             }
             TypedInstruction::RenderingIntent(_) => {
                 // Ignore for now.
@@ -482,28 +501,20 @@ pub fn interpret<'a>(
                     .and_then(|name| resources.properties.get::<Dict<'_>>(name))
                     .or_else(|| dict_or_stream(bdc.1).map(|(props, _)| props.clone()));
 
-                let oc = bdc
-                    .1
-                    .clone()
-                    .into_name()
-                    .and_then(|name| {
-                        let r = resources.properties.get_ref(name.as_ref())?;
-                        let d = resources
-                            .properties
-                            .get::<Dict<'_>>(name)
-                            .unwrap_or_default();
-                        Some((d, r))
-                    })
-                    .or_else(|| {
-                        let (props, _) = dict_or_stream(bdc.1)?;
-                        let r = props.get_ref(OC)?;
-                        let d = props.get::<Dict<'_>>(OC).unwrap_or_default();
-                        Some((d, r))
+                // Only the `OC` tag of a property list the resources name marks
+                // optional content, as `PDFium` reads it
+                // (`CPDF_OCContext::CheckPageObjectVisible`), and a level begins only
+                // for a property list there is
+                // (`CPDF_StreamContentParser::Handle_BeginMarkedContent_Dictionary`):
+                // the `EMC` of one there is not ends the level before it.
+                let begun = bdc.0.as_ref() == OC
+                    && bdc.1.clone().into_name().is_some_and(|name| {
+                        context.ocg_state.begin_named(
+                            &Kept::Document(resources.properties.clone()),
+                            name.as_ref(),
+                        )
                     });
-
-                if let Some((dict, oc_ref)) = oc {
-                    context.ocg_state.begin_ocg(&dict, oc_ref.into());
-                } else {
+                if !begun && properties.is_some() {
                     context.ocg_state.begin_marked_content();
                 }
 
@@ -536,15 +547,11 @@ pub fn interpret<'a>(
                 context.text_state_mut().text_matrix = m;
             }
             TypedInstruction::EndText(_) => {
-                let has_outline = context.text_state().clip_paths.segments().next().is_some();
-
-                if has_outline {
-                    let clip_path = context.ctm() * context.text_state().clip_paths.clone();
-
+                if let Some(clip_path) = context.text_clip.take()
+                    && context.text_state().render_mode.clips()
+                {
                     context.push_clip_path(clip_path, FillRule::NonZero, device);
                 }
-
-                context.text_state_mut().clip_paths.truncate(0);
             }
             TypedInstruction::TextFont(t) => {
                 let name = t.0;
@@ -582,7 +589,8 @@ pub fn interpret<'a>(
                 text::show_text_string(context, device, resources, s.0);
             }
             TypedInstruction::ShowTexts(s) => {
-                if context.text_state().font.is_none() {
+                let had_font = context.text_state().font.is_some();
+                if !had_font {
                     // Even if no explicit font was set, we try to assume Helvetica. Acrobat
                     // seems to do the same.
                     context.text_state_mut().font = Font::new_standard(
@@ -592,7 +600,9 @@ pub fn interpret<'a>(
                     .map(TextStateFont::Fallback);
                 }
 
+                let text_matrix = context.text_state().text_matrix;
                 text::begin_glyph_run(context);
+                let mut drawn = true;
                 for obj in s.0.iter::<Object<'_>>() {
                     match obj {
                         Object::Number(num) => {
@@ -601,10 +611,26 @@ pub fn interpret<'a>(
                         Object::String(text) => {
                             text::append_text_string(context, resources, &text);
                         }
-                        _ => {}
+                        _ => {
+                            drawn = false;
+                            break;
+                        }
                     }
                 }
-                text::show_glyph_run(context, device);
+                if drawn {
+                    text::show_glyph_run(context, device);
+                } else {
+                    // An array with an entry that is neither a number nor a string
+                    // draws nothing and moves the text on by nothing, as `MuPDF`
+                    // (`PyMuPDF` 1.28.2) draws it: the glyphs gathered before the
+                    // entry are dropped and the text state is as before the array.
+                    text::begin_glyph_run(context);
+                    let state = context.text_state_mut();
+                    state.text_matrix = text_matrix;
+                    if !had_font {
+                        state.font = None;
+                    }
+                }
             }
             TypedInstruction::HorizontalScaling(h) => {
                 context.text_state_mut().horizontal_scaling = h.0.as_f32();
@@ -655,6 +681,19 @@ pub fn interpret<'a>(
             }
             TypedInstruction::ShapeGlyph(_) => {}
             TypedInstruction::XObject(x) => {
+                // A glyph of the generated appearance being drawn.
+                let glyph = std::str::from_utf8(x.0.as_ref())
+                    .ok()
+                    .and_then(|name| context.generated_glyphs.get(name).cloned());
+                if let Some(glyph) = glyph {
+                    interpret(
+                        TypedIter::new(glyph.content().as_bytes()),
+                        resources,
+                        context,
+                        device,
+                    );
+                    continue;
+                }
                 let cache = context.interpreter_cache.object_cache.clone();
                 let warning_sink = context.settings.warning_sink.clone();
                 let transfer_function = context.compositing().transfer_function.clone();
@@ -681,7 +720,7 @@ pub fn interpret<'a>(
                     &cache,
                     transfer_function,
                 ) {
-                    x_object.draw(context, device);
+                    x_object.draw(context, device, &Kept::Content(i.0.dict().clone()));
                 }
             }
             TypedInstruction::TextRise(t) => {
@@ -704,7 +743,8 @@ pub fn interpret<'a>(
                         Pattern::Shading(ShadingPattern {
                             shading: Arc::new(s),
                             matrix: Affine::IDENTITY,
-                            opacity: context.fill_paint().alpha,
+                            // Set where it paints.
+                            opacity: 1.0,
                             transfer_function: transfer_function.clone(),
                         })
                     })
@@ -748,4 +788,6 @@ pub fn interpret<'a>(
     while context.num_states() > num_states {
         context.restore_state(device);
     }
+    context.ocg_state.close(floor);
+    context.text_clip = outer_text_clip;
 }

@@ -6,7 +6,7 @@ use crate::page::Pages;
 use crate::page::cached::CachedPages;
 use crate::reader::Reader;
 use crate::sync::Arc;
-use crate::xref::{XRef, XRefError, fallback, root_xref};
+use crate::xref::{XRef, XRefError, open};
 
 pub use crate::crypto::DecryptionError;
 use crate::metadata::Metadata;
@@ -47,12 +47,10 @@ impl Pdf {
         let data = data.into();
         let password = password.as_bytes();
         let version = find_version(data.as_ref()).unwrap_or(PdfVersion::Pdf10);
-        let xref = match root_xref(data.clone(), password) {
+        let xref = match open(data.clone(), password) {
             Ok(x) => x,
             Err(e) => match e {
-                XRefError::Unknown => {
-                    fallback(data.clone(), password).ok_or(LoadPdfError::Invalid)?
-                }
+                XRefError::Unknown => return Err(LoadPdfError::Invalid),
                 XRefError::Encryption(e) => return Err(LoadPdfError::Decryption(e)),
             },
         };

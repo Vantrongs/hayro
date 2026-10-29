@@ -1,8 +1,10 @@
 use crate::bit_reader::BitReader;
 use crate::codes::Mode;
 use crate::{DecodeError, DecodeSettings, Decoder, Result};
-use alloc::vec;
 use alloc::vec::Vec;
+
+/// The most changes per line that room is made for before decoding.
+const MAX_RESERVED_CHANGES: usize = 1 << 8;
 
 /// A reusable context for decoding CCITT images.
 pub struct DecoderContext {
@@ -35,11 +37,15 @@ pub struct DecoderContext {
 impl DecoderContext {
     /// Creates a new decoder context using the provided decode settings.
     pub fn new(settings: DecodeSettings) -> Self {
+        // A line has at most as many changes as columns. Making room for them up to a
+        // bound spares small images growing both lists change by change.
+        let changes = (settings.columns as usize).min(MAX_RESERVED_CHANGES);
+
         Self {
-            ref_changes: vec![],
+            ref_changes: Vec::with_capacity(changes),
             ref_pos: 0,
             b1_idx: 0,
-            coding_changes: Vec::new(),
+            coding_changes: Vec::with_capacity(changes),
             pixels_decoded: 0,
             line_width: settings.columns,
             // Each run starts with an imaginary white pixel on the left.
@@ -164,9 +170,14 @@ impl DecoderContext {
 
 /// Decode a single 1D-coded line (T.4 Section 4.1.1, T.6 Section 2.2.4).
 #[inline(always)]
-pub(crate) fn decode_1d_line(ctx: &mut DecoderContext, reader: &mut BitReader<'_>) -> Result<()> {
+pub(crate) fn decode_1d_line(
+    ctx: &mut DecoderContext,
+    reader: &mut BitReader<'_>,
+    decoder: &mut impl Decoder,
+) -> Result<()> {
     while !ctx.at_eol() {
-        let run_length = reader.decode_run(ctx.color)?;
+        reader.poll(decoder)?;
+        let run_length = reader.decode_run(ctx.color, decoder)?;
         ctx.push_pixels(run_length)?;
         ctx.color = ctx.color.opposite();
     }
@@ -176,8 +187,13 @@ pub(crate) fn decode_1d_line(ctx: &mut DecoderContext, reader: &mut BitReader<'_
 
 /// Decode a single 2D-coded line (T.4 Section 4.2, T.6 Section 2.2).
 #[inline(always)]
-pub(crate) fn decode_2d_line(ctx: &mut DecoderContext, reader: &mut BitReader<'_>) -> Result<()> {
+pub(crate) fn decode_2d_line(
+    ctx: &mut DecoderContext,
+    reader: &mut BitReader<'_>,
+    decoder: &mut impl Decoder,
+) -> Result<()> {
     while !ctx.at_eol() {
+        reader.poll(decoder)?;
         let mode = reader.decode_mode()?;
 
         match mode {
@@ -205,11 +221,11 @@ pub(crate) fn decode_2d_line(ctx: &mut DecoderContext, reader: &mut BitReader<'_
             }
             // Horizontal mode (T.4 Section 4.2.1.3.2c, T.6 Section 2.2.3.3).
             Mode::Horizontal => {
-                let a0a1 = reader.decode_run(ctx.color)?;
+                let a0a1 = reader.decode_run(ctx.color, decoder)?;
                 ctx.push_pixels(a0a1)?;
                 ctx.color = ctx.color.opposite();
 
-                let a1a2 = reader.decode_run(ctx.color)?;
+                let a1a2 = reader.decode_run(ctx.color, decoder)?;
                 ctx.push_pixels(a1a2)?;
                 ctx.color = ctx.color.opposite();
 

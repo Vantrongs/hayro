@@ -11,12 +11,13 @@ readme = "README.md"
 
 [features]
 default = ["std", "images"]
-std = ["hayro-jbig2?/std", "hayro-jpeg2000?/std", "dep:rustc-hash", "zune-jpeg?/std"]
+std = ["hayro-jbig2?/std", "hayro-jpeg2000?/std", "dep:foldhash", "zune-jpeg?/std"]
 images = ["dep:zune-jpeg", "dep:hayro-ccitt", "dep:hayro-jbig2", "dep:hayro-jpeg2000"]
 unsafe = [
     "std",
-    "dep:flate2",
+    "dep:zlib-rs",
     "dep:memchr",
+    "dep:fearless_simd",
     "hayro-jbig2?/simd",
     "hayro-jpeg2000?/simd",
     "zune-jpeg?/x86",
@@ -26,10 +27,11 @@ logging = ["dep:log", "hayro-jpeg2000?/logging"]
 
 [dependencies]
 log = { workspace = true, optional = true }
-rustc-hash = { workspace = true, optional = true }
+foldhash = { workspace = true, optional = true }
 smallvec = { workspace = true }
-flate2 = { workspace = true, optional = true, features = ["zlib-rs"] }
+zlib-rs = { workspace = true, optional = true }
 memchr = { workspace = true, optional = true }
+fearless_simd = { workspace = true, optional = true }
 
 zune-jpeg = { workspace = true, optional = true }
 hayro-ccitt = { workspace = true, optional = true }
@@ -40,7 +42,14 @@ hayro-jpeg2000 = { workspace = true, optional = true }
 workspace = true
 
 [dev-dependencies]
+flate2 = { workspace = true, features = ["zlib-rs"] }
 sha2 = "0.10"
 md5 = "0.8"
 aes = "0.8.4"
 cbc = "0.1.2"
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }

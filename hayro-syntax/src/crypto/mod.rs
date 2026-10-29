@@ -4,17 +4,74 @@
 //! audited and should not be used for security-critical purposes, like creating new
 //! encrypted PDFs. They solely serve the purpose of being able to decrypt and read
 //! _already_ encrypted documents, where security isn't really relevant.
+//!
+//! # Crypt filters
+//!
+//! Which crypt filter decrypts each string and stream of a document encrypted by the
+//! standard security handler, by these rules (pinned by `tests/crypt_filters.rs`).
+//!
+//! 1. A document of `/V 1` or `/V 2` decrypts every string and stream with RC4 and the
+//!    file key. It has no crypt filters: `/CF`, `/StmF` and `/StrF` are not read.
+//! 2. In a document of `/V 4` or `/V 5`, `/StmF` names the crypt filter of its streams
+//!    and `/StrF` that of its strings, each looked up among the entries of `/CF` by its
+//!    name, whatever the name. A crypt filter's method is its `/CFM`: `/V2` is RC4,
+//!    `/AESV2` is AES-128 and `/AESV3` AES-256; `/None` and `/Identity` are no
+//!    encryption. Every method uses the file key the handler computes, whatever the
+//!    crypt filter's `/Length`: RC4 and AES-128 with the key of the object holding the
+//!    data (the PDF specification's algorithm 1), AES-256 with the file key itself. A
+//!    method that cannot use the file key, AES-256 with a key of 128 bits, fails each
+//!    stream it decrypts. A string that cannot be decrypted is read as stored.
+//! 3. `/StmF` or `/StrF` leaves its streams or strings as stored where it names
+//!    `/Identity` and `/CF` defines no crypt filter of that name, a name `/CF` does not
+//!    define, an entry of `/CF` that is no dictionary or whose `/CFM` is missing,
+//!    `/None`, `/Identity` or another name rule 2 does not know, or any name where
+//!    `/CF` is no dictionary.
+//! 4. A document of `/V 4` or `/V 5` whose `/StmF` or `/StrF` is missing or no name
+//!    cannot be opened ([`DecryptionError::InvalidEncryption`]).
+//! 5. A stream with a `/Crypt` filter is not decrypted by `/StmF`. A `/Crypt` filter
+//!    whose parameters have no `/Name` that is a name, or whose `/Name` is `/Identity`,
+//!    decrypts nothing, wherever it stands among the stream's filters.
+//! 6. A `/Crypt` filter whose `/Name` is another name decrypts the stream with the
+//!    crypt filter of `/CF` of that name, its method as in rule 2 (`/None` and
+//!    `/Identity` being no encryption), where it is the first of the filters the stream
+//!    names (an entry that names no filter does not count). It fails the stream for
+//!    every reading ([`crate::object::stream::DecodeFailure::Decryption`]) where `/CF`
+//!    does not define that name, where the entry is no dictionary or its `/CFM` is
+//!    missing or of no method rule 2 knows, and where another filter comes before it,
+//!    so that only the first `/Crypt` filter may name one. `/Name` and the parameters
+//!    may be given by reference.
+//! 7. In a document whose `/CF` is missing or no dictionary, every `/V` included, a
+//!    `/Crypt` filter named `/StdCF` decrypts with RC4 and the file key, and one of any
+//!    other name but `/Identity` fails its stream.
+//! 8. In a document that is not encrypted, a `/Crypt` filter does nothing.
+//! 9. A stream's filters ([`crate::object::Stream::filters`]) include its `/Crypt`
+//!    filters, which decoding passes over. Its raw data
+//!    ([`crate::object::Stream::try_raw_data`]) are decrypted by the `/Crypt` filter
+//!    and not decoded, so that a writer copying them leaves every `/Crypt` filter out.
+//!    A stream with a `/Crypt` filter offers no reader of its decoded data a piece at a
+//!    time ([`crate::object::Stream::decoded_reader`]), but offers the strict one.
+//! 10. Every stream of an encrypted document read as an object is decrypted, except one
+//!     whose `/Type` is the string `(XRef)`: a cross-reference stream, whose `/Type` is
+//!     the name `/XRef`, is read as stored when the document's table is read from it,
+//!     and decrypted when it is read as an object. `/EncryptMetadata` false enters the
+//!     file key only: the metadata stream is decrypted like any other unless its own
+//!     `/Crypt` filter says otherwise. `/EFF` is not read: an embedded file is
+//!     decrypted by `/StmF`. An inline image is never decrypted.
+//! 11. A stream without data reads as empty. AES data are the IV and whole blocks:
+//!     other data fail every strict reading and the raw data, while the lenient
+//!     decoding decrypts the whole blocks after the IV and fails data shorter than the
+//!     IV.
 
 use crate::crypto::DecryptionError::InvalidEncryption;
 use crate::crypto::aes::{AES128Cipher, AES256Cipher};
 use crate::crypto::rc4::Rc4;
 use crate::object;
 use crate::object::dict::keys::{
-    CF, CFM, ENCRYPT_META_DATA, FILTER, LENGTH, O, OE, P, R, STM_F, STR_F, U, UE, V,
+    AESV2, AESV3, CF, CFM, ENCRYPT_META_DATA, FILTER, IDENTITY, LENGTH, NONE, O, OE, P, R, STD_CF,
+    STM_F, STR_F, U, UE, V,
 };
 use crate::object::{Dict, Name, ObjectIdentifier};
-use crate::sync::HashMap;
-use alloc::string::ToString;
+use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp;
@@ -23,6 +80,7 @@ use core::ops::Deref;
 mod aes;
 mod md5;
 mod rc4;
+pub(crate) mod reader;
 mod sha256;
 mod sha384;
 mod sha512;
@@ -54,54 +112,147 @@ enum DecryptorTag {
     Aes256,
 }
 
-impl DecryptorTag {
-    fn from_name(name: &Name<'_>) -> Option<Self> {
-        match name.as_str() {
-            "None" | "Identity" => Some(Self::None),
-            "V2" => Some(Self::Rc4),
-            "AESV2" => Some(Self::Aes128),
-            "AESV3" => Some(Self::Aes256),
-            _ => None,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Decryptor {
+    None,
+    /// A document of `/V 1` or `/V 2`: RC4 with the file key for every string and
+    /// stream (rule 1).
+    Rc4 {
+        key: Vec<u8>,
+    },
+    /// A document of `/V 4` or `/V 5`, whose crypt filters choose the method
+    /// (rules 2 to 7).
+    Filters {
+        key: Vec<u8>,
+        filters: CryptFilters,
+    },
+}
+
+/// The crypt filters of a document of `/V 4` or `/V 5`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CryptFilters {
+    /// The method of `/StmF`, [`DecryptorTag::None`] where it names none (rule 3).
+    stream: DecryptorTag,
+    /// The method of `/StrF`, [`DecryptorTag::None`] where it names none (rule 3).
+    string: DecryptorTag,
+    /// The method of each crypt filter of `/CF` by name, `None` for one that names no
+    /// method rule 2 knows; `None` where `/CF` is missing or no dictionary.
+    defined: Option<BTreeMap<Vec<u8>, Option<DecryptorTag>>>,
+}
+
+impl CryptFilters {
+    /// The crypt filters of encryption dictionary `dict`; [`InvalidEncryption`] where
+    /// `/StmF` or `/StrF` is missing or no name (rule 4).
+    fn read(dict: &Dict<'_>) -> Result<Self, DecryptionError> {
+        let stream = dict.get::<Name<'_>>(STM_F).ok_or(InvalidEncryption)?;
+        let string = dict.get::<Name<'_>>(STR_F).ok_or(InvalidEncryption)?;
+        let defined = dict.get::<Dict<'_>>(CF).map(|cf| {
+            cf.keys()
+                .map(|name| {
+                    let method = cf
+                        .get::<Dict<'_>>(name.deref())
+                        .and_then(|entry| method_of(&entry));
+                    (name.to_vec(), method)
+                })
+                .collect::<BTreeMap<_, _>>()
+        });
+        let of_document = |name: &Name<'_>| {
+            defined
+                .as_ref()
+                .and_then(|defined| *defined.get(name.deref())?)
+                .unwrap_or(DecryptorTag::None)
+        };
+        Ok(Self {
+            stream: of_document(&stream),
+            string: of_document(&string),
+            defined,
+        })
+    }
+
+    /// The method of the crypt filter `name` names for a `/Crypt` filter, by rules 6
+    /// and 7; `None` where it names none.
+    fn named(&self, name: &[u8]) -> Option<DecryptorTag> {
+        match &self.defined {
+            None => (name == STD_CF).then_some(DecryptorTag::Rc4),
+            Some(defined) => *defined.get(name)?,
         }
     }
 }
-#[derive(Debug, Clone)]
-pub(crate) enum Decryptor {
-    None,
-    Rc4 { key: Vec<u8> },
-    Aes128 { key: Vec<u8>, dict: DecryptorData },
-    Aes256 { key: Vec<u8>, dict: DecryptorData },
+
+/// The method of crypt filter dictionary `entry` by its `/CFM` (rule 2); `None` where
+/// it is missing or names no method rule 2 knows.
+fn method_of(entry: &Dict<'_>) -> Option<DecryptorTag> {
+    Some(match entry.get::<Name<'_>>(CFM)?.deref() {
+        NONE | IDENTITY => DecryptorTag::None,
+        b"V2" => DecryptorTag::Rc4,
+        AESV2 => DecryptorTag::Aes128,
+        AESV3 => DecryptorTag::Aes256,
+        _ => return None,
+    })
 }
 
 #[derive(Debug, Copy, Clone)]
-pub(crate) enum DecryptionTarget {
+pub(crate) enum DecryptionTarget<'n> {
     String,
     Stream,
+    /// A stream under a /Crypt filter that names one of the document's crypt
+    /// filters, by that name.
+    Named(&'n [u8]),
 }
 
 impl Decryptor {
+    /// The key and method that decrypt `target`, by rules 2, 6 and 7 of the module
+    /// doc; `None` where a `/Crypt` filter names no crypt filter of the document with a
+    /// method.
+    fn method(&self, target: DecryptionTarget<'_>) -> Option<(&[u8], DecryptorTag)> {
+        match self {
+            Self::None => Some((&[], DecryptorTag::None)),
+            Self::Rc4 { key } => match target {
+                DecryptionTarget::String | DecryptionTarget::Stream => {
+                    Some((key, DecryptorTag::Rc4))
+                }
+                DecryptionTarget::Named(name) => {
+                    (name == STD_CF).then_some((key.as_slice(), DecryptorTag::Rc4))
+                }
+            },
+            Self::Filters { key, filters } => {
+                let tag = match target {
+                    DecryptionTarget::String => filters.string,
+                    DecryptionTarget::Stream => filters.stream,
+                    DecryptionTarget::Named(name) => filters.named(name)?,
+                };
+                Some((key, tag))
+            }
+        }
+    }
+
+    /// Whether `data` decrypts whole: AES needs its IV and whole blocks, and the
+    /// decryption leaves a trailing partial block out. No data is whole. Data that
+    /// do not decrypt at all, by no method or by one that cannot use the key, are not.
+    pub(crate) fn decrypts_whole(&self, data: &[u8], target: DecryptionTarget<'_>) -> bool {
+        let Some((key, tag)) = self.method(target) else {
+            return false;
+        };
+        let blocks = || data.is_empty() || (data.len() >= 16 && data.len().is_multiple_of(16));
+        match tag {
+            DecryptorTag::None | DecryptorTag::Rc4 => true,
+            DecryptorTag::Aes128 => blocks(),
+            DecryptorTag::Aes256 => AES256Cipher::new(key).is_some() && blocks(),
+        }
+    }
+
     pub(crate) fn decrypt(
         &self,
         id: ObjectIdentifier,
         data: &[u8],
-        target: DecryptionTarget,
+        target: DecryptionTarget<'_>,
     ) -> Option<Vec<u8>> {
-        match self {
-            Self::None => Some(data.to_vec()),
-            Self::Rc4 { key } => decrypt_rc4(key, data, id),
-            Self::Aes128 { key, dict } | Self::Aes256 { key, dict } => {
-                let crypt_dict = match target {
-                    DecryptionTarget::String => dict.string_filter,
-                    DecryptionTarget::Stream => dict.stream_filter,
-                };
-
-                match crypt_dict.cfm {
-                    DecryptorTag::None => Some(data.to_vec()),
-                    DecryptorTag::Rc4 => decrypt_rc4(key, data, id),
-                    DecryptorTag::Aes128 => decrypt_aes128(key, data, id),
-                    DecryptorTag::Aes256 => decrypt_aes256(key, data),
-                }
-            }
+        let (key, tag) = self.method(target)?;
+        match tag {
+            DecryptorTag::None => Some(data.to_vec()),
+            DecryptorTag::Rc4 => decrypt_rc4(key, data, id),
+            DecryptorTag::Aes128 => decrypt_aes128(key, data, id),
+            DecryptorTag::Aes256 => decrypt_aes256(key, data),
         }
     }
 }
@@ -128,20 +279,11 @@ pub(crate) fn get(
         _ => return Err(DecryptionError::UnsupportedAlgorithm),
     };
 
-    let (algorithm, data) = match encryption_v {
-        1 => (DecryptorTag::Rc4, None),
-        2 => (DecryptorTag::Rc4, None),
-        4 => (
-            DecryptorTag::Aes128,
-            Some(DecryptorData::from_dict(dict, length).ok_or(InvalidEncryption)?),
-        ),
-        5 | 6 => (
-            DecryptorTag::Aes256,
-            Some(DecryptorData::from_dict(dict, length).ok_or(InvalidEncryption)?),
-        ),
-        _ => {
-            return Err(DecryptionError::UnsupportedAlgorithm);
-        }
+    // Rules 1 to 4 of the module doc: crypt filters from /V 4 on, read before the
+    // password is checked, so that an invalid dictionary is reported as such.
+    let filters = match encryption_v {
+        1 | 2 => None,
+        _ => Some(CryptFilters::read(dict)?),
     };
 
     let byte_length = length / 8;
@@ -183,20 +325,15 @@ pub(crate) fn get(
         decryption_key.resize(16, 0);
     }
 
-    match algorithm {
-        DecryptorTag::None => Ok(Decryptor::None),
-        DecryptorTag::Rc4 => Ok(Decryptor::Rc4 {
+    Ok(match filters {
+        None => Decryptor::Rc4 {
             key: decryption_key,
-        }),
-        DecryptorTag::Aes128 => Ok(Decryptor::Aes128 {
+        },
+        Some(filters) => Decryptor::Filters {
             key: decryption_key,
-            dict: data.unwrap(),
-        }),
-        DecryptorTag::Aes256 => Ok(Decryptor::Aes256 {
-            key: decryption_key,
-            dict: data.unwrap(),
-        }),
-    }
+            filters,
+        },
+    })
 }
 
 /// Algorithm 1.A: Encryption of data using the AES algorithms
@@ -234,12 +371,12 @@ fn decrypt_rc4(key: &[u8], data: &[u8], id: ObjectIdentifier) -> Option<Vec<u8>>
 }
 
 /// Algorithm 1: Encryption of data using the RC4 or AES algorithms
-fn decrypt_rc_aes(
+fn decrypt_rc_aes<T>(
     key: &[u8],
     id: ObjectIdentifier,
     aes: bool,
-    with_key: impl FnOnce(&[u8]) -> Option<Vec<u8>>,
-) -> Option<Vec<u8>> {
+    with_key: impl FnOnce(&[u8]) -> Option<T>,
+) -> Option<T> {
     let n = key.len();
     // a) Obtain the object number and generation number from the object identifier of
     // the string or stream to be encrypted (see 7.3.10, "Indirect objects"). If the
@@ -272,77 +409,6 @@ fn decrypt_rc_aes(
     let final_key = &hash[..cmp::min(16, n + 5)];
 
     with_key(final_key)
-}
-
-#[derive(Debug, Copy, Clone)]
-pub(crate) struct DecryptorData {
-    stream_filter: CryptDictionary,
-    string_filter: CryptDictionary,
-}
-
-impl DecryptorData {
-    fn from_dict(dict: &Dict<'_>, default_length: u16) -> Option<Self> {
-        let mut mappings = HashMap::new();
-
-        if let Some(dict) = dict.get::<Dict<'_>>(CF) {
-            for key in dict.keys() {
-                if let Some(dict) = dict.get::<Dict<'_>>(key.as_ref())
-                    && let Some(crypt_dict) = CryptDictionary::from_dict(&dict, default_length)
-                {
-                    mappings.insert(key.as_str().to_string(), crypt_dict);
-                }
-            }
-        }
-
-        let stm_f = *mappings
-            .get(dict.get::<Name<'_>>(STM_F)?.as_str())
-            .unwrap_or(&CryptDictionary::identity(default_length));
-        let str_f = *mappings
-            .get(dict.get::<Name<'_>>(STR_F)?.as_str())
-            .unwrap_or(&CryptDictionary::identity(default_length));
-
-        Some(Self {
-            stream_filter: stm_f,
-            string_filter: str_f,
-        })
-    }
-}
-
-#[derive(Debug, Copy, Clone)]
-struct CryptDictionary {
-    cfm: DecryptorTag,
-    _length: u16,
-}
-
-impl CryptDictionary {
-    fn from_dict(dict: &Dict<'_>, default_length: u16) -> Option<Self> {
-        let cfm = DecryptorTag::from_name(&dict.get::<Name<'_>>(CFM)?)?;
-        // The standard security handler expresses the Length entry in bytes (e.g., 32 means a
-        // length of 256 bits) and public-key security handlers express it as is (e.g., 256 means a
-        // length of 256 bits).
-        // Note: We only support the standard security handler.
-        let mut length = dict.get::<u16>(LENGTH).unwrap_or(default_length / 8);
-
-        // When CFM is AESV2, the Length key shall have the value of 128. When
-        // CFM is AESV3, the Length key shall have a value of 256.
-        if cfm == DecryptorTag::Aes128 {
-            length = 16;
-        } else if cfm == DecryptorTag::Aes256 {
-            length = 32;
-        }
-
-        Some(Self {
-            cfm,
-            _length: length,
-        })
-    }
-
-    fn identity(default_length: u16) -> Self {
-        Self {
-            cfm: DecryptorTag::None,
-            _length: default_length,
-        }
-    }
 }
 
 /// Algorithm 2.B: Computing a hash (revision 6 and later)
@@ -675,4 +741,121 @@ fn decryption_key_rev56(
     // the file encryption key as the key. Verify that bytes 9-11 of the result are the characters "a", "d",
     // "b". Bytes 0-3 of the decrypted Perms entry, treated as a little-endian integer, are the user
     // permissions. They shall match the value in the P key.
+}
+
+/// Encrypted test files.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::aes::AES128Cipher;
+    use super::rc4::Rc4;
+    use super::{PASSWORD_PADDING, md5};
+    use alloc::format;
+    use alloc::vec::Vec;
+
+    /// An object of a test file.
+    pub(crate) enum Part<'a> {
+        /// An object without strings, written as it is.
+        Plain(&'a str),
+        /// A stream with `dict`'s entries and `data`, encrypted unless `encrypt` is false.
+        Stream {
+            dict: &'a str,
+            data: &'a [u8],
+            encrypt: bool,
+        },
+    }
+
+    const ID: [u8; 16] = *b"hayro-test-file!";
+    const PERMISSIONS: i32 = -4;
+
+    fn rc4_rounds(key: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut out = Rc4::new(key).encrypt(data);
+        for i in 1..=19_u8 {
+            let key: Vec<u8> = key.iter().map(|b| b ^ i).collect();
+            out = Rc4::new(&key).encrypt(&out);
+        }
+        out
+    }
+
+    /// A file encrypted with AES-128 (/V 4 /R 4) and the empty user and owner
+    /// password, whose objects are numbered from 1, the first being the catalog.
+    pub(crate) fn aes128(objects: &[Part<'_>]) -> Vec<u8> {
+        // Algorithm 3: /O from the empty owner password.
+        let mut hash = md5::calculate(&PASSWORD_PADDING);
+        for _ in 0..50 {
+            hash = md5::calculate(&hash);
+        }
+        let owner = rc4_rounds(&hash, &PASSWORD_PADDING);
+        // Algorithm 2: the file key.
+        let mut input = PASSWORD_PADDING.to_vec();
+        input.extend(&owner);
+        input.extend(PERMISSIONS.to_le_bytes());
+        input.extend(ID);
+        let mut key = md5::calculate(&input);
+        for _ in 0..50 {
+            key = md5::calculate(&key);
+        }
+        // Algorithm 5: /U.
+        let mut input = PASSWORD_PADDING.to_vec();
+        input.extend(ID);
+        let mut user = rc4_rounds(&key, &md5::calculate(&input));
+        user.extend([0; 16]);
+
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>();
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, part) in objects.iter().enumerate() {
+            let number = i + 1;
+            offsets.push(out.len());
+            out.extend(format!("{number} 0 obj\n").bytes());
+            match part {
+                Part::Plain(object) => out.extend(object.bytes()),
+                Part::Stream {
+                    dict,
+                    data,
+                    encrypt,
+                } => {
+                    let data = if *encrypt {
+                        let mut input = key.to_vec();
+                        input.extend(&(number as u32).to_le_bytes()[..3]);
+                        input.extend([0, 0]);
+                        input.extend(b"sAlT");
+                        let object_key = md5::calculate(&input);
+                        let iv = [7; 16];
+                        let mut encrypted = iv.to_vec();
+                        encrypted.extend(
+                            AES128Cipher::new(&object_key)
+                                .unwrap()
+                                .encrypt_cbc(data, &iv),
+                        );
+                        encrypted
+                    } else {
+                        data.to_vec()
+                    };
+                    out.extend(format!("<< {dict} /Length {} >>\nstream\n", data.len()).bytes());
+                    out.extend(data);
+                    out.extend(b"\nendstream");
+                }
+            }
+            out.extend(b"\nendobj\n");
+        }
+        let xref = out.len();
+        out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).bytes());
+        for offset in offsets {
+            out.extend(format!("{offset:010} 00000 n \n").bytes());
+        }
+        let id = hex(&ID).concat();
+        out.extend(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R /ID [<{id}> <{id}>] /Encrypt << /Filter \
+                 /Standard /V 4 /R 4 /Length 128 /CF << /StdCF << /CFM /AESV2 /AuthEvent \
+                 /DocOpen /Length 16 >> >> /StmF /StdCF /StrF /StdCF /P {PERMISSIONS} /O <{}> \
+                 /U <{}> >> >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1,
+                hex(&owner).concat(),
+                hex(&user).concat(),
+            )
+            .bytes(),
+        );
+        out
+    }
 }

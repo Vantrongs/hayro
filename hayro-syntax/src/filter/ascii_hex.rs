@@ -2,10 +2,35 @@
 
 use crate::trivia::is_white_space_character;
 use crate::util::ByteBuf;
+use crate::work::{Meter, POLL_BYTES};
 use alloc::vec::Vec;
 
-pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
-    decode_into(data)
+/// The data decoded as [`decode_into`] does, in pieces whose work counts on `meter`;
+/// `None` once its hook asks to stop.
+pub(crate) fn decode(data: &[u8], meter: &Meter<'_>) -> Option<Vec<u8>> {
+    let mut decoded = Vec::new();
+    let mut high = None;
+    for piece in data.chunks(POLL_BYTES) {
+        let end = piece.iter().position(|&b| b == b'>');
+        for &byte in &piece[..end.unwrap_or(piece.len())] {
+            if is_white_space_character(byte) {
+                continue;
+            }
+            let digit = decode_hex_digit(byte)?;
+            match high.take() {
+                Some(high) => decoded.push(high << 4 | digit),
+                None => high = Some(digit),
+            }
+        }
+        meter.work(piece.len()).ok()?;
+        if end.is_some() {
+            break;
+        }
+    }
+    if let Some(high) = high {
+        decoded.push(high << 4);
+    }
+    Some(decoded)
 }
 
 pub(crate) fn decode_into<B: ByteBuf>(data: &[u8]) -> Option<B> {
@@ -78,7 +103,15 @@ pub(crate) fn decode_hex_digit(c: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use crate::filter::ascii_hex::decode;
+    use crate::filter::ascii_hex::decode_into;
+    use crate::work::Meter;
+    use alloc::vec::Vec;
+
+    fn decode(data: &[u8]) -> Option<Vec<u8>> {
+        let metered = super::decode(data, &Meter::default());
+        assert_eq!(metered, decode_into(data));
+        metered
+    }
 
     #[test]
     fn decode_simple() {
@@ -104,5 +137,11 @@ mod tests {
     fn decode_with_padding() {
         let input = b"AF3E291>";
         assert_eq!(decode(input).unwrap(), vec![0xaf, 0x3e, 0x29, 0x10]);
+    }
+
+    #[test]
+    fn invalid_digits_fail_before_the_end_only() {
+        assert_eq!(decode(b"AF 3G>"), None);
+        assert_eq!(decode(b"AF 3>G"), Some(vec![0xaf, 0x30]));
     }
 }

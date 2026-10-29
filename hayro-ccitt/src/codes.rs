@@ -1,7 +1,7 @@
 use crate::bit_reader::BitReader;
 use crate::context::Color;
 use crate::tables::{BLACK_LOOKUP, LOOKUP_BITS, LOOKUP_INVALID, WHITE_LOOKUP};
-use crate::{DecodeError, Result};
+use crate::{DecodeError, Decoder, Result};
 
 /// 2D coding modes (T.4 Section 4.2.1.3.2, T.6 Section 2.2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,10 +17,10 @@ pub(crate) enum Mode {
 impl BitReader<'_> {
     /// Decode a run length for the specified color.
     #[inline(always)]
-    pub(crate) fn decode_run(&mut self, color: Color) -> Result<u32> {
+    pub(crate) fn decode_run(&mut self, color: Color, decoder: &mut impl Decoder) -> Result<u32> {
         match color {
-            Color::White => self.decode_run_inner(&WHITE_LOOKUP),
-            Color::Black => self.decode_run_inner(&BLACK_LOOKUP),
+            Color::White => self.decode_run_inner(&WHITE_LOOKUP, decoder),
+            Color::Black => self.decode_run_inner(&BLACK_LOOKUP, decoder),
         }
     }
 
@@ -65,16 +65,19 @@ impl BitReader<'_> {
     /// EOL is defined as `000000000001` (11 zeros followed by a 1).
     /// Fill bits (T.4 Section 4.1.3) may precede the EOL as a variable-length
     /// string of zeros.
-    pub(crate) fn read_eol_if_available(&mut self) -> usize {
-        self.read_eols(usize::MAX)
+    pub(crate) fn read_eol_if_available(&mut self, decoder: &mut impl Decoder) -> Result<usize> {
+        self.read_eols(usize::MAX, decoder)
     }
 
     /// Like [`Self::read_eol_if_available`], but reads at most `max` EOLs.
-    pub(crate) fn read_eols(&mut self, max: usize) -> usize {
+    pub(crate) fn read_eols(&mut self, max: usize, decoder: &mut impl Decoder) -> Result<usize> {
         let mut count = 0;
 
+        // An EOL starts with 11 zeros, while a line mostly starts with a code
+        // that has a 1 among them.
         while count < max
-            && let (zeros, Some(after)) = self.zero_run()
+            && self.peek_u32().leading_zeros() >= 11
+            && let Some((zeros, after)) = self.zero_run(decoder)?
         {
             if zeros < 11 {
                 break;
@@ -84,25 +87,25 @@ impl BitReader<'_> {
             count += 1;
         }
 
-        count
+        Ok(count)
     }
 
     /// Advance to the start of the next EOL (including any fill preceding it),
     /// without consuming it. Returns `false` and doesn't advance if there is
     /// none.
-    pub(crate) fn skip_to_eol(&mut self) -> bool {
+    pub(crate) fn skip_to_eol(&mut self, decoder: &mut impl Decoder) -> Result<bool> {
         let mut reader = self.clone();
 
-        while let (zeros, Some(after)) = reader.zero_run() {
+        while let Some((zeros, after)) = reader.zero_run(decoder)? {
             if zeros >= 11 {
                 *self = reader;
-                return true;
+                return Ok(true);
             }
 
             reader = after;
         }
 
-        false
+        Ok(false)
     }
 
     /// Decode a run length using the given lookup table (T.4 Section 4.1.1, T.6 Section 2.2.4).
@@ -110,7 +113,11 @@ impl BitReader<'_> {
     /// Run lengths 0-63 use terminating codes.
     /// Run lengths 64+ use one or more make-up codes followed by a terminating code.
     #[inline(always)]
-    fn decode_run_inner(&mut self, lookup: &[u16; 1 << LOOKUP_BITS]) -> Result<u32> {
+    fn decode_run_inner(
+        &mut self,
+        lookup: &[u16; 1 << LOOKUP_BITS],
+        decoder: &mut impl Decoder,
+    ) -> Result<u32> {
         let mut total: u32 = 0;
 
         loop {
@@ -130,21 +137,33 @@ impl BitReader<'_> {
             if len < 64 {
                 return Ok(total);
             }
+
+            self.poll(decoder)?;
         }
     }
 
-    /// Count the zeros at the current position and return a reader positioned
-    /// after the 1 that terminates them, if there is one.
-    fn zero_run(&self) -> (usize, Option<Self>) {
+    /// Count the zeros at the current position and return their number with a
+    /// reader positioned after the 1 that terminates them, if there is one.
+    fn zero_run(&self, decoder: &mut impl Decoder) -> Result<Option<(usize, Self)>> {
         let mut reader = self.clone();
         let mut zeros = 0;
 
         loop {
-            match reader.read_bit() {
-                Ok(0) => zeros += 1,
-                Ok(_) => return (zeros, Some(reader)),
-                Err(_) => return (zeros, None),
+            reader.poll(decoder)?;
+            let leading = reader.peek_u32().leading_zeros() as usize;
+
+            if leading < 32 {
+                // Bits past the end of the data are zero, so the 1 is part of
+                // it and can be consumed.
+                reader.consume(leading + 1)?;
+                return Ok(Some((zeros + leading, reader)));
             }
+
+            if reader.consume(32).is_err() {
+                return Ok(None);
+            }
+
+            zeros += 32;
         }
     }
 }

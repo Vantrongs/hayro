@@ -1,8 +1,8 @@
 //! Names.
 
 use crate::filter::ascii_hex::decode_hex_digit;
-use crate::object::Object;
 use crate::object::macros::object;
+use crate::object::{Bytes, Object};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, Skippable};
 use crate::trivia::is_regular_character;
@@ -12,15 +12,9 @@ use core::hash::{Hash, Hasher};
 use core::ops::Deref;
 use smallvec::SmallVec;
 
-#[derive(Clone)]
-enum NameInner<'a> {
-    Borrowed(&'a [u8]),
-    Owned(SmallVec<[u8; 23]>),
-}
-
 /// A PDF name object.
 #[derive(Clone)]
-pub struct Name<'a>(NameInner<'a>);
+pub struct Name<'a>(Bytes<'a>);
 
 impl<'a> Deref for Name<'a> {
     type Target = [u8];
@@ -32,10 +26,7 @@ impl<'a> Deref for Name<'a> {
 
 impl AsRef<[u8]> for Name<'_> {
     fn as_ref(&self) -> &[u8] {
-        match &self.0 {
-            NameInner::Borrowed(data) => data,
-            NameInner::Owned(data) => data,
-        }
+        self.0.as_ref()
     }
 }
 
@@ -46,9 +37,26 @@ impl Borrow<[u8]> for Name<'_> {
 }
 
 impl PartialEq for Name<'_> {
+    /// Counts the bytes compared ([`same`]).
     fn eq(&self, other: &Self) -> bool {
-        self.as_ref() == other.as_ref()
+        same(self, other)
     }
+}
+
+/// Whether the bytes of two names are the same, counting the bytes compared
+/// ([`crate::work::TOLD`]): a map compares a key it inserts with each key that
+/// hashes alike, and a parsed dictionary a key with those before it, which tests
+/// bound.
+pub(crate) fn same(a: &[u8], b: &[u8]) -> bool {
+    crate::work::told(1 + a.len().min(b.len()));
+    a == b
+}
+
+/// The order of the bytes of two names, counting the bytes compared, as [`same`]
+/// does: a parsed dictionary sorts its keys with it.
+pub(crate) fn order(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+    crate::work::told(1 + a.len().min(b.len()));
+    a.cmp(b)
 }
 
 impl Eq for Name<'_> {}
@@ -85,25 +93,26 @@ impl<'a> Name<'a> {
     /// Create a new name from an unescaped byte sequence.
     #[inline]
     pub fn new_unescaped(data: &'a [u8]) -> Self {
-        Self(NameInner::Borrowed(data))
+        Self(Bytes::Borrowed(data))
     }
 
-    /// Create a new name from bytes that may contain escape sequences.
+    /// Create a new name from bytes that may contain escape sequences
+    /// ([`unescape`]).
     #[inline]
     pub fn new_escaped(data: &'a [u8]) -> Option<Self> {
         let mut result = SmallVec::new();
-        let mut r = Reader::new(data);
+        unescape(data, |b| result.push(b));
+        Some(Self(Bytes::decoded(result)))
+    }
 
-        while let Some(b) = r.read_byte() {
-            if b == b'#' {
-                let hex = r.read_bytes(2)?;
-                result.push(decode_hex_digit(hex[0])? << 4 | decode_hex_digit(hex[1])?);
-            } else {
-                result.push(b);
-            }
-        }
+    /// The name of `bytes`, decoded.
+    pub(crate) fn from_bytes(bytes: Bytes<'a>) -> Self {
+        Self(bytes)
+    }
 
-        Some(Self(NameInner::Owned(result)))
+    /// The name's bytes, decoded.
+    pub(crate) fn into_bytes(self) -> Bytes<'a> {
+        self.0
     }
 
     /// Return a string representation of the name.
@@ -131,21 +140,66 @@ impl Display for Name<'_> {
 
 object!(Name<'a>, Name);
 
+// Skipping a name reads it as reading does, escapes included, without decoding them.
 impl Skippable for Name<'_> {
     fn skip(r: &mut Reader<'_>, _: bool) -> Option<()> {
-        skip_name_like(r, true).map(|_| ())
+        lex_name_like(r, true).map(|_| ())
     }
 }
 
 impl<'a> Readable<'a> for Name<'a> {
     fn read(r: &mut Reader<'a>, _: &ReaderContext<'a>) -> Option<Self> {
-        let start = r.offset();
-        skip_name_like(r, true)?;
-        let end = r.offset();
+        Self::new(lex_name_like(r, true)?)
+    }
+}
 
-        // Exclude leading solidus.
-        let data = r.range(start + 1..end)?;
-        Self::new(data)
+/// Reads a name, after its solidus where `solidus`, or an operator of a content
+/// stream, which is read as a name without one: its bytes, whose `#` escapes are
+/// decoded where they are read ([`unescape`]).
+pub(crate) fn lex_name_like<'a>(r: &mut Reader<'a>, solidus: bool) -> Option<&'a [u8]> {
+    let start = r.offset() + usize::from(solidus);
+    skip_name_like(r, solidus)?;
+    r.range(start..r.offset())
+}
+
+/// Decodes the `#` escapes of a name's bytes into `out`, as `MuPDF` reads them
+/// (`PyMuPDF` 1.28.2): a `#` and two hex digits is the byte they make, but for 0,
+/// which no name holds; any other `#` is itself (`/A#2`, `/A#G1` and `/A#00` are
+/// `A#2`, `A#G1` and `A#00`, and `/A##41` is `A#A`).
+#[inline]
+fn unescape(data: &[u8], mut out: impl FnMut(u8)) {
+    let mut at = 0;
+    while let Some(&b) = data.get(at) {
+        let byte = (b == b'#')
+            .then(|| {
+                let hex = data.get(at + 1..at + 3)?;
+                let byte = decode_hex_digit(hex[0])? << 4 | decode_hex_digit(hex[1])?;
+                (byte != 0).then_some(byte)
+            })
+            .flatten();
+        match byte {
+            Some(byte) => {
+                out(byte);
+                at += 3;
+            }
+            None => {
+                out(b);
+                at += 1;
+            }
+        }
+    }
+}
+
+/// Skips the word `word`, a keyword such as `true` or `null`, only when it is the
+/// whole token: `truefoo` and `nullable` are other words, which are left unread.
+pub(crate) fn skip_keyword(r: &mut Reader<'_>, word: &[u8]) -> Option<()> {
+    let start = r.offset();
+    r.forward_while(is_regular_character);
+    if r.range(start..r.offset()) == Some(word) {
+        Some(())
+    } else {
+        r.jump(start);
+        None
     }
 }
 
@@ -202,13 +256,31 @@ mod tests {
         );
     }
 
+    // A `#` that is not an escape is itself, as `MuPDF` reads it (`PyMuPDF` 1.28.2).
     #[test]
     fn name_3() {
-        assert!(
-            Reader::new("/AB#FG".as_bytes())
-                .read_without_context::<Name<'_>>()
-                .is_none()
-        );
+        for (written, read) in [
+            ("/AB#FG", &b"AB#FG"[..]),
+            ("/A#2", b"A#2"),
+            ("/A#", b"A#"),
+            ("/A#G1", b"A#G1"),
+            ("/A#4G", b"A#4G"),
+            ("/A##41", b"A#A"),
+            ("/#", b"#"),
+            ("/A#00", b"A#00"),
+            ("/A#g1", b"A#g1"),
+            ("/A#61", b"Aa"),
+            ("/A#2F", b"A/"),
+        ] {
+            assert_eq!(
+                Reader::new(written.as_bytes())
+                    .read_without_context::<Name<'_>>()
+                    .unwrap()
+                    .deref(),
+                read,
+                "{written}"
+            );
+        }
     }
 
     #[test]

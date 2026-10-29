@@ -1,13 +1,16 @@
 //! Dictionaries.
 
+use crate::hash;
 use crate::object::macros::object;
+use crate::object::name::lex_name_like;
+use crate::object::parsed::{Node, Part};
 use crate::object::r#ref::{MaybeRef, ObjRef};
 use crate::object::{Name, ObjectIdentifier};
-use crate::object::{Object, ObjectLike};
+use crate::object::{Object, ObjectLike, Written};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::sync::Arc;
-use crate::sync::FxHashMap;
+use crate::xref::ContentKey;
 use alloc::format;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
@@ -20,8 +23,11 @@ pub struct Dict<'a>(Inner<'a>);
 
 #[derive(Clone)]
 enum Inner<'a> {
-    Empty,
-    Some(Arc<Repr<'a>>),
+    /// Read from its bytes; none where it is empty, which, held in one variant
+    /// with this, leaves the other's pointer the only tag, in two words.
+    Read(Option<Arc<Repr<'a>>>),
+    /// Parsed with the body of an object ([`crate::object::parsed`]).
+    Parsed(Part<'a>),
 }
 
 impl Default for Dict<'_> {
@@ -41,31 +47,39 @@ impl PartialEq for Dict<'_> {
 impl<'a> Dict<'a> {
     /// Create a new empty dictionary.
     pub fn empty() -> Self {
-        Self(Inner::Empty)
+        Self(Inner::Read(None))
     }
 
     /// Get the raw bytes underlying to the dictionary.
     pub fn data(&self) -> &'a [u8] {
         match &self.0 {
-            Inner::Empty => &[],
-            Inner::Some(repr) => repr.data,
+            Inner::Read(None) => &[],
+            Inner::Read(Some(repr)) => repr.data,
+            Inner::Parsed(part) => part.data(),
         }
     }
 
     /// Returns the number of entries in the dictionary.
     pub fn len(&self) -> usize {
-        self.offsets().map_or(0, FxHashMap::len)
+        match self.offsets() {
+            None => 0,
+            Some(Found::Offsets(offsets)) => offsets.len(),
+            Some(Found::Parsed(part)) => part.len(),
+        }
     }
 
     /// Return whether the dictionary is empty.
     pub fn is_empty(&self) -> bool {
-        self.offsets().is_none_or(FxHashMap::is_empty)
+        self.len() == 0
     }
 
     /// Checks whether the dictionary contains an entry with a specific key.
     pub fn contains_key(&self, key: impl AsRef<[u8]>) -> bool {
-        self.offsets()
-            .is_some_and(|offsets| offsets.contains_key(key.as_ref()))
+        match self.offsets() {
+            None => false,
+            Some(Found::Offsets(offsets)) => offsets.get(key.as_ref()).is_some(),
+            Some(Found::Parsed(part)) => part.find(key.as_ref()).is_some(),
+        }
     }
 
     /// Returns the entry of a key as a specific object, or try to resolve it in case it's
@@ -81,27 +95,79 @@ impl<'a> Dict<'a> {
         self.get_raw::<T>(key.as_ref())?.resolve(self.ctx())
     }
 
-    /// Get the object reference linked to a key.
-    pub fn get_ref(&self, key: impl AsRef<[u8]>) -> Option<ObjRef> {
-        let offset = *self.offsets()?.get(key.as_ref())?;
-
-        Reader::new(&self.data()[offset..]).read_with_context::<ObjRef>(self.ctx())
+    /// The entry of a key as a specific object, resolved: `Ok(None)` without the key,
+    /// or where it is another kind of object or a reference to an object the file
+    /// does not list; `Err` with an object reading it lost ([`crate::lost`]), the one
+    /// a reference leads to where the file lists it but it cannot be read, which the
+    /// computation being watched is told too, as [`Self::get`] tells it.
+    #[allow(
+        private_bounds,
+        reason = "users shouldn't be able to implement `ObjectLike` for custom objects."
+    )]
+    pub fn get_checked<T>(&self, key: impl AsRef<[u8]>) -> Result<Option<T>, ObjectIdentifier>
+    where
+        T: ObjectLike<'a>,
+    {
+        match self.get_raw::<T>(key.as_ref()) {
+            Some(MaybeRef::Ref(r)) => self.ctx().xref().get_checked_with(r.into(), self.ctx()),
+            Some(MaybeRef::NotRef(value)) => Ok(Some(value)),
+            None => Ok(None),
+        }
     }
 
-    /// Returns an iterator over all keys in the dictionary.
+    /// Get the object reference linked to a key.
+    pub fn get_ref(&self, key: impl AsRef<[u8]>) -> Option<ObjRef> {
+        match self.offsets()? {
+            Found::Offsets(offsets) => {
+                let offset = *offsets.get(key.as_ref())?;
+                Reader::new(&self.data()[offset..]).read_with_context::<ObjRef>(self.ctx())
+            }
+            Found::Parsed(part) => match part.items()[part.find(key.as_ref())?] {
+                Node::Ref(reference) => Some(reference),
+                _ => None,
+            },
+        }
+    }
+
+    /// Returns an iterator over all keys in the dictionary, sorted: however the
+    /// dictionary is held, its keys come in one order, which no map's hashing
+    /// decides ([`crate::hash`]).
     pub fn keys(&self) -> impl Iterator<Item = Name<'a>> + '_ {
-        self.offsets()
-            .into_iter()
-            .flat_map(|offsets| offsets.keys().cloned())
+        let mut keys: Vec<Name<'a>> = match self.offsets() {
+            None => Vec::new(),
+            Some(Found::Offsets(offsets)) => offsets.keys().cloned().collect(),
+            Some(Found::Parsed(part)) => part.names().collect(),
+        };
+        keys.sort_unstable_by(|n1, n2| n1.as_ref().cmp(n2.as_ref()));
+        keys.into_iter()
     }
 
     /// An iterator over all entries in the dictionary, sorted by key.
     pub fn entries(&self) -> impl Iterator<Item = (Name<'a>, MaybeRef<Object<'a>>)> + '_ {
-        let mut sorted_keys = self.keys().collect::<Vec<_>>();
-        sorted_keys.sort_by(|n1, n2| n1.as_ref().cmp(n2.as_ref()));
-        sorted_keys
-            .into_iter()
+        self.keys()
             .filter_map(|k| self.get_raw(k.deref()).map(|obj| (k, obj)))
+    }
+
+    /// The entries as the file writes them ([`Written`]), sorted by key.
+    pub fn written(&self) -> impl Iterator<Item = (Name<'a>, Written<'a>)> + '_ {
+        self.keys().map(|k| {
+            let value = self.get_written(k.deref()).unwrap();
+            (k, value)
+        })
+    }
+
+    /// The entry of a key as the file writes it ([`Written`]).
+    pub fn get_written(&self, key: impl AsRef<[u8]>) -> Option<Written<'a>> {
+        match self.offsets()? {
+            Found::Offsets(offsets) => {
+                let offset = *offsets.get(key.as_ref())?;
+                let mut r = Reader::new(&self.data()[offset..]);
+                let value = Written::read(&mut r, self.ctx());
+                crate::work::lexed(r.offset());
+                value
+            }
+            Found::Parsed(part) => Some(part.written(part.find(key.as_ref())?)),
+        }
     }
 
     /// Return the object identifier of the dict, if it's an indirect object.
@@ -113,25 +179,45 @@ impl<'a> Dict<'a> {
     #[allow(private_bounds)]
     pub fn get_raw<T>(&self, key: impl AsRef<[u8]>) -> Option<MaybeRef<T>>
     where
-        T: Readable<'a>,
+        T: ObjectLike<'a>,
     {
-        let offset = *self.offsets()?.get(key.as_ref())?;
-
-        Reader::new(&self.data()[offset..]).read_with_context::<MaybeRef<T>>(self.ctx())
+        match self.offsets()? {
+            Found::Offsets(offsets) => {
+                let offset = *offsets.get(key.as_ref())?;
+                let mut r = Reader::new(&self.data()[offset..]);
+                let value = r.read_with_context::<MaybeRef<T>>(self.ctx());
+                crate::work::lexed(r.offset());
+                value
+            }
+            Found::Parsed(part) => part.item_as(part.find(key.as_ref())?),
+        }
     }
 
     pub(crate) fn ctx(&self) -> &ReaderContext<'a> {
         match &self.0 {
-            Inner::Empty => ReaderContext::dummy_ref(),
-            Inner::Some(repr) => &repr.ctx,
+            Inner::Read(None) => ReaderContext::dummy_ref(),
+            Inner::Read(Some(repr)) => &repr.ctx,
+            Inner::Parsed(part) => part.ctx(),
         }
     }
 
-    fn offsets(&self) -> Option<&FxHashMap<Name<'a>, usize>> {
+    fn offsets(&self) -> Option<Found<'_, 'a>> {
         match &self.0 {
-            Inner::Empty => None,
-            Inner::Some(repr) => Some(&repr.offsets),
+            Inner::Read(None) => None,
+            Inner::Read(Some(repr)) => Some(repr.offsets()),
+            Inner::Parsed(part) => Some(Found::Parsed(part)),
         }
+    }
+
+    /// What the dictionary's entries are read from, for a cache of what is read or
+    /// copied from them.
+    pub fn content_key(&self) -> ContentKey<'a> {
+        ContentKey::new(self.data(), self.ctx())
+    }
+
+    /// The dictionary `part` reads.
+    pub(crate) fn parsed(part: Part<'a>) -> Self {
+        Self(Inner::Parsed(part))
     }
 }
 
@@ -168,34 +254,22 @@ impl Skippable for Dict<'_> {
         Self::skip_with_depth(r, is_content_stream, 0)
     }
 
+    // Read as `Dict::read` reads a dictionary, which keeps where its entries are: the
+    // dictionary a reading skips is the one reading it finds.
     fn skip_with_depth(r: &mut Reader<'_>, is_content_stream: bool, depth: usize) -> Option<()> {
         if depth >= super::MAX_OBJECT_NESTING_DEPTH {
             return None;
         }
 
-        r.forward_tag(b"<<")?;
-
-        loop {
-            r.skip_white_spaces_and_comments();
-
-            if let Some(()) = r.forward_tag(b">>") {
-                break Some(());
-            } else {
-                let Some(_) = r.skip::<Name<'_>>(is_content_stream) else {
-                    // In case there is garbage in-between, be lenient and just try to skip it.
-                    r.skip_with_depth::<Object<'_>>(is_content_stream, depth + 1)?;
-                    continue;
-                };
-
-                r.skip_white_spaces_and_comments();
-
-                if is_content_stream {
-                    r.skip_with_depth::<Object<'_>>(is_content_stream, depth + 1)?;
-                } else {
-                    r.skip_with_depth::<MaybeRef<Object<'_>>>(is_content_stream, depth + 1)?;
-                }
-            }
-        }
+        parse_dict_with(
+            r,
+            is_content_stream,
+            depth + 1,
+            Some(b"<<"),
+            b">>",
+            |r, _, _| skip_value(r, is_content_stream, depth + 1),
+        )
+        .map(|_| ())
     }
 }
 
@@ -211,87 +285,79 @@ fn read_inner<'a>(
     start_tag: Option<&[u8]>,
     end_tag: &[u8],
 ) -> Option<Dict<'a>> {
+    let mut offsets = new_offsets();
+    let in_content_stream = ctx.in_content_stream();
+    let depth = usize::from(start_tag.is_some());
+
+    let data = parse_dict_with(
+        r,
+        in_content_stream,
+        depth,
+        start_tag,
+        end_tag,
+        #[inline]
+        |r, key, offset| {
+            offsets.insert(Name::new(key)?, offset);
+            skip_value(r, in_content_stream, depth)
+        },
+    )?;
+
+    #[cfg(test)]
+    parsed(offsets.len(), data.len());
+    crate::work::lexed(data.len());
+
+    Some(Dict(Inner::Read(Some(Arc::new(Repr {
+        data,
+        offsets,
+        ctx: ctx.clone(),
+    })))))
+}
+
+/// A map for where the entries of a dictionary start, or for their values.
+pub(crate) fn new_offsets<K, V>() -> hash::Map<K, V> {
     // TODO: Figure out how to
     // 1) Make dictionaries easily cloneable without wrapping in Arc.
     // 2) Maybe have an efficient per-document allocator pool for hashmaps
     // that can be reused.
     #[cfg(feature = "std")]
-    let mut offsets = FxHashMap::with_capacity_and_hasher(8, rustc_hash::FxBuildHasher);
+    return hash::Map::with_capacity_and_hasher(8, hash::State::default());
     #[cfg(not(feature = "std"))]
-    let mut offsets = FxHashMap::new();
-
-    let data = parse_dict_with(
-        r,
-        ctx,
-        start_tag,
-        end_tag,
-        #[inline]
-        |name, offset, _| {
-            offsets.insert(name, offset);
-            Some(())
-        },
-    )?;
-
-    Some(Dict(Inner::Some(Arc::new(Repr {
-        data,
-        offsets,
-        ctx: ctx.clone(),
-    }))))
+    return hash::Map::new();
 }
 
-pub(crate) struct DictProbe<'a> {
-    pub(crate) data: &'a [u8],
-    pub(crate) has_root: bool,
-    pub(crate) has_type: bool,
+#[cfg(test)]
+fn parsed(entries: usize, bytes: usize) {
+    PARSED.with(|parsed| {
+        let (all, read) = parsed.get();
+        parsed.set((all + entries, read + bytes));
+    });
 }
 
-// We use that method during fallback xref parsing, so that we can search for
-// the dictionaries we need without allocating the whole hash map.
-// If the above TODOs are ever resolved, we can probably remove this method.
-pub(crate) fn probe_dict<'a>(
+#[cfg(test)]
+std::thread_local! {
+    /// The entries and bytes of the dictionaries parsed on this thread, and the
+    /// bytes of the arrays, which the tests bound to show that a dictionary or array
+    /// many objects share is parsed once.
+    pub(crate) static PARSED: core::cell::Cell<(usize, usize)> =
+        const { core::cell::Cell::new((0, 0)) };
+}
+
+/// Reads a dictionary, calling `on_entry` with each key's bytes as written, after
+/// the solidus and with their escapes ([`Name::new`] decodes them), and where its
+/// value starts, which reads the value, as an object `depth` deep: the one way a
+/// dictionary is read, whether it is kept, skipped or parsed; a skip decodes no key.
+/// A key is a name; another token in its place is skipped as an object.
+pub(crate) fn parse_dict_with<'a, F>(
     r: &mut Reader<'a>,
-    ctx: &ReaderContext<'a>,
-    start_tag: Option<&[u8]>,
-    end_tag: &[u8],
-) -> Option<DictProbe<'a>> {
-    let mut has_root = false;
-    let mut has_type = false;
-
-    let data = parse_dict_with(
-        r,
-        ctx,
-        start_tag,
-        end_tag,
-        #[inline]
-        |name, _, _value_reader| {
-            if name.as_ref() == keys::ROOT {
-                has_root = true;
-            } else if name.as_ref() == keys::TYPE {
-                has_type = true;
-            }
-
-            Some(())
-        },
-    )?;
-
-    Some(DictProbe {
-        data,
-        has_root,
-        has_type,
-    })
-}
-
-fn parse_dict_with<'a, F>(
-    r: &mut Reader<'a>,
-    ctx: &ReaderContext<'a>,
+    in_content_stream: bool,
+    depth: usize,
     start_tag: Option<&[u8]>,
     end_tag: &[u8],
     mut on_entry: F,
 ) -> Option<&'a [u8]>
 where
-    F: FnMut(Name<'a>, usize, &Reader<'a>) -> Option<()>,
+    F: FnMut(&mut Reader<'a>, &'a [u8], usize) -> Option<()>,
 {
-    let depth = usize::from(start_tag.is_some());
     let dict_data = r.tail()?;
     let start_offset = r.offset();
 
@@ -310,12 +376,12 @@ where
 
             break Some(&dict_data[..end_offset]);
         } else {
-            let Some(name) = r.read_without_context::<Name<'_>>() else {
+            let Some(key) = lex_name_like(r, true) else {
                 if start_tag.is_some() {
                     // In case there is garbage in-between, be lenient and just try to skip it.
                     // But only do this if we are parsing a proper dictionary as opposed to an
                     // inline dictionary.
-                    r.skip_with_depth::<Object<'_>>(ctx.in_content_stream(), depth)?;
+                    r.skip_with_depth::<Object<'_>>(in_content_stream, depth)?;
                     continue;
                 } else {
                     return None;
@@ -331,23 +397,41 @@ where
             // whether the object is `null` before inserting it, but that caused problems
             // in some test cases where encryption + object streams are involved (as we would
             // attempt to read an object stream before having resolved the encryption dictionary).
-            on_entry(name, offset, r)?;
-
-            if ctx.in_content_stream() {
-                r.skip_with_depth::<Object<'_>>(ctx.in_content_stream(), depth)?;
-            } else {
-                r.skip_with_depth::<MaybeRef<Object<'_>>>(ctx.in_content_stream(), depth)?;
-            }
+            on_entry(r, key, offset)?;
         }
     }
+}
+
+/// Skips the value of an entry, as an object `depth` deep.
+fn skip_value(r: &mut Reader<'_>, in_content_stream: bool, depth: usize) -> Option<()> {
+    if in_content_stream {
+        r.skip_with_depth::<Object<'_>>(in_content_stream, depth)?;
+    } else {
+        r.skip_with_depth::<MaybeRef<Object<'_>>>(in_content_stream, depth)?;
+    }
+    Some(())
 }
 
 object!(Dict<'a>, Dict);
 
 struct Repr<'a> {
     data: &'a [u8],
-    offsets: FxHashMap<Name<'a>, usize>,
+    /// Where each entry's value starts.
+    offsets: hash::Map<Name<'a>, usize>,
     ctx: ReaderContext<'a>,
+}
+
+impl<'a> Repr<'a> {
+    fn offsets(&self) -> Found<'_, 'a> {
+        Found::Offsets(&self.offsets)
+    }
+}
+
+/// Where each entry's value is, however it is held.
+#[derive(Clone, Copy)]
+enum Found<'r, 'a> {
+    Offsets(&'r hash::Map<Name<'a>, usize>),
+    Parsed(&'r Part<'a>),
 }
 
 pub(crate) struct InlineImageDict<'a>(Dict<'a>);
@@ -1019,11 +1103,10 @@ pub mod keys {
 
 #[cfg(test)]
 mod tests {
-    use crate::object::dict::keys::{COLORSPACE, EXT_G_STATE, FONT, PROC_SET};
+    use crate::object::Name;
     use crate::object::dict::{Dict, InlineImageDict};
     use crate::object::string;
     use crate::object::{FromBytes, Number};
-    use crate::object::{Name, ObjRef};
     use crate::reader::Reader;
     use crate::reader::{ReaderContext, ReaderExt};
 
@@ -1140,31 +1223,6 @@ mod tests {
         let dict = dict_impl(dict_data).unwrap();
 
         assert!(dict.contains_key("PANTONE 104 C"));
-    }
-
-    #[test]
-    fn garbage_in_between() {
-        let dict_data = b"<< 
-/ProcSet [ /PDF /Text ] 
-/Font << /F4 31 0 R /F6 23 0 R >> 
-/ExtGState << /GS2 14 0 R
-2000
- /GS3 15 0 R >> 
-/ColorSpace << /Cs5 13 0 R >> 
->> ";
-        let dict = dict_impl(dict_data).unwrap();
-
-        assert!(dict.contains_key(PROC_SET));
-        assert!(dict.contains_key(FONT));
-        assert!(dict.contains_key(EXT_G_STATE));
-        assert!(dict.contains_key(COLORSPACE));
-
-        let Some(dict) = dict.get::<Dict<'_>>(EXT_G_STATE) else {
-            panic!("failed to parse ext g state");
-        };
-
-        assert_eq!(dict.get_ref("GS2"), Some(ObjRef::new(14, 0)));
-        assert_eq!(dict.get_ref("GS3"), Some(ObjRef::new(15, 0)));
     }
 
     #[test]

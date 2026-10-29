@@ -21,10 +21,19 @@ skrifa = { workspace = true }
 yoke = { workspace = true, features = ["derive"]}
 siphasher = { workspace = true }
 bitflags = { workspace = true }
-rustc-hash = { workspace = true }
+html5ever = { workspace = true }
+unicode-bidi = { workspace = true }
 
 [dev-dependencies]
+flate2 = { workspace = true, features = ["zlib-rs"] }
 image = { workspace = true, features = ["png"] }
+jpeg-encoder = "0.7"
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [features]
 default = ["embed-fonts", "embed-cmaps"]

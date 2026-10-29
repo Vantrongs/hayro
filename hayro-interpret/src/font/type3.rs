@@ -9,17 +9,17 @@ use crate::font::{
 use crate::interpret::state::TextState;
 use crate::x_object::soft_mask::SoftMask;
 use crate::{BlendMode, interpret};
-use crate::{CacheKey, ClipPath, DrawMode, DrawProps, ImageDrawProps};
+use crate::{CacheKey, ClipPath, DrawMode, DrawProps, ImageDrawProps, Knockout};
 use crate::{Image, Paint};
 use hayro_cmap::{BfString, CMap};
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
+use hayro_syntax::hash;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::{CHAR_PROCS, FONT_MATRIX, RESOURCES};
 use hayro_syntax::page::Resources;
 use kurbo::{Affine, BezPath};
-use rustc_hash::FxHashMap;
 use skrifa::GlyphId;
 
 #[derive(Debug)]
@@ -27,9 +27,9 @@ pub(crate) struct Type3<'a> {
     widths: Vec<Width>,
     missing_width: f32,
     encoding: Encoding,
-    encodings: FxHashMap<u8, String>,
+    encodings: hash::Map<u8, String>,
     dict: Dict<'a>,
-    char_procs: FxHashMap<String, Stream<'a>>,
+    char_procs: hash::Map<String, Stream<'a>>,
     glyph_simulator: GlyphSimulator,
     matrix: Affine,
     to_unicode: Option<CMap>,
@@ -46,7 +46,7 @@ impl<'a> Type3<'a> {
         );
 
         let char_procs = {
-            let mut procs = FxHashMap::default();
+            let mut procs = hash::Map::default();
             let dict = dict.get::<Dict<'_>>(CHAR_PROCS).unwrap_or_default();
 
             for name in dict.keys() {
@@ -162,6 +162,7 @@ impl<'a> Type3<'a> {
             glyph.settings.clone(),
             state,
             glyph.nesting_depth,
+            glyph.optional_content.clone(),
         );
 
         let resources = program
@@ -205,8 +206,10 @@ impl<'a, 'b, T: Device<'a>> Type3ShapeGlyphDevice<'a, 'b, T> {
 // Only filling, stroking of paths and stencil masks are allowed.
 impl<'a, T: Device<'a>> Device<'a> for Type3ShapeGlyphDevice<'a, '_, T> {
     fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        // The pair a knockout is for is not grouped here, so the stroke is drawn over.
         let props = DrawProps {
             paint: self.paint.clone(),
+            knockout: Knockout::None,
             ..props
         };
         self.inner.draw_path(path, props, draw_mode);
@@ -232,6 +235,10 @@ impl<'a, T: Device<'a>> Device<'a> for Type3ShapeGlyphDevice<'a, '_, T> {
     }
 
     fn pop_transparency_group(&mut self) {}
+
+    // Groups are not drawn here, so the pair's fill lies in no group of its own:
+    // clearing in the device drawn into would clear what was drawn before the pair
+    // as well.
 
     fn draw_image(&mut self, image: Image<'a, '_>, props: ImageDrawProps<'a>) {
         if let Image::Stencil(mut s) = image {

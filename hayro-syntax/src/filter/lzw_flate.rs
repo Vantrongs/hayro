@@ -1,135 +1,444 @@
-use crate::bit_reader::{BitChunk, BitChunks, BitReader, BitWriter, bit_mask};
-use crate::filter::png::{self, BytesPerPixel, RowFilter};
-use crate::object::Dict;
+use crate::filter::png::{self, RowFilter};
 use crate::object::dict::keys::{BITS_PER_COMPONENT, COLORS, COLUMNS, EARLY_CHANGE, PREDICTOR};
-use alloc::vec;
+use crate::object::{Dict, Object};
+use crate::work::{Meter, POLL_BYTES};
 use alloc::vec::Vec;
 
 pub(crate) mod flate {
     use super::*;
     use crate::filter::lzw_flate::{PredictorParams, apply_predictor};
-    use crate::object::Dict;
 
-    #[cfg(feature = "unsafe")]
-    pub(crate) fn decode(data: &[u8], params: &Dict<'_>) -> Option<Vec<u8>> {
-        use flate2::read::{DeflateDecoder, ZlibDecoder};
-        use std::io::Read;
-
-        fn zlib_stream(data: &[u8]) -> Option<Vec<u8>> {
-            let mut decoder = ZlibDecoder::new(data);
-            let mut result = Vec::new();
-            decoder.read_to_end(&mut result).ok().map(|_| result)
-        }
-
-        fn deflate_stream(data: &[u8]) -> Option<Vec<u8>> {
-            let mut decoder = DeflateDecoder::new(data);
-            let mut result = Vec::new();
-            decoder.read_to_end(&mut result).ok().map(|_| result)
-        }
-
-        let decoded = zlib_stream(data)
-            .or_else(|| deflate_stream(data))
-            .or_else(|| {
-                warn!("flate stream is broken, decoding with fallback");
-
-                fallback::decode(data)
-            })?;
-        let params = PredictorParams::from_params(params);
-        apply_predictor(decoded, &params)
+    /// The data inflated and its predictor reversed, the work counted on `meter`;
+    /// `None` once its hook asks to stop, or, if `strict`, where the data is corrupt
+    /// rather than cut short (see [`fallback::decode`]). `expected` is the size the
+    /// inflated data should have, 0 where none is known: room is not reserved past
+    /// it while the data is shorter ([`inflate`]).
+    pub(crate) fn decode(
+        data: &[u8],
+        params: &PredictorParams,
+        meter: &Meter<'_>,
+        strict: bool,
+        expected: usize,
+    ) -> Option<Vec<u8>> {
+        decode_within(data, params, meter, strict, expected, usize::MAX).unwrap_or(None)
     }
 
+    /// `decoded` holding no room past its bytes, which a caller may keep while it
+    /// reads them.
+    fn fitted(mut decoded: Vec<u8>) -> Vec<u8> {
+        decoded.shrink_to_fit();
+        decoded
+    }
+
+    /// A decoder made more than the limit it was given; `tried` decoders before it
+    /// found the data corrupt (zlib, then raw deflate, then the permissive one; only
+    /// the last without the `unsafe` feature).
+    pub(crate) struct Larger {
+        pub(crate) tried: usize,
+    }
+
+    /// [`decode`], stopped where a decoder made more than `limit` bytes.
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn decode_within(
+        data: &[u8],
+        params: &PredictorParams,
+        meter: &Meter<'_>,
+        strict: bool,
+        expected: usize,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, Larger> {
+        let larger = |tried| move |_| Larger { tried };
+        let decoded = match inflate(data, true, meter, expected, limit).map_err(larger(0))? {
+            Some(decoded) => decoded,
+            None if meter.cancelled() => return Ok(None),
+            None => match inflate(data, false, meter, expected, limit).map_err(larger(1))? {
+                Some(decoded) => decoded,
+                None if meter.cancelled() => return Ok(None),
+                None => {
+                    warn!("flate stream is broken, decoding with fallback");
+                    match fallback::decode_within(data, meter, strict, limit) {
+                        Ok(Some(decoded)) => decoded,
+                        Ok(None) | Err(fallback::Stopped::Cancelled) => return Ok(None),
+                        Err(fallback::Stopped::Larger) => return Err(Larger { tried: 2 }),
+                    }
+                }
+            },
+        };
+        Ok(apply_predictor(decoded, params, meter).map(fitted))
+    }
+
+    /// `data` inflated whole, read as zlib if `zlib`, else as raw deflate, the work
+    /// counted on `meter`; `None` when the data is corrupt for that format or the hook
+    /// asks to stop. Data that ends before its stream does yields what it holds, and
+    /// bytes after the stream's end are ignored.
+    /// `Err` once it made more than `limit` bytes. Its room grows as upstream's does
+    /// ([`room`]), but while it made less than `expected` no further than that and a
+    /// little more, which the end of the stream is read into: the room of a large
+    /// image's data ends at its size, and other data holds no more than upstream.
+    #[cfg(feature = "unsafe")]
+    fn inflate(
+        data: &[u8],
+        zlib: bool,
+        meter: &Meter<'_>,
+        expected: usize,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, ()> {
+        let mut decoder = zlib_rs::Inflate::new(zlib, 15);
+        let mut out = Vec::new();
+        // The input bytes the decoder took, and those it was offered and counted.
+        let (mut taken, mut offered) = (0, 0);
+        loop {
+            if out.len() == out.capacity() {
+                let made = out.len();
+                out.reserve_exact(room(made, data.len(), expected, limit) - made);
+            }
+            // Input is offered half of POLL_BYTES at a time and counted before it is
+            // taken, and output is made no further than the next poll, so at most
+            // POLL_BYTES and one piece of input are worked on between two polls.
+            // Calls that make less are slower: each copies what it made into zlib's
+            // history window, and matches reaching back past its output read from
+            // there.
+            let end = data.len().min(taken + POLL_BYTES / 2);
+            if meter.work(end.saturating_sub(offered)).is_err() {
+                return Ok(None);
+            }
+            offered = offered.max(end);
+            let input = &data[taken..end];
+            let len = out.len();
+            let room = (out.capacity() - len).min(meter.until_poll());
+            out.resize(len + room, 0);
+            let flush = if input.is_empty() {
+                zlib_rs::InflateFlush::Finish
+            } else {
+                zlib_rs::InflateFlush::NoFlush
+            };
+            let (out_before, in_before) = (decoder.total_out(), decoder.total_in());
+            let status = decoder.decompress(input, &mut out[len..], flush);
+            let written = (decoder.total_out() - out_before) as usize;
+            let took = (decoder.total_in() - in_before) as usize;
+            out.truncate(len + written);
+            taken += took;
+            if meter.work(written).is_err() {
+                return Ok(None);
+            }
+            match status {
+                Ok(_) if out.len() > limit => return Err(()),
+                Ok(zlib_rs::Status::StreamEnd) => return Ok(Some(out)),
+                Ok(_) if written > 0 || took > 0 => {}
+                Ok(_) if input.is_empty() => return Ok(Some(out)),
+                _ => return Ok(None),
+            }
+        }
+    }
+
+    /// The room a full output buffer holding the `made` bytes inflated from `len`
+    /// encoded bytes grows to. Upstream (036fb21c) inflates with `read_to_end`, whose
+    /// room doubles from 32 bytes when it is full: the smallest power of two above
+    /// what it holds. So does this room, so that it is never larger than upstream's
+    /// at the same point of the same data, however the data inflate along it; it
+    /// only stops short of upstream's at what the data should make, while they make
+    /// less, and at a little past the limit. The first room may be larger than
+    /// upstream's, up to 32 KiB, as this decoder needs that much less than upstream's
+    /// decoder and its input buffer; it is at least what zlib's fast loop needs.
+    #[cfg(feature = "unsafe")]
+    fn room(made: usize, len: usize, expected: usize, limit: usize) -> usize {
+        let doubled = match made {
+            0 => len.clamp(1024, POLL_BYTES / 2),
+            _ => made
+                .checked_add(1)
+                .and_then(usize::checked_next_power_of_two)
+                .unwrap_or(usize::MAX),
+        };
+        let end = if made < expected {
+            expected.min(limit)
+        } else {
+            limit
+        };
+        doubled.min(end.saturating_add(1024))
+    }
+
+    /// [`decode`], stopped where the decoder made more than `limit` bytes.
     #[cfg(not(feature = "unsafe"))]
-    pub(crate) fn decode(data: &[u8], params: &Dict<'_>) -> Option<Vec<u8>> {
-        let decoded = fallback::decode(data)?;
-        let params = PredictorParams::from_params(params);
-        apply_predictor(decoded, &params)
+    pub(crate) fn decode_within(
+        data: &[u8],
+        params: &PredictorParams,
+        meter: &Meter<'_>,
+        strict: bool,
+        _expected: usize,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, Larger> {
+        let decoded = match fallback::decode_within(data, meter, strict, limit) {
+            Ok(Some(decoded)) => decoded,
+            Ok(None) | Err(fallback::Stopped::Cancelled) => return Ok(None),
+            Err(fallback::Stopped::Larger) => return Err(Larger { tried: 0 }),
+        };
+        Ok(apply_predictor(decoded, params, meter).map(fitted))
     }
 
     /// Ported from <https://github.com/mozilla/pdf.js/blob/master/src/core/flate_stream.js>
     /// TODO: Rewrite this in idiomatic Rust.
-    mod fallback {
+    pub(crate) mod fallback {
+        use crate::work::{Cancelled, Meter};
         use alloc::vec;
         use alloc::vec::Vec;
 
-        pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
-            flate_decode(data)
+        /// The data decoded, its work counted on `meter`. Decoding stops at the first
+        /// thing that is no valid deflate data and keeps what came before; if `strict`,
+        /// such data is `None` instead. Data that ends early, or with a wrong or missing
+        /// checksum, is not corrupt: what it holds is all decoded.
+        pub(crate) fn decode(
+            data: &[u8],
+            meter: &Meter<'_>,
+            strict: bool,
+        ) -> Result<Option<Vec<u8>>, Cancelled> {
+            decode_within(data, meter, strict, usize::MAX).map_err(|_| Cancelled)
         }
 
-        fn flate_decode(data: &[u8]) -> Option<Vec<u8>> {
-            if data.len() >= 2 {
-                let cmf = data[0];
-                let flg = data[1];
+        /// The most bytes a step makes past the bytes it was asked for: a match.
+        const STEP_PAST: usize = 257;
 
-                if (cmf & 0x0f) == 0x08
-                    && ((cmf as u16) << 8 | flg as u16).is_multiple_of(31)
-                    && (flg & 0x20) == 0
-                {
-                    let mut stream = FlateStream::new(&data[2..]);
-                    return stream.decode();
-                }
+        /// Why [`decode_within`] stopped.
+        pub(crate) enum Stopped {
+            Cancelled,
+            /// It made more than its limit.
+            Larger,
+        }
+
+        /// [`decode`], stopped once it made more than `limit` bytes.
+        pub(crate) fn decode_within(
+            data: &[u8],
+            meter: &Meter<'_>,
+            strict: bool,
+            limit: usize,
+        ) -> Result<Option<Vec<u8>>, Stopped> {
+            let mut stream = FlateStream::new(Slice::new(data));
+            let pending = limit.saturating_add(1);
+            stream.most = pending.saturating_add(STEP_PAST);
+            let stepped = stream.step(meter, pending);
+            #[cfg(test)]
+            WORK.set((stream.input.taken(), stream.made()));
+            stepped.map_err(|_| Stopped::Cancelled)?;
+            if stream.made() > limit {
+                return Err(Stopped::Larger);
+            }
+            if stream.corrupt && strict {
+                warn!("flate stream is corrupt");
+                return Ok(None);
+            }
+            Ok(Some(core::mem::take(&mut stream.output)))
+        }
+
+        /// Where the decoder takes its bytes from, one at a time.
+        pub(crate) trait Input {
+            /// The next byte; `None` at the end.
+            fn next(&mut self, meter: &Meter<'_>) -> Option<u8>;
+            /// The byte `ahead` bytes after the next one, which stays next.
+            fn peek(&mut self, ahead: usize, meter: &Meter<'_>) -> Option<u8>;
+            /// The bytes taken so far.
+            fn taken(&self) -> usize;
+            /// Takes the next bytes, at most `max` and at least one where any is left.
+            fn take(&mut self, max: usize, meter: &Meter<'_>) -> &[u8];
+        }
+
+        /// Bytes all at hand.
+        pub(crate) struct Slice<'a> {
+            data: &'a [u8],
+            at: usize,
+        }
+
+        impl<'a> Slice<'a> {
+            pub(crate) fn new(data: &'a [u8]) -> Self {
+                Self { data, at: 0 }
+            }
+        }
+
+        impl Input for Slice<'_> {
+            fn next(&mut self, _: &Meter<'_>) -> Option<u8> {
+                let byte = *self.data.get(self.at)?;
+                self.at += 1;
+                Some(byte)
             }
 
-            let mut stream = FlateStream::new(data);
-            stream.decode()
+            fn peek(&mut self, ahead: usize, _: &Meter<'_>) -> Option<u8> {
+                self.data.get(self.at + ahead).copied()
+            }
+
+            fn taken(&self) -> usize {
+                self.at
+            }
+
+            fn take(&mut self, max: usize, _: &Meter<'_>) -> &[u8] {
+                let n = max.min(self.data.len() - self.at);
+                self.at += n;
+                &self.data[self.at - n..self.at]
+            }
         }
 
-        struct FlateStream<'a> {
-            data: &'a [u8],
-            pos: usize,
+        #[cfg(test)]
+        std::thread_local! {
+            /// The bytes the last whole decoding on this thread took and made.
+            pub(crate) static WORK: core::cell::Cell<(usize, usize)> =
+                const { core::cell::Cell::new((0, 0)) };
+        }
+
+        /// The decoder, which can stop between two codes and go on later
+        /// ([`Self::step`]), so that it is read a part at a time: its output is the
+        /// history back references reach into, then the bytes not handed out yet.
+        pub(crate) struct FlateStream<I: Input> {
+            pub(crate) input: I,
             code_buf: u32,
             code_size: u8,
+            /// The bytes made, from the `dropped`th on.
             output: Vec<u8>,
+            /// The room `output` grows to at most where that holds what is made
+            /// ([`grow`]).
+            most: usize,
+            dropped: usize,
+            /// The bytes of `output` handed out ([`Self::hand`]).
+            handed: usize,
+            /// Whether the zlib header was looked for.
+            started: bool,
+            /// The tables of the compressed block being decoded, and the bytes taken
+            /// when it started.
+            block: Option<(HuffmanTable, HuffmanTable, usize)>,
+            /// The bytes of the stored block being copied left to copy.
+            stored: usize,
             eof: bool,
+            /// Whether decoding stopped at, or passed over, data that is no valid
+            /// deflate, rather than at the end of the stream or of the data.
+            pub(crate) corrupt: bool,
         }
 
-        impl<'a> FlateStream<'a> {
-            fn new(data: &'a [u8]) -> Self {
-                FlateStream {
-                    data,
-                    pos: 0,
+        /// The farthest a back reference reaches.
+        const WINDOW: usize = 32 * 1024;
+
+        /// Makes room in `output` for `n` more bytes where it has none, as pushing
+        /// them grows a `Vec` (as upstream's decoder grows its output), to at least
+        /// twice the room; but no further than `most` where that holds them.
+        #[inline]
+        fn grow(output: &mut Vec<u8>, n: usize, most: usize) {
+            let (len, room) = (output.len(), output.capacity());
+            if len + n > room {
+                let doubled = (2 * room).max(len + n).max(8);
+                output.reserve_exact(doubled.min(most.max(len + n)) - len);
+            }
+        }
+
+        impl<I: Input> FlateStream<I> {
+            pub(crate) fn new(input: I) -> Self {
+                Self {
+                    input,
                     code_buf: 0,
                     code_size: 0,
                     output: Vec::new(),
+                    most: usize::MAX,
+                    dropped: 0,
+                    handed: 0,
+                    started: false,
+                    block: None,
+                    stored: 0,
                     eof: false,
+                    corrupt: false,
                 }
             }
 
-            fn decode(&mut self) -> Option<Vec<u8>> {
-                while !self.eof && self.pos < self.data.len() {
-                    self.read_block();
-                }
-
-                Some(core::mem::take(&mut self.output))
+            /// The bytes made in all.
+            fn made(&self) -> usize {
+                self.dropped + self.output.len()
             }
 
-            fn get_byte(&mut self) -> Option<u8> {
-                if self.pos >= self.data.len() {
-                    None
-                } else {
-                    let byte = self.data[self.pos];
-                    self.pos += 1;
-                    Some(byte)
-                }
+            /// The bytes made and not handed out yet.
+            pub(crate) fn pending(&self) -> &[u8] {
+                &self.output[self.handed..]
             }
 
-            fn peek_byte(&self) -> Option<u8> {
-                if self.pos >= self.data.len() {
-                    None
-                } else {
-                    Some(self.data[self.pos])
+            /// Hands out `n` pending bytes, and drops what back references can no
+            /// longer reach of what was handed out.
+            pub(crate) fn hand(&mut self, n: usize) {
+                self.handed += n;
+                if self.handed >= 2 * WINDOW {
+                    let drop = self.handed - WINDOW;
+                    self.output.drain(..drop);
+                    self.dropped += drop;
+                    self.handed -= drop;
                 }
             }
 
-            fn get_bytes(&mut self, n: usize) -> Vec<u8> {
-                let end = (self.pos + n).min(self.data.len());
-                let bytes = self.data[self.pos..end].to_vec();
-                self.pos = end;
-                bytes
+            /// Whether all data was decoded.
+            pub(crate) fn done(&self) -> bool {
+                self.started && self.block.is_none() && self.stored == 0 && self.eof
             }
 
-            fn get_bits(&mut self, bits: u8) -> Option<u32> {
+            /// Decodes until the end of the data or of the stream, or until at least
+            /// `pending` bytes made are not handed out: each block counts the bytes it
+            /// took, and at least one, when it ends.
+            pub(crate) fn step(
+                &mut self,
+                meter: &Meter<'_>,
+                pending: usize,
+            ) -> Result<(), Cancelled> {
+                if !self.started {
+                    self.started = true;
+                    self.skip_header(meter);
+                }
+                loop {
+                    if self.stored > 0 {
+                        let from = self.input.taken();
+                        let copied = self.copy_stored(meter, pending);
+                        meter.work(self.input.taken() - from + usize::from(copied))?;
+                        if !copied {
+                            return Ok(());
+                        }
+                    }
+                    if let Some((lit, dist, from)) = self.block.take() {
+                        if !self.read_codes(lit, dist, from, meter, pending)? {
+                            return Ok(());
+                        }
+                        meter.work(self.input.taken() - from + 1)?;
+                    }
+                    if self.eof || self.input.peek(0, meter).is_none() {
+                        self.eof = true;
+                        return Ok(());
+                    }
+                    if self.output.len() - self.handed >= pending {
+                        return Ok(());
+                    }
+                    let from = self.input.taken();
+                    self.read_block(meter, pending)?;
+                    if self.block.is_some() {
+                        return Ok(());
+                    }
+                    if self.stored > 0 {
+                        // The block's header; its data count as they are copied.
+                        meter.work(self.input.taken() - from)?;
+                        continue;
+                    }
+                    meter.work(self.input.taken() - from + 1)?;
+                }
+            }
+
+            /// Takes a zlib header, if the data starts with one.
+            fn skip_header(&mut self, meter: &Meter<'_>) {
+                if let (Some(cmf), Some(flg)) =
+                    (self.input.peek(0, meter), self.input.peek(1, meter))
+                    && (cmf & 0x0f) == 0x08
+                    && ((cmf as u16) << 8 | flg as u16).is_multiple_of(31)
+                    && (flg & 0x20) == 0
+                {
+                    self.input.next(meter);
+                    self.input.next(meter);
+                }
+            }
+
+            /// Stops decoding at data that is no valid deflate.
+            fn corrupt(&mut self) {
+                self.corrupt = true;
+                self.eof = true;
+            }
+
+            fn get_bits(&mut self, bits: u8, meter: &Meter<'_>) -> Option<u32> {
                 while self.code_size < bits {
-                    let b = self.get_byte()?;
+                    let b = self.input.next(meter)?;
                     self.code_buf |= (b as u32) << self.code_size;
                     self.code_size += 8;
                 }
@@ -141,12 +450,12 @@ pub(crate) mod flate {
                 Some(result)
             }
 
-            fn get_code(&mut self, table: &HuffmanTable) -> Option<u16> {
+            fn get_code(&mut self, table: &HuffmanTable, meter: &Meter<'_>) -> Option<u16> {
                 let codes = &table.codes;
                 let max_len = table.max_len;
 
                 while self.code_size < max_len {
-                    if let Some(b) = self.get_byte() {
+                    if let Some(b) = self.input.next(meter) {
                         self.code_buf |= (b as u32) << self.code_size;
                         self.code_size += 8;
                     } else {
@@ -159,7 +468,12 @@ pub(crate) mod flate {
                 let code_len = (code >> 16) as u8;
                 let code_val = code & 0xffff;
 
-                if code_len < 1 || self.code_size < code_len {
+                if code_len < 1 {
+                    // No code of the table starts with these bits.
+                    self.corrupt = true;
+                    return None;
+                }
+                if self.code_size < code_len {
                     return None;
                 }
 
@@ -169,14 +483,17 @@ pub(crate) mod flate {
                 Some(code_val as u16)
             }
 
-            fn read_block(&mut self) {
+            /// Reads a block, or, for a compressed one, its tables and its codes up to
+            /// `pending` bytes not handed out ([`Self::read_codes`]).
+            fn read_block(&mut self, meter: &Meter<'_>, pending: usize) -> Result<(), Cancelled> {
+                let from = self.input.taken();
                 // Read block header
-                let hdr = match self.get_bits(3) {
+                let hdr = match self.get_bits(3, meter) {
                     Some(h) => h,
                     None => {
                         warn!("bad block header in flate stream");
                         self.eof = true;
-                        return;
+                        return Ok(());
                     }
                 };
 
@@ -187,125 +504,143 @@ pub(crate) mod flate {
                 let hdr = hdr >> 1;
 
                 match hdr {
-                    0 => self.read_uncompressed_block(),
-                    1 => self.read_compressed_block(true),
-                    2 => self.read_compressed_block(false),
+                    0 => self.read_uncompressed_block(meter),
+                    1 | 2 => {
+                        let (lit, dist) = if hdr == 1 {
+                            (get_fixed_lit_table(), get_fixed_dist_table())
+                        } else {
+                            match self.read_dynamic_tables(meter) {
+                                Some(tables) => tables,
+                                None => {
+                                    self.eof = true;
+                                    return Ok(());
+                                }
+                            }
+                        };
+                        meter.work(lit.codes.len() + dist.codes.len())?;
+                        if !self.read_codes(lit, dist, from, meter, pending)? {
+                            return Ok(());
+                        }
+                    }
                     _ => {
                         warn!("unknown block type in flate stream");
-                        self.eof = true;
+                        self.corrupt();
                     }
                 }
+                Ok(())
             }
 
-            fn read_uncompressed_block(&mut self) {
+            fn read_uncompressed_block(&mut self, meter: &Meter<'_>) {
                 // Skip any remaining bits in current byte
                 self.code_buf = 0;
                 self.code_size = 0;
 
-                let len_low = match self.get_byte() {
-                    Some(b) => b as u16,
-                    None => {
-                        warn!("bad block header in flate stream");
-                        self.eof = true;
-                        return;
+                let mut bytes = [0_u16; 4];
+                for byte in &mut bytes {
+                    match self.input.next(meter) {
+                        Some(b) => *byte = b as u16,
+                        None => {
+                            warn!("bad block header in flate stream");
+                            self.eof = true;
+                            return;
+                        }
                     }
-                };
-
-                let len_high = match self.get_byte() {
-                    Some(b) => b as u16,
-                    None => {
-                        warn!("bad block header in flate stream");
-                        self.eof = true;
-                        return;
-                    }
-                };
-
+                }
+                let [len_low, len_high, nlen_low, nlen_high] = bytes;
                 let block_len = len_low | (len_high << 8);
-
-                let nlen_low = match self.get_byte() {
-                    Some(b) => b as u16,
-                    None => {
-                        warn!("bad block header in flate stream");
-                        self.eof = true;
-                        return;
-                    }
-                };
-
-                let nlen_high = match self.get_byte() {
-                    Some(b) => b as u16,
-                    None => {
-                        warn!("bad block header in flate stream");
-                        self.eof = true;
-                        return;
-                    }
-                };
-
                 let check = nlen_low | (nlen_high << 8);
 
                 if check != !block_len && (block_len != 0 || check != 0) {
                     // Ignoring error for bad "empty" block
                     warn!("bad uncompressed block length in flate stream");
+                    self.corrupt = true;
                 }
 
                 if block_len == 0 {
-                    if self.peek_byte().is_none() {
+                    if self.input.peek(0, meter).is_none() {
                         self.eof = true;
                     }
                 } else {
-                    let block = self.get_bytes(block_len as usize);
-                    self.output.extend_from_slice(&block);
-                    if block.len() < block_len as usize {
-                        self.eof = true;
-                    }
+                    self.stored = usize::from(block_len);
                 }
             }
 
-            fn read_compressed_block(&mut self, fixed: bool) {
-                let (lit_code_table, dist_code_table) = if fixed {
-                    (get_fixed_lit_table(), get_fixed_dist_table())
-                } else {
-                    match self.read_dynamic_tables() {
-                        Some(tables) => tables,
-                        None => {
-                            self.eof = true;
-                            return;
-                        }
+            /// Copies the stored block's data until at least `pending` bytes made are
+            /// not handed out: to its end, or the end of the data (true), or not (false).
+            fn copy_stored(&mut self, meter: &Meter<'_>, pending: usize) -> bool {
+                while self.stored > 0 {
+                    let room = pending.saturating_sub(self.output.len() - self.handed);
+                    if room == 0 {
+                        return false;
                     }
-                };
+                    let bytes = self.input.take(self.stored.min(room), meter);
+                    if bytes.is_empty() {
+                        self.stored = 0;
+                        self.eof = true;
+                        return true;
+                    }
+                    self.stored -= bytes.len();
+                    grow(&mut self.output, bytes.len(), self.most);
+                    self.output.extend_from_slice(bytes);
+                }
+                true
+            }
 
+            /// Reads the codes of a compressed block whose tables are `lit` and `dist`
+            /// and which started when `from` bytes were taken: to its end (true), or
+            /// until `pending` bytes made are not handed out, keeping the block to go
+            /// on with (false). Counts each code's output.
+            fn read_codes(
+                &mut self,
+                lit_code_table: HuffmanTable,
+                dist_code_table: HuffmanTable,
+                from: usize,
+                meter: &Meter<'_>,
+                pending: usize,
+            ) -> Result<bool, Cancelled> {
                 loop {
-                    let code1 = match self.get_code(&lit_code_table) {
+                    if self.output.len() - self.handed >= pending {
+                        self.block = Some((lit_code_table, dist_code_table, from));
+                        return Ok(false);
+                    }
+                    let code1 = match self.get_code(&lit_code_table, meter) {
                         Some(c) => c,
                         None => {
                             self.eof = true;
-                            return;
+                            return Ok(true);
                         }
                     };
 
                     if code1 < 256 {
+                        grow(&mut self.output, 1, self.most);
                         self.output.push(code1 as u8);
+                        meter.work(1)?;
                     } else if code1 == 256 {
-                        return;
+                        return Ok(true);
                     } else {
                         let code1 = code1 - 257;
-                        let length_info = LENGTH_DECODE.get(code1 as usize).copied().unwrap_or(0);
+                        let Some(&length_info) = LENGTH_DECODE.get(code1 as usize) else {
+                            warn!("invalid length code {} in flate stream", code1 + 257);
+                            self.corrupt();
+                            return Ok(true);
+                        };
                         let extra_bits = (length_info >> 16) as u8;
                         let mut length = (length_info & 0xffff) as usize;
 
                         if extra_bits > 0 {
-                            if let Some(extra) = self.get_bits(extra_bits) {
+                            if let Some(extra) = self.get_bits(extra_bits, meter) {
                                 length += extra as usize;
                             } else {
                                 self.eof = true;
-                                return;
+                                return Ok(true);
                             }
                         }
 
-                        let dist_code = match self.get_code(&dist_code_table) {
+                        let dist_code = match self.get_code(&dist_code_table, meter) {
                             Some(c) => c,
                             None => {
                                 self.eof = true;
-                                return;
+                                return Ok(true);
                             }
                         };
 
@@ -314,8 +649,8 @@ pub(crate) mod flate {
                             None => {
                                 warn!("invalid distance code {} in flate stream", dist_code);
 
-                                self.eof = true;
-                                return;
+                                self.corrupt();
+                                return Ok(true);
                             }
                         };
 
@@ -323,35 +658,43 @@ pub(crate) mod flate {
                         let mut distance = (dist_info & 0xffff) as usize;
 
                         if extra_bits > 0 {
-                            if let Some(extra) = self.get_bits(extra_bits) {
+                            if let Some(extra) = self.get_bits(extra_bits, meter) {
                                 distance += extra as usize;
                             } else {
                                 self.eof = true;
-                                return;
+                                return Ok(true);
                             }
                         }
 
-                        // Copy from previous output
-                        let start = self.output.len().wrapping_sub(distance);
-                        for _ in 0..length {
-                            if start < self.output.len() {
+                        // Copy from previous output; a distance back past the start of
+                        // the output copies nothing.
+                        if distance > self.made() {
+                            self.corrupt = true;
+                        } else {
+                            for _ in 0..length {
                                 let byte = self.output[self.output.len() - distance];
+                                grow(&mut self.output, 1, self.most);
                                 self.output.push(byte);
                             }
                         }
+                        meter.work(length + 1)?;
                     }
                 }
             }
 
-            fn read_dynamic_tables(&mut self) -> Option<(HuffmanTable, HuffmanTable)> {
-                let num_lit_codes = self.get_bits(5)? as usize + 257;
-                let num_dist_codes = self.get_bits(5)? as usize + 1;
-                let num_code_len_codes = self.get_bits(4)? as usize + 4;
+            fn read_dynamic_tables(
+                &mut self,
+                meter: &Meter<'_>,
+            ) -> Option<(HuffmanTable, HuffmanTable)> {
+                let num_lit_codes = self.get_bits(5, meter)? as usize + 257;
+                let num_dist_codes = self.get_bits(5, meter)? as usize + 1;
+                let num_code_len_codes = self.get_bits(4, meter)? as usize + 4;
 
                 // Build code length code table
                 let mut code_len_code_lengths = vec![0_u8; 19];
                 for i in 0..num_code_len_codes {
-                    code_len_code_lengths[CODE_LEN_CODE_MAP[i] as usize] = self.get_bits(3)? as u8;
+                    code_len_code_lengths[CODE_LEN_CODE_MAP[i] as usize] =
+                        self.get_bits(3, meter)? as u8;
                 }
 
                 let code_len_table = generate_huffman_table(&code_len_code_lengths);
@@ -362,7 +705,7 @@ pub(crate) mod flate {
                 let mut i = 0;
 
                 while i < total_codes {
-                    let code = self.get_code(&code_len_table)?;
+                    let code = self.get_code(&code_len_table, meter)?;
 
                     match code {
                         0..=15 => {
@@ -371,7 +714,7 @@ pub(crate) mod flate {
                         }
                         16 => {
                             // Repeat previous
-                            let repeat_count = self.get_bits(2)? as usize + 3;
+                            let repeat_count = self.get_bits(2, meter)? as usize + 3;
                             let prev = if i > 0 { code_lengths[i - 1] } else { 0 };
                             for _ in 0..repeat_count {
                                 if i < total_codes {
@@ -382,7 +725,7 @@ pub(crate) mod flate {
                         }
                         17 => {
                             // Repeat zero 3-10 times
-                            let repeat_count = self.get_bits(3)? as usize + 3;
+                            let repeat_count = self.get_bits(3, meter)? as usize + 3;
                             for _ in 0..repeat_count {
                                 if i < total_codes {
                                     code_lengths[i] = 0;
@@ -392,7 +735,7 @@ pub(crate) mod flate {
                         }
                         18 => {
                             // Repeat zero 11-138 times
-                            let repeat_count = self.get_bits(7)? as usize + 11;
+                            let repeat_count = self.get_bits(7, meter)? as usize + 11;
                             for _ in 0..repeat_count {
                                 if i < total_codes {
                                     code_lengths[i] = 0;
@@ -400,7 +743,10 @@ pub(crate) mod flate {
                                 }
                             }
                         }
-                        _ => return None,
+                        _ => {
+                            self.corrupt = true;
+                            return None;
+                        }
                     }
                 }
 
@@ -563,19 +909,34 @@ pub(crate) mod flate {
 }
 
 pub(crate) mod lzw {
-    use crate::bit_reader::BitReader;
+    use crate::filter::lzw_flate::flate::fallback::{Input, Slice};
     use crate::filter::lzw_flate::{PredictorParams, apply_predictor};
-    use crate::object::Dict;
+    use crate::work::Meter;
     use alloc::vec;
     use alloc::vec::Vec;
 
-    /// Decode a LZW-encoded stream.
-    pub(crate) fn decode(data: &[u8], params: &Dict<'_>) -> Option<Vec<u8>> {
-        let params = PredictorParams::from_params(params);
+    /// Decode a LZW-encoded stream, its work counted on `meter`; `None` once its hook
+    /// asks to stop.
+    pub(crate) fn decode(
+        data: &[u8],
+        params: &PredictorParams,
+        meter: &Meter<'_>,
+    ) -> Option<Vec<u8>> {
+        decode_within(data, params, meter, usize::MAX).unwrap_or(None)
+    }
 
-        let decoded = decode_impl(data, params.early_change)?;
+    /// [`decode`], `Err` once it made more than `limit` bytes.
+    pub(crate) fn decode_within(
+        data: &[u8],
+        params: &PredictorParams,
+        meter: &Meter<'_>,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, ()> {
+        let Some(decoded) = decode_impl(data, params.early_change, meter, limit)? else {
+            return Ok(None);
+        };
 
-        apply_predictor(decoded, &params)
+        Ok(apply_predictor(decoded, params, meter))
     }
 
     const CLEAR_TABLE: usize = 256;
@@ -583,29 +944,86 @@ pub(crate) mod lzw {
     const MAX_ENTRIES: usize = 4096;
     const INITIAL_SIZE: u16 = 258;
 
-    fn decode_impl(data: &[u8], early_change: bool) -> Option<Vec<u8>> {
-        let mut table = Table::new(early_change);
-        let mut bit_size = table.code_length();
-        let mut reader = BitReader::new(data);
+    fn decode_impl(
+        data: &[u8],
+        early_change: bool,
+        meter: &Meter<'_>,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, ()> {
+        let mut decoder = Decoder::new(early_change);
+        let mut input = Slice::new(data);
         let mut decoded = vec![];
-        let mut prev = None;
-
         loop {
-            let next = match reader.read(bit_size) {
-                Some(code) => code as usize,
+            let step = decoder.step(&mut input, &mut decoded, meter);
+            if decoded.len() > limit {
+                return Err(());
+            }
+            match step {
+                Some(true) => {}
+                Some(false) => return Ok(Some(decoded)),
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// The decoder, a code at a time ([`Self::step`]), its codes read most
+    /// significant bit first.
+    pub(crate) struct Decoder {
+        table: Table,
+        bit_size: u8,
+        prev: Option<usize>,
+        /// Bits taken from the input and not read yet, the last `bits` of `buffer`.
+        buffer: u64,
+        bits: u8,
+    }
+
+    impl Decoder {
+        pub(crate) fn new(early_change: bool) -> Self {
+            let table = Table::new(early_change);
+            Self {
+                bit_size: table.code_length(),
+                table,
+                prev: None,
+                buffer: 0,
+                bits: 0,
+            }
+        }
+
+        /// The next `bit_size` bits; `None` where the input ends first.
+        fn code(&mut self, input: &mut impl Input, meter: &Meter<'_>) -> Option<usize> {
+            while self.bits < self.bit_size {
+                self.buffer = (self.buffer << 8) | u64::from(input.next(meter)?);
+                self.bits += 8;
+            }
+            self.bits -= self.bit_size;
+            Some(((self.buffer >> self.bits) & ((1 << self.bit_size) - 1)) as usize)
+        }
+
+        /// Decodes the next code into `decoded`: false at the end of the data,
+        /// `None` where it is invalid or the meter's hook asks to stop.
+        pub(crate) fn step(
+            &mut self,
+            input: &mut impl Input,
+            decoded: &mut Vec<u8>,
+            meter: &Meter<'_>,
+        ) -> Option<bool> {
+            meter.work(1).ok()?;
+            let next = match self.code(input, meter) {
+                Some(code) => code,
                 None => {
                     warn!("premature EOF in LZW stream, EOD code missing");
-                    return Some(decoded);
+                    return Some(false);
                 }
             };
+            let table = &mut self.table;
 
             match next {
                 CLEAR_TABLE => {
                     table.clear();
-                    prev = None;
-                    bit_size = table.code_length();
+                    self.prev = None;
+                    self.bit_size = table.code_length();
                 }
-                EOD => return Some(decoded),
+                EOD => return Some(false),
                 new => {
                     if new > table.size() {
                         warn!("invalid LZW code: {} (table size: {})", new, table.size());
@@ -615,27 +1033,31 @@ pub(crate) mod lzw {
                     if new < table.size() {
                         let entry = table.get(new)?;
                         let first_byte = entry[0];
+                        meter.work(entry.len()).ok()?;
                         decoded.extend_from_slice(entry);
 
-                        if let Some(prev_code) = prev {
+                        if let Some(prev_code) = self.prev {
                             table.register(prev_code, first_byte);
                         }
-                    } else if new == table.size() && prev.is_some() {
-                        let prev_code = prev.unwrap();
+                    } else if new == table.size()
+                        && let Some(prev_code) = self.prev
+                    {
                         let prev_entry = table.get(prev_code)?;
                         let first_byte = prev_entry[0];
 
                         let new_entry = table.register(prev_code, first_byte)?;
+                        meter.work(new_entry.len()).ok()?;
                         decoded.extend_from_slice(new_entry);
                     } else {
                         warn!("LZW decode error: code {new} not found and prev is None");
                         return None;
                     }
 
-                    bit_size = table.code_length();
-                    prev = Some(new);
+                    self.bit_size = table.code_length();
+                    self.prev = Some(new);
                 }
             }
+            Some(true)
         }
     }
 
@@ -708,22 +1130,17 @@ pub(crate) mod lzw {
     }
 }
 
-struct PredictorParams {
-    predictor: u8,
-    colors: u8,
-    bits_per_component: u8,
-    columns: usize,
-    early_change: bool,
-}
-
-impl PredictorParams {
-    fn bits_per_pixel(&self) -> u8 {
-        self.bits_per_component * self.colors
-    }
-
-    fn row_length_in_bytes(&self) -> usize {
-        (self.columns * self.bits_per_pixel() as usize).div_ceil(8)
-    }
+#[derive(Clone)]
+pub(crate) struct PredictorParams {
+    /// 1 for none, 2 for TIFF prediction, 10 to 15 for PNG prediction.
+    pub(crate) predictor: u8,
+    /// 1 to 32.
+    pub(crate) colors: u8,
+    /// 1, 2, 4, 8 or 16.
+    pub(crate) bits_per_component: u8,
+    /// At least 1, and few enough that a row's bits fit 32 bits.
+    pub(crate) columns: usize,
+    pub(crate) early_change: bool,
 }
 
 impl Default for PredictorParams {
@@ -739,288 +1156,345 @@ impl Default for PredictorParams {
 }
 
 impl PredictorParams {
-    fn from_params(dict: &Dict<'_>) -> Self {
-        Self {
-            predictor: dict.get(PREDICTOR).unwrap_or(1),
-            colors: dict.get(COLORS).unwrap_or(1),
-            bits_per_component: dict.get(BITS_PER_COMPONENT).unwrap_or(8),
-            columns: dict.get(COLUMNS).unwrap_or(1),
-            early_change: dict.get::<u8>(EARLY_CHANGE).map(|e| e != 0).unwrap_or(true),
-        }
-    }
-}
-
-fn apply_predictor(data: Vec<u8>, params: &PredictorParams) -> Option<Vec<u8>> {
-    match params.predictor {
-        1 => Some(data),
-        i => {
-            let is_png_predictor = i >= 10;
-
-            let row_len = params.row_length_in_bytes();
-
-            let total_row_len = if is_png_predictor {
-                // + 1 Because each row must start with the predictor that is used for PNG predictors.
-                row_len + 1
-            } else {
-                row_len
-            };
-
-            let num_rows = data.len() / total_row_len;
-
-            if !matches!(params.bits_per_component, 1 | 2 | 4 | 8 | 16) {
-                warn!("invalid bits per component {}", params.bits_per_component);
-
-                return None;
-            }
-
-            let (bit_size, chunk_len) = if is_png_predictor {
-                (
-                    8,
-                    (params.colors * params.bits_per_component).div_ceil(8) as usize,
-                )
-            } else {
-                (params.bits_per_component, params.colors as usize)
-            };
-
-            if bit_size == 8
-                && let Some(tbpp) = BytesPerPixel::from_row_len(row_len, chunk_len)
-            {
-                return apply_predictor_8bit_png(
-                    data,
-                    i,
-                    is_png_predictor,
-                    row_len,
-                    total_row_len,
-                    num_rows,
-                    tbpp,
-                );
-            }
-
-            let zero_row = vec![0; row_len];
-            let mut prev_row = BitChunks::new(&zero_row, bit_size, chunk_len)?;
-            let zero_col = BitChunk::new(0, chunk_len);
-            let mut out = vec![0; num_rows * row_len];
-            let mut writer = BitWriter::new(&mut out, bit_size)?;
-
-            for in_row in data.chunks_exact(total_row_len) {
-                if is_png_predictor {
-                    let predictor = in_row[0];
-                    let in_data = &in_row[1..];
-                    let in_data_chunks = BitChunks::new(in_data, bit_size, chunk_len)?;
-
-                    match predictor {
-                        1 => apply::<Sub>(
-                            prev_row,
-                            zero_col.clone(),
-                            zero_col.clone(),
-                            in_data_chunks,
-                            &mut writer,
-                            chunk_len,
-                            bit_size,
-                        )?,
-                        2 => apply::<Up>(
-                            prev_row,
-                            zero_col.clone(),
-                            zero_col.clone(),
-                            in_data_chunks,
-                            &mut writer,
-                            chunk_len,
-                            bit_size,
-                        )?,
-                        3 => apply::<Avg>(
-                            prev_row,
-                            zero_col.clone(),
-                            zero_col.clone(),
-                            in_data_chunks,
-                            &mut writer,
-                            chunk_len,
-                            bit_size,
-                        )?,
-                        4 => apply::<Paeth>(
-                            prev_row,
-                            zero_col.clone(),
-                            zero_col.clone(),
-                            in_data_chunks,
-                            &mut writer,
-                            chunk_len,
-                            bit_size,
-                        )?,
-                        _ => {
-                            // Just copy the data.
-                            let mut reader = BitReader::new(in_data);
-
-                            while let Some(data) = reader.read(bit_size) {
-                                writer.write(data);
-                            }
-                        }
-                    }
-                } else if i == 2 {
-                    apply::<Sub>(
-                        prev_row,
-                        zero_col.clone(),
-                        zero_col.clone(),
-                        BitChunks::new(in_row, bit_size, chunk_len)?,
-                        &mut writer,
-                        chunk_len,
-                        bit_size,
-                    );
-                } else {
-                    warn!("unknown predictor {i}");
-
-                    return None;
-                }
-
-                let (data, new_writer) = writer.split_off();
-                writer = new_writer;
-                prev_row = BitChunks::new(data, bit_size, chunk_len)?;
-            }
-
-            Some(out)
-        }
-    }
-}
-
-fn apply_predictor_8bit_png(
-    mut data: Vec<u8>,
-    predictor: u8,
-    is_png_predictor: bool,
-    row_len: usize,
-    total_row_len: usize,
-    num_rows: usize,
-    tbpp: BytesPerPixel,
-) -> Option<Vec<u8>> {
-    if row_len == 0 || total_row_len == 0 {
-        return None;
-    }
-
-    let out_len = num_rows * row_len;
-
-    for row_idx in 0..num_rows {
-        let src_start = row_idx * total_row_len;
-        let dst_start = row_idx * row_len;
-
-        if is_png_predictor {
-            let predictor = data[src_start];
-            data.copy_within(src_start + 1..src_start + 1 + row_len, dst_start);
-
-            let (done, rest) = data.split_at_mut(dst_start);
-            let prev_row = if let Some(prev_start) = done.len().checked_sub(row_len) {
-                &done[prev_start..]
-            } else {
-                &[]
-            };
-            let row = &mut rest[..row_len];
-
-            if let Some(filter) = RowFilter::from_u8(predictor) {
-                png::unfilter(filter, tbpp, prev_row, row);
-            }
-        } else if predictor == 2 {
-            let (done, rest) = data.split_at_mut(dst_start);
-            let prev_row = if let Some(prev_start) = done.len().checked_sub(row_len) {
-                &done[prev_start..]
-            } else {
-                &[]
-            };
-            let row = &mut rest[..row_len];
-            png::unfilter(RowFilter::Sub, tbpp, prev_row, row);
-        } else {
-            warn!("unknown predictor {predictor}");
-
+    /// The parameters of `dict` as `MuPDF` reads them (observed in `PyMuPDF` 1.28.2):
+    /// each number as [`Number::viewer_i32`] gives it, a value that is no number as
+    /// absent. A predictor it does not know is none; under a predictor, colors,
+    /// bits per component or columns below one are their defaults. `None` where it
+    /// refuses the stream: more than 32 colors, bits per component other than 1, 2,
+    /// 4, 8 or 16, or so many columns that a row's bits come near 2^31; also where
+    /// the reading of a number is not established.
+    pub(crate) fn from_params(dict: &Dict<'_>) -> Option<Self> {
+        let read = |key: &[u8], default: i32| match dict.get::<Object<'_>>(key) {
+            Some(Object::Number(n)) => n.viewer_i32(),
+            _ => Some(default),
+        };
+        let mut params = Self {
+            // Read by LZW alone, so a reading not established leaves it the default.
+            early_change: read(EARLY_CHANGE, 1).is_none_or(|e| e != 0),
+            ..Self::default()
+        };
+        params.predictor = match read(PREDICTOR, 1)? {
+            p @ (2 | 10..=15) => p as u8,
+            _ => return Some(params),
+        };
+        let at_least_one = |v: i32, default: i32| if v < 1 { default } else { v };
+        let colors = at_least_one(read(COLORS, 1)?, 1);
+        let bpc = at_least_one(read(BITS_PER_COMPONENT, 8)?, 8);
+        let columns = at_least_one(read(COLUMNS, 1)?, 1);
+        if colors > 32 || !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
             return None;
         }
+        let bits = colors * bpc;
+        if i64::from(columns) * i64::from(bits) > i64::from(i32::MAX - 7)
+            || columns >= i32::MAX / bits
+        {
+            return None;
+        }
+        params.colors = colors as u8;
+        params.bits_per_component = bpc as u8;
+        params.columns = columns as usize;
+        Some(params)
     }
+}
 
-    data.truncate(out_len);
+/// How the rows of a predictor are laid out and reversed.
+#[derive(Clone, Copy)]
+struct Rows {
+    /// The bytes of a decoded row.
+    len: usize,
+    kind: Kind,
+}
 
+#[derive(Clone, Copy)]
+enum Kind {
+    /// A row filter byte before each row, which is unfiltered a byte at a time with
+    /// pixels of `bpp` bytes.
+    Png { bpp: usize },
+    /// TIFF prediction of 8-bit components: each byte adds the one `colors` before.
+    Tiff8 { colors: usize },
+    /// TIFF prediction of components of 1, 2, 4 or 16 bits.
+    Tiff { colors: usize, bpc: u8 },
+}
+
+impl Rows {
+    /// `None` without a predictor.
+    fn of(params: &PredictorParams) -> Option<Self> {
+        let colors = usize::from(params.colors);
+        let bpc = params.bits_per_component;
+        let bits = colors * usize::from(bpc);
+        let len = (bits * params.columns).div_ceil(8);
+        let kind = match params.predictor {
+            1 => return None,
+            2 if bpc == 8 => Kind::Tiff8 { colors },
+            2 => Kind::Tiff { colors, bpc },
+            _ => Kind::Png {
+                bpp: bits.div_ceil(8),
+            },
+        };
+        Some(Self { len, kind })
+    }
+}
+
+/// The data with its predictor reversed, in pieces whose work counts on `meter`;
+/// `None` once its hook asks to stop. A last row cut short is reversed as far as it
+/// goes and kept, as `MuPDF` keeps it: a PNG row needs a byte after its filter byte.
+pub(crate) fn apply_predictor(
+    data: Vec<u8>,
+    params: &PredictorParams,
+    meter: &Meter<'_>,
+) -> Option<Vec<u8>> {
+    let Some(rows) = Rows::of(params) else {
+        return Some(data);
+    };
+    match rows.kind {
+        Kind::Png { bpp } => unpredict_png(data, rows.len, bpp, meter),
+        Kind::Tiff8 { colors } => unpredict_tiff8(data, rows.len, colors, meter),
+        Kind::Tiff { colors, bpc } => {
+            let components = colors * params.columns;
+            unpredict_tiff(data, rows.len, colors, bpc, components, meter)
+        }
+    }
+}
+
+/// The bytes of a part of a row reversed between two polls: whole pixels of `bpp`.
+fn part_len(bpp: usize) -> usize {
+    (POLL_BYTES / bpp).max(1) * bpp
+}
+
+fn unpredict_png(mut data: Vec<u8>, len: usize, bpp: usize, meter: &Meter<'_>) -> Option<Vec<u8>> {
+    let part_len = part_len(bpp);
+    let (mut src, mut dst) = (0, 0);
+    while src < data.len() {
+        let filter = RowFilter::from_u8(data[src]);
+        // The row's bytes after its filter byte, fewer in a last row cut short.
+        let k = (data.len() - src - 1).min(len);
+        for start in (0..k).step_by(part_len) {
+            let end = (start + part_len).min(k);
+            // The row moves left, so the bytes a part overwrites were moved before.
+            data.copy_within(src + 1 + start..src + 1 + end, dst + start);
+            let (done, rest) = data.split_at_mut(dst);
+            let previous = done.len().checked_sub(len).map_or(&[][..], |p| &done[p..]);
+            if let Some(filter) = filter {
+                png::unfilter_part(filter, bpp, previous, &mut rest[..k], start..end);
+            }
+            meter.work(end - start).ok()?;
+        }
+        src += len + 1;
+        dst += k;
+    }
+    data.truncate(dst);
     Some(data)
 }
 
-fn apply<'a, T: Predictor>(
-    prev_row: BitChunks<'a>,
-    mut prev_col: BitChunk,
-    mut top_left: BitChunk,
-    cur_row: BitChunks<'a>,
-    writer: &mut BitWriter<'a>,
-    chunk_len: usize,
-    bit_size: u8,
-) -> Option<()> {
-    for (cur_row, prev_row) in cur_row.zip(prev_row) {
-        let old_pos = writer.cur_pos();
-
-        for (((cur_row, prev_row), prev_col), top_left) in cur_row
-            .iter()
-            .zip(prev_row.iter())
-            .zip(prev_col.iter())
-            .zip(top_left.iter())
-        {
-            // Note that the wrapping behavior when adding inside the predictors is dependent on the
-            // bit size, so it wouldn't be triggered for bits per component < 16. So we mask out
-            // the bytes manually, which is equivalent to a wrapping add.
-            writer.write(
-                T::predict(cur_row, prev_row, prev_col, top_left) as u32 & bit_mask(bit_size),
-            );
+fn unpredict_tiff8(
+    mut data: Vec<u8>,
+    len: usize,
+    colors: usize,
+    meter: &Meter<'_>,
+) -> Option<Vec<u8>> {
+    let part_len = part_len(colors);
+    for row in data.chunks_mut(len) {
+        for start in (0..row.len()).step_by(part_len) {
+            let end = (start + part_len).min(row.len());
+            png::unfilter_part(RowFilter::Sub, colors, &[], row, start..end);
+            meter.work(end - start).ok()?;
         }
-
-        prev_col = {
-            let out_data = writer.get_data();
-            let mut reader = BitReader::new_with(out_data, old_pos);
-            BitChunk::from_reader(&mut reader, bit_size, chunk_len).unwrap()
-        };
-
-        top_left = prev_row;
     }
+    Some(data)
+}
 
+fn unpredict_tiff(
+    mut data: Vec<u8>,
+    len: usize,
+    colors: usize,
+    bpc: u8,
+    components: usize,
+    meter: &Meter<'_>,
+) -> Option<Vec<u8>> {
+    // In a last row cut short inside a 16-bit component, `MuPDF` takes the missing low
+    // byte from where the row before held it, as stored (observed in `PyMuPDF`
+    // 1.28.2; in a first row it reads a byte not established, taken as zero here).
+    let (full, cut) = (data.len() / len, data.len() % len);
+    let missing = match full.checked_sub(1) {
+        Some(before) if bpc == 16 && cut % 2 == 1 => data[before * len + cut],
+        _ => 0,
+    };
+    for row in data.chunks_mut(len) {
+        if bpc == 16 {
+            unpredict_tiff16(row, colors, missing, meter)?;
+        } else {
+            unpredict_tiff_bits(row, colors, bpc, components, meter)?;
+        }
+    }
+    Some(data)
+}
+
+/// A row of 16-bit components, each the sum of itself and the one `colors` before;
+/// a last component cut short takes `missing` as its low byte, and keeps its high one.
+fn unpredict_tiff16(row: &mut [u8], colors: usize, missing: u8, meter: &Meter<'_>) -> Option<()> {
+    let n = row.len().div_ceil(2);
+    let part = part_len(2) / 2;
+    for start in (colors..n).step_by(part) {
+        let end = (start + part).min(n);
+        for s in start..end {
+            let at = |row: &[u8], s: usize| {
+                u16::from_be_bytes([row[2 * s], row.get(2 * s + 1).copied().unwrap_or(missing)])
+            };
+            let [high, low] = at(row, s).wrapping_add(at(row, s - colors)).to_be_bytes();
+            row[2 * s] = high;
+            if let Some(byte) = row.get_mut(2 * s + 1) {
+                *byte = low;
+            }
+        }
+        meter.work(2 * (end - start)).ok()?;
+    }
     Some(())
 }
 
-trait Predictor {
-    fn predict(cur_row: u16, prev_row: u16, prev_col: u16, top_left: u16) -> u16;
-}
-
-struct Sub;
-impl Predictor for Sub {
-    fn predict(cur_row: u16, _: u16, prev_col: u16, _: u16) -> u16 {
-        cur_row.wrapping_add(prev_col)
-    }
-}
-
-struct Up;
-impl Predictor for Up {
-    fn predict(cur_row: u16, prev_row: u16, _: u16, _: u16) -> u16 {
-        cur_row.wrapping_add(prev_row)
-    }
-}
-
-struct Avg;
-impl Predictor for Avg {
-    fn predict(cur_row: u16, prev_row: u16, prev_col: u16, _: u16) -> u16 {
-        cur_row.wrapping_add(((prev_col as u32 + prev_row as u32) / 2) as u16)
-    }
-}
-
-struct Paeth;
-impl Predictor for Paeth {
-    fn predict(cur_row: u16, prev_row: u16, prev_col: u16, top_left: u16) -> u16 {
-        fn paeth(a: u16, b: u16, c: u16) -> u16 {
-            let a = a as i32;
-            let b = b as i32;
-            let c = c as i32;
-
-            let p = a + b - c;
-            let pa = (p - a).abs();
-            let pb = (p - b).abs();
-            let pc = (p - c).abs();
-
-            if pa <= pb && pa <= pc {
-                a as u16
-            } else if pb <= pc {
-                b as u16
-            } else {
-                c as u16
-            }
+/// A row of components of `bpc` (1, 2 or 4) bits, most significant first, each the
+/// sum of itself and the one `colors` before modulo 2^bpc; a row holds `components`,
+/// a last row cut short as many as its bytes do. Bits after the last component of a
+/// row are cleared, as `MuPDF` clears them.
+fn unpredict_tiff_bits(
+    row: &mut [u8],
+    colors: usize,
+    bpc: u8,
+    components: usize,
+    meter: &Meter<'_>,
+) -> Option<()> {
+    let bpc = usize::from(bpc);
+    let n = components.min(row.len() * 8 / bpc);
+    let mask = (1_u8 << bpc) - 1;
+    let shift = |s: usize| 8 - bpc - s * bpc % 8;
+    let part = part_len(1) * 8 / bpc;
+    for start in (colors..n).step_by(part) {
+        let end = (start + part).min(n);
+        for s in start..end {
+            let left = (row[(s - colors) * bpc / 8] >> shift(s - colors)) & mask;
+            let byte = &mut row[s * bpc / 8];
+            let v = ((*byte >> shift(s)) & mask).wrapping_add(left) & mask;
+            *byte = (*byte & !(mask << shift(s))) | (v << shift(s));
         }
+        meter.work((end - start) * bpc / 8 + 1).ok()?;
+    }
+    let used = n * bpc % 8;
+    if used != 0 {
+        row[n * bpc / 8] &= !(0xFF >> used);
+    }
+    Some(())
+}
 
-        cur_row.wrapping_add(paeth(prev_col, prev_row, top_left))
+/// Reverses a predictor row by row, as `apply_predictor` does for the whole data at
+/// once: for PNG prediction and TIFF prediction of 8-bit components, the predictors
+/// that unfilter a byte at a time. A row is reversed in parts, as its bytes arrive.
+#[derive(Clone)]
+pub(crate) struct Unpredictor {
+    is_png_predictor: bool,
+    /// The bytes of a pixel for PNG prediction, of the components of one for TIFF.
+    bpp: usize,
+    /// The previous row, decoded after its predictor byte for PNG predictors; empty
+    /// before the first, as `apply_predictor` passes it.
+    prev: Vec<u8>,
+    row_len: usize,
+    /// The bytes of the row being read that are reversed.
+    done: usize,
+}
+
+impl Unpredictor {
+    /// `None` for predictor 1 (no prediction) and for the TIFF prediction of
+    /// components of other than 8 bits, which only `apply_predictor` reverses.
+    pub(crate) fn new(params: &PredictorParams) -> Option<Self> {
+        let rows = Rows::of(params)?;
+        let (is_png_predictor, bpp) = match rows.kind {
+            Kind::Png { bpp } => (true, bpp),
+            Kind::Tiff8 { colors } => (false, colors),
+            Kind::Tiff { .. } => return None,
+        };
+        Some(Self {
+            is_png_predictor,
+            bpp,
+            prev: Vec::new(),
+            row_len: rows.len,
+            done: 0,
+        })
+    }
+
+    /// The bytes of one encoded row (with its predictor byte for PNG predictors).
+    pub(crate) fn input_len(&self) -> usize {
+        self.row_len + usize::from(self.is_png_predictor)
+    }
+
+    /// The filter of the encoded row read so far, and its bytes after the filter byte.
+    fn split<'b>(&self, input: &'b mut [u8]) -> Option<(Option<RowFilter>, &'b mut [u8])> {
+        if self.is_png_predictor {
+            let (&mut filter, row) = input.split_first_mut()?;
+            Some((RowFilter::from_u8(filter), row))
+        } else {
+            Some((Some(RowFilter::Sub), input))
+        }
+    }
+
+    /// Reverses the predictor over the bytes of `input`, the encoded row read so far,
+    /// that make whole pixels and were not reversed before, once there are at least
+    /// `min` of them.
+    pub(crate) fn advance(&mut self, input: &mut [u8], min: usize) {
+        let (bpp, done) = (self.bpp, self.done);
+        let Some((filter, row)) = self.split(input) else {
+            return;
+        };
+        let end = row.len() / bpp * bpp;
+        if end <= done || end - done < min {
+            return;
+        }
+        if let Some(filter) = filter {
+            png::unfilter_part(filter, bpp, self.row(), row, done..end);
+        }
+        self.done = end;
+    }
+
+    /// Decodes the rest of `input`, which holds the encoded row, whole or the last
+    /// one cut short, and takes it as the previous row ([`Self::row`]), leaving
+    /// `input` empty.
+    pub(crate) fn finish_row(&mut self, input: &mut Vec<u8>) {
+        let (bpp, done) = (self.bpp, self.done);
+        if let Some((Some(filter), row)) = self.split(input) {
+            let end = row.len();
+            png::unfilter_part(filter, bpp, self.row(), row, done.min(end)..end);
+        }
+        core::mem::swap(&mut self.prev, input);
+        input.clear();
+        self.done = 0;
+    }
+
+    /// At the end of the data, decodes the last row cut short that `input` holds, as
+    /// `apply_predictor` keeps it: true where it holds a byte of data.
+    pub(crate) fn finish_cut_row(&mut self, input: &mut Vec<u8>) -> bool {
+        if input.len() <= usize::from(self.is_png_predictor) {
+            input.clear();
+            self.done = 0;
+            return false;
+        }
+        self.finish_row(input);
+        true
+    }
+
+    /// The last row decoded; empty before the first.
+    pub(crate) fn row(&self) -> &[u8] {
+        self.prev
+            .get(usize::from(self.is_png_predictor)..)
+            .unwrap_or_default()
+    }
+
+    /// The heap bytes the previous row holds.
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.prev.capacity()
+    }
+
+    /// Back to the first row.
+    pub(crate) fn reset(&mut self) {
+        self.prev.clear();
+        self.done = 0;
     }
 }
 
@@ -1028,12 +1502,13 @@ impl Predictor for Paeth {
 #[rustfmt::skip]
 mod tests {
     use crate::filter::lzw_flate::{PredictorParams, apply_predictor, flate, lzw};
-    use crate::object::Dict;
+    use crate::filter::png::{self, RowFilter};
+    use crate::work::{Meter, POLL_BYTES};
 
     #[test]
     fn decode_lzw() {
         let input = [0x80, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01];
-        let decoded = lzw::decode(&input, &Dict::default()).unwrap();
+        let decoded = lzw::decode(&input, &PredictorParams::default(), &Meter::default()).unwrap();
 
         assert_eq!(decoded, vec![45, 45, 45, 45, 45, 65, 45, 45, 45, 66]);
     }
@@ -1044,7 +1519,7 @@ mod tests {
             0x78, 0x9c, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x7, 0x0, 0x5, 0x8c, 0x1, 0xf5,
         ];
 
-        let decoded = flate::decode(&input, &Dict::default()).unwrap();
+        let decoded = flate::decode(&input, &PredictorParams::default(), &Meter::default(), false, 0).unwrap();
         assert_eq!(decoded, b"Hello");
     }
 
@@ -1052,10 +1527,35 @@ mod tests {
     fn decode_flate() {
         let input = [0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x7, 0x0];
 
-        let decoded = flate::decode(&input, &Dict::default()).unwrap();
+        let decoded = flate::decode(&input, &PredictorParams::default(), &Meter::default(), false, 0).unwrap();
         assert_eq!(decoded, b"Hello");
     }
-    
+
+    /// As flate2's reader decodes them: a stream cut short yields the bytes it holds,
+    /// and bytes after a stream's end are ignored.
+    #[cfg(feature = "unsafe")]
+    #[test]
+    fn decode_flate_cut_short_or_followed_by_more() {
+        use std::io::{Read, Write};
+        let data: Vec<u8> = (0..300_000_u64).map(|i| (i * i / 7) as u8).collect();
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&data).unwrap();
+        let encoded = encoder.finish().unwrap();
+        let cut = &encoded[..encoded.len() / 2];
+        let mut expected = Vec::new();
+        flate2::read::ZlibDecoder::new(cut)
+            .read_to_end(&mut expected)
+            .unwrap();
+        assert!(expected.len() > POLL_BYTES && data.starts_with(&expected));
+        let decoded = flate::decode(cut, &PredictorParams::default(), &Meter::default(), false, 0);
+        assert_eq!(decoded, Some(expected));
+        let mut followed = encoded.clone();
+        followed.extend(b"more");
+        let decoded = flate::decode(&followed, &PredictorParams::default(), &Meter::default(), false, 0);
+        assert_eq!(decoded, Some(data));
+    }
+
     fn predictor_expected() -> Vec<u8> {
         vec![
             // Row 1
@@ -1077,7 +1577,7 @@ mod tests {
         };
 
         let expected = predictor_expected();
-        let out = apply_predictor(input.to_vec(), &params).unwrap();
+        let out = apply_predictor(input.to_vec(), &params, &Meter::default()).unwrap();
 
         assert_eq!(expected, out);
     }
@@ -1140,5 +1640,35 @@ mod tests {
                 4, 3, 1, 252, 5, 253, 6, 1, 229, 254,
             ],
         );
+    }
+
+    /// Rows wider than a piece, each with another filter, reverse as whole rows do.
+    #[test]
+    fn wide_rows_reverse_as_whole_rows() {
+        let row_len = (2 * POLL_BYTES / 3 + 5) * 3;
+        let mut seed = 7_u32;
+        let mut input = Vec::new();
+        for filter in 0..5 {
+            input.push(filter);
+            input.extend((0..row_len).map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (seed >> 16) as u8
+            }));
+        }
+        let mut expected = Vec::new();
+        for row in input.chunks(row_len + 1) {
+            let mut current = row[1..].to_vec();
+            let previous = &expected[expected.len().saturating_sub(row_len)..];
+            png::unfilter(RowFilter::from_u8(row[0]).unwrap(), 3, previous, &mut current);
+            expected.extend(current);
+        }
+        let params = PredictorParams {
+            predictor: 15,
+            colors: 3,
+            bits_per_component: 8,
+            columns: row_len / 3,
+            early_change: false,
+        };
+        assert_eq!(apply_predictor(input, &params, &Meter::default()).unwrap(), expected);
     }
 }

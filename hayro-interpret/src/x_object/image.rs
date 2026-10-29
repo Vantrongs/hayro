@@ -1,20 +1,21 @@
 use super::decode::{DecodedImage, DecodedMask, decode_image, decode_mask};
-use super::xobject_oc;
 use crate::WarningSinkFn;
 use crate::cache::Cache;
 use crate::color::ColorSpace;
 use crate::context::Context;
 use crate::device::Device;
 use crate::interpret::state::ActiveTransferFunction;
+use crate::ocg::Kept;
 use crate::{BlendMode, CacheKey, Image, ImageDrawProps, RasterImage, StencilImage};
 use hayro_syntax::object::dict::keys::*;
-use hayro_syntax::object::{Name, Object, Stream};
+use hayro_syntax::object::{Dict, Name, Object, Stream};
+use hayro_syntax::work::Meter;
 use kurbo::Affine;
 
 #[derive(Clone)]
 pub(crate) struct ImageXObject<'a> {
-    width: u32,
-    height: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     pub(crate) color_space: Option<ColorSpace>,
     pub(crate) cache: Cache,
     pub(crate) interpolate: bool,
@@ -22,6 +23,9 @@ pub(crate) struct ImageXObject<'a> {
     pub(crate) stream: Stream<'a>,
     pub(crate) transfer_function: Option<ActiveTransferFunction>,
     pub(crate) warning_sink: WarningSinkFn,
+    /// Whether the colour space is a name looked up in the resources (which the spec
+    /// allows only for inline images), so it depends on where the image is drawn.
+    pub(crate) cs_by_name: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -82,6 +86,7 @@ impl<'a> ImageXObject<'a> {
             kind = ImageKind::StencilMask;
         }
 
+        let mut cs_by_name = false;
         let image_cs = if kind.is_mask() {
             // Masks are always single-channel.
             Some(ColorSpace::device_gray())
@@ -97,9 +102,9 @@ impl<'a> ImageXObject<'a> {
                 // Apparently, some PDF producers also do this for normal images,
                 // though the PDF spec forbids it. See https://github.com/LaurenzV/hayro/pull/1311.
                 .or_else(|| {
-                    cs_obj
-                        .and_then(|c| c.into_name())
-                        .and_then(|n| resolve_cs(&n))
+                    let name = cs_obj?.into_name()?;
+                    cs_by_name = true;
+                    resolve_cs(&name)
                 })
         };
 
@@ -125,15 +130,23 @@ impl<'a> ImageXObject<'a> {
             interpolate,
             stream: stream.clone(),
             kind,
+            cs_by_name,
         })
     }
 
-    pub(crate) fn draw<'b>(&self, context: &mut Context<'b>, device: &mut impl Device<'b>) {
+    /// Draws the image, its dictionary `own` held where it was read, whose `/OC`
+    /// decides whether it shows.
+    pub(crate) fn draw<'b>(
+        &self,
+        context: &mut Context<'b>,
+        device: &mut impl Device<'b>,
+        own: &Kept<Dict<'b>, Dict<'a>>,
+    ) {
         if !context.ocg_state.is_visible() {
             return;
         }
 
-        let has_oc = xobject_oc(self.stream.dict(), context);
+        let has_oc = context.ocg_state.begin_named(own, OC);
         if !context.ocg_state.is_visible() {
             if has_oc {
                 context.ocg_state.end_marked_content();
@@ -203,7 +216,7 @@ impl<'a> ImageXObject<'a> {
             return None;
         }
 
-        decode_mask(self, target_dimension)
+        decode_mask(self, target_dimension, &Meter::default())
     }
 
     pub(crate) fn decoded_image(
@@ -214,7 +227,7 @@ impl<'a> ImageXObject<'a> {
             return None;
         }
 
-        decode_image(self, target_dimension)
+        decode_image(self, target_dimension, &Meter::default())
     }
 
     pub(crate) fn width(&self) -> u32 {

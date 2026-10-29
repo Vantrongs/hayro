@@ -1,9 +1,11 @@
 use crate::object::Dict;
 use crate::object::dict::keys::COLOR_TRANSFORM;
 use crate::object::stream::{FilterResult, ImageColorSpace, ImageData, ImageDecodeParams};
+use crate::work::{Meter, POLL_BYTES};
 use alloc::borrow::Cow;
+use alloc::vec::Vec;
 use core::num::NonZeroU32;
-use zune_jpeg::zune_core::bytestream::ZCursor;
+use zune_jpeg::progress::ProgressCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::colorspace::ColorSpace::CMYK;
 use zune_jpeg::zune_core::options::DecoderOptions;
@@ -12,6 +14,7 @@ pub(crate) fn decode(
     data: &[u8],
     params: &Dict<'_>,
     image_params: &ImageDecodeParams,
+    meter: &Meter<'_>,
 ) -> Option<FilterResult<'static>> {
     if image_params.width > u16::MAX as u32 || image_params.height > u16::MAX as u32 {
         return None;
@@ -22,12 +25,13 @@ pub(crate) fn decode(
     // metadata in the PDF image dictionary is correct. Therefore, we first
     // validate the JPEG metadata and patch the data if any of the dimensions
     // are too large (if they are too small, they will just be padded later on).
-    let data = maybe_patch_jpeg_dimensions(data, image_params)?;
+    let data = maybe_patch_jpeg_dimensions(data, image_params, meter)?;
 
     let options = DecoderOptions::default()
         .set_max_width(u16::MAX as usize)
         .set_max_height(u16::MAX as usize);
-    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(&*data), options);
+    let mut decoder =
+        zune_jpeg::JpegDecoder::new_with_options(ProgressCursor::new(&*data, meter), options);
     decoder.decode_headers().ok()?;
 
     let color_transform = params.get::<u8>(COLOR_TRANSFORM);
@@ -60,23 +64,41 @@ pub(crate) fn decode(
         out_colorspace = ColorSpace::RGB;
     }
 
-    decoder.set_options(DecoderOptions::default().jpeg_set_out_colorspace(out_colorspace));
-    let mut decoded = decoder.decode().ok()?;
+    // A frame of height 0 takes its height from a DNL marker after the scan, and the
+    // decoder sizes its output by its height limit before decoding: the limit is the
+    // rows that fit the image dictionary's area at the frame's width, the area that
+    // bounds the frames patched above.
+    let jpeg_width = decoder.dimensions()?.0.max(1);
+    let max_rows =
+        (image_params.width as usize).saturating_mul(image_params.height as usize) / jpeg_width;
+    decoder.set_options(
+        DecoderOptions::default()
+            .set_max_height(max_rows.clamp(1, u16::MAX as usize))
+            .jpeg_set_out_colorspace(out_colorspace),
+    );
+    let mut decoded = decoder.decode_with_progress(meter).ok()?;
 
     if out_colorspace == ColorSpace::YCCK {
         // See <https://github.com/mozilla/pdf.js/blob/69595a29192b7704733404a42a2ebb537601117b/src/core/jpg.js#L1331>
-        for c in decoded.chunks_mut(4) {
-            let y = c[0] as f32;
-            let cb = c[1] as f32;
-            let cr = c[2] as f32;
-            c[0] = (434.456 - y - 1.402 * cr) as u8;
-            c[1] = (119.541 - y + 0.344 * cb + 0.714 * cr) as u8;
-            c[2] = (481.816 - y - 1.772 * cb) as u8;
+        for piece in decoded.chunks_mut(POLL_BYTES) {
+            for c in piece.chunks_mut(4) {
+                let y = c[0] as f32;
+                let cb = c[1] as f32;
+                let cr = c[2] as f32;
+                c[0] = (434.456 - y - 1.402 * cr) as u8;
+                c[1] = (119.541 - y + 0.344 * cb + 0.714 * cr) as u8;
+                c[2] = (481.816 - y - 1.772 * cb) as u8;
+            }
+            meter.work(piece.len()).ok()?;
         }
     }
 
     let width = decoder.dimensions().unwrap().0 as u32;
     let height = decoder.dimensions().unwrap().1 as u32;
+    // A DNL frame whose data ended before its marker has no height.
+    if height == 0 {
+        return None;
+    }
 
     let image_data = ImageData {
         alpha: None,
@@ -101,8 +123,9 @@ pub(crate) fn decode(
 fn maybe_patch_jpeg_dimensions<'a>(
     data: &'a [u8],
     image_params: &ImageDecodeParams,
+    meter: &Meter<'_>,
 ) -> Option<Cow<'a, [u8]>> {
-    let sof_offset = find_sof_marker(data)?;
+    let sof_offset = find_sof_marker(data, meter)?;
 
     let height_offset = sof_offset.checked_add(5)?;
     let width_offset = sof_offset.checked_add(7)?;
@@ -127,17 +150,29 @@ fn maybe_patch_jpeg_dimensions<'a>(
     let target_w = (image_params.width as u16).to_be_bytes();
     let target_h = (image_params.height as u16).to_be_bytes();
 
-    let mut patched = data.to_vec();
+    let mut patched = Vec::with_capacity(data.len());
+    for piece in data.chunks(POLL_BYTES) {
+        patched.extend_from_slice(piece);
+        meter.work(piece.len()).ok()?;
+    }
     patched[height_offset..height_offset.checked_add(2)?].copy_from_slice(&target_h);
     patched[width_offset..width_offset.checked_add(2)?].copy_from_slice(&target_w);
 
     Some(Cow::Owned(patched))
 }
 
-fn find_sof_marker(data: &[u8]) -> Option<usize> {
+/// The offset of the first frame marker; `None` also once `meter`'s hook asks to stop.
+fn find_sof_marker(data: &[u8], meter: &Meter<'_>) -> Option<usize> {
     let mut i = 0_usize;
+    // The offset up to which the scan is counted on `meter`.
+    let mut counted = 0;
 
     while i.checked_add(1).is_some_and(|next| next < data.len()) {
+        if i >= counted + POLL_BYTES {
+            meter.work(i - counted).ok()?;
+            counted = i;
+        }
+
         if data[i] != 0xFF {
             i += 1;
             continue;

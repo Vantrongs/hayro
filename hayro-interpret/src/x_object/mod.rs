@@ -1,9 +1,11 @@
+pub(crate) mod area;
+pub(crate) mod asset;
 mod decode;
 mod form;
 mod image;
 pub(crate) mod soft_mask;
 
-pub(crate) use form::FormXObject;
+pub(crate) use form::{FormXObject, box_and_matrix};
 pub(crate) use image::ImageXObject;
 
 use crate::WarningSinkFn;
@@ -12,7 +14,7 @@ use crate::color::ColorSpace;
 use crate::context::Context;
 use crate::device::Device;
 use crate::interpret::state::ActiveTransferFunction;
-use hayro_syntax::object::Dict;
+use crate::ocg::Kept;
 use hayro_syntax::object::Name;
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::*;
@@ -54,21 +56,13 @@ impl<'a> XObject<'a> {
     ) {
         match self {
             Self::FormXObject(form) => form.draw(resources, context, device),
-            Self::ImageXObject(image) => image.draw(context, device),
+            Self::ImageXObject(image) => {
+                image.draw(
+                    context,
+                    device,
+                    &Kept::Document(image.stream.dict().clone()),
+                );
+            }
         }
     }
-}
-
-fn xobject_oc(dict: &Dict<'_>, context: &mut Context<'_>) -> bool {
-    let Some(oc_dict) = dict.get::<Dict<'_>>(OC) else {
-        return false;
-    };
-
-    if let Some(oc_ref) = dict.get_ref(OC) {
-        context.ocg_state.begin_ocg(&oc_dict, oc_ref.into());
-    } else {
-        context.ocg_state.begin_ocmd(&oc_dict);
-    }
-
-    true
 }

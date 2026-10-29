@@ -1,7 +1,8 @@
 use crate::{Id, SvgRenderer, hash128};
 use hayro_interpret::color::AlphaColor;
 use hayro_interpret::{
-    BlendMode, CacheKey, DrawMode, DrawProps, FillRule, MaskType, Paint, SoftMask, TransferFunction,
+    BlendMode, CacheKey, DrawMode, DrawProps, FillRule, Knockout, MaskType, Paint, SoftMask,
+    TransferFunction,
 };
 use image::DynamicImage;
 use kurbo::{Affine, Rect, Shape};
@@ -23,16 +24,16 @@ impl<'a> SvgRenderer<'a> {
     pub(crate) fn get_mask_id(&mut self, mask: MaskKind<'a>) -> Id {
         match mask {
             MaskKind::SoftMask(mask) => {
-                let cache_key = mask.cache_key();
-
-                if !self.masks.contains(cache_key) {
-                    self.with_dummy(|r| {
-                        mask.interpret(r);
-                    });
+                if let Some(id) = self.soft_masks.get(&mask) {
+                    return *id;
                 }
-
-                self.masks
-                    .insert_with(cache_key, || MaskKind::SoftMask(mask))
+                let mut interpreted = None;
+                self.with_dummy(|r| interpreted = Some(mask.interpret(r)));
+                let id = self.masks.insert(MaskKind::SoftMask(mask));
+                if let Some(interpreted) = interpreted {
+                    self.soft_masks.insert(interpreted, id);
+                }
+                id
             }
             MaskKind::Image(mask) => {
                 let cache_key = hash128(&(
@@ -103,6 +104,7 @@ impl<'a> SvgRenderer<'a> {
                                 paint,
                                 soft_mask: None,
                                 blend_mode: BlendMode::Normal,
+                                knockout: Knockout::None,
                             },
                             &DrawMode::Fill(FillRule::NonZero),
                         );
@@ -110,7 +112,8 @@ impl<'a> SvgRenderer<'a> {
                         self.xml.write_attribute("style", "isolation:isolate");
                     }
 
-                    mask.interpret(self);
+                    // Drawn as when its id was given, for the uses that id serves.
+                    let _ = mask.interpret(self);
 
                     if use_bg {
                         self.xml.end_element();

@@ -12,6 +12,7 @@ use crate::font::true_type::TrueTypeFont;
 use crate::font::type1::Type1Font;
 use crate::font::type3::Type3;
 use crate::interpret::state::State;
+use crate::ocg::OptionalContent;
 use crate::{CMapResolverFn, CacheKey, FontResolverFn, InterpreterSettings, Paint};
 use bitflags::bitflags;
 use hayro_syntax::object::Name;
@@ -29,7 +30,7 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
-mod blob;
+pub(crate) mod blob;
 mod cid;
 mod generated;
 mod glyph_simulator;
@@ -246,6 +247,7 @@ pub struct Type3Glyph<'a> {
     pub(crate) settings: InterpreterSettings,
     pub(crate) nesting_depth: u32,
     pub(crate) char_code: u32,
+    pub(crate) optional_content: Option<Rc<OptionalContent<'a>>>,
 }
 
 /// A glyph defined by PDF drawing instructions.
@@ -277,7 +279,12 @@ impl<'a> Type3Glyph<'a> {
 
 impl CacheKey for Type3Glyph<'_> {
     fn cache_key(&self) -> u128 {
-        hash128(&(self.font.cache_key(), self.glyph_id, self.bbox.cache_key()))
+        hash128(&(
+            self.font.cache_key(),
+            self.glyph_id,
+            self.bbox.cache_key(),
+            self.optional_content.is_some(),
+        ))
     }
 }
 
@@ -392,6 +399,7 @@ impl<'a> Font<'a> {
                     settings: ctx.settings.clone(),
                     nesting_depth,
                     char_code,
+                    optional_content: ctx.ocg_state.content(),
                 };
 
                 Glyph::Type3(Box::new(shape_glyph))
@@ -550,6 +558,34 @@ pub enum FontQuery {
     /// Note that this type of query is currently not supported,
     /// but will be implemented in the future.
     Fallback(FallbackFontQuery),
+    /// A query for the face generated annotation text is set in where it names no
+    /// family a viewer maps to a standard font: rich text (PDF 32000-1 12.7.3.4)
+    /// without a `font-family`, or with an unknown one or the generic `serif`.
+    /// Common viewers use a serif text face there that is wider than Times;
+    /// [`FontQuery::standard_substitute`] gives Times.
+    TextDefault {
+        /// Whether the face is bold.
+        bold: bool,
+        /// Whether the face is italic.
+        italic: bool,
+    },
+}
+
+impl FontQuery {
+    /// The standard font that stands in for the queried one when a resolver has
+    /// nothing closer.
+    pub fn standard_substitute(&self) -> StandardFont {
+        match self {
+            Self::Standard(font) => *font,
+            Self::Fallback(query) => query.pick_standard_font(),
+            Self::TextDefault { bold, italic } => match (bold, italic) {
+                (true, true) => StandardFont::TimesBoldItalic,
+                (true, false) => StandardFont::TimesBold,
+                (false, true) => StandardFont::TimesItalic,
+                (false, false) => StandardFont::TimesRoman,
+            },
+        }
+    }
 }
 
 /// A query for a font with specific properties.
@@ -746,6 +782,15 @@ fn bf_string_from_str(s: &str) -> Option<BfString> {
         (Some(_), Some(_)) => Some(BfString::String(s.to_string())),
         (None, _) => None,
     }
+}
+
+/// The character glyph `name` names by itself, as the Adobe Glyph List or a
+/// `uniXXXX` or `uXXXX` name spells it, without the suffixes and ligatures
+/// [`glyph_name_to_unicode`] reads: what annotations draw a character with.
+pub(crate) fn glyph_name_to_char(name: &str) -> Option<char> {
+    glyph_names::get(name)
+        .and_then(|unicode| unicode.chars().next())
+        .or_else(|| unicode_from_name(name))
 }
 
 pub(crate) fn unicode_from_name(name: &str) -> Option<char> {

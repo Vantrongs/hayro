@@ -7,7 +7,7 @@ use kurbo::Affine;
 /// A copy-on-write group of graphics state parameters.
 struct Group<T> {
     // Sorted by depth, with at most one item per depth.
-    items: Vec<(T, u16)>,
+    items: Vec<(T, usize)>,
 }
 
 impl<T: Clone> Group<T> {
@@ -17,42 +17,39 @@ impl<T: Clone> Group<T> {
         }
     }
 
-    fn get(&self, idx: u16) -> &T {
-        &self.items[idx as usize].0
+    fn get(&self, idx: usize) -> &T {
+        &self.items[idx].0
     }
 
-    fn get_mut(&mut self, idx: &mut u16, depth: u16) -> &mut T {
-        if self.items[*idx as usize].1 != depth {
-            let value = self.items[*idx as usize].0.clone();
+    fn get_mut(&mut self, idx: &mut usize, depth: usize) -> &mut T {
+        if self.items[*idx].1 != depth {
+            let value = self.items[*idx].0.clone();
             self.items.push((value, depth));
-            *idx = (self.items.len() - 1) as u16;
+            *idx = self.items.len() - 1;
         }
 
-        &mut self.items[*idx as usize].0
+        &mut self.items[*idx].0
     }
 
-    fn truncate(&mut self, idx: u16) {
-        self.items.truncate(idx as usize + 1);
+    fn truncate(&mut self, idx: usize) {
+        self.items.truncate(idx + 1);
     }
 }
 
 #[derive(Clone, Copy)]
 struct Frame {
-    ctm: u16,
-    stroke: u16,
-    fill: u16,
-    stroke_props: u16,
-    text: u16,
-    compositing: u16,
-    clips: u32,
+    ctm: usize,
+    stroke: usize,
+    fill: usize,
+    stroke_props: usize,
+    text: usize,
+    compositing: usize,
+    clips: usize,
 }
 
 /// The graphics state stack.
 pub(crate) struct StateStack<'a> {
     frames: Vec<Frame>,
-    // Saves beyond the maximum depth.
-    // TODO: Return an error instead once interpretation is fallible.
-    overflow: usize,
     ctm: Group<Affine>,
     stroke: Group<PaintState<'a>>,
     fill: Group<PaintState<'a>>,
@@ -88,7 +85,6 @@ impl<'a> StateStack<'a> {
                 compositing: 0,
                 clips: 0,
             }],
-            overflow: 0,
             ctm: Group::new(state.ctm),
             stroke: Group::new(state.stroke),
             fill: Group::new(state.fill),
@@ -103,8 +99,8 @@ impl<'a> StateStack<'a> {
         self.frames.last().unwrap()
     }
 
-    fn depth(&self) -> u16 {
-        (self.frames.len() - 1) as u16
+    fn depth(&self) -> usize {
+        self.frames.len() - 1
     }
 
     accessors!(ctm, ctm_mut, ctm, Affine);
@@ -121,36 +117,22 @@ impl<'a> StateStack<'a> {
 
     /// The number of states, including the initial one.
     pub(crate) fn len(&self) -> usize {
-        self.frames.len() + self.overflow
+        self.frames.len()
     }
 
     pub(crate) fn save(&mut self) {
-        if self.frames.len() > u16::MAX as usize {
-            self.overflow += 1;
-            return;
-        }
-
         let mut frame = *self.top();
-        frame.clips = self.clips.len() as u32;
+        frame.clips = self.clips.len();
         self.frames.push(frame);
     }
 
     /// The number of clips to keep when restoring, or `None` if there is nothing to restore.
     pub(crate) fn restore_target_clips(&self) -> Option<usize> {
-        if self.overflow > 0 {
-            return Some(self.clips.len());
-        }
-
-        (self.frames.len() > 1).then(|| self.top().clips as usize)
+        (self.frames.len() > 1).then(|| self.top().clips)
     }
 
     /// Restore the previous state. Excess clips must have been popped already.
     pub(crate) fn restore(&mut self) {
-        if self.overflow > 0 {
-            self.overflow -= 1;
-            return;
-        }
-
         if self.frames.len() <= 1 {
             return;
         }
@@ -187,5 +169,27 @@ impl<'a> StateStack<'a> {
             text_state: self.text().clone(),
             compositing: self.compositing().clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_undoes_saves_past_u16_depth() {
+        let mut stack = StateStack::new(State::default());
+        for _ in 0..70_000 {
+            stack.save();
+        }
+        *stack.ctm_mut() = Affine::translate((10.0, 0.0));
+        stack.save();
+        *stack.ctm_mut() = Affine::translate((30.0, 0.0));
+        stack.push_clip(ClipType::Dummy);
+        assert_eq!(stack.restore_target_clips(), Some(0));
+        stack.pop_clip();
+        stack.restore();
+        assert_eq!(*stack.ctm(), Affine::translate((10.0, 0.0)));
+        assert_eq!(stack.len(), 70_001);
     }
 }

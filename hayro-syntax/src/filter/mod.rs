@@ -4,20 +4,23 @@ mod ascii_85;
 pub(crate) mod ascii_hex;
 #[cfg(feature = "images")]
 mod ccitt;
+pub(crate) mod chain;
 #[cfg(feature = "images")]
 mod dct;
 #[cfg(feature = "images")]
 mod jbig2;
 #[cfg(feature = "images")]
 mod jpx;
-mod lzw_flate;
+pub(crate) mod lzw_flate;
 mod png;
+pub(crate) mod reader;
 mod run_length;
 
 use crate::object::Dict;
 use crate::object::Name;
 use crate::object::dict::keys::*;
 use crate::object::stream::{DecodeFailure, FilterResult, ImageDecodeParams};
+use crate::work::Meter;
 use core::ops::Deref;
 
 /// A data filter.
@@ -81,49 +84,70 @@ impl Filter {
         }
     }
 
+    /// The filter applied to `data`, its work counted on `meter`;
+    /// [`DecodeFailure::Cancelled`] once the meter's hook asks to stop. If `strict`,
+    /// data a lenient decoder would recover part of is a failure. `expected` is the
+    /// size the decoded data should have, 0 where none is known, which a decoder
+    /// that grows its output reserves no more than while it made less.
     pub(crate) fn apply(
         &self,
         data: &[u8],
         params: &Dict<'_>,
         #[cfg_attr(not(feature = "images"), allow(unused))] image_params: &ImageDecodeParams,
+        meter: &Meter<'_>,
+        strict: bool,
+        expected: usize,
     ) -> Result<FilterResult<'static>, DecodeFailure> {
-        let res = match self {
-            Self::AsciiHexDecode => ascii_hex::decode(data)
-                .map(FilterResult::from_data)
-                .ok_or(DecodeFailure::StreamDecode),
-            Self::Ascii85Decode => ascii_85::decode(data)
-                .map(FilterResult::from_data)
-                .ok_or(DecodeFailure::StreamDecode),
-            Self::RunLengthDecode => run_length::decode(data)
-                .map(FilterResult::from_data)
-                .ok_or(DecodeFailure::StreamDecode),
-            Self::LzwDecode => lzw_flate::lzw::decode(data, params)
-                .map(FilterResult::from_data)
-                .ok_or(DecodeFailure::StreamDecode),
-            Self::FlateDecode => lzw_flate::flate::decode(data, params)
-                .map(FilterResult::from_data)
-                .ok_or(DecodeFailure::StreamDecode),
-            #[cfg(feature = "images")]
-            Self::DctDecode => {
-                dct::decode(data, params, image_params).ok_or(DecodeFailure::ImageDecode)
-            }
-            #[cfg(feature = "images")]
-            Self::CcittFaxDecode => {
-                ccitt::decode(data, params, image_params).ok_or(DecodeFailure::ImageDecode)
-            }
-            #[cfg(feature = "images")]
-            Self::Jbig2Decode => {
-                jbig2::decode(data, params, image_params).ok_or(DecodeFailure::ImageDecode)
-            }
-            #[cfg(feature = "images")]
-            Self::JpxDecode => jpx::decode(data, image_params).ok_or(DecodeFailure::ImageDecode),
-            #[cfg(not(feature = "images"))]
-            Self::DctDecode | Self::CcittFaxDecode | Self::Jbig2Decode | Self::JpxDecode => {
-                warn!("image decoding is not supported (enable the `images` feature)");
-                Err(DecodeFailure::ImageDecode)
-            }
-            _ => Err(DecodeFailure::StreamDecode),
-        };
+        // `MuPDF` refuses a stream whose predictor parameters it refuses.
+        let predictor =
+            || lzw_flate::PredictorParams::from_params(params).ok_or(DecodeFailure::StreamDecode);
+        let res =
+            match self {
+                Self::AsciiHexDecode => ascii_hex::decode(data, meter)
+                    .map(FilterResult::from_data)
+                    .ok_or(DecodeFailure::StreamDecode),
+                Self::Ascii85Decode => ascii_85::decode(data, meter)
+                    .map(FilterResult::from_data)
+                    .ok_or(DecodeFailure::StreamDecode),
+                Self::RunLengthDecode => run_length::decode(data, meter)
+                    .map(FilterResult::from_data)
+                    .ok_or(DecodeFailure::StreamDecode),
+                Self::LzwDecode => predictor().and_then(|p| {
+                    lzw_flate::lzw::decode(data, &p, meter)
+                        .map(FilterResult::from_data)
+                        .ok_or(DecodeFailure::StreamDecode)
+                }),
+                Self::FlateDecode => predictor().and_then(|p| {
+                    lzw_flate::flate::decode(data, &p, meter, strict, expected)
+                        .map(FilterResult::from_data)
+                        .ok_or(DecodeFailure::StreamDecode)
+                }),
+                #[cfg(feature = "images")]
+                Self::DctDecode => {
+                    dct::decode(data, params, image_params, meter).ok_or(DecodeFailure::ImageDecode)
+                }
+                #[cfg(feature = "images")]
+                Self::CcittFaxDecode => ccitt::decode(data, params, image_params, meter)
+                    .ok_or(DecodeFailure::ImageDecode),
+                #[cfg(feature = "images")]
+                Self::Jbig2Decode => jbig2::decode(data, params, image_params, meter)
+                    .ok_or(DecodeFailure::ImageDecode),
+                #[cfg(feature = "images")]
+                Self::JpxDecode => {
+                    jpx::decode(data, image_params, meter).ok_or(DecodeFailure::ImageDecode)
+                }
+                #[cfg(not(feature = "images"))]
+                Self::DctDecode | Self::CcittFaxDecode | Self::Jbig2Decode | Self::JpxDecode => {
+                    warn!("image decoding is not supported (enable the `images` feature)");
+                    Err(DecodeFailure::ImageDecode)
+                }
+                _ => Err(DecodeFailure::StreamDecode),
+            };
+
+        // A decoder may end early on a stop as on data cut short.
+        if meter.cancelled() {
+            return Err(DecodeFailure::Cancelled);
+        }
 
         if res.is_err() {
             warn!("failed to apply filter {}", self.debug_name());

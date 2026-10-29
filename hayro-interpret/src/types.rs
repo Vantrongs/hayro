@@ -1,5 +1,6 @@
 use crate::CacheKey;
 use crate::color::Color;
+use crate::interpret::state::ActiveTransferFunction;
 use crate::pattern::Pattern;
 use crate::util::hash128;
 use crate::x_object::ImageXObject;
@@ -7,6 +8,7 @@ use crate::x_object::soft_mask::SoftMask;
 use hayro_syntax::object::Stream;
 use kurbo::{Affine, BezPath, Cap, Join};
 use smallvec::{SmallVec, smallvec};
+use std::sync::Arc;
 
 /// A clip path.
 #[derive(Debug, Clone)]
@@ -45,6 +47,26 @@ impl<'a, 'b> StencilImage<'a, 'b> {
         if let Some(decoded) = self.image_xobject.decoded_mask(target_dimension) {
             func(decoded.luma, &self.paint);
         }
+    }
+
+    /// The paint the mask lets through.
+    pub fn paint(&self) -> &Paint<'a> {
+        &self.paint
+    }
+
+    /// The mask as an owned asset, as [`RasterImage::asset`]: its one plane
+    /// ([`Plane::Image`](crate::Plane::Image)) is the alpha the paint is drawn
+    /// through ([`PixelFormat::Alpha`](crate::PixelFormat::Alpha)), decoded whole when
+    /// opened.
+    pub fn asset(&self) -> crate::ImageAsset {
+        self.image_xobject.asset(self.pixels_key())
+    }
+
+    /// Identifies the alpha the mask decodes to, as [`RasterImage::pixels_key`]: its
+    /// body, which no raster image's key names alone. `None` for an inline mask.
+    pub fn pixels_key(&self) -> Option<u128> {
+        let id = self.image_xobject.stream.identity()?;
+        Some(hash128(&(id, "stencil")))
     }
 
     // These are hidden since clients are supposed to call get the
@@ -104,6 +126,34 @@ impl RasterImage<'_> {
     #[doc(hidden)]
     pub fn height(&self) -> u32 {
         self.0.height()
+    }
+
+    /// The image as an owned asset: a handle that outlives the content stream and
+    /// decodes regions of the image on request, keyed by [`Self::pixels_key`].
+    pub fn asset(&self) -> crate::ImageAsset {
+        self.0.asset(self.pixels_key())
+    }
+
+    /// Identifies the pixels `with_rgba` decodes for a given `target_dimension`: the
+    /// image's body ([`Stream::identity`](hayro_syntax::object::Stream::identity),
+    /// unique among the documents loaded, one for every entry leading to it) and the
+    /// transfer function in effect. `None`
+    /// when there is no object to identify (an inline image) or the colour space is a
+    /// name looked up in the resources where the image is drawn.
+    pub fn pixels_key(&self) -> Option<u128> {
+        let image = &self.0;
+        let id = image.stream.identity()?;
+        if image.cs_by_name {
+            return None;
+        }
+        // Decoding applies the transfer function through these tables
+        // (`decode_image`): a luma image the single one, an RGB one the first three.
+        let tables: SmallVec<[&[u8; 256]; 3]> = match &image.transfer_function {
+            None => SmallVec::new(),
+            Some(ActiveTransferFunction::Single(f)) => smallvec![f.samples()],
+            Some(ActiveTransferFunction::Four(f)) => f[..3].iter().map(|f| f.samples()).collect(),
+        };
+        Some(hash128(&(id, tables)))
     }
 }
 
@@ -280,6 +330,26 @@ pub struct DrawProps<'a> {
     pub soft_mask: Option<SoftMask<'a>>,
     /// The blend mode.
     pub blend_mode: BlendMode,
+    /// How the drawing combines with what the current transparency group drew
+    /// beneath it.
+    pub knockout: Knockout,
+}
+
+/// How a drawing combines with what the current transparency group drew beneath it:
+/// the stroke of a path filled and stroked by one operator, which viewers paint as a
+/// knockout group (PDF 32000-1 11.4.6.2), hides the fill where it covers it. A device
+/// that composites every drawing over shows what the stroke should hide.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Knockout {
+    /// Composited over it.
+    #[default]
+    None,
+    /// Replaces it in proportion to how much of each pixel the drawing covers, so a
+    /// pixel the drawing covers in part is as opaque as the two together.
+    Replace,
+    /// Clears it in proportion to coverage, then is composited over it, so a pixel
+    /// the drawing covers in part shows less of either.
+    ClearThenOver,
 }
 
 /// Properties for an image drawing operation.
@@ -317,8 +387,9 @@ pub struct StrokeProps {
     pub line_join: Join,
     /// The miter limit.
     pub miter_limit: f32,
-    /// The dash array.
-    pub dash_array: SmallVec<[f32; 4]>,
+    /// The dash array, shared by the copies of the graphics state that hold it, so
+    /// that a copy costs the same however long the array is.
+    pub dash_array: Arc<[f32]>,
     /// The dash offset.
     pub dash_offset: f32,
 }
@@ -330,7 +401,7 @@ impl Default for StrokeProps {
             line_cap: Cap::Butt,
             line_join: Join::Miter,
             miter_limit: 10.0,
-            dash_array: smallvec![],
+            dash_array: Arc::default(),
             dash_offset: 0.0,
         }
     }

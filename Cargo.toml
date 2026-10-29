@@ -44,12 +44,15 @@ kurbo = { version = "0.13.0" }
 log = { version = "0.4" }
 resvg = { version = "0.47.0" }
 flate2 = { version = "1" }
+html5ever = { version = "0.39.0" }
+zlib-rs = { version = "0.6.8", default-features = false, features = ["std"] }
 phf = { version = "0.13.1", default-features = false }
 moxcms = { version = "0.8.1" }
-rustc-hash = { version = "2" }
+foldhash = { version = "0.2", default-features = false, features = ["std"] }
 siphasher = "1"
 skrifa = { version = "0.46.0" }
 smallvec = { version = "1" }
+unicode-bidi = { version = "0.3.18", default-features = false, features = ["hardcoded-data"] }
 yoke = { version = "0.8" }
 pdf-writer = { version = "0.15" }
 xmlwriter = { version = "0.1" }
@@ -94,6 +97,8 @@ clippy.debug_assert_with_mut_call = "warn"
 clippy.doc_markdown = "warn"
 clippy.fn_to_numeric_cast_any = "warn"
 clippy.infinite_loop = "warn"
+# A map hashed at random iterates in another order each run (hayro_syntax::hash).
+clippy.iter_over_hash_type = "warn"
 clippy.large_stack_arrays = "warn"
 clippy.mismatching_type_param_order = "warn"
 #clippy.missing_assert_message = "warn"
@@ -121,3 +126,28 @@ strip = "none"
 inherits = "release"
 debug = 1
 overflow-checks = true
+
+[patch.crates-io]
+# Strokes and dashes whose work stays bounded by the view: a dash pattern far finer
+# than a pixel is drawn solid rather than expanded dash by dash. An unclipped layer is
+# composited only where each row drew, which knockout groups rely on.
+vello_common = { git = "https://github.com/Vantrongs/vello", rev = "d8b2846ca4a47479727e36cbf55f27fa757b34cd" }
+vello_cpu = { git = "https://github.com/Vantrongs/vello", rev = "d8b2846ca4a47479727e36cbf55f27fa757b34cd" }
+# `Inflate::try_clone` and `Inflate::allocation_size`, which Flate checkpoints need.
+zlib-rs = { git = "https://github.com/Vantrongs/zlib-rs", rev = "124359709a6ed94bda6fe1ff4d413e23bbae34e5" }
+# `zune_jpeg::rows`, which grayscale JPEG rows need, and tables kept in the
+# decoder, so that a page of many small JPEGs allocates little per image.
+zune-jpeg = { git = "https://github.com/Vantrongs/zune-image", rev = "7bdce7146cecfbde19a9fe735459471610f80cf8" }
+# A tag's duplicate attributes found through a set keyed by the names' text, so
+# that rich text with many attributes on one tag is parsed in linear time
+# (servo/html5ever issue 796), and a `meta` Content-Type cut after `charset`
+# read without a panic (servo/html5ever PR 764, released in 0.40.1).
+html5ever = { git = "https://github.com/Vantrongs/html5ever", rev = "16c09dc3dab410bf600c2a721d8a5dfd500c9324" }
+# Atoms longer than 7 bytes placed by a per-process random hash rather than in
+# 4,096 lists by a fixed one, so that attribute names chosen to share a list do
+# not make interning them quadratic; with upstream's fixes for an uninitialized
+# buffer and a reference count overflow (servo/string-cache PRs 300, 301).
+string_cache = { git = "https://github.com/Vantrongs/string-cache", rev = "fa62c6494ca80e41784fb79760ca2e8e0d079ab4" }
+# `NumberToken`, which writes a copied number as its source writes it: an i32 or
+# f32 cannot hold `4294967297`, `5.0` or `--5` as viewers read them.
+pdf-writer = { git = "https://github.com/Vantrongs/pdf-writer", rev = "daf9012abec3d7284d756c48ae9d5e5e01cf18b6" }
