@@ -112,7 +112,8 @@ impl<'a> JpegStreamed<'a> {
         {
             return Ok(None);
         }
-        let Some(colour) = Colour::new(obj).filter(|c| c.device_bytes() && c.components() == 1)
+        let Some(colour) =
+            Colour::new(obj, meter)?.filter(|c| c.device_bytes() && c.components() == 1)
         else {
             return Ok(None);
         };

@@ -1,9 +1,9 @@
 use super::mask::{DecodedMask, decode_mask};
 use super::{
     ColourKey, DecodeContext, Rows, Texel, complete, decode_context, decode_u8_samples, in_pieces,
-    into_owned, pixel_piece, unpack_samples,
+    into_owned, matte, pixel_piece, unpack_samples,
 };
-use crate::color::{ColorComponents, ColorSpace, ToLuma, ToRgb};
+use crate::color::{ColorSpace, ToLuma, ToRgb};
 use crate::interpret::state::ActiveTransferFunction;
 use crate::x_object::image::ImageXObject;
 use crate::{ImageData, LumaData, RgbData};
@@ -413,12 +413,9 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
     }
 
     fn resolve_matte(&self) -> Option<((LumaData, Rows), [u8; 3])> {
+        let components = self.ctx.color_space.num_components() as usize;
+        let matte = matte(self.obj, components, self.meter).ok()??;
         let s_mask = self.obj.stream.dict().get::<Stream<'_>>(SMASK)?;
-        let matte = s_mask.dict().get::<ColorComponents>(MATTE)?;
-
-        if matte.len() != self.ctx.color_space.num_components() as usize {
-            return None;
-        }
 
         // In theory, matte needs to be applied in the image's original color space,
         // but we always do it in RGB for now.

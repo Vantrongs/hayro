@@ -5,18 +5,18 @@ use super::rows::{DataEnds, MaskRows, MaskSource, RawRow, RawRows, piece_texels,
 use super::{
     DecodeWork, ImageLayout, PixelFormat, Plane, PlaneLayout, Stop, interleave, premultiply,
 };
-use crate::color::{ColorComponents, ColorSpace, ToLuma, ToRgb};
+use crate::color::{ColorSpace, ToLuma, ToRgb};
 use crate::interpret::state::ActiveTransferFunction;
 use crate::x_object::area::Area;
 use crate::x_object::decode::{
     ColourKey, MaskPath, SampleFormat, SampleRows, colour_key, direct_invert, image_decode_params,
-    mask_lut, sample_format, sample_lut, short_rows_transparent, unpack_packed,
+    mask_lut, matte, sample_format, sample_lut, short_rows_transparent, unpack_packed,
     unpremultiply_samples,
 };
 use crate::x_object::image::{ImageKind, ImageXObject};
 use core::ops::Range;
 use hayro_syntax::object::Stream;
-use hayro_syntax::object::dict::keys::{MASK, MATTE, SMASK, SMASK_IN_DATA};
+use hayro_syntax::object::dict::keys::{MASK, SMASK, SMASK_IN_DATA};
 use hayro_syntax::object::stream::{ImageData, OwnedStream};
 use hayro_syntax::work::{Cancelled, Meter};
 use std::sync::OnceLock;
@@ -88,7 +88,10 @@ pub(super) fn incremental_samples(
     let data = obj
         .stream
         .ccitt_image_data(&image_decode_params(obj, meter)?, meter)?;
-    Ok(Grid::of(obj, data.as_ref()).map(|grid| (grid, sample_format(obj, data.as_ref()))))
+    let Some(grid) = Grid::of(obj, data.as_ref()) else {
+        return Ok(None);
+    };
+    Ok(Some((grid, sample_format(obj, data.as_ref(), meter)?)))
 }
 
 /// How stored samples become the texels a request returns: colour, or a stencil
@@ -149,9 +152,12 @@ impl Colour {
     /// The conversion for `obj`'s stored samples, if they are samples of fewer than
     /// eight bits, 8-bit samples of one component or `DeviceRGB` samples used as
     /// stored or inverted, other 8-bit samples of one component, or a stencil mask's
-    /// samples.
-    pub(super) fn new(obj: &ImageXObject<'_>) -> Option<Self> {
-        Self::of(obj, sample_format(obj, None))
+    /// samples. Reading its decode array counts on `meter`.
+    pub(super) fn new(
+        obj: &ImageXObject<'_>,
+        meter: &Meter<'_>,
+    ) -> Result<Option<Self>, Cancelled> {
+        Ok(Self::of(obj, sample_format(obj, None, meter)?))
     }
 
     /// [`Self::new`], for samples of `format` (which a filter may set).
@@ -397,10 +403,7 @@ impl<'a> Alpha<'a> {
     ) -> Result<Self, Stop> {
         let dict = obj.stream.dict();
         let smask = dict.get::<Stream<'_>>(SMASK);
-        let matte = smask
-            .as_ref()
-            .and_then(|s| s.dict().get::<ColorComponents>(MATTE))
-            .filter(|m| m.len() == colour.components);
+        let matte = matte(obj, colour.components, meter)?;
         let in_data = dict.get::<u8>(SMASK_IN_DATA) == Some(1);
         // Only JPX data holds alpha; for other data there is none. `/Matte` takes
         // precedence when the soft mask has the image's size.
@@ -466,7 +469,7 @@ impl<'a> Streamed<'a> {
         let Some(colour) = Colour::of(obj, format) else {
             return Ok(None);
         };
-        let key = colour_key(obj, colour.components);
+        let key = colour_key(obj, colour.components, meter)?;
         let transparent = short_rows_transparent(obj, key.is_some());
         // A stencil mask is alpha alone, as whole decoding reads it.
         let alpha = if colour.is_stencil() {

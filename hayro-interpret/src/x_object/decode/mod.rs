@@ -5,7 +5,7 @@ pub(crate) use image::{DecodedImage, decode_image, direct_invert, unpremultiply_
 pub(crate) use mask::{BILEVEL_MASK_LUT, DecodedMask, MaskPath, decode_mask, mask_lut};
 
 use crate::InterpreterWarning;
-use crate::color::ColorSpace;
+use crate::color::{ColorComponents, ColorSpace};
 use crate::function::interpolate;
 use crate::x_object::image::{ImageKind, ImageXObject};
 use core::ops::Range;
@@ -141,11 +141,13 @@ pub(crate) struct SampleFormat {
     pub(crate) decode_arr: SmallVec<[(f32, f32); 4]>,
 }
 
+/// [`sample_format_with`], with the bits per component of the dictionary.
 pub(crate) fn sample_format(
     obj: &ImageXObject<'_>,
     image_data: Option<&ImageData>,
-) -> SampleFormat {
-    sample_format_with(obj, image_data, dict_bpc(obj))
+    meter: &Meter<'_>,
+) -> Result<SampleFormat, Cancelled> {
+    sample_format_with(obj, image_data, dict_bpc(obj), meter)
 }
 
 /// The parameters `obj`'s filters decode with, at its own size; reading the filters
@@ -164,12 +166,14 @@ fn dict_bpc(obj: &ImageXObject<'_>) -> Option<u8> {
         .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT))
 }
 
-/// [`sample_format`], with the bits per component of the dictionary already read.
+/// How `obj`'s samples are laid out ([`SampleFormat`]), with the bits per component
+/// of the dictionary already read; reading its decode array counts on `meter`.
 fn sample_format_with(
     obj: &ImageXObject<'_>,
     image_data: Option<&ImageData>,
     dict_bpc: Option<u8>,
-) -> SampleFormat {
+    meter: &Meter<'_>,
+) -> Result<SampleFormat, Cancelled> {
     let dict = obj.stream.dict();
     let color_space = obj
         .color_space
@@ -196,41 +200,40 @@ fn sample_format_with(
             .or_else(|| dict.get::<Object<'_>>(DECODE)),
         &color_space,
         bits_per_component,
-    );
+        meter,
+    )?;
 
-    SampleFormat {
+    Ok(SampleFormat {
         color_space,
         bits_per_component,
         decode_arr,
-    }
+    })
 }
 
 /// The decode array of samples of `color_space` and `bits_per_component` that `entry`
 /// gives, one pair per component, as `MuPDF` reads it (observed through `PyMuPDF`
 /// 1.28.2): without an entry, or a null one, the colour space's default; an entry
 /// missing from the array or not a number is 0, and entries past the components'
-/// are ignored; an entry that is no array maps every sample to 0.
+/// are ignored, and not read; an entry that is no array maps every sample to 0.
+/// Reading the array counts on `meter`.
 fn decode_array(
     entry: Option<Object<'_>>,
     color_space: &ColorSpace,
     bits_per_component: u8,
-) -> SmallVec<[(f32, f32); 4]> {
+    meter: &Meter<'_>,
+) -> Result<SmallVec<[(f32, f32); 4]>, Cancelled> {
     let pairs = color_space.num_components() as usize;
-    let values: SmallVec<[f32; 8]> = match entry {
+    let values = match entry {
         None | Some(Object::Null(_)) => {
-            return color_space.default_decode_arr(f32::from(bits_per_component));
+            return Ok(color_space.default_decode_arr(f32::from(bits_per_component)));
         }
-        Some(Object::Array(array)) => array
-            .items::<f32>()
-            .take(2 * pairs)
-            .map(|v| v.unwrap_or(0.0))
-            .collect(),
+        Some(Object::Array(array)) => array.leading::<f32>(2 * pairs, meter)?.entries,
         Some(_) => SmallVec::new(),
     };
-    let value = |i: usize| values.get(i).copied().unwrap_or(0.0);
-    (0..pairs)
+    let value = |i: usize| values.get(i).copied().flatten().unwrap_or(0.0);
+    Ok((0..pairs)
         .map(|c| (value(2 * c), value(2 * c + 1)))
-        .collect()
+        .collect())
 }
 
 /// The parameters `obj`'s filters decode with: where its dictionary gives no bits
@@ -314,11 +317,11 @@ fn decode_context<'a>(
         color_space,
         bits_per_component,
         decode_arr,
-    } = sample_format_with(obj, decoded.image_data.as_ref(), dict_bpc);
+    } = sample_format_with(obj, decoded.image_data.as_ref(), dict_bpc, meter).ok()?;
 
     let components = color_space.num_components() as usize;
     let rows = SampleRows::new(width, components, bits_per_component, height);
-    let key = colour_key(obj, components);
+    let key = colour_key(obj, components, meter).ok()?;
     let transparent = short_rows_transparent(obj, key.is_some());
     let (data, held) = fit_rows(
         core::mem::take(&mut decoded.data),
@@ -415,9 +418,35 @@ pub(crate) fn short_rows_transparent(obj: &ImageXObject<'_>, keyed: bool) -> boo
 /// array, where it gives a range for each component, as `MuPDF` reads it (observed
 /// through `PyMuPDF` 1.28.2): with fewer entries it is no mask, and entries past
 /// those ranges are ignored, and not read: a file may add any number of them.
-pub(crate) fn colour_key(obj: &ImageXObject<'_>, components: usize) -> Option<ColourKey> {
-    let mut entries = obj.stream.dict().get::<Array<'_>>(MASK)?.flex_iter();
-    (0..2 * components).map(|_| entries.next::<u16>()).collect()
+/// Reading the array counts on `meter`.
+pub(crate) fn colour_key(
+    obj: &ImageXObject<'_>,
+    components: usize,
+    meter: &Meter<'_>,
+) -> Result<Option<ColourKey>, Cancelled> {
+    let Some(array) = obj.stream.dict().get::<Array<'_>>(MASK) else {
+        return Ok(None);
+    };
+    Ok(array.leading::<u16>(2 * components, meter)?.at_least())
+}
+
+/// The `/Matte` of `obj`'s soft mask, where it gives a value for each of the image's
+/// `components` and no more: with fewer or more numbers it gives no matte, and the
+/// numbers past one more than those are not read. Reading it counts on `meter`.
+pub(crate) fn matte(
+    obj: &ImageXObject<'_>,
+    components: usize,
+    meter: &Meter<'_>,
+) -> Result<Option<ColorComponents>, Cancelled> {
+    let Some(array) = obj
+        .stream
+        .dict()
+        .get::<Stream<'_>>(SMASK)
+        .and_then(|mask| mask.dict().get::<Array<'_>>(MATTE))
+    else {
+        return Ok(None);
+    };
+    Ok(array.leading::<f32>(components, meter)?.exactly())
 }
 
 /// A colour-key mask: a range of stored values for each component, low then high.

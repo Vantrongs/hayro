@@ -6,6 +6,7 @@ use crate::object::r#ref::MaybeRef;
 use crate::object::{FromBytes, Object, ObjectIdentifier, ObjectLike, Written};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
+use crate::work::{Cancelled, Meter};
 use crate::xref::ContentKey;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
@@ -159,6 +160,35 @@ impl<'a> Array<'a> {
             cursor: self.cursor(),
             ctx: self.ctx().clone(),
         }
+    }
+
+    /// The first `n` entries, and whether the one after them is a `T`, read as
+    /// [`Self::items`] reads them and each counted on `meter` before it is: an array
+    /// read for a few entries costs those, however many follow.
+    #[allow(
+        private_bounds,
+        reason = "users shouldn't be able to implement `ObjectLike` for custom objects."
+    )]
+    pub fn leading<T>(&self, n: usize, meter: &Meter<'_>) -> Result<Leading<T>, Cancelled>
+    where
+        T: ObjectLike<'a>,
+    {
+        let mut items = self.items::<T>();
+        let mut entries = SmallVec::new();
+        let mut more = false;
+        for i in 0..=n {
+            meter.work(LEADING_ENTRY_WORK)?;
+            crate::work::operation(1);
+            let Some(entry) = items.next() else {
+                break;
+            };
+            if i < n {
+                entries.push(entry);
+            } else {
+                more = entry.is_some();
+            }
+        }
+        Ok(Leading { entries, more, n })
     }
 
     /// Return the raw data of the array.
@@ -360,6 +390,39 @@ where
             MaybeRef::Ref(r) => self.raw.ctx.xref().get_with::<T>(r.into(), &self.raw.ctx),
             MaybeRef::NotRef(object) => object.cast::<T>(),
         })
+    }
+}
+
+/// The work an entry [`Array::leading`] reads counts as: the object read.
+const LEADING_ENTRY_WORK: usize = size_of::<Object<'static>>();
+
+/// The first entries of an array ([`Array::leading`]).
+#[derive(Debug, Clone)]
+pub struct Leading<T> {
+    /// Each of the first `n` entries, or of all of a shorter array: a `T`, or `None`
+    /// where it is of another type or a reference to no object.
+    pub entries: SmallVec<[Option<T>; 8]>,
+    /// Whether the entry after them is a `T`.
+    pub more: bool,
+    n: usize,
+}
+
+impl<T> Leading<T> {
+    /// The `n` entries, where the array starts with `n` `T`s or more.
+    pub fn at_least<C: FromIterator<T>>(self) -> Option<C> {
+        if self.entries.len() < self.n {
+            return None;
+        }
+        self.entries.into_iter().collect()
+    }
+
+    /// The `n` entries, where the array starts with `n` `T`s and no more: as reading
+    /// it as a vector of `T`s reads `n` of them.
+    pub fn exactly<C: FromIterator<T>>(self) -> Option<C> {
+        if self.more {
+            return None;
+        }
+        self.at_least()
     }
 }
 
@@ -633,6 +696,82 @@ mod tests {
         let array = numbers(b"[1 2 null 3]");
         assert_eq!(Vec::<f32>::try_from(array.clone()), Ok(vec![1.0, 2.0]));
         assert_eq!(<[f32; 3]>::try_from(array), Err(()));
+    }
+
+    /// Each array of `cases`, as read from its bytes and as parsed once.
+    fn both_readings(f: impl Fn(&[u8], &Array<'_>)) {
+        let cases: [&[u8]; 14] = [
+            b"[]",
+            b"[1]",
+            b"[1 2]",
+            b"[1 2 3]",
+            b"[1 null 2]",
+            b"[1 /N 2 3]",
+            b"[1 2 (x) 3]",
+            b"[1.5 2]",
+            b"[-1 70000 2 3]",
+            b"[1 5 0 R 2 3]",
+            b"[[1] 2]",
+            b"[1 2 3 4 5 6 7 8 9 10]",
+            b"[0 1 % a comment\n 2]",
+            b"[1 2 3 4 /N]",
+        ];
+        let ctx = ReaderContext::new(XRef::dummy(), false);
+        for data in cases {
+            f(data, &numbers(data));
+            let parsed = crate::object::parsed::Top::read(&mut Reader::new(data), data, &ctx)
+                .unwrap()
+                .object(data, &ctx);
+            let Object::Array(parsed) = parsed else {
+                panic!("{data:?} is no array");
+            };
+            f(data, &parsed);
+        }
+    }
+
+    #[test]
+    fn leading_entries_read_as_the_whole_array_does() {
+        use crate::work::Meter;
+        use smallvec::SmallVec;
+        both_readings(|data, array| {
+            for n in 0..6 {
+                let meter = Meter::default();
+                let exactly = array.leading::<f32>(n, &meter).unwrap().exactly();
+                let whole = SmallVec::<[f32; 4]>::try_from(array.clone())
+                    .ok()
+                    .filter(|v| v.len() == n);
+                assert_eq!(exactly, whole, "{data:?} exactly {n}");
+                let at_least = array.leading::<u16>(n, &meter).unwrap().at_least();
+                let mut entries = array.flex_iter();
+                let prefix: Option<SmallVec<[u16; 4]>> =
+                    (0..n).map(|_| entries.next::<u16>()).collect();
+                assert_eq!(at_least, prefix, "{data:?} at least {n}");
+                let leading = array.leading::<f32>(n, &meter).unwrap().entries;
+                let items: Vec<_> = array.items::<f32>().take(n).collect();
+                assert_eq!(leading.as_slice(), items.as_slice(), "{data:?} entries {n}");
+            }
+        });
+    }
+
+    #[test]
+    fn leading_entries_are_counted_and_stop() {
+        use crate::work::Meter;
+        let array = numbers(b"[1 2 3 4 5 6 7 8]");
+        let polls = core::cell::Cell::new(0);
+        let hook = || {
+            polls.set(polls.get() + 1);
+            true
+        };
+        let meter = Meter::new(Some(&hook));
+        let mut read = 0;
+        while array.leading::<f32>(3, &meter).is_ok() {
+            read += 1;
+        }
+        assert!(
+            read > 0 && polls.get() == 1,
+            "{read} reads, {} polls",
+            polls.get()
+        );
     }
 
     #[test]

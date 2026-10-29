@@ -717,3 +717,69 @@ fn oversubscribed_flate_tables_are_metered() {
     }
     assert_metered(shapes);
 }
+
+/// One-pixel 1-bit images whose arrays run on past the entries they are read by,
+/// by a growing number of numbers: a soft mask's `/Matte`, which so gives no
+/// matte, and the image's and the mask's `/Decode`; and a colour key's `/Mask`
+/// and the image's `/Decode`. Opening, requesting and decoding each does the same
+/// work, and gives the same pixels, however many there are.
+#[test]
+fn array_entries_past_those_read_are_not_read() {
+    let bit = zlib(&[0x00]);
+    let shapes = |suffix: &str| {
+        let gray1 = format!("{GRAY1} /Filter /FlateDecode");
+        [
+            (
+                "matte",
+                pdf(&[
+                    (
+                        image(&format!("{gray1} /SMask 4 0 R /Decode [1 0{suffix}]"), 1, 1),
+                        bit.clone(),
+                    ),
+                    (
+                        image(
+                            &format!("{gray1} /Matte [0.5{suffix}] /Decode [1 0{suffix}]"),
+                            1,
+                            1,
+                        ),
+                        bit.clone(),
+                    ),
+                ]),
+            ),
+            (
+                "colour key",
+                pdf(&[(
+                    image(
+                        &format!("{gray1} /Mask [0 0{suffix}] /Decode [1 0{suffix}]"),
+                        1,
+                        1,
+                    ),
+                    bit.clone(),
+                )]),
+            ),
+        ]
+    };
+    let mut first = Vec::new();
+    for numbers in [1, 10_000, 1_000_000] {
+        for (i, (name, pdf)) in shapes(&" 7".repeat(numbers)).into_iter().enumerate() {
+            let pixels = {
+                let asset = asset(&pdf);
+                let mut streamed = asset.open(None, None).unwrap();
+                assert!(is_streamed(&streamed), "{name}");
+                let a = request(&mut streamed, Plane::Image, (1, 1), [0, 0, 1, 1]);
+                let b = request(&mut whole(&asset), Plane::Image, (1, 1), [0, 0, 1, 1]);
+                assert_eq!((a.format, &a.data), (b.format, &b.data), "{name}");
+                (a.format, a.data)
+            };
+            let work = (pixels, measure(&pdf));
+            println!(
+                "{name}, {numbers} numbers past: {:?} {:?}",
+                work.0, work.1.1
+            );
+            match first.get(i) {
+                None => first.push(work),
+                Some(first) => assert_eq!(&work, first, "{name}, {numbers} numbers past"),
+            }
+        }
+    }
+}
