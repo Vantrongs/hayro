@@ -4,15 +4,16 @@ use moxcms::{
     TransformOptions,
 };
 use std::fmt::{Debug, Formatter};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 struct ICCColorRepr {
     number_components: usize,
     is_srgb: bool,
     is_lab: bool,
-    src_profile: Option<ColorProfile>,
-    src_layout: Layout,
-    transform_u8: OnceLock<Option<Arc<Transform8BitExecutor>>>,
+    /// Made with the profile, not when first used: a profile a document keeps does
+    /// not grow when a paint or an image converts through it later, wherever that
+    /// happens.
+    transform_u8: Option<Arc<Transform8BitExecutor>>,
     transform_in_place_u8: Option<Arc<dyn InPlaceTransformExecutor<u8> + Send + Sync>>,
     transform_in_place_luma_u8: Option<Arc<dyn InPlaceTransformExecutor<u8> + Send + Sync>>,
 }
@@ -81,26 +82,23 @@ impl ICCProfile {
         } else {
             None
         };
-        let (src_profile, transform_u8) = if transform_in_place_u8.is_some() {
-            (Some(src_profile), OnceLock::new())
-        } else {
-            let transform_u8 = src_profile
-                .create_transform_8bit(
-                    src_layout,
-                    &dest_profile,
-                    Layout::Rgb,
-                    TransformOptions::default(),
-                )
-                .ok()?;
-            (None, OnceLock::from(Some(transform_u8)))
-        };
+        let transform_u8 = src_profile
+            .create_transform_8bit(
+                src_layout,
+                &dest_profile,
+                Layout::Rgb,
+                TransformOptions::default(),
+            )
+            .ok();
+        // Without either transform the profile converts nothing.
+        if transform_u8.is_none() && transform_in_place_u8.is_none() {
+            return None;
+        }
 
         Some(Self(Arc::new(ICCColorRepr {
             number_components,
             is_srgb,
             is_lab,
-            src_profile,
-            src_layout,
             transform_u8,
             transform_in_place_u8,
             transform_in_place_luma_u8,
@@ -125,21 +123,7 @@ impl ICCProfile {
     }
 
     fn transform_u8(&self) -> Option<&Arc<Transform8BitExecutor>> {
-        self.0
-            .transform_u8
-            .get_or_init(|| {
-                self.0
-                    .src_profile
-                    .as_ref()?
-                    .create_transform_8bit(
-                        self.0.src_layout,
-                        &ColorProfile::new_srgb(),
-                        Layout::Rgb,
-                        TransformOptions::default(),
-                    )
-                    .ok()
-            })
-            .as_ref()
+        self.0.transform_u8.as_ref()
     }
 
     fn transform_in_place_u8(

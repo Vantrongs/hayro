@@ -44,9 +44,9 @@ impl CalGray {
 
     fn u8_lookup(&self) -> Option<&[u8; 256]> {
         self.lookup.get_or_init_with(|input| {
-            Some(Box::new(core::array::from_fn(|index| {
+            Some(core::array::from_fn(|index| {
                 self.convert_value(input[index])
-            })))
+            }))
         })
     }
 }

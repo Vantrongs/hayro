@@ -37,8 +37,11 @@ use std::sync::{Arc, OnceLock};
 /// A storage for the components of colors.
 pub type ColorComponents = SmallVec<[f32; 4]>;
 
+/// A table of what each 8-bit value converts to, made the first time it is used, in
+/// room allocated with it: a colour space a document keeps does not grow when an
+/// image or a paint converts through it later, wherever that happens.
 #[derive(Clone)]
-pub(super) struct U8Lookup<T>(Arc<OnceLock<Option<Box<[T; 256]>>>>);
+pub(super) struct U8Lookup<T>(Arc<OnceLock<Option<[T; 256]>>>);
 
 impl<T> Default for U8Lookup<T> {
     fn default() -> Self {
@@ -55,14 +58,14 @@ impl<T> std::fmt::Debug for U8Lookup<T> {
 impl<T> U8Lookup<T> {
     pub(super) fn get_or_init_with(
         &self,
-        init: impl FnOnce(&[u8; 256]) -> Option<Box<[T; 256]>>,
+        init: impl FnOnce(&[u8; 256]) -> Option<[T; 256]>,
     ) -> Option<&[T; 256]> {
         self.0
             .get_or_init(|| {
                 let input: [u8; 256] = core::array::from_fn(|index| index as u8);
                 init(&input)
             })
-            .as_deref()
+            .as_ref()
     }
 }
 
@@ -72,7 +75,7 @@ impl U8Lookup<[u8; 3]> {
         convert: impl FnOnce(&[u8], &mut [u8]) -> Option<()>,
     ) -> Option<&[[u8; 3]; 256]> {
         self.get_or_init_with(|input| {
-            let mut output = Box::new([[0; 3]; 256]);
+            let mut output = [[0; 3]; 256];
             convert(input, output.as_flattened_mut())?;
             Some(output)
         })

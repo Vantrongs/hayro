@@ -1549,6 +1549,18 @@ std::thread_local! {
 #[derive(Debug, Clone)]
 pub struct XRef(Inner);
 
+/// A reader of a document apart from the table it was made from
+/// ([`XRef::detached`]): what is read through it is kept by it alone.
+#[derive(Debug, Clone)]
+pub struct Detached(XRef);
+
+impl Detached {
+    /// The reader's table.
+    pub(crate) fn xref(&self) -> &XRef {
+        &self.0
+    }
+}
+
 impl XRef {
     /// The table `map` of the file `data`, with what reading it found besides,
     /// `rebuilt`, decrypted by `decryptor`, its trailer not read yet.
@@ -1681,6 +1693,33 @@ impl XRef {
             Inner::Dummy => unreachable!(),
             Inner::Some(repr) => Arc::make_mut(repr),
         }
+    }
+
+    /// A reader of this table's document that keeps what its reads keep (the object
+    /// streams they decode, the bodies they parse) in stores of its own: so nothing
+    /// read through it is kept by this table, and what holds it holds what was read
+    /// through it. It shares with this table what reading does not change: the file,
+    /// its entries, and where its objects and, once found, its `endstream`s are.
+    pub fn detached(&self) -> Detached {
+        Detached(match &self.0 {
+            Inner::Dummy => Self(Inner::Dummy),
+            Inner::Some(repr) => {
+                let ends = if repr.layout.ends.get().is_some() {
+                    repr.layout.ends.clone()
+                } else {
+                    Arc::default()
+                };
+                Self(Inner::Some(Arc::new(SomeRepr {
+                    data: Arc::new(Data::new(repr.data.get().clone())),
+                    shapes: Arc::default(),
+                    layout: Layout {
+                        starts: repr.layout.starts.clone(),
+                        ends,
+                    },
+                    ..SomeRepr::clone(repr)
+                })))
+            }
+        })
     }
 
     pub(crate) fn dummy() -> &'static Self {
@@ -3818,6 +3857,53 @@ mod tests {
         out.extend(data);
         out.extend(format!("\nendstream\nendobj\nstartxref\n{offset}\n%%EOF\n").bytes());
         out
+    }
+
+    /// How many object streams `xref` keeps decoded.
+    fn kept_streams(xref: &XRef) -> usize {
+        match &xref.0 {
+            Inner::Some(repr) => repr.data.kept_streams(),
+            Inner::Dummy => 0,
+        }
+    }
+
+    /// A stream read again through an owned handle on a detached reader reads what
+    /// its dictionary names (here its `/DecodeParms`, in an object stream) through the
+    /// reader, which keeps it: the table it was first read through keeps nothing.
+    #[test]
+    fn an_owned_stream_keeps_nothing_in_the_table_it_was_read_through() {
+        let image = "<< /Filter /ASCIIHexDecode /DecodeParms 5 0 R /Length 7 >>\nstream\n616263>\nendstream";
+        let objstm = "5 0 << /Predictor 1 >>";
+        let objects = [
+            (1, CATALOG.to_owned()),
+            (2, TREE.to_owned()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>".to_owned(),
+            ),
+            (4, image.to_owned()),
+            (
+                6,
+                format!(
+                    "<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n{objstm}\nendstream",
+                    objstm.len()
+                ),
+            ),
+        ];
+        let pdf = crate::Pdf::new(file_with_stream_table(&objects, &[(5, 6, 0)])).unwrap();
+        let xref = pdf.xref();
+        let stream = xref.get::<Stream<'_>>(ObjectIdentifier::new(4, 0)).unwrap();
+        let before = kept_streams(xref);
+        let reader = xref.detached();
+        let owned = stream.to_owned_stream(Some(&reader));
+        assert_eq!(owned.get().unwrap().decoded().unwrap().as_ref(), b"abc");
+        assert_eq!(
+            (kept_streams(xref), kept_streams(reader.xref())),
+            (before, 1)
+        );
+        // Read through the table itself, the object stream is kept there.
+        assert_eq!(stream.decoded().unwrap().as_ref(), b"abc");
+        assert_eq!(kept_streams(xref), before + 1);
     }
 
     /// The size and content of the one page `file` opens to.

@@ -53,7 +53,7 @@ impl OwnedStream {
             return None;
         }
         let bytes = match &self.0 {
-            OwnedInner::Indirect { xref, .. } => xref.file_data()?.clone(),
+            OwnedInner::Indirect { xref, .. } => xref.xref().file_data()?.clone(),
             OwnedInner::Inline { data, .. } => PdfData::from(Arc::new(data.clone())),
         };
         let all = bytes.as_ref();

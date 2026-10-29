@@ -10,6 +10,7 @@ use crate::{BlendMode, CacheKey, Image, ImageDrawProps, RasterImage, StencilImag
 use hayro_syntax::object::dict::keys::*;
 use hayro_syntax::object::{Dict, Name, Object, Stream};
 use hayro_syntax::work::Meter;
+use hayro_syntax::xref::Detached;
 use kurbo::Affine;
 
 #[derive(Clone)]
@@ -26,6 +27,10 @@ pub(crate) struct ImageXObject<'a> {
     /// Whether the colour space is a name looked up in the resources (which the spec
     /// allows only for inline images), so it depends on where the image is drawn.
     pub(crate) cs_by_name: bool,
+    /// What its data are read through once it is drawn: a reader apart from the
+    /// table the image was read through (`Context::reader`), or, without one, a
+    /// reader of its own.
+    pub(crate) reader: Option<Detached>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -131,6 +136,7 @@ impl<'a> ImageXObject<'a> {
             stream: stream.clone(),
             kind,
             cs_by_name,
+            reader: None,
         })
     }
 
@@ -185,13 +191,17 @@ impl<'a> ImageXObject<'a> {
             blend_mode,
         );
 
+        let drawn = ImageXObject {
+            reader: Some(context.reader().clone()),
+            ..self.clone()
+        };
         let image = if self.kind.is_mask() {
             Image::Stencil(StencilImage {
                 paint: context.get_paint(false),
-                image_xobject: self.clone(),
+                image_xobject: drawn,
             })
         } else {
-            Image::Raster(RasterImage(self.clone()))
+            Image::Raster(RasterImage(drawn))
         };
 
         device.draw_image(
@@ -216,7 +226,7 @@ impl<'a> ImageXObject<'a> {
             return None;
         }
 
-        decode_mask(self, target_dimension, &Meter::default())
+        self.apart(|image| decode_mask(image, target_dimension, &Meter::default()))?
     }
 
     pub(crate) fn decoded_image(
@@ -227,7 +237,28 @@ impl<'a> ImageXObject<'a> {
             return None;
         }
 
-        decode_image(self, target_dimension, &Meter::default())
+        self.apart(|image| decode_image(image, target_dimension, &Meter::default()))?
+    }
+
+    /// `f` of the image read again through its reader ([`Self::reader`]), so that
+    /// decoding it keeps nothing in the table it was read through; `None` where it
+    /// cannot be read again.
+    fn apart<R>(&self, f: impl FnOnce(&ImageXObject<'_>) -> R) -> Option<R> {
+        let owned = self.stream.to_owned_stream(self.reader.as_ref());
+        let image = ImageXObject {
+            width: self.width,
+            height: self.height,
+            color_space: self.color_space.clone(),
+            cache: self.cache.clone(),
+            interpolate: self.interpolate,
+            kind: self.kind,
+            stream: owned.get()?,
+            transfer_function: self.transfer_function.clone(),
+            warning_sink: self.warning_sink.clone(),
+            cs_by_name: self.cs_by_name,
+            reader: None,
+        };
+        Some(f(&image))
     }
 
     pub(crate) fn width(&self) -> u32 {

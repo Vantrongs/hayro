@@ -91,6 +91,12 @@ impl Data {
         }
     }
 
+    /// How many object streams are kept decoded.
+    #[cfg(test)]
+    pub(crate) fn kept_streams(&self) -> usize {
+        self.map.get().len()
+    }
+
     /// Get access to the original data of the PDF.
     pub(crate) fn get(&self) -> &PdfData {
         &self.data

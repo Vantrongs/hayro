@@ -30,6 +30,12 @@ use streamed::Streamed;
 /// inline image's bytes), resolved colour space, transfer function, interpolation
 /// and masks, without the content stream or resources it was drawn from. It holds no
 /// decoded pixels; [`ImageAsset::open`] reads it. Cheap to clone.
+///
+/// Its stream is read through a reader of the document apart from the table it was
+/// drawn from ([`XRef::detached`](hayro_syntax::xref::XRef::detached)), shared by the
+/// images drawn in one context: what decoding it reads (its filters' parameters, its
+/// masks) is kept with the assets, not in the document, which a renderer may keep
+/// open while it draws other pages.
 #[derive(Clone)]
 pub struct ImageAsset(Arc<AssetData>);
 
@@ -52,7 +58,7 @@ struct AssetData {
 impl ImageXObject<'_> {
     pub(crate) fn asset(&self, key: Option<u128>) -> ImageAsset {
         ImageAsset(Arc::new(AssetData {
-            stream: self.stream.to_owned_stream(),
+            stream: self.stream.to_owned_stream(self.reader.as_ref()),
             checkpoints: Checkpoints::default(),
             mask_height: MaskHeight::new(),
             width: self.width(),
@@ -109,6 +115,7 @@ impl ImageAsset {
             transfer_function: a.transfer_function.clone(),
             warning_sink: a.warning_sink.clone(),
             cs_by_name: a.cs_by_name,
+            reader: None,
         })
     }
 

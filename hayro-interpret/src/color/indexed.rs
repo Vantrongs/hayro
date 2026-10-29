@@ -89,7 +89,7 @@ impl Indexed {
                 return None;
             }
 
-            Some(Box::new(core::array::from_fn(|index| rgb[index][0])))
+            Some(core::array::from_fn(|index| rgb[index][0]))
         })
     }
 }
