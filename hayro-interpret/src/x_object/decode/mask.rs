@@ -213,7 +213,7 @@ fn decode_mask_data(
     let data = match path {
         MaskPath::Bilevel { invert } => decode_bilevel_mask_data(&ctx, invert, meter)?,
         MaskPath::Bytes { invert } => {
-            let mut decoded = into_owned(ctx.decoded.data, meter)?;
+            let mut decoded = into_owned(ctx.decoded.data, 0, meter)?;
             if invert {
                 invert_bytes(&mut decoded, meter)?;
             }
@@ -231,7 +231,7 @@ fn decode_mask_data(
                 meter,
             )?;
 
-            let mut decoded = Vec::with_capacity(components.len());
+            let mut decoded = meter.room(components.len());
 
             // Whole pixels a piece, as `chunks` splits them.
             let piece_len = pixel_piece(num_components) * num_components.max(1);
@@ -270,7 +270,7 @@ fn decode_bilevel_mask_data(
     let full_bytes = width / 8;
     let tail_bits = width % 8;
     let lut = &**BILEVEL_MASK_LUT;
-    let mut out = Vec::with_capacity(width.saturating_mul(height));
+    let mut out = meter.room(width.saturating_mul(height));
     // To avoid repeatedly calling `extend`, which turns out to be very
     // expensive.
     let mut buffer = [[0; 8]; 32];

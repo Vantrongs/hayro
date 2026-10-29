@@ -1,6 +1,5 @@
 //! Work counted as it is done, so that whoever asked for it can stop it.
 
-#[cfg(any(feature = "unsafe", feature = "images"))]
 use alloc::vec::Vec;
 use core::cell::Cell;
 
@@ -78,6 +77,29 @@ std::thread_local! {
     /// Debug builds only.
     #[doc(hidden)]
     pub static STATE_COPIED: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(all(debug_assertions, feature = "std"))]
+std::thread_local! {
+    /// The bytes of decoders' states made on this thread ([`Meter::making_state`]):
+    /// what tests tell the work of making decoders from that of the data by. Debug
+    /// builds only.
+    #[doc(hidden)]
+    pub static STATE_MADE: Cell<usize> = const { Cell::new(0) };
+    /// How many decoders' states [`STATE_MADE`] counts. Debug builds only.
+    #[doc(hidden)]
+    pub static STATES_MADE: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(all(debug_assertions, feature = "std"))]
+std::thread_local! {
+    /// The bytes of the room made on this thread by [`Meter::room`] and
+    /// [`Meter::reserve`], which is filled under a meter, a counted piece at a time:
+    /// what tests tell an allocation whose filling is counted from one that copies or
+    /// makes its bytes uncounted by.
+    /// Debug builds only.
+    #[doc(hidden)]
+    pub static RESERVED: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Counts a byte a reader looked at ([`EXAMINED`]).
@@ -159,6 +181,20 @@ impl<'a> Meter<'a> {
         }
     }
 
+    /// Counts a decoder's state of `bytes` about to be made as the work of making it,
+    /// so that making any number of decoders, over however little data, polls the
+    /// hook.
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn making_state(&self, bytes: usize) -> Result<(), Cancelled> {
+        self.work(bytes)?;
+        #[cfg(all(debug_assertions, feature = "std"))]
+        {
+            STATE_MADE.set(STATE_MADE.get() + bytes);
+            STATES_MADE.set(STATES_MADE.get() + 1);
+        }
+        Ok(())
+    }
+
     /// Counts the copy of a decoder's state of `bytes`, copied whole, at most
     /// [`POLL_BYTES`] so that the copy stays within the work between two polls; to
     /// be called before the copy, which a stop then saves.
@@ -177,12 +213,50 @@ impl<'a> Meter<'a> {
     /// polls a piece, and a stop leaves the rest uncopied.
     #[cfg(any(feature = "unsafe", feature = "images"))]
     pub(crate) fn copied<T: Copy>(&self, from: &[T]) -> Result<Vec<T>, Cancelled> {
-        let mut to = Vec::with_capacity(from.len());
+        let mut to = self.room(from.len());
         for piece in from.chunks((POLL_BYTES / size_of::<T>().max(1)).max(1)) {
             self.copying(size_of_val(piece))?;
             to.extend_from_slice(piece);
         }
         Ok(to)
+    }
+
+    /// Room in `buf` for `additional` more items, as [`Vec::reserve`] makes it, to be
+    /// filled under this meter a counted piece at a time, as [`Self::room`]'s is. Where
+    /// the items must move, the allocator moves them as it can: glibc remaps a block
+    /// above its mmap threshold and grows one at the top of its heap in place, so no
+    /// move is counted as work, and none holds the old block besides the new across a
+    /// poll. The one way a buffer that grows with the data grows.
+    pub fn reserve<T>(&self, buf: &mut Vec<T>, additional: usize) {
+        let before = buf.capacity();
+        buf.reserve(additional);
+        self.grown((buf.capacity() - before) * size_of::<T>());
+    }
+
+    /// [`Self::reserve`], with room for `additional` more items and no more.
+    pub fn reserve_exact<T>(&self, buf: &mut Vec<T>, additional: usize) {
+        let before = buf.capacity();
+        buf.reserve_exact(additional);
+        self.grown((buf.capacity() - before) * size_of::<T>());
+    }
+
+    /// Notes room of `bytes` made ([`RESERVED`]).
+    #[allow(clippy::unused_self)]
+    fn grown(&self, bytes: usize) {
+        #[cfg(all(debug_assertions, feature = "std"))]
+        RESERVED.set(RESERVED.get() + bytes);
+        #[cfg(not(all(debug_assertions, feature = "std")))]
+        let _ = bytes;
+    }
+
+    /// An empty vector with room for `capacity` items, to be filled under this meter a
+    /// counted piece at a time: the room is mapped as it is written, so allocating it
+    /// is no work of its own ([`RESERVED`]). The one way a buffer whose size grows
+    /// with the data is allocated before it is filled.
+    pub fn room<T>(&self, capacity: usize) -> Vec<T> {
+        let room = Vec::with_capacity(capacity);
+        self.grown(room.capacity() * size_of::<T>());
+        room
     }
 
     /// The work that can be done before the hook is polled again; 0 once it asked to

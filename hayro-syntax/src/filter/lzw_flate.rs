@@ -107,6 +107,12 @@ pub(crate) mod flate {
         expected: usize,
         limit: usize,
     ) -> Result<Inflated, ()> {
+        if meter
+            .making_state(crate::filter::reader::inflate_heap())
+            .is_err()
+        {
+            return Ok(Inflated::Cancelled);
+        }
         let mut decoder = zlib_rs::Inflate::new(zlib, 15);
         let mut out = Vec::new();
         // The input bytes the decoder took, and those it was offered and counted.
@@ -114,7 +120,8 @@ pub(crate) mod flate {
         loop {
             if out.len() == out.capacity() {
                 let made = out.len();
-                out.reserve_exact(room(made, data.len(), expected, limit) - made);
+                let room = room(made, data.len(), expected, limit) - made;
+                meter.reserve_exact(&mut out, room);
             }
             // Input is offered half of POLL_BYTES at a time and counted before it is
             // taken, and output is made no further than the next poll, so at most
@@ -355,13 +362,14 @@ pub(crate) mod flate {
 
         /// Makes room in `output` for `n` more bytes where it has none, as pushing
         /// them grows a `Vec` (as upstream's decoder grows its output), to at least
-        /// twice the room; but no further than `most` where that holds them.
+        /// twice the room; but no further than `most` where that holds them. The room
+        /// is made on `meter` ([`Meter::reserve_exact`]).
         #[inline]
-        fn grow(output: &mut Vec<u8>, n: usize, most: usize) {
+        fn grow(output: &mut Vec<u8>, n: usize, most: usize, meter: &Meter<'_>) {
             let (len, room) = (output.len(), output.capacity());
             if len + n > room {
                 let doubled = (2 * room).max(len + n).max(8);
-                output.reserve_exact(doubled.min(most.max(len + n)) - len);
+                meter.reserve_exact(output, doubled.min(most.max(len + n)) - len);
             }
         }
 
@@ -673,7 +681,7 @@ pub(crate) mod flate {
                         return true;
                     }
                     self.stored -= bytes.len();
-                    grow(&mut self.output, bytes.len(), self.most);
+                    grow(&mut self.output, bytes.len(), self.most, meter);
                     self.output.extend_from_slice(bytes);
                 }
                 true
@@ -705,7 +713,7 @@ pub(crate) mod flate {
                     };
 
                     if code1 < 256 {
-                        grow(&mut self.output, 1, self.most);
+                        grow(&mut self.output, 1, self.most, meter);
                         self.output.push(code1 as u8);
                         meter.work(1)?;
                     } else if code1 == 256 {
@@ -766,7 +774,7 @@ pub(crate) mod flate {
                         } else {
                             for _ in 0..length {
                                 let byte = self.output[self.output.len() - distance];
-                                grow(&mut self.output, 1, self.most);
+                                grow(&mut self.output, 1, self.most, meter);
                                 self.output.push(byte);
                             }
                         }
@@ -1249,7 +1257,7 @@ pub(crate) mod lzw {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(crate) struct PredictorParams {
     /// 1 for none, 2 for TIFF prediction, 10 to 15 for PNG prediction.
     pub(crate) predictor: u8,
@@ -1713,7 +1721,10 @@ impl PngRows {
         let len = self.row_len + 1;
         while self.input.len() < len {
             let have = self.input.len();
-            self.input.resize(len.min(have + TIFF_PIECE), 0);
+            let next = len.min(have + TIFF_PIECE);
+            // A wide row's room grows on the meter, not between two polls.
+            meter.reserve(&mut self.input, next - have);
+            self.input.resize(next, 0);
             let read = read(&mut self.input[have..]);
             self.input.truncate(have + *read.as_ref().unwrap_or(&0));
             if read? == 0 {

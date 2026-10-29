@@ -61,7 +61,7 @@ fn read_all(
 fn the_reader_reads_what_strict_decoding_returns() {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let mut outcomes = BTreeMap::new();
-    for case in 0..1500 {
+    for case in 0..3000 {
         let mut encoded = data(&mut rng);
         let (mut filters, mut params) = (Vec::new(), Vec::new());
         for _ in 0..1 + rng.below(3) {
@@ -478,7 +478,7 @@ fn deep_chains_are_read_on_a_small_stack_in_memory_of_their_filters() {
 #[test]
 #[cfg(debug_assertions)]
 fn nested_bad_checksums_are_read_with_work_linear_in_their_number() {
-    use hayro_syntax::work::TOLD;
+    use hayro_syntax::work::{STATE_MADE, STATES_MADE, TOLD};
     let data = b"0 0 1 rg 20 20 160 160 re f\n".repeat(40);
     for n in [16, 32, 64, 128] {
         let mut encoded = data.clone();
@@ -495,12 +495,20 @@ fn nested_bad_checksums_are_read_with_work_linear_in_their_number() {
         let stream = object_3(&pdf);
         assert_eq!(stream.decoded_strict().unwrap().as_ref(), data, "{n}");
         TOLD.set(0);
+        STATE_MADE.set(0);
+        STATES_MADE.set(0);
         let mut reader = stream
             .decoded_strict_reader(&Meter::default())
             .unwrap()
             .unwrap();
         let (read, _) = read_all(&mut reader, &mut Rng(5), &Meter::default());
-        let work = TOLD.get();
+        // The decoders' states made count apart, two at most for each filter.
+        let work = TOLD.get() - STATE_MADE.get();
+        let states = STATES_MADE.get();
+        assert!(
+            states <= 2 * n,
+            "{n} filters: {states} decoders' states made"
+        );
         assert_eq!(read, Ok(data.clone()), "{n}");
         println!("{n} filters: work {work} for {made} bytes made");
         // Each filter takes its data and makes its output with zlib, then with the

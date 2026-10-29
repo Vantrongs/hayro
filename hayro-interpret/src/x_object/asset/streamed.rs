@@ -77,16 +77,18 @@ impl Grid {
 }
 
 /// The grid and format of `obj`'s samples, as whole decoding reads them, where its
-/// filters allow reading them incrementally.
-pub(super) fn incremental_samples(obj: &ImageXObject<'_>) -> Option<(Grid, SampleFormat)> {
-    if !obj.stream.image_reads_incrementally() {
-        return None;
+/// filters allow reading them incrementally; reading the filters counts on `meter`.
+pub(super) fn incremental_samples(
+    obj: &ImageXObject<'_>,
+    meter: &Meter<'_>,
+) -> Result<Option<(Grid, SampleFormat)>, Cancelled> {
+    if !obj.stream.image_reads_incrementally(meter)? {
+        return Ok(None);
     }
-    let data = obj.stream.ccitt_image_data(&image_decode_params(obj));
-    Some((
-        Grid::of(obj, data.as_ref())?,
-        sample_format(obj, data.as_ref()),
-    ))
+    let data = obj
+        .stream
+        .ccitt_image_data(&image_decode_params(obj, meter)?, meter)?;
+    Ok(Grid::of(obj, data.as_ref()).map(|grid| (grid, sample_format(obj, data.as_ref()))))
 }
 
 /// How stored samples become the texels a request returns: colour, or a stencil
@@ -457,7 +459,7 @@ impl<'a> Streamed<'a> {
         ends: &'a DataEnds,
         meter: &Meter<'_>,
     ) -> Result<Option<Self>, Stop> {
-        let Some((grid, format)) = incremental_samples(obj) else {
+        let Some((grid, format)) = incremental_samples(obj, meter)? else {
             return Ok(None);
         };
         let Some(colour) = Colour::of(obj, format) else {
@@ -635,7 +637,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
         let n = colour.components();
         let row_bytes = image.rows().row_bytes();
         let mut raw =
-            RawRows::new(&image.obj, row_bytes, &image.ends.colour, meter).ok_or(Stop::Failed)?;
+            RawRows::new(&image.obj, row_bytes, &image.ends.colour, meter)?.ok_or(Stop::Failed)?;
         let columns = area.columns();
         let start = columns.start as usize / colour.align() * colour.align();
         let piece = piece_texels(columns.end as usize - start, n);
@@ -646,7 +648,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
                 same_grid,
             } if *same_grid || matte.is_some() => (
                 Some(Lockstep {
-                    rows: mask.rows(&image.ends.mask, meter).ok_or(Stop::Failed)?,
+                    rows: mask.rows(&image.ends.mask, meter)?.ok_or(Stop::Failed)?,
                     matte: *matte,
                     same_grid: *same_grid,
                     alpha: vec![0; piece],
@@ -1037,7 +1039,7 @@ impl<'a> MaskPass<'a> {
         meter: &'a Meter<'a>,
     ) -> Result<Self, Stop> {
         let (_, h) = mask.size();
-        let mut rows = mask.rows(end, meter).ok_or(Stop::Failed)?;
+        let mut rows = mask.rows(end, meter)?.ok_or(Stop::Failed)?;
         let checkpointer = match (rows.raw(), mask.owned_stream()) {
             (Some(raw), Some(stream)) => {
                 let (bound, row_bytes) = (raw.reader.checkpoint_heap_bound(), raw.row_bytes);

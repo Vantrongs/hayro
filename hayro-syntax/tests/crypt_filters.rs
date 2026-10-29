@@ -450,7 +450,7 @@ fn read(stream: &Stream<'_>) -> Result<Vec<u8>, String> {
             assert_eq!(read, strict.clone().ok(), "decoded_strict_reader");
         }
     }
-    if let Some(mut reader) = stream.decoded_reader() {
+    if let Some(mut reader) = stream.decoded_reader(&Meter::default()).unwrap() {
         let read = read_all(|buf| Ok(reader.read(buf, &Meter::default())?));
         assert_eq!(read, lenient.ok(), "decoded_reader");
     }
@@ -475,7 +475,7 @@ fn refused(stream: &Stream<'_>) -> bool {
     read(stream) == decryption_failure()
         && matches!(stream.decoded(), Err(DecodeFailure::Decryption))
         && raw(stream) == decryption_failure()
-        && stream.decoded_reader().is_none()
+        && stream.decoded_reader(&Meter::default()).unwrap().is_none()
 }
 
 fn decryption_failure() -> Result<Vec<u8>, String> {
@@ -981,8 +981,14 @@ fn crypt_filters_are_listed_and_passed_over_by_the_readers() {
         );
         let stream = object(&pdf, 3);
         assert_eq!(stream.filters().first(), Some(&Filter::Crypt), "{name}");
-        assert!(stream.can_read_incrementally(), "{name}");
-        assert!(stream.decoded_reader().is_some(), "{name}");
+        assert!(
+            stream.can_read_incrementally(&Meter::default()).unwrap(),
+            "{name}"
+        );
+        assert!(
+            stream.decoded_reader(&Meter::default()).unwrap().is_some(),
+            "{name}"
+        );
         assert_eq!(read(&stream), Ok(CONTENT.to_vec()), "{name}");
     }
 }

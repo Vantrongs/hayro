@@ -7,21 +7,57 @@ use super::rows::{MaskRows, RawRows};
 use super::{Plane, Stop};
 use hayro_syntax::object::stream::{DecodedCheckpoint, OwnedStream};
 use hayro_syntax::work::Cancelled;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// The most bytes one asset's saved states take, the index's own included.
 pub(super) const CHECKPOINT_BUDGET: usize = 2 * 1024 * 1024;
 /// The fewest stored bytes between two saved states.
 pub(super) const MIN_CHECKPOINT_BYTES: usize = 256 * 1024;
+/// The bytes a saved state takes besides its heap: it is shared, so that taking it
+/// out of an index or putting it in copies nothing while the index is locked.
+pub(super) const SHARED_STATE_BYTES: usize =
+    size_of::<DecodedCheckpoint>() + 2 * size_of::<usize>();
 
 /// An asset's saved decoder states.
 #[derive(Default)]
 pub(super) struct Checkpoints {
     /// Of the colour (or a stencil mask's alpha), with a mask read alongside it.
-    rows: Mutex<RowIndex>,
+    rows: Locked<RowIndex>,
     /// Of a mask on its own grid.
-    mask: Mutex<RowIndex>,
-    pub(super) jpeg: Mutex<JpegIndex>,
+    mask: Locked<RowIndex>,
+    pub(super) jpeg: Locked<JpegIndex>,
+}
+
+/// The bytes an index holds on the heap.
+pub(super) trait HeapBytes {
+    fn heap_bytes(&self) -> usize;
+}
+
+/// An index shared by an asset's requests, which lock it only for steps that poll
+/// no hook, and the bytes it holds, read without locking it: so a hook may read the
+/// asset's statistics while one of its requests polls it, and no request waits on
+/// another's decoding or copying.
+#[derive(Default)]
+pub(super) struct Locked<T> {
+    index: Mutex<T>,
+    bytes: AtomicUsize,
+}
+
+impl<T: HeapBytes> Locked<T> {
+    /// What `step` makes of the index, locked meanwhile. A step is `Send`, so it
+    /// holds no meter, whose counts are not `Sync`, nor a hook: no hook is polled
+    /// while the index is locked. What it returns borrows nothing of the index.
+    pub(super) fn with<R>(&self, step: impl FnOnce(&mut T) -> R + Send) -> Result<R, Stop> {
+        let mut index = self.index.lock().map_err(|_| Stop::Failed)?;
+        let made = step(&mut index);
+        self.bytes.store(index.heap_bytes(), Ordering::Relaxed);
+        Ok(made)
+    }
+
+    fn bytes(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
+    }
 }
 
 /// Decoder states of a plane's rows, by the row they resume at.
@@ -33,42 +69,44 @@ struct RowIndex {
 
 struct Entry {
     row: u32,
-    state: DecodedCheckpoint,
-    /// The state of a mask read alongside, where its reader needs one; boxed, as most
-    /// entries have none.
-    mask: Option<Box<DecodedCheckpoint>>,
+    state: Arc<DecodedCheckpoint>,
+    /// The state of a mask read alongside, where its reader needs one.
+    mask: Option<Arc<DecodedCheckpoint>>,
 }
 
-impl RowIndex {
-    fn bytes(&self) -> usize {
+impl HeapBytes for RowIndex {
+    fn heap_bytes(&self) -> usize {
+        let state = |s: &DecodedCheckpoint| SHARED_STATE_BYTES + s.heap_bytes();
         self.entries.capacity() * size_of::<Entry>()
             + self
                 .entries
                 .iter()
-                .map(|e| {
-                    let mask = e
-                        .mask
-                        .as_ref()
-                        .map_or(0, |m| size_of::<DecodedCheckpoint>() + m.heap_bytes());
-                    e.state.heap_bytes() + mask
-                })
+                .map(|e| state(&e.state) + e.mask.as_deref().map_or(0, state))
                 .sum::<usize>()
     }
 }
 
+impl RowIndex {
+    fn position(&self, row: u32) -> Result<usize, usize> {
+        self.entries.binary_search_by_key(&row, |e| e.row)
+    }
+}
+
+/// A state of the colour, and one of a mask read alongside, saved together.
+type Pair = (DecodedCheckpoint, Option<DecodedCheckpoint>);
+
 impl Checkpoints {
-    /// The bytes the saved states take: the index, its slots, and each state's heap.
-    pub(super) fn bytes(&self) -> Result<usize, Stop> {
-        let rows = self.rows.lock().map_err(|_| Stop::Failed)?;
-        let mask = self.mask.lock().map_err(|_| Stop::Failed)?;
-        let jpeg = self.jpeg.lock().map_err(|_| Stop::Failed)?;
-        Ok(size_of::<Self>() + rows.bytes() + mask.bytes() + jpeg.heap_bytes())
+    /// The bytes the saved states take: the indexes, their slots, and each state's
+    /// heap; read without locking an index.
+    pub(super) fn bytes(&self) -> usize {
+        size_of::<Self>() + self.rows.bytes() + self.mask.bytes() + self.jpeg.bytes()
     }
 
     /// A checkpointer for a pass over `plane`, whose readers' states hold `bound` heap
     /// bytes at most, in `budget` bytes, `height` rows of `row_bytes` stored bytes, read
     /// from `stream` and a mask's `mask_stream` read alongside; and the row the pass
-    /// continues at, `resume`d from the state nearest at or before row `before`.
+    /// continues at, `resume`d from the state nearest at or before row `before`, which
+    /// is taken out of the index, shared, before it is copied.
     /// `None` when the readers cannot be checkpointed or not one state fits the budget.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn checkpointer<'c>(
@@ -88,9 +126,12 @@ impl Checkpoints {
             Plane::Image => &self.rows,
             Plane::Mask => &self.mask,
         };
-        let entries = index.lock().map_err(|_| Stop::Failed)?;
-        let start = match entries.entries.iter().rev().find(|e| e.row <= before) {
-            Some(e) if resume(e.row, &e.state, e.mask.as_deref())? => e.row,
+        let nearest = index.with(|index| {
+            let e = index.entries.iter().rev().find(|e| e.row <= before)?;
+            Some((e.row, e.state.clone(), e.mask.clone()))
+        })?;
+        let start = match nearest {
+            Some((row, state, mask)) if resume(row, &state, mask.as_deref())? => row,
             Some(_) => return Err(Stop::Failed),
             None => 0,
         };
@@ -118,7 +159,7 @@ impl Plan {
     /// row, where no request resumes.
     fn new(heap_bound: usize, row_bytes: usize, height: u32, budget: usize) -> Option<Self> {
         let count = budget.checked_sub(size_of::<Checkpoints>())?
-            / size_of::<Entry>().checked_add(heap_bound)?;
+            / (size_of::<Entry>() + SHARED_STATE_BYTES).checked_add(heap_bound)?;
         let interval = height
             .div_ceil(u32::try_from(count).ok().filter(|&c| c > 0)?)
             .max(MIN_CHECKPOINT_BYTES.div_ceil(row_bytes) as u32);
@@ -135,7 +176,7 @@ impl Plan {
 
 /// One pass's use of the index: it saves states every so many rows.
 pub(super) struct Checkpointer<'c> {
-    index: &'c Mutex<RowIndex>,
+    index: &'c Locked<RowIndex>,
     stream: OwnedStream,
     mask_stream: Option<OwnedStream>,
     plan: Plan,
@@ -161,7 +202,7 @@ impl Checkpointer<'_> {
             };
             let mask = match mask {
                 Some(m) => match m.checkpoint(row, self.mask_stream.as_ref())? {
-                    Some(mask) => mask.map(Box::new),
+                    Some(mask) => mask,
                     None => return Ok(None),
                 },
                 None => None,
@@ -183,31 +224,46 @@ impl Checkpointer<'_> {
         })
     }
 
+    /// Saves the `state` made at `row`, if one is due there and the index has room
+    /// for it. The state is copied before the index is locked to put it in; a pass
+    /// that saved one there meanwhile keeps its own.
     fn save(
         &self,
         row: u32,
-        state: impl FnOnce() -> Result<
-            Option<(DecodedCheckpoint, Option<Box<DecodedCheckpoint>>)>,
-            Cancelled,
-        >,
+        state: impl FnOnce() -> Result<Option<Pair>, Cancelled>,
     ) -> Result<(), Stop> {
         if !self.plan.due(row) {
             return Ok(());
         }
-        let mut index = self.index.lock().map_err(|_| Stop::Failed)?;
-        if index.entries.len() == self.plan.slots {
+        let slots = self.plan.slots;
+        // Where a state at `row` goes, if the index has none there and room for it.
+        let room = move |index: &RowIndex| {
+            (index.entries.len() < slots)
+                .then(|| index.position(row).err())
+                .flatten()
+        };
+        if self.index.with(|index| room(index))?.is_none() {
             return Ok(());
         }
-        let Err(at) = index.entries.binary_search_by_key(&row, |e| e.row) else {
-            return Ok(());
-        };
         let Some((state, mask)) = state()? else {
             return Ok(());
         };
-        if index.entries.capacity() == 0 {
-            index.entries.reserve_exact(self.plan.slots);
-        }
-        index.entries.insert(at, Entry { row, state, mask });
+        let entry = Entry {
+            row,
+            state: Arc::new(state),
+            mask: mask.map(Arc::new),
+        };
+        // Dropped, where not put in, once the index is unlocked.
+        let _unsaved = self.index.with(move |index| {
+            let Some(at) = room(index) else {
+                return Some(entry);
+            };
+            if index.entries.capacity() == 0 {
+                index.entries.reserve_exact(slots);
+            }
+            index.entries.insert(at, entry);
+            None
+        })?;
         Ok(())
     }
 }
@@ -258,7 +314,12 @@ mod tests {
     }
 
     fn saved(asset: &ImageAsset) -> usize {
-        asset.0.checkpoints.rows.lock().unwrap().entries.len()
+        asset
+            .0
+            .checkpoints
+            .rows
+            .with(|index| index.entries.len())
+            .unwrap()
     }
 
     /// Reopened, an image resumes from the state nearest before a request's rows, for
@@ -336,12 +397,72 @@ mod tests {
                 assert_eq!(pass == 1 && fits, work.rows_decoded < u64::from(h / 2));
                 assert!(asset.checkpoint_bytes().unwrap() <= CHECKPOINT_BUDGET);
             }
-            let index = asset.0.checkpoints.rows.lock().unwrap();
-            let full = index.entries.len() == index.entries.capacity();
-            assert!(
-                full && index.entries.is_empty() != fits,
-                "{columns} columns"
-            );
+            let (len, capacity) = asset
+                .0
+                .checkpoints
+                .rows
+                .with(|index| (index.entries.len(), index.entries.capacity()))
+                .unwrap();
+            assert!(len == capacity && (len == 0) != fits, "{columns} columns");
+        }
+    }
+
+    /// A hook that reads the asset's statistics while a request saves a state, or
+    /// resumes from one, copying a predictor row wider than a piece between its
+    /// polls, does not wait on the index: both requests finish. After a request
+    /// stopped while copying a state, the next returns what decoding the image whole
+    /// does.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_hook_reading_statistics_while_a_state_is_copied_does_not_wait() {
+        use hayro_syntax::work::STATE_COPIED;
+        const COLUMNS: usize = 65_536;
+        let rows_of = (W * H) as usize / COLUMNS + 1;
+        let mut predicted = noise(rows_of * (COLUMNS + 1), 13);
+        for row in predicted.chunks_mut(COLUMNS + 1) {
+            row[0] %= 5;
+        }
+        let params = format!("/DecodeParms << /Predictor 15 /Columns {COLUMNS} >>");
+        let pdf = gray(&params, zlib(&predicted));
+        let window = [0, H - 2, W, H];
+        let expected = request(&mut whole(&asset(&pdf)), Plane::Image, (W, H), window).data;
+        // Stops once `stop_after` bytes of states were copied in the request; reads
+        // the statistics at every poll.
+        let read = |asset: &ImageAsset, stop_after: usize| {
+            STATE_COPIED.set(0);
+            let cancel = || {
+                asset.checkpoint_bytes().unwrap();
+                STATE_COPIED.get() > stop_after
+            };
+            let request = ImageRequest {
+                plane: Plane::Image,
+                grid: (W, H),
+                window,
+                cancel: Some(&cancel),
+            };
+            let got = asset.open(None, None).unwrap().request(&request);
+            (got.map(|r| r.data), STATE_COPIED.get())
+        };
+        // The first request saves states; the second resumes from one.
+        let asset = asset(&pdf);
+        let (first, copied) = read(&asset, usize::MAX);
+        assert_eq!(first.unwrap(), expected);
+        assert!(copied > COLUMNS, "{copied} bytes saved");
+        assert!(saved(&asset) > 0);
+        let (second, restored) = read(&asset, usize::MAX);
+        assert_eq!(second.unwrap(), expected);
+        assert!(restored > COLUMNS, "{restored} bytes restored");
+        // Stopped as a state is saved, and as one is restored: at the poll after its
+        // first piece.
+        for fresh in [true, false] {
+            let stopped = match fresh {
+                true => super::super::tests::asset(&pdf),
+                false => asset.clone(),
+            };
+            let (got, _) = read(&stopped, 0);
+            assert_eq!(got, Err(RequestError::Cancelled), "fresh {fresh}");
+            let (after, _) = read(&stopped, usize::MAX);
+            assert_eq!(after.unwrap(), expected, "fresh {fresh}");
         }
     }
 

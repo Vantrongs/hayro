@@ -321,7 +321,8 @@ impl<'a> DecryptedReader<'a> {
     /// each piece decrypted counted on `meter`.
     pub(crate) fn decrypt_all(&mut self, meter: &Meter<'_>) -> Result<Vec<u8>, Cancelled> {
         self.rewind();
-        let mut data = Vec::new();
+        // Decrypted, the data hold no more bytes than stored.
+        let mut data = meter.room(self.len());
         let mut buf = [0; 8192];
         loop {
             let n = self.read(&mut buf);
@@ -329,6 +330,7 @@ impl<'a> DecryptedReader<'a> {
                 return Ok(data);
             }
             meter.work(n)?;
+            meter.reserve(&mut data, n);
             data.extend_from_slice(&buf[..n]);
         }
     }

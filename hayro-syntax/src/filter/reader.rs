@@ -49,7 +49,7 @@ const OUTPUT_CHUNK: usize = POLL_BYTES;
 /// The most bytes a decoder that takes a byte or a few at a time holds made: a poll's
 /// worth, and the most one step makes past it (an LZW code's bytes).
 #[cfg(feature = "unsafe")]
-const MADE_AT_MOST: usize = POLL_BYTES + 4096;
+const MADE_AT_MOST: usize = POLL_BYTES + crate::filter::bytewise::STEP_AT_MOST;
 
 /// The bytes [`DecodedReader::skip`] reads at a time, on the stack.
 const SKIP_CHUNK: usize = 8 * 1024;
@@ -122,7 +122,7 @@ struct Stored<'a> {
 }
 
 /// A filter a reader decodes, with its predictor's parameters.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(crate) enum Codec {
     Flate(PredictorParams),
     Lzw(PredictorParams),
@@ -285,16 +285,28 @@ impl<'a> DecodedReader<'a> {
     }
 
     /// `stored` decoded by `codecs` in turn, as it is read; `None` when a predictor
-    /// is one only the whole-data decoder reverses.
-    pub(crate) fn decoding(stored: DecryptedReader<'a>, codecs: &[Codec]) -> Option<Self> {
-        let layers = codecs.iter().map(Layer::new).collect::<Option<_>>()?;
-        Some(Self::chain(stored, layers))
+    /// is one only the whole-data decoder reverses. Each layer made counts on
+    /// `meter`, so that making any number of them polls its hook.
+    pub(crate) fn decoding(
+        stored: DecryptedReader<'a>,
+        codecs: &[Codec],
+        meter: &Meter<'_>,
+    ) -> Result<Option<Self>, Cancelled> {
+        let mut layers = meter.room(codecs.len());
+        for codec in codecs {
+            meter.work(size_of::<Layer>())?;
+            let Some(layer) = Layer::new(codec) else {
+                return Ok(None);
+            };
+            layers.push(layer);
+        }
+        Ok(Some(Self::chain(stored, layers)))
     }
 
     /// Flate data with its predictor `params` (see [`Self::decoding`]).
     #[cfg(test)]
     pub(crate) fn flate(data: DecryptedReader<'a>, params: &PredictorParams) -> Option<Self> {
-        Self::decoding(data, &[Codec::Flate(params.clone())])
+        Self::decoding(data, &[Codec::Flate(*params)], &Meter::default()).unwrap()
     }
 
     /// The bytes the reader yields from its start, where it knows them without
@@ -564,7 +576,7 @@ fn address(data: &[u8]) -> (usize, usize) {
 
 /// The heap bytes of a zlib-rs decoder's state and window.
 #[cfg(feature = "unsafe")]
-fn inflate_heap() -> usize {
+pub(crate) fn inflate_heap() -> usize {
     use core::sync::atomic::{AtomicUsize, Ordering};
     static HEAP: AtomicUsize = AtomicUsize::new(0);
     match HEAP.load(Ordering::Relaxed) {
@@ -1145,6 +1157,9 @@ impl Inflating {
                 }
             }
             let zlib = self.zlib;
+            if self.decoder.is_none() {
+                meter.making_state(inflate_heap() + OUTPUT_CHUNK)?;
+            }
             let decoder = self
                 .decoder
                 .get_or_insert_with(|| zlib_rs::Inflate::new(zlib, 15));

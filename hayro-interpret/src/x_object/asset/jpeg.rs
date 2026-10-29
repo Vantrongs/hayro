@@ -2,7 +2,7 @@
 //! from states saved along the bands.
 
 use super::decoded::Decoded;
-use super::index::{CHECKPOINT_BUDGET, Checkpoints, MIN_CHECKPOINT_BYTES};
+use super::index::{CHECKPOINT_BUDGET, Checkpoints, HeapBytes, Locked, MIN_CHECKPOINT_BYTES};
 use super::streamed::{Colour, Grid};
 use super::{DecodeWork, ImageLayout, Plane, Stop};
 use crate::x_object::area::Area;
@@ -11,7 +11,7 @@ use crate::x_object::image::ImageXObject;
 use hayro_syntax::object::dict::keys::{MASK, SMASK, SMASK_IN_DATA};
 use hayro_syntax::object::stream::{JpegCheckpoint, JpegRows, OwnedStream};
 use hayro_syntax::work::{Cancelled, Meter};
-use std::sync::Mutex;
+use std::sync::Arc;
 
 /// JPEG states, by the row they resume at.
 #[derive(Default)]
@@ -28,29 +28,31 @@ pub(super) enum JpegIndex {
 
 pub(super) struct Saved {
     /// The state at the first row.
-    base: JpegCheckpoint,
+    base: Arc<JpegCheckpoint>,
     /// Rows between saved states, a multiple of the eight a band holds.
     interval: u32,
     slots: usize,
-    /// Sorted by row; capacity `slots`.
-    entries: Vec<JpegCheckpoint>,
+    /// Sorted by row; capacity `slots`. Shared, so that a state is taken out of the
+    /// index without copying it while the index is locked.
+    entries: Vec<Arc<JpegCheckpoint>>,
 }
 
-impl JpegIndex {
+impl HeapBytes for JpegIndex {
     /// The bytes the saved states take beyond the index itself.
-    pub(super) fn heap_bytes(&self) -> usize {
+    fn heap_bytes(&self) -> usize {
         let Self::Read(saved) = self else {
             return 0;
         };
         size_of::<Saved>()
-            + heap_bytes(&saved.base)
-            + saved.entries.capacity() * size_of::<JpegCheckpoint>()
-            + saved.entries.iter().map(heap_bytes).sum::<usize>()
+            + shared_bytes(&saved.base)
+            + saved.entries.capacity() * size_of::<Arc<JpegCheckpoint>>()
+            + saved.entries.iter().map(|s| shared_bytes(s)).sum::<usize>()
     }
 }
 
-fn heap_bytes(state: &JpegCheckpoint) -> usize {
-    state.storage_bytes() - size_of::<JpegCheckpoint>()
+/// The bytes a shared state takes on the heap: itself, its counts and its row.
+fn shared_bytes(state: &JpegCheckpoint) -> usize {
+    state.storage_bytes() + 2 * size_of::<usize>()
 }
 
 impl Saved {
@@ -58,15 +60,15 @@ impl Saved {
     /// the budget holds besides it, spread over the rows with it.
     fn new(base: JpegCheckpoint, width: u32, height: u32) -> Self {
         let slots = (CHECKPOINT_BUDGET - size_of::<Checkpoints>() - size_of::<Self>())
-            .saturating_sub(heap_bytes(&base))
-            / base.storage_bytes();
+            .saturating_sub(shared_bytes(&base))
+            / (shared_bytes(&base) + size_of::<Arc<JpegCheckpoint>>());
         let interval = height
             .div_ceil(slots as u32 + 1)
             .max(MIN_CHECKPOINT_BYTES.div_ceil(width as usize) as u32)
             .next_multiple_of(8);
         let slots = slots.min((height / interval) as usize);
         Self {
-            base,
+            base: Arc::new(base),
             interval,
             slots,
             entries: Vec::with_capacity(slots),
@@ -89,7 +91,7 @@ impl Saved {
 pub(super) struct JpegStreamed<'a> {
     obj: ImageXObject<'a>,
     colour: Colour,
-    index: &'a Mutex<JpegIndex>,
+    index: &'a Locked<JpegIndex>,
 }
 
 impl<'a> JpegStreamed<'a> {
@@ -100,7 +102,7 @@ impl<'a> JpegStreamed<'a> {
     pub(super) fn new(
         obj: &ImageXObject<'a>,
         stream: &OwnedStream,
-        index: &'a Mutex<JpegIndex>,
+        index: &'a Locked<JpegIndex>,
         meter: &Meter<'_>,
     ) -> Result<Option<Self>, Cancelled> {
         let dict = obj.stream.dict();
@@ -114,30 +116,33 @@ impl<'a> JpegStreamed<'a> {
         else {
             return Ok(None);
         };
-        let Ok(locked) = index.lock() else {
+        let Ok(unread) = index.with(|index| matches!(index, JpegIndex::Unread)) else {
             return Ok(None);
         };
-        if matches!(*locked, JpegIndex::Unread) {
-            drop(locked);
+        if unread {
             // Parsing reads all of the data; the index is not locked meanwhile.
             let base = stream
                 .jpeg_rows((obj.width(), obj.height()), meter)
                 .and_then(|mut rows| rows.checkpoint().ok());
             meter.poll()?;
-            let Ok(mut locked) = index.lock() else {
+            let read = base.map_or(JpegIndex::Rejected, |base| {
+                JpegIndex::Read(Box::new(Saved::new(base, obj.width(), obj.height())))
+            });
+            // Dropped, where another request read it meanwhile, once it is unlocked.
+            let unused = index.with(move |index| match index {
+                JpegIndex::Unread => {
+                    *index = read;
+                    None
+                }
+                _ => Some(read),
+            });
+            if unused.is_err() {
                 return Ok(None);
-            };
-            if matches!(*locked, JpegIndex::Unread) {
-                *locked = base.map_or(JpegIndex::Rejected, |base| {
-                    JpegIndex::Read(Box::new(Saved::new(base, obj.width(), obj.height())))
-                });
             }
-        } else {
-            drop(locked);
         }
         let read = index
-            .lock()
-            .is_ok_and(|index| matches!(*index, JpegIndex::Read(_)));
+            .with(|index| matches!(index, JpegIndex::Read(_)))
+            .unwrap_or(false);
         Ok(read.then(|| Self {
             obj: obj.clone(),
             colour,
@@ -193,28 +198,30 @@ impl<'a> JpegStreamed<'a> {
                 }
             }
         }
-        match *self.index.lock().map_err(|_| Stop::Failed)? {
-            JpegIndex::Read(_) => Ok(()),
-            _ => Err(Stop::Failed),
+        match self
+            .index
+            .with(|index| matches!(index, JpegIndex::Read(_)))?
+        {
+            true => Ok(()),
+            false => Err(Stop::Failed),
         }
     }
 
     /// A reader at the state nearest at or before row `before`, its work counted on
     /// `meter`.
     fn resume<'m>(&self, before: u32, meter: &'m Meter<'m>) -> Result<JpegRows<'m>, Stop> {
-        let state = {
-            let index = self.index.lock().map_err(|_| Stop::Failed)?;
-            let JpegIndex::Read(saved) = &*index else {
-                return Err(Stop::Failed);
+        let state = self.index.with(|index| {
+            let JpegIndex::Read(saved) = index else {
+                return None;
             };
-            saved
+            let nearest = saved
                 .entries
                 .iter()
                 .rev()
-                .find(|s| s.next_row() <= before as usize)
-                .unwrap_or(&saved.base)
-                .clone()
-        };
+                .find(|s| s.next_row() <= before as usize);
+            Some(Arc::clone(nearest.unwrap_or(&saved.base)))
+        })?;
+        let state = state.ok_or(Stop::Failed)?;
         // Resuming parses the headers again, polling the meter's hook, which may read
         // the index.
         state.resume(meter).map_err(|_| Stop::Failed)
@@ -223,26 +230,33 @@ impl<'a> JpegStreamed<'a> {
     /// Saves `rows`' state if one is due there and the index has room.
     fn save(&self, rows: &mut JpegRows<'_>) -> Result<(), Stop> {
         let row = rows.next_row();
-        let wanted = |index: &JpegIndex| matches!(index, JpegIndex::Read(s) if s.wants(row));
-        if !wanted(&*self.index.lock().map_err(|_| Stop::Failed)?) {
+        let wanted = |index: &mut JpegIndex| matches!(index, JpegIndex::Read(s) if s.wants(row));
+        if !self.index.with(wanted)? {
             return Ok(());
         }
         // Copying the state does not hold the index.
-        let state = rows.checkpoint().map_err(|_| Stop::Failed)?;
-        let mut index = self.index.lock().map_err(|_| Stop::Failed)?;
-        if let JpegIndex::Read(saved) = &mut *index
-            && saved.wants(row)
-            && let Err(at) = saved.position(row)
-        {
-            saved.entries.insert(at, state);
-        }
+        let state = Arc::new(rows.checkpoint().map_err(|_| Stop::Failed)?);
+        // Dropped, where not put in, once the index is unlocked.
+        let _unsaved = self.index.with(move |index| {
+            if let JpegIndex::Read(saved) = index
+                && saved.wants(row)
+                && let Err(at) = saved.position(row)
+            {
+                saved.entries.insert(at, state);
+                return None;
+            }
+            Some(state)
+        })?;
         Ok(())
     }
 
     /// Rejects the asset's JPEG rows and reads `area` from the image decoded whole;
     /// returns the rows decoded, all of the image's.
     fn decode_whole(&self, area: &mut Area<'_>, meter: &Meter<'_>) -> Result<u32, Stop> {
-        *self.index.lock().map_err(|_| Stop::Failed)? = JpegIndex::Rejected;
+        // The index's states are dropped once it is unlocked.
+        let _states = self
+            .index
+            .with(|index| std::mem::replace(index, JpegIndex::Rejected))?;
         area.reset()?;
         let decoded = decode_image(&self.obj, None, meter);
         meter.poll()?;
@@ -293,8 +307,9 @@ mod tests {
         matches!(source.inner, Inner::Jpeg(_))
     }
 
-    fn index(asset: &ImageAsset) -> std::sync::MutexGuard<'_, JpegIndex> {
-        asset.0.checkpoints.jpeg.lock().unwrap()
+    /// What `step` makes of the asset's JPEG index.
+    fn index<R>(asset: &ImageAsset, step: impl FnOnce(&mut JpegIndex) -> R + Send) -> R {
+        asset.0.checkpoints.jpeg.with(step).unwrap()
     }
 
     /// Bands at odd sizes, across restart markers, inverted, through a transfer
@@ -409,7 +424,7 @@ mod tests {
             let reject = || {
                 polls.set(polls.get() + 1);
                 if polls.get() == 3 {
-                    *index(&asset) = JpegIndex::Rejected;
+                    index(&asset, |index| *index = JpegIndex::Rejected);
                 }
                 false
             };
@@ -448,12 +463,12 @@ mod tests {
         );
         assert_eq!(actual.data, expected.data);
         assert!(asset.checkpoint_bytes().unwrap() <= CHECKPOINT_BUDGET);
-        let JpegIndex::Read(saved) = &*index(&asset) else {
-            panic!("not read in bands");
-        };
-        assert!(saved.slots > 0);
-        assert_eq!(saved.entries.len(), saved.slots);
-        assert_eq!(saved.entries.capacity(), saved.slots);
+        let (slots, saved, capacity) = index(&asset, |index| match index {
+            JpegIndex::Read(saved) => (saved.slots, saved.entries.len(), saved.entries.capacity()),
+            _ => panic!("not read in bands"),
+        });
+        assert!(slots > 0);
+        assert_eq!((saved, capacity), (slots, slots));
     }
 
     /// Data cut short reads as decoding it whole does; data of another size than the
@@ -489,7 +504,7 @@ mod tests {
                 !asset.open(None, None).is_ok_and(|s| is_jpeg(&s)),
                 "{w} × {h}"
             );
-            assert!(matches!(*index(&asset), JpegIndex::Rejected));
+            assert!(index(&asset, |index| matches!(index, JpegIndex::Rejected)));
         }
     }
 
@@ -531,7 +546,10 @@ mod tests {
                 "{name}: {} bytes of work",
                 TOLD.get()
             );
-            assert!(matches!(*index(&asset), JpegIndex::Unread), "{name}");
+            assert!(
+                index(&asset, |index| matches!(index, JpegIndex::Unread)),
+                "{name}"
+            );
             let mut source = asset.open(None, None).unwrap();
             assert_eq!(is_jpeg(&source), banded, "{name}");
             let window = [0, 1000, w.into(), h.into()];

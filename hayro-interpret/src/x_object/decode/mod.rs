@@ -17,7 +17,7 @@ use hayro_syntax::object::stream::{
     DecodeFailure, FilterResult, ImageColorSpace, ImageData, ImageDecodeParams,
 };
 use hayro_syntax::object::{Array, Object};
-use hayro_syntax::work::{Meter, POLL_BYTES};
+use hayro_syntax::work::{Cancelled, Meter, POLL_BYTES};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 
@@ -121,7 +121,7 @@ pub(crate) fn complete(
     if data.len() >= want {
         return Some(());
     }
-    data.reserve_exact(want - data.len());
+    meter.reserve_exact(data, want - data.len());
     while data.len() < want {
         let n = (want - data.len()).min(POLL_BYTES / texel.len() * texel.len());
         for _ in 0..n / texel.len() {
@@ -148,9 +148,13 @@ pub(crate) fn sample_format(
     sample_format_with(obj, image_data, dict_bpc(obj))
 }
 
-/// The parameters `obj`'s filters decode with, at its own size.
-pub(crate) fn image_decode_params(obj: &ImageXObject<'_>) -> ImageDecodeParams {
-    decode_params(obj, None, dict_bpc(obj))
+/// The parameters `obj`'s filters decode with, at its own size; reading the filters
+/// counts on `meter`.
+pub(crate) fn image_decode_params(
+    obj: &ImageXObject<'_>,
+    meter: &Meter<'_>,
+) -> Result<ImageDecodeParams, Cancelled> {
+    decode_params(obj, None, dict_bpc(obj), meter)
 }
 
 /// The bits per component the image's dictionary gives.
@@ -233,21 +237,30 @@ fn decode_array(
 /// per component or colour space, those its samples are read with when no filter
 /// reports them ([`sample_format_with`]), so that the last filter knows their size.
 /// A JPX image's bits per component stay the dictionary's: its decoder scales its
-/// samples to the depth it is given and keeps their own without one.
+/// samples to the depth it is given and keeps their own without one. Reading the
+/// filters counts on `meter`.
 fn decode_params(
     obj: &ImageXObject<'_>,
     target_dimension: Option<(u32, u32)>,
     dict_bpc: Option<u8>,
-) -> ImageDecodeParams {
-    let bpc = dict_bpc.or_else(|| {
-        let filters = obj.stream.filter_entries();
-        let jpx = filters
-            .applied()
-            .any(|(filter, _)| filter == Filter::JpxDecode);
-        (!jpx).then(|| fallback_bpc(obj.kind))
-    });
+    meter: &Meter<'_>,
+) -> Result<ImageDecodeParams, Cancelled> {
+    let bpc = match dict_bpc {
+        Some(bpc) => Some(bpc),
+        None => {
+            let filters = obj.stream.filter_entries();
+            let mut jpx = false;
+            for applied in filters.applied_counted(meter) {
+                if applied?.0 == Filter::JpxDecode {
+                    jpx = true;
+                    break;
+                }
+            }
+            (!jpx).then(|| fallback_bpc(obj.kind))
+        }
+    };
     let color_space = obj.color_space.as_ref();
-    ImageDecodeParams {
+    Ok(ImageDecodeParams {
         is_indexed: color_space.is_some_and(|cs| cs.is_indexed()),
         bpc,
         // Device gray's, as `sample_format_with` reads samples without a colour space.
@@ -255,7 +268,7 @@ fn decode_params(
         target_dimension,
         width: obj.width(),
         height: obj.height(),
-    }
+    })
 }
 
 /// The bits per component samples of an image of `kind` are read with where neither
@@ -272,7 +285,7 @@ fn decode_context<'a>(
     meter: &Meter<'_>,
 ) -> Option<DecodeContext<'a>> {
     let dict_bpc = dict_bpc(obj);
-    let decode_params = decode_params(obj, target_dimension, dict_bpc);
+    let decode_params = decode_params(obj, target_dimension, dict_bpc, meter).ok()?;
 
     let mut decoded = obj
         .stream
@@ -311,7 +324,8 @@ fn decode_context<'a>(
         rows,
         components,
         transparent,
-    );
+        meter,
+    )?;
     decoded.data = data;
     // Data that holds no whole row of an image whose short rows are transparent fails.
     if width == 0 || components == 0 || transparent && held == 0 {
@@ -342,15 +356,18 @@ fn decode_context<'a>(
 /// Only the samples held are kept: the texel stored zero makes stands for the rest
 /// ([`Rows::fill`]), so data of a few bytes declaring a huge image costs little.
 /// Where short rows are `transparent`, only whole rows count at every depth and the
-/// rows past them are transparent. Data past the declared rows is dropped.
-fn fit_rows(
-    data: Cow<'_, [u8]>,
+/// rows past them are transparent. Data past the declared rows is dropped. Where
+/// the samples of a texel are completed, the data is copied or grown on `meter`;
+/// `None` once its hook asks to stop.
+fn fit_rows<'d>(
+    data: Cow<'d, [u8]>,
     rows: SampleRows,
     components: usize,
     transparent: bool,
-) -> (Cow<'_, [u8]>, u32) {
+    meter: &Meter<'_>,
+) -> Option<(Cow<'d, [u8]>, u32)> {
     let held = rows.bytes_held(data.len(), transparent);
-    let mut data = match data {
+    let data = match data {
         Cow::Borrowed(d) => Cow::Borrowed(&d[..held]),
         Cow::Owned(mut d) => {
             d.truncate(held);
@@ -362,10 +379,15 @@ fn fit_rows(
         true => held.div_ceil(components.max(1)) * components,
         false => held,
     };
-    if len > held {
-        data.to_mut().resize(len, 0);
-    }
-    (data, len.div_ceil(rows.row_bytes()) as u32)
+    let data = match len > held {
+        true => {
+            let mut owned = into_owned(data, len, meter)?;
+            owned.resize(len, 0);
+            Cow::Owned(owned)
+        }
+        false => data,
+    };
+    Some((data, len.div_ceil(rows.row_bytes()) as u32))
 }
 
 /// Whether the rows of `obj`'s colour that its data does not hold are transparent,
@@ -418,19 +440,23 @@ fn in_pieces(
     Some(())
 }
 
-/// The bytes of `data`, owned, copied a counted piece at a time if borrowed.
-fn into_owned(data: Cow<'_, [u8]>, meter: &Meter<'_>) -> Option<Vec<u8>> {
-    match data {
-        Cow::Owned(data) => Some(data),
+/// The bytes of `data`, owned, with room for `room` bytes at least: copied a
+/// counted piece at a time if borrowed, moved so if owned without that room.
+fn into_owned(data: Cow<'_, [u8]>, room: usize, meter: &Meter<'_>) -> Option<Vec<u8>> {
+    let mut owned = match data {
+        Cow::Owned(data) => data,
         Cow::Borrowed(data) => {
-            let mut owned = Vec::with_capacity(data.len());
+            let mut owned = meter.room(room.max(data.len()));
             for piece in data.chunks(POLL_BYTES) {
-                owned.extend_from_slice(piece);
                 meter.work(piece.len()).ok()?;
+                owned.extend_from_slice(piece);
             }
-            Some(owned)
+            owned
         }
-    }
+    };
+    let more = room.saturating_sub(owned.len());
+    meter.reserve_exact(&mut owned, more);
+    Some(owned)
 }
 
 /// Every byte of `data` inverted, a counted piece at a time.
@@ -523,7 +549,7 @@ fn decode_u8_samples(
         1..8 => {
             let lut = sample_lut(color_space, bits_per_component, decode)?;
             let rows = SampleRows::new(width, num_components, bits_per_component, height);
-            let mut buf = Vec::with_capacity(rows.row_len * height as usize);
+            let mut buf = meter.room(rows.row_len * height as usize);
             for_each_packed_row(data, rows, meter, |first, samples| {
                 if let [lut] = &lut[..] {
                     buf.extend(samples.iter().map(|&v| lut[usize::from(v)]));
@@ -541,7 +567,7 @@ fn decode_u8_samples(
         }
         9..16 => {
             let map = SampleMap::new(color_space, bits_per_component, decode);
-            let mut buf = Vec::with_capacity(width as usize * num_components * height as usize);
+            let mut buf = meter.room(width as usize * num_components * height as usize);
             for_each_sample(
                 data,
                 width,
@@ -559,7 +585,7 @@ fn decode_u8_samples(
         }
         8 | 16 => {
             let map = SampleMap::new(color_space, bits_per_component, decode);
-            let mut buf = Vec::with_capacity(data.len() / (bits_per_component as usize / 8));
+            let mut buf = meter.room(data.len() / (bits_per_component as usize / 8));
             for_each_whole_sample(data, bits_per_component, meter, |value, index| {
                 buf.push(map.map(value, index)?);
                 Some(())
@@ -584,7 +610,7 @@ fn unpack_samples(
     match bits_per_component {
         1..8 => {
             let rows = SampleRows::new(width, num_components, bits_per_component, height);
-            let mut buf = Vec::with_capacity(rows.row_len * height as usize);
+            let mut buf = meter.room(rows.row_len * height as usize);
             for_each_packed_row(data, rows, meter, |_, samples| {
                 buf.extend(samples.iter().map(|&v| u16::from(v)));
             })?;
@@ -592,7 +618,7 @@ fn unpack_samples(
         }
         9..16 => {
             let rows = SampleRows::new(width, num_components, bits_per_component, height);
-            let mut buf = Vec::with_capacity(rows.row_len * height as usize);
+            let mut buf = meter.room(rows.row_len * height as usize);
             for_each_sample(
                 data,
                 width,
@@ -609,7 +635,7 @@ fn unpack_samples(
             Some(buf)
         }
         8 | 16 => {
-            let mut buf = Vec::with_capacity(data.len() / (bits_per_component as usize / 8));
+            let mut buf = meter.room(data.len() / (bits_per_component as usize / 8));
             for_each_whole_sample(data, bits_per_component, meter, |value, _| {
                 buf.push(value as u16);
                 Some(())
@@ -824,7 +850,7 @@ mod tests {
             .unwrap();
         let sink: WarningSinkFn = Arc::new(|_| {});
         let obj = ImageXObject::new(&stream, |_| None, &sink, &Cache::new(), None).unwrap();
-        let params = decode_params(&obj, None, dict_bpc(&obj));
+        let params = decode_params(&obj, None, dict_bpc(&obj), &Meter::default()).unwrap();
         (params.bpc, params.num_components)
     }
 

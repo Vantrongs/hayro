@@ -36,7 +36,7 @@ impl OwnedStream {
         dimensions: (u32, u32),
         meter: &'m Meter<'m>,
     ) -> Option<JpegRows<'m>> {
-        let input = self.jpeg_input()?;
+        let input = self.jpeg_input(meter)?;
         let options = DecoderOptions::default()
             .set_max_width(u16::MAX as usize)
             .set_max_height(u16::MAX as usize);
@@ -45,11 +45,16 @@ impl OwnedStream {
         (rows.dimensions() == (w as usize, h as usize)).then_some(rows)
     }
 
-    fn jpeg_input(&self) -> Option<JpegInput> {
+    /// The stored bytes, where the one filter is `DCTDecode` and they are not
+    /// encrypted; reading the filters counts on `meter`.
+    fn jpeg_input(&self, meter: &Meter<'_>) -> Option<JpegInput> {
         let stream = self.get()?;
-        if !matches!(stream.decryption(), Ok(None))
-            || !matches!(stream.filters().as_slice(), [Filter::DctDecode])
-        {
+        let entries = stream.filter_entries();
+        let mut applied = entries.applied_counted(meter);
+        if !matches!(applied.next(), Some(Ok((Filter::DctDecode, _)))) || applied.next().is_some() {
+            return None;
+        }
+        if !matches!(stream.decryption(meter), Ok(None)) {
             return None;
         }
         let bytes = match &self.0 {

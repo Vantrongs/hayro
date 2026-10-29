@@ -49,7 +49,7 @@ fn read_up_to(reader: &mut DecodedReader<'_>, len: usize, chunk: usize) -> Vec<u
 /// Everything the reader yields, read `chunk` bytes at a time, read twice with a
 /// rewind between.
 fn read_twice(stream: &Stream<'_>, chunk: usize) -> Vec<u8> {
-    let mut reader = stream.decoded_reader().unwrap();
+    let mut reader = stream.decoded_reader(&Meter::default()).unwrap().unwrap();
     let first = read_up_to(&mut reader, usize::MAX, chunk);
     reader.rewind();
     let second = read_up_to(&mut reader, usize::MAX, chunk);
@@ -92,7 +92,7 @@ fn a_wide_tiff_predictor_row_is_reversed_in_bounded_pieces() {
                 same
             };
             let ((), lenient) = measure(|| {
-                let mut reader = stream.decoded_reader().unwrap();
+                let mut reader = stream.decoded_reader(&Meter::default()).unwrap().unwrap();
                 let (mut buf, mut at) = (vec![0; 1 << 16], 0);
                 loop {
                     match reader.read(&mut buf, &Meter::default()).unwrap() {
@@ -144,11 +144,12 @@ fn a_declared_predictor_row_is_not_allocated_before_data_arrives() {
                 &common::stored_zlib(row, usize::from(u16::MAX)),
             );
             let stream = object_3(&pdf);
-            let (can, probe) = measure(|| stream.can_read_incrementally());
+            let (can, probe) =
+                measure(|| stream.can_read_incrementally(&Meter::default()).unwrap());
             assert!(can);
             assert!(probe.largest < 4096, "the probe allocated {probe:?}");
             let ((), read) = measure(|| {
-                let mut reader = stream.decoded_reader().unwrap();
+                let mut reader = stream.decoded_reader(&Meter::default()).unwrap().unwrap();
                 let data = read_up_to(&mut reader, 8, 4);
                 assert_eq!(data, expected);
                 reader.rewind();
@@ -165,12 +166,12 @@ fn encrypted_stored_data_is_decrypted_as_it_is_read() {
     let data: Vec<u8> = (0..262_144).map(|i| (i % 251) as u8).collect();
     let pdf = encrypted_file("", &data);
     let stream = object_3(&pdf);
-    let (can, probe) = measure(|| stream.can_read_incrementally());
+    let (can, probe) = measure(|| stream.can_read_incrementally(&Meter::default()).unwrap());
     assert!(can);
     assert_eq!(probe.largest, 0);
     assert_eq!(read_twice(&stream, 37), data);
     let ((), prefix) = measure(|| {
-        let mut reader = stream.decoded_reader().unwrap();
+        let mut reader = stream.decoded_reader(&Meter::default()).unwrap().unwrap();
         let mut buf = [0; 37];
         assert_eq!(reader.read(&mut buf, &Meter::default()), Ok(37));
         assert_eq!(buf, data[..37]);
@@ -231,7 +232,7 @@ fn flate_only_the_permissive_decoder_reads_is_read_as_it_goes() {
             let expected = stream.decoded().unwrap();
             assert!(expected[..] == data[..], "{bytes} bytes");
             let (first, reading) = measure(|| {
-                let mut reader = stream.decoded_reader().unwrap();
+                let mut reader = stream.decoded_reader(&Meter::default()).unwrap().unwrap();
                 read_up_to(&mut reader, 64, 64)
             });
             assert_eq!(first, data[..64]);
@@ -288,7 +289,7 @@ fn resume_at(encrypted: bool, params: &str, encoded: &[u8], offset: usize) {
         let stream = object_3(&pdf);
         let expected = stream.decoded().unwrap().into_owned();
         let owned = stream.to_owned_stream();
-        let mut reader = stream.decoded_reader().unwrap();
+        let mut reader = stream.decoded_reader(&Meter::default()).unwrap().unwrap();
         assert_eq!(read_up_to(&mut reader, offset, 4093), expected[..offset]);
         let (checkpoint, taken) = measure(|| {
             reader
@@ -302,7 +303,7 @@ fn resume_at(encrypted: bool, params: &str, encoded: &[u8], offset: usize) {
     };
     for chunk in [7, 4093] {
         let stream = stream.get().unwrap();
-        let mut reader = stream.decoded_reader().unwrap();
+        let mut reader = stream.decoded_reader(&Meter::default()).unwrap().unwrap();
         assert!(reader.restore(&checkpoint, &Meter::default()).unwrap());
         let rest = read_up_to(&mut reader, usize::MAX, chunk);
         assert!(rest == expected[offset..], "{params} at {offset}");
@@ -322,7 +323,7 @@ fn a_stopped_meter_stops_every_later_read() {
     let mut buf = [0; 257];
 
     let meter = Meter::new(Some(&hook));
-    let mut reader = stream.decoded_reader().unwrap();
+    let mut reader = stream.decoded_reader(&Meter::default()).unwrap().unwrap();
     assert_eq!(reader.read(&mut buf[..1], &meter), Ok(1));
     stop.set(true);
     let mut read = 0;
@@ -337,7 +338,7 @@ fn a_stopped_meter_stops_every_later_read() {
 
     let meter = Meter::new(Some(&hook));
     assert_eq!(meter.poll(), Err(Cancelled));
-    let mut reader = stream.decoded_reader().unwrap();
+    let mut reader = stream.decoded_reader(&Meter::default()).unwrap().unwrap();
     assert_eq!(reader.read(&mut buf[..1], &Meter::default()), Ok(1));
     #[cfg(feature = "unsafe")]
     let readers = {
@@ -345,7 +346,7 @@ fn a_stopped_meter_stops_every_later_read() {
             .checkpoint(&stream.to_owned_stream(), &Meter::default())
             .unwrap()
             .unwrap();
-        let mut resumed = stream.decoded_reader().unwrap();
+        let mut resumed = stream.decoded_reader(&Meter::default()).unwrap().unwrap();
         assert!(resumed.restore(&checkpoint, &Meter::default()).unwrap());
         [reader, resumed]
     };
@@ -365,7 +366,10 @@ fn a_stopped_meter_stops_every_later_read() {
 fn a_checkpoint_belongs_to_the_bytes_it_was_taken_from() {
     let data = common::noise(10_000, 3);
     let stored = stream_file("", &data);
-    let reader = object_3(&stored).decoded_reader().unwrap();
+    let reader = object_3(&stored)
+        .decoded_reader(&Meter::default())
+        .unwrap()
+        .unwrap();
     assert!(reader.checkpoint_heap_bound().is_none());
     assert!(
         reader
@@ -380,7 +384,7 @@ fn a_checkpoint_belongs_to_the_bytes_it_was_taken_from() {
         stream_file("/Filter /FlateDecode", &encoded),
     );
     let (a, b) = (object_3(&a), object_3(&b));
-    let mut reader = a.decoded_reader().unwrap();
+    let mut reader = a.decoded_reader(&Meter::default()).unwrap().unwrap();
     read_up_to(&mut reader, 100, 100);
     assert!(
         reader
@@ -392,7 +396,7 @@ fn a_checkpoint_belongs_to_the_bytes_it_was_taken_from() {
         .checkpoint(&a.to_owned_stream(), &Meter::default())
         .unwrap()
         .unwrap();
-    let mut other = b.decoded_reader().unwrap();
+    let mut other = b.decoded_reader(&Meter::default()).unwrap().unwrap();
     assert!(!other.restore(&checkpoint, &Meter::default()).unwrap());
     assert_eq!(read_up_to(&mut other, usize::MAX, 997), data);
 }
@@ -439,7 +443,10 @@ mod ccitt {
     /// The image bytes an image reader yields, read in pieces of `chunk` bytes, read
     /// twice with a rewind between.
     fn read_image_twice(stream: &Stream<'_>, params: &ImageDecodeParams, chunk: usize) -> Vec<u8> {
-        let mut reader = stream.image_reader(params).unwrap();
+        let mut reader = stream
+            .image_reader(params, &Meter::default())
+            .unwrap()
+            .unwrap();
         let first = read_up_to(&mut reader, usize::MAX, chunk);
         reader.rewind();
         let second = read_up_to(&mut reader, usize::MAX, chunk);
@@ -451,7 +458,10 @@ mod ccitt {
     /// bytes and skips the rest, each skipped byte zero, and the bytes it held.
     fn read_skipping(stream: &Stream<'_>, params: &ImageDecodeParams, chunk: usize) -> Vec<u8> {
         let meter = Meter::new(None);
-        let mut reader = stream.image_reader(params).unwrap();
+        let mut reader = stream
+            .image_reader(params, &Meter::default())
+            .unwrap()
+            .unwrap();
         let mut out = Vec::new();
         let mut buf = vec![0; chunk];
         for k in 0.. {
@@ -513,7 +523,10 @@ mod ccitt {
                         ..Default::default()
                     };
                     let whole = stream.decoded_image(&params);
-                    let reported = stream.ccitt_image_data(&params).unwrap();
+                    let reported = stream
+                        .ccitt_image_data(&params, &Meter::default())
+                        .unwrap()
+                        .unwrap();
                     for chunk in [1, 7, 4096] {
                         let read = read_image_twice(&stream, &params, chunk);
                         let case =
@@ -565,7 +578,10 @@ mod ccitt {
             };
             // The rows read, and a sum of their bytes.
             let count = |stream: &Stream<'_>| {
-                let mut reader = stream.image_reader(&params).unwrap();
+                let mut reader = stream
+                    .image_reader(&params, &Meter::default())
+                    .unwrap()
+                    .unwrap();
                 let (mut buf, mut read, mut sum) = (vec![0; 1000], 0, 0_u64);
                 loop {
                     match reader.read(&mut buf, &Meter::default()).unwrap() {
@@ -583,7 +599,12 @@ mod ccitt {
             assert_eq!(expected.0, rows as usize);
             let encrypted = encrypted_file(&dict, &data);
             let stream = object_3(&encrypted);
-            let (made, making) = measure(|| stream.image_reader(&params).is_some());
+            let (made, making) = measure(|| {
+                stream
+                    .image_reader(&params, &Meter::default())
+                    .unwrap()
+                    .is_some()
+            });
             assert!(made);
             assert!(
                 making.largest < 1024,
@@ -653,7 +674,10 @@ mod ccitt {
             };
             // The bytes read and the work counted reading them.
             let read = |stream: &Stream<'_>| {
-                let mut reader = stream.image_reader(&params).unwrap();
+                let mut reader = stream
+                    .image_reader(&params, &Meter::default())
+                    .unwrap()
+                    .unwrap();
                 let before = TOLD.get();
                 let bytes = read_up_to(&mut reader, usize::MAX, 4096);
                 (bytes, TOLD.get() - before)
@@ -720,7 +744,10 @@ mod ccitt {
                     ("AES", encrypted_file(dict, &data)),
                 ] {
                     let stream = object_3(&pdf);
-                    let mut reader = stream.image_reader(&params).unwrap();
+                    let mut reader = stream
+                        .image_reader(&params, &Meter::default())
+                        .unwrap()
+                        .unwrap();
                     TOLD.set(0);
                     let row = read_up_to(&mut reader, 8, 8);
                     let work = TOLD.get();
@@ -918,17 +945,23 @@ fn the_reader_reads_what_lenient_decoding_returns() {
         };
         let stream = object_3(&pdf);
         let whole = stream.decoded().map(|d| d.into_owned());
-        let Some(mut reader) = stream.decoded_reader() else {
+        let Some(mut reader) = stream.decoded_reader(&Meter::default()).unwrap() else {
             assert!(
                 filters.iter().any(|f| f == "/Unknown")
                     || params.iter().any(|p| p.starts_with("<< /Predictor 2 ")
                         && p.contains("/BitsPerComponent 16 ")),
                 "case {case}: {dict}: no reader"
             );
-            assert!(!stream.can_read_incrementally(), "case {case}: {dict}");
+            assert!(
+                !stream.can_read_incrementally(&Meter::default()).unwrap(),
+                "case {case}: {dict}"
+            );
             continue;
         };
-        assert!(stream.can_read_incrementally(), "case {case}: {dict}");
+        assert!(
+            stream.can_read_incrementally(&Meter::default()).unwrap(),
+            "case {case}: {dict}"
+        );
         let first = read_in_pieces(&mut reader, &mut rng, &Meter::default()).unwrap();
         match &whole {
             Ok(whole) => assert!(
@@ -984,7 +1017,7 @@ fn damage_at_every_byte_reads_as_lenient_decoding() {
                 let stream = object_3(&pdf);
                 let whole = stream.decoded().unwrap().into_owned();
                 for chunk in [1, 4096] {
-                    let mut reader = stream.decoded_reader().unwrap();
+                    let mut reader = stream.decoded_reader(&Meter::default()).unwrap().unwrap();
                     let read = read_up_to(&mut reader, usize::MAX, chunk);
                     assert!(
                         read == whole,
@@ -1046,7 +1079,7 @@ fn lenient_decoding_keeps_what_comes_before_damage() {
         let stream = object_3(&pdf);
         let decoded = stream.decoded().ok().map(|d| d.into_owned());
         assert_eq!(decoded.as_ref(), Some(&expected), "{filter} {data:?}");
-        let mut reader = stream.decoded_reader().unwrap();
+        let mut reader = stream.decoded_reader(&Meter::default()).unwrap().unwrap();
         assert_eq!(read_up_to(&mut reader, usize::MAX, 3), expected, "{filter}");
     }
 }
@@ -1095,7 +1128,10 @@ fn deep_chains_are_read_on_a_small_stack() {
             let pdf = stream_file(&dict, &data);
             let stream = object_3(&pdf);
             let whole = stream.decoded().map(|d| d.into_owned()).unwrap_or_default();
-            let mut reader = stream.decoded_reader().expect("a reader");
+            let mut reader = stream
+                .decoded_reader(&Meter::default())
+                .unwrap()
+                .expect("a reader");
             let mut rng = chains::Rng(n as u64);
             let first = read_in_pieces(&mut reader, &mut rng, &Meter::default());
             assert_eq!(first, Ok(whole.clone()), "{n} {filter}");
@@ -1115,7 +1151,7 @@ fn deep_chains_are_read_on_a_small_stack() {
                     .unwrap()
                     .expect("a checkpoint");
                 assert!(reader.checkpoint_heap_bound().is_some());
-                let mut resumed = stream.decoded_reader().unwrap();
+                let mut resumed = stream.decoded_reader(&Meter::default()).unwrap().unwrap();
                 assert!(
                     resumed.restore(&checkpoint, &Meter::default()).unwrap(),
                     "{n} {filter}"
@@ -1127,7 +1163,7 @@ fn deep_chains_are_read_on_a_small_stack() {
             // Each layer the loop goes down to counts a step of work, so the hook is
             // polled once a poll's worth of them were gone down to.
             let stop = || true;
-            let mut cancelled = stream.decoded_reader().unwrap();
+            let mut cancelled = stream.decoded_reader(&Meter::default()).unwrap().unwrap();
             let mut buf = [0; 16];
             let read = cancelled.read(&mut buf, &Meter::new(Some(&stop)));
             assert!(
@@ -1178,7 +1214,10 @@ fn chains_longer_than_the_filters_read_incrementally_read_as_lenient_decoding() 
         };
         let stream = object_3(&pdf);
         let whole = stream.decoded().map(|d| d.into_owned()).unwrap_or_default();
-        let mut reader = stream.decoded_reader().expect("a reader");
+        let mut reader = stream
+            .decoded_reader(&Meter::default())
+            .unwrap()
+            .expect("a reader");
         let first = read_in_pieces(&mut reader, &mut rng, &Meter::default()).unwrap();
         assert!(
             first == whole,
@@ -1194,7 +1233,7 @@ fn chains_longer_than_the_filters_read_incrementally_read_as_lenient_decoding() 
             polls.set(polls.get() + 1);
             polls.get() > 1
         };
-        let mut stopped = stream.decoded_reader().unwrap();
+        let mut stopped = stream.decoded_reader(&Meter::default()).unwrap().unwrap();
         let read = read_in_pieces(&mut stopped, &mut rng, &Meter::new(Some(&second)));
         if read.is_err() {
             stopped.rewind();

@@ -23,7 +23,7 @@ use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::sync::Arc;
 use crate::trivia::is_white_space_character;
 use crate::util::{OptionLog, find_needle};
-use crate::work::Meter;
+use crate::work::{Cancelled, Meter};
 use crate::xref::{StreamId, XRef};
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
@@ -230,7 +230,25 @@ impl<'a> FilterEntries<'a> {
         self.entries()
             .filter_map(|entry| Some((entry.filter?, entry)))
     }
+
+    /// [`Self::applied`], each entry read, applied or not, counted on `meter` before
+    /// it is, so that reading any number of them polls its hook: an `Err` once it
+    /// asks to stop.
+    pub fn applied_counted<'m>(
+        &'m self,
+        meter: &'m Meter<'_>,
+    ) -> impl Iterator<Item = Result<(Filter, FilterEntry<'a>), Cancelled>> + 'm {
+        self.entries()
+            .filter_map(move |entry| match meter.work(ENTRY_WORK) {
+                Ok(()) => Some(Ok((entry.filter?, entry))),
+                Err(stop) => Some(Err(stop)),
+            })
+    }
 }
+
+/// The work an entry of a stream's filters counts as it is read: the entry made of
+/// its name and parameters.
+const ENTRY_WORK: usize = size_of::<FilterEntry<'static>>();
 
 /// A stream of arbitrary data.
 #[derive(Clone)]
@@ -315,7 +333,7 @@ impl<'a> Stream<'a> {
         meter: &Meter<'_>,
         strict: bool,
     ) -> Result<Cow<'a, [u8]>, DecodeFailure> {
-        let Some((id, name)) = self.decryption()? else {
+        let Some((id, name)) = self.decryption(meter)? else {
             return Ok(Cow::Borrowed(self.data));
         };
         let xref = self.dict.ctx().xref();
@@ -345,8 +363,12 @@ impl<'a> Stream<'a> {
     /// (`crate::crypto`): `Ok(None)` where they are read as stored, else the object
     /// whose key decrypts them and the name of the crypt filter that does, `None`
     /// for the document's stream filter; [`DecodeFailure::Decryption`] where a named
-    /// `/Crypt` filter is not the first filter.
-    fn decryption(&self) -> Result<Option<(ObjectIdentifier, Option<Name<'a>>)>, DecodeFailure> {
+    /// `/Crypt` filter is not the first filter; [`DecodeFailure::Cancelled`] once
+    /// `meter`'s hook asks to stop as the filters are read.
+    fn decryption(
+        &self,
+        meter: &Meter<'_>,
+    ) -> Result<Option<(ObjectIdentifier, Option<Name<'a>>)>, DecodeFailure> {
         // Rules 8 and 10: what the document does not decrypt, an inline image included.
         let Some(id) = self.dict.ctx().decryption() else {
             return Ok(None);
@@ -362,7 +384,9 @@ impl<'a> Stream<'a> {
         // that names none leaves the data as stored, unless the first one names one.
         let mut named = None;
         let mut stored = false;
-        for (i, (filter, entry)) in self.filter_entries().applied().enumerate() {
+        let filters = self.filter_entries();
+        for (i, applied) in filters.applied_counted(meter).enumerate() {
+            let (filter, entry) = applied.map_err(|_| DecodeFailure::Cancelled)?;
             if filter != Filter::Crypt {
                 continue;
             }
@@ -481,8 +505,9 @@ impl<'a> Stream<'a> {
 
         let mut current: Option<FilterResult<'a>> = None;
 
-        let mut applied = filters.applied().peekable();
-        while let Some((filter, entry)) = applied.next() {
+        let mut applied = filters.applied_counted(meter).peekable();
+        while let Some(next) = applied.next() {
+            let (filter, entry) = next.map_err(|_| DecodeFailure::Cancelled)?;
             if filter == Filter::Crypt {
                 // Rule 9 of the crypt filter rules (`crate::crypto`): decoding passes over /Crypt.
                 continue;
@@ -525,7 +550,8 @@ impl<'a> Stream<'a> {
     ) -> Result<Option<StrictReader<'a>>, DecodeFailure> {
         let filters = self.filter_entries();
         let mut layers = Vec::new();
-        for (filter, entry) in filters.applied() {
+        for applied in filters.applied_counted(meter) {
+            let (filter, entry) = applied.map_err(|_| DecodeFailure::Cancelled)?;
             let params = &entry.params;
             // The parameters and the reversal of the predictor; `None` where whole
             // decoding refuses the parameters or only it reverses the predictor.
@@ -570,59 +596,85 @@ impl<'a> Stream<'a> {
     /// the last filter after any of those, whose rows decode as they are read, the
     /// reader holding the decoder's state and a row's colour changes, and of
     /// encrypted or decoded data a window of it ([`Self::ccitt_image_data`] tells what
-    /// they are). `None` otherwise, or where decryption would fail.
+    /// they are). `None` otherwise, or where decryption would fail. Reading the
+    /// filters and making their decoders counts on `meter`, and fails once its hook
+    /// asks to stop.
     #[cfg(feature = "images")]
-    pub fn image_reader(&self, image_params: &ImageDecodeParams) -> Option<DecodedReader<'a>> {
-        let Some((entry, before)) = self.ccitt_filters() else {
-            return self.decoded_reader();
+    pub fn image_reader(
+        &self,
+        image_params: &ImageDecodeParams,
+        meter: &Meter<'_>,
+    ) -> Result<Option<DecodedReader<'a>>, Cancelled> {
+        let Some((entry, before)) = self.ccitt_filters(meter)? else {
+            return self.decoded_reader(meter);
         };
-        let data = self.decrypted()?;
+        let Some(data) = self.decrypted(meter)? else {
+            return Ok(None);
+        };
         let bytes = match before.is_empty() {
             true => CcittBytes::new(data, &entry.params, image_params),
-            false => CcittBytes::decoded(
-                DecodedReader::decoding(data, &before)?,
-                &entry.params,
-                image_params,
-            ),
+            false => {
+                let Some(reader) = DecodedReader::decoding(data, &before, meter)? else {
+                    return Ok(None);
+                };
+                CcittBytes::decoded(reader, &entry.params, image_params)
+            }
         };
-        Some(DecodedReader::ccitt(bytes))
+        Ok(Some(DecodedReader::ccitt(bytes)))
     }
 
     /// What [`Self::decoded_image`] reports of the samples of an image whose last
     /// filter is `CCITTFaxDecode`, after filters [`Self::decoded_reader`] reads, from
     /// the dictionary alone: 8-bit gray samples, or of a bit for an indexed image, in
     /// rows of its `Columns`, as many as the image declares. `None` for other filters.
+    /// Reading the filters counts on `meter`.
     #[cfg(feature = "images")]
-    pub fn ccitt_image_data(&self, image_params: &ImageDecodeParams) -> Option<ImageData> {
-        let (entry, _) = self.ccitt_filters()?;
-        Some(crate::filter::ccitt::image_data(
-            &entry.params,
-            image_params,
-        ))
+    pub fn ccitt_image_data(
+        &self,
+        image_params: &ImageDecodeParams,
+        meter: &Meter<'_>,
+    ) -> Result<Option<ImageData>, Cancelled> {
+        Ok(self
+            .ccitt_filters(meter)?
+            .map(|(entry, _)| crate::filter::ccitt::image_data(&entry.params, image_params)))
     }
 
     /// Whether the filters allow [`Self::image_reader`], judged from the dictionary
-    /// alone: no data is read or decrypted.
+    /// alone: no data is read or decrypted. Reading the filters counts on `meter`.
     #[cfg(feature = "images")]
-    pub fn image_reads_incrementally(&self) -> bool {
-        self.ccitt_filters().is_some() || self.can_read_incrementally()
+    pub fn image_reads_incrementally(&self, meter: &Meter<'_>) -> Result<bool, Cancelled> {
+        Ok(self.ccitt_filters(meter)?.is_some() || self.can_read_incrementally(meter)?)
     }
 
     /// The entry of the last filter (besides `/Crypt`), if it is `CCITTFaxDecode`
-    /// and [`DecodedReader`] reads the filters before it, and their decoders.
+    /// and [`DecodedReader`] reads the filters before it, and their decoders; each
+    /// entry read counts on `meter`.
     #[cfg(feature = "images")]
-    fn ccitt_filters(&self) -> Option<(FilterEntry<'a>, Vec<Codec>)> {
+    fn ccitt_filters(
+        &self,
+        meter: &Meter<'_>,
+    ) -> Result<Option<(FilterEntry<'a>, Vec<Codec>)>, Cancelled> {
         let filters = self.filter_entries();
-        let applied: SmallVec<[_; 2]> = filters
-            .applied()
-            .filter(|(f, _)| *f != Filter::Crypt)
-            .collect();
-        match applied.split_last()? {
-            ((Filter::CcittFaxDecode, entry), before) => {
-                Some((entry.clone(), Self::codecs(before.iter().cloned())?))
+        let mut before = Vec::new();
+        let mut last = None;
+        for applied in filters.applied_counted(meter) {
+            let (filter, entry) = applied?;
+            if filter == Filter::Crypt {
+                continue;
             }
-            _ => None,
+            // A filter before the last one is decoded as it is read.
+            if let Some((filter, entry)) = last.replace((filter, entry)) {
+                let Some(codec) = Self::codec(filter, &entry) else {
+                    return Ok(None);
+                };
+                meter.reserve(&mut before, 1);
+                before.push(codec);
+            }
         }
+        Ok(match last {
+            Some((Filter::CcittFaxDecode, entry)) => Some((entry, before)),
+            _ => None,
+        })
     }
 
     /// The decoded data, read incrementally, when the stream's filters allow it: any
@@ -631,17 +683,38 @@ impl<'a> Stream<'a> {
     /// bits; the last 16 each read as the one before it decodes, any before them
     /// decoded whole on the first read. It yields the bytes [`Stream::decoded`]
     /// returns, without holding them all. `None` for other filters, or where
-    /// decryption would fail.
-    pub fn decoded_reader(&self) -> Option<DecodedReader<'a>> {
-        let codecs = Self::codecs(self.filter_entries().applied())?;
-        DecodedReader::decoding(self.decrypted()?, &codecs)
+    /// decryption would fail. Reading the filters and making their decoders counts
+    /// on `meter`, and fails once its hook asks to stop.
+    pub fn decoded_reader(
+        &self,
+        meter: &Meter<'_>,
+    ) -> Result<Option<DecodedReader<'a>>, Cancelled> {
+        let Some(codecs) = self.codecs(meter)? else {
+            return Ok(None);
+        };
+        match self.decrypted(meter)? {
+            Some(data) => DecodedReader::decoding(data, &codecs, meter),
+            None => Ok(None),
+        }
     }
 
     /// The stored data, decrypted as it is read, as lenient decoding decrypts it;
-    /// `None` where that fails.
-    fn decrypted(&self) -> Option<DecryptedReader<'a>> {
+    /// `None` where that fails. Reading the filters counts on `meter`.
+    fn decrypted(&self, meter: &Meter<'_>) -> Result<Option<DecryptedReader<'a>>, Cancelled> {
+        let decryption = match self.decryption(meter) {
+            Ok(decryption) => decryption,
+            Err(DecodeFailure::Cancelled) => return Err(Cancelled),
+            Err(_) => return Ok(None),
+        };
+        Ok(self.decrypted_by(decryption))
+    }
+
+    fn decrypted_by(
+        &self,
+        decryption: Option<(ObjectIdentifier, Option<Name<'a>>)>,
+    ) -> Option<DecryptedReader<'a>> {
         // Rules 5 to 11 of the crypt filter rules (`crate::crypto`): the data, decrypted, or `None`.
-        Some(match self.decryption().ok()? {
+        Some(match decryption {
             None => DecryptedReader::raw(Cow::Borrowed(self.data)),
             Some((id, name)) => {
                 let xref = self.dict.ctx().xref();
@@ -659,39 +732,56 @@ impl<'a> Stream<'a> {
     }
 
     /// Whether the filters and predictor allow [`Stream::decoded_reader`], judged from
-    /// the dictionary alone: no data is read or decrypted.
-    pub fn can_read_incrementally(&self) -> bool {
-        Self::codecs(self.filter_entries().applied()).is_some()
+    /// the dictionary alone: no data is read or decrypted. Reading the filters counts
+    /// on `meter`.
+    pub fn can_read_incrementally(&self, meter: &Meter<'_>) -> Result<bool, Cancelled> {
+        Ok(self.codecs(meter)?.is_some())
     }
 
-    /// The decoders [`DecodedReader`] reads `filters` with, in turn, passing over
+    /// The decoders [`DecodedReader`] reads the filters with, in turn, passing over
     /// `/Crypt` as decoding does (rule 9 of the crypt filter rules, `crate::crypto`);
     /// `None` where a filter is one only whole decoding decodes, an image filter or a
-    /// predictor only it reverses, or where it refuses a predictor's parameters.
-    fn codecs(filters: impl Iterator<Item = (Filter, FilterEntry<'a>)>) -> Option<Vec<Codec>> {
+    /// predictor only it reverses, or where it refuses a predictor's parameters. Each
+    /// entry read counts on `meter`.
+    fn codecs(&self, meter: &Meter<'_>) -> Result<Option<Vec<Codec>>, Cancelled> {
+        let filters = self.filter_entries();
         let mut codecs = Vec::new();
-        for (filter, entry) in filters {
-            let predicted = || {
-                let params = PredictorParams::from_params(&entry.params)?;
-                if params.predictor != 1 {
-                    Unpredictor::new(&params)?;
-                }
-                Some(params)
+        for applied in filters.applied_counted(meter) {
+            let (filter, entry) = applied?;
+            if filter == Filter::Crypt {
+                continue;
+            }
+            let Some(codec) = Self::codec(filter, &entry) else {
+                return Ok(None);
             };
-            codecs.push(match filter {
-                Filter::Crypt => continue,
-                Filter::FlateDecode => Codec::Flate(predicted()?),
-                Filter::LzwDecode => Codec::Lzw(predicted()?),
-                Filter::AsciiHexDecode => Codec::AsciiHex,
-                Filter::Ascii85Decode => Codec::Ascii85,
-                Filter::RunLengthDecode => Codec::RunLength,
-                Filter::CcittFaxDecode
-                | Filter::Jbig2Decode
-                | Filter::DctDecode
-                | Filter::JpxDecode => return None,
-            });
+            meter.reserve(&mut codecs, 1);
+            codecs.push(codec);
         }
-        Some(codecs)
+        Ok(Some(codecs))
+    }
+
+    /// The decoder [`DecodedReader`] reads `filter` with, its parameters in `entry`;
+    /// `None` as [`Self::codecs`] tells.
+    fn codec(filter: Filter, entry: &FilterEntry<'a>) -> Option<Codec> {
+        let predicted = || {
+            let params = PredictorParams::from_params(&entry.params)?;
+            if params.predictor != 1 {
+                Unpredictor::new(&params)?;
+            }
+            Some(params)
+        };
+        Some(match filter {
+            Filter::FlateDecode => Codec::Flate(predicted()?),
+            Filter::LzwDecode => Codec::Lzw(predicted()?),
+            Filter::AsciiHexDecode => Codec::AsciiHex,
+            Filter::Ascii85Decode => Codec::Ascii85,
+            Filter::RunLengthDecode => Codec::RunLength,
+            Filter::Crypt
+            | Filter::CcittFaxDecode
+            | Filter::Jbig2Decode
+            | Filter::DctDecode
+            | Filter::JpxDecode => return None,
+        })
     }
 
     /// An owned handle to this stream, which [`OwnedStream::get`] turns back into it

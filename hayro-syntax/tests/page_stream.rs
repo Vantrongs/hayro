@@ -33,7 +33,7 @@ fn a_content_row_cut_short_is_kept() {
 /// and the lenient reading alike, though the content holds it each time.
 #[test]
 fn a_stream_named_many_times_is_decoded_once() {
-    use hayro_syntax::work::TOLD;
+    use hayro_syntax::work::{STATE_MADE, TOLD};
 
     let data = common::noise(4096, 7);
     let stored = common::stored_zlib(&data, 1000);
@@ -45,12 +45,16 @@ fn a_stream_named_many_times_is_decoded_once() {
         let expected: Vec<u8> = (0..n)
             .flat_map(|_| data.iter().copied().chain(*b" "))
             .collect();
+        // The work of the data: a decoder's state made counts apart.
+        let work = || TOLD.get() - STATE_MADE.get();
         TOLD.set(0);
+        STATE_MADE.set(0);
         assert_eq!(page.try_page_stream().unwrap(), expected);
-        let strict = TOLD.get();
+        let strict = work();
         TOLD.set(0);
+        STATE_MADE.set(0);
         assert_eq!(page.page_stream().unwrap(), expected);
-        let lenient = TOLD.get();
+        let lenient = work();
         // One decoding takes the stored bytes and makes the data.
         let once = stored.len() + data.len();
         assert!(

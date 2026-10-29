@@ -251,7 +251,7 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
             // This is actually the most common case, where the PDF is embedded
             // in such a way where we don't need to decode. In this case,
             // we can use the raw decoded component values directly.
-            let data = into_owned(core::mem::take(&mut self.ctx.decoded.data), meter)?;
+            let data = into_owned(core::mem::take(&mut self.ctx.decoded.data), 0, meter)?;
             self.ctx.decoded.data = data.into();
 
             if self.color_key_mask.is_some() {
@@ -333,13 +333,12 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
                 color_space.convert_in_place(piece)
             })?;
         } else {
-            let mut output = vec![0; decoded.len() / n * 3];
-            for (input, output) in decoded
-                .chunks(pixels * n)
-                .zip(output.chunks_mut(pixels * 3))
-            {
-                color_space.convert(input, output)?;
-                self.meter.work(output.len()).ok()?;
+            let mut output = self.meter.room(decoded.len() / n * 3);
+            for input in decoded.chunks(pixels * n) {
+                let (at, len) = (output.len(), input.len() / n * 3);
+                self.meter.work(len).ok()?;
+                output.resize(at + len, 0);
+                color_space.convert(input, &mut output[at..])?;
             }
             decoded = output;
         }
@@ -381,6 +380,8 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
                 .image_data
                 .as_mut()
                 .and_then(|image| image.alpha.take())?;
+            let more = texels.saturating_sub(data.len());
+            self.meter.reserve_exact(&mut data, more);
             data.resize(texels, 0);
 
             Some((
@@ -442,7 +443,7 @@ impl<'a, 'b, 'm> ImageDecoder<'a, 'b, 'm> {
             self.ctx.bits_per_component,
             self.meter,
         )?;
-        let mut data = Vec::with_capacity(components.len() / num_components);
+        let mut data = self.meter.room(components.len() / num_components);
 
         for piece in components.chunks(pixel_piece(num_components) * num_components) {
             for pixel in piece.chunks_exact(num_components) {

@@ -16,7 +16,7 @@ use crate::filter::ascii_hex::decode_hex_digit;
 use crate::filter::lzw_flate::flate::fallback::{Input, Slice};
 use crate::filter::lzw_flate::lzw;
 use crate::trivia::is_white_space_character;
-use crate::work::Meter;
+use crate::work::{Meter, POLL_BYTES};
 use alloc::vec::Vec;
 
 /// Where a decoding is.
@@ -131,13 +131,25 @@ pub(crate) fn decode_within(
     limit: usize,
 ) -> Result<Option<Vec<u8>>, ()> {
     let mut decoded = Vec::new();
-    let state = decoder.make(
-        &mut Slice::new(data),
-        &mut decoded,
-        limit.saturating_add(1),
-        strict,
-        meter,
-    );
+    let mut input = Slice::new(data);
+    // Made a poll's worth at a time. Room of a poll's worth or less grows as pushing
+    // grows it; past that, a step makes no more than the room holds, which doubles on
+    // the meter once a step could fill it, as pushing would double it. So the room
+    // doubles once more than pushing would only for data ending within a step of it.
+    let state = loop {
+        let (len, room) = (decoded.len(), decoded.capacity());
+        let mut until = len.saturating_add(POLL_BYTES).min(limit.saturating_add(1));
+        if room >= POLL_BYTES {
+            if room - len <= STEP_AT_MOST {
+                meter.reserve_exact(&mut decoded, room);
+            }
+            until = until.min(decoded.capacity() - STEP_AT_MOST);
+        }
+        match decoder.make(&mut input, &mut decoded, until, strict, meter) {
+            State::Going if decoded.len() <= limit => {}
+            state => break state,
+        }
+    };
     if decoded.len() > limit {
         return Err(());
     }
@@ -146,6 +158,10 @@ pub(crate) fn decode_within(
         _ => None,
     })
 }
+
+/// The most bytes a decoder's step makes past the bytes it was asked for: an LZW
+/// code's, at most the table's size.
+pub(crate) const STEP_AT_MOST: usize = 4096;
 
 /// [`decode_within`] without a limit.
 pub(crate) fn decode(

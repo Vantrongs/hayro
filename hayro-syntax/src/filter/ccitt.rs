@@ -20,17 +20,18 @@ use hayro_ccitt::{DecodeSettings, Decoder, EncodingMode, RowDecoder, Source};
 /// are at most [`POLL_BYTES`]. It so holds less than eight times `needed`, or at most
 /// `POLL_BYTES`: a stream cut short or stopped costs what it decoded, not what `Rows`
 /// and `Columns` declare, while the last growth to the declared size copies an eighth
-/// of it. Past the declared size, or without one, it doubles.
+/// of it. Past the declared size, or without one, it doubles. The room is made on
+/// `meter` ([`Meter::reserve_exact`]).
 #[inline(always)]
-fn reserve(output: &mut Vec<u8>, needed: usize, declared: usize) {
+fn reserve(output: &mut Vec<u8>, needed: usize, declared: usize, meter: &Meter<'_>) {
     if needed > output.capacity() {
-        grow_to(output, needed, declared);
+        grow_to(output, needed, declared, meter);
     }
 }
 
 #[cold]
 #[inline(never)]
-fn grow_to(output: &mut Vec<u8>, needed: usize, declared: usize) {
+fn grow_to(output: &mut Vec<u8>, needed: usize, declared: usize, meter: &Meter<'_>) {
     let mut target = declared;
     while target > POLL_BYTES && target / 8 >= needed {
         target /= 8;
@@ -38,7 +39,7 @@ fn grow_to(output: &mut Vec<u8>, needed: usize, declared: usize) {
     if target < needed {
         target = needed.max(2 * output.len());
     }
-    output.reserve_exact(target - output.len());
+    meter.reserve_exact(output, target - output.len());
 }
 
 /// How a stream's CCITT data decodes: its settings, and the byte its white pixels
@@ -342,7 +343,7 @@ impl<'a> CcittBytes<'a> {
             let n = self.left.min(POLL_BYTES);
             if n > 0 {
                 let len = output.len();
-                reserve(output, len + n, declared);
+                reserve(output, len + n, declared, meter);
                 output.resize(len + n, self.setup.white);
                 let spans = self.write_row(&mut output[len..]);
                 self.taken(n);
@@ -828,7 +829,9 @@ mod tests {
         let reader = DecodedReader::decoding(
             DecryptedReader::raw(alloc::borrow::Cow::Borrowed(hex)),
             &[Codec::AsciiHex],
+            &Meter::default(),
         )
+        .unwrap()
         .unwrap();
         let mut bytes = CcittBytes::decoded(reader, params, &ImageDecodeParams::default());
         if let Encoded::Decoded(feed) = &bytes.data {
@@ -915,7 +918,9 @@ mod tests {
         let reader = DecodedReader::decoding(
             DecryptedReader::raw(alloc::borrow::Cow::Borrowed(&hex)),
             &[Codec::AsciiHex],
+            &Meter::default(),
         )
+        .unwrap()
         .unwrap();
         let feed = Feed::new(reader);
         let meter = Meter::default();

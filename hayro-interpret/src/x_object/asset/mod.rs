@@ -93,9 +93,10 @@ impl ImageAsset {
     }
 
     /// The bytes the decoder states saved for this asset's requests take: at most
-    /// 2 MiB, whatever the image's size.
+    /// 2 MiB, whatever the image's size. Read without waiting on a request, so a
+    /// request's `cancel` hook may read it; it does not fail.
     pub fn checkpoint_bytes(&self) -> Result<usize, RequestError> {
-        Ok(self.0.checkpoints.bytes()?)
+        Ok(self.0.checkpoints.bytes())
     }
 
     fn xobject(&self) -> Option<ImageXObject<'_>> {
@@ -444,7 +445,7 @@ fn with_coverage(
     Ok(match coverage {
         Some(coverage) if !format.has_alpha() => {
             let c = format.channels();
-            let mut out = Vec::with_capacity(data.len() / c * (c + 1));
+            let mut out = meter.room(data.len() / c * (c + 1));
             let texels = data.len() / c;
             let mut start = 0;
             while start < texels {
@@ -512,3 +513,5 @@ mod differential;
 mod short;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod unmetered;

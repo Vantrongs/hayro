@@ -25,7 +25,9 @@ This crate has one optional feature:
   will add around ~240KB to your binary.
 */
 
-#![forbid(unsafe_code)]
+#![cfg_attr(not(test), forbid(unsafe_code))]
+// Unit tests count allocations with an allocator of their own, the one unsafe code.
+#![cfg_attr(test, deny(unsafe_code))]
 #![deny(missing_docs)]
 
 #[macro_use]

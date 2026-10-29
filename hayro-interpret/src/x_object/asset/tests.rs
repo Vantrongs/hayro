@@ -8,7 +8,7 @@ use crate::fixtures::{file, noise, stored_deflate, stored_zlib, stream};
 use hayro_syntax::Pdf;
 use hayro_syntax::object::{ObjectIdentifier, Stream};
 #[cfg(debug_assertions)]
-use hayro_syntax::work::{POLL_BYTES, TOLD};
+use hayro_syntax::work::{POLL_BYTES, STATE_MADE, STATES_MADE, TOLD};
 use std::cell::Cell;
 use std::ops::Range;
 
@@ -1302,13 +1302,15 @@ fn rows_past_the_data_are_jumped_over() {
             let huge = asset(&huge);
             let mut source = huge.open(None, None).unwrap();
             assert_eq!(is_streamed(&source), bits == 1, "{case}");
-            let polls = Cell::new(0);
+            let polls = Cell::new(0_usize);
             let hook = || {
                 polls.set(polls.get() + 1);
                 false
             };
             let run = |source: &mut ImageSource<'_>, h: u32, grid, window| {
                 TOLD.set(0);
+                STATE_MADE.set(0);
+                STATES_MADE.set(0);
                 rows::STEPPED.set(0);
                 polls.set(0);
                 let region = source
@@ -1319,7 +1321,15 @@ fn rows_past_the_data_are_jumped_over() {
                         cancel: Some(&hook),
                     })
                     .unwrap_or_else(|e| panic!("{case}, {h} rows high: {e:?}"));
-                (region.data, TOLD.get(), rows::STEPPED.get(), polls.get())
+                // The decoders' states made count apart, and each may poll as it is
+                // made.
+                let polls = polls.get().saturating_sub(STATES_MADE.get());
+                (
+                    region.data,
+                    TOLD.get() - STATE_MADE.get(),
+                    rows::STEPPED.get(),
+                    polls,
+                )
             };
             let (last, told, stepped, polls_made) = run(
                 &mut source,

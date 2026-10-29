@@ -2,6 +2,7 @@
 //! alpha.
 
 use super::Stop;
+use super::index::SHARED_STATE_BYTES;
 use super::streamed::incremental_samples;
 use crate::x_object::decode::{
     BILEVEL_MASK_LUT, DecodedMask, MaskPath, SampleFormat, SampleRows, decode_mask,
@@ -83,25 +84,27 @@ pub(super) enum RawRow {
 
 impl<'a> RawRows<'a> {
     /// The rows of `obj`'s samples, `row_bytes` each, read on `meter`, noting where
-    /// the data ends in `end`.
+    /// the data ends in `end`; `None` where they cannot be read incrementally.
     pub(super) fn new(
         obj: &ImageXObject<'a>,
         row_bytes: usize,
         end: &'a OnceLock<usize>,
         meter: &'a Meter<'a>,
-    ) -> Option<Self> {
-        let reader = image_reader(obj)?;
+    ) -> Result<Option<Self>, Cancelled> {
+        let Some(reader) = image_reader(obj, meter)? else {
+            return Ok(None);
+        };
         if let Some(len) = reader.stored_len() {
             end.get_or_init(|| len);
         }
-        Some(Self {
+        Ok(Some(Self {
             reader,
             meter,
             end,
             row_bytes,
             total: 0,
             at: 0,
-        })
+        }))
     }
 
     /// Whether the data holds row `y` whole: `None` until its end is known.
@@ -314,7 +317,7 @@ impl<'a> MaskSource<'a> {
             return Ok(None);
         };
         let stencil = mask.kind == ImageKind::StencilMask;
-        if let Some((grid, format)) = incremental_samples(&mask) {
+        if let Some((grid, format)) = incremental_samples(&mask, meter)? {
             let path = MaskPath::new(
                 &format.color_space,
                 format.bits_per_component,
@@ -358,13 +361,14 @@ impl<'a> MaskSource<'a> {
         }
     }
 
-    /// The mask's rows, read on `meter`, noting where its data ends in `end`.
+    /// The mask's rows, read on `meter`, noting where its data ends in `end`; `None`
+    /// where they cannot be read.
     pub(super) fn rows(
         &'a self,
         end: &'a OnceLock<usize>,
         meter: &'a Meter<'a>,
-    ) -> Option<MaskRows<'a>> {
-        Some(match self {
+    ) -> Result<Option<MaskRows<'a>>, Cancelled> {
+        Ok(Some(match self {
             Self::Streamed {
                 obj,
                 path,
@@ -373,7 +377,10 @@ impl<'a> MaskSource<'a> {
             } => {
                 let row_bytes = path.rows(*width, *height).row_bytes();
                 MaskRows::Streamed {
-                    raw: Box::new(RawRows::new(obj, row_bytes, end, meter)?),
+                    raw: match RawRows::new(obj, row_bytes, end, meter)? {
+                        Some(raw) => Box::new(raw),
+                        None => return Ok(None),
+                    },
                     path: path.clone(),
                     bytes: Vec::new(),
                     last: 0,
@@ -383,13 +390,18 @@ impl<'a> MaskSource<'a> {
                 }
             }
             Self::Decoded(mask) => MaskRows::Decoded { mask, row: 0 },
-        })
+        }))
     }
 }
 
-/// The reader of `obj`'s samples, as whole decoding decodes them.
-fn image_reader<'a>(obj: &ImageXObject<'a>) -> Option<DecodedReader<'a>> {
-    obj.stream.image_reader(&image_decode_params(obj))
+/// The reader of `obj`'s samples, as whole decoding decodes them; making it counts
+/// on `meter`.
+fn image_reader<'a>(
+    obj: &ImageXObject<'a>,
+    meter: &Meter<'_>,
+) -> Result<Option<DecodedReader<'a>>, Cancelled> {
+    obj.stream
+        .image_reader(&image_decode_params(obj, meter)?, meter)
 }
 
 /// A mask's rows, as alpha, each read from its start in pieces of columns from left
@@ -433,7 +445,7 @@ impl<'a> MaskRows<'a> {
         }
     }
 
-    /// The most heap bytes a state saved of it alongside the colour holds, boxed: none
+    /// The most heap bytes a state saved of it alongside the colour holds, shared: none
     /// for a mask decoded whole, which moves to any row at once; `None` where its
     /// reader cannot be saved.
     pub(super) fn checkpoint_heap_bound(&self) -> Option<usize> {
@@ -441,7 +453,7 @@ impl<'a> MaskRows<'a> {
             MaskRows::Streamed { raw, .. } => raw
                 .reader
                 .checkpoint_heap_bound()?
-                .checked_add(size_of::<DecodedCheckpoint>()),
+                .checked_add(SHARED_STATE_BYTES),
             MaskRows::Decoded { .. } => Some(0),
         }
     }
