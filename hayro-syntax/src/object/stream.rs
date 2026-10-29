@@ -566,14 +566,10 @@ impl<'a> Stream<'a> {
 
     /// The stream's image data read row by row, when its one filter (besides
     /// `/Crypt`) is `CCITTFaxDecode` and the image is not indexed (whose samples it
-    /// decodes to bits); `None` otherwise, and where the hook of `meter`, which
-    /// decryption counts on, asks to stop.
+    /// decodes to bits); `None` otherwise, or where decryption would fail. Encrypted
+    /// data is decrypted as the rows are read.
     #[cfg(feature = "images")]
-    pub fn ccitt_rows(
-        &self,
-        image_params: &ImageDecodeParams,
-        meter: &Meter<'_>,
-    ) -> Option<CcittRows<'a>> {
+    pub fn ccitt_rows(&self, image_params: &ImageDecodeParams) -> Option<CcittRows<'a>> {
         let filters = self.filter_entries();
         let mut applied = filters.applied().filter(|(f, _)| *f != Filter::Crypt);
         let (Some((Filter::CcittFaxDecode, entry)), None) = (applied.next(), applied.next()) else {
@@ -582,8 +578,11 @@ impl<'a> Stream<'a> {
         if image_params.is_indexed {
             return None;
         }
-        let data = self.raw_data_metered(meter, false).ok()?;
-        Some(CcittRows::new(data, &entry.params, image_params))
+        Some(CcittRows::new(
+            self.decrypted()?,
+            &entry.params,
+            image_params,
+        ))
     }
 
     /// The decoded data, read incrementally, when the stream's filters allow it: no
@@ -592,8 +591,18 @@ impl<'a> Stream<'a> {
     /// holding them all. `None` for other filters, or where decryption would fail.
     pub fn decoded_reader(&self) -> Option<DecodedReader<'a>> {
         let filter = self.reader_filter()?;
+        let data = self.decrypted()?;
+        match filter {
+            None => Some(DecodedReader::raw(data)),
+            Some(params) => DecodedReader::flate(data, &params),
+        }
+    }
+
+    /// The stored data, decrypted as it is read, as lenient decoding decrypts it;
+    /// `None` where that fails.
+    fn decrypted(&self) -> Option<DecryptedReader<'a>> {
         // Rules 5 to 11 of the crypt filter rules (`crate::crypto`): the data, decrypted, or `None`.
-        let data = match self.decryption().ok()? {
+        Some(match self.decryption().ok()? {
             None => DecryptedReader::raw(Cow::Borrowed(self.data)),
             Some((id, name)) => {
                 let xref = self.dict.ctx().xref();
@@ -607,11 +616,7 @@ impl<'a> Stream<'a> {
                     xref.decrypted_reader(id, self.data, target)?
                 }
             }
-        };
-        match filter {
-            None => Some(DecodedReader::raw(data)),
-            Some(params) => DecodedReader::flate(data, &params),
-        }
+        })
     }
 
     /// Whether the filters and predictor allow [`Stream::decoded_reader`], judged from

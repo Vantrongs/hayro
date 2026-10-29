@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 
 /// Reads the bytes [`Decryptor::decrypt`] returns for the same data, in pieces, with
 /// no more than one AES block of them held at a time.
+#[derive(Clone)]
 pub(crate) struct DecryptedReader<'a> {
     data: Cow<'a, [u8]>,
     cursor: Cursor,
@@ -215,6 +216,26 @@ impl<'a> DecryptedReader<'a> {
         n
     }
 
+    /// The bytes the data decrypts to: for AES, the whole blocks after the IV without
+    /// the last one's padding, which is decrypted to find it.
+    #[cfg(feature = "images")]
+    pub(crate) fn len(&self) -> usize {
+        let Cipher::Aes(blocks) = &self.cursor.cipher else {
+            return self.data.len();
+        };
+        // `Aes::blocks` takes data of an IV at least.
+        let whole = (self.data.len() - 16) / 16;
+        if whole == 0 {
+            return 0;
+        }
+        let at = 16 * whole;
+        let last = blocks.aes.decrypt_cbc_block(
+            self.data[at..at + 16].try_into().unwrap(),
+            self.data[at - 16..at].try_into().unwrap(),
+        );
+        at - padding_len(&last)
+    }
+
     /// The stored bytes, when they need no decryption.
     pub(crate) fn plain(&self) -> Option<&[u8]> {
         matches!(self.cursor.cipher, Cipher::None).then_some(&*self.data)
@@ -280,6 +301,8 @@ mod tests {
                 continue;
             };
             let expected = expected.as_deref().unwrap();
+            #[cfg(feature = "images")]
+            assert_eq!(reader.len(), expected.len());
             for prefix in [0, 1, 15, 17, 37, data.len() + 1] {
                 reader.rewind();
                 #[cfg_attr(not(feature = "unsafe"), allow(unused))]

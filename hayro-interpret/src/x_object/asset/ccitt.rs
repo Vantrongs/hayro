@@ -1,6 +1,8 @@
 //! CCITT fax images read row by row for each request: the data decoded from its
 //! start, each row's colour changes turned into the texels of the columns a request
-//! reads, no row kept.
+//! reads, no row kept. Opening reads nothing: the rows whole decoding keeps of data
+//! that ends early, and whether it fails, depend only on where the data ends, which
+//! a request reaching past it finds.
 
 use super::rows::piece_texels;
 use super::streamed::Colour;
@@ -12,52 +14,32 @@ use core::ops::Range;
 use hayro_syntax::object::dict::keys::{MASK, SMASK, SMASK_IN_DATA};
 use hayro_syntax::object::stream::{CcittEnd, CcittRows, ImageColorSpace, ImageData};
 use hayro_syntax::work::Meter;
-use std::sync::OnceLock;
-
-/// The rows a CCITT image's data decodes to and the rows its plane has, counted when
-/// its asset is first opened; `None` when decoding it whole fails.
-pub(super) type CcittHeight = OnceLock<Option<Counted>>;
-
-#[derive(Clone, Copy)]
-pub(super) struct Counted {
-    /// The rows the data decodes to.
-    decoded: u32,
-    /// The rows of the plane: those decoded, and white ones after them where whole
-    /// decoding pads the image.
-    kept: u32,
-}
 
 /// A CCITT image read row by row.
 pub(super) struct CcittStreamed<'a> {
     rows: CcittRows<'a>,
     colour: Colour,
-    counted: Counted,
     layout: PlaneLayout,
 }
 
 impl<'a> CcittStreamed<'a> {
     /// `obj` read row by row, if its one filter is `CCITTFaxDecode`, it has no mask,
-    /// and it is a gray image or a stencil mask whose 8-bit rows [`Colour`] converts;
-    /// its rows are counted into `height` once, by decoding all of its data. Fails
-    /// where decoding it whole fails.
-    pub(super) fn new(
-        obj: &ImageXObject<'a>,
-        height: &CcittHeight,
-        meter: &Meter<'_>,
-    ) -> Result<Option<Self>, Stop> {
+    /// and it is a gray image or a stencil mask whose 8-bit rows [`Colour`] converts.
+    /// Its plane has the rows the image declares; those whole decoding leaves out are
+    /// transparent.
+    pub(super) fn new(obj: &ImageXObject<'a>) -> Option<Self> {
         let dict = obj.stream.dict();
         if [SMASK, MASK, SMASK_IN_DATA]
             .iter()
             .any(|k| dict.contains_key(k))
         {
-            return Ok(None);
+            return None;
         }
         let params = image_decode_params(obj);
-        let rows = obj.stream.ccitt_rows(&params, meter);
-        meter.poll()?;
-        let Some(rows) = rows else {
-            return Ok(None);
-        };
+        if params.height == 0 {
+            return None;
+        }
+        let rows = obj.stream.ccitt_rows(&params)?;
         // What the filter reports of the samples it decodes, as whole decoding reads
         // them.
         let data = ImageData {
@@ -67,23 +49,12 @@ impl<'a> CcittStreamed<'a> {
             width: rows.columns(),
             height: params.height,
         };
-        let Some(colour) =
-            Colour::of(obj, sample_format(obj, Some(&data))).filter(|c| c.components() == 1)
-        else {
-            return Ok(None);
-        };
-        let counted = match height.get() {
-            Some(&counted) => counted,
-            None => {
-                let counted = count(&rows, meter)?;
-                *height.get_or_init(|| counted)
-            }
-        };
-        let counted = counted.ok_or(Stop::Failed)?;
+        let colour =
+            Colour::of(obj, sample_format(obj, Some(&data))).filter(|c| c.components() == 1)?;
         let (w, h) = (obj.width(), obj.height());
         let layout = PlaneLayout {
             width: rows.columns(),
-            height: counted.kept,
+            height: params.height,
             // As whole decoding maps a plane of another size than the dictionary
             // declares onto the image.
             to_image: (
@@ -93,12 +64,11 @@ impl<'a> CcittStreamed<'a> {
             interpolate: obj.interpolate,
             format: colour.format(false),
         };
-        Ok(Some(Self {
+        Some(Self {
             rows,
             colour,
-            counted,
             layout,
-        }))
+        })
     }
 
     pub(super) fn layout(&self) -> ImageLayout {
@@ -109,7 +79,10 @@ impl<'a> CcittStreamed<'a> {
     }
 
     /// Reads the image plane into `area`: decodes the data from its start through
-    /// the last row `area` reads, converting and pushing the rows it reads.
+    /// the last row `area` reads, converting and pushing the rows it reads. Where the
+    /// data ends before that row, the rows after it are white as far as whole
+    /// decoding pads them, and left out (transparent) past that; the request fails
+    /// where whole decoding does.
     pub(super) fn run(&self, area: &mut Area<'_>, meter: &Meter<'_>) -> Result<DecodeWork, Stop> {
         let wanted = area.rows();
         let columns = area.columns();
@@ -118,39 +91,35 @@ impl<'a> CcittStreamed<'a> {
         let mut rgb = Vec::new();
         let mut y = 0;
         let mut failed = None;
-        let held = wanted.end.min(self.counted.decoded);
-        if held > 0 {
-            let end = self.rows.decode(
-                |changes| {
-                    if y >= wanted.start
-                        && let Err(stop) =
-                            self.push_row(area, changes, columns.clone(), &mut texels, &mut rgb)
-                    {
-                        failed = Some(stop);
-                        return false;
-                    }
-                    y += 1;
-                    y < held
-                },
-                meter,
-            );
-            if let Some(stop) = failed {
-                return Err(stop);
-            }
-            if end == CcittEnd::Cancelled {
-                return Err(Stop::Cancelled);
-            }
-            // The data decodes as it did when its rows were counted.
-            if y < held {
-                return Err(Stop::Failed);
-            }
+        let end = self.rows.decode(
+            |changes| {
+                if y >= wanted.start
+                    && let Err(stop) =
+                        self.push_row(area, changes, columns.clone(), &mut texels, &mut rgb)
+                {
+                    failed = Some(stop);
+                    return false;
+                }
+                y += 1;
+                y < wanted.end
+            },
+            meter,
+        );
+        if let Some(stop) = failed {
+            return Err(stop);
         }
-        // Rows past those the data holds are white, as whole decoding pads them.
-        let mut white = [self.rows.white()];
-        let white = self.colour.convert(&mut white, &mut rgb)?;
-        for _ in y.max(wanted.start)..wanted.end {
-            area.push_rest(columns.start as u32, white)?;
-            area.end_row()?;
+        if end == CcittEnd::Cancelled {
+            return Err(Stop::Cancelled);
+        }
+        if y < wanted.end {
+            // The data ended at row `y`, which decides what whole decoding keeps.
+            let kept = self.rows.rows_kept(y, end).ok_or(Stop::Failed)?;
+            let mut white = [self.rows.white()];
+            let white = self.colour.convert(&mut white, &mut rgb)?;
+            for _ in y.max(wanted.start)..kept.min(wanted.end) {
+                area.push_rest(columns.start as u32, white)?;
+                area.end_row()?;
+            }
         }
         Ok(DecodeWork {
             rows_decoded: u64::from(y),
@@ -197,33 +166,14 @@ impl<'a> CcittStreamed<'a> {
     }
 }
 
-/// The rows `rows` decodes to and keeps, decoding all of its data; `None` where
-/// decoding it whole fails.
-fn count(rows: &CcittRows<'_>, meter: &Meter<'_>) -> Result<Option<Counted>, Stop> {
-    let mut decoded = 0;
-    let end = rows.decode(
-        |_| {
-            decoded += 1;
-            true
-        },
-        meter,
-    );
-    if end == CcittEnd::Cancelled {
-        return Err(Stop::Cancelled);
-    }
-    Ok(rows
-        .rows_kept(decoded, end)
-        .map(|kept| Counted { decoded, kept }))
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::Plane;
+    use super::super::differential::assert_streams_as_whole;
     use super::super::tests::{
         assert_asset_streams_as_decoded, asset, image, is_streamed, named, pdf, request, transfer,
-        whole,
+        try_whole, whole,
     };
-    use super::super::{Plane, RequestError};
-    use crate::x_object::decode::decode_image;
     use std::sync::Arc;
 
     /// A 211 × 96 test page in each encoding, as `hayro-ccitt`'s tests have it.
@@ -276,9 +226,9 @@ mod tests {
     }
 
     /// Data that ends before the image's rows: the missing rows are white where whole
-    /// decoding pads them (few, after data that decodes through), and left out
-    /// otherwise; data that breaks off keeps the rows before; data that holds no row
-    /// fails as decoding it whole does.
+    /// decoding pads them (few, after data that decodes through), and transparent
+    /// where it leaves them out; data that breaks off keeps the rows before; data that
+    /// holds no row fails as decoding it whole does, at the first request.
     #[test]
     fn ccitt_data_that_ends_early_streams_as_decoded() {
         let gray = "/ColorSpace /DeviceGray /BitsPerComponent 1";
@@ -298,15 +248,13 @@ mod tests {
                 data,
             )]);
             let asset = asset(&pdf);
-            named(&format!("height {height}"), || {
-                assert_asset_streams_as_decoded(&asset);
-            });
+            assert_streams_as_whole(&asset, &format!("height {height}"));
             let source = asset.open(None, None).unwrap();
-            let kept = source.layout().image.height;
+            assert_eq!(source.layout().image.height, height);
+            let kept = try_whole(&asset).unwrap().layout().image.height;
             assert!(rows.contains(&kept), "height {height}: {kept} rows");
         }
-        // Data that holds no row: where whole decoding fails, so does opening the
-        // image.
+        // Data that holds no row: where whole decoding fails, so does a request.
         let mut failed = 0;
         for data in [
             vec![0xFF; 4],
@@ -314,27 +262,17 @@ mod tests {
             vec![0x12, 0x34, 0x56, 0x78],
             vec![],
         ] {
+            let case = format!("{data:?}");
             let pdf = pdf(&[(image(&format!("{gray} {}", ccitt(-1, "")), 211, 96), data)]);
             let asset = asset(&pdf);
-            let meter = hayro_syntax::work::Meter::default();
-            let decodes = decode_image(&asset.xobject().unwrap(), None, &meter).is_some();
-            match asset.open(None, None) {
-                Err(RequestError::Failed) => {
-                    assert!(!decodes);
-                    failed += 1;
-                }
-                Ok(_) => {
-                    assert!(decodes);
-                    assert_asset_streams_as_decoded(&asset);
-                }
-                Err(e) => panic!("{e:?}"),
-            }
+            assert_streams_as_whole(&asset, &case);
+            failed += usize::from(try_whole(&asset).is_none());
         }
         assert!(failed > 0);
     }
 
-    /// A request decodes the rows through the last one it reads and no further; the
-    /// rows are counted once, when the asset is first opened.
+    /// Opening reads none of the data, and a request decodes the rows through the
+    /// last one it reads and no further.
     #[test]
     fn a_ccitt_request_decodes_through_its_rows() {
         let gray = "/ColorSpace /DeviceGray /BitsPerComponent 1";
@@ -343,7 +281,13 @@ mod tests {
             G4.to_vec(),
         )]);
         let asset = asset(&pdf);
-        let mut source = asset.open(None, None).unwrap();
+        let polls = std::cell::Cell::new(0);
+        let cancel = || {
+            polls.set(polls.get() + 1);
+            false
+        };
+        let mut source = asset.open(None, Some(&cancel)).unwrap();
+        assert_eq!(polls.get(), 1, "opening polled once, as it starts");
         assert!(is_streamed(&source));
         let a = request(&mut source, Plane::Image, (211, 96), [10, 20, 30, 40]);
         assert_eq!(source.work().rows_decoded, 40);
@@ -354,6 +298,25 @@ mod tests {
             [10, 20, 30, 40],
         );
         assert_eq!(a.data, b.data);
-        assert!(super::super::ccitt::CcittHeight::get(&asset.0.ccitt_height).is_some());
+    }
+
+    /// A request of the first row of data that breaks off later returns it, as whole
+    /// decoding does.
+    #[test]
+    fn a_request_before_the_data_breaks_returns_its_rows() {
+        let gray = "/ColorSpace /DeviceGray /BitsPerComponent 1";
+        let pdf = pdf(&[(
+            image(&format!("{gray} {}", ccitt(-1, "")), 211, 96),
+            G4[..G4.len() / 2].to_vec(),
+        )]);
+        let asset = asset(&pdf);
+        let mut source = asset.open(None, None).unwrap();
+        let a = request(&mut source, Plane::Image, (211, 96), [0, 0, 211, 1]);
+        assert_eq!(source.work().rows_decoded, 1);
+        let mut whole = whole(&asset);
+        let kept = whole.layout().image.height;
+        assert!(kept < 96);
+        let b = request(&mut whole, Plane::Image, (211, kept), [0, 0, 211, 1]);
+        assert_eq!(a.data, b.data);
     }
 }

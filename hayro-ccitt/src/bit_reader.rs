@@ -1,11 +1,19 @@
 //! Bit-level reader for CCITT encoded data streams.
 
-use crate::{DecodeError, Decoder, POLL_BITS, Result};
-use core::fmt::Debug;
+use crate::{DecodeError, Decoder, POLL_BITS, Result, Source};
 
-#[derive(Debug, Clone)]
+/// Where the encoded bytes are.
+#[derive(Clone, Copy)]
+pub(crate) enum Data<'a> {
+    Slice(&'a [u8]),
+    Source(&'a dyn Source),
+}
+
+#[derive(Clone)]
 pub(crate) struct BitReader<'a> {
-    data: &'a [u8],
+    data: Data<'a>,
+    /// The bytes of `data`.
+    len: usize,
     bit_offset: usize,
     /// The bits starting at `bit_offset`, with the next bit in the most
     /// significant position. Always contains at least 32 valid bits, bits past
@@ -21,9 +29,14 @@ pub(crate) struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     #[inline(always)]
-    pub(crate) fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: Data<'a>) -> Self {
+        let len = match data {
+            Data::Slice(bytes) => bytes.len(),
+            Data::Source(source) => source.len(),
+        };
         let mut reader = Self {
             data,
+            len,
             bit_offset: 0,
             buffer: 0,
             limit: 0,
@@ -101,7 +114,7 @@ impl<'a> BitReader<'a> {
 
     #[inline(always)]
     pub(crate) fn at_end(&self) -> bool {
-        self.byte_pos() >= self.data.len()
+        self.byte_pos() >= self.len
     }
 
     #[inline(always)]
@@ -111,7 +124,7 @@ impl<'a> BitReader<'a> {
 
     #[inline(always)]
     fn consume_slow(&mut self, bit_offset: usize) -> Result<()> {
-        let end = self.data.len() * 8;
+        let end = self.len * 8;
         self.bit_offset = bit_offset.min(end);
         self.refill();
 
@@ -131,18 +144,30 @@ impl<'a> BitReader<'a> {
     fn refill(&mut self) {
         let byte_pos = self.byte_pos();
 
-        let word = if let Some(bytes) = self.data.get(byte_pos..byte_pos + 8) {
-            u64::from_be_bytes(bytes.try_into().unwrap())
-        } else {
-            let mut bytes = [0; 8];
-            let rest = self.data.get(byte_pos..).unwrap_or_default();
-            bytes[..rest.len()].copy_from_slice(rest);
-            u64::from_be_bytes(bytes)
+        let word = match self.data {
+            Data::Slice(data) => {
+                if let Some(bytes) = data.get(byte_pos..byte_pos + 8) {
+                    u64::from_be_bytes(bytes.try_into().unwrap())
+                } else {
+                    let mut bytes = [0; 8];
+                    let rest = data.get(byte_pos..).unwrap_or_default();
+                    bytes[..rest.len()].copy_from_slice(rest);
+                    u64::from_be_bytes(bytes)
+                }
+            }
+            Data::Source(source) => {
+                let mut bytes = [0; 8];
+                if byte_pos < self.len {
+                    let n = (self.len - byte_pos).min(8);
+                    source.read_at(byte_pos, &mut bytes[..n]);
+                }
+                u64::from_be_bytes(bytes)
+            }
         };
 
         self.buffer = word << self.bit_pos();
         // The buffer contains bits up to `byte_pos * 8 + 64`. Refill once fewer
         // than 32 of them are left.
-        self.limit = (byte_pos * 8 + 32).min(self.data.len() * 8);
+        self.limit = (byte_pos * 8 + 32).min(self.len * 8);
     }
 }

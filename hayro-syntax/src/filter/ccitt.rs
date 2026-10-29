@@ -1,3 +1,4 @@
+use crate::crypto::reader::DecryptedReader;
 use crate::object::Dict;
 use crate::object::dict::keys::{
     BLACK_IS_1, COLUMNS, ENCODED_BYTE_ALIGN, END_OF_BLOCK, END_OF_LINE, K, ROWS,
@@ -6,7 +7,8 @@ use crate::object::stream::{FilterResult, ImageColorSpace, ImageData, ImageDecod
 use crate::work::{Meter, POLL_BYTES};
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
-use hayro_ccitt::{DecodeSettings, Decoder, DecoderContext, EncodingMode};
+use core::cell::{Cell, RefCell};
+use hayro_ccitt::{DecodeSettings, Decoder, DecoderContext, EncodingMode, Source};
 
 /// Makes room in `output` for `needed` bytes: it grows to the `declared` bytes
 /// divided by eight as often as that leaves room for them, and no further once they
@@ -151,11 +153,12 @@ impl Setup {
 
 /// An image's CCITT data, read as 8-bit rows (gray, not indexed) that are handed
 /// over one at a time as they decode and not kept, so that reading it holds a row's
-/// colour changes rather than the image ([`Stream::ccitt_rows`]).
+/// colour changes rather than the image, and of encrypted data a window of it
+/// decrypted ([`Stream::ccitt_rows`]).
 ///
 /// [`Stream::ccitt_rows`]: crate::object::Stream::ccitt_rows
 pub struct CcittRows<'a> {
-    data: Cow<'a, [u8]>,
+    data: DecryptedReader<'a>,
     setup: Setup,
 }
 
@@ -174,7 +177,7 @@ pub enum CcittEnd {
 
 impl<'a> CcittRows<'a> {
     pub(crate) fn new(
-        data: Cow<'a, [u8]>,
+        data: DecryptedReader<'a>,
         params: &Dict<'_>,
         image_params: &ImageDecodeParams,
     ) -> Self {
@@ -218,7 +221,8 @@ impl<'a> CcittRows<'a> {
     /// Decodes the rows from the first, handing each to `row` as the columns where
     /// its colour changes, in ascending order: black from the first, white from the
     /// second, and so on (as `hayro_ccitt::Decoder::push_row`), until `row` returns
-    /// `false`. The decoding counts on `meter` a step per bit read.
+    /// `false`. The decoding counts on `meter` a step per bit read, and a step per
+    /// byte decrypted.
     pub fn decode(&self, row: impl FnMut(&[u32]) -> bool, meter: &Meter<'_>) -> CcittEnd {
         struct Rows<'m, F> {
             row: F,
@@ -244,7 +248,22 @@ impl<'a> CcittRows<'a> {
             meter,
         };
         let mut context = DecoderContext::new(self.setup.settings);
-        let result = hayro_ccitt::decode(&self.data, &mut rows, &mut context);
+        let result = match self.data.plain() {
+            Some(data) => hayro_ccitt::decode(data, &mut rows, &mut context),
+            None => {
+                let window = Window {
+                    len: self.data.len(),
+                    state: RefCell::new(WindowState {
+                        reader: self.data.clone(),
+                        bytes: Vec::new(),
+                        start: 0,
+                    }),
+                    meter,
+                    cancelled: Cell::new(false),
+                };
+                hayro_ccitt::decode_source(&window, &mut rows, &mut context)
+            }
+        };
         if meter.cancelled() {
             CcittEnd::Cancelled
         } else if rows.stopped {
@@ -254,6 +273,69 @@ impl<'a> CcittRows<'a> {
         } else {
             CcittEnd::Broken
         }
+    }
+}
+
+/// Decrypted bytes the CCITT decoder reads behind where it reads: it goes back to the
+/// start of a damaged line, which this holds for lines of up to this many encoded
+/// bytes; a line longer than that is decrypted again from the start of the data.
+const WINDOW: usize = 64 * 1024;
+
+/// The bytes decrypted at a time.
+const DECRYPT_CHUNK: usize = 8 * 1024;
+
+/// Encrypted CCITT data, decrypted as the decoder reads it, holding at most twice
+/// [`WINDOW`] bytes of it and a chunk.
+struct Window<'r, 'a> {
+    /// The bytes the data decrypts to.
+    len: usize,
+    state: RefCell<WindowState<'a>>,
+    meter: &'r Meter<'r>,
+    /// Whether the meter's hook asked to stop while decrypting: the bytes not
+    /// decrypted then read as zero, and the decoder stops at its next ask.
+    cancelled: Cell<bool>,
+}
+
+struct WindowState<'a> {
+    reader: DecryptedReader<'a>,
+    /// Decrypted bytes, the first at `start` in the data.
+    bytes: Vec<u8>,
+    start: usize,
+}
+
+impl Source for Window<'_, '_> {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn read_at(&self, pos: usize, out: &mut [u8]) {
+        let mut state = self.state.borrow_mut();
+        let end = pos + out.len();
+        if pos < state.start {
+            state.reader.rewind();
+            state.bytes.clear();
+            state.start = 0;
+        }
+        while state.start + state.bytes.len() < end && !self.cancelled.get() {
+            if state.bytes.len() >= 2 * WINDOW {
+                let drop = state.bytes.len() - WINDOW;
+                state.bytes.drain(..drop);
+                state.start += drop;
+            }
+            let held = state.bytes.len();
+            state.bytes.resize(held + DECRYPT_CHUNK, 0);
+            let state = &mut *state;
+            let n = state.reader.read(&mut state.bytes[held..]);
+            state.bytes.truncate(held + n);
+            if n == 0 {
+                break;
+            }
+            self.cancelled.set(self.meter.work(n).is_err());
+        }
+        let held = &state.bytes[(pos - state.start).min(state.bytes.len())..];
+        let n = held.len().min(out.len());
+        out[..n].copy_from_slice(&held[..n]);
+        out[n..].fill(0);
     }
 }
 
@@ -557,8 +639,10 @@ fn fill_short<T: Copy>(slice: &mut [T], value: T) {
 
 #[cfg(test)]
 mod tests {
-    use super::decode;
+    use super::{Source, WINDOW, Window, WindowState, decode};
+    use crate::crypto::{DecryptionTarget, Decryptor};
     use crate::object::FromBytes;
+    use crate::object::ObjectIdentifier;
     use crate::object::dict::Dict;
     use crate::object::stream::ImageDecodeParams;
     use crate::work::Meter;
@@ -631,5 +715,57 @@ mod tests {
         // each black span adds one.
         assert!(luma >= 2 * pairs + pairs + pairs, "{luma}");
         assert!(bits >= 2 * pairs / 8 + pairs + pairs, "{bits}");
+    }
+
+    /// RC4 data read through a window reads as the data decrypted whole, read
+    /// forward, back within the window, and back past it (decrypted again from the
+    /// start), holding no more than the window allows. (AES data is read through one
+    /// in `tests/streaming.rs`.)
+    #[test]
+    fn a_window_reads_as_whole_decryption() {
+        let data: Vec<u8> = (0..300_000_u32).map(|i| (i * 7 % 251) as u8).collect();
+        let id = ObjectIdentifier::new(12, 0);
+        {
+            let decryptor = Decryptor::Rc4 {
+                key: alloc::vec![13; 5],
+            };
+            let plain = decryptor
+                .decrypt(id, &data, DecryptionTarget::Stream)
+                .unwrap();
+            let reader = decryptor
+                .reader(id, &data, DecryptionTarget::Stream)
+                .unwrap();
+            let meter = Meter::default();
+            let window = Window {
+                len: reader.len(),
+                state: core::cell::RefCell::new(WindowState {
+                    reader,
+                    bytes: Vec::new(),
+                    start: 0,
+                }),
+                meter: &meter,
+                cancelled: core::cell::Cell::new(false),
+            };
+            assert_eq!(window.len(), plain.len());
+            let len = plain.len();
+            for pos in [
+                0,
+                5,
+                3 * WINDOW,
+                3 * WINDOW - 100,
+                3 * WINDOW - WINDOW / 2,
+                len - 3,
+                WINDOW / 3,
+                len - 8,
+                10,
+            ] {
+                let mut out = [0xAA; 8];
+                let n = (len - pos).min(8);
+                window.read_at(pos, &mut out[..n]);
+                assert_eq!(out[..n], plain[pos..pos + n], "at {pos}");
+                let held = window.state.borrow().bytes.capacity();
+                assert!(held <= 2 * WINDOW + super::DECRYPT_CHUNK, "{held} held");
+            }
+        }
     }
 }

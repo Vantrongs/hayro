@@ -99,7 +99,7 @@ impl Cases {
 /// Requests of `asset` opened equal the same requests of it decoded whole. Where
 /// whole decoding leaves out the rows its data does not reach, streaming has them,
 /// transparent; where whole decoding fails, opening the image or requesting it does.
-fn assert_streams_as_whole(asset: &ImageAsset, case: &str) {
+pub(super) fn assert_streams_as_whole(asset: &ImageAsset, case: &str) {
     let streamed = asset.open(None, None);
     let (mut streamed, mut whole) = match (streamed, try_whole(asset)) {
         (Ok(s), Some(w)) => (s, w),

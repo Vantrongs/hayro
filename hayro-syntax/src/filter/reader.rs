@@ -369,26 +369,22 @@ impl Source<'_> {
     fn read(
         &mut self,
         buf: &mut [u8],
-        inflated: &mut u64,
+        #[cfg_attr(not(feature = "unsafe"), expect(unused_variables))] inflated: &mut u64,
         meter: &Meter<'_>,
     ) -> Result<usize, Cancelled> {
-        match self {
-            Source::Raw(data) => {
-                let n = data.read(buf);
-                meter.work(n)?;
-                Ok(n)
-            }
-            #[cfg(feature = "unsafe")]
-            Source::Inflating(inflating) => match inflating.read(buf, inflated, meter)? {
-                Some(n) => Ok(n),
-                None => {
-                    self.restart();
-                    self.read(buf, inflated, meter)
+        loop {
+            match self {
+                Source::Raw(data) => {
+                    let n = data.read(buf);
+                    meter.work(n)?;
+                    return Ok(n);
                 }
-            },
-            Source::Fallback(data) => {
-                *self = fallback(data, meter)?;
-                self.read(buf, inflated, meter)
+                #[cfg(feature = "unsafe")]
+                Source::Inflating(inflating) => match inflating.read(buf, inflated, meter)? {
+                    Some(n) => return Ok(n),
+                    None => self.restart(),
+                },
+                Source::Fallback(data) => *self = fallback(data, meter)?,
             }
         }
     }

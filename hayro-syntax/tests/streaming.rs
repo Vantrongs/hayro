@@ -310,6 +310,57 @@ fn a_declared_ccitt_size_is_not_allocated_before_rows_are_decoded() {
     }
 }
 
+/// Encrypted CCITT data is decrypted as its rows are read, through a window: reading
+/// all rows of AES-encrypted Group 4 data holds about as much whatever the data's
+/// size, and yields the rows of the same data stored plain. Making the reader
+/// decrypts nothing.
+#[test]
+fn encrypted_ccitt_rows_hold_a_window_whatever_the_data_size() {
+    let columns = 64;
+    let dict = format!("/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns {columns} >>");
+    let mut peaks = Vec::new();
+    for bytes in [1 << 18, 1 << 20, 1 << 22] {
+        // White rows, a bit each against the white row above.
+        let data = vec![0xFF; bytes];
+        let rows = 8 * bytes as u32;
+        let params = ImageDecodeParams {
+            width: columns,
+            height: rows,
+            ..Default::default()
+        };
+        let count = |stream: &Stream<'_>| {
+            let mut changes = 0;
+            let mut decoded = 0;
+            let rows = stream.ccitt_rows(&params).unwrap();
+            let end = rows.decode(
+                |c| {
+                    decoded += 1;
+                    changes += c.len();
+                    true
+                },
+                &Meter::default(),
+            );
+            (decoded, changes, end)
+        };
+        let plain = stream_file(&dict, &data);
+        let expected = count(&object_3(&plain));
+        assert_eq!(expected.0, rows);
+        let encrypted = encrypted_file(&dict, &data);
+        let stream = object_3(&encrypted);
+        let (made, making) = measure(|| stream.ccitt_rows(&params).is_some());
+        assert!(made);
+        assert!(
+            making.largest < 1024,
+            "making the reader allocated {making:?}"
+        );
+        let (read, reading) = measure(|| count(&stream));
+        assert_eq!(read, expected, "{bytes} bytes");
+        peaks.push(reading.peak);
+    }
+    assert!(peaks[0] < 160 * 1024, "{peaks:?}");
+    assert!(peaks.iter().all(|&p| p <= peaks[0] + 4096), "{peaks:?}");
+}
+
 /// A CCITT stream that decodes a few rows of many declared holds at most eight
 /// times what it decoded: room is made ahead of the rows, but not for all of them.
 #[test]

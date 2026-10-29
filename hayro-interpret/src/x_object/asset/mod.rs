@@ -17,7 +17,7 @@ use crate::WarningSinkFn;
 use crate::cache::Cache;
 use crate::color::ColorSpace;
 use crate::interpret::state::ActiveTransferFunction;
-use ccitt::{CcittHeight, CcittStreamed};
+use ccitt::CcittStreamed;
 use decoded::Decoded;
 use hayro_syntax::object::stream::OwnedStream;
 use hayro_syntax::work::{Cancelled, Meter};
@@ -39,7 +39,6 @@ struct AssetData {
     stream: OwnedStream,
     checkpoints: Checkpoints,
     held_rows: HeldRows,
-    ccitt_height: CcittHeight,
     width: u32,
     height: u32,
     kind: ImageKind,
@@ -58,7 +57,6 @@ impl ImageXObject<'_> {
             stream: self.stream.to_owned_stream(),
             checkpoints: Checkpoints::default(),
             held_rows: HeldRows::default(),
-            ccitt_height: CcittHeight::new(),
             width: self.width(),
             height: self.height(),
             kind: self.kind,
@@ -131,9 +129,11 @@ impl ImageAsset {
     /// grayscale JPEG of its declared size without masks, read in bands of eight
     /// rows; once its data fails to decode, it is decoded whole like other images.
     /// A gray image or stencil mask without masks whose one filter is
-    /// `CCITTFaxDecode` has its data decoded through once, the first time, to count
-    /// its rows, and each request decodes it from the start through its last row,
-    /// keeping a row's colour changes. Other images are decoded whole here (with
+    /// `CCITTFaxDecode` only reads its dictionary here; each request decodes the
+    /// data from the start through its last row, keeping a row's colour changes, and
+    /// where the data ends before the declared height, the rows decoding it whole
+    /// keeps past the last decoded one are white, the rest transparent, and a
+    /// request fails where the data holds no row. Other images are decoded whole here (with
     /// `hint`, the size they are wanted at, for decoders that can reduce), and
     /// requests read the decoded planes, which the source holds until it is dropped.
     /// `cancel` is polled as [`ImageRequest::cancel`] is; a cancelled open leaves the
@@ -156,7 +156,7 @@ impl ImageAsset {
                 opened,
             ));
         }
-        if let Some(ccitt) = CcittStreamed::new(&obj, &a.ccitt_height, &meter)? {
+        if let Some(ccitt) = CcittStreamed::new(&obj) {
             let layout = ccitt.layout();
             return Ok(ImageSource::new(
                 layout,

@@ -4,6 +4,6 @@ image_8192_tile_peak 978616
 stencil_4096_tile_peak 571935
 stencil_4096_thumbnail_peak 595415
 stencil_8192_tile_peak 977848
-ccitt_4096_tile_peak 6944
-ccitt_4096_thumbnail_peak 13792
-ccitt_8192_tile_peak 6944
+ccitt_4096_tile_peak 7232
+ccitt_4096_thumbnail_peak 14080
+ccitt_8192_tile_peak 7232

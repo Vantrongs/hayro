@@ -30,7 +30,7 @@
 
 extern crate alloc;
 
-use crate::bit_reader::BitReader;
+use crate::bit_reader::{BitReader, Data};
 
 mod bit_reader;
 mod codes;
@@ -53,6 +53,38 @@ pub use error::{DecodeError, Result};
 /// of rows were decoded successfully and written into the decoder, so those
 /// can still be used, but the image might be truncated.
 pub fn decode(data: &[u8], decoder: &mut impl Decoder, ctx: &mut DecoderContext) -> Result<usize> {
+    decode_data(Data::Slice(data), decoder, ctx)
+}
+
+/// [`decode`], of data that `source` reads a few bytes at a time: data that is not
+/// held in one slice, such as data decrypted as it is read.
+pub fn decode_source(
+    source: &dyn Source,
+    decoder: &mut impl Decoder,
+    ctx: &mut DecoderContext,
+) -> Result<usize> {
+    decode_data(Data::Source(source), decoder, ctx)
+}
+
+/// Encoded data read a few bytes at a time ([`decode_source`]). Decoding reads it
+/// mostly forward, and after a damaged line in Group 3 data again from the line's
+/// start.
+pub trait Source {
+    /// The bytes of the data.
+    fn len(&self) -> usize;
+    /// Whether the data is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Copies the bytes from `pos` on into `out`, which the data holds whole.
+    fn read_at(&self, pos: usize, out: &mut [u8]);
+}
+
+fn decode_data(
+    data: Data<'_>,
+    decoder: &mut impl Decoder,
+    ctx: &mut DecoderContext,
+) -> Result<usize> {
     ctx.reset();
     let mut reader = BitReader::new(data);
 
