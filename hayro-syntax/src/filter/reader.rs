@@ -5,19 +5,20 @@ use crate::crypto::reader::Cursor;
 use crate::crypto::reader::DecryptedReader;
 #[cfg(feature = "images")]
 use crate::filter::ccitt::CcittBytes;
-use crate::filter::lzw_flate::{PredictorParams, Unpredictor, flate};
+use crate::filter::lzw_flate::flate::fallback::{FlateStream, Input};
+use crate::filter::lzw_flate::{PredictorParams, Unpredictor};
 #[cfg(feature = "unsafe")]
 use crate::object::stream::OwnedStream;
 use crate::work::{Cancelled, Meter, POLL_BYTES};
 use alloc::borrow::Cow;
-#[cfg(feature = "images")]
 use alloc::boxed::Box;
-#[cfg(feature = "unsafe")]
 use alloc::vec::Vec;
 
-/// How many decrypted encoded bytes the Flate decoder is given at a time.
-#[cfg(feature = "unsafe")]
+/// How many decrypted encoded bytes the Flate decoders are given at a time.
 const INPUT_CHUNK: usize = 8192;
+
+/// How many bytes the permissive Flate decoder makes ahead of the reads at most.
+const PERMISSIVE_STEP: usize = 16 * 1024;
 
 /// How many bytes the Flate decoder makes at a time for reads that ask for fewer. Calls
 /// that make less are slower: each copies what it made into zlib's history window, and
@@ -49,24 +50,31 @@ impl From<Cancelled> for ReadError {
 /// [`Stream::decoded_reader`](crate::object::Stream::decoded_reader)). It yields the
 /// bytes [`Stream::decoded`](crate::object::Stream::decoded) returns, but holds only
 /// the decoder's state, up to [`POLL_BYTES`] inflated ahead of the reads and a
-/// predictor row, not the whole result, except where neither zlib nor raw deflate
-/// makes a byte of Flate data and the permissive decoder decodes it whole. A byte
-/// handed out is never taken back: the decoder is chosen before the first byte, as
-/// lenient whole decoding chooses it ([`flate::decode`]). Every read counts its work
-/// on a [`Meter`], and stops when the meter's hook asks to.
+/// predictor row, not the whole result. A byte handed out is never taken back: the
+/// decoder is chosen before the first byte, as lenient whole decoding chooses it
+/// ([`flate::decode`](crate::filter::lzw_flate::flate::decode)). Every read counts its
+/// work on a [`Meter`], and stops when the meter's hook asks to.
 pub struct DecodedReader<'a> {
     source: Source<'a>,
     predictor: Option<Predicted>,
     inflated: u64,
 }
 
+#[cfg_attr(
+    not(feature = "unsafe"),
+    expect(
+        clippy::large_enum_variant,
+        reason = "stored bytes are read without an allocation; the permissive decoder allocates its window anyway"
+    )
+)]
 enum Source<'a> {
-    /// The stored bytes, or everything the permissive Flate decoder produced.
+    /// The stored bytes.
     Raw(DecryptedReader<'a>),
     #[cfg(feature = "unsafe")]
     Inflating(Inflating<'a>),
-    /// Flate data for the permissive decoder, which decodes it whole at the next read.
-    Fallback(DecryptedReader<'a>),
+    /// Flate data read by the permissive decoder as it is read: data of which neither
+    /// zlib nor raw deflate makes a byte, or, without the `unsafe` feature, any.
+    Permissive(Box<FlateStream<Encoded<'a>>>),
     /// An image's CCITT data, decoded a row at a time.
     #[cfg(feature = "images")]
     Ccitt(Box<CcittBytes<'a>>),
@@ -151,7 +159,7 @@ impl<'a> DecodedReader<'a> {
             broken: false,
         });
         #[cfg(not(feature = "unsafe"))]
-        let source = Source::Fallback(data);
+        let source = Source::permissive(data);
         Some(Self {
             source,
             predictor,
@@ -160,8 +168,7 @@ impl<'a> DecodedReader<'a> {
     }
 
     /// The bytes the reader yields from its start, where it knows them without
-    /// reading: for data stored without a filter, or decoded whole by the permissive
-    /// Flate decoder.
+    /// reading: for data stored without a filter.
     #[cfg(feature = "images")]
     pub fn stored_len(&self) -> Option<usize> {
         match (&self.source, &self.predictor) {
@@ -180,8 +187,7 @@ impl<'a> DecodedReader<'a> {
         }
     }
 
-    /// The bytes this reader's incremental Flate decoder produced, including those not
-    /// read yet; not those the permissive decoder produced.
+    /// The bytes this reader's Flate decoders produced, including those not read yet.
     pub fn inflated_bytes(&self) -> u64 {
         self.inflated
     }
@@ -261,7 +267,8 @@ impl<'a> DecodedReader<'a> {
     #[cfg(all(test, feature = "unsafe"))]
     fn stored_read(&self) -> usize {
         match &self.source {
-            Source::Raw(data) | Source::Fallback(data) => data.position(),
+            Source::Raw(data) => data.position(),
+            Source::Permissive(stream) => stream.input.data.position(),
             #[cfg(feature = "images")]
             Source::Ccitt(_) => 0,
             #[cfg(feature = "unsafe")]
@@ -377,22 +384,42 @@ impl Predicted {
     }
 }
 
-impl Source<'_> {
+impl<'a> Source<'a> {
     fn rewind(&mut self) {
         match self {
             Source::Raw(data) => data.rewind(),
             #[cfg(feature = "unsafe")]
             Source::Inflating(inflating) => inflating.rewind(),
-            Source::Fallback(_) => {}
+            Source::Permissive(stream) => {
+                let mut input = core::mem::replace(&mut stream.input, Encoded::new(empty()));
+                input.rewind();
+                **stream = FlateStream::stepping(input, PERMISSIVE_STEP);
+            }
             #[cfg(feature = "images")]
             Source::Ccitt(bytes) => bytes.rewind(),
         }
     }
 
+    /// `data` read by the permissive Flate decoder from its start.
+    fn permissive(mut data: DecryptedReader<'a>) -> Self {
+        data.rewind();
+        Source::Permissive(Box::new(FlateStream::stepping(
+            Encoded::new(data),
+            PERMISSIVE_STEP,
+        )))
+    }
+
+    #[cfg_attr(
+        not(feature = "unsafe"),
+        expect(
+            clippy::never_loop,
+            reason = "only the inflating decoder hands the data on to another"
+        )
+    )]
     fn read(
         &mut self,
         buf: &mut [u8],
-        #[cfg_attr(not(feature = "unsafe"), expect(unused_variables))] inflated: &mut u64,
+        inflated: &mut u64,
         meter: &Meter<'_>,
     ) -> Result<usize, Cancelled> {
         loop {
@@ -407,7 +434,18 @@ impl Source<'_> {
                     Some(n) => return Ok(n),
                     None => self.restart(),
                 },
-                Source::Fallback(data) => *self = fallback(data, meter)?,
+                Source::Permissive(stream) => {
+                    if stream.pending().is_empty() {
+                        stream.step(meter, PERMISSIVE_STEP)?;
+                        *inflated += stream.pending().len() as u64;
+                    }
+                    // A step stops with nothing made only at the end.
+                    let pending = stream.pending();
+                    let n = buf.len().min(pending.len());
+                    buf[..n].copy_from_slice(&pending[..n]);
+                    stream.hand(n);
+                    return Ok(n);
+                }
                 #[cfg(feature = "images")]
                 Source::Ccitt(bytes) => return bytes.read(buf, meter),
             }
@@ -428,11 +466,8 @@ impl Source<'_> {
         }
         if let Source::Inflating(inflating) = self {
             warn!("flate stream is broken, decoding with fallback");
-            let data = core::mem::replace(
-                &mut inflating.data,
-                DecryptedReader::raw(Cow::Borrowed(&[])),
-            );
-            *self = Source::Fallback(data);
+            let data = core::mem::replace(&mut inflating.data, empty());
+            *self = Source::permissive(data);
         }
     }
 }
@@ -440,21 +475,86 @@ impl Source<'_> {
 /// The bytes [`DecodedReader::skip`] reads at a time, on the stack.
 const SKIP_CHUNK: usize = 8 * 1024;
 
-/// Everything the permissive decoder makes of `data`, as stored bytes.
-fn fallback<'a>(
-    data: &mut DecryptedReader<'_>,
-    meter: &Meter<'_>,
-) -> Result<Source<'a>, Cancelled> {
-    let decrypted;
-    let bytes = match data.plain() {
-        Some(bytes) => bytes,
-        None => {
-            decrypted = data.decrypt_all(meter)?;
-            &decrypted
+/// No data.
+fn empty<'a>() -> DecryptedReader<'a> {
+    DecryptedReader::raw(Cow::Borrowed(&[]))
+}
+
+/// Stored Flate data, decrypted as the permissive decoder takes it, a chunk at a time.
+struct Encoded<'a> {
+    data: DecryptedReader<'a>,
+    /// Decrypted bytes, of which the decoder took those before `at`.
+    buf: Vec<u8>,
+    at: usize,
+    taken: usize,
+}
+
+impl<'a> Encoded<'a> {
+    fn new(data: DecryptedReader<'a>) -> Self {
+        Self {
+            data,
+            buf: Vec::new(),
+            at: 0,
+            taken: 0,
         }
-    };
-    let decoded = flate::fallback::decode_lenient(bytes, meter)?;
-    Ok(Source::Raw(DecryptedReader::raw(Cow::Owned(decoded))))
+    }
+
+    fn rewind(&mut self) {
+        self.data.rewind();
+        self.buf.clear();
+        self.at = 0;
+        self.taken = 0;
+    }
+
+    /// Makes `ahead` + 1 bytes available, if the data holds as many.
+    fn fill(&mut self, ahead: usize) -> bool {
+        while self.buf.len() - self.at <= ahead {
+            self.buf.drain(..self.at);
+            self.at = 0;
+            let len = self.buf.len();
+            self.buf.resize(len + INPUT_CHUNK, 0);
+            let n = self.data.read(&mut self.buf[len..]);
+            self.buf.truncate(len + n);
+            if n == 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// The decoder counts the bytes it takes.
+impl Input for Encoded<'_> {
+    #[inline]
+    fn next(&mut self, _: &Meter<'_>) -> Option<u8> {
+        if self.at == self.buf.len() && !self.fill(0) {
+            return None;
+        }
+        let byte = self.buf[self.at];
+        self.at += 1;
+        self.taken += 1;
+        Some(byte)
+    }
+
+    #[inline]
+    fn peek(&mut self, ahead: usize, _: &Meter<'_>) -> Option<u8> {
+        if let Some(&byte) = self.buf.get(self.at + ahead) {
+            return Some(byte);
+        }
+        self.fill(ahead).then(|| self.buf[self.at + ahead])
+    }
+
+    fn taken(&self) -> usize {
+        self.taken
+    }
+
+    fn take(&mut self, max: usize, _: &Meter<'_>) -> &[u8] {
+        self.fill(0);
+        let n = max.min(self.buf.len() - self.at);
+        self.at += n;
+        self.taken += n;
+        &self.buf[self.at - n..self.at]
+    }
 }
 
 #[cfg(feature = "unsafe")]

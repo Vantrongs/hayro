@@ -208,6 +208,44 @@ fn encrypted_corrupt_flate_ends_as_whole_decoding_does() {
     assert_eq!(read_twice(&stream, 397), expected.to_vec());
 }
 
+/// Flate data of which neither zlib nor raw deflate reads a byte (stored blocks whose
+/// lengths do not check) is read by the permissive decoder as it is read, plain or
+/// encrypted: its first bytes hold about as much whatever the data's size, and all
+/// of it reads as whole decoding returns it.
+#[test]
+fn flate_only_the_permissive_decoder_reads_is_read_as_it_goes() {
+    for encrypted in [false, true] {
+        let mut peaks = Vec::new();
+        for bytes in [1 << 18, 1 << 20, 1 << 22] {
+            let data = common::noise(bytes, 7);
+            let mut encoded = common::stored_zlib(&data, 65_535);
+            for block in (2..encoded.len() - 4).step_by(65_535 + 5) {
+                encoded[block + 3..block + 5].fill(1);
+            }
+            let pdf = if encrypted {
+                encrypted_file("/Filter /FlateDecode", &encoded)
+            } else {
+                stream_file("/Filter /FlateDecode", &encoded)
+            };
+            let stream = object_3(&pdf);
+            let expected = stream.decoded().unwrap();
+            assert!(expected[..] == data[..], "{bytes} bytes");
+            let (first, reading) = measure(|| {
+                let mut reader = stream.decoded_reader().unwrap();
+                read_up_to(&mut reader, 64, 64)
+            });
+            assert_eq!(first, data[..64]);
+            peaks.push(reading.peak);
+            assert!(read_twice(&stream, 4099) == data, "{bytes} bytes");
+        }
+        assert!(peaks[0] < 160 * 1024, "encrypted {encrypted}: {peaks:?}");
+        assert!(
+            peaks.iter().all(|&p| p <= peaks[0] + 4096),
+            "encrypted {encrypted}: {peaks:?}"
+        );
+    }
+}
+
 /// A checkpoint resumes Flate data after the reader, stream and document that took it
 /// are gone: mid-row for predictors, mid-block for AES, with back references reaching
 /// before it, and in raw deflate. It holds the decoder's state, not the

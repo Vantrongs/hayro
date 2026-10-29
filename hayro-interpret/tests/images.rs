@@ -439,6 +439,39 @@ fn a_small_region_of_a_large_bilevel_image_costs_the_region() {
     );
 }
 
+/// A small first region of an image whose Flate data neither zlib nor raw deflate
+/// reads a byte of (stored blocks whose lengths do not check) costs memory in
+/// proportion to the region, as other Flate data does: the permissive decoder reads
+/// it as the request does, where decoding it whole held all of it (2 MiB for the
+/// smaller); an image four times as large costs the same, but for the piece of a row
+/// twice as wide that is read past.
+#[test]
+fn a_small_region_of_flate_only_the_permissive_decoder_reads_costs_the_region() {
+    let first: Bins = |w, h| ((w, h), [w / 2, 0, w / 2 + 64, 64]);
+    let gray = "/ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /FlateDecode";
+    region_cost(
+        &format!("{gray} /Width 16 /Height 16"),
+        &common::stored_zlib(&[0; 32], 1000),
+        |w, h| ((w, h), [0, 0, 1, 1]),
+    );
+    let mut peaks = Vec::new();
+    for side in [4096_u32, 8192] {
+        let packed = common::noise((side / 8 * side) as usize, side);
+        let mut encoded = common::stored_zlib(&packed, 65_535);
+        for block in (2..encoded.len() - 4).step_by(65_535 + 5) {
+            encoded[block + 3..block + 5].fill(1);
+        }
+        let (peak, _) = region_cost(
+            &format!("{gray} /Width {side} /Height {side}"),
+            &encoded,
+            first,
+        );
+        peaks.push(peak);
+    }
+    assert!(peaks[0] < 1 << 20, "{peaks:?}");
+    assert!(peaks[1] <= peaks[0] + 512, "{peaks:?}");
+}
+
 /// A small region of each kind of low-bit image that streams costs memory in
 /// proportion to the region, not to the image: colour of fewer than eight bits in
 /// colour spaces other than `DeviceGray` and `RGB`, soft masks of fewer than eight

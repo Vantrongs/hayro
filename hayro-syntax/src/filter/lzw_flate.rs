@@ -11,7 +11,7 @@ pub(crate) mod flate {
 
     /// The data inflated and its predictor reversed, the work counted on `meter`;
     /// `None` once its hook asks to stop, or, if `strict`, where the data is corrupt
-    /// rather than cut short (see [`fallback::decode_lenient`]). `expected` is the size the
+    /// rather than cut short (see [`fallback::decode_within`]). `expected` is the size the
     /// inflated data should have, 0 where none is known: room is not reserved past
     /// it while the data is shorter ([`inflate`]).
     ///
@@ -210,6 +210,7 @@ pub(crate) mod flate {
         /// thing that is no valid deflate data and keeps what came before. Data that
         /// ends early, or with a wrong or missing checksum, is not corrupt: what it
         /// holds is all decoded.
+        #[cfg(test)]
         pub(crate) fn decode_lenient(data: &[u8], meter: &Meter<'_>) -> Result<Vec<u8>, Cancelled> {
             match run(data, meter, usize::MAX) {
                 Ok((decoded, _)) => Ok(decoded),
@@ -371,6 +372,15 @@ pub(crate) mod flate {
                     eof: false,
                     corrupt: false,
                 }
+            }
+
+            /// A decoder of `input` whose bytes are handed out as it makes them, each
+            /// [`Self::step`] asked for at most `step` pending bytes: its output never
+            /// needs more room than the history and a step's bytes.
+            pub(crate) fn stepping(input: I, step: usize) -> Self {
+                let mut stream = Self::new(input);
+                stream.most = 2 * WINDOW + step + STEP_PAST;
+                stream
             }
 
             /// The bytes made in all.
