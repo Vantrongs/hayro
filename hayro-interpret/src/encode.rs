@@ -6,7 +6,7 @@ use crate::pattern::ShadingPattern;
 use crate::shading::{PATCH_TRIANGLES, ShadingFunction, ShadingType, Triangle};
 use crate::util::x_y_advances;
 use hayro_syntax::hash;
-use kurbo::{Affine, Point, Rect, Shape, Vec2};
+use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape, Vec2};
 use smallvec::{SmallVec, ToSmallVec, smallvec};
 use std::ops::Range;
 use std::sync::Arc;
@@ -139,6 +139,9 @@ pub enum EncodedShadingType {
 pub struct EncodedFunctionBasedShading {
     pub(crate) domain: Rect,
     pub(crate) function: ShadingFunction,
+    /// The sides of `domain` it is extended past, `x0`, `x1`, `y0`, `y1`: a point
+    /// past one is taken at the side ([`EncodedShadingPattern::extend_within_metered`]).
+    pub(crate) extended: [bool; 4],
 }
 
 /// Encoded axial or radial shading.
@@ -398,7 +401,148 @@ pub fn texture_dimensions(bbox: Rect, scale: f32) -> (u32, u32) {
     )
 }
 
+/// The share of a circle's radius a path drawing it may reach past it and still
+/// be taken to end at it (`extend_within_metered`): four cubic arcs, as producers
+/// draw a circle, reach 0.027 % past it, and the chords a path is tested along
+/// stray 0.02 % more.
+const CIRCLE_SLACK: f64 = 5e-4;
+
+/// The share of `CIRCLE_SLACK` the chords a path is tested along may stray from it.
+const CHORD_SLACK: f64 = 2e-4;
+
+/// The steps testing a point of a path against an edge of a shading takes:
+/// placing it and comparing.
+const EDGE_POINT_COST: Cost = Cost::new(8);
+
 impl EncodedShadingPattern {
+    /// Extends the shading past each edge of the part it paints itself in that
+    /// `shape`, placed in device space by `to_device`, lies within, reaching at
+    /// most `tolerance` device units past it: an end of an axial or radial
+    /// shading that does not extend, a side of a function-based one's domain.
+    /// Within the shape it paints as before, but no edge of its own cuts a pixel
+    /// where the shape ends at it, as where a gradient fills its own rectangle or
+    /// disc. A renderer that multiplies a shape's coverage of a pixel by the
+    /// shading's there would cut such a pixel twice: a shape covering half of it
+    /// would paint a quarter. A radial shading is extended only where one of its
+    /// circles holds the other, as elsewhere extending an end changes which circle
+    /// a point it painted lies on; a path may reach `CIRCLE_SLACK` of a circle's
+    /// radius past it besides, as cubic arcs do. A mesh has no such edges here.
+    ///
+    /// The work is taken of `meter` before it is done: a step for each point of
+    /// the shape's elements, and for a radial shading each point of the chords it
+    /// is tested along. `Exhausted`, the shading unchanged, when `meter` refuses.
+    pub fn extend_within_metered(
+        &mut self,
+        shape: &BezPath,
+        to_device: Affine,
+        tolerance: f64,
+        meter: &mut dyn Meter,
+    ) -> Result<(), Exhausted> {
+        let base = self.base_transform;
+        let to_shading = base * to_device;
+        let [a, b, c, d, _, _] = base.as_coeffs();
+        // The shading's units across a device unit along its axes, and the fewest
+        // along any direction.
+        let (per_x, per_y) = (a.hypot(c), b.hypot(d));
+        let det = (a * d - b * c).abs();
+        let squares = a * a + b * b + c * c + d * d;
+        let most = ((squares + (squares * squares - 4.0 * det * det).max(0.0).sqrt()) / 2.0).sqrt();
+        let fewest = if most > 0.0 { det / most } else { 0.0 };
+        let edges = match &self.shading_type {
+            EncodedShadingType::FunctionBased(shading) => !shading.extended.iter().all(|&e| e),
+            EncodedShadingType::RadialAxial(shading) => shading.extend != [true, true],
+            EncodedShadingType::Sampled(_) | EncodedShadingType::Dummy(_) => false,
+        };
+        if !edges {
+            return Ok(());
+        }
+        take(meter, EDGE_POINT_COST.times(control_points(shape) as u64))?;
+        // The box of the shape's control points in the shading's space, which
+        // holds the shape: a side of the box within a half-plane holds it there.
+        let bounds = || {
+            let mut bounds: Option<Rect> = None;
+            each_control_point(shape, |p| {
+                let p = to_shading * p;
+                bounds = Some(bounds.map_or(Rect::from_points(p, p), |r| r.union_pt(p)));
+            });
+            bounds
+        };
+        match &mut self.shading_type {
+            EncodedShadingType::FunctionBased(shading) => {
+                let Some(bounds) = bounds() else {
+                    return Ok(());
+                };
+                let domain = shading.domain;
+                let (x, y) = (tolerance * per_x, tolerance * per_y);
+                shading.extended[0] |= bounds.x0 >= domain.x0 - x;
+                shading.extended[1] |= bounds.x1 <= domain.x1 + x;
+                shading.extended[2] |= bounds.y0 >= domain.y0 - y;
+                shading.extended[3] |= bounds.y1 <= domain.y1 + y;
+            }
+            EncodedShadingType::RadialAxial(shading) => match shading.params {
+                RadialAxialParams::Axial => {
+                    let Some(bounds) = bounds() else {
+                        return Ok(());
+                    };
+                    let t = tolerance * per_x;
+                    shading.extend[0] |= bounds.x0 >= -t;
+                    shading.extend[1] |= bounds.x1 <= 1.0 + t;
+                }
+                RadialAxialParams::Radial { p1, r } => {
+                    let (r0, r1) = (r.x, r.y);
+                    // Where one circle holds the other, each holds the ones before
+                    // it or after: one end is the larger circle's inside, the other
+                    // the smaller one's outside.
+                    let grows = r1 >= r0;
+                    let nested = p1.to_vec2().hypot() <= (r1 - r0).abs() * (1.0 + 1e-9);
+                    if !nested {
+                        return Ok(());
+                    }
+                    let (large, small) = if grows {
+                        ((p1, r1), (Point::ZERO, r0))
+                    } else {
+                        ((Point::ZERO, r0), (p1, r1))
+                    };
+                    // The tolerance in the shading's units, which reach it along
+                    // every direction.
+                    let near = tolerance * fewest;
+                    let chord = large.1 * CHORD_SLACK + near / 2.0;
+                    let steps = chord_steps(shape, to_shading, chord);
+                    take(meter, EDGE_POINT_COST.times(steps))?;
+                    let polyline = chords(shape, to_shading, chord);
+                    let inside = polyline.iter().all(|&(_, q)| {
+                        q.distance(large.0)
+                            <= large.1 * (1.0 + CIRCLE_SLACK - CHORD_SLACK) + near / 2.0
+                    });
+                    let hole = small.1 * (1.0 - CIRCLE_SLACK) - near;
+                    let outside = hole <= 0.0 || avoids_disc(&polyline, small.0, hole);
+                    let (outer_end, inner_end) = if grows { (1, 0) } else { (0, 1) };
+                    shading.extend[outer_end] |= inside;
+                    shading.extend[inner_end] |= outside;
+                }
+            },
+            EncodedShadingType::Sampled(_) | EncodedShadingType::Dummy(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Which edges of the part the shading paints itself in it extends past, a
+    /// bit each: encodings of one shading under one transform paint alike where
+    /// these agree ([`extend_within_metered`](Self::extend_within_metered)).
+    pub fn extended_edges(&self) -> u8 {
+        let bits = |flags: &[bool]| {
+            flags
+                .iter()
+                .enumerate()
+                .fold(0, |bits, (i, &on)| bits | (u8::from(on) << i))
+        };
+        match &self.shading_type {
+            EncodedShadingType::FunctionBased(shading) => bits(&shading.extended),
+            EncodedShadingType::RadialAxial(shading) => bits(&shading.extend),
+            EncodedShadingType::Sampled(_) | EncodedShadingType::Dummy(_) => 0,
+        }
+    }
+
     /// Sample the shading at the given position.
     ///
     /// A mesh shading places all its triangles for each call;
@@ -1051,6 +1195,7 @@ fn encode_function_shading(domain: &[f32; 4], function: &ShadingFunction) -> Enc
     EncodedShadingType::FunctionBased(EncodedFunctionBasedShading {
         domain,
         function: function.clone(),
+        extended: [false; 4],
     })
 }
 
@@ -1069,11 +1214,31 @@ impl EncodedShadingType {
         samples: Option<&Samples>,
     ) -> Option<AlphaColor> {
         match self {
-            Self::FunctionBased(EncodedFunctionBasedShading { domain, function }) => {
-                if !domain.contains(pos) {
+            Self::FunctionBased(EncodedFunctionBasedShading {
+                domain,
+                function,
+                extended,
+            }) => {
+                // A side the shading is extended past holds the points past it.
+                let x = match (extended[0], extended[1]) {
+                    (true, _) if pos.x < domain.x0 => domain.x0,
+                    (_, true) if pos.x >= domain.x1 => domain.x1,
+                    _ => pos.x,
+                };
+                let y = match (extended[2], extended[3]) {
+                    (true, _) if pos.y < domain.y0 => domain.y0,
+                    (_, true) if pos.y >= domain.y1 => domain.y1,
+                    _ => pos.y,
+                };
+                // The domain holds its far sides only where it is extended past them.
+                let within =
+                    |v: f64, lo: f64, hi: f64, far: bool| v >= lo && (v < hi || far && v <= hi);
+                if !(within(x, domain.x0, domain.x1, extended[1])
+                    && within(y, domain.y0, domain.y1, extended[3]))
+                {
                     Some(bg_color)
                 } else {
-                    let out = function.eval(&smallvec![pos.x as f32, pos.y as f32])?;
+                    let out = function.eval(&smallvec![x as f32, y as f32])?;
                     // TODO: Clamp out-of-range values.
                     Some(color_space.to_rgba(&out, 1.0))
                 }
@@ -1214,6 +1379,144 @@ fn radial_pos(
         (None, Some(max)) => Some(max),
         (None, None) => None,
     }
+}
+
+/// The points of `shape`'s elements, each element's after its start.
+fn each_control_point(shape: &BezPath, mut f: impl FnMut(Point)) {
+    for el in shape.elements() {
+        match *el {
+            PathEl::MoveTo(p) | PathEl::LineTo(p) => f(p),
+            PathEl::QuadTo(p1, p2) => [p1, p2].into_iter().for_each(&mut f),
+            PathEl::CurveTo(p1, p2, p3) => [p1, p2, p3].into_iter().for_each(&mut f),
+            PathEl::ClosePath => {}
+        }
+    }
+}
+
+/// How many points `each_control_point` passes on.
+fn control_points(shape: &BezPath) -> usize {
+    shape
+        .elements()
+        .iter()
+        .map(|el| match el {
+            PathEl::MoveTo(_) | PathEl::LineTo(_) => 1,
+            PathEl::QuadTo(..) => 2,
+            PathEl::CurveTo(..) => 3,
+            PathEl::ClosePath => 0,
+        })
+        .sum()
+}
+
+/// The equal steps of a curve's parameter whose chords stray at most
+/// `tolerance` from it, its second derivative at most `bend`: a chord over a
+/// step `h` strays at most `bend * h² / 8`.
+fn steps_for(bend: f64, tolerance: f64) -> u64 {
+    let steps = (bend / (8.0 * tolerance)).sqrt().ceil();
+    if steps.is_finite() {
+        (steps as u64).max(1)
+    } else {
+        u64::MAX
+    }
+}
+
+/// The steps `chords` cuts `shape`'s curves in, placed by `to_shading`, so its
+/// chords stray at most `tolerance` from them, a step a line.
+fn chord_steps(shape: &BezPath, to_shading: Affine, tolerance: f64) -> u64 {
+    let mut last = Point::ZERO;
+    let mut steps = 0_u64;
+    for el in shape.elements() {
+        let el = to_shading * *el;
+        let (count, end) = match el {
+            PathEl::MoveTo(p) => (1, p),
+            PathEl::LineTo(p) => (1, p),
+            PathEl::QuadTo(p1, p2) => {
+                let bend = 2.0 * (last - 2.0 * p1.to_vec2() + p2.to_vec2()).to_vec2().hypot();
+                (steps_for(bend, tolerance), p2)
+            }
+            PathEl::CurveTo(p1, p2, p3) => {
+                let a = (last - 2.0 * p1.to_vec2() + p2.to_vec2()).to_vec2().hypot();
+                let b = (p1 - 2.0 * p2.to_vec2() + p3.to_vec2()).to_vec2().hypot();
+                (steps_for(6.0 * a.max(b), tolerance), p3)
+            }
+            PathEl::ClosePath => (0, last),
+        };
+        steps = steps.saturating_add(count);
+        last = end;
+    }
+    steps
+}
+
+/// `shape` placed by `to_shading` as closed polylines whose chords stray at most
+/// `tolerance` from it (`chord_steps`), each point with whether it starts one.
+fn chords(shape: &BezPath, to_shading: Affine, tolerance: f64) -> Vec<(bool, Point)> {
+    use kurbo::{CubicBez, ParamCurve, QuadBez};
+    let mut points = Vec::new();
+    let mut last = Point::ZERO;
+    for el in shape.elements() {
+        match to_shading * *el {
+            PathEl::MoveTo(p) => {
+                points.push((true, p));
+                last = p;
+            }
+            PathEl::LineTo(p) => {
+                points.push((false, p));
+                last = p;
+            }
+            PathEl::QuadTo(p1, p2) => {
+                let curve = QuadBez::new(last, p1, p2);
+                let bend = 2.0 * (last - 2.0 * p1.to_vec2() + p2.to_vec2()).to_vec2().hypot();
+                let n = steps_for(bend, tolerance);
+                points.extend((1..=n).map(|i| (false, curve.eval(i as f64 / n as f64))));
+                last = p2;
+            }
+            PathEl::CurveTo(p1, p2, p3) => {
+                let curve = CubicBez::new(last, p1, p2, p3);
+                let a = (last - 2.0 * p1.to_vec2() + p2.to_vec2()).to_vec2().hypot();
+                let b = (p1 - 2.0 * p2.to_vec2() + p3.to_vec2()).to_vec2().hypot();
+                let n = steps_for(6.0 * a.max(b), tolerance);
+                points.extend((1..=n).map(|i| (false, curve.eval(i as f64 / n as f64))));
+                last = p3;
+            }
+            PathEl::ClosePath => {}
+        }
+    }
+    points
+}
+
+/// Whether the inside of the closed polylines `polyline` (each starting where a
+/// point is marked) misses the disc at `center` of `radius`: no side reaches into
+/// it, and the polylines do not wind around its centre.
+fn avoids_disc(polyline: &[(bool, Point)], center: Point, radius: f64) -> bool {
+    let mut winding = 0;
+    let mut start = 0;
+    for i in 0..polyline.len() {
+        let next = match polyline.get(i + 1) {
+            Some(&(false, _)) => i + 1,
+            // The last point of a subpath closes it.
+            _ => start,
+        };
+        let (p, q) = (polyline[i].1, polyline[next].1);
+        let side = q - p;
+        let along = if side.hypot2() > 0.0 {
+            ((center - p).dot(side) / side.hypot2()).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if center.distance(p + side * along) < radius {
+            return false;
+        }
+        // A side crossing the ray from the centre to the right.
+        if (p.y <= center.y) != (q.y <= center.y) {
+            let x = p.x + (center.y - p.y) / (q.y - p.y) * (q.x - p.x);
+            if x > center.x {
+                winding += if q.y > p.y { 1 } else { -1 };
+            }
+        }
+        if next == start {
+            start = i + 1;
+        }
+    }
+    winding == 0
 }
 
 #[cfg(test)]
@@ -1534,6 +1837,179 @@ mod tests {
             let asked: u64 = meter.asked.iter().sum();
             assert_eq!(*taken.get_or_insert(asked), asked, "{n} functions");
         }
+    }
+
+    /// A shading is extended past the edges of the part it paints that a shape
+    /// ends at, within a thirty-second of a device unit, and nowhere else: an
+    /// axial one's ends at its own rectangle's, turned or not, but not an end a
+    /// rectangle reaches a unit past; a function-based one's domain's sides; a
+    /// radial one's larger circle drawn with four cubic arcs, the smaller one's
+    /// outside where a ring's hole is it, but not where a disc covers the hole,
+    /// and no end of one whose circles do not nest. Inside the shape it paints as
+    /// before, and past an extended edge the colour at the edge.
+    #[test]
+    fn a_shading_is_extended_past_the_edges_a_shape_ends_at() {
+        use kurbo::{BezPath, Shape};
+        const TOLERANCE: f64 = 1.0 / 32.0;
+        let encoded = |shading: &str, matrix: Affine| {
+            let mut pattern = shading_pattern(&[
+                "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+                shading.to_string(),
+                "<< /FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1] /Length 22 >>\n\
+                 stream\n{ pop dup 1 exch sub 0 }\nendstream"
+                    .to_string(),
+            ]);
+            pattern.matrix = matrix;
+            pattern.encode()
+        };
+        // The colour at a device point.
+        let at = |encoded: &super::EncodedShadingPattern, point: Point| {
+            let mut color = [0.0; 4];
+            encoded
+                .sample_points_metered(&[point], &mut super::Unmetered, |c| color = c)
+                .expect("unmetered");
+            color
+        };
+        let extended = |shading: &str, matrix: Affine, shape: &BezPath| {
+            let mut encoded = encoded(shading, matrix);
+            encoded
+                .extend_within_metered(shape, matrix, TOLERANCE, &mut super::Unmetered)
+                .expect("unmetered");
+            encoded.extended_edges()
+        };
+        let red_to_blue =
+            "/Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >>";
+        let axial = format!(
+            "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [10.3 20 90.6 20] {red_to_blue} >>"
+        );
+        let turned = Affine::rotate_about(0.5, Point::new(50.0, 40.0));
+        let rect = |x1: f64| Rect::new(10.3, 15.7, x1, 75.2).to_path(0.1);
+        for matrix in [Affine::IDENTITY, turned, Affine::scale(4.0) * turned] {
+            assert_eq!(extended(&axial, matrix, &rect(90.6)), 0b11, "{matrix:?}");
+            assert_eq!(extended(&axial, matrix, &rect(91.6)), 0b01, "{matrix:?}");
+        }
+        // Inside it paints as before; past the start, the start's colour, not nothing.
+        let mut start = encoded(&axial, Affine::IDENTITY);
+        let (inside, past) = (Point::new(40.0, 30.0), Point::new(10.0, 30.0));
+        let (before, nothing) = (at(&start, inside), at(&start, past));
+        start
+            .extend_within_metered(
+                &rect(90.6),
+                Affine::IDENTITY,
+                TOLERANCE,
+                &mut super::Unmetered,
+            )
+            .expect("unmetered");
+        assert_eq!(nothing, [0.0; 4]);
+        assert_eq!(at(&start, inside), before);
+        assert_eq!(at(&start, past), [1.0, 0.0, 0.0, 1.0]);
+
+        let function = "<< /ShadingType 1 /ColorSpace /DeviceRGB /Domain [0 1 0 1] \
+                        /Matrix [80.3 0 0 59.5 10.3 15.7] /Function 6 0 R >>";
+        assert_eq!(extended(function, Affine::IDENTITY, &rect(90.6)), 0b1111);
+        assert_eq!(extended(function, turned, &rect(90.6)), 0b1111);
+        assert_eq!(extended(function, Affine::IDENTITY, &rect(91.6)), 0b1101);
+        let mut domain = encoded(function, Affine::IDENTITY);
+        let (edge, past) = (Point::new(90.6, 30.0), Point::new(91.0, 30.0));
+        assert_eq!(at(&domain, past), [0.0; 4]);
+        domain
+            .extend_within_metered(
+                &rect(90.6),
+                Affine::IDENTITY,
+                TOLERANCE,
+                &mut super::Unmetered,
+            )
+            .expect("unmetered");
+        assert_eq!(at(&domain, past), [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(at(&domain, edge), [1.0, 0.0, 0.0, 1.0]);
+
+        // A circle as producers draw it: four cubic arcs reaching 0.027 % past it.
+        let arcs = |center: Point, r: f64, reversed: bool| {
+            const KAPPA: f64 = 0.552_284_749_8;
+            let (c, k) = (center, r * KAPPA);
+            let mut path = BezPath::new();
+            path.move_to((c.x + r, c.y));
+            let quarter = |path: &mut BezPath, s: f64| {
+                path.curve_to(
+                    (c.x + r, c.y + s * k),
+                    (c.x + k, c.y + s * r),
+                    (c.x, c.y + s * r),
+                );
+                path.curve_to(
+                    (c.x - k, c.y + s * r),
+                    (c.x - r, c.y + s * k),
+                    (c.x - r, c.y),
+                );
+                path.curve_to(
+                    (c.x - r, c.y - s * k),
+                    (c.x - k, c.y - s * r),
+                    (c.x, c.y - s * r),
+                );
+                path.curve_to(
+                    (c.x + k, c.y - s * r),
+                    (c.x + r, c.y - s * k),
+                    (c.x + r, c.y),
+                );
+            };
+            quarter(&mut path, if reversed { -1.0 } else { 1.0 });
+            path.close_path();
+            path
+        };
+        let center = Point::new(50.0, 40.0);
+        let radial = |coords: &str| {
+            format!("<< /ShadingType 3 /ColorSpace /DeviceRGB /Coords [{coords}] {red_to_blue} >>")
+        };
+        let disc = radial("50 40 0 50 40 300");
+        for matrix in [Affine::IDENTITY, Affine::scale(4.0) * turned] {
+            assert_eq!(
+                extended(&disc, matrix, &arcs(center, 300.0, false)) & 0b10,
+                0b10
+            );
+            assert_eq!(
+                extended(&disc, matrix, &arcs(center, 300.5, false)) & 0b10,
+                0
+            );
+        }
+        let ring = radial("50 40 10 50 40 30");
+        let mut hole = arcs(center, 30.0, false);
+        hole.extend(arcs(center, 10.0, true));
+        assert_eq!(extended(&ring, Affine::IDENTITY, &hole), 0b11);
+        assert_eq!(
+            extended(&ring, Affine::IDENTITY, &arcs(center, 30.0, false)),
+            0b10
+        );
+        let cone = radial("20 40 5 80 40 10");
+        let around = Rect::new(0.0, 0.0, 100.0, 80.0).to_path(0.1);
+        assert_eq!(extended(&cone, Affine::IDENTITY, &around), 0);
+
+        // The work is asked first: refused, the shading is left as it was; a
+        // shading with no edge to extend asks none.
+        for shading in [&axial, &disc] {
+            let mut refused = encoded(shading, Affine::IDENTITY);
+            let mut meter = Recording {
+                left: 0,
+                asked: vec![],
+                held: vec![],
+            };
+            let shape = arcs(center, 300.0, false);
+            let result =
+                refused.extend_within_metered(&shape, Affine::IDENTITY, TOLERANCE, &mut meter);
+            assert_eq!((result, refused.extended_edges()), (Err(Exhausted), 0));
+            assert!(meter.asked[0] > 0);
+        }
+        let both = format!(
+            "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [10.3 20 90.6 20] \
+             /Extend [true true] {red_to_blue} >>"
+        );
+        let mut meter = Recording {
+            left: 0,
+            asked: vec![],
+            held: vec![],
+        };
+        encoded(&both, Affine::IDENTITY)
+            .extend_within_metered(&rect(90.6), Affine::IDENTITY, TOLERANCE, &mut meter)
+            .expect("nothing to do");
+        assert!(meter.asked.is_empty());
     }
 
     /// Points sampled one by one are the colours a texture samples at the same
