@@ -133,6 +133,11 @@ pub enum EncodedShadingType {
     Sampled(EncodedSampledShading),
     /// Empty dummy shading.
     Dummy(EncodedDummyShading),
+    /// A function-based, axial or radial shading whose space does not map onto
+    /// the device's, its matrix not inverting: it covers no area there, so it
+    /// paints its background alone, where it has one, as `MuPDF` paints an axial
+    /// or radial one.
+    Background,
 }
 
 /// Encoded function-based shading.
@@ -457,8 +462,9 @@ impl EncodedShadingPattern {
     /// with the shape. Without one, it is built for this test where one is needed.
     ///
     /// Each test holds with a margin for the rounding of the shape's coordinates
-    /// and of the test's arithmetic ([`rounding`]), so a shape too far from the
-    /// origin for its position to be known extends nothing.
+    /// and of the test's arithmetic ([`Placement::rounding`]), so a shape too far
+    /// from the origin for its position to be known extends nothing; nor does one
+    /// whose placement is not a number or does not invert ([`Placement::new`]).
     ///
     /// The work is taken of `meter` before it is done: reading the hull, and for a
     /// radial shading the lines of the shape's outline near the window
@@ -473,9 +479,10 @@ impl EncodedShadingPattern {
         tolerance: f64,
         meter: &mut dyn Meter,
     ) -> Result<(), Exhausted> {
-        let base = self.base_transform;
-        let to_shading = base * to_device;
-        let [a, b, c, d, _, _] = base.as_coeffs();
+        let Some(placed) = Placement::new(self.base_transform, to_device, window) else {
+            return Ok(());
+        };
+        let [a, b, c, d, _, _] = placed.base.as_coeffs();
         // The shading's units across a device unit along its axes, and the fewest
         // along any direction.
         let (per_x, per_y) = (a.hypot(c), b.hypot(d));
@@ -486,7 +493,9 @@ impl EncodedShadingPattern {
         let edges = match &self.shading_type {
             EncodedShadingType::FunctionBased(shading) => !shading.extended.iter().all(|&e| e),
             EncodedShadingType::RadialAxial(shading) => shading.extend != [true, true],
-            EncodedShadingType::Sampled(_) | EncodedShadingType::Dummy(_) => false,
+            EncodedShadingType::Sampled(_)
+            | EncodedShadingType::Dummy(_)
+            | EncodedShadingType::Background => false,
         };
         if !edges {
             return Ok(());
@@ -504,8 +513,8 @@ impl EncodedShadingPattern {
             };
             take(meter, hull.bounds_cost())?;
             Ok(hull
-                .bounds(to_shading)
-                .map(|bounds| (bounds, rounding(base, to_device, reach(bounds)))))
+                .bounds(placed.to_shading)
+                .map(|bounds| (bounds, placed.rounding(reach(bounds)))))
         };
         match &mut self.shading_type {
             EncodedShadingType::FunctionBased(shading) => {
@@ -548,14 +557,13 @@ impl EncodedShadingPattern {
                     let Some((bounds, _)) = bounds()? else {
                         return Ok(());
                     };
-                    let window = base.transform_rect_bbox(window);
-                    let error = rounding(base, to_device, reach(bounds).max(reach(window)));
+                    let error = placed.rounding(reach(bounds).max(reach(placed.window)));
                     // The tolerance in the shading's units, which reach it along
                     // every direction.
                     let near = tolerance * fewest;
                     let chord = large.1 * CHORD_SLACK + near / 2.0;
                     let mut test = Nesting::new(
-                        window,
+                        &placed,
                         (
                             large.0,
                             large.1 * (1.0 + CIRCLE_SLACK - CHORD_SLACK) + near / 2.0,
@@ -569,7 +577,7 @@ impl EncodedShadingPattern {
                     let cull = test.window.inflate(past, past);
                     crate::flatten::flatten_metered(
                         shape.iter(),
-                        to_shading,
+                        placed.to_shading,
                         chord,
                         Some(cull),
                         meter,
@@ -584,7 +592,9 @@ impl EncodedShadingPattern {
                     shading.extend[inner_end] |= outside;
                 }
             },
-            EncodedShadingType::Sampled(_) | EncodedShadingType::Dummy(_) => {}
+            EncodedShadingType::Sampled(_)
+            | EncodedShadingType::Dummy(_)
+            | EncodedShadingType::Background => {}
         }
         Ok(())
     }
@@ -602,7 +612,9 @@ impl EncodedShadingPattern {
         match &self.shading_type {
             EncodedShadingType::FunctionBased(shading) => bits(&shading.extended),
             EncodedShadingType::RadialAxial(shading) => bits(&shading.extend),
-            EncodedShadingType::Sampled(_) | EncodedShadingType::Dummy(_) => 0,
+            EncodedShadingType::Sampled(_)
+            | EncodedShadingType::Dummy(_)
+            | EncodedShadingType::Background => 0,
         }
     }
 
@@ -629,7 +641,7 @@ impl EncodedShadingPattern {
             EncodedShadingType::Sampled(mesh) => {
                 mesh.function.as_ref().map_or(Cost::ZERO, |f| f.cost())
             }
-            EncodedShadingType::Dummy(_) => Cost::ZERO,
+            EncodedShadingType::Dummy(_) | EncodedShadingType::Background => Cost::ZERO,
         };
         // A step a channel mapped.
         let transfer = if self.transfer_function.is_some() {
@@ -933,6 +945,12 @@ impl ShadingPattern {
 
                 EncodedShadingType::Dummy(EncodedDummyShading)
             }
+        };
+        let inverts = |t: Affine| t.is_finite() && t.determinant() != 0.0;
+        let (shading_type, base_transform) = if inverts(base_transform) {
+            (shading_type, base_transform)
+        } else {
+            (EncodedShadingType::Background, Affine::IDENTITY)
         };
 
         let color_space = self.shading.color_space.clone();
@@ -1369,6 +1387,7 @@ impl EncodedShadingType {
                 color_space,
             ),
             Self::Dummy(_) => Some(AlphaColor::TRANSPARENT),
+            Self::Background => Some(bg_color),
         }
     }
 }
@@ -1496,7 +1515,8 @@ struct Nesting {
 }
 
 impl Nesting {
-    fn new(window: Rect, large: (Point, f64), hole: (Point, f64), error: f64) -> Self {
+    fn new(placed: &Placement, large: (Point, f64), hole: (Point, f64), error: f64) -> Self {
+        let window = placed.window;
         // A corner's probe lies inside it, off the window's sides, which a shape
         // ending at them passes along.
         let inset = 1e-9 * window.width().max(window.height()).max(f64::MIN_POSITIVE);
@@ -1625,33 +1645,73 @@ fn reach(rect: Rect) -> f64 {
         .max(rect.y1.abs())
 }
 
-/// How far, along either axis in a shading's space, a point of a shape placed
-/// there through `to_device` and then `base`, as a test computes it, may lie from
-/// the same point as painted, where vello places it in device space through
-/// `to_device` alone, for a shape and window within `reach` of the origin there;
-/// with the error of a test's own arithmetic on lines so placed besides. A margin
-/// smaller than this proves nothing: infinite where it is not known.
-///
-/// Each step, a product or sum of terms reaching `m`, rounds by at most
-/// `f64::EPSILON * m`. A point `s = B T p` lies within `‖B‖‖T‖‖p‖` of the
-/// origin's image, and `‖p‖ ≤ ‖(B T)⁻¹‖ (‖s‖ + ‖t‖)` for `t` the translation of
-/// `B T`: placing it in each way, making `B T`, flattening a curve and clipping a
-/// line to the window each takes a few steps over terms within
-/// `cond(B) cond(T) (reach + ‖t‖)` of the origin, besides the translations.
-fn rounding(base: Affine, to_device: Affine, reach: f64) -> f64 {
-    /// More than the steps of rounding all of these take together.
-    const STEPS: f64 = 64.0;
-    // The largest sum of a row's magnitudes, of the matrix and of its inverse.
-    let norm = |[a, b, c, d, _, _]: [f64; 6]| (a.abs() + c.abs()).max(b.abs() + d.abs());
-    let inverse_norm = |[a, b, c, d, _, _]: [f64; 6]| {
-        (d.abs() + c.abs()).max(b.abs() + a.abs()) / (a * d - b * c).abs()
-    };
-    let shift = |[_, _, _, _, e, f]: [f64; 6]| e.abs().max(f.abs());
-    let (base, to_device) = (base.as_coeffs(), to_device.as_coeffs());
-    let spread = norm(base) * inverse_norm(base) * norm(to_device) * inverse_norm(to_device);
-    let offset = norm(base) * shift(to_device) + shift(base);
-    let error = STEPS * f64::EPSILON * (spread * (reach + offset) + offset);
-    if error.is_nan() { f64::INFINITY } else { error }
+/// Where a shape is tested for the edges a shading extends past
+/// ([`EncodedShadingPattern::extend_within_metered`]): the shading's transform
+/// from device space, the shape's transform to device space, the two together,
+/// and the window the shape is seen in, in the shading's space. Each is finite
+/// and each transform inverts, so every bound a test derives from them is a
+/// number, if an infinite one, and the window's sides are ordered.
+struct Placement {
+    base: Affine,
+    to_device: Affine,
+    to_shading: Affine,
+    window: Rect,
+}
+
+impl Placement {
+    /// `None` where a transform or the window, in device space or the shading's,
+    /// is not finite, or a transform does not invert: a shape squeezed onto a
+    /// line covers no pixel, and from a place that is not a number no test
+    /// proves anything, so nothing is extended.
+    fn new(base: Affine, to_device: Affine, window: Rect) -> Option<Self> {
+        let inverts = |t: Affine| {
+            let det = t.determinant();
+            t.is_finite() && det != 0.0 && det.is_finite() && t.inverse().is_finite()
+        };
+        let finite = |r: Rect| {
+            [r.x0, r.y0, r.x1, r.y1].iter().all(|v| v.is_finite()) && r.x0 <= r.x1 && r.y0 <= r.y1
+        };
+        let to_shading = base * to_device;
+        if !(inverts(base) && inverts(to_device) && inverts(to_shading) && finite(window)) {
+            return None;
+        }
+        let window = base.transform_rect_bbox(window);
+        finite(window).then_some(Self {
+            base,
+            to_device,
+            to_shading,
+            window,
+        })
+    }
+
+    /// How far, along either axis in a shading's space, a point of a shape placed
+    /// there through `to_device` and then `base`, as a test computes it, may lie from
+    /// the same point as painted, where vello places it in device space through
+    /// `to_device` alone, for a shape and window within `reach` of the origin there;
+    /// with the error of a test's own arithmetic on lines so placed besides. A margin
+    /// smaller than this proves nothing: infinite where it is not known.
+    ///
+    /// Each step, a product or sum of terms reaching `m`, rounds by at most
+    /// `f64::EPSILON * m`. A point `s = B T p` lies within `‖B‖‖T‖‖p‖` of the
+    /// origin's image, and `‖p‖ ≤ ‖(B T)⁻¹‖ (‖s‖ + ‖t‖)` for `t` the translation of
+    /// `B T`: placing it in each way, making `B T`, flattening a curve and clipping a
+    /// line to the window each takes a few steps over terms within
+    /// `cond(B) cond(T) (reach + ‖t‖)` of the origin, besides the translations.
+    fn rounding(&self, reach: f64) -> f64 {
+        /// More than the steps of rounding all of these take together.
+        const STEPS: f64 = 64.0;
+        // The largest sum of a row's magnitudes, of the matrix and of its inverse.
+        let norm = |[a, b, c, d, _, _]: [f64; 6]| (a.abs() + c.abs()).max(b.abs() + d.abs());
+        let inverse_norm = |[a, b, c, d, _, _]: [f64; 6]| {
+            (d.abs() + c.abs()).max(b.abs() + a.abs()) / (a * d - b * c).abs()
+        };
+        let shift = |[_, _, _, _, e, f]: [f64; 6]| e.abs().max(f.abs());
+        let (base, to_device) = (self.base.as_coeffs(), self.to_device.as_coeffs());
+        let spread = norm(base) * inverse_norm(base) * norm(to_device) * inverse_norm(to_device);
+        let offset = norm(base) * shift(to_device) + shift(base);
+        let error = STEPS * f64::EPSILON * (spread * (reach + offset) + offset);
+        if error.is_nan() { f64::INFINITY } else { error }
+    }
 }
 
 /// The part of the line from `a` to `b` within `rect`, `None` where it misses it.
@@ -2380,6 +2440,149 @@ mod tests {
                 0b11,
                 "{to_device:?}"
             );
+        }
+    }
+
+    /// A shading placed by a transform that does not invert or is not a number,
+    /// or a shape so placed or seen in a window that is not a number, extends
+    /// nothing, and the test does not panic: a radial shading under the matrix
+    /// `[0 0 0 0 0 0]`, its circles about the origin, made a window of NaN that
+    /// the test's clamp panicked on. The same shape, placed well, is extended,
+    /// axial, function-based and radial.
+    #[test]
+    fn a_placement_that_is_not_a_number_extends_nothing() {
+        use kurbo::Shape;
+        let red_to_blue =
+            "/Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >>";
+        let shadings = [
+            format!(
+                "<< /ShadingType 3 /ColorSpace /DeviceRGB /Coords [0 0 0 0 0 30] {red_to_blue} >>"
+            ),
+            format!(
+                "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [10 20 90 20] {red_to_blue} >>"
+            ),
+            "<< /ShadingType 1 /ColorSpace /DeviceRGB /Domain [0 1 0 1] \
+             /Matrix [80 0 0 60 10 15] /Function 6 0 R >>"
+                .to_string(),
+        ];
+        let (id, zero) = (Affine::IDENTITY, Affine::new([0.0; 6]));
+        let not_a_number = Affine::new([f64::NAN, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let page = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let shape = Rect::new(10.0, 15.0, 90.0, 75.0).to_path(0.1);
+        // The shading's transform from device space, if not its own, the
+        // shape's to device space and the window.
+        let placements = [
+            (None, id, page, true),
+            (Some(zero), id, page, false),
+            (
+                Some(Affine::new([1.0, 0.0, 1.0, 0.0, 0.0, 0.0])),
+                id,
+                page,
+                false,
+            ),
+            (Some(not_a_number), id, page, false),
+            (None, zero, page, false),
+            (None, not_a_number, page, false),
+            (
+                None,
+                Affine::new([1.0, 0.0, 0.0, 1.0, f64::INFINITY, 0.0]),
+                page,
+                false,
+            ),
+            (None, id, Rect::new(f64::NAN, 0.0, 100.0, 100.0), false),
+            (None, id, Rect::new(0.0, 0.0, f64::INFINITY, 100.0), false),
+        ];
+        for shading in &shadings {
+            for (base, to_device, window, extends) in placements {
+                let mut encoded = shading_pattern(&[
+                    "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+                    shading.clone(),
+                    "<< /FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1] /Length 22 >>\n\
+                     stream\n{ pop dup 1 exch sub 0 }\nendstream"
+                        .to_string(),
+                ])
+                .encode();
+                if let Some(base) = base {
+                    encoded.base_transform = base;
+                }
+                encoded
+                    .extend_within_metered(
+                        &shape,
+                        None,
+                        to_device,
+                        window,
+                        1.0 / 32.0,
+                        &mut super::Unmetered,
+                    )
+                    .expect("unmetered");
+                assert_eq!(
+                    encoded.extended_edges() != 0,
+                    extends,
+                    "{shading} {base:?} {to_device:?} {window:?}"
+                );
+            }
+        }
+    }
+
+    /// A shading whose matrix does not invert paints its background alone, or
+    /// nothing without one, and has no edge to extend past: axial, radial and
+    /// function-based, under a matrix of zeros and one squeezing the plane onto
+    /// a line, whose inverses are not numbers. The radial one painted its end's
+    /// colour where its place was not a number.
+    #[test]
+    fn a_shading_under_a_singular_matrix_paints_its_background() {
+        use kurbo::Shape;
+        let red_to_blue =
+            "/Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >>";
+        let shadings = [
+            format!("/ShadingType 3 /Coords [0 0 0 0 0 30] {red_to_blue}"),
+            format!("/ShadingType 3 /Coords [0 0 0 0 0 30] /Extend [true true] {red_to_blue}"),
+            format!("/ShadingType 2 /Coords [10 20 90 20] /Extend [true true] {red_to_blue}"),
+            "/ShadingType 1 /Domain [0 1 0 1] /Function 6 0 R".to_string(),
+        ];
+        let shape = Rect::new(10.0, 15.0, 90.0, 75.0).to_path(0.1);
+        for shading in &shadings {
+            for matrix in [
+                Affine::new([0.0; 6]),
+                Affine::new([1.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+            ] {
+                for (background, color) in [
+                    ("", [0.0; 4]),
+                    ("/Background [0 1 0]", [0.0, 1.0, 0.0, 1.0]),
+                ] {
+                    let mut pattern = shading_pattern(&[
+                        "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+                        format!("<< /ColorSpace /DeviceRGB {shading} {background} >>"),
+                        "<< /FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1] \
+                         /Length 22 >>\nstream\n{ pop dup 1 exch sub 0 }\nendstream"
+                            .to_string(),
+                    ]);
+                    pattern.matrix = matrix;
+                    let mut encoded = pattern.encode();
+                    let case = format!("{shading} {matrix:?} {background}");
+                    assert!(
+                        matches!(encoded.shading_type, EncodedShadingType::Background),
+                        "{case}"
+                    );
+                    let points = [Point::new(50.0, 40.0), Point::ZERO, Point::new(-7.0, 1e6)];
+                    let mut colors = Vec::new();
+                    encoded
+                        .sample_points_metered(&points, &mut super::Unmetered, |c| colors.push(c))
+                        .expect("unmetered");
+                    assert_eq!(colors, [color; 3], "{case}");
+                    encoded
+                        .extend_within_metered(
+                            &shape,
+                            None,
+                            Affine::IDENTITY,
+                            Rect::new(0.0, 0.0, 100.0, 100.0),
+                            1.0 / 32.0,
+                            &mut super::Unmetered,
+                        )
+                        .expect("unmetered");
+                    assert_eq!(encoded.extended_edges(), 0, "{case}");
+                }
+            }
         }
     }
 
