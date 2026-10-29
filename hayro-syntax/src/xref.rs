@@ -93,7 +93,7 @@ use crate::object::{Object, ObjectLike, Written};
 use crate::pdf::PdfVersion;
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt};
-use crate::sync::{Arc, Mutex, MutexExt, OnceLock};
+use crate::sync::{Arc, Mutex, MutexExt, OnceLock, Weak};
 use crate::trivia::{is_eol_character, is_regular_character, is_white_space_character};
 use crate::util::findr_needle;
 use crate::{PdfData, object};
@@ -1550,26 +1550,35 @@ std::thread_local! {
 pub struct XRef(Inner);
 
 /// What readers of a document apart from the table it was made from share with it
-/// ([`XRef::detached`]), nothing read through it kept.
+/// ([`XRef::detached`]), nothing read through it kept; and the object streams the
+/// table keeps, while the table is alive.
 #[derive(Debug, Clone)]
-pub struct Detached(XRef);
+pub struct Detached {
+    xref: XRef,
+    /// Not kept alive by what holds this, which may outlive the table, but read
+    /// while a reader made from it is.
+    table: Weak<Data>,
+}
 
 impl Detached {
     /// A reader of the document that keeps what its reads keep (the object streams
     /// they decode, the bodies they parse) in stores of its own, freed with it: so
-    /// nothing read through it is kept by the table, nor by another reader.
+    /// nothing read through it is kept by the table, nor by another reader. An
+    /// object stream the table keeps, it reads there, keeping the table's store
+    /// alive while it is: so a read through the table, which the table keeps, is not
+    /// done again for every reader.
     pub(crate) fn reader(&self) -> XRef {
-        self.0.detached().0
+        self.xref.reader_apart(self.table.upgrade())
     }
 
     /// The document the readers read, if any.
     pub(crate) fn document_id(&self) -> Option<DocumentId> {
-        self.0.document_id()
+        self.xref.document_id()
     }
 
     /// The file the readers read.
     pub(crate) fn file_data(&self) -> Option<&PdfData> {
-        self.0.file_data()
+        self.xref.file_data()
     }
 }
 
@@ -1585,6 +1594,7 @@ impl XRef {
         Self(Inner::Some(Arc::new(SomeRepr {
             document: DocumentId::new(),
             data: Arc::new(Data::new(data)),
+            table: None,
             layout: rebuilt.layout,
             map,
             repairs: Arc::new(rebuilt.repairs),
@@ -1709,14 +1719,29 @@ impl XRef {
 
     /// What readers of this table's document apart from it share with it, from which
     /// [`Detached::reader`] makes each: the file, its entries, and where its objects
-    /// and its `endstream`s are. Where each `endstream` is is found once for the
+    /// and its `endstream`s are; and the object streams the table keeps, which each
+    /// reads and none adds to. Where each `endstream` is is found once for the
     /// document; found by a reader apart, it is kept in common with this table, at
-    /// [`Self::apart_bytes`].
+    /// [`Self::apart_bytes`]. Made from a reader apart, the same as from its table.
     pub fn detached(&self) -> Detached {
-        Detached(match &self.0 {
+        let table = match &self.0 {
+            Inner::Dummy => Weak::new(),
+            Inner::Some(repr) => Arc::downgrade(repr.table.as_ref().unwrap_or(&repr.data)),
+        };
+        Detached {
+            xref: self.reader_apart(None),
+            table,
+        }
+    }
+
+    /// A reader of this table's document apart from it ([`Self::detached`]),
+    /// reading the object streams `table` keeps.
+    fn reader_apart(&self, table: Option<Arc<Data>>) -> Self {
+        match &self.0 {
             Inner::Dummy => Self(Inner::Dummy),
             Inner::Some(repr) => Self(Inner::Some(Arc::new(SomeRepr {
                 data: Arc::new(Data::new(repr.data.get().clone())),
+                table,
                 shapes: Arc::default(),
                 layout: Layout {
                     starts: repr.layout.starts.clone(),
@@ -1724,7 +1749,7 @@ impl XRef {
                 },
                 ..SomeRepr::clone(repr)
             }))),
-        })
+        }
     }
 
     /// The bytes that readers apart from this table ([`Self::detached`]) keep in
@@ -2229,11 +2254,10 @@ impl XRef {
                     }
                     EntryType::Normal(_) => unreachable!(),
                 };
-                let (kept, objects) = self.object_stream(repr, stream, at, entered)?;
+                let (source, objects) = self.object_stream(repr, stream, at, entered)?;
                 let at = objects.offset(id, index).ok_or(Unread::Lost(id))?;
                 let place = Place {
-                    // The list keeping object streams holds fewer than 2^32.
-                    source: Source::Stream(kept as u32),
+                    source,
                     at,
                     decryption,
                 };
@@ -2243,15 +2267,15 @@ impl XRef {
     }
 
     /// Object stream `stream`, at `at` of the file, read from `ctx`, decoded once for
-    /// every entry leading to its place ([`Self::decoded`]), and where it is kept. A
-    /// stream that cannot be read is lost, with the objects in it.
+    /// every entry leading to its place ([`Self::decoded`]), and the bytes its
+    /// objects are in. A stream that cannot be read is lost, with the objects in it.
     fn object_stream<'a>(
         &'a self,
         repr: &'a SomeRepr,
         stream: ObjectIdentifier,
         at: usize,
         ctx: &ReaderContext<'a>,
-    ) -> Result<(usize, &'a ObjectStream), Unread> {
+    ) -> Result<(Source, &'a ObjectStream), Unread> {
         let entry = EntryType::Normal(at);
         let entered = Self::entered(ctx, stream, repr, entry);
         let place = self.place(repr, stream, entry, &entered)?;
@@ -2264,7 +2288,9 @@ impl XRef {
     /// kept: once for every entry and every read leading to the place, and for the
     /// rebuild of a table, which reads its object streams by their places
     /// ([`Self::object_stream_at`]). What reading it lost is told to every read of it
-    /// ([`crate::data::Data::object_stream`]).
+    /// ([`crate::data::Data::object_stream`]). A reader apart from the table reads
+    /// one the table keeps there, as it was read once for the document, and decodes
+    /// and keeps one the table does not keep itself.
     fn decoded<'a>(
         &'a self,
         repr: &'a SomeRepr,
@@ -2272,7 +2298,17 @@ impl XRef {
         entry: EntryType,
         place: (Place, &'a [u8], Slot),
         ctx: &ReaderContext<'a>,
-    ) -> Result<(usize, &'a ObjectStream), Unread> {
+    ) -> Result<(Source, &'a ObjectStream), Unread> {
+        if let Some((kept, (objects, lost))) =
+            repr.table.as_ref().and_then(|table| table.kept(place.0))
+        {
+            repr.data.watched.note(*lost);
+            // The list keeping object streams holds fewer than 2^32.
+            return match objects {
+                Some(objects) => Ok((Source::Table(kept as u32), objects)),
+                None => Err(Unread::Lost(lost.unwrap_or(stream))),
+            };
+        }
         let decoded = repr.data.object_stream(place.0, stream, ctx, |ctx| {
             let link = place.0.link();
             if ctx.rejects(&link) {
@@ -2301,7 +2337,8 @@ impl XRef {
             }
         });
         match decoded {
-            Decoded::Stream(kept, objects) => Ok((kept, objects)),
+            // The list keeping object streams holds fewer than 2^32.
+            Decoded::Stream(kept, objects) => Ok((Source::Stream(kept as u32), objects)),
             Decoded::Lost(lost) => Err(Unread::Lost(lost)),
             Decoded::Rejected => Err(Unread::Rejected),
         }
@@ -2716,6 +2753,11 @@ impl TrailerData {
 struct SomeRepr {
     document: Option<DocumentId>,
     data: Arc<Data>,
+    /// For a reader apart from the table ([`XRef::detached`]), the object streams the
+    /// table keeps, which it reads and never adds to: what the table read once, it
+    /// reads without decoding it again, and what it decodes itself it keeps in
+    /// `data`, its own.
+    table: Option<Arc<Data>>,
     /// Where the objects of the file start, and `endstream` is ([`Layout`]).
     layout: Layout,
     /// Never changed once read: what is read through it is read from one table.
@@ -3988,13 +4030,45 @@ mod tests {
                     object::stream::Read::Indirect { xref, .. } => kept_streams(xref),
                     object::stream::Read::Inline { .. } => unreachable!(),
                 },
-                kept_streams(&apart.0)
+                kept_streams(&apart.xref)
             ),
             (before, 1, 0)
         );
         // Read through the table itself, the object stream is kept there.
         assert_eq!(stream.decoded().unwrap().as_ref(), b"abc");
         assert_eq!(kept_streams(xref), before + 1);
+    }
+
+    /// An object stream the table keeps, which a read through the table decoded, a
+    /// reader apart from the table reads there, as the table read it, without decoding
+    /// it again nor adding to what the table keeps; once the table is gone, it decodes
+    /// it itself.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_reader_apart_reads_the_object_streams_the_table_keeps() {
+        use crate::work::OBJECT_STREAM_ENTRIES;
+        let file = image_with_parameters_in_object_stream("/Length {len}", 0);
+        let pdf = crate::Pdf::new(file).unwrap();
+        let xref = pdf.xref();
+        let stream = xref.get::<Stream<'_>>(ObjectIdentifier::new(4, 0)).unwrap();
+        let before = kept_streams(xref);
+        stream.read_decoding();
+        assert_eq!(kept_streams(xref), before + 1);
+        let owned = stream.to_owned_stream(Some(&xref.detached()));
+        let read_apart = || {
+            OBJECT_STREAM_ENTRIES.set(0);
+            let reader = owned.reader();
+            assert_eq!(reader.stream().unwrap().decoded().unwrap().as_ref(), b"abc");
+            let own = match &reader.read {
+                object::stream::Read::Indirect { xref, .. } => kept_streams(xref),
+                object::stream::Read::Inline { .. } => unreachable!(),
+            };
+            (OBJECT_STREAM_ENTRIES.get(), own)
+        };
+        assert_eq!(read_apart(), (0, 0));
+        assert_eq!(kept_streams(xref), before + 1);
+        drop(pdf);
+        assert_eq!(read_apart(), (1, 1));
     }
 
     /// Where each `endstream` of the file is, looked for by readers apart from the

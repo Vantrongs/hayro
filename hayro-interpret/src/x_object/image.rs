@@ -10,7 +10,7 @@ use crate::{BlendMode, CacheKey, Image, ImageDrawProps, RasterImage, StencilImag
 use hayro_syntax::object::dict::keys::*;
 use hayro_syntax::object::{Dict, Name, Object, Stream};
 use hayro_syntax::work::Meter;
-use hayro_syntax::xref::Detached;
+use hayro_syntax::xref::{Detached, XRef};
 use kurbo::Affine;
 
 #[derive(Clone)]
@@ -190,6 +190,7 @@ impl<'a> ImageXObject<'a> {
             blend_mode,
         );
 
+        self.read_decoding(context.xref);
         let drawn = ImageXObject {
             reader: Some(context.reader().clone()),
             ..self.clone()
@@ -217,6 +218,24 @@ impl<'a> ImageXObject<'a> {
 
         if has_oc {
             context.ocg_state.end_marked_content();
+        }
+    }
+
+    /// Reads through `xref`, the table the image was read through, what decoding it
+    /// reads besides its data (`decode_image`, `decode_mask`, the streamed sources),
+    /// as decoding reads it: so that the decoding, through a reader apart from the
+    /// table (`Context::reader`), which reads what the table keeps and adds nothing
+    /// to it, finds it read once for the document, not again for each decoding. What
+    /// it misses, the decoding reads itself and does not keep past the decoding.
+    fn read_decoding(&self, xref: &XRef) {
+        // An inline image reads nothing but its own bytes.
+        if let Some(stream) = self
+            .stream
+            .dict()
+            .obj_id()
+            .and_then(|id| xref.get::<Stream<'_>>(id))
+        {
+            read_image_decoding(&stream, true);
         }
     }
 
@@ -277,6 +296,40 @@ impl<'a> ImageXObject<'a> {
         let dict = self.stream.dict();
 
         dict.contains_key(SMASK_IN_DATA) || dict.contains_key(SMASK) || dict.contains_key(MASK)
+    }
+}
+
+/// Reads what decoding the image `stream` reads besides its data
+/// ([`ImageXObject::read_decoding`]): its filters' parameters, the entries of its
+/// dictionary decoding reads, and, if `masks`, its masks, read as images themselves.
+fn read_image_decoding(stream: &Stream<'_>, masks: bool) {
+    stream.read_decoding();
+    let dict = stream.dict();
+    let read = |key: &[u8]| match dict.get::<Object<'_>>(key) {
+        Some(Object::Array(array)) => array.iter::<Object<'_>>().for_each(drop),
+        Some(Object::Stream(mask)) if masks => read_image_decoding(&mask, false),
+        _ => {}
+    };
+    for key in [
+        TYPE,
+        BPC,
+        BITS_PER_COMPONENT,
+        D,
+        DECODE,
+        SMASK_IN_DATA,
+        MATTE,
+        W,
+        WIDTH,
+        H,
+        HEIGHT,
+        IM,
+        IMAGE_MASK,
+        I,
+        INTERPOLATE,
+        SMASK,
+        MASK,
+    ] {
+        read(key);
     }
 }
 

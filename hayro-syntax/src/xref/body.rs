@@ -48,6 +48,7 @@ impl Place {
         match self.source {
             Source::File => Link::File(self.at),
             Source::Stream(kept) => Link::Stream(kept, self.at),
+            Source::Table(kept) => Link::Table(kept, self.at),
         }
     }
 }
@@ -62,6 +63,9 @@ pub(crate) enum Source {
     /// an object has no header. In 32 bits, so that a place takes 4 words, as the
     /// table keeps one for each body read ([`Shapes`]).
     Stream(u32),
+    /// The decoded data of an object stream kept by the table a reader is apart
+    /// from ([`super::XRef::detached`]), by where the table keeps it.
+    Table(u32),
 }
 
 /// Why a read of an object the table lists finds none.

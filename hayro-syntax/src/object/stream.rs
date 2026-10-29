@@ -397,6 +397,29 @@ impl<'a> Stream<'a> {
         &self.dict
     }
 
+    /// Reads what decoding the stream's data reads besides them: its filters'
+    /// parameters, each value in them, and a stream that one of them is (JBIG2
+    /// globals), with what decoding that reads. Read through a document's table,
+    /// what the table keeps of it, such as the object streams it is in, a reader
+    /// apart from the table reads there once for the document, rather than
+    /// decoding it again for each decoding ([`XRef::detached`]).
+    pub fn read_decoding(&self) {
+        self.read_decoding_naming(true);
+    }
+
+    /// [`Self::read_decoding`], and that of a stream a parameter is if `streams`.
+    fn read_decoding_naming(&self, streams: bool) {
+        for (_, entry) in self.filter_entries().applied() {
+            for key in entry.params.keys() {
+                if let Some(Object::Stream(named)) = entry.params.get::<Object<'_>>(&key)
+                    && streams
+                {
+                    named.read_decoding_naming(false);
+                }
+            }
+        }
+    }
+
     /// Identifies the stream among the streams of every document loaded in this
     /// process, by its body ([`StreamId`]): entries of a damaged table that lead to
     /// one body find one identity. `None` for a stream that is no object of a loaded
@@ -680,8 +703,10 @@ impl OwnedStream {
 
 /// The stream of an [`OwnedStream`] read through a reader of its own: what reading
 /// it and what its dictionary names (its filters' parameters, its masks) keeps, such
-/// as the object streams those are in, it keeps, and frees when it is dropped. So
-/// what holds an [`OwnedStream`] holds nothing it read, however often it is read.
+/// as the object streams those are in, it keeps, and frees when it is dropped, but
+/// for what the table it was first read through keeps, which it reads there
+/// ([`XRef::detached`]). So what holds an [`OwnedStream`] holds nothing it read,
+/// however often it is read.
 pub struct StreamReader {
     owned: OwnedStream,
     pub(crate) read: Read,

@@ -34,8 +34,10 @@ use streamed::Streamed;
 ///
 /// Its stream is read through a reader of the document of its own, apart from the
 /// table it was drawn from ([`XRef::detached`](hayro_syntax::xref::XRef::detached)),
-/// one for each [`ImageAsset::reader`]: what decoding it reads (its filters'
-/// parameters, its masks, the object streams they are in) is kept while the image
+/// one for each [`ImageAsset::reader`]. What decoding it reads (its filters'
+/// parameters, its masks, the object streams they are in) drawing it read through
+/// the table, which keeps it for the document; the reader reads it there while the
+/// table is alive, without adding to it. What else it reads is kept while the image
 /// is read, neither in the document, which a renderer may keep open while it draws
 /// other pages, nor with the asset, which a display list may keep while the image
 /// is read again and again.

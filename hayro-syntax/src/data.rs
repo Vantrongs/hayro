@@ -102,6 +102,15 @@ impl Data {
         &self.data
     }
 
+    /// The object stream at `place`, if it is kept, and where, with what reading it
+    /// lost: found, never decoded, so that a reader apart from the table that keeps
+    /// it ([`crate::xref::XRef::detached`]) reads what the table read once, and
+    /// keeps nothing in it.
+    pub(crate) fn kept(&self, place: Place) -> Option<(usize, &(Option<ObjectStream>, Lost))> {
+        let idx = *self.map.get().get(&place)?;
+        Some((idx, self.decoded.get(idx)?))
+    }
+
     /// The object stream `id` at `place`, decoded by `decode` from `ctx` once for
     /// every entry and every read leading to the place, and where it is kept; what
     /// reading it lost is told to every computation that asks for it

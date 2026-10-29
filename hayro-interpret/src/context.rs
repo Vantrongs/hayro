@@ -147,8 +147,9 @@ impl<'a> Context<'a> {
     /// What readers of the document apart from `xref` share with it
     /// ([`XRef::detached`]), for every image drawn in the context: decoding an image
     /// reads what its dictionary names (its filters' parameters, its masks) through
-    /// a reader of its own made from it, which keeps what it reads while the image
-    /// is decoded, not `xref` for the document.
+    /// a reader of its own made from it, which reads what `xref` keeps, as drawing
+    /// the image read it, and keeps what else it reads while the image is decoded,
+    /// adding nothing to what `xref` keeps for the document.
     pub(crate) fn reader(&self) -> &Detached {
         self.reader.get_or_init(|| self.xref.detached())
     }

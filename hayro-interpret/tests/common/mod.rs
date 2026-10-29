@@ -10,7 +10,10 @@ use kurbo::{Affine, Rect};
 
 #[path = "../../../hayro-syntax/tests/common/fixtures.rs"]
 mod fixtures;
-pub(crate) use fixtures::{file, file_with_aliases, one_page, one_page_objects, stream};
+pub(crate) use fixtures::{
+    file, file_with_aliases, file_with_object_stream, one_page, one_page_objects, stored_zlib,
+    stream,
+};
 
 #[path = "../../../hayro-syntax/tests/common/cpu_time.rs"]
 mod cpu_time;

@@ -158,6 +158,10 @@ pub(crate) enum Link {
     /// this index ([`crate::data::Data::object_stream`], which keeps fewer than
     /// 2^32).
     Stream(u32, usize),
+    /// The body at this offset of the decoded data of the object stream kept at
+    /// this index by the table the reader is apart from
+    /// ([`crate::xref::XRef::detached`]).
+    Table(u32, usize),
 }
 
 const _: () = assert!(size_of::<Link>() == 16);

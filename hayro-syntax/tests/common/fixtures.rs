@@ -32,6 +32,59 @@ pub(crate) fn file(objects: &[Vec<u8>], trailer: &str) -> Vec<u8> {
     out
 }
 
+/// A file of `objects` numbered from 1, as [`file`] writes them, object 1 being the
+/// catalog, and of `packed` numbered on from there, held in one object stream, which
+/// with the table, an xref stream, follows them.
+pub(crate) fn file_with_object_stream(objects: &[Vec<u8>], packed: &[Vec<u8>]) -> Vec<u8> {
+    let first = objects.len() + 1;
+    let (mut header, mut body) = (String::new(), Vec::new());
+    for (i, o) in packed.iter().enumerate() {
+        header.push_str(&format!("{} {} ", first + i, body.len()));
+        body.extend_from_slice(o);
+        body.push(b' ');
+    }
+    let mut data = header.into_bytes();
+    let first_offset = data.len();
+    data.extend(body);
+    let holding = first + packed.len();
+    let mut all = objects.to_vec();
+    all.extend(std::iter::repeat_n(b"null".to_vec(), packed.len()));
+    all.push(stream(
+        &format!("/Type /ObjStm /N {} /First {first_offset}", packed.len()),
+        &data,
+    ));
+    let mut out = b"%PDF-1.7\n".to_vec();
+    // Type, field 2, field 3 of each object's entry.
+    let mut entries = vec![(0_u8, 0_u32, 0_u16)];
+    for (i, o) in all.iter().enumerate() {
+        let number = i + 1;
+        if (first..holding).contains(&number) {
+            entries.push((2, holding as u32, (number - first) as u16));
+            continue;
+        }
+        entries.push((1, out.len() as u32, 0));
+        out.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        out.extend_from_slice(o);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let table = entries.len();
+    let offset = out.len();
+    entries.push((1, offset as u32, 0));
+    let mut rows = Vec::new();
+    for (kind, field, index) in entries {
+        rows.push(kind);
+        rows.extend(field.to_be_bytes());
+        rows.extend(index.to_be_bytes());
+    }
+    out.extend_from_slice(format!("{table} 0 obj\n").as_bytes());
+    out.extend(stream(
+        &format!("/Type /XRef /Size {} /W [1 4 2] /Root 1 0 R", table + 1),
+        &rows,
+    ));
+    out.extend_from_slice(format!("\nendobj\nstartxref\n{offset}\n%%EOF\n").as_bytes());
+    out
+}
+
 /// A file of `objects` numbered from 1, as [`file`] writes them, whose table
 /// also lists objects from `objects.len() + 1` on, one for each of `aliases`, at the
 /// place of object `aliases[i]`. Those entries do not lead to their objects, so the
