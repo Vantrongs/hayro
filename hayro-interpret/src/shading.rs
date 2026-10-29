@@ -756,7 +756,8 @@ where
     F: Fn(Point) -> Point,
     I: Fn(Point) -> ColorComponents,
 {
-    let mut grid = vec![vec![Point::ZERO; GRID_SIZE]; GRID_SIZE];
+    // On the stack: a mesh is cut patch by patch on every pass over it.
+    let mut grid = [[Point::ZERO; GRID_SIZE]; GRID_SIZE];
 
     // Create grid by mapping unit square coordinates.
     for i in 0..GRID_SIZE {

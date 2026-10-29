@@ -161,6 +161,26 @@ pub struct EncodedSampledShading {
 }
 
 impl EncodedSampledShading {
+    /// The color of the mesh where it interpolated `color`, or the background
+    /// where no triangle lies.
+    #[inline]
+    fn color(
+        &self,
+        color: Option<&ColorComponents>,
+        bg_color: AlphaColor,
+        color_space: &ColorSpace,
+    ) -> Option<AlphaColor> {
+        let Some(color) = color else {
+            return Some(bg_color);
+        };
+        if let Some(function) = &self.function {
+            let val = function.eval(&color.to_smallvec())?;
+            Some(color_space.to_rgba(&val, 1.0))
+        } else {
+            Some(color_space.to_rgba(color, 1.0))
+        }
+    }
+
     /// The triangles the mesh is cut into.
     fn triangles(&self) -> u64 {
         match self.mesh.as_ref() {
@@ -221,6 +241,74 @@ impl EncodedSampledShading {
         ))
     }
 }
+
+impl EncodedSampledShading {
+    /// The colors of the mesh at `points`, in device space, each found where it
+    /// lies rather than at its pixel's centre: a later triangle's where two hold
+    /// it, `None` where none does. The work and memory are taken of `meter` before
+    /// they are spent: the triangles placed and what the points' order holds at
+    /// once, then for each triangle a search a row of points its box reaches,
+    /// and each point of its box tested.
+    fn sample_points(
+        &self,
+        points: &[Point],
+        meter: &mut dyn Meter,
+    ) -> Result<Vec<Option<ColorComponents>>, Exhausted> {
+        take(meter, TRIANGLE_COST.times(self.triangles()))?;
+        let held = size_of::<((i32, i32), u32)>() + size_of::<Option<ColorComponents>>();
+        if !meter.hold(points.len().saturating_mul(held)) {
+            return Err(Exhausted);
+        }
+        // The points by the pixel they lie in, row by row.
+        let mut order: Vec<((i32, i32), u32)> = points
+            .iter()
+            .zip(0..)
+            .map(|(p, i)| ((p.y.floor() as i32, p.x.floor() as i32), i))
+            .collect();
+        order.sort_unstable();
+        let mut colors = vec![None; points.len()];
+        let mut refused = false;
+        self.each_triangle(|t| {
+            if refused {
+                return;
+            }
+            let t = placed(t, self.transform);
+            let bbox = t.bounding_box();
+            let (x0, x1) = (bbox.x0.floor() as i32, bbox.x1.floor() as i32);
+            let row_end = bbox.y1.floor() as i32;
+            let first = |row: i32| order.partition_point(|&(pixel, _)| pixel < (row, x0));
+            let mut at = first(bbox.y0.floor() as i32);
+            // Two searches for each row of points the box reaches: its end, and
+            // the next row's start.
+            while let Some(&((row, _), _)) = order.get(at).filter(|(p, _)| p.0 <= row_end) {
+                if !meter.work(SEARCH_COST.times(2)) {
+                    refused = true;
+                    return;
+                }
+                let end = at + order[at..].partition_point(|&(pixel, _)| pixel <= (row, x1));
+                let tests = (end - at) as u64;
+                if !meter.work((VISIT_COST + Cost::of(t.p0.colors.len())).times(tests)) {
+                    refused = true;
+                    return;
+                }
+                for &(_, i) in &order[at..end] {
+                    let point = points[i as usize];
+                    if t.contains_point(point) {
+                        colors[i as usize] = Some(t.interpolate(point));
+                    }
+                }
+                at = first(row.saturating_add(1));
+            }
+        });
+        if refused {
+            return Err(Exhausted);
+        }
+        Ok(colors)
+    }
+}
+
+/// The steps a binary search among the points a mesh is sampled at takes.
+const SEARCH_COST: Cost = Cost::new(32);
 
 /// Device pixels, `xs` by `ys`.
 type Region = (Range<u16>, Range<u16>);
@@ -377,8 +465,16 @@ impl EncodedShadingPattern {
     /// The shading at `pos`, a mesh's looked up in `samples`.
     #[inline]
     fn sample_in(&self, pos: Point, samples: Option<&Samples>) -> [f32; 4] {
-        self.shading_type
-            .eval(pos, self.background_color, &self.color_space, samples)
+        self.finish(
+            self.shading_type
+                .eval(pos, self.background_color, &self.color_space, samples),
+        )
+    }
+
+    /// A color the shading evaluated to, with its opacity and transfer function.
+    #[inline]
+    fn finish(&self, color: Option<AlphaColor>) -> [f32; 4] {
+        color
             .map(|v| {
                 let mut components = v.components();
                 components[3] *= self.opacity;
@@ -463,7 +559,9 @@ impl EncodedShadingPattern {
     /// order as straight RGBA, its work and memory taken of `meter` first as
     /// [`sample_texture_metered`](Self::sample_texture_metered) takes them.
     /// `Exhausted`, with no point passed to `f`, when `meter` refuses. A mesh is
-    /// sampled at the pixels the points fall in, as its texture is.
+    /// sampled where each point lies, not at its pixel's centre as a texture
+    /// samples it, so points spread over a pixel find the edges of the mesh that
+    /// cross it.
     pub fn sample_points_metered(
         &self,
         points: &[Point],
@@ -474,13 +572,20 @@ impl EncodedShadingPattern {
             meter,
             self.setup_cost() + self.point_cost().times(points.len() as u64),
         )?;
-        let samples = self.samples_at(meter, |reach| {
-            for point in points {
-                reach.add(self.base_transform * *point);
+        if let EncodedShadingType::Sampled(mesh) = &self.shading_type {
+            let placed: Vec<Point> = points.iter().map(|p| self.base_transform * *p).collect();
+            let colors = mesh.sample_points(&placed, meter)?;
+            for color in &colors {
+                f(self.finish(mesh.color(
+                    color.as_ref(),
+                    self.background_color,
+                    &self.color_space,
+                )));
             }
-        })?;
+            return Ok(());
+        }
         for point in points {
-            f(self.sample_in(self.base_transform * *point, samples.as_ref()));
+            f(self.sample_in(self.base_transform * *point, None));
         }
         Ok(())
     }
@@ -907,24 +1012,32 @@ fn sample(
         let Some((xs, ys, _)) = pixels(t, transform, region) else {
             return;
         };
-        let t = {
-            let mut v0 = t.p0.clone();
-            v0.point = transform * t.p0.point;
-            let mut v1 = t.p1.clone();
-            v1.point = transform * t.p1.point;
-            let mut v2 = t.p2.clone();
-            v2.point = transform * t.p2.point;
-            Triangle::new(v0, v1, v2)
-        };
+        let t = placed(t, transform);
         for y in ys {
             for x in xs.clone() {
-                let point = Point::new(x as f64, y as f64);
+                let point = pixel_centre(x, y);
                 if t.contains_point(point) {
                     put(x, y, t.interpolate(point));
                 }
             }
         }
     });
+}
+
+/// The point a mesh's pixel is sampled at: its centre, where the texture that
+/// looks it up samples it.
+fn pixel_centre(x: u16, y: u16) -> Point {
+    Point::new(f64::from(x) + 0.5, f64::from(y) + 0.5)
+}
+
+/// `t`, as `transform` places it.
+fn placed(t: &Triangle, transform: Affine) -> Triangle {
+    let [v0, v1, v2] = [&t.p0, &t.p1, &t.p2].map(|v| {
+        let mut v = v.clone();
+        v.point = transform * v.point;
+        v
+    });
+    Triangle::new(v0, v1, v2)
 }
 
 fn encode_function_shading(domain: &[f32; 4], function: &ShadingFunction) -> EncodedShadingType {
@@ -1004,18 +1117,11 @@ impl EncodedShadingType {
 
                 Some(color_space.to_rgba(&val, 1.0))
             }
-            Self::Sampled(EncodedSampledShading { function, .. }) => {
-                if let Some(color) = samples.and_then(|samples| samples.get(pixel(pos))) {
-                    if let Some(function) = function {
-                        let val = function.eval(&color.to_smallvec())?;
-                        Some(color_space.to_rgba(&val, 1.0))
-                    } else {
-                        Some(color_space.to_rgba(color, 1.0))
-                    }
-                } else {
-                    Some(bg_color)
-                }
-            }
+            Self::Sampled(mesh) => mesh.color(
+                samples.and_then(|samples| samples.get(pixel(pos))),
+                bg_color,
+                color_space,
+            ),
             Self::Dummy(_) => Some(AlphaColor::TRANSPARENT),
         }
     }
@@ -1170,7 +1276,7 @@ mod tests {
             let xs = x0.max(region.0.start)..x1.min(region.0.end);
             for y in y0.max(region.1.start)..y1.min(region.1.end) {
                 for x in xs.clone() {
-                    let point = Point::new(x as f64, y as f64);
+                    let point = Point::new(x as f64 + 0.5, y as f64 + 0.5);
                     if t.contains_point(point) {
                         expected.insert((x, y), t.interpolate(point));
                     }
@@ -1471,6 +1577,107 @@ mod tests {
         let mut passed = 0;
         let refused = encoded.sample_points_metered(&points, &mut meter, |_| passed += 1);
         assert_eq!((refused, passed), (Err(Exhausted), 0));
+    }
+
+    /// A mesh's points are sampled where they lie: at pixel centres, as its
+    /// texture samples them; within one pixel, on either side of an edge that
+    /// crosses it. They are paid for as the texture's points, then the triangles
+    /// placed and the points' order held, then for each triangle two searches a
+    /// row of points its box reaches and a test each point there, each taken
+    /// before it is spent: a triangle 80 rows tall over points in two rows takes
+    /// four searches, and a meter that refuses passes no colour on.
+    #[test]
+    fn mesh_points_are_sampled_where_they_lie() {
+        let vertex = |x: f64, y: f64, rgb: [u8; 3]| {
+            let at = |v: f64| format!("{:04X}", (v / 100.0 * 65535.0).round() as u32);
+            format!(
+                "00{}{}{:02X}{:02X}{:02X}",
+                at(x),
+                at(y),
+                rgb[0],
+                rgb[1],
+                rgb[2]
+            )
+        };
+        // Its right edge, at x 50.25 by the 16-bit coordinates, crosses the
+        // pixels of column 50.
+        let data = [
+            vertex(10.0, 10.0, [255, 0, 0]),
+            vertex(50.25, 10.0, [0, 255, 0]),
+            vertex(50.25, 90.0, [0, 0, 255]),
+        ]
+        .concat();
+        let pattern = shading_pattern(&[
+            "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+            format!(
+                "<< /ShadingType 4 /ColorSpace /DeviceRGB /BitsPerCoordinate 16 \
+                 /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 100 0 100 0 1 0 1 0 1] \
+                 /Filter /ASCIIHexDecode /Length {} >>\nstream\n{data}>\nendstream",
+                data.len() + 1
+            ),
+        ]);
+        let encoded = pattern.encode();
+        let bbox = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let mut texture = vec![];
+        let (width, _, to_bbox) = encoded.sample_texture(bbox, 1.0, |c| texture.push(c));
+        let centres: Vec<Point> = (0..texture.len())
+            .map(|i| {
+                let (x, y) = (i as u32 % width, i as u32 / width);
+                to_bbox * Point::new(f64::from(x) + 0.5, f64::from(y) + 0.5)
+            })
+            .collect();
+        let mut sampled = vec![];
+        encoded
+            .sample_points_metered(&centres, &mut super::Unmetered, |c| sampled.push(c))
+            .expect("unmetered");
+        assert_eq!(sampled, texture);
+        assert!(texture.iter().any(|c| c[3] == 1.0));
+        // Two points of pixel (50, 30), inside the edge and past it, and two
+        // of pixel (20, 70), above the triangle's diagonal.
+        let points = [
+            Point::new(50.1, 30.5),
+            Point::new(50.4, 30.5),
+            Point::new(20.5, 70.5),
+            Point::new(20.6, 70.5),
+        ];
+        let mut sampled = vec![];
+        let mut meter = Recording {
+            left: u64::MAX,
+            asked: vec![],
+            held: vec![],
+        };
+        encoded
+            .sample_points_metered(&points, &mut meter, |c| sampled.push(c))
+            .expect("given all it asks");
+        assert_eq!(sampled[0][3], 1.0, "{sampled:?}");
+        assert_eq!(sampled[1], [0.0; 4], "{sampled:?}");
+        let whole = encoded.setup_cost() + encoded.point_cost().times(points.len() as u64);
+        let search = super::SEARCH_COST.times(2).steps();
+        let test = (super::VISIT_COST + Cost::of(3)).steps();
+        assert_eq!(
+            meter.asked,
+            [
+                whole.steps(),
+                TRIANGLE_COST.steps(),
+                search,
+                2 * test,
+                search,
+                2 * test
+            ]
+        );
+        assert_eq!(meter.held.len(), 1);
+        assert!(meter.held[0] >= points.len() * size_of::<Option<crate::color::ColorComponents>>());
+        let all: u64 = meter.asked.iter().sum();
+        for left in [0, whole.steps(), all - 1] {
+            let mut meter = Recording {
+                left,
+                asked: vec![],
+                held: vec![],
+            };
+            let mut passed = 0;
+            let refused = encoded.sample_points_metered(&points, &mut meter, |_| passed += 1);
+            assert_eq!((refused, passed), (Err(Exhausted), 0), "{left}");
+        }
     }
 
     /// A patch mesh is sampled as the triangles it is cut into are, one patch
