@@ -13,7 +13,7 @@
 use crate::hash;
 use crate::lost::Lost;
 use crate::object::parsed::{Once, Top, TopDict};
-use crate::object::{Number, ObjectIdentifier};
+use crate::object::{Kind, Number, ObjectIdentifier};
 use crate::reader::{Link, Reader, ReaderContext, ReaderExt};
 use crate::trivia::{is_eol_character, is_white_space_character};
 use alloc::boxed::Box;
@@ -77,7 +77,21 @@ pub(super) enum Unread {
     /// it needs as a cycle: from another chain it may be read, so it is neither
     /// lost nor kept.
     Rejected,
+    /// The body's first token tells the object is of this kind, which decides the
+    /// read alone ([`Told`]), and the body can be read: it was passed over, not
+    /// built.
+    Told(Kind),
 }
+
+/// Whether the kind an object's first token tells ([`Kind::of_token`]) decides a
+/// read alone, so that its body is not built: as it does a read of a type of
+/// another kind, which the object cannot be, whatever follows. `None` for a read
+/// that builds the object whatever it is.
+pub(super) type Told = Option<fn(Kind) -> bool>;
+
+/// The kind a body's first token tells, where it decided a read, and whether the
+/// body can be read, found by passing over it ([`Shape::read_told`]).
+pub(super) type Token = (Kind, bool);
 
 /// How a read takes an object that is a stream.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -161,6 +175,11 @@ pub(super) enum Shape {
 #[derive(Debug, Default)]
 pub(super) struct Shapes {
     kept: hash::Map<Place, Kept>,
+    /// The kind the first token of a body tells and whether it can be read, kept
+    /// where it decided a read, which the body is passed over for, not built: what
+    /// reads it decides look at, in place of a shape, which is kept for every
+    /// other ([`Shape::read_told`]).
+    tokens: hash::Map<Place, Token>,
     /// The places of the bodies kept read once whose reads may still hold what they
     /// parsed ([`Self::sweep`]), and how many of them did when this last looked.
     reading: Vec<Place>,
@@ -291,6 +310,17 @@ impl Shapes {
         }
     }
 
+    /// The kind the first token of the body at `place` tells and whether it can be
+    /// read, where it was kept ([`Self::told`]).
+    pub(super) fn token(&self, place: &Place) -> Option<Token> {
+        self.tokens.get(place).copied()
+    }
+
+    /// Keeps `token`, what the body at `place` was found to be by its first token.
+    pub(super) fn told(&mut self, place: Place, token: Token) {
+        self.tokens.insert(place, token);
+    }
+
     /// Keeps where the data of the stream at `place` are, and what finding them
     /// lost, found the same way from every chain of references.
     pub(super) fn found(&mut self, place: &Place, found: (Option<DataAt>, Lost)) {
@@ -351,6 +381,10 @@ std::thread_local! {
     /// The places whose streams' data were found on this thread, how often each.
     pub(crate) static DATA_FOUND: core::cell::RefCell<hash::Map<Place, usize>> =
         core::cell::RefCell::new(hash::Map::default());
+    /// The places whose bodies were passed over, their first tokens deciding a
+    /// read, on this thread, how often each ([`Shape::read_told`]).
+    pub(crate) static PASSED: core::cell::RefCell<hash::Map<Place, usize>> =
+        core::cell::RefCell::new(hash::Map::default());
 }
 
 impl Shape {
@@ -365,14 +399,19 @@ impl Shape {
     ) -> Self {
         #[cfg(test)]
         BODIES.with_borrow_mut(|bodies| *bodies.entry(place).or_default() += 1);
-        let (read, looked) = Read::in_slot(
-            data,
-            place.at,
-            slot,
-            place.source == Source::File,
-            |r| TopDict::read(r, data, ctx),
-            |r| Top::read(r, data, ctx),
-        );
+        Self::read_at(SlotReader::at_body(data, slot, place), ctx)
+    }
+
+    /// What the body `r` is at holds, where it is at one ([`SlotReader::at_body`]),
+    /// read as [`Self::read`] reads it.
+    fn read_at<'a>(r: Option<SlotReader<'a>>, ctx: &ReaderContext<'a>) -> Self {
+        let (read, looked) = match r {
+            Some(r) => {
+                let data = r.data;
+                r.object(|r| TopDict::read(r, data, ctx), |r| Top::read(r, data, ctx))
+            }
+            None => (None, 0),
+        };
         crate::work::read_bodies(looked);
         match read.map(|(read, _)| read) {
             None => Self::Unreadable,
@@ -384,6 +423,45 @@ impl Shape {
                 data: None,
             },
         }
+    }
+}
+
+impl Shape {
+    /// [`Self::read`], but where the kind the body's first token tells
+    /// ([`Kind::of_token`]) decides the read as `decides` says: `Err` with that kind
+    /// and whether the body can be read, which only reading to its end tells. The
+    /// body is then passed over as reading it would read it, a dictionary followed
+    /// by `stream` being a stream's, nothing of it built, as the table's check
+    /// passes over the bodies it reads ([`super::check`]): so a read of another kind
+    /// costs the body's bytes, looked at once, not what building it makes.
+    pub(super) fn read_told<'a>(
+        data: &'a [u8],
+        slot: Slot,
+        place: Place,
+        ctx: &ReaderContext<'a>,
+        decides: fn(Kind) -> bool,
+    ) -> Result<Self, Token> {
+        let r = SlotReader::at_body(data, slot, place);
+        let told = r
+            .as_ref()
+            .and_then(SlotReader::token)
+            .filter(|k| decides(*k));
+        let (r, kind) = match (r, told) {
+            (Some(r), Some(kind)) => (r, kind),
+            (r, _) => {
+                #[cfg(test)]
+                BODIES.with_borrow_mut(|bodies| *bodies.entry(place).or_default() += 1);
+                return Ok(Self::read_at(r, ctx));
+            }
+        };
+        #[cfg(test)]
+        PASSED.with_borrow_mut(|passed| *passed.entry(place).or_default() += 1);
+        let (read, looked) = r.object(
+            |r| r.skip::<crate::object::Dict<'_>>(false),
+            |r| r.skip::<crate::object::Object<'_>>(false),
+        );
+        crate::work::read_bodies(looked);
+        Err((kind, read.is_some()))
     }
 }
 
@@ -494,6 +572,26 @@ impl<'a> SlotReader<'a> {
         rest.len() < b"obj".len() && b"obj".starts_with(rest)
     }
 
+    /// The reader after the header the bytes start with, where `header` asks for
+    /// one, as [`Read::in_slot`] reads it; `None` where there is none in the slot.
+    fn after_header(mut self, header: bool) -> Option<Self> {
+        (!header || matches!(self.header(), Header::Read(_))).then_some(self)
+    }
+
+    /// A reader at the body at `place` of `data`, whose slot ends at `slot`: after
+    /// its header, in the file ([`Read::in_slot`]).
+    fn at_body(data: &'a [u8], slot: Slot, place: Place) -> Option<Self> {
+        Self::new(data, place.at, slot)?.after_header(place.source == Source::File)
+    }
+
+    /// The kind the first token of the object tells ([`Kind::of_token`]), after
+    /// white space and comments, where it starts before the slot's end.
+    pub(super) fn token(&self) -> Option<Kind> {
+        let mut r = self.r.clone();
+        r.skip_white_spaces_and_comments();
+        (r.offset() < self.slot.end).then(|| Kind::of_token(&r))?
+    }
+
     /// Where the object starts, after white space and comments, where it starts
     /// before the slot's end.
     pub(super) fn object_start(&self) -> Option<usize> {
@@ -564,13 +662,10 @@ impl<O, D> Read<O, D> {
         dict: impl FnOnce(&mut Reader<'a>) -> Option<D>,
         object: impl FnOnce(&mut Reader<'a>) -> Option<O>,
     ) -> (Option<(Self, usize)>, usize) {
-        let Some(mut r) = SlotReader::new(data, at, slot) else {
-            return (None, 0);
-        };
-        if header && !matches!(r.header(), Header::Read(_)) {
-            return (None, 0);
+        match SlotReader::new(data, at, slot).and_then(|r| r.after_header(header)) {
+            Some(r) => r.object(dict, object),
+            None => (None, 0),
         }
-        r.object(dict, object)
     }
 }
 

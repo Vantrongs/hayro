@@ -1,7 +1,7 @@
 use super::mask::{DecodedMask, decode_mask};
 use super::{
     ColourKey, DecodeContext, Rows, Texel, complete, decode_context, decode_u8_samples, in_pieces,
-    into_owned, matte, pixel_piece, unpack_samples,
+    into_owned, matte, pixel_piece, room_for, unpack_samples,
 };
 use crate::color::{ColorSpace, ToLuma, ToRgb};
 use crate::interpret::state::ActiveTransferFunction;
@@ -81,30 +81,44 @@ impl DecodedImage {
     }
 
     /// The colour and alpha with every texel of the rows they cover, those past the
-    /// texels held each plane's fill: as large as the image intact.
-    pub(crate) fn into_whole(self) -> (ImageData, Option<LumaData>) {
+    /// texels held each plane's fill: as large as the image intact. `None` where
+    /// that does not fit in memory, before either is filled ([`room_for`]).
+    pub(crate) fn into_whole(self) -> Option<(ImageData, Option<LumaData>)> {
         let meter = Meter::default();
         let mut image = self.image;
-        let width = image.width() as usize;
+        let mut alpha = self.alpha;
+        let texels = |width: u32, rows: Rows| (width as usize).checked_mul(rows.declared as usize);
+        let width = image.width();
         let (data, height, channels) = image.rows_mut();
+        let mut colour = None;
         if let Some(fill) = self.rows.fill {
-            complete(
-                data,
-                width * self.rows.declared as usize,
-                &fill[..channels],
-                &meter,
-            );
+            let texels = texels(width, self.rows)?;
+            room_for(data, texels, channels, &meter)?;
+            colour = Some((texels, fill));
+        }
+        let mut alpha_fill = None;
+        if let Some((a, rows)) = &mut alpha
+            && let Some(fill) = rows.fill
+        {
+            let texels = texels(a.width, *rows)?;
+            room_for(&mut a.data, texels, 1, &meter)?;
+            alpha_fill = Some((texels, fill));
+        }
+        if let Some((texels, fill)) = colour {
+            complete(data, texels, &fill[..channels], &meter)?;
             *height = self.rows.declared;
         }
-        let alpha = self.alpha.map(|(mut a, rows)| {
-            if let Some(fill) = rows.fill {
-                let texels = a.width as usize * rows.declared as usize;
-                complete(&mut a.data, texels, &fill[..1], &meter);
-                a.height = rows.declared;
+        let alpha = match alpha {
+            Some((mut a, rows)) => {
+                if let Some((texels, fill)) = alpha_fill {
+                    complete(&mut a.data, texels, &fill[..1], &meter)?;
+                    a.height = rows.declared;
+                }
+                Some(a)
             }
-            a
-        });
-        (image, alpha)
+            None => None,
+        };
+        Some((image, alpha))
     }
 }
 

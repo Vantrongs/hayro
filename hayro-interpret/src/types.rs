@@ -39,13 +39,19 @@ impl<'a, 'b> StencilImage<'a, 'b> {
     /// mean that the resulting image will have that dimension. Instead, it allows
     /// the image decoder to extract a lower-resolution version of the image in
     /// certain cases.
+    ///
+    /// `func` is not called where the image cannot be decoded, nor where it cannot
+    /// be held whole, as large as the rows it declares: that is a decode failure.
     pub fn with_stencil(
         &self,
         func: impl FnOnce(LumaData, &Paint<'a>),
         target_dimension: Option<(u32, u32)>,
     ) {
         if let Some(decoded) = self.image_xobject.decoded_mask(target_dimension) {
-            func(decoded.into_whole(), &self.paint);
+            match decoded.into_whole() {
+                Some(luma) => func(luma, &self.paint),
+                None => self.image_xobject.whole_failed(),
+            }
         }
     }
 
@@ -99,14 +105,19 @@ impl RasterImage<'_> {
     /// mean that the resulting image will have that dimension. Instead, it allows
     /// the image decoder to extract a lower-resolution version of the image in
     /// certain cases.
+    ///
+    /// `func` is not called where the image cannot be decoded, nor where it cannot
+    /// be held whole, as large as the rows it declares: that is a decode failure.
     pub fn with_rgba(
         &self,
         func: impl FnOnce(ImageData, Option<LumaData>),
         target_dimension: Option<(u32, u32)>,
     ) {
         if let Some(decoded) = self.0.decoded_image(target_dimension) {
-            let (image, alpha) = decoded.into_whole();
-            func(image, alpha);
+            match decoded.into_whole() {
+                Some((image, alpha)) => func(image, alpha),
+                None => self.0.whole_failed(),
+            }
         }
     }
 

@@ -56,15 +56,16 @@ impl DecodedMask {
     }
 
     /// The alpha with every texel of the rows it covers, those past the texels held
-    /// its fill: as large as the mask intact.
-    pub(crate) fn into_whole(self) -> LumaData {
+    /// its fill: as large as the mask intact. `None` where that does not fit in
+    /// memory, before it is filled ([`complete`]).
+    pub(crate) fn into_whole(self) -> Option<LumaData> {
         let mut luma = self.luma;
         if let Some(fill) = self.rows.fill {
-            let texels = luma.width as usize * self.rows.declared as usize;
-            complete(&mut luma.data, texels, &fill[..1], &Meter::default());
+            let texels = (luma.width as usize).checked_mul(self.rows.declared as usize)?;
+            complete(&mut luma.data, texels, &fill[..1], &Meter::default())?;
             luma.height = self.rows.declared;
         }
-        luma
+        Some(luma)
     }
 }
 

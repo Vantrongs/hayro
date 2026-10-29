@@ -6,7 +6,9 @@ use crate::context::Context;
 use crate::device::Device;
 use crate::interpret::state::ActiveTransferFunction;
 use crate::ocg::Kept;
-use crate::{BlendMode, CacheKey, Image, ImageDrawProps, RasterImage, StencilImage};
+use crate::{
+    BlendMode, CacheKey, Image, ImageDrawProps, InterpreterWarning, RasterImage, StencilImage,
+};
 use hayro_syntax::object::dict::keys::*;
 use hayro_syntax::object::{Dict, Name, Object, Stream};
 use hayro_syntax::work::Meter;
@@ -217,6 +219,11 @@ impl<'a> ImageXObject<'a> {
         }
 
         decode_mask(self, target_dimension, &Meter::default())
+    }
+
+    /// Tells the warning sink that the image, decoded, cannot be held whole.
+    pub(crate) fn whole_failed(&self) {
+        (self.warning_sink)(InterpreterWarning::ImageDecodeFailure);
     }
 
     pub(crate) fn decoded_image(

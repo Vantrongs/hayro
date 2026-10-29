@@ -111,18 +111,16 @@ impl<'p> Held<'p> {
 }
 
 /// `data`, texels of `texel.len()` bytes, completed with `texel` up to `texels` of
-/// them, a counted piece at a time; `None` once the meter's hook asks to stop.
+/// them, a counted piece at a time; `None` once the meter's hook asks to stop, and,
+/// before anything is allocated, where they do not fit in memory ([`room_for`]).
 pub(crate) fn complete(
     data: &mut Vec<u8>,
     texels: usize,
     texel: &[u8],
     meter: &Meter<'_>,
 ) -> Option<()> {
+    room_for(data, texels, texel.len(), meter)?;
     let want = texels * texel.len();
-    if data.len() >= want {
-        return Some(());
-    }
-    meter.reserve_exact(data, want - data.len());
     while data.len() < want {
         let n = (want - data.len()).min(POLL_BYTES / texel.len() * texel.len());
         for _ in 0..n / texel.len() {
@@ -131,6 +129,21 @@ pub(crate) fn complete(
         meter.work(n).ok()?;
     }
     Some(())
+}
+
+/// Room in `data` for `texels` texels of `channels` bytes, made on `meter`; `None`,
+/// with nothing allocated, where their bytes overflow or a vector cannot hold them
+/// or memory cannot give them: a plane completed up to the rows an image declares
+/// is sized by the file, not by the data it holds.
+pub(crate) fn room_for(
+    data: &mut Vec<u8>,
+    texels: usize,
+    channels: usize,
+    meter: &Meter<'_>,
+) -> Option<()> {
+    let want = texels.checked_mul(channels)?;
+    let more = want.saturating_sub(data.len());
+    meter.try_reserve_exact(data, more).ok()
 }
 
 /// How an image's samples are laid out and what they mean: from its dictionary, and

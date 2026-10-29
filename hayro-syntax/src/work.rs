@@ -283,6 +283,20 @@ impl<'a> Meter<'a> {
         self.grown((buf.capacity() - before) * size_of::<T>());
     }
 
+    /// [`Self::reserve_exact`], or `Err` without allocating where the room cannot be
+    /// made: for room sized from what a file declares, which may be past what a
+    /// vector holds or memory can give.
+    pub fn try_reserve_exact<T>(
+        &self,
+        buf: &mut Vec<T>,
+        additional: usize,
+    ) -> Result<(), alloc::collections::TryReserveError> {
+        let before = buf.capacity();
+        buf.try_reserve_exact(additional)?;
+        self.grown((buf.capacity() - before) * size_of::<T>());
+        Ok(())
+    }
+
     /// Notes room of `bytes` made ([`RESERVED`]).
     #[allow(clippy::unused_self)]
     fn grown(&self, bytes: usize) {

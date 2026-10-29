@@ -798,17 +798,30 @@ fn pixels(asset: &ImageAsset, name: &str) -> (PixelFormat, Vec<u8>) {
     (a.format, a.data)
 }
 
-/// One-pixel 1-bit images whose arrays hold, after the entries their rule reads, a
-/// reference to object 5, an array of a growing number of numbers that nothing
-/// read before: the image's and a soft mask's `/Decode` after their pair, a colour
-/// key's `/Mask` after its pair and after a name that ends its numbers, and a
-/// `/Matte` after a name that ends its one number, after a second number that
-/// makes it no matte, and after a name that leaves it none. Opening, requesting and
-/// decoding each does the same work, reads the same bodies of objects and gives the
-/// same pixels, however long the array: the object is not read.
+/// One-pixel 1-bit images that refer to object 5, an array of numbers or a
+/// dictionary, of a growing number of entries, that nothing read before:
+/// - after the entries an array's rule reads: the image's and a soft mask's
+///   `/Decode` after their pair, a colour key's `/Mask` after its pair and after a
+///   name that ends its numbers, and a `/Matte` after a name that ends its one
+///   number, after a second number that makes it no matte, and after a name that
+///   leaves it none;
+/// - where an entry the rule reads must be a number, so that the object's kind
+///   decides: `/Decode [null 5 0 R]`, whose pair goes on past a null, `/Decode
+///   [5 0 R 1]`, the soft mask's `/Matte [0.5 5 0 R]`, which reads the entry after
+///   its number to tell, and a colour key's `/Mask [0 5 0 R]`;
+/// - as a `/Decode` itself, where the object is a dictionary, which is no decode
+///   array.
+///
+/// Each document is loaded fresh, which reads none of its objects but its page
+/// tree's, and its image opened first: loading it, opening, requesting and decoding
+/// the image allocates the same and takes the same steps between polls and in all,
+/// and gives the same pixels, however large the object, and reads the object's
+/// bytes once at most. Its kind is told by its first token, and it is not built:
+/// where that decides, it is passed over once, to tell whether it can be read,
+/// which a reference to an object that cannot be read loses.
 #[cfg(debug_assertions)]
 #[test]
-fn references_past_the_entries_a_rule_reads_are_not_resolved() {
+fn referenced_objects_a_rule_reads_past_or_by_kind_are_not_built() {
     use crate::fixtures::{file, stream};
     use hayro_syntax::work::BODIES_READ;
     let bit = zlib(&[0x00]);
@@ -819,64 +832,112 @@ fn references_past_the_entries_a_rule_reads_are_not_resolved() {
             stream(&image(&format!("{gray1} {mask}"), 1, 1), &bit),
         ]
     };
-    let shapes: Vec<(&str, Vec<Vec<u8>>)> = vec![
+    let alone = |entries: &str| vec![stream(&image(&format!("{gray1} {entries}"), 1, 1), &bit)];
+    // Each shape, whether an array refers to the object where an array is read,
+    // and whether the object is read at all: past the entries a rule reads, it is
+    // not; where its kind decides, it is passed over.
+    let shapes: Vec<(&str, Vec<Vec<u8>>, bool, bool)> = vec![
+        ("decode", alone("/Decode [1 0 5 0 R]"), true, false),
         (
-            "decode",
-            vec![stream(
-                &image(&format!("{gray1} /Decode [1 0 5 0 R]"), 1, 1),
-                &bit,
-            )],
+            "soft mask's decode",
+            with_mask("/Decode [1 0 5 0 R]"),
+            true,
+            false,
         ),
-        ("soft mask's decode", with_mask("/Decode [1 0 5 0 R]")),
-        ("matte of one", with_mask("/Matte [0.5 /N 5 0 R]")),
-        ("matte of two", with_mask("/Matte [0.5 0.5 5 0 R]")),
-        ("matte of none", with_mask("/Matte [/N 5 0 R]")),
         (
-            "colour key",
-            vec![stream(
-                &image(&format!("{gray1} /Mask [0 0 5 0 R]"), 1, 1),
-                &bit,
-            )],
+            "matte of one",
+            with_mask("/Matte [0.5 /N 5 0 R]"),
+            true,
+            false,
         ),
+        (
+            "matte of two",
+            with_mask("/Matte [0.5 0.5 5 0 R]"),
+            true,
+            false,
+        ),
+        ("matte of none", with_mask("/Matte [/N 5 0 R]"), true, false),
+        ("colour key", alone("/Mask [0 0 5 0 R]"), true, false),
         (
             "colour key cut short",
-            vec![stream(
-                &image(&format!("{gray1} /Mask [0 /N 5 0 R]"), 1, 1),
-                &bit,
-            )],
+            alone("/Mask [0 /N 5 0 R]"),
+            true,
+            false,
         ),
+        (
+            "decode past a null",
+            alone("/Decode [null 5 0 R]"),
+            true,
+            true,
+        ),
+        (
+            "decode starting with it",
+            alone("/Decode [5 0 R 1]"),
+            true,
+            true,
+        ),
+        (
+            "matte deciding",
+            with_mask("/Matte [0.5 5 0 R]"),
+            true,
+            true,
+        ),
+        ("colour key's pair", alone("/Mask [0 5 0 R]"), true, true),
+        ("decode itself", alone("/Decode 5 0 R"), false, true),
     ];
+    let object = |array: bool, n: usize| match array {
+        true => format!("[{}]", " 7".repeat(n)),
+        false => {
+            let entries: String = (0..n).map(|i| format!("/K{i} 7 ")).collect();
+            format!("<< {entries}>>")
+        }
+    };
     let mut grew = Vec::new();
-    for (name, objects) in shapes {
-        let mut first = None;
-        for numbers in [1, 10_000, 1_000_000] {
-            let mut all = vec![
-                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-                b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec(),
-            ];
-            all.extend(objects.iter().cloned());
-            all.resize(4, b"null".to_vec());
-            all.push(format!("[{}]", " 7".repeat(numbers)).into_bytes());
-            let pdf = Pdf::new(file(&all, "")).unwrap();
-            let bodies = BODIES_READ.with(Cell::get);
-            let pixels = pixels(&asset(&pdf), name);
-            let work = (
-                pixels,
-                measure(&pdf).1,
-                BODIES_READ.with(Cell::get) - bodies,
-            );
-            println!(
-                "{name}, {numbers} numbers referred to: {:?} {:?} {:?}",
-                work.0, work.1, work.2
-            );
-            match &first {
-                None => first = Some(work),
-                Some(first) if work != *first => grew.push(format!("{name}, {numbers} numbers")),
-                Some(_) => {}
+    for (name, images, of_any_kind, passed) in &shapes {
+        for (kind, array) in [("an array", true), ("a dictionary", false)] {
+            // An array where an array is read is read.
+            if array && !of_any_kind {
+                continue;
+            }
+            let mut first = None;
+            // A first run, on a document of its own, makes what the thread makes once,
+            // on first use, which no run measured then makes.
+            for (run, entries) in [1, 1, 10_000, 1_000_000].into_iter().enumerate() {
+                // A page tree that loads without a scan of the file's objects.
+                let mut all = vec![
+                    b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+                    b"<< /Type /Pages /Kids [6 0 R] /Count 1 >>".to_vec(),
+                ];
+                all.extend(images.iter().cloned());
+                all.resize(4, b"null".to_vec());
+                let referred = object(array, entries).into_bytes();
+                let size = referred.len();
+                all.push(referred);
+                all.push(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] >>".to_vec());
+                let data = file(&all, "");
+                let bodies = BODIES_READ.with(Cell::get);
+                let pdf = Pdf::new(data).unwrap();
+                let measured = measure_asset(asset(&pdf));
+                let bodies = BODIES_READ.with(Cell::get) - bodies;
+                let work = (measured, pixels(&asset(&pdf), name));
+                println!(
+                    "{name}, {kind} of {entries}: {:?} {:?} {bodies} body bytes, {:?}",
+                    work.0.0, work.0.1, work.1
+                );
+                match &first {
+                    _ if run == 0 => {}
+                    None => first = Some((work, bodies)),
+                    Some((first, read))
+                        if work != *first || bodies > read + usize::from(*passed) * size =>
+                    {
+                        grew.push(format!("{name}, {kind} of {entries}"));
+                    }
+                    Some(_) => {}
+                }
             }
         }
     }
-    assert!(grew.is_empty(), "work grew with the array: {grew:?}");
+    assert!(grew.is_empty(), "work grew with the object: {grew:?}");
 }
 
 /// The image of the inline image `content` holds, as an asset.
@@ -942,4 +1003,102 @@ fn inline_entries_of_another_kind_are_not_read() {
         }
     }
     assert!(grew.is_empty(), "work grew with the dictionary: {grew:?}");
+}
+
+/// Images whose data holds nothing, declared so large that their planes, held whole
+/// as `with_rgba` and `with_stencil` hand them over, do not fit in a vector: grey
+/// and a stencil mask past `isize::MAX` bytes, RGB whose bytes overflow, and a soft
+/// mask past `isize::MAX` under a colour that fits. Each fails as a decode does,
+/// handing nothing over and warning, before anything that large is allocated; an
+/// image as empty that fits is handed over whole, on its declared grid.
+#[test]
+fn planes_too_large_to_hold_whole_fail_before_they_are_allocated() {
+    use crate::color::Color;
+    use crate::{InterpreterWarning, Paint, RasterImage, StencilImage};
+    use smallvec::smallvec;
+    use std::sync::Mutex;
+    const HUGE: u32 = u32::MAX;
+    let gray8 = "/ColorSpace /DeviceGray /BitsPerComponent 8";
+    let shapes = [
+        ("grey", vec![(image(gray8, HUGE, HUGE), vec![])], false),
+        (
+            "rgb",
+            vec![(
+                image("/ColorSpace /DeviceRGB /BitsPerComponent 8", HUGE, HUGE),
+                vec![],
+            )],
+            false,
+        ),
+        (
+            "stencil",
+            vec![(
+                image("/ImageMask true /BitsPerComponent 1", HUGE, HUGE),
+                vec![],
+            )],
+            false,
+        ),
+        (
+            "soft mask",
+            vec![
+                (image(&format!("{gray8} /SMask 4 0 R"), 1, 1), vec![7]),
+                (image(gray8, HUGE, HUGE), vec![]),
+            ],
+            false,
+        ),
+        ("grey that fits", vec![(image(gray8, 3, 2), vec![])], true),
+    ];
+    for (name, objects, fits) in shapes {
+        let pdf = pdf(&objects);
+        let stream = pdf
+            .xref()
+            .get::<Stream<'_>>(ObjectIdentifier::new(3, 0))
+            .unwrap();
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let sink: WarningSinkFn = {
+            let warnings = warnings.clone();
+            Arc::new(move |w| warnings.lock().unwrap().push(w))
+        };
+        let obj = ImageXObject::new(&stream, |_| None, &sink, &Cache::new(), None).unwrap();
+        // The image decodes: it is holding it whole that fails.
+        let decodes = match obj.kind {
+            ImageKind::StencilMask => obj.decoded_mask(None).is_some(),
+            _ => obj.decoded_image(None).is_some(),
+        };
+        assert!(decodes, "{name}");
+        let mut handed = None;
+        COUNTS.with(|c| c.set(Some(0)));
+        if obj.kind == ImageKind::StencilMask {
+            let paint = Paint::Color(Color::new(ColorSpace::device_gray(), smallvec![0.0], 1.0));
+            let stencil = StencilImage {
+                paint,
+                image_xobject: obj.clone(),
+            };
+            stencil.with_stencil(
+                |l, _| handed = Some((l.width, l.height, l.data.len())),
+                None,
+            );
+        } else {
+            RasterImage(obj.clone()).with_rgba(
+                |mut i, _| handed = Some((i.width(), i.height(), i.rows_mut().0.len())),
+                None,
+            );
+        }
+        let allocated = COUNTS.with(|c| c.replace(None)).unwrap();
+        let warned = warnings.lock().unwrap().clone();
+        println!("{name}: {handed:?}, {allocated} bytes allocated, {warned:?}");
+        if fits {
+            assert_eq!(handed, Some((3, 2, 6)), "{name}");
+            assert!(warned.is_empty(), "{name}");
+        } else {
+            assert_eq!(handed, None, "{name}");
+            assert!(
+                matches!(warned[..], [InterpreterWarning::ImageDecodeFailure]),
+                "{name}: {warned:?}"
+            );
+            assert!(
+                allocated < POLL_BYTES,
+                "{name}: {allocated} bytes allocated"
+            );
+        }
+    }
 }

@@ -146,6 +146,20 @@ pub(crate) trait ObjectLike<'a>: TryFrom<Object<'a>> + Readable<'a> + Debug + Cl
     /// object, and is not read as one.
     const KIND: Option<Kind> = None;
 
+    /// Whether the kind an indirect object's first token tells may decide what it is
+    /// as one ([`Self::told_by`]), so that its body is passed over, not built.
+    const TOLD_BY_TOKEN: bool = Self::KIND.is_some();
+
+    /// What an indirect object whose first token tells it is a `token`
+    /// ([`Kind::of_token`]) is as one, where that alone decides it: none where
+    /// `token` is not [`Self::KIND`], as a stream's dictionary's is no stream's.
+    /// `None` where only reading the object tells.
+    fn told_by(token: Kind) -> Option<Option<Self>> {
+        let own = Self::KIND?;
+        let takes = own == token || (own == Kind::Stream && token == Kind::Dict);
+        (!takes).then_some(None)
+    }
+
     /// Reads the object an indirect object holds, after its header.
     fn read_indirect(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         r.read_with_context::<Self>(ctx)
@@ -222,6 +236,9 @@ impl<'a> Written<'a> {
 /// The kind of an object: the variant of [`Object`] it reads as. Read as an object,
 /// it is the kind of the object there, which is passed over, not read: a dictionary
 /// or an array of any size costs its bytes, looked at, not what reading it makes.
+/// Read through a reference, it is the kind the object's first token tells, where
+/// it tells one, and the object is passed over, not built: a stream is its
+/// dictionary's, as to a read of any type but a stream or any object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// The null object.
@@ -289,9 +306,15 @@ impl TryFrom<Object<'_>> for Kind {
     }
 }
 
-// Read where an object is: a stream is one, as it is to an `Object`.
+// An indirect object's first token tells its kind but a stream's, which, as a
+// stream is to a read of any type but a stream or any object, is its dictionary's:
+// so it is told by that token, and the object passed over, not built.
 impl ObjectLike<'_> for Kind {
-    const STREAM: bool = true;
+    const TOLD_BY_TOKEN: bool = true;
+
+    fn told_by(token: Kind) -> Option<Option<Self>> {
+        Some(Some(token))
+    }
 }
 
 /// Makes the kind of a token [`leaf`] reads, which it passes over.

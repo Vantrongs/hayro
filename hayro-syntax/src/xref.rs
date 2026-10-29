@@ -111,7 +111,7 @@ mod body;
 mod scan;
 
 pub(crate) use body::Place;
-use body::{Header, Slot, SlotReader, Source, Taken, Unread};
+use body::{Header, Slot, SlotReader, Source, Taken, Told, Unread};
 use scan::Scan;
 
 pub(crate) const XREF_ENTRY_LEN: usize = 20;
@@ -1879,7 +1879,7 @@ impl XRef {
                 // Past the bytes: nothing can be read there, which the read tells.
                 None => self.read::<Object<'_>>(id, &ctx, Taken::Either).and(None),
             },
-            Err(Unread::Rejected) => None,
+            Err(Unread::Rejected | Unread::Told(_)) => None,
             Err(Unread::Lost(lost)) => {
                 self.note(Some(lost));
                 None
@@ -1958,7 +1958,11 @@ impl XRef {
     /// too, and lost: the computation being watched is told ([`Self::watch`]).
     ///
     /// The object is the one its body holds ([`Self::read`]), as a `T`: a stream, for
-    /// any `T` but a stream or any object, as its dictionary.
+    /// any `T` but a stream or any object, as its dictionary. Where the body's first
+    /// token alone tells what it is as a `T` ([`ObjectLike::told_by`]), as it tells
+    /// an object of another kind than a `T`'s is none, the body is passed over to
+    /// tell whether it can be read, which it must be not to be lost, but not built:
+    /// it costs its bytes, looked at once, whatever it holds.
     #[allow(private_bounds)]
     pub(crate) fn get_with<'a, T>(
         &'a self,
@@ -1969,7 +1973,11 @@ impl XRef {
         T: ObjectLike<'a>,
     {
         let taken = if T::STREAM { Taken::Whole } else { Taken::Dict };
-        self.read::<Object<'a>>(id, ctx, taken)?.cast()
+        let decides: fn(object::Kind) -> bool = |token| T::told_by(token).is_some();
+        match self.read_told::<Object<'a>>(id, ctx, taken, T::TOLD_BY_TOKEN.then_some(decides)) {
+            Ok(object) => object.cast(),
+            Err(token) => T::told_by(token?)?,
+        }
     }
 
     /// Object `id`, read from `ctx` as [`Self::get_with`] reads any object, but a
@@ -2019,13 +2027,27 @@ impl XRef {
         ctx: &ReaderContext<'a>,
         taken: Taken,
     ) -> Option<O> {
-        let (repr, entry, entered) = self.entry(id, ctx)?;
-        match self.body(repr, id, entry, ctx, entered, taken) {
-            Ok(object) => Some(object),
-            Err(Unread::Rejected) => None,
+        self.read_told(id, ctx, taken, None).ok()
+    }
+
+    /// [`Self::read`], where the kind the body's first token tells decides the read
+    /// as `told` says ([`Told`]): `Err` with that kind, the body not read past it,
+    /// and `Err(None)` where `read` reads nothing.
+    fn read_told<'a, O: Made<'a>>(
+        &'a self,
+        id: ObjectIdentifier,
+        ctx: &ReaderContext<'a>,
+        taken: Taken,
+        told: Told,
+    ) -> Result<O, Option<object::Kind>> {
+        let (repr, entry, entered) = self.entry(id, ctx).ok_or(None)?;
+        match self.body(repr, id, entry, ctx, entered, taken, told) {
+            Ok(object) => Ok(object),
+            Err(Unread::Told(token)) => Err(Some(token)),
+            Err(Unread::Rejected) => Err(None),
             Err(Unread::Lost(lost)) => {
                 self.note(Some(lost));
-                None
+                Err(None)
             }
         }
     }
@@ -2037,6 +2059,7 @@ impl XRef {
     ///
     /// `entered` is taken, not borrowed, so that the link is added to the context
     /// [`Self::entry`] made rather than to a copy of it.
+    #[allow(clippy::too_many_arguments)]
     fn body<'a, O: Made<'a>>(
         &'a self,
         repr: &'a SomeRepr,
@@ -2045,6 +2068,7 @@ impl XRef {
         ctx: &ReaderContext<'a>,
         mut entered: ReaderContext<'a>,
         taken: Taken,
+        told: Told,
     ) -> Result<O, Unread> {
         let (place, data, slot) = self.place(repr, id, entry, &entered)?;
         let link = place.link();
@@ -2054,13 +2078,25 @@ impl XRef {
             return Err(Unread::Rejected);
         }
         entered.parent_chain_push(link);
-        self.at_place(repr, id, entry, (place, data, slot), ctx, &entered, taken)
+        self.at_place(
+            repr,
+            id,
+            entry,
+            (place, data, slot),
+            ctx,
+            &entered,
+            (taken, told),
+        )
     }
 
     /// The object the body at `place`, in `data`, whose slot ends at `slot`, holds,
     /// read for entry `id`, at `entry`, in `entered`, the context of the entry from
     /// `ctx` whose chain holds the body: read once for every entry leading there and
-    /// every read.
+    /// every read. Or, where the kind its first token tells decides the read as
+    /// `told` says, that kind, where the body can be read, and else the object is
+    /// lost, as reading it would find: the body is passed over, not built, once for
+    /// every read it decides ([`body::Shape::read_told`]). A body kept needs no
+    /// token: a read of any type made of its shape is what the token decides.
     #[allow(clippy::too_many_arguments)]
     fn at_place<'a, O: Made<'a>>(
         &'a self,
@@ -2070,9 +2106,25 @@ impl XRef {
         (place, data, slot): (Place, &'a [u8], Slot),
         ctx: &ReaderContext<'a>,
         entered: &ReaderContext<'a>,
-        taken: Taken,
+        (taken, told): (Taken, Told),
     ) -> Result<O, Unread> {
-        let kept = repr.shapes.get().whole(&place);
+        let (kept, token) = {
+            let mut shapes = repr.shapes.get();
+            let kept = shapes.whole(&place);
+            let token = (kept.is_none() && told.is_some())
+                .then(|| shapes.token(&place))
+                .flatten();
+            (kept, token)
+        };
+        let told_by = |(kind, readable): body::Token| match readable {
+            true => Unread::Told(kind),
+            false => Unread::Lost(id),
+        };
+        if let (Some(decides), Some(token)) = (told, token)
+            && decides(token.0)
+        {
+            return Err(told_by(token));
+        }
         let shape = match kept {
             Some(shape) => shape,
             None => {
@@ -2083,7 +2135,18 @@ impl XRef {
                     }
                 });
                 // Reading a body resolves nothing: no lock is held while it reads.
-                let shape = body::Shape::read(data, slot, place, entered);
+                let shape = match told {
+                    Some(decides) => {
+                        match body::Shape::read_told(data, slot, place, entered, decides) {
+                            Ok(shape) => shape,
+                            Err(token) => {
+                                repr.shapes.get().told(place, token);
+                                return Err(told_by(token));
+                            }
+                        }
+                    }
+                    None => body::Shape::read(data, slot, place, entered),
+                };
                 repr.shapes.get().read(place, shape)
             }
         };
@@ -2227,7 +2290,15 @@ impl XRef {
             let mut entered = Self::entered(ctx, stream, repr, entry);
             entered.parent_chain_push(link);
             let read = |taken| {
-                self.at_place::<Object<'_>>(repr, stream, entry, place, ctx, &entered, taken)
+                self.at_place::<Object<'_>>(
+                    repr,
+                    stream,
+                    entry,
+                    place,
+                    ctx,
+                    &entered,
+                    (taken, None),
+                )
             };
             match read(Taken::Contained) {
                 Ok(Object::Stream(contained)) => {
@@ -2239,7 +2310,7 @@ impl XRef {
                     );
                     ObjectStream::new(&contained, cut)
                 }
-                Ok(_) | Err(Unread::Rejected) => None,
+                Ok(_) | Err(Unread::Rejected | Unread::Told(_)) => None,
                 Err(Unread::Lost(lost)) => {
                     self.note(Some(lost));
                     None
@@ -4678,10 +4749,11 @@ mod tests {
         }
     }
 
-    // An object of another kind than a read asks for is read once to find out it is
-    // not lost, however many references lead to it.
+    // An object of another kind than a read asks for, as its first token tells, is
+    // passed over once to find out it is not lost, however many references lead to
+    // it, and not built.
     #[test]
-    fn an_object_of_another_kind_is_read_once_to_find_it_is_not_lost() {
+    fn an_object_of_another_kind_is_passed_over_once_to_find_it_is_not_lost() {
         let n = 512;
         let items = vec!["5 0 R"; n].join(" ");
         let annots = format!("<< /List [{items}] >>");
@@ -4696,11 +4768,99 @@ mod tests {
             .get::<Array<'_>>(b"List".as_slice())
             .unwrap();
         body::BODIES.with_borrow_mut(hash::Map::clear);
+        body::PASSED.with_borrow_mut(hash::Map::clear);
         let read: Vec<_> = list.iter_checked::<Dict<'_>>().collect();
         assert!(read.is_empty(), "{read:?}");
-        let bodies =
-            body::BODIES.with_borrow(|bodies| bodies.values().copied().collect::<Vec<_>>());
-        assert_eq!(bodies, [1]);
+        let counts = |of: &'static std::thread::LocalKey<core::cell::RefCell<hash::Map<_, _>>>| {
+            of.with_borrow(|counts| counts.values().copied().collect::<Vec<usize>>())
+        };
+        assert_eq!(counts(&body::BODIES), []);
+        assert_eq!(counts(&body::PASSED), [1]);
+    }
+
+    // A read of a type of another kind than the one an object's first token tells,
+    // and a read of a `Kind`, a stream's being its dictionary's, gives what building
+    // the object and casting it gives, lost where the object cannot be read, but
+    // the body is passed over, not built, once for every read of its place,
+    // whatever reads it after. Every other read, of the token's kind, of a body
+    // whose first token tells none, or of any object, builds the body as before.
+    // Each read gives the same on a document that read nothing before and on one
+    // that built the object first.
+    #[test]
+    fn a_read_the_first_token_decides_passes_over_the_body() {
+        use crate::object::{Kind, Name, Null, Rect, String};
+        let objects: [(&str, Option<Kind>); 11] = [
+            ("[1 2 3]", Some(Kind::Array)),
+            ("<< /Broken >", Some(Kind::Dict)),
+            ("<< /A 1 >>", Some(Kind::Dict)),
+            ("<< /Length 3 >>\nstream\nabc\nendstream", Some(Kind::Dict)),
+            ("<< /Length 99 >>\nstream\nabc", Some(Kind::Dict)),
+            ("/N", Some(Kind::Name)),
+            ("(s)", Some(Kind::String)),
+            ("12", None),
+            ("null", None),
+            ("[1 2 /A", Some(Kind::Array)),
+            ("% a comment\n[4 5 6 7]", Some(Kind::Array)),
+        ];
+        let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>";
+        let all: Vec<&str> = [CATALOG, TREE, page]
+            .into_iter()
+            .chain(objects.iter().map(|(o, _)| *o))
+            .collect();
+        let file = file_of(&all, false);
+        let fresh = || crate::Pdf::new(file.clone()).unwrap();
+        let show = |read: &dyn core::fmt::Debug| format!("{read:?}");
+        macro_rules! reads {
+            ($($t:ty),*) => {$(
+                for (i, &(object, token)) in objects.iter().enumerate() {
+                    let id = ObjectIdentifier::new(i as i32 + 4, 0);
+                    let ty = core::any::type_name::<$t>();
+                    // Read as `get_with` read every object before: built, then cast.
+                    let whole = fresh();
+                    let xref = whole.xref();
+                    let ctx = ReaderContext::new(xref, false);
+                    let taken = if <$t>::STREAM { Taken::Whole } else { Taken::Dict };
+                    let built = xref.watch(|| xref.read::<Object<'_>>(id, &ctx, taken)
+                        .and_then(|o| o.cast::<$t>()));
+                    let built = (show(&built.0), built.1);
+                    // Read on a document that read nothing before, then on the one
+                    // that read the object whole.
+                    let first = fresh();
+                    body::BODIES.with_borrow_mut(hash::Map::clear);
+                    body::PASSED.with_borrow_mut(hash::Map::clear);
+                    let read = first.xref().watch(|| first.xref().get::<$t>(id));
+                    let read = (show(&read.0), read.1);
+                    let bodies = body::BODIES.with_borrow(|b| b.values().sum::<usize>());
+                    let again = first.xref().watch(|| first.xref().get::<$t>(id));
+                    assert_eq!((show(&again.0), again.1), read, "{object:?} as {ty}, again");
+                    let passed = body::PASSED.with_borrow(|p| p.values().sum::<usize>());
+                    let after = xref.watch(|| xref.get::<$t>(id));
+                    assert_eq!((show(&after.0), after.1), read, "{object:?} as {ty}, after");
+                    assert_eq!(read, built, "{object:?} as {ty}: built");
+                    let told = token.and_then(<$t as ObjectLike>::told_by).is_some();
+                    assert_eq!(
+                        (bodies, passed),
+                        (usize::from(!told), usize::from(told)),
+                        "{object:?} as {ty}: bodies built and passed over"
+                    );
+                }
+            )*};
+        }
+        reads!(
+            f32,
+            i32,
+            bool,
+            Null,
+            Name<'_>,
+            String<'_>,
+            Array<'_>,
+            Dict<'_>,
+            Stream<'_>,
+            Rect,
+            Vec<f32>,
+            Kind,
+            Object<'_>
+        );
     }
 
     /// An object stream whose header is `header` and whose objects follow it as
