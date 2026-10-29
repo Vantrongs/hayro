@@ -112,6 +112,29 @@ impl DecoderContext {
         self.update_b();
     }
 
+    /// Ends the line being decoded where the data ends within it, as `MuPDF` does
+    /// (observed through `PyMuPDF` 1.28.2): the pixels decoded of it are kept and the
+    /// rest are white, and it is pushed, unless no pixel was decoded. A code the end
+    /// cuts reads the bits past it as zero. Other errors, and errors before the end,
+    /// fail with `error`.
+    pub(crate) fn salvage(
+        &mut self,
+        reader: &BitReader<'_>,
+        error: DecodeError,
+        decoder: &mut impl Decoder,
+    ) -> Result<()> {
+        if error == DecodeError::Stopped || self.settings.strict || !reader.at_end() {
+            return Err(error);
+        }
+        if self.pixels_decoded == 0 {
+            return Ok(());
+        }
+        self.color = Color::White;
+        self.push_pixels(self.line_width - self.pixels_decoded)?;
+        self.next_line(decoder);
+        Ok(())
+    }
+
     /// `a0` refers to the first changing element on the current line.
     #[inline(always)]
     fn a0(&self) -> Option<u32> {
@@ -182,6 +205,9 @@ pub(crate) fn decode_1d_line(
 ) -> Result<()> {
     while !ctx.at_eol() {
         reader.poll(decoder)?;
+        if reader.overrun() {
+            return Err(DecodeError::UnexpectedEof);
+        }
         let run_length = reader.decode_run(ctx.color, decoder)?;
         ctx.push_pixels(run_length)?;
         ctx.color = ctx.color.opposite();
@@ -199,6 +225,9 @@ pub(crate) fn decode_2d_line(
 ) -> Result<()> {
     while !ctx.at_eol() {
         reader.poll(decoder)?;
+        if reader.overrun() {
+            return Err(DecodeError::UnexpectedEof);
+        }
         let mode = reader.decode_mode()?;
 
         match mode {

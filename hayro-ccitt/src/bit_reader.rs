@@ -26,6 +26,8 @@ pub(crate) struct BitReader<'a> {
     /// The bit offset from which on the decoder is asked whether to stop:
     /// [`POLL_BITS`] past the offset at which it was last asked.
     poll_at: usize,
+    /// Whether a code was read past the end of the data ([`Self::consume_code`]).
+    overrun: bool,
 }
 
 impl<'a> BitReader<'a> {
@@ -42,6 +44,7 @@ impl<'a> BitReader<'a> {
             buffer: 0,
             limit: 0,
             poll_at: POLL_BITS,
+            overrun: false,
         };
         reader.refill();
         reader
@@ -75,6 +78,22 @@ impl<'a> BitReader<'a> {
         self.buffer <<= num_bits;
 
         Ok(())
+    }
+
+    /// Consumes the `num_bits` bits of a code, up to 32, where the data may end within
+    /// them: the bits past its end read as zero and the reader is left at the end
+    /// ([`Self::overrun`]). Returns whether the code reached past the end.
+    #[inline(always)]
+    pub(crate) fn consume_code(&mut self, num_bits: usize) -> bool {
+        let past_end = self.consume(num_bits).is_err();
+        self.overrun |= past_end;
+        past_end
+    }
+
+    /// Whether a code was read past the end of the data.
+    #[inline(always)]
+    pub(crate) fn overrun(&self) -> bool {
+        self.overrun
     }
 
     /// Asks `decoder` whether to stop once [`POLL_BITS`] bits were read since

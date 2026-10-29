@@ -49,6 +49,9 @@ pub use error::{DecodeError, Result};
 /// If decoding was successful, the number of bytes that have been read in total
 /// is returned.
 ///
+/// Data that ends within a row ends decoding there, not in an error: the row is
+/// pushed with the pixels decoded of it and the rest white, unless none was decoded.
+///
 /// If an error is returned, it means that the file is somehow malformed.
 /// However, even if that's the case, it is possible that a number
 /// of rows were decoded successfully and written into the decoder, so those

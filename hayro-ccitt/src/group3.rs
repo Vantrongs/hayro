@@ -25,7 +25,10 @@ pub(crate) fn step_1d(
     let line_start = reader.clone();
 
     if let Err(e) = decode_1d_line(ctx, reader, decoder) {
-        recover(ctx, reader, line_start, e)?;
+        match ctx.salvage(reader, e, decoder) {
+            Ok(()) => return Ok(false),
+            Err(e) => recover(ctx, reader, line_start, e)?,
+        }
     }
 
     ctx.next_line(decoder);
@@ -52,7 +55,10 @@ pub(crate) fn step_2d(
     });
 
     if let Err(e) = result {
-        recover(ctx, reader, line_start, e)?;
+        match ctx.salvage(reader, e, decoder) {
+            Ok(()) => return Ok(false),
+            Err(e) => recover(ctx, reader, line_start, e)?,
+        }
     }
 
     ctx.next_line(decoder);

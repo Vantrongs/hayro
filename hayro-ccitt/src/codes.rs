@@ -30,7 +30,7 @@ impl BitReader<'_> {
         let bits = self.peek_u32();
 
         if bits >> 31 == 1 {
-            self.consume(1)?;
+            self.consume_code(1);
             return Ok(Mode::Vertical(0));
         }
 
@@ -55,7 +55,7 @@ impl BitReader<'_> {
             }
         };
 
-        self.consume(len)?;
+        self.consume_code(len);
 
         Ok(mode)
     }
@@ -122,13 +122,23 @@ impl BitReader<'_> {
 
         loop {
             let entry = lookup[(self.peek_u32() >> (32 - LOOKUP_BITS)) as usize];
-            self.consume((entry >> 12) as usize)?;
-
             let len = entry & 0xFFF;
 
             if len == LOOKUP_INVALID {
-                return Err(DecodeError::InvalidCode);
+                // Bits past the end of the data are no code; the make-up codes read
+                // before it count.
+                let past_end = self.consume_code((entry >> 12) as usize);
+                if past_end && total > 0 {
+                    return Ok(total);
+                }
+                return Err(if past_end {
+                    DecodeError::UnexpectedEof
+                } else {
+                    DecodeError::InvalidCode
+                });
             }
+
+            self.consume_code((entry >> 12) as usize);
 
             total = total.checked_add(len as u32).ok_or(DecodeError::Overflow)?;
 

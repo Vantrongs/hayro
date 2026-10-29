@@ -28,7 +28,10 @@ pub(crate) fn step(
         return Ok(false);
     }
 
-    decode_2d_line(ctx, reader, decoder)?;
+    if let Err(e) = decode_2d_line(ctx, reader, decoder) {
+        ctx.salvage(reader, e, decoder)?;
+        return Ok(false);
+    }
     ctx.next_line(decoder);
 
     if ctx.settings.rows_are_byte_aligned {
