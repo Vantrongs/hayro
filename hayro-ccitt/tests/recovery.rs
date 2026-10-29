@@ -73,3 +73,25 @@ fn data_that_ends_within_a_row() {
     settings.strict = true;
     assert!(decoded(541, settings).0.is_err());
 }
+
+/// A code cut by the end of the data that completes a row (`[0x75]`: two white
+/// pixels and a black one, then `1` and zeros past the end, read as three white):
+/// strict decoding fails, whole and by rows, while lenient decoding keeps the row.
+#[test]
+fn a_cut_code_that_completes_a_row_fails_strict_decoding() {
+    let data = [0x75];
+    for strict in [false, true] {
+        let mut settings = DecodeSettings::new(3, 2);
+        settings.encoding = G3_1D;
+        settings.strict = strict;
+        let mut rows = Collector::new(3);
+        let ended = decode(&data, &mut rows, &mut DecoderContext::new(settings));
+        decodes_the_same_by_rows("[0x75]", &data, settings);
+        if strict {
+            assert!(ended.is_err(), "{ended:?}");
+        } else {
+            assert_eq!(ended, Ok(1));
+            assert!(rows.rows == [vec![true, true, false], vec![true; 3]]);
+        }
+    }
+}

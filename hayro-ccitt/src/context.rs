@@ -136,6 +136,16 @@ impl DecoderContext {
         Ok(())
     }
 
+    /// Fails a line that a code cut by the end of the data completed, where decoding
+    /// is strict: the bits past the end, read as zero, are no data.
+    #[inline(always)]
+    fn check_complete(&self, reader: &BitReader<'_>) -> Result<()> {
+        if self.settings.strict && reader.overrun() {
+            return Err(DecodeError::UnexpectedEof);
+        }
+        Ok(())
+    }
+
     /// `a0` refers to the first changing element on the current line.
     #[inline(always)]
     fn a0(&self) -> Option<u32> {
@@ -214,7 +224,7 @@ pub(crate) fn decode_1d_line(
         ctx.color = ctx.color.opposite();
     }
 
-    Ok(())
+    ctx.check_complete(reader)
 }
 
 /// Decode a single 2D-coded line (T.4 Section 4.2, T.6 Section 2.2).
@@ -269,7 +279,7 @@ pub(crate) fn decode_2d_line(
         }
     }
 
-    Ok(())
+    ctx.check_complete(reader)
 }
 
 /// Pixel color in a bi-level (black and white) image.
