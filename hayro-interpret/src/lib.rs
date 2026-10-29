@@ -46,6 +46,11 @@ mod x_object;
 #[allow(dead_code)]
 mod fixtures;
 
+#[cfg(test)]
+#[path = "../../hayro-syntax/tests/common/rc4.rs"]
+#[allow(dead_code)]
+mod rc4_fixtures;
+
 pub mod color;
 pub mod encode;
 pub mod font;

@@ -1368,3 +1368,112 @@ fn a_stencil_asset_is_the_alpha_the_paint_is_drawn_through() {
     let halved = request(&mut source, Plane::Image, (5, 2), [0, 0, 5, 2]);
     assert_eq!(halved.data.len(), 10);
 }
+
+/// The bottom-right pixel of each plane of an image stored without a filter, `n` × `n`
+/// one-bit samples, alone, under a one-bit soft mask read alongside, under an 8-bit
+/// soft mask on its own grid, or a stencil mask, requested twice: what decoding it
+/// whole gives, the rows and columns before it moved past without reading them, so
+/// that the bytes read, rows stepped and work counted do not grow with `n`.
+#[test]
+#[cfg(debug_assertions)]
+fn stored_rows_before_a_request_are_moved_past_unread() {
+    let gray = |bits: u32| format!("/ColorSpace /DeviceGray /BitsPerComponent {bits}");
+    for (case, plane) in [
+        ("alone", Plane::Image),
+        ("alongside", Plane::Image),
+        ("own grid", Plane::Mask),
+        ("stencil", Plane::Image),
+    ] {
+        let mut told_at = Vec::new();
+        for n in [256_u32, 1024, 4096] {
+            let colour = noise((n * n / 8) as usize, n);
+            let objects = match case {
+                "alone" => vec![(image(&gray(1), n, n), colour)],
+                "alongside" => vec![
+                    (image(&format!("{} /SMask 4 0 R", gray(1)), n, n), colour),
+                    (image(&gray(1), n, n), noise((n * n / 8) as usize, n + 1)),
+                ],
+                "own grid" => vec![
+                    (image(&format!("{} /SMask 4 0 R", gray(1)), n, n), colour),
+                    (
+                        image(&gray(8), n / 2, n),
+                        noise((n * n / 2) as usize, n + 2),
+                    ),
+                ],
+                _ => vec![(image("/ImageMask true", n, n), colour)],
+            };
+            let pdf = pdf(&objects);
+            let asset = asset(&pdf);
+            let mut source = asset.open(None, None).unwrap();
+            assert!(is_streamed(&source), "{case} {n}");
+            let p = *source.layout().plane(plane).unwrap();
+            let (grid, window) = (
+                (p.width, p.height),
+                [p.width - 1, p.height - 1, p.width, p.height],
+            );
+            let expected = request(&mut whole(&asset), plane, grid, window);
+            for _ in 0..2 {
+                rows::READ.set(0);
+                rows::STEPPED.set(0);
+                TOLD.set(0);
+                let got = request(&mut source, plane, grid, window);
+                assert_eq!(got.data, expected.data, "{case} {n}");
+                let (read, stepped, told) = (rows::READ.get(), rows::STEPPED.get(), TOLD.get());
+                assert!(
+                    read <= 2 && stepped == 0,
+                    "{case} {n}: {read} bytes read, {stepped} rows stepped"
+                );
+                told_at.push(told);
+            }
+        }
+        let (least, most) = (told_at.iter().min().unwrap(), told_at.iter().max().unwrap());
+        assert!(most - least < 256, "{case}: work {told_at:?}");
+    }
+}
+
+/// A request near the bottom of an image stored without a filter and encrypted with
+/// RC4, whose keystream runs from the start, makes the keystream of the rows before it
+/// once; later requests resume from the state saved nearest before them, making no
+/// more than the bytes between two saved states, and give what decoding it whole
+/// gives.
+#[test]
+#[cfg(debug_assertions)]
+fn rc4_rows_before_a_request_resume_from_a_saved_state() {
+    use crate::rc4_fixtures::{Part, file};
+    let n = 4096_u32;
+    let data = noise((n * n / 8) as usize, 5);
+    let dict = image("/ColorSpace /DeviceGray /BitsPerComponent 1", n, n);
+    let bytes = file(
+        &[
+            Part::Object("<< /Type /Catalog /Pages 2 0 R >>", b""),
+            Part::Object("<< /Type /Pages /Kids [] /Count 0 >>", b""),
+            Part::StreamWith(&dict, &data),
+        ],
+        &[],
+    );
+    let pdf = Pdf::new(bytes).unwrap();
+    let asset = asset(&pdf);
+    let mut source = asset.open(None, None).unwrap();
+    assert!(is_streamed(&source));
+    let mut decoded = whole(&asset);
+    let mut work = Vec::new();
+    for y in [n - 1, n - 2, n - 700, n - 1] {
+        let window = [n - 9, y, n, y + 1];
+        let expected = request(&mut decoded, Plane::Image, (n, n), window);
+        TOLD.set(0);
+        rows::READ.set(0);
+        let got = request(&mut source, Plane::Image, (n, n), window);
+        assert_eq!(got.data, expected.data, "row {y}");
+        assert!(
+            rows::READ.get() <= 2,
+            "row {y}: {} bytes read",
+            rows::READ.get()
+        );
+        work.push(TOLD.get());
+    }
+    let stored = (n * n / 8) as usize;
+    assert!(work[0] >= stored - index::MIN_CHECKPOINT_BYTES, "{work:?}");
+    for &later in &work[1..] {
+        assert!(later < index::MIN_CHECKPOINT_BYTES + 4096, "{work:?}");
+    }
+}

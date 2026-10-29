@@ -170,11 +170,35 @@ impl<'a> RawRows<'a> {
         self.at += got;
         self.total += got;
         #[cfg(test)]
-        READ.set(READ.get() + got as u64);
+        if !self.reader.seeks() {
+            READ.set(READ.get() + got as u64);
+        }
         if got < wanted {
             self.ended();
         }
         Ok(got == wanted)
+    }
+
+    /// How many of the `n` rows from row `y`, where the next read starts, the reader
+    /// moves past without reading them: those the data is known to hold whole, where
+    /// the reader seeks ([`DecodedReader::seeks`]); else none.
+    pub(super) fn seekable_rows(&self, y: u32, n: u32) -> u32 {
+        match self.end.get() {
+            Some(&end) if self.reader.seeks() => {
+                let held = u32::try_from(end / self.row_bytes).unwrap_or(u32::MAX);
+                held.saturating_sub(y).min(n)
+            }
+            _ => 0,
+        }
+    }
+
+    /// Moves past the next `n` rows, which [`Self::seekable_rows`] allows.
+    pub(super) fn seek_rows(&mut self, n: u32) -> Result<(), Cancelled> {
+        self.begin();
+        let bytes = n as usize * self.row_bytes;
+        let got = self.reader.skip(bytes, self.meter)?;
+        self.total += got;
+        Ok(())
     }
 
     /// Reads past the rest of the row: what the row held.
@@ -520,16 +544,27 @@ impl MaskRows<'_> {
         self.end_row()
     }
 
-    /// Moves past the next `n` rows: reads past each of a streamed mask's its data
-    /// holds, and jumps over the rest, and over those of a mask decoded whole.
+    /// Moves past the next `n` rows: of a streamed mask, jumps over those its data
+    /// holds whole where its reader seeks, reads past each other one its data holds,
+    /// and jumps over the rest; jumps over those of a mask decoded whole.
     pub(super) fn skip_rows(&mut self, n: u32) -> Result<(), Stop> {
-        for left in (1..=n).rev() {
+        let mut left = n;
+        while left > 0 {
             match self {
                 MaskRows::Streamed { raw, path, row, .. } if !reads_row(raw, path.bits(), *row) => {
                     *row += left;
                     return Ok(());
                 }
-                MaskRows::Streamed { .. } => self.skip_row()?,
+                MaskRows::Streamed { raw, row, .. } if raw.seekable_rows(*row, left) > 0 => {
+                    let k = raw.seekable_rows(*row, left);
+                    raw.seek_rows(k)?;
+                    *row += k;
+                    left -= k;
+                }
+                MaskRows::Streamed { .. } => {
+                    self.skip_row()?;
+                    left -= 1;
+                }
                 MaskRows::Decoded { row, .. } => {
                     *row += left;
                     return Ok(());

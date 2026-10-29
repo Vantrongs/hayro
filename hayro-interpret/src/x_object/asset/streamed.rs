@@ -680,6 +680,13 @@ impl<'s, 'a> ImagePass<'s, 'a> {
         let wanted = area.rows();
         let mut y = std::mem::take(&mut self.first_row);
         while y < wanted.end.min(self.image.grid.height) {
+            if y < wanted.start {
+                let to = self.jump(y, wanted.start)?;
+                if to > y {
+                    y = to;
+                    continue;
+                }
+            }
             if y < wanted.start && !self.reads(y) && !self.image.transparent {
                 // The data ends before row `y`, so it and every row up to those read
                 // are stored zero: only the mask is read past, up to there.
@@ -721,6 +728,28 @@ impl<'s, 'a> ImagePass<'s, 'a> {
             y += 1;
         }
         Ok(())
+    }
+
+    /// Moves past rows from `y`, up to `to`, without reading them, where the colour's
+    /// reader seeks and its data is known to hold them whole (and through a mask read
+    /// alongside, as it moves past rows), up to the next row due a saved state, which
+    /// it saves; returns the row it got to, `y` where it moved past none.
+    fn jump(&mut self, y: u32, to: u32) -> Result<u32, Stop> {
+        let mut n = self.raw.seekable_rows(y, to - y);
+        if let Some(c) = &self.checkpointer {
+            n = n.min(c.next_due(y) - y);
+        }
+        if n == 0 {
+            return Ok(y);
+        }
+        if let Some(m) = &mut self.mask {
+            m.rows.skip_rows(n)?;
+        }
+        self.raw.seek_rows(n)?;
+        if let Some(c) = &self.checkpointer {
+            c.after_row(y + n, &self.raw.reader)?;
+        }
+        Ok(y + n)
     }
 
     /// Whether the bytes of row `y` are read: until the data's end is known, every

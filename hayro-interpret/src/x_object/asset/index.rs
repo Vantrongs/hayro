@@ -111,6 +111,11 @@ pub(super) struct Checkpointer<'c> {
 }
 
 impl Checkpointer<'_> {
+    /// The first row after `row` due a saved state.
+    pub(super) fn next_due(&self, row: u32) -> u32 {
+        (row / self.plan.interval + 1).saturating_mul(self.plan.interval)
+    }
+
     /// Saves `reader`'s state as resuming at `row`, if `row` is due for one and the
     /// index has room for it.
     pub(super) fn after_row(&self, row: u32, reader: &DecodedReader<'_>) -> Result<(), Stop> {

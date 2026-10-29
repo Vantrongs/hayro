@@ -609,6 +609,7 @@ dependencies = [
  "kurbo",
  "libc",
  "log",
+ "md5",
  "moxcms",
  "phf",
  "siphasher",

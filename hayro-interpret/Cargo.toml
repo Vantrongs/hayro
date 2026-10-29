@@ -28,6 +28,7 @@ unicode-bidi = { workspace = true }
 flate2 = { workspace = true, features = ["zlib-rs"] }
 image = { workspace = true, features = ["png"] }
 jpeg-encoder = "0.7"
+md5 = "0.8"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

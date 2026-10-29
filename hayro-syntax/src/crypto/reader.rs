@@ -224,9 +224,57 @@ impl<'a> DecryptedReader<'a> {
         n
     }
 
+    /// Moves past the next `n` decrypted bytes without copying them; returns how many
+    /// the data held, fewer only at the end. Data stored as it is and AES data are
+    /// addressed directly (an AES block decrypts from the stored block before it); RC4,
+    /// a running keystream, makes the keystream of the bytes moved past, counted on
+    /// `meter` a piece at a time.
+    pub(crate) fn skip(&mut self, n: usize, meter: &Meter<'_>) -> Result<usize, Cancelled> {
+        let at = self.at();
+        let target = at.saturating_add(n).min(self.len());
+        let Cursor { cipher, pos } = &mut self.cursor;
+        match cipher {
+            Cipher::None => *pos = target,
+            Cipher::Rc4 { current, .. } => {
+                while *pos < target {
+                    let k = (target - *pos).min(crate::work::POLL_BYTES);
+                    current.skip(k);
+                    *pos += k;
+                    meter.work(k)?;
+                }
+            }
+            Cipher::Aes(blocks) => {
+                // The block holding `target`, after the IV.
+                *pos = 16 + target / 16 * 16;
+                blocks.taken = 0;
+                blocks.end = 0;
+                if !target.is_multiple_of(16) && blocks.next_block(&self.data, pos) {
+                    blocks.taken = target % 16;
+                }
+            }
+        }
+        Ok(target - at)
+    }
+
+    /// The decrypted bytes read.
+    fn at(&self) -> usize {
+        let Cursor { cipher, pos } = &self.cursor;
+        match cipher {
+            Cipher::None | Cipher::Rc4 { .. } => *pos,
+            // Before the first block, the IV; past a block handed out, the block.
+            Cipher::Aes(blocks) if blocks.end == 0 => *pos - 16,
+            Cipher::Aes(blocks) => *pos - 32 + blocks.taken,
+        }
+    }
+
+    /// Whether the data is decrypted with RC4, whose keystream runs from the start.
+    #[cfg(feature = "unsafe")]
+    pub(crate) fn is_rc4(&self) -> bool {
+        matches!(self.cursor.cipher, Cipher::Rc4 { .. })
+    }
+
     /// The bytes the data decrypts to: for AES, the whole blocks after the IV without
     /// the last one's padding, which is decrypted to find it.
-    #[cfg(feature = "images")]
     pub(crate) fn len(&self) -> usize {
         let Cipher::Aes(blocks) = &self.cursor.cipher else {
             return self.data.len();
@@ -496,6 +544,45 @@ mod tests {
                     read.extend_from_slice(&buf[..n]);
                 }
                 assert_eq!(read, expected[at..], "back to {to}");
+            }
+        }
+    }
+
+    /// Moved past any number of bytes from any position, a reader reads on as whole
+    /// decryption returns the data, having moved past as many as the data held.
+    #[test]
+    fn skipping_reads_on_as_whole_decryption() {
+        let id = ObjectIdentifier::new(1234, 17);
+        for decryptor in [
+            Decryptor::None,
+            Decryptor::Rc4 {
+                key: alloc::vec![13; 5],
+            },
+            decryptor(DecryptorTag::Aes128),
+            decryptor(DecryptorTag::Aes256),
+        ] {
+            for len in [0, 1, 15, 16, 17, 31, 32, 33, 100, 5000] {
+                let data: Vec<u8> = (0..len).map(|i| (i * 7 % 253) as u8).collect();
+                // AES data of less than an IV decrypts to nothing.
+                let (Some(expected), Some(mut reader)) = (
+                    decryptor.decrypt(id, &data, DecryptionTarget::Stream),
+                    decryptor.reader(id, &data, DecryptionTarget::Stream),
+                ) else {
+                    continue;
+                };
+                for prefix in [0, 1, 15, 16, 17, 40, 4999] {
+                    for n in [0, 1, 15, 16, 17, 33, 4096, usize::MAX] {
+                        reader.rewind();
+                        let read = reader.read(&mut alloc::vec![0; prefix]);
+                        let skipped = reader.skip(n, &Meter::default()).unwrap();
+                        assert_eq!(skipped, n.min(expected.len() - read), "{len} {prefix} {n}");
+                        assert_eq!(
+                            read_all(&mut reader, 7),
+                            expected[read + skipped..],
+                            "{len}: {prefix} read, {n} skipped"
+                        );
+                    }
+                }
             }
         }
     }

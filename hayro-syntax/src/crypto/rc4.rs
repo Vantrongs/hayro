@@ -47,6 +47,17 @@ impl Rc4 {
         }
     }
 
+    /// Moves the keystream on by `n` bytes, as decrypting `n` bytes would.
+    pub(crate) fn skip(&mut self, n: usize) {
+        for _ in 0..n {
+            self.a = self.a.wrapping_add(1);
+            let tmp = self.s[self.a as usize];
+            self.b = self.b.wrapping_add(tmp);
+            self.s[self.a as usize] = self.s[self.b as usize];
+            self.s[self.b as usize] = tmp;
+        }
+    }
+
     pub(crate) fn encrypt(&mut self, data: &[u8]) -> Vec<u8> {
         self.decrypt(data)
     }
