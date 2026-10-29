@@ -8,7 +8,7 @@ use hayro_interpret::font::GlyphRun;
 use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::{
     BlendMode, CacheKey, ClipPath, Device, DrawMode, DrawProps, Image, ImageData, ImageDrawProps,
-    ImageRequest, InterpreterSettings, Plane, SoftMask,
+    ImageRequest, InterpreterSettings, Plane, RequestError, SoftMask,
 };
 use kurbo::BezPath;
 
@@ -970,4 +970,87 @@ fn an_image_drawn_through_two_entries_decodes_alike() {
         assert_eq!(first, second, "{content}");
         assert_eq!(first.1, [65, 1], "{content}");
     }
+}
+
+/// CCITT data after a Flate filter whose line is preceded by a run of zero fill
+/// bytes, 1, 4 or 16 MiB of it, before its EOL: a request of the line holds what the
+/// decoders hold, not the fill, whose bytes carry no data; its pixels are white, as
+/// the line codes them, and a request is cancelled while the fill is read.
+#[test]
+fn ccitt_fill_after_a_filter_takes_no_room() {
+    let dict = "/Width 8 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 1 \
+                /Filter [/FlateDecode /CCITTFaxDecode] /DecodeParms [null << /K 0 /Columns 8 >>]";
+    let fill = |mib: usize| {
+        let mut data = vec![0; mib << 20];
+        // The EOL's 1, eight white pixels (`10011`), then padding.
+        data.push(0b1100_1100);
+        common::chains::zlib(&data, 6)
+    };
+    let all: Bins = |w, h| ((w, h), [0, 0, w, h]);
+    // What a thread allocates once, before the first image is measured, is not
+    // counted.
+    region_cost(dict, &fill(0), all);
+    let mut peaks = Vec::new();
+    for mib in [1, 4, 16] {
+        let pdf = page(
+            "q 100 0 0 100 0 0 cm /Im Do Q",
+            "/XObject << /Im 5 0 R >>",
+            vec![image(dict, &fill(mib))],
+        );
+        let mut requested = Requested::new(Plane::Image, all);
+        common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+        let [(peak, data)] = &requested.regions[..] else {
+            panic!("one image")
+        };
+        assert_eq!(data, &[255; 8], "{mib} MiB");
+        peaks.push(*peak);
+    }
+    println!("peaks {peaks:?} for 1, 4 and 16 MiB of fill");
+    assert!(
+        peaks.iter().all(|&p| p < 1 << 20) && peaks[2] <= peaks[0] + (64 << 10),
+        "peaks {peaks:?} for 1, 4 and 16 MiB of fill"
+    );
+    let pdf = page(
+        "q 100 0 0 100 0 0 cm /Im Do Q",
+        "/XObject << /Im 5 0 R >>",
+        vec![image(dict, &fill(16))],
+    );
+    let mut cancelled = Cancelled::default();
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut cancelled);
+    assert_eq!(cancelled.results, [Err(RequestError::Cancelled)]);
+}
+
+/// Requests each image's plane whole with a hook that asks to stop at its third poll.
+#[derive(Default)]
+struct Cancelled {
+    results: Vec<Result<(), RequestError>>,
+}
+
+impl<'a> Device<'a> for Cancelled {
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
+    fn draw_glyph_run(&mut self, _: &GlyphRun<'_, 'a>, _: DrawProps<'a>, _: &DrawMode) {}
+    fn draw_image(&mut self, image: Image<'a, '_>, _: ImageDrawProps<'a>) {
+        let asset = match image {
+            Image::Raster(r) => r.asset(),
+            Image::Stencil(s) => s.asset(),
+        };
+        let polls = std::cell::Cell::new(0);
+        let cancel = || {
+            polls.set(polls.get() + 1);
+            polls.get() >= 3
+        };
+        let mut source = asset.open(None, None).expect("streamed");
+        let plane = source.layout().image;
+        let request = ImageRequest {
+            plane: Plane::Image,
+            grid: (plane.width, plane.height),
+            window: [0, 0, plane.width, plane.height],
+            cancel: Some(&cancel),
+        };
+        self.results.push(source.request(&request).map(|_| ()));
+    }
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
 }

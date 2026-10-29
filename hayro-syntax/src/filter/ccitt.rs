@@ -200,7 +200,7 @@ impl<'a> CcittBytes<'a> {
         let feed = Feed {
             state: RefCell::new(FeedState {
                 reader,
-                bytes: Vec::new(),
+                bytes: Kept::default(),
                 start: 0,
                 ended: false,
             }),
@@ -535,8 +535,9 @@ impl Source for Window<'_> {
 /// window's worth past it, and a row whose decoding reads past them is decoded again
 /// from where it started, with twice as many ready (a decoder that read past them
 /// took their end for the data's, so it is not kept). Decoding reads no byte before
-/// where a row's decoding starts, so the feed holds those of the row decoded last, a
-/// window and a chunk.
+/// where a row's decoding starts, so the feed keeps those of the row decoded last, a
+/// window and a chunk, of which a long run of zero bytes, the fill a Group 3 line
+/// may be padded with however long, takes no room ([`Kept`]).
 struct Feed<'a> {
     state: RefCell<FeedState<'a>>,
     /// The bytes made ready past where a row's decoding starts.
@@ -553,7 +554,7 @@ struct Feed<'a> {
 struct FeedState<'a> {
     reader: DecodedReader<'a>,
     /// Decoded bytes, the first at `start` in the data.
-    bytes: Vec<u8>,
+    bytes: Kept,
     start: usize,
     /// Whether `bytes` reach the end of the data.
     ended: bool,
@@ -601,17 +602,18 @@ impl Feed<'_> {
         // Dropped a window at a time, so that the bytes held move once per window.
         let gone = (from - state.start).min(state.bytes.len());
         if gone >= WINDOW {
-            state.bytes.drain(..gone);
+            state.bytes.drop_front(gone);
             state.start += gone;
         }
         let end = from.saturating_add(self.ahead.get());
+        let mut chunk = [0; DECRYPT_CHUNK];
         while !state.ended && state.start + state.bytes.len() < end {
-            let held = state.bytes.len();
-            let wanted = end - (state.start + held);
-            state.bytes.resize(held + wanted.min(DECRYPT_CHUNK), 0);
-            let read = state.reader.read(&mut state.bytes[held..], meter);
-            state.bytes.truncate(held + *read.as_ref().unwrap_or(&0));
-            state.ended = read? == 0;
+            let wanted = end - (state.start + state.bytes.len());
+            let read = state
+                .reader
+                .read(&mut chunk[..wanted.min(DECRYPT_CHUNK)], meter)?;
+            state.bytes.extend(&chunk[..read]);
+            state.ended = read == 0;
         }
         Ok(())
     }
@@ -625,13 +627,142 @@ impl Source for Feed<'_> {
             self.short.set(true);
             return 0;
         };
-        let held = state.bytes.get(at..).unwrap_or_default();
-        let n = held.len().min(out.len());
-        out[..n].copy_from_slice(&held[..n]);
+        let n = state.bytes.copy(at, out);
         if n < out.len() && !state.ended {
             self.short.set(true);
         }
         n
+    }
+}
+
+/// The fewest zero bytes in a row that [`Kept`] keeps as their number.
+const ZERO_RUN: usize = 64;
+
+/// Bytes kept from a position on, a run of at least [`ZERO_RUN`] zero bytes kept as
+/// its length: so fill, which carries no data, takes no room however long it is.
+#[derive(Default)]
+struct Kept {
+    /// The bytes, without those of the runs.
+    bytes: Vec<u8>,
+    /// The runs left out of `bytes`, in order.
+    runs: Vec<Run>,
+    /// The bytes kept, those of the runs included.
+    len: usize,
+    /// The zero bytes `bytes` ends with, after its last run.
+    zeros: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Run {
+    /// The byte of `Kept::bytes` the run comes before.
+    at: usize,
+    /// Its first byte, and its zero bytes.
+    from: usize,
+    len: usize,
+}
+
+impl Kept {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Appends `data`.
+    fn extend(&mut self, mut data: &[u8]) {
+        while let Some((&first, _)) = data.split_first() {
+            let n = data
+                .iter()
+                .position(|&b| (b == 0) != (first == 0))
+                .unwrap_or(data.len());
+            let (piece, rest) = data.split_at(n);
+            data = rest;
+            self.len += n;
+            if first != 0 {
+                self.bytes.extend_from_slice(piece);
+                self.zeros = 0;
+                continue;
+            }
+            match self.runs.last_mut() {
+                Some(run) if run.at == self.bytes.len() => run.len += n,
+                _ if self.zeros + n >= ZERO_RUN => {
+                    self.bytes.truncate(self.bytes.len() - self.zeros);
+                    self.runs.push(Run {
+                        at: self.bytes.len(),
+                        from: self.len - n - self.zeros,
+                        len: self.zeros + n,
+                    });
+                    self.zeros = 0;
+                }
+                _ => {
+                    self.bytes.extend_from_slice(piece);
+                    self.zeros += n;
+                }
+            }
+        }
+    }
+
+    /// Copies the bytes from `at` on into `out`; returns how many it keeps there.
+    fn copy(&self, at: usize, out: &mut [u8]) -> usize {
+        let n = out.len().min(self.len.saturating_sub(at));
+        let mut done = 0;
+        // The runs that end after `at`, and the zero bytes of those before them.
+        let mut next = self.runs.partition_point(|r| r.from + r.len <= at);
+        while done < n {
+            let pos = at + done;
+            let (gone, run) = self.before(next);
+            match run {
+                Some(run) if run.from <= pos => {
+                    let k = (run.from + run.len - pos).min(n - done);
+                    out[done..done + k].fill(0);
+                    done += k;
+                    next += 1;
+                }
+                _ => {
+                    let i = pos - gone;
+                    let end = run.map_or(self.bytes.len(), |r| r.at);
+                    let k = (end - i).min(n - done);
+                    out[done..done + k].copy_from_slice(&self.bytes[i..i + k]);
+                    done += k;
+                }
+            }
+        }
+        n
+    }
+
+    /// The zero bytes of the runs before run `i`, and run `i` if there is one.
+    fn before(&self, i: usize) -> (usize, Option<Run>) {
+        let gone = match i.checked_sub(1).map(|j| self.runs[j]) {
+            Some(r) => r.from + r.len - r.at,
+            None => 0,
+        };
+        (gone, self.runs.get(i).copied())
+    }
+
+    /// Drops the first `n` bytes kept.
+    fn drop_front(&mut self, n: usize) {
+        let n = n.min(self.len);
+        let i = self.runs.partition_point(|r| r.from + r.len <= n);
+        let (gone, run) = self.before(i);
+        // Where byte `n` lies: in run `i`, or among the bytes before it.
+        let cut = match run {
+            Some(run) if run.from <= n => run.at,
+            _ => n - gone,
+        };
+        self.bytes.drain(..cut);
+        self.runs.drain(..i);
+        for run in &mut self.runs {
+            run.at -= cut;
+            if run.from < n {
+                run.len -= n - run.from;
+                run.from = n;
+            }
+            run.from -= n;
+        }
+        self.len -= n;
+        self.zeros = self.zeros.min(self.bytes.len());
     }
 }
 
@@ -842,6 +973,60 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Bytes kept with their long zero runs as lengths read back as kept, from any
+    /// position after appends of any size and drops from the front, and a run of a
+    /// million zero bytes takes no room.
+    #[test]
+    fn kept_bytes_read_back_as_appended() {
+        use super::{Kept, ZERO_RUN};
+        let mut state = 7_u32;
+        let mut next = |n: u32| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state % n
+        };
+        let mut kept = Kept::default();
+        let mut plain: Vec<u8> = Vec::new();
+        for _ in 0..3000 {
+            match next(10) {
+                0..=5 => {
+                    let len = next(3) as usize * ZERO_RUN / 2 + next(40) as usize;
+                    let zero = next(3) > 0;
+                    let piece: Vec<u8> = (0..len)
+                        .map(|_| if zero { 0 } else { next(3) as u8 })
+                        .collect();
+                    kept.extend(&piece);
+                    plain.extend_from_slice(&piece);
+                }
+                6 => {
+                    let n = next(plain.len() as u32 + 1) as usize;
+                    kept.drop_front(n);
+                    plain.drain(..n);
+                }
+                _ => {}
+            }
+            assert_eq!(kept.len(), plain.len());
+            for _ in 0..4 {
+                let at = next(plain.len() as u32 + 2) as usize;
+                let mut out = [0xAA; 8];
+                let wanted = 1 + next(8) as usize;
+                let n = kept.copy(at, &mut out[..wanted]);
+                let expected = plain.get(at..).unwrap_or_default();
+                assert_eq!(n, wanted.min(expected.len()));
+                assert_eq!(out[..n], expected[..n]);
+            }
+        }
+        kept.clear();
+        kept.extend(&[1]);
+        kept.extend(&alloc::vec![0; 1 << 20]);
+        kept.extend(&[2]);
+        assert!(kept.bytes.capacity() < 4 * ZERO_RUN && kept.len() == (1 << 20) + 2);
+        let mut out = [0xAA; 3];
+        assert_eq!(kept.copy((1 << 20) - 1, &mut out), 3);
+        assert_eq!(out, [0, 0, 2]);
     }
 
     #[test]
