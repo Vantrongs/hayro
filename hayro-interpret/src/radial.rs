@@ -5,30 +5,42 @@ use hayro_syntax::object::Number;
 
 /// The leading coefficient of the quadratic the painter solves for the circle of a
 /// radial shading through a point, `|c1 - c0|² - (r1 - r0)²`, of its `/Coords` as
-/// written in the file, with the sign of their exact value: positive where the
-/// circles form a cone, zero where one touches the other inside, negative where
-/// one holds the other apart from it. Every decision between these is made on
-/// this sign, the painter's and the extension's alike.
+/// written in the file, taken to the precision they are written to: zero where
+/// one circle touches the other inside, which the coordinates say wherever some
+/// values they round from make the coefficient zero; otherwise the coefficient of
+/// the values as written, positive where the circles form a cone and negative
+/// where one holds the other apart from it. Every decision between these is made
+/// on this sign, the painter's and the extension's alike.
 ///
-/// No tolerance tells them apart, and no reading in fewer digits: circles a
-/// document writes touching, such as `[10.3 0 0 50.7 0 40.4]`, touch, though in
-/// `f32` a third of such draws are a cone an ulp wide, whose further circles sweep
-/// the end's colour over its whole inside; and `[0 0 0 1000000.25 0 1000000]` is
-/// a cone.
+/// The array is written to the places of its longest number, `k` digits after
+/// its point: a writer printing six places writes 0.500000 as `0.5` and zero as
+/// `0`, dropping the zeros, not the precision. So each of the six, integers
+/// among them, states its value to within half a unit of that place,
+/// `±0.5 × 10^-k`; an array of integers only states its values exactly. So
+/// `[-.223151 -.974784 0 0 0 1]`, a focal point a producer rounded to six places
+/// onto the circle, touches, though as written it lies 2 × 10^-7 outside, where
+/// a cone's further circles would sweep the end's colour over the whole inside;
+/// and `[10.3 0 0 50.7 0 40.4]` touches, though in `f32` a third of such draws
+/// are a cone an ulp wide. But `[0 0 0 1000000.25 0 1000000]`, which its digits
+/// hold to within 10^4 of its coefficient of 5 × 10^5, is a cone.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Lead(f64);
 
 impl Lead {
     /// Of `/Coords [x0 y0 r0 x1 y1 r1]`. Each number with at most 19 significant
     /// digits is its exact decimal ([`Number::as_decimal`]), and the coefficient's
-    /// sign exact ([`decimal_sum`]). A real of more digits, or an integer beyond 64
-    /// bits, hayro-syntax keeps only as the nearest `f64`: then each coordinate is
-    /// read as its nearest `f64`, the coefficient of those is found exactly
-    /// ([`exact_sum`]), and circles it lies within the rounding of those readings
-    /// of touching ([`READ_ROUNDING`]) are taken to touch, which only such
-    /// coordinates may make of a cone or nested circles that close.
+    /// sign exact ([`decimal_sum`]), as are the signs of the least and the most it
+    /// reaches over the values the coordinates round from ([`touching`]). A real of
+    /// more digits, or an integer beyond 64 bits, hayro-syntax keeps only as the
+    /// nearest `f64`: then each coordinate is read as its nearest `f64`, the
+    /// coefficient of those is found exactly ([`exact_sum`]), and circles it lies
+    /// within the rounding of those readings ([`READ_ROUNDING`]) and the precision
+    /// of the array of touching are taken to touch. The two are one interval but
+    /// for its sides: of these readings it is taken as wide on either side as on
+    /// its wider one.
     pub(crate) fn of(coords: [Number; 6]) -> Self {
         let decimals = coords.map(|n| n.as_decimal());
+        let halves = [half_unit(&coords); 6];
         // The terms of the coefficient, each a product of two coordinates, those
         // counted twice listed twice: `x1² - 2 x0 x1 + x0²`, likewise for `y`, less
         // `r1² - 2 r0 r1 + r0²`.
@@ -56,7 +68,12 @@ impl Lead {
                     scale: u64::from(si) + u64::from(sj),
                 }
             });
-            return Self(decimal_sum(terms));
+            let a = decimal_sum(&terms);
+            return Self(if a != 0.0 && touching(&d, &halves, a > 0.0) {
+                0.0
+            } else {
+                a
+            });
         }
         let v = coords.map(nearest_f64);
         let mut parts = Vec::with_capacity(2 * TERMS.len());
@@ -69,7 +86,17 @@ impl Lead {
             size += product.abs();
         }
         let a = exact_sum(&parts);
-        if !a.is_finite() || a.abs() <= size * READ_ROUNDING {
+        // How far the coefficient moves over the values the decimals round from:
+        // `(S + e)² - S²` along each axis, `S` the distance and `e` its precision.
+        let written: f64 = [(0, 3), (1, 4), (2, 5)]
+            .into_iter()
+            .map(|(i, j)| {
+                let half = |k: usize| halves[k].map_or(0.0, nearest_f64_of);
+                let e = half(i) + half(j);
+                (2.0 * (v[j] - v[i]).abs() + e) * e
+            })
+            .sum();
+        if !a.is_finite() || a.abs() <= size * READ_ROUNDING + written * (1.0 + WRITTEN_ROUNDING) {
             Self(0.0)
         } else {
             Self(a)
@@ -100,6 +127,78 @@ const READ_ROUNDING: f64 = {
     (2.0 * u + 3.0 * u * u) * (1.0 + 16.0 * u)
 };
 
+/// The relative rounding of the dozen operations finding how far a coefficient of
+/// `f64` readings moves over the precision of its decimals.
+const WRITTEN_ROUNDING: f64 = 16.0 * f64::EPSILON;
+
+/// Half a unit of the last place an array of numbers is written to,
+/// `0.5 × 10^-k` for its longest number's `k` digits after the point, as a
+/// decimal: the most each of its values may lie from the value it was rounded
+/// from. `None` for an array of integers, which is written exactly.
+fn half_unit(numbers: &[Number]) -> Option<(bool, u64, u32)> {
+    let places = numbers.iter().filter_map(Number::fraction_digits).max()?;
+    Some((false, 5, places.saturating_add(1)))
+}
+
+/// Whether the coefficient of circles whose coordinates are the decimals `d`,
+/// each written to within `halves` of its value, is zero for some values they
+/// round from: the least it reaches is at most zero where the coefficient as
+/// written is positive (`positive`), the most at least zero where it is negative.
+/// Along each axis the distance `s = v1 - v0` lies within `e = h0 + h1` of its
+/// value, so its square ranges from `(|s| - e)²`, or zero where `|s| <= e`, to
+/// `(|s| + e)²`; the coefficient adds those of the centres' axes and subtracts
+/// the radii's. Each bound is a sum of products of two decimals, its sign exact.
+fn touching(
+    d: &[(bool, u64, u32); 6],
+    halves: &[Option<(bool, u64, u32)>; 6],
+    positive: bool,
+) -> bool {
+    let mut terms = Vec::with_capacity(3 * 16);
+    for (axis, (i, j)) in [(0, 3), (1, 4), (2, 5)].into_iter().enumerate() {
+        let radius = axis == 2;
+        let negate = |(negative, digits, scale): (bool, u64, u32)| (!negative, digits, scale);
+        let difference = [d[j], negate(d[i])];
+        // `|s|`: the difference, negated where it is negative.
+        let s = if decimal_sum(&difference.map(Term::of)) < 0.0 {
+            difference.map(negate)
+        } else {
+            difference
+        };
+        let e = [halves[i], halves[j]];
+        // The bound needs `|s| + e` where the centres' distance is most and the
+        // radii's least, so where `positive` the radii's most, and the other way.
+        let most = radius == positive;
+        let mut side: Vec<(bool, u64, u32)> = s.to_vec();
+        for h in e.into_iter().flatten() {
+            side.push(if most { h } else { negate(h) });
+        }
+        if !most {
+            // `|s| - e`, which counts only where it is not below zero.
+            let rest = decimal_sum(&side.iter().map(|&x| Term::of(x)).collect::<Vec<_>>());
+            if rest <= 0.0 {
+                continue;
+            }
+        }
+        for &p in &side {
+            for &q in &side {
+                let mut term = Term::times(p, q);
+                term.negative ^= radius;
+                terms.push(term);
+            }
+        }
+    }
+    let bound = decimal_sum(&terms);
+    if positive { bound <= 0.0 } else { bound >= 0.0 }
+}
+
+/// The `f64` nearest a decimal.
+fn nearest_f64_of((negative, digits, scale): (bool, u64, u32)) -> f64 {
+    let sign = if negative { "-" } else { "" };
+    format!("{sign}{digits}e-{scale}")
+        .parse()
+        .expect("digits and an exponent read as a float")
+}
+
 /// Whether two numbers as written are one value: decimals compared exactly, any
 /// other real by its nearest `f64`.
 pub(crate) fn same(a: Number, b: Number) -> bool {
@@ -125,15 +224,7 @@ fn normal((negative, mut digits, mut scale): (bool, u64, u32)) -> (bool, u64, u3
 /// The `f64` nearest to the number as written, which [`Number::as_f64`] may miss
 /// by a place for a decimal of 17 to 19 digits.
 fn nearest_f64(n: Number) -> f64 {
-    match n.as_decimal() {
-        Some((negative, digits, scale)) => {
-            let sign = if negative { "-" } else { "" };
-            format!("{sign}{digits}e-{scale}")
-                .parse()
-                .expect("digits and an exponent read as a float")
-        }
-        None => n.as_f64(),
-    }
+    n.as_decimal().map_or_else(|| n.as_f64(), nearest_f64_of)
 }
 
 /// `±digits × 10^-scale`.
@@ -144,6 +235,24 @@ struct Term {
     scale: u64,
 }
 
+impl Term {
+    fn of((negative, digits, scale): (bool, u64, u32)) -> Self {
+        Self {
+            negative,
+            digits: u128::from(digits),
+            scale: u64::from(scale),
+        }
+    }
+
+    fn times((n0, d0, s0): (bool, u64, u32), (n1, d1, s1): (bool, u64, u32)) -> Self {
+        Self {
+            negative: n0 ^ n1,
+            digits: u128::from(d0) * u128::from(d1),
+            scale: u64::from(s0) + u64::from(s1),
+        }
+    }
+}
+
 /// The sum of `terms`, rounded: of the exact sum's sign, and zero only where it is
 /// zero. The terms are added from the coarsest scale to the finest into an integer
 /// in units of the scale reached, scaled by ten as each finer one comes; once that
@@ -151,11 +260,16 @@ struct Term {
 /// below them in the integer's, cannot change its sign or its first 53 bits, and
 /// the sum is read from it. So the work does not grow with the scales, however far
 /// apart they lie.
-fn decimal_sum(mut terms: [Term; 12]) -> f64 {
+fn decimal_sum(terms: &[Term]) -> f64 {
+    assert!(terms.len() <= MOST_TERMS, "at most {MOST_TERMS} terms");
+    if terms.is_empty() {
+        return 0.0;
+    }
+    let mut terms = terms.to_vec();
     terms.sort_by_key(|t| t.scale);
     let mut sum = Signed::default();
     let mut unit = terms[0].scale;
-    for term in terms {
+    for term in &terms {
         while unit < term.scale {
             if sum.magnitude.is_zero() {
                 unit = term.scale;
@@ -172,9 +286,12 @@ fn decimal_sum(mut terms: [Term; 12]) -> f64 {
     sum.value(unit)
 }
 
-/// The bit past which a sum of `decimal_sum` is decided: twelve terms below 2^128
-/// stay below 2^132, which is 2^-53 of it.
-const DECIDED: u32 = 185;
+/// The most terms `decimal_sum` adds: three squares of four.
+const MOST_TERMS: usize = 64;
+
+/// The bit past which a sum of `decimal_sum` is decided: `MOST_TERMS` terms below
+/// 2^128 stay below 2^134, which is 2^-53 of it.
+const DECIDED: u32 = 187;
 
 /// An integer of a sign and a magnitude.
 #[derive(Default)]
@@ -216,7 +333,7 @@ impl Signed {
 }
 
 /// An unsigned integer of 256 bits, its lowest 64 first; the sums of
-/// `decimal_sum` stay below 2^190.
+/// `decimal_sum` stay below 2^192.
 #[derive(Clone, Copy, Default, PartialEq)]
 struct U256([u64; 4]);
 
@@ -254,7 +371,7 @@ impl U256 {
             *limb = s;
             carry = c1 || c2;
         }
-        debug_assert!(!carry, "sums stay below 2^190");
+        debug_assert!(!carry, "sums stay below 2^192");
         Self(out)
     }
 
@@ -279,7 +396,7 @@ impl U256 {
             *limb = product as u64;
             carry = product >> 64;
         }
-        debug_assert_eq!(carry, 0, "sums stay below 2^190");
+        debug_assert_eq!(carry, 0, "sums stay below 2^192");
     }
 
     fn to_f64(self) -> f64 {
@@ -356,11 +473,26 @@ mod tests {
         }
     }
 
+    /// The coefficient's least and most over values `e` either way of `s` along
+    /// each of the centres' axes and the radii's, in integers.
+    fn reach(s: [i128; 3], e: [i128; 3]) -> (i128, i128) {
+        let square = |s: i128, e: i128| {
+            let s = s.abs();
+            (if s > e { (s - e).pow(2) } else { 0 }, (s + e).pow(2))
+        };
+        let [x, y, r] = [0, 1, 2].map(|i| square(s[i], e[i]));
+        (x.0 + y.0 - r.1, x.1 + y.1 - r.0)
+    }
+
     /// The sign of the coefficient of circles written as decimals agrees with
-    /// exact integer arithmetic, near touching and far from it: circles written
-    /// touching along an axis and on a 3-4-5 diagonal, at up to six places and
-    /// nine digits, and moved apart by one in the last place or by more, each way.
-    /// The `f32` reading of these takes a third of the touching ones for cones.
+    /// exact integer arithmetic on the values they round from, near touching and
+    /// far from it: circles written touching along an axis and on a 3-4-5
+    /// diagonal, as integers or at up to six places and nine digits, and moved
+    /// apart by one in the last place, which their digits do not tell from
+    /// touching, or by more, each way; about half the numbers written with their
+    /// trailing zeros dropped, as writers drop them, so the array's places are
+    /// its longest number's. The `f32` reading of these takes a third of the
+    /// touching ones for cones.
     #[test]
     fn the_circles_of_decimals_lie_as_exact_arithmetic_says() {
         let mut state = 0x9e37_79b9_7f4a_7c15_u64;
@@ -370,7 +502,8 @@ mod tests {
             state ^= state << 17;
             (state % below as u64) as i64
         };
-        let mut seen = [0; 3];
+        // Nested, touching, a cone, and touching though not as written.
+        let mut seen = [0; 4];
         for _ in 0..20_000 {
             let places = next(7) as u32;
             let size = 10_i64.pow(next(10) as u32).max(10);
@@ -385,24 +518,49 @@ mod tests {
             };
             let nudge = [0, 1, -1, 7, -7, unit / 3, -unit / 3][next(7) as usize];
             let coords = [x0, y0, r0, x0 + dx + nudge, y0 + dy, r0 + dr];
-            let [x0, y0, r0, x1, y1, r1] = coords.map(i128::from);
+            let written = coords.map(|c| {
+                let full = decimal(c, places);
+                if full.contains('.') && next(2) == 0 {
+                    full.trim_end_matches('0').trim_end_matches('.').to_string()
+                } else {
+                    full
+                }
+            });
+            let longest = written
+                .iter()
+                .filter_map(|t| t.split_once('.').map(|(_, f)| f.len() as u32))
+                .max();
+            // In half units of the last of `places`, each coordinate's precision
+            // half a unit of the longest number's last place, none where all are
+            // integers.
+            let [x0, y0, r0, x1, y1, r1] = coords.map(|c| 2 * i128::from(c));
+            let half = longest.map_or(0, |k| 10_i128.pow(places - k));
+            let (least, most) = reach([x1 - x0, y1 - y0, r1 - r0], [2 * half; 3]);
             let exact = (x1 - x0).pow(2) + (y1 - y0).pow(2) - (r1 - r0).pow(2);
-            let written = coords.map(|c| decimal(c, places));
+            let expected = if least <= 0 && most >= 0 {
+                0
+            } else {
+                exact.signum()
+            };
             let got = lead(written.each_ref().map(String::as_str));
-            assert_eq!(sign(got), exact.cmp(&0), "{written:?}");
-            assert_eq!(got.cone(), exact > 0, "{written:?}");
-            seen[(exact.signum() + 1) as usize] += 1;
+            assert_eq!(sign(got), expected.cmp(&0), "{written:?}");
+            assert_eq!(got.cone(), expected > 0, "{written:?}");
+            seen[(expected + 1) as usize] += 1;
+            if expected == 0 && exact != 0 {
+                seen[3] += 1;
+            }
         }
         assert!(seen.iter().all(|&n| n > 1000), "{seen:?}");
     }
 
     /// Coordinates of very different scales are decided exactly too, in steps
-    /// that do not grow with the scales: a centre 10^-100 off touching is nested
-    /// or a cone by the side it lies on, one apart by 10^-60 from another number
-    /// apart by as much touches, and the coefficient's size follows the gap.
+    /// that do not grow with the scales: a centre 10^-100 off touching, written to
+    /// a place finer, is nested or a cone by the side it lies on, one apart by
+    /// 10^-60 from another number apart by as much touches, and the coefficient's
+    /// size follows the gap.
     #[test]
     fn far_apart_scales_are_decided_exactly() {
-        let tiny = format!("0.{}1", "0".repeat(99));
+        let tiny = format!("0.{}10", "0".repeat(99));
         let minus_tiny = format!("-{tiny}");
         assert_eq!(sign(lead(["0", "0", "0", "5", "0", "5"])), Ordering::Equal);
         assert_eq!(sign(lead([&tiny, "0", "0", "5", "0", "5"])), Ordering::Less);
@@ -419,6 +577,64 @@ mod tests {
         assert!((a - 500_000.062_5).abs() < 1e-9, "{a}");
         let a = lead([&minus_tiny, "0", "0", "5", "0", "5"]).value();
         assert!((a / 1e-99 - 1.0).abs() < 1e-12, "{a}");
+    }
+
+    /// Circles touch where their coordinates' digits do not tell them from
+    /// touching, each to half a unit of the last place of the array's longest
+    /// number: focal points a producer rounded to five and six places onto the
+    /// circle, either side of it, and circles of two places a hundredth off,
+    /// touch, the integers among them as imprecise as the rest; where the
+    /// longest number has seven or eight places, the same focal points 10^-7 off
+    /// lie as written, as do circles of two places five hundredths off. An array
+    /// of integers is exact, so the same digits as integers are a cone or nested
+    /// as written; and `1000000.25` from `1000000` is a cone, two places moving
+    /// the coefficient of 5 × 10^5 by 4 × 10^4 at most. A point after a whole
+    /// number states it to half a unit.
+    #[test]
+    fn circles_touch_within_the_precision_they_are_written_to() {
+        let cases: [([&str; 6], Ordering); 17] = [
+            (
+                ["-.223151", "-.974784", "0", "0", "0", "1"],
+                Ordering::Equal,
+            ),
+            (["-.28201", "-.959412", "0", "0", "0", "1"], Ordering::Equal),
+            (["-.891111", ".453785", "0", "0", "0", "1"], Ordering::Equal),
+            (["-.9999", ".0141175", "0", "0", "0", "1"], Ordering::Less),
+            (
+                ["-.999995", "-.00323254", "0", "0", "0", "1"],
+                Ordering::Greater,
+            ),
+            (
+                ["-.999999", "-.00148365", "0", "0", "0", "1"],
+                Ordering::Greater,
+            ),
+            (["0", "0", "0", "3.01", "4", "5.01"], Ordering::Equal),
+            (["0", "0", "0", "3", "4.01", "5.01"], Ordering::Equal),
+            (["0", "0", "0", "3.01", "4", "5"], Ordering::Equal),
+            (["0", "0", "0", "3", "4", "4.99"], Ordering::Equal),
+            (["0", "0", "0", "3.05", "4", "5"], Ordering::Greater),
+            (["0", "0", "0", "2.95", "4", "5"], Ordering::Less),
+            (["0", "0", "0", "3", "4", "5.6"], Ordering::Less),
+            (
+                ["-223151", "-974784", "0", "0", "0", "1000000"],
+                Ordering::Greater,
+            ),
+            (
+                ["-28201", "959412", "0", "0", "0", "1000000"],
+                Ordering::Less,
+            ),
+            (
+                ["0", "0", "0", "1000000.25", "0", "1000000"],
+                Ordering::Greater,
+            ),
+            (
+                ["0", "0", "0", "1000000", "0", "1000000.25"],
+                Ordering::Less,
+            ),
+        ];
+        for (coords, expected) in cases {
+            assert_eq!(sign(lead(coords)), expected, "{coords:?}");
+        }
     }
 
     /// A real of more digits than 64 bits hold is read as its nearest `f64`, and

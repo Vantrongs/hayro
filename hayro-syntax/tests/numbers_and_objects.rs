@@ -396,8 +396,6 @@ fn typed_reads() {
     );
 }
 
-/// Two numbers are equal where both are integers of one value or both reals of one
-/// 64-bit value; an integer never equals a real.
 /// A number's exact decimal is its sign, digits and places after the point as
 /// written, where the digits make an integer below 2^64; any other real has none.
 #[test]
@@ -417,6 +415,27 @@ fn a_number_as_its_exact_decimal() {
     }
 }
 
+/// The digits a number is written with after its point, of a real of any length,
+/// trailing zeros counted; none for an integer of any size.
+#[test]
+fn a_number_as_the_places_it_is_written_to() {
+    for (token, places) in [
+        ("7", None),
+        ("99999999999999999999", None),
+        ("-12", None),
+        ("5.", Some(0)),
+        ("-.223151", Some(6)),
+        ("0.500000", Some(6)),
+        ("5.0000000000000000000000001", Some(25)),
+        ("18446744073709551615.0", Some(1)),
+    ] {
+        assert_eq!(number(token).unwrap().fraction_digits(), places, "{token}");
+    }
+    assert_eq!(Number::from_f32(0.5).fraction_digits(), None);
+}
+
+/// Two numbers are equal where both are integers of one value or both reals of one
+/// 64-bit value; an integer never equals a real.
 #[test]
 fn equality() {
     let n = |t: &str| number(t).unwrap();
