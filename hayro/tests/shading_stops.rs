@@ -49,8 +49,9 @@ fn row((x0, x1): (u8, u8), function: Vec<u8>) -> Vec<u8> {
 /// than half a pixel off.
 #[test]
 fn an_axial_shading_paints_its_function_at_each_pixel() {
-    type Exact = fn(f64) -> f64;
-    let cases: [(&str, (u8, u8), Vec<u8>, Exact); 3] = [
+    /// A name, the span of the axis in pixels, the function and its value.
+    type Case = (&'static str, (u8, u8), Vec<u8>, fn(f64) -> f64);
+    let cases: [Case; 3] = [
         (
             "lone sample",
             (0, 100),
