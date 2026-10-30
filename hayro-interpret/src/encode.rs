@@ -446,7 +446,7 @@ impl EncodedShadingPattern {
     /// disc. A renderer that multiplies a shape's coverage of a pixel by the
     /// shading's there would cut such a pixel twice: a shape covering half of it
     /// would paint a quarter. A radial shading is extended only where one of its
-    /// circles holds the other as it is painted ([`radial_cone`]), as elsewhere
+    /// circles holds the other ([`radial_cone`]), as elsewhere
     /// extending an end changes which circle a point it painted lies on. A mesh
     /// has no such edges here.
     ///
@@ -540,7 +540,7 @@ impl EncodedShadingPattern {
                     // it or after: one end is the larger circle's inside, the other
                     // the smaller one's outside.
                     let grows = r1 >= r0;
-                    if radial_cone(p1, r).is_some() {
+                    if radial_cone(p1, r) {
                         return Ok(());
                     }
                     let (large, small) = if grows {
@@ -1404,24 +1404,38 @@ fn unit_to_line(p0: Point, p1: Point) -> Affine {
     ])
 }
 
-/// The leading coefficient of the quadratic [`radial_pos`] solves for the circle a
-/// point lies on, as it computes it, where it solves it as a quadratic and that is
-/// positive: the circles of a radial shading with centres `0` and `p1` and radii
-/// `r` form a cone as painted, and every point within the one ending it lies on a
-/// circle past that end too. `None` where one holds the other as painted: the
-/// coefficient is negative, or so near zero the painter solves a line, which
-/// meets each point's circles once.
-fn radial_cone(p1: Point, r: Point) -> Option<f32> {
-    let (dx, dy) = (p1.x as f32, p1.y as f32);
-    let dr = r.y as f32 - r.x as f32;
-    let a = dx * dx + dy * dy - dr * dr;
-    (a >= RADIAL_LINEAR).then_some(a)
+/// Whether the circles of a radial shading with centres `0` and `p1` and radii `r`
+/// form a cone, the leading coefficient of the quadratic [`radial_pos`] solves for
+/// a point's circle positive (`radial_a`): every point within the circle ending it
+/// then lies on a circle past that end too. Where it is not, one circle holds the
+/// other, and a point within them lies on one of the circles between.
+fn radial_cone(p1: Point, r: Point) -> bool {
+    radial_a(p1, r) > 0.0
 }
 
-/// The magnitude of the leading coefficient below which [`radial_pos`] solves a
-/// line, not a quadratic.
-const RADIAL_LINEAR: f32 = 1e-6;
+/// The leading coefficient of the quadratic [`radial_pos`] solves, `|p1|² - dr²`;
+/// zero within `COORDINATE_ROUNDING` of its terms, as for circles a document
+/// draws one touching the other inside, whose coordinates, read as `f32`, place
+/// them only so near: a rounding's cone would put every point within them on a
+/// circle past their end.
+fn radial_a(p1: Point, r: Point) -> f64 {
+    let dr = r.y - r.x;
+    let (along, across) = (p1.x * p1.x + p1.y * p1.y, dr * dr);
+    let a = along - across;
+    if a.abs() <= COORDINATE_ROUNDING * (along + across) {
+        0.0
+    } else {
+        a
+    }
+}
 
+/// The share of its terms `radial_a` rounds to zero: a few times the rounding of a
+/// coordinate read as `f32` and of the difference of two.
+const COORDINATE_ROUNDING: f64 = 4.0 * f32::EPSILON as f64;
+
+/// The parameter of the circle through `pos`, in `f64`: in `f32`, a point 10⁹
+/// units from the origin is placed to 64 units, and points that near a circle
+/// lie on it.
 fn radial_pos(
     pos: &Point,
     p1: &Point,
@@ -1429,15 +1443,12 @@ fn radial_pos(
     min_extend: bool,
     max_extend: bool,
 ) -> Option<f32> {
-    let r0 = r.x as f32;
-    let dx = p1.x as f32;
-    let dy = p1.y as f32;
-    let dr = r.y as f32 - r0;
+    let r0 = r.x;
+    let (dx, dy) = (p1.x, p1.y);
+    let dr = r.y - r0;
+    let (px, py) = (pos.x, pos.y);
 
-    let px = pos.x as f32;
-    let py = pos.y as f32;
-
-    let a = dx * dx + dy * dy - dr * dr;
+    let a = radial_a(*p1, r);
     let b = -2.0 * (px * dx + py * dy + r0 * dr);
     let c = px * px + py * py - r0 * r0;
 
@@ -1448,8 +1459,8 @@ fn radial_pos(
         return None;
     }
 
-    if a.abs() < RADIAL_LINEAR {
-        if b.abs() < 1e-6 {
+    if a == 0.0 {
+        if b == 0.0 {
             return None;
         }
 
@@ -1464,7 +1475,7 @@ fn radial_pos(
             return None;
         }
 
-        return Some(t);
+        return Some(t as f32);
     }
 
     // The root whose terms add, and the other from the roots' product `c / a`:
@@ -1489,9 +1500,9 @@ fn radial_pos(
     }
 
     match (take_min, take_max) {
-        (Some(_), Some(max)) => Some(max),
-        (Some(min), None) => Some(min),
-        (None, Some(max)) => Some(max),
+        (Some(_), Some(max)) => Some(max as f32),
+        (Some(min), None) => Some(min as f32),
+        (None, Some(max)) => Some(max as f32),
         (None, None) => None,
     }
 }
@@ -2971,6 +2982,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A radial shading paints each point the colour of the circle it lies on, at
+    /// any size: points 10 to 90 units past a circle 10⁹ units across, which in
+    /// `f32` lay on it, paint nothing; and a point between circles one nearly
+    /// touches inside the other, whose root cancelled to 2 in `f32`, past the
+    /// shading's end, paints the colour at 0.96, not nothing.
+    #[test]
+    fn a_radial_shading_paints_each_point_on_its_own_circle() {
+        let color_at = |coords: &str, point: Point| {
+            let mut encoded = shading_pattern(&[
+                "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+                format!(
+                    "<< /ShadingType 3 /ColorSpace /DeviceRGB /Coords [{coords}] \
+                     /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] \
+                     /N 1 >> >>"
+                ),
+            ]);
+            encoded.matrix = Affine::IDENTITY;
+            let mut color = [0.0; 4];
+            encoded
+                .encode()
+                .sample_points_metered(&[point], &mut super::Unmetered, |c| color = c)
+                .expect("unmetered");
+            color
+        };
+        for x in [10.0, 20.0, 32.0, 90.0] {
+            let far = "-1000000000 0 0 -1000000000 0 1000000000";
+            assert_eq!(color_at(far, Point::new(x, 50.0)), [0.0; 4], "{x}");
+        }
+        let touching = "-28.378400802612305 -23.183061599731445 65.53812408447266 \
+                        -48.73333740234375 -2.4536094665527344 36.48586654663086";
+        let color = color_at(touching, Point::new(-10.740612721343854, 2.219963409998261));
+        assert!(
+            (color[2] - 0.961).abs() < 0.01 && color[3] == 1.0,
+            "{color:?}"
+        );
     }
 
     /// A circle as producers draw it: four cubic arcs reaching 0.027 % of its
