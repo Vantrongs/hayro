@@ -738,12 +738,9 @@ pub fn interpret<'a>(
                         let (dict, stream) = dict_or_stream(&o)?;
                         Shading::new(dict, stream, &context.interpreter_cache.object_cache)
                     })
-                    .map(|mut s| {
-                        // A shading's background fills only a shading pattern's
-                        // shape, not what `sh` paints (the PDF specification on `/Background`).
-                        s.background = None;
+                    .map(|s| {
                         Pattern::Shading(ShadingPattern {
-                            shading: Arc::new(s),
+                            shading: Arc::new(s.without_background()),
                             matrix: Affine::IDENTITY,
                             // Set where it paints.
                             opacity: 1.0,

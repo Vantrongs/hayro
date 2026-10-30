@@ -33,7 +33,7 @@ impl Renderer<'_> {
                     Pattern::Shading(s) => {
                         const NATIVE_GRADIENT_TOLERANCE: f32 = 0.01;
 
-                        clip_path = s.shading.clip_path.clone();
+                        clip_path = s.clip_path();
                         let encoded = s.encode();
                         let mut bbox = (*path_transform * path_bbox().to_path(0.0)).bounding_box();
 

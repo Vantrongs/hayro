@@ -153,7 +153,7 @@ impl<'a> SvgRenderer<'a> {
                             }
                         };
 
-                        let clip_path = s.shading.clip_path.clone().map(|path| {
+                        let clip_path = s.clip_path().map(|path| {
                             self.clip_paths.insert(CachedClipPath::Path {
                                 path,
                                 fill_rule: FillRule::NonZero,

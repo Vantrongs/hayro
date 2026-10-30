@@ -44,8 +44,8 @@ impl<'a> Device<'a> for Rec {
                 },
                 Pattern::Shading(s) => Painted::Shading {
                     matrix: s.matrix,
-                    clip: s.shading.clip_path.as_ref().map(Shape::bounding_box),
-                    function_matrix: match s.shading.shading_type.as_ref() {
+                    clip: s.clip_path().as_ref().map(Shape::bounding_box),
+                    function_matrix: match s.shading.shading_type().as_ref() {
                         ShadingType::FunctionBased { matrix, .. } => Some(*matrix),
                         _ => None,
                     },

@@ -8,7 +8,7 @@ use crate::color::{ColorComponents, ColorSpace};
 use crate::encode::Cost;
 use crate::function::{Function, StitchingBounds, Values, interpolate, sorting};
 use crate::interpret::annotation::entries::Entries;
-use crate::util::{Float32Ext, PointExt};
+use crate::util::{Float32Ext, PointExt, hash128};
 use hayro_syntax::bit_reader::BitReader;
 use hayro_syntax::object::Array;
 use hayro_syntax::object::Dict;
@@ -144,18 +144,15 @@ pub enum ShadingType {
     Dummy,
 }
 
-/// A PDF shading.
+/// A PDF shading. Its fields are read, not set: its cache key stands for all of
+/// them, so two shadings with one key paint alike.
 #[derive(Clone, Debug)]
 pub struct Shading {
     cache_key: u128,
-    /// The type of shading.
-    pub shading_type: Arc<ShadingType>,
-    /// The color space of the shading.
-    pub color_space: ColorSpace,
-    /// A clip path that should be applied to the shading.
-    pub clip_path: Option<BezPath>,
-    /// The background color of the shading.
-    pub background: Option<SmallVec<[f32; 4]>>,
+    shading_type: Arc<ShadingType>,
+    color_space: ColorSpace,
+    clip_path: Option<BezPath>,
+    background: Option<SmallVec<[f32; 4]>>,
 }
 
 impl Shading {
@@ -327,6 +324,37 @@ impl Shading {
             clip_path: bbox.map(|r| r.to_path(0.1)),
             background,
         })
+    }
+}
+
+impl Shading {
+    /// The type of shading.
+    pub fn shading_type(&self) -> &Arc<ShadingType> {
+        &self.shading_type
+    }
+
+    /// The color space of the shading.
+    pub fn color_space(&self) -> &ColorSpace {
+        &self.color_space
+    }
+
+    /// The shading's `/BBox` as a path in its own space, which it is clipped to.
+    pub fn clip_path(&self) -> Option<&BezPath> {
+        self.clip_path.as_ref()
+    }
+
+    /// The background color of the shading.
+    pub fn background(&self) -> Option<&[f32]> {
+        self.background.as_deref()
+    }
+
+    /// The shading without its background, as `sh` paints it (the PDF
+    /// specification on `/Background`), under a key of its own where it had one.
+    pub(crate) fn without_background(mut self) -> Self {
+        if self.background.take().is_some() {
+            self.cache_key = hash128(&(self.cache_key, "without background"));
+        }
+        self
     }
 }
 

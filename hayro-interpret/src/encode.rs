@@ -895,8 +895,8 @@ impl ShadingPattern {
         &self,
         meter: &mut dyn Meter,
     ) -> Result<EncodedShadingPattern, Exhausted> {
-        let color_space = &self.shading.color_space;
-        if self.shading.background.is_some() {
+        let color_space = self.shading.color_space();
+        if self.shading.background().is_some() {
             take(meter, color_space.setup_cost() + color_space.cost())?;
         }
         Ok(self.encode())
@@ -906,7 +906,7 @@ impl ShadingPattern {
     pub fn encode(&self) -> EncodedShadingPattern {
         let base_transform;
 
-        let shading_type = match self.shading.shading_type.as_ref() {
+        let shading_type = match self.shading.shading_type().as_ref() {
             ShadingType::FunctionBased {
                 domain,
                 matrix,
@@ -935,7 +935,7 @@ impl ShadingPattern {
                 base_transform = Affine::IDENTITY;
 
                 EncodedShadingType::Sampled(EncodedSampledShading {
-                    mesh: self.shading.shading_type.clone(),
+                    mesh: self.shading.shading_type().clone(),
                     transform: self.matrix,
                     function: function.clone(),
                 })
@@ -953,12 +953,11 @@ impl ShadingPattern {
             (EncodedShadingType::Background, Affine::IDENTITY)
         };
 
-        let color_space = self.shading.color_space.clone();
+        let color_space = self.shading.color_space().clone();
 
         let background_color = self
             .shading
-            .background
-            .as_ref()
+            .background()
             .map(|b| color_space.to_rgba(b, 1.0))
             .unwrap_or(AlphaColor::TRANSPARENT);
 
@@ -2096,7 +2095,7 @@ mod tests {
                 tint.clone(),
                 components.clone(),
             ]);
-            let cost = pattern.shading.color_space.cost();
+            let cost = pattern.shading.color_space().cost();
             assert_eq!(cost, Cost::new(u64::MAX), "{space}");
             let encoded = pattern.encode();
             assert_eq!(encoded.point_cost(), Cost::new(u64::MAX), "{space}");

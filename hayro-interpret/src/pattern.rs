@@ -52,8 +52,6 @@ impl<'a> Pattern<'a> {
         match self {
             Self::Shading(p) => {
                 p.matrix = transform * p.matrix;
-                let transformed_clip_path = p.shading.clip_path.clone().map(|r| p.matrix * r);
-                Arc::make_mut(&mut p.shading).clip_path = transformed_clip_path;
             }
             Self::Tiling(p) => p.matrix = transform * p.matrix,
         }
@@ -116,6 +114,13 @@ impl ShadingPattern {
             matrix,
             transfer_function: None,
         })
+    }
+}
+
+impl ShadingPattern {
+    /// The shading's `/BBox` placed by `matrix`, which it is clipped to.
+    pub fn clip_path(&self) -> Option<BezPath> {
+        self.shading.clip_path().map(|path| self.matrix * path)
     }
 }
 

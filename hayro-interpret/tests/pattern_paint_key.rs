@@ -144,3 +144,69 @@ fn a_transfer_function_changes_a_shading_key() {
     );
     assert_eq!(plain, reset, "after /TR /Identity");
 }
+
+/// The cache key of each shading painted, and whether it paints a background.
+#[derive(Default)]
+struct ShadingKeys(Vec<(u128, bool)>);
+
+impl<'a> Device<'a> for ShadingKeys {
+    fn draw_path(&mut self, _: &BezPath, props: DrawProps<'a>, _: &DrawMode) {
+        if let Paint::Pattern(p) = &props.paint
+            && let Pattern::Shading(s) = p.as_ref()
+        {
+            self.0
+                .push((s.cache_key(), s.shading.background().is_some()));
+        }
+    }
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
+    fn draw_glyph_run(&mut self, _: &GlyphRun<'_, 'a>, _: DrawProps<'a>, _: &DrawMode) {}
+    fn draw_image(&mut self, _: Image<'a, '_>, _: ImageDrawProps<'a>) {}
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
+}
+
+/// `sh` paints a shading without its background, a shading pattern of the same
+/// shading with it: their keys differ, so a cache keyed by them holds both, in
+/// either order. A renderer caching by key painted whichever came first for both.
+/// A shading without a background paints alike either way, under one key.
+#[test]
+fn a_shading_painted_by_sh_has_another_key_than_its_pattern() {
+    let shading = |background: &str| {
+        format!(
+            "<< /ShadingType 2 /ColorSpace /DeviceRGB {background} /Coords [40 0 60 0] \
+             /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [1 0 0] /N 1 >> >>"
+        )
+        .into_bytes()
+    };
+    let keys = |content: &[u8]| {
+        let file = common::one_page(
+            100,
+            "/Contents 4 0 R /Resources << /Shading << /A 5 0 R /N 6 0 R >> \
+             /Pattern << /P << /PatternType 2 /Shading 5 0 R >> \
+             /Q << /PatternType 2 /Shading 6 0 R >> >> >>",
+            vec![
+                common::stream("", content),
+                shading("/Background [0 1 0]"),
+                shading(""),
+            ],
+        );
+        let pdf = Pdf::new(file).expect("valid pdf");
+        let mut rec = ShadingKeys::default();
+        common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut rec);
+        rec.0
+    };
+    let fill = "/Pattern cs /P scn 0 0 100 100 re f";
+    for content in [format!("/A sh {fill}"), format!("{fill} /A sh")] {
+        let k = keys(content.as_bytes());
+        let (direct, pattern) = if content.starts_with("/A") {
+            (k[0], k[1])
+        } else {
+            (k[1], k[0])
+        };
+        assert_eq!((direct.1, pattern.1), (false, true), "{content}");
+        assert_ne!(direct.0, pattern.0, "{content}");
+    }
+    let k = keys(b"/N sh /Pattern cs /Q scn 0 0 100 100 re f");
+    assert_eq!(k[0], k[1]);
+}
