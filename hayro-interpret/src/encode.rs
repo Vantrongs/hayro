@@ -2,8 +2,7 @@
 
 use crate::color::{AlphaColor, ColorComponents, ColorSpace};
 use crate::flatten::ControlHull;
-use crate::function::shape::Piece;
-use crate::gradient::{SvgGradientStop, color_at};
+use crate::gradient::{StopMemo, SvgGradientStop, color_at};
 use crate::interpret::state::ActiveTransferFunction;
 use crate::pattern::ShadingPattern;
 use crate::radial::Lead;
@@ -13,7 +12,7 @@ use hayro_syntax::hash;
 use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape, Vec2};
 use smallvec::{SmallVec, ToSmallVec, smallvec};
 use std::ops::Range;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 /// Steps of work: an operator of a function run, a value read, computed or
 /// written, a pixel visited. Its arithmetic saturates, so a cost made of others
@@ -163,9 +162,9 @@ pub struct EncodedRadialAxialShading {
     pub(crate) params: RadialAxialParams,
     pub(crate) domain: [f32; 2],
     pub(crate) extend: [bool; 2],
-    /// Its function's shape over its domain, found when its stops are first
-    /// found ([`EncodedRadialAxialShading::stops_metered`]).
-    pub(crate) shape: OnceLock<Vec<Piece>>,
+    /// What finding its stops learns of it, kept for every paint of its
+    /// shading ([`EncodedRadialAxialShading::stops_metered`]).
+    pub(crate) memo: Arc<StopMemo>,
 }
 
 /// Encoded mesh shading, sampled at the device pixels a texture reads.
@@ -762,7 +761,7 @@ impl EncodedShadingPattern {
 
     /// A color the shading evaluated to, with its opacity and transfer function.
     #[inline]
-    fn finish(&self, color: Option<AlphaColor>) -> [f32; 4] {
+    pub(crate) fn finish(&self, color: Option<AlphaColor>) -> [f32; 4] {
         color
             .map(|v| {
                 let mut components = v.components();
@@ -1044,9 +1043,17 @@ impl ShadingPattern {
                 function,
                 extend,
                 axial,
+                memo,
             } => {
-                let (encoded, initial_transform) =
-                    encode_axial_shading(*coords, *lead, *domain, function, *extend, *axial);
+                let (encoded, initial_transform) = encode_axial_shading(
+                    *coords,
+                    *lead,
+                    *domain,
+                    function,
+                    *extend,
+                    *axial,
+                    memo.clone(),
+                );
 
                 base_transform = initial_transform * self.matrix.inverse();
 
@@ -1102,6 +1109,7 @@ fn encode_axial_shading(
     function: &ShadingFunction,
     extend: [bool; 2],
     is_axial: bool,
+    memo: Arc<StopMemo>,
 ) -> (EncodedShadingType, Affine) {
     let initial_transform;
 
@@ -1132,7 +1140,7 @@ fn encode_axial_shading(
             params,
             domain,
             extend,
-            shape: OnceLock::new(),
+            memo,
         }),
         initial_transform,
     )
@@ -2218,6 +2226,12 @@ mod tests {
 
     /// The pattern object 4 of a one-page file of `objects`, numbered from 4.
     fn shading_pattern(objects: &[String]) -> crate::pattern::ShadingPattern {
+        shading_patterns(objects, 1).remove(0)
+    }
+
+    /// The pattern object 4 of a one-page file of `objects`, numbered from 4,
+    /// read `n` times through one cache, as a page reads it where it paints it.
+    fn shading_patterns(objects: &[String], n: usize) -> Vec<crate::pattern::ShadingPattern> {
         use hayro_syntax::object::{Dict, ObjectIdentifier};
         let mut all = crate::fixtures::one_page_objects(10, "");
         all.extend(objects.iter().map(|o| o.clone().into_bytes()));
@@ -2227,7 +2241,10 @@ mod tests {
             .xref()
             .get::<Dict<'_>>(ObjectIdentifier::new(4, 0))
             .expect("a pattern");
-        crate::pattern::ShadingPattern::new(&dict, &crate::cache::Cache::new()).expect("a shading")
+        let cache = crate::cache::Cache::new();
+        (0..n)
+            .map(|_| crate::pattern::ShadingPattern::new(&dict, &cache).expect("a shading"))
+            .collect()
     }
 
     /// A tint transform whose evaluation takes more steps than a `u64` counts

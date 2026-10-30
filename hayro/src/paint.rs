@@ -6,6 +6,7 @@ use hayro_interpret::pattern::Pattern;
 use hayro_interpret::util::x_y_advances;
 use kurbo::{Affine, BezPath, Rect, Shape};
 use std::sync::Arc;
+use vello_common::encode::{EncodeExt, EncodedPaint};
 use vello_cpu::color::{AlphaColor, DynamicColor, Srgb};
 use vello_cpu::peniko::{ColorStop, Gradient, ImageQuality, ImageSampler};
 use vello_cpu::{Image, ImageSource, Level, PaintType, PixelMetadata, Pixmap, peniko};
@@ -57,9 +58,9 @@ impl Renderer<'_> {
                             _ => None,
                         };
                         if let Some((gradient, transform)) = native {
-                            paint_transform = path_transform.inverse()
-                                * Affine::translate((-0.5, -0.5))
-                                * transform;
+                            // vello reads a gradient at each pixel's centre, as the
+                            // shading is sampled.
+                            paint_transform = path_transform.inverse() * transform;
                             PaintType::Gradient(gradient)
                         } else {
                             let (width, height) = texture_dimensions(bbox, 1.0);
@@ -179,12 +180,28 @@ impl Renderer<'_> {
     }
 }
 
-/// The gradient vello draws for `native`, and its transform, where it paints
-/// within a level of its stops ([`SvgGradient::paints_within_a_level`]): its
-/// table of colors, as vello builds it at `level`, is fine enough for them.
-/// `None` where it is not, so the shading is sampled instead.
+/// The gradient vello draws for `native`, and the transform from the paint's
+/// space to the device, where it paints within a level of its stops
+/// ([`SvgGradient::paints_within_a_level`]): its table of colors, as vello
+/// builds it at `level`, is fine enough for them. `None` where it is not, so
+/// the shading is sampled instead.
 fn native_gradient(native: &SvgGradient, level: Level) -> Option<(Gradient, Affine)> {
-    use vello_common::encode::{EncodeExt, EncodedPaint};
+    let gradient = drawn(native);
+    let mut paints = Vec::new();
+    gradient.encode_into(&mut paints, Affine::IDENTITY, None)?;
+    // Fewer than two stops encode a solid color, which needs no table.
+    let fits = match paints.pop() {
+        Some(EncodedPaint::Gradient(encoded)) => vello_common::fearless_simd::dispatch!(
+            level,
+            simd => native.paints_within_a_level(encoded.u8_lut(simd).lut())
+        ),
+        _ => true,
+    };
+    fits.then_some((gradient, native.transform))
+}
+
+/// The gradient vello draws for `native`'s stops.
+fn drawn(native: &SvgGradient) -> Gradient {
     let stops = native
         .stops
         .iter()
@@ -193,20 +210,82 @@ fn native_gradient(native: &SvgGradient, level: Level) -> Option<(Gradient, Affi
             color: DynamicColor::from_alpha_color(AlphaColor::<Srgb>::new(stop.color)),
         })
         .collect::<Vec<_>>();
-    let gradient = match native.kind {
+    match native.kind {
         SvgGradientKind::Linear { start, end } => Gradient::new_linear(start, end),
     }
     .with_extend(peniko::Extend::Pad)
-    .with_stops(stops.as_slice());
-    let mut paints = Vec::new();
-    gradient.encode_into(&mut paints, Affine::IDENTITY, None)?;
-    // Fewer than two stops encode a solid color, which needs no table.
-    let lut_fits = match paints.pop() {
-        Some(EncodedPaint::Gradient(encoded)) => vello_common::fearless_simd::dispatch!(
-            level,
-            simd => native.paints_within_a_level(encoded.u8_lut(simd).lut())
-        ),
-        _ => true,
-    };
-    lut_fits.then_some((gradient, native.transform))
+    .with_stops(stops.as_slice())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{drawn, native_gradient};
+    use hayro_interpret::gradient::{SvgGradient, SvgGradientKind, SvgGradientStop};
+    use kurbo::{Affine, Point};
+    use vello_common::encode::{EncodeExt, EncodedPaint};
+    use vello_cpu::Level;
+
+    fn gray(offset: f32, level: f32) -> SvgGradientStop {
+        let v = level / 255.0;
+        SvgGradientStop {
+            offset,
+            color: [v, v, v, 1.0],
+        }
+    }
+
+    /// Where [`rise`] starts: nine tenths of the way from the 1638th of 4096
+    /// equal steps to the next, past the 1638th entry of a table of 4096 at
+    /// 1638/4095.
+    const RISE: f32 = 1638.9 / 4096.0;
+
+    /// Gray rising from 100 to 103 levels from [`RISE`] over nine tenths of an
+    /// entry of 4096, flat around, for a gradient 1000 pixels long: a step of a
+    /// color table of three levels, a fourth of a pixel wide, as the shading
+    /// drawn directly may be off by there, and flat at the entry before it.
+    fn rise() -> SvgGradient {
+        let x0 = RISE;
+        SvgGradient {
+            kind: SvgGradientKind::Linear {
+                start: Point::ZERO,
+                end: Point::new(1.0, 0.0),
+            },
+            transform: Affine::IDENTITY,
+            stops: vec![
+                gray(0.0, 100.0),
+                gray(1.0 / 4095.0, 100.0),
+                gray(x0 - 0.2 / 4095.0, 100.0),
+                gray(x0, 100.0),
+                gray(x0 + 0.9 / 4095.0, 103.0),
+                gray(1.0, 103.0),
+            ],
+            range: (0.0, 1.0),
+            pixel_step: 1.0 / 1000.0,
+            table_steps: vec![0.0, 0.0, 0.0, 3.0, 3.0, 0.0],
+        }
+    }
+
+    /// A gradient whose color steps by three levels within an entry, a step of
+    /// a color table, is drawn natively: each entry of vello's table holds the
+    /// color of its stops at its own place, the entry just before the step
+    /// the flat 100 there.
+    #[test]
+    fn a_gradient_stepping_within_an_entry_is_drawn_natively() {
+        let native = rise();
+        let mut paints = Vec::new();
+        drawn(&native)
+            .encode_into(&mut paints, Affine::IDENTITY, None)
+            .expect("a gradient");
+        let Some(EncodedPaint::Gradient(encoded)) = paints.pop() else {
+            panic!("a gradient's table");
+        };
+        let lut = vello_common::fearless_simd::dispatch!(
+            Level::new(),
+            simd => encoded.u8_lut(simd).lut().to_vec()
+        );
+        assert_eq!(lut.len(), 4096);
+        const { assert!((1638.0 / 4095.0) < RISE) };
+        assert_eq!(lut[1638][0], 100);
+        assert!(native.paints_within_a_level(&lut));
+        assert!(native_gradient(&native, Level::new()).is_some());
+    }
 }

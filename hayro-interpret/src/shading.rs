@@ -8,6 +8,7 @@ use crate::color::{ColorComponents, ColorSpace};
 use crate::encode::Cost;
 use crate::function::shape::{self, Piece};
 use crate::function::{Function, OVER_POINTS_COUNT, Values, interpolate, sorting};
+use crate::gradient::StopMemo;
 use crate::interpret::annotation::entries::Entries;
 use crate::radial::{Lead, same};
 use crate::util::{PointExt, hash128};
@@ -132,6 +133,8 @@ pub enum ShadingType {
         extend: [bool; 2],
         /// Whether the shading is axial or radial.
         axial: bool,
+        /// What finding its stops learns of it, for each paint of it.
+        memo: Arc<StopMemo>,
     },
     /// A triangle-mesh shading.
     TriangleMesh {
@@ -173,7 +176,16 @@ pub struct Shading {
 }
 
 impl Shading {
+    /// The shading of `dict`, read once in `cache`: each use of it shares what
+    /// painting it learns ([`StopMemo`]).
     pub(crate) fn new(dict: &Dict<'_>, stream: Option<&Stream<'_>>, cache: &Cache) -> Option<Self> {
+        let cache_key = dict.cache_key();
+        cache.get_or_insert_with(hash128(&(cache_key, "shading")), || {
+            Self::read(dict, stream, cache)
+        })
+    }
+
+    fn read(dict: &Dict<'_>, stream: Option<&Stream<'_>>, cache: &Cache) -> Option<Self> {
         let cache_key = dict.cache_key();
 
         let shading_num = dict.get::<u8>(SHADING_TYPE)?;
@@ -220,6 +232,7 @@ impl Shading {
                         coords,
                         lead: Lead::of(read),
                         axial,
+                        memo: Arc::default(),
                     }
                 }
             }

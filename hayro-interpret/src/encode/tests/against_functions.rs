@@ -5,6 +5,7 @@
 
 use super::shading_pattern;
 use crate::encode::{EncodedShadingPattern, EncodedShadingType};
+use crate::gradient::levels_apart;
 use kurbo::{Point, Rect};
 use smallvec::smallvec;
 
@@ -304,35 +305,16 @@ fn direct(encoded: &EncodedShadingPattern, t: f64) -> [f32; 4] {
     encoded.finish(values.map(|v| encoded.color_space.to_rgba(&v, 1.0)))
 }
 
-/// How far the color moves where hayro's color tables read a component of the
-/// function's outputs at `t` as the next 8-bit value, which a color space other
-/// than gray and RGB does: it reads each to 8 bits, so its colors step from one
-/// to the next, and straight lines between stops cut across the steps.
+/// The [`table_step`](crate::gradient::table_step) of the function's outputs
+/// at `t`, the shading's own as its native gradient is checked against.
 fn table_step(encoded: &EncodedShadingPattern, t: f64) -> f32 {
     let EncodedShadingType::RadialAxial(shading) = &encoded.shading_type else {
         unreachable!("an axial or radial shading");
     };
-    let Some(values) = shading.function.eval(&smallvec![t as f32]) else {
-        return 0.0;
-    };
-    let color = |v: &[f32]| encoded.finish(Some(encoded.color_space.to_rgba(v, 1.0)));
-    let at = color(&values);
-    let mut most = 0.0_f32;
-    for i in 0..values.len() {
-        for d in [-1.0 / 255.0, 1.0 / 255.0] {
-            let mut moved = values.clone();
-            moved[i] = (moved[i] + d).clamp(0.0, 1.0);
-            most = most.max(levels_apart(&color(&moved), &at));
-        }
-    }
-    most
-}
-
-fn levels_apart(a: &[f32; 4], b: &[f32; 4]) -> f32 {
-    a.iter()
-        .zip(b)
-        .map(|(a, b)| (a - b).abs() * 255.0)
-        .fold(0.0, f32::max)
+    shading
+        .function
+        .eval(&smallvec![t as f32])
+        .map_or(0.0, |values| crate::gradient::table_step(encoded, &values))
 }
 
 /// Whether the color has a feature narrower than `step` within `step` of `t`:
@@ -370,8 +352,9 @@ fn between(stops: &[crate::gradient::SvgGradientStop], t: f32) -> [f32; 4] {
 #[derive(Default)]
 struct Tally {
     compared: u64,
-    /// Pixels off by more than [`LEVELS`] at a feature narrower than a pixel.
-    sharp: u64,
+    /// Pixels off by more than [`LEVELS`] at a feature narrower than a pixel,
+    /// by case.
+    sharp: std::collections::BTreeMap<String, u64>,
     failures: Vec<String>,
 }
 
@@ -408,7 +391,7 @@ impl Tally {
         };
         let step = across(1.0, 0.0).hypot(across(0.0, 1.0));
         if !lines && sharp_near(encoded, t, step) {
-            self.sharp += 1;
+            *self.sharp.entry(case.to_string()).or_default() += 1;
             return;
         }
         if self.failures.len() < 20 {
@@ -497,9 +480,12 @@ fn shadings_paint_within_a_level_of_their_functions() {
     eprintln!(
         "{} pixels compared, {} excused at a feature narrower than a pixel, {} off",
         tally.compared,
-        tally.sharp,
+        tally.sharp.values().sum::<u64>(),
         tally.failures.len()
     );
+    for (case, n) in &tally.sharp {
+        eprintln!("  excused {n:6} {case}");
+    }
     assert!(lines_cases > 20, "{lines_cases}");
     assert!(
         tally.failures.is_empty(),
@@ -514,6 +500,12 @@ fn shadings_paint_within_a_level_of_their_functions() {
             .join("\n")
     );
     assert!(tally.compared > 1_000_000, "{}", tally.compared);
-    // A feature narrower than a pixel is rare among them.
-    assert!(tally.sharp * 200 < tally.compared, "{}", tally.sharp);
+    // Features narrower than a pixel are only where the function has them:
+    // samples closer than a pixel, a PostScript function's steps.
+    for case in tally.sharp.keys() {
+        assert!(
+            case.contains("size 1024") || case.contains("type4"),
+            "{case}"
+        );
+    }
 }

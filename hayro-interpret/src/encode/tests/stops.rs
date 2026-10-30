@@ -1,7 +1,7 @@
 //! The stops of axial and radial shadings: where they are, what they cost, and
 //! whether a renderer's table of their colors paints them.
 
-use super::{Recording, shading_pattern};
+use super::{Recording, shading_pattern, shading_patterns};
 use crate::encode::{EncodedShadingPattern, EncodedShadingType, Exhausted};
 use crate::gradient::{SvgGradient, SvgGradientKind, SvgGradientStop};
 use kurbo::{Affine, Point, Rect};
@@ -127,6 +127,7 @@ fn gradient(stops: Vec<SvgGradientStop>, pixel_step: f32) -> SvgGradient {
         stops,
         range: (0.0, 1.0),
         pixel_step,
+        table_steps: Vec::new(),
     }
 }
 
@@ -157,6 +158,46 @@ fn a_table_paints_within_a_level_only_where_it_is_fine_enough() {
     assert!(gradient(step.clone(), 1.0 / 200.0).paints_within_a_level(&lut));
     assert!(!gradient(step, 1.0 / 1000.0).paints_within_a_level(&lut));
 
+    // A rise of the color narrower than refining resolves, a millionth wide,
+    // is a step; one a pixel's step wide is a slope an entry must follow.
+    let rise = |width: f32| {
+        vec![
+            stop(0.0, 0.0),
+            stop(0.3, 0.2),
+            stop(0.3 + width, 0.8),
+            stop(1.0, 1.0),
+        ]
+    };
+    let lut = table(&rise(1e-6), 256);
+    assert!(gradient(rise(1e-6), 1.0 / 200.0).paints_within_a_level(&lut));
+    let lut = table(&rise(1.0 / 200.0), 256);
+    assert!(!gradient(rise(1.0 / 200.0), 1.0 / 200.0).paints_within_a_level(&lut));
+
+    // Such a rise across the end of an entry, the entry from 75/255 to 76/255
+    // read along it, is a step too.
+    let across = vec![
+        stop(0.0, 0.0),
+        stop(0.2980, 0.2),
+        stop(0.29806, 0.8),
+        stop(1.0, 1.0),
+    ];
+    let lut = table(&across, 256);
+    assert!(gradient(across, 1.0 / 200.0).paints_within_a_level(&lut));
+
+    // A rise of two levels within an entry, where hayro's color tables step by
+    // two levels, as the shading drawn directly may be off by.
+    let stair = vec![
+        stop(0.0, 0.0),
+        stop(0.3, 0.4),
+        stop(0.3 + 0.5 / 255.0, 0.4 + 2.0 / 255.0),
+        stop(1.0, 1.0),
+    ];
+    let lut = table(&stair, 256);
+    assert!(!gradient(stair.clone(), 1.0 / 200.0).paints_within_a_level(&lut));
+    let mut tables = gradient(stair, 1.0 / 200.0);
+    tables.table_steps = vec![0.0, 2.0, 2.0, 0.0];
+    assert!(tables.paints_within_a_level(&lut));
+
     // Stops a pixel apart along a curve, read from 256 entries for 1000 pixels.
     let curve: Vec<SvgGradientStop> = (0..=1000)
         .map(|i| {
@@ -179,4 +220,128 @@ fn the_grid_steps_no_more_than_a_pixel() {
     };
     assert_eq!(shading.grid_step(&encoded, 1.0), 1.0 / 512.0);
     assert_eq!(shading.grid_step(&encoded, 2.0), 1.0 / 1024.0);
+}
+
+/// A shading a page paints in many shapes finds each color once: read again
+/// where it paints a second shape, over part of the first's, its stops there
+/// evaluate its function nowhere, take less work, and are the first's.
+#[test]
+fn a_shading_painted_again_finds_its_colors_found() {
+    use crate::function::TYPE0_EVALS;
+    let objects = [
+        "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+        "<< /ShadingType 2 /ColorSpace /DeviceCMYK /Coords [0 0 300 0] /Extend [true true] \
+         /Function 6 0 R >>"
+            .to_string(),
+        "<< /FunctionType 0 /Domain [0 1] /Range [0 1 0 1 0 1 0 1] /Size [3] \
+         /BitsPerSample 8 /Filter /ASCIIHexDecode /Length 27 >>\nstream\n\
+         FF000000 00FF0000 0000FF00>\nendstream"
+            .to_string(),
+    ];
+    let mut paints = Vec::new();
+    for (pattern, end) in shading_patterns(&objects, 2).into_iter().zip([1.0, 0.4]) {
+        let encoded = pattern.encode();
+        let EncodedShadingType::RadialAxial(shading) = &encoded.shading_type else {
+            unreachable!("an axial shading");
+        };
+        let mut meter = Recording {
+            left: u64::MAX,
+            asked: vec![],
+            held: vec![],
+        };
+        TYPE0_EVALS.set(0);
+        let stops = shading
+            .stops_metered(&encoded, (0.0, end), 1.0, &mut meter)
+            .expect("given all it asks");
+        paints.push((stops, TYPE0_EVALS.get(), meter.asked.iter().sum::<u64>()));
+    }
+    let [
+        (first, first_evals, first_asked),
+        (second, second_evals, second_asked),
+    ] = &paints[..]
+    else {
+        unreachable!("two paints");
+    };
+    assert!(*first_evals > 0);
+    assert_eq!(*second_evals, 0);
+    assert!(
+        second_asked < first_asked,
+        "{second_asked} of {first_asked}"
+    );
+    assert!(second.len() > 2 && second.len() < first.len());
+    for stop in second {
+        assert!(first.contains(stop), "{stop:?}");
+    }
+}
+
+/// A gradient made for a shape that reaches a part of the shading runs over
+/// that part alone, so a renderer's table of as many colors paints it finer: a
+/// wave of thirty periods along 4000 pixels, a table's 4096 entries step by six
+/// levels and more across it, but within a level across a twentieth of it.
+#[test]
+fn a_gradient_spans_the_part_its_shape_reaches() {
+    let function = "<< /FunctionType 4 /Domain [0 1] /Range [0 1] /Length 33 >>\nstream\n\
+                    { 10800 mul sin 0.5 mul 0.5 add }\nendstream";
+    let encoded = axial("0 0 4000 0", "/DeviceGray", function);
+    let EncodedShadingType::RadialAxial(shading) = &encoded.shading_type else {
+        unreachable!("an axial shading");
+    };
+    let fits = |bbox: Rect| {
+        let gradient = shading
+            .as_svg_gradient(&encoded, bbox)
+            .expect("an axial shading within its extension");
+        assert_eq!(gradient.stops[0].offset, 0.0);
+        assert_eq!(gradient.stops[gradient.stops.len() - 1].offset, 1.0);
+        gradient.paints_within_a_level(&table(&gradient.stops, 4096))
+    };
+    assert!(!fits(Rect::new(0.0, 0.0, 4000.0, 1.0)));
+    assert!(fits(Rect::new(1000.0, 0.0, 1200.0, 1.0)));
+}
+
+/// In a color space hayro reads through color tables, the stops where the
+/// color changes from a neighbour's by more than a level and a half carry the
+/// table step of the function's outputs there, as the shading is checked
+/// against; in gray and RGB, none.
+#[test]
+fn stops_where_tables_step_carry_the_step() {
+    use crate::gradient::{LEVEL_TOLERANCE, levels_apart, table_step};
+    let lab = "[/Lab << /WhitePoint [0.9505 1 1.089] /Range [-128 127 -128 127] >>]";
+    let function = "<< /FunctionType 2 /Domain [0 1] /C0 [0 -100 -100] /C1 [100 100 100] /N 1 >>";
+    let encoded = axial("0 0 300 0", lab, function);
+    let EncodedShadingType::RadialAxial(shading) = &encoded.shading_type else {
+        unreachable!("an axial shading");
+    };
+    let gradient = shading
+        .as_svg_gradient(&encoded, Rect::new(0.0, 0.0, 300.0, 1.0))
+        .expect("an axial shading within its extension");
+    let stops = &gradient.stops;
+    assert_eq!(gradient.table_steps.len(), stops.len());
+    let mut stepped = 0;
+    for (i, step) in gradient.table_steps.iter().enumerate() {
+        let jumps = [i.checked_sub(1), Some(i + 1)]
+            .into_iter()
+            .flatten()
+            .any(|j| {
+                stops
+                    .get(j)
+                    .is_some_and(|n| levels_apart(&n.color, &stops[i].color) > LEVEL_TOLERANCE)
+            });
+        let x = stops[i].offset;
+        let want = table_step(
+            &encoded,
+            &shading.function.eval(&smallvec![x]).expect("a value"),
+        );
+        assert_eq!(*step, if jumps { want } else { 0.0 }, "stop {i} at {x}");
+        stepped += usize::from(jumps && want > 0.0);
+    }
+    assert!(stepped > 0, "{stops:?}");
+
+    let gray = axial("0 0 300 0", "/DeviceGray", STEPS);
+    let EncodedShadingType::RadialAxial(shading) = &gray.shading_type else {
+        unreachable!("an axial shading");
+    };
+    let gradient = shading
+        .as_svg_gradient(&gray, Rect::new(0.0, 0.0, 300.0, 1.0))
+        .expect("an axial shading within its extension");
+    assert!(gradient.table_steps.is_empty());
 }
