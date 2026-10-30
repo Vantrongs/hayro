@@ -62,9 +62,8 @@ pub struct SvgGradient {
     pub pixel_step: f32,
     /// For each of `stops`, how far its color moves where hayro's color tables
     /// read a component of the function's outputs there as the next 8-bit value
-    /// ([`table_step`]), where the color changes from a neighbouring stop by
-    /// more than [`LEVEL_TOLERANCE`]; 0 elsewhere, and empty for gray and RGB,
-    /// which read no tables.
+    /// ([`table_step`]), as much as the shading drawn directly may be off
+    /// there; empty for gray and RGB, which read no tables.
     pub table_steps: Vec<f32>,
 }
 
@@ -242,8 +241,7 @@ impl EncodedRadialAxialShading {
     }
 
     /// [`SvgGradient::table_steps`] of `stops`, of the shading's parameter: in
-    /// a color space other than gray and RGB, the [`table_step`] at each stop
-    /// whose color changes from a neighbour's by more than [`LEVEL_TOLERANCE`],
+    /// a color space other than gray and RGB, the [`table_step`] at each stop,
     /// of the function's outputs at it, as the shading evaluates them; kept in
     /// its [`StopMemo`], and each taken of `meter` before it is found: the
     /// function evaluated and its colors converted.
@@ -258,17 +256,9 @@ impl EncodedRadialAxialShading {
         }
         let [t0, t1] = self.domain;
         let value_cost = pattern.value_cost();
-        let jumps = |i: usize, j: Option<usize>| {
-            j.and_then(|j| stops.get(j))
-                .is_some_and(|n| levels_apart(&n.color, &stops[i].color) > LEVEL_TOLERANCE)
-        };
         let mut found = self.memo.table_steps.lock().unwrap();
         let mut steps = Vec::with_capacity(stops.len());
-        for (i, stop) in stops.iter().enumerate() {
-            if !(jumps(i, i.checked_sub(1)) || jumps(i, Some(i + 1))) {
-                steps.push(0.0);
-                continue;
-            }
+        for stop in stops {
             let x = t0 + (t1 - t0) * stop.offset;
             let step = match found.get(&x.to_bits()) {
                 Some(step) => *step,

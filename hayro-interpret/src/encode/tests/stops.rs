@@ -298,13 +298,12 @@ fn a_gradient_spans_the_part_its_shape_reaches() {
     assert!(fits(Rect::new(1000.0, 0.0, 1200.0, 1.0)));
 }
 
-/// In a color space hayro reads through color tables, the stops where the
-/// color changes from a neighbour's by more than a level and a half carry the
-/// table step of the function's outputs there, as the shading is checked
-/// against; in gray and RGB, none.
+/// In a color space hayro reads through color tables, every stop carries the
+/// table step of the function's outputs there, as the pixels of the shading
+/// are checked against; in gray and RGB, none.
 #[test]
 fn stops_where_tables_step_carry_the_step() {
-    use crate::gradient::{LEVEL_TOLERANCE, levels_apart, table_step};
+    use crate::gradient::table_step;
     let lab = "[/Lab << /WhitePoint [0.9505 1 1.089] /Range [-128 127 -128 127] >>]";
     let function = "<< /FunctionType 2 /Domain [0 1] /C0 [0 -100 -100] /C1 [100 100 100] /N 1 >>";
     let encoded = axial("0 0 300 0", lab, function);
@@ -316,25 +315,15 @@ fn stops_where_tables_step_carry_the_step() {
         .expect("an axial shading within its extension");
     let stops = &gradient.stops;
     assert_eq!(gradient.table_steps.len(), stops.len());
-    let mut stepped = 0;
     for (i, step) in gradient.table_steps.iter().enumerate() {
-        let jumps = [i.checked_sub(1), Some(i + 1)]
-            .into_iter()
-            .flatten()
-            .any(|j| {
-                stops
-                    .get(j)
-                    .is_some_and(|n| levels_apart(&n.color, &stops[i].color) > LEVEL_TOLERANCE)
-            });
         let x = stops[i].offset;
         let want = table_step(
             &encoded,
             &shading.function.eval(&smallvec![x]).expect("a value"),
         );
-        assert_eq!(*step, if jumps { want } else { 0.0 }, "stop {i} at {x}");
-        stepped += usize::from(jumps && want > 0.0);
+        assert_eq!(*step, want, "stop {i} at {x}");
     }
-    assert!(stepped > 0, "{stops:?}");
+    assert!(gradient.table_steps.iter().any(|s| *s > 0.0), "{stops:?}");
 
     let gray = axial("0 0 300 0", "/DeviceGray", STEPS);
     let EncodedShadingType::RadialAxial(shading) = &gray.shading_type else {
@@ -344,4 +333,52 @@ fn stops_where_tables_step_carry_the_step() {
         .as_svg_gradient(&gray, Rect::new(0.0, 0.0, 300.0, 1.0))
         .expect("an axial shading within its extension");
     assert!(gradient.table_steps.is_empty());
+}
+
+/// Where hayro's color tables step the colors of a `DeviceN` shading by two
+/// levels within an entry of a table of 4096, the entry is off by the step
+/// at the end of the entry past it, where the stops are flat: as the shading
+/// drawn directly may be off by the step anywhere its tables read, the
+/// gradient is drawn natively, over every part of it a shape may reach.
+#[test]
+fn a_table_step_within_an_entry_is_allowed_where_the_tables_step() {
+    let cmy = "[/DeviceN [/Cyan /Magenta /Yellow] /DeviceCMYK 7 0 R]";
+    let samples = 1365;
+    let hex: String = (0..samples)
+        .flat_map(|i| {
+            let v = i * 255 / (samples - 1);
+            [v, v, v]
+        })
+        .map(|v| format!("{v:02X}"))
+        .collect();
+    let encoded = shading_pattern(&[
+        "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+        format!(
+            "<< /ShadingType 2 /ColorSpace {cmy} /Coords [0 0 1440 0] /Extend [true true] \
+             /Function 6 0 R >>"
+        ),
+        format!(
+            "<< /FunctionType 0 /Domain [0 1] /Range [0 0.0664 0 0.0469 0 0.0469] \
+             /Size [{samples}] /BitsPerSample 8 /Filter /ASCIIHexDecode /Length {} >>\nstream\n\
+             {hex}>\nendstream",
+            hex.len() + 1
+        ),
+        "<< /FunctionType 4 /Domain [0 1 0 1 0 1] /Range [0 1 0 1 0 1 0 1] /Length 5 >>\nstream\n\
+         { 0 }\nendstream"
+            .to_string(),
+    ])
+    .encode();
+    let EncodedShadingType::RadialAxial(shading) = &encoded.shading_type else {
+        unreachable!("an axial shading");
+    };
+    let mut drawn = 0;
+    for start in 0..40 {
+        let x0 = f64::from(start) * 0.37;
+        let gradient = shading
+            .as_svg_gradient(&encoded, Rect::new(x0, 0.0, 1440.0 - x0 / 3.0, 1.0))
+            .expect("an axial shading within its extension");
+        assert!(gradient.table_steps.iter().any(|s| *s >= 1.5));
+        drawn += usize::from(gradient.paints_within_a_level(&table(&gradient.stops, 4096)));
+    }
+    assert_eq!(drawn, 40);
 }
