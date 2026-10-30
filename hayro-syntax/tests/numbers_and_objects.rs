@@ -398,6 +398,25 @@ fn typed_reads() {
 
 /// Two numbers are equal where both are integers of one value or both reals of one
 /// 64-bit value; an integer never equals a real.
+/// A number's exact decimal is its sign, digits and places after the point as
+/// written, where the digits make an integer below 2^64; any other real has none.
+#[test]
+fn a_number_as_its_exact_decimal() {
+    for (token, decimal) in [
+        ("7", Some((false, 7, 0))),
+        ("-12", Some((true, 12, 0))),
+        ("-1.50", Some((true, 150, 2))),
+        ("+.25", Some((false, 25, 2))),
+        ("1000000.25", Some((false, 100_000_025, 2))),
+        ("0.000000000000000000000000000001", Some((false, 1, 30))),
+        ("18446744073709551615.0", None),
+        ("5.0000000000000000000000001", None),
+        ("99999999999999999999", None),
+    ] {
+        assert_eq!(number(token).unwrap().as_decimal(), decimal, "{token}");
+    }
+}
+
 #[test]
 fn equality() {
     let n = |t: &str| number(t).unwrap();

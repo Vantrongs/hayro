@@ -8,10 +8,12 @@ use crate::color::{ColorComponents, ColorSpace};
 use crate::encode::Cost;
 use crate::function::{Function, StitchingBounds, Values, interpolate, sorting};
 use crate::interpret::annotation::entries::Entries;
-use crate::util::{Float32Ext, PointExt, hash128};
+use crate::radial::{Lead, same};
+use crate::util::{PointExt, hash128};
 use hayro_syntax::bit_reader::BitReader;
 use hayro_syntax::object::Array;
 use hayro_syntax::object::Dict;
+use hayro_syntax::object::Number;
 use hayro_syntax::object::Object;
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::{
@@ -109,7 +111,12 @@ pub enum ShadingType {
         ///
         /// For radial shadings, the coordinates contain the x/y coordinates as well as the radius
         /// for both circles.
-        coords: [f32; 6],
+        ///
+        /// Each is the `f64` its number as written reads as.
+        coords: [f64; 6],
+        /// How a radial shading's circles lie, decided on its coordinates as
+        /// written; of an axial one's, nothing.
+        lead: Lead,
         /// The domain of the shading.
         domain: [f32; 2],
         /// The function forming the basis of the shading.
@@ -140,7 +147,10 @@ pub enum ShadingType {
         /// An optional function used for calculating the sampled color values.
         function: Option<ShadingFunction>,
     },
-    /// A dummy shading that should just be drawn transparent.
+    /// An axial or radial shading whose two points or circles are one, exactly:
+    /// no line or circle between them passes a point, so it paints its
+    /// background alone, as `MuPDF` does. Points or circles apart by any step
+    /// of their coordinates paint as they lie.
     Dummy,
 }
 
@@ -179,18 +189,17 @@ impl Shading {
                 let domain = dict.get::<[f32; 2]>(DOMAIN).unwrap_or([0.0, 1.0]);
                 let function = read_function(dict, &color_space)?;
                 let extend = dict.get::<[bool; 2]>(EXTEND).unwrap_or([false, false]);
-                let (coords, invalid) = if shading_num == 2 {
-                    let read = dict.get::<[f32; 4]>(COORDS)?;
-                    let invalid = (read[0] - read[2]).is_nearly_zero()
-                        && (read[1] - read[3]).is_nearly_zero();
-                    ([read[0], read[1], read[2], read[3], 0.0, 0.0], invalid)
+                let (read, invalid) = if shading_num == 2 {
+                    let [x0, y0, x1, y1] = dict.get::<[Number; 4]>(COORDS)?;
+                    let invalid = same(x0, x1) && same(y0, y1);
+                    ([x0, y0, x1, y1, Number::ZERO, Number::ZERO], invalid)
                 } else {
-                    let read = dict.get::<[f32; 6]>(COORDS)?;
-                    let invalid = (read[0] - read[3]).is_nearly_zero()
-                        && (read[1] - read[4]).is_nearly_zero()
-                        && (read[2] - read[5]).is_nearly_zero();
+                    let read = dict.get::<[Number; 6]>(COORDS)?;
+                    let invalid =
+                        same(read[0], read[3]) && same(read[1], read[4]) && same(read[2], read[5]);
                     (read, invalid)
                 };
+                let coords = read.map(|n| n.as_f64());
 
                 let axial = shading_num == 2;
 
@@ -202,6 +211,7 @@ impl Shading {
                         function,
                         extend,
                         coords,
+                        lead: Lead::of(read),
                         axial,
                     }
                 }

@@ -52,6 +52,7 @@ pub mod flatten;
 pub mod font;
 pub mod gradient;
 pub mod pattern;
+pub mod radial;
 pub mod shading;
 pub mod util;
 

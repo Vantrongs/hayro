@@ -165,6 +165,12 @@ impl Number {
     }
 }
 
+impl Default for Number {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
 /// `Number(` and the [`Repr`] it holds.
 impl Debug for Number {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
@@ -309,6 +315,24 @@ impl Number {
     /// Whether the number was written as an integer, without a decimal point.
     pub fn is_integer(&self) -> bool {
         matches!(self.repr(), Repr::Integer(_))
+    }
+
+    /// The number's value as written, exactly, where its digits make an integer
+    /// below 2^64: whether it is negative, its digits, and how many of them stand
+    /// after the point (`-1.50` is `(true, 150, 2)`, `7` is `(false, 7, 0)`).
+    /// `None` for any other real, whose value is the nearest 64-bit float to its
+    /// digits ([`Number::as_f64`], rules 5 and 6 of the module doc).
+    pub fn as_decimal(&self) -> Option<(bool, u64, u32)> {
+        match self.repr() {
+            Repr::Integer(value) => Some((value < 0, value.unsigned_abs(), 0)),
+            Repr::Decimal {
+                digits,
+                scale,
+                negative,
+                ..
+            } => Some((negative, digits, scale)),
+            Repr::Real { .. } => None,
+        }
     }
 
     /// The number in 32 bits as a viewer reads it from the digits as written, which

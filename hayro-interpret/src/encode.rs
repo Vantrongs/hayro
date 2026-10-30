@@ -4,6 +4,7 @@ use crate::color::{AlphaColor, ColorComponents, ColorSpace};
 use crate::flatten::ControlHull;
 use crate::interpret::state::ActiveTransferFunction;
 use crate::pattern::ShadingPattern;
+use crate::radial::Lead;
 use crate::shading::{PATCH_TRIANGLES, ShadingFunction, ShadingType, Triangle};
 use crate::util::x_y_advances;
 use hayro_syntax::hash;
@@ -131,12 +132,11 @@ pub enum EncodedShadingType {
     RadialAxial(EncodedRadialAxialShading),
     /// Mesh-based shading sampled into device pixels.
     Sampled(EncodedSampledShading),
-    /// Empty dummy shading.
-    Dummy(EncodedDummyShading),
     /// A function-based, axial or radial shading whose space does not map onto
-    /// the device's, its matrix not inverting: it covers no area there, so it
-    /// paints its background alone, where it has one, as `MuPDF` paints an axial
-    /// or radial one.
+    /// the device's, its matrix not inverting, or an axial or radial one whose
+    /// two points or circles are one ([`ShadingType::Dummy`]): it covers no area
+    /// there, so it paints its background alone, where it has one, as `MuPDF`
+    /// paints an axial or radial one.
     Background,
 }
 
@@ -398,10 +398,6 @@ impl Samples {
     }
 }
 
-/// Encoded dummy shading.
-#[derive(Clone, Debug)]
-pub struct EncodedDummyShading;
-
 /// A shading that was rasterized into a texture.
 pub struct ShadingTexture {
     /// The straight (non-premultiplied) RGBA8 pixel data, row-major.
@@ -446,7 +442,7 @@ impl EncodedShadingPattern {
     /// disc. A renderer that multiplies a shape's coverage of a pixel by the
     /// shading's there would cut such a pixel twice: a shape covering half of it
     /// would paint a quarter. A radial shading is extended only where one of its
-    /// circles holds the other ([`radial_cone`]), as elsewhere
+    /// circles holds the other ([`Lead::cone`]), as elsewhere
     /// extending an end changes which circle a point it painted lies on. A mesh
     /// has no such edges here.
     ///
@@ -490,9 +486,7 @@ impl EncodedShadingPattern {
         let edges = match &self.shading_type {
             EncodedShadingType::FunctionBased(shading) => !shading.extended.iter().all(|&e| e),
             EncodedShadingType::RadialAxial(shading) => shading.extend != [true, true],
-            EncodedShadingType::Sampled(_)
-            | EncodedShadingType::Dummy(_)
-            | EncodedShadingType::Background => false,
+            EncodedShadingType::Sampled(_) | EncodedShadingType::Background => false,
         };
         if !edges {
             return Ok(());
@@ -534,13 +528,13 @@ impl EncodedShadingPattern {
                     shading.extend[0] |= bounds.x0 >= -t;
                     shading.extend[1] |= bounds.x1 <= 1.0 + t;
                 }
-                RadialAxialParams::Radial { p1, r } => {
+                RadialAxialParams::Radial { p1, r, lead } => {
                     let (r0, r1) = (r.x, r.y);
                     // Where one circle holds the other, each holds the ones before
                     // it or after: one end is the larger circle's inside, the other
                     // the smaller one's outside.
                     let grows = r1 >= r0;
-                    if radial_cone(p1, r) {
+                    if lead.cone() {
                         return Ok(());
                     }
                     let (large, small) = if grows {
@@ -586,9 +580,7 @@ impl EncodedShadingPattern {
                     shading.extend[inner_end] |= outside;
                 }
             },
-            EncodedShadingType::Sampled(_)
-            | EncodedShadingType::Dummy(_)
-            | EncodedShadingType::Background => {}
+            EncodedShadingType::Sampled(_) | EncodedShadingType::Background => {}
         }
         Ok(())
     }
@@ -606,9 +598,7 @@ impl EncodedShadingPattern {
         match &self.shading_type {
             EncodedShadingType::FunctionBased(shading) => bits(&shading.extended),
             EncodedShadingType::RadialAxial(shading) => bits(&shading.extend),
-            EncodedShadingType::Sampled(_)
-            | EncodedShadingType::Dummy(_)
-            | EncodedShadingType::Background => 0,
+            EncodedShadingType::Sampled(_) | EncodedShadingType::Background => 0,
         }
     }
 
@@ -635,7 +625,7 @@ impl EncodedShadingPattern {
             EncodedShadingType::Sampled(mesh) => {
                 mesh.function.as_ref().map_or(Cost::ZERO, |f| f.cost())
             }
-            EncodedShadingType::Dummy(_) | EncodedShadingType::Background => Cost::ZERO,
+            EncodedShadingType::Background => Cost::ZERO,
         };
         // A step a channel mapped.
         let transfer = if self.transfer_function.is_some() {
@@ -911,13 +901,14 @@ impl ShadingPattern {
             }
             ShadingType::RadialAxial {
                 coords,
+                lead,
                 domain,
                 function,
                 extend,
                 axial,
             } => {
                 let (encoded, initial_transform) =
-                    encode_axial_shading(*coords, *domain, function, *extend, *axial);
+                    encode_axial_shading(*coords, *lead, *domain, function, *extend, *axial);
 
                 base_transform = initial_transform * self.matrix.inverse();
 
@@ -937,7 +928,7 @@ impl ShadingPattern {
             ShadingType::Dummy => {
                 base_transform = Affine::IDENTITY;
 
-                EncodedShadingType::Dummy(EncodedDummyShading)
+                EncodedShadingType::Background
             }
         };
         let inverts = |t: Affine| t.is_finite() && t.determinant() != 0.0;
@@ -967,7 +958,8 @@ impl ShadingPattern {
 }
 
 fn encode_axial_shading(
-    coords: [f32; 6],
+    coords: [f64; 6],
+    lead: Lead,
     domain: [f32; 2],
     function: &ShadingFunction,
     extend: [bool; 2],
@@ -979,8 +971,8 @@ fn encode_axial_shading(
         let [x_0, y_0, x_1, y_1, _, _] = coords;
 
         initial_transform = ts_from_line_to_line(
-            Point::new(x_0 as f64, y_0 as f64),
-            Point::new(x_1 as f64, y_1 as f64),
+            Point::new(x_0, y_0),
+            Point::new(x_1, y_1),
             Point::ZERO,
             Point::new(1.0, 0.0),
         );
@@ -989,14 +981,11 @@ fn encode_axial_shading(
     } else {
         let [x_0, y_0, r0, x_1, y_1, r_1] = coords;
 
-        initial_transform = Affine::translate((-x_0 as f64, -y_0 as f64));
-        let new_x1 = x_1 - x_0;
-        let new_y1 = y_1 - y_0;
+        initial_transform = Affine::translate((-x_0, -y_0));
+        let p1 = Point::new(x_1 - x_0, y_1 - y_0);
+        let r = Point::new(r0, r_1);
 
-        let p1 = Point::new(new_x1 as f64, new_y1 as f64);
-        let r = Point::new(r0 as f64, r_1 as f64);
-
-        RadialAxialParams::Radial { p1, r }
+        RadialAxialParams::Radial { p1, r, lead }
     };
 
     (
@@ -1294,7 +1283,7 @@ fn encode_function_shading(domain: &[f32; 4], function: &ShadingFunction) -> Enc
 #[derive(Clone, Debug)]
 pub(crate) enum RadialAxialParams {
     Axial,
-    Radial { p1: Point, r: Point },
+    Radial { p1: Point, r: Point, lead: Lead },
 }
 
 impl EncodedShadingType {
@@ -1345,8 +1334,8 @@ impl EncodedShadingType {
 
                 let mut t = match params {
                     RadialAxialParams::Axial => pos.x as f32,
-                    RadialAxialParams::Radial { p1, r } => {
-                        radial_pos(&pos, p1, *r, extend[0], extend[1]).unwrap_or(f32::MIN)
+                    RadialAxialParams::Radial { p1, r, lead } => {
+                        radial_pos(&pos, p1, *r, *lead, extend[0], extend[1]).unwrap_or(f32::MIN)
                     }
                 };
 
@@ -1379,7 +1368,6 @@ impl EncodedShadingType {
                 bg_color,
                 color_space,
             ),
-            Self::Dummy(_) => Some(AlphaColor::TRANSPARENT),
             Self::Background => Some(bg_color),
         }
     }
@@ -1404,35 +1392,6 @@ fn unit_to_line(p0: Point, p1: Point) -> Affine {
     ])
 }
 
-/// Whether the circles of a radial shading with centres `0` and `p1` and radii `r`
-/// form a cone, the leading coefficient of the quadratic [`radial_pos`] solves for
-/// a point's circle positive (`radial_a`): every point within the circle ending it
-/// then lies on a circle past that end too. Where it is not, one circle holds the
-/// other, and a point within them lies on one of the circles between.
-fn radial_cone(p1: Point, r: Point) -> bool {
-    radial_a(p1, r) > 0.0
-}
-
-/// The leading coefficient of the quadratic [`radial_pos`] solves, `|p1|² - dr²`;
-/// zero within `COORDINATE_ROUNDING` of its terms, as for circles a document
-/// draws one touching the other inside, whose coordinates, read as `f32`, place
-/// them only so near: a rounding's cone would put every point within them on a
-/// circle past their end.
-fn radial_a(p1: Point, r: Point) -> f64 {
-    let dr = r.y - r.x;
-    let (along, across) = (p1.x * p1.x + p1.y * p1.y, dr * dr);
-    let a = along - across;
-    if a.abs() <= COORDINATE_ROUNDING * (along + across) {
-        0.0
-    } else {
-        a
-    }
-}
-
-/// The share of its terms `radial_a` rounds to zero: a few times the rounding of a
-/// coordinate read as `f32` and of the difference of two.
-const COORDINATE_ROUNDING: f64 = 4.0 * f32::EPSILON as f64;
-
 /// The parameter of the circle through `pos`, in `f64`: in `f32`, a point 10⁹
 /// units from the origin is placed to 64 units, and points that near a circle
 /// lie on it.
@@ -1440,6 +1399,7 @@ fn radial_pos(
     pos: &Point,
     p1: &Point,
     r: Point,
+    lead: Lead,
     min_extend: bool,
     max_extend: bool,
 ) -> Option<f32> {
@@ -1448,7 +1408,7 @@ fn radial_pos(
     let dr = r.y - r0;
     let (px, py) = (pos.x, pos.y);
 
-    let a = radial_a(*p1, r);
+    let a = lead.value();
     let b = -2.0 * (px * dx + py * dy + r0 * dr);
     let c = px * px + py * py - r0 * r0;
 
@@ -3270,7 +3230,7 @@ mod tests {
                             }
                         }
                     }
-                    RadialAxialParams::Radial { p1, r } => {
+                    RadialAxialParams::Radial { p1, r, .. } => {
                         let grows = r.y >= r.x;
                         let (large, small) = if grows {
                             ((p1, r.y), (Point::ZERO, r.x))

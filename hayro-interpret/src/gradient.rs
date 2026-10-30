@@ -1,8 +1,8 @@
 //! SVG-like gradient conversion for encoded shadings.
 //!
-//! PDF shadings are very expensive to evaluate. Because of this, at least for
-//! radial-axial shadings it's useful if we can instead approximate them by
-//! SVG-like sRGB gradients.
+//! PDF shadings are very expensive to evaluate. Because of this, it's useful to
+//! approximate axial shadings by SVG-like sRGB linear gradients. Radial ones are
+//! painted by the shading itself (`as_svg_gradient_metered`).
 
 use crate::color::AlphaColor;
 use crate::encode::{
@@ -10,11 +10,10 @@ use crate::encode::{
     Unmetered, take,
 };
 use crate::function::StitchingBounds;
-use kurbo::{Affine, Circle, Point, Rect, Shape};
+use kurbo::{Affine, Point, Rect};
 use smallvec::smallvec;
 
 const MAX_GRADIENT_SUBDIVISION_DEPTH: u8 = 10;
-const RADIAL_EPSILON: f64 = 1.0e-6;
 
 /// An SVG-like gradient.
 pub struct SvgGradient {
@@ -34,17 +33,6 @@ pub enum SvgGradientKind {
         start: Point,
         /// The normalized end point of the gradient line.
         end: Point,
-    },
-    /// Radial gradient.
-    Radial {
-        /// The center point of the start circle.
-        start_center: Point,
-        /// The radius of the start circle.
-        start_radius: f32,
-        /// The center point of the end circle.
-        end_center: Point,
-        /// The radius of the end circle.
-        end_radius: f32,
     },
 }
 
@@ -82,20 +70,23 @@ impl EncodedRadialAxialShading {
         meter: &mut dyn Meter,
     ) -> Result<Option<SvgGradient>, Exhausted> {
         // A couple of cases cannot be losslessly represented by an SVG gradient.
-        match self.params {
+        let kind = match self.params {
             RadialAxialParams::Axial => {
                 if !self.axial_extend_covers_bbox(pattern, path_bbox) {
                     return Ok(None);
                 }
-            }
-            RadialAxialParams::Radial { .. } => {
-                if !self.radial_extend_covers_bbox(pattern, path_bbox)
-                    || pattern.background_color.components()[3] > 0.0
-                {
-                    return Ok(None);
+                SvgGradientKind::Linear {
+                    start: Point::ZERO,
+                    end: Point::new(1.0, 0.0),
                 }
             }
-        }
+            // A two-point radial gradient of an SVG renderer tells a cone from
+            // circles that touch within a tolerance and paints in `f32`, as
+            // vello's does: it paints near-touching circles, and circles of a
+            // thousandth of a unit, as others, and points 10^9 units out as on
+            // their neighbours' circles. The shading paints its points itself.
+            RadialAxialParams::Radial { .. } => return Ok(None),
+        };
 
         take(meter, pattern.setup_cost() + self.function.bounds_cost())?;
         let stops = approximate_gradient_stops(
@@ -109,25 +100,10 @@ impl EncodedRadialAxialShading {
             tolerance,
         )?;
         Ok(Some(SvgGradient {
-            kind: self.native_gradient_kind(),
+            kind,
             transform: pattern.base_transform.inverse(),
             stops,
         }))
-    }
-
-    fn native_gradient_kind(&self) -> SvgGradientKind {
-        match &self.params {
-            RadialAxialParams::Axial => SvgGradientKind::Linear {
-                start: Point::ZERO,
-                end: Point::new(1.0, 0.0),
-            },
-            RadialAxialParams::Radial { p1, r } => SvgGradientKind::Radial {
-                start_center: Point::ZERO,
-                start_radius: r.x as f32,
-                end_center: *p1,
-                end_radius: r.y as f32,
-            },
-        }
     }
 
     fn sample_t(&self, pattern: &EncodedShadingPattern, t: f32) -> [f32; 4] {
@@ -155,42 +131,6 @@ impl EncodedRadialAxialShading {
         (self.extend[0] || min_x >= 0.0) && (self.extend[1] || max_x <= 1.0)
     }
 
-    fn radial_extend_covers_bbox(&self, pattern: &EncodedShadingPattern, path_bbox: Rect) -> bool {
-        let RadialAxialParams::Radial { p1, r } = self.params else {
-            return false;
-        };
-
-        let path_bbox = pattern.base_transform.transform_rect_bbox(path_bbox);
-
-        if p1.x.abs() <= RADIAL_EPSILON && p1.y.abs() <= RADIAL_EPSILON {
-            return self.same_center_radial_extend_covers_bbox(path_bbox, r.x, r.y);
-        }
-
-        let start_extend_ok = self.extend[0] || r.x.abs() <= RADIAL_EPSILON;
-        let end_extend_ok = self.extend[1] || circle_covers_bbox(Circle::new(p1, r.y), path_bbox);
-
-        start_extend_ok && end_extend_ok
-    }
-
-    fn same_center_radial_extend_covers_bbox(&self, path_bbox: Rect, r0: f64, r1: f64) -> bool {
-        let mut inner_circle = Circle::new(Point::ZERO, r0);
-        let mut outer_circle = Circle::new(Point::ZERO, r1);
-        let mut inner_extend = self.extend[0];
-        let mut outer_extend = self.extend[1];
-
-        if inner_circle.radius > outer_circle.radius {
-            std::mem::swap(&mut inner_circle, &mut outer_circle);
-            std::mem::swap(&mut inner_extend, &mut outer_extend);
-        }
-
-        let inner_extend_ok = inner_extend
-            || inner_circle.radius <= RADIAL_EPSILON
-            || circle_outside_bbox(inner_circle, path_bbox);
-        let outer_extend_ok = outer_extend || circle_covers_bbox(outer_circle, path_bbox);
-
-        inner_extend_ok && outer_extend_ok
-    }
-
     fn normalized_stitching_bounds(&self) -> StitchingBounds {
         let [t0, t1] = self.domain;
         let dt = t1 - t0;
@@ -212,38 +152,6 @@ impl EncodedRadialAxialShading {
 
         bounds
     }
-}
-
-fn circle_covers_bbox(circle: Circle, bbox: Rect) -> bool {
-    if circle.radius < 0.0 {
-        return false;
-    }
-
-    let radius_squared = circle.radius * circle.radius;
-    [
-        Point::new(bbox.x0, bbox.y0),
-        Point::new(bbox.x1, bbox.y0),
-        Point::new(bbox.x0, bbox.y1),
-        Point::new(bbox.x1, bbox.y1),
-    ]
-    .into_iter()
-    .all(|point| {
-        let delta = point - circle.center;
-        delta.hypot2() <= radius_squared
-    })
-}
-
-fn circle_outside_bbox(circle: Circle, bbox: Rect) -> bool {
-    if circle.radius <= 0.0 {
-        return true;
-    }
-
-    let closest = Point::new(
-        circle.center.x.clamp(bbox.x0, bbox.x1),
-        circle.center.y.clamp(bbox.y0, bbox.y1),
-    );
-
-    !circle.contains(closest)
 }
 
 /// Stops as they are found, each sample taken for them and each growth of the

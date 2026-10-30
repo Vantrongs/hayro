@@ -74,17 +74,6 @@ impl Renderer<'_> {
                                 SvgGradientKind::Linear { start, end } => {
                                     Gradient::new_linear(start, end)
                                 }
-                                SvgGradientKind::Radial {
-                                    start_center,
-                                    start_radius,
-                                    end_center,
-                                    end_radius,
-                                } => Gradient::new_two_point_radial(
-                                    start_center,
-                                    start_radius,
-                                    end_center,
-                                    end_radius,
-                                ),
                             }
                             .with_extend(peniko::Extend::Pad)
                             .with_stops(stops.as_slice());

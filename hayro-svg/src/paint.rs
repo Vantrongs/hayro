@@ -368,21 +368,6 @@ fn gradient_key(shading_key: u128, gradient: &SvgGradient) -> u128 {
             0_u32,
             0_u32,
         ),
-        SvgGradientKind::Radial {
-            start_center,
-            start_radius,
-            end_center,
-            end_radius,
-        } => (
-            1_u8,
-            start_center.x.to_bits(),
-            start_center.y.to_bits(),
-            start_radius.to_bits(),
-            end_center.x.to_bits(),
-            end_center.y.to_bits(),
-            end_radius.to_bits(),
-            0_u32,
-        ),
     };
 
     let transform = gradient.transform.as_coeffs().map(|coeff| coeff.to_bits());
@@ -417,29 +402,6 @@ fn write_gradient(xml: &mut xmlwriter::XmlWriter, id: &str, gradient: &SvgGradie
             xml.write_attribute("y1", &start.y);
             xml.write_attribute("x2", &end.x);
             xml.write_attribute("y2", &end.y);
-        }
-        SvgGradientKind::Radial {
-            start_center,
-            start_radius,
-            end_center,
-            end_radius,
-        } => {
-            xml.start_element("radialGradient");
-            xml.write_attribute("id", id);
-            xml.write_attribute("gradientUnits", "userSpaceOnUse");
-            xml.write_attribute(
-                "gradientTransform",
-                &format!(
-                    "matrix({})",
-                    convert_transform(&(Affine::translate((-0.5, -0.5)) * gradient.transform))
-                ),
-            );
-            xml.write_attribute("fx", &start_center.x);
-            xml.write_attribute("fy", &start_center.y);
-            xml.write_attribute("fr", &start_radius);
-            xml.write_attribute("cx", &end_center.x);
-            xml.write_attribute("cy", &end_center.y);
-            xml.write_attribute("r", &end_radius);
         }
     }
 
