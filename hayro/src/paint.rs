@@ -1,14 +1,14 @@
 use crate::Renderer;
 use hayro_interpret::Paint;
 use hayro_interpret::encode::{EncodedShadingType, texture_dimensions};
-use hayro_interpret::gradient::SvgGradientKind;
+use hayro_interpret::gradient::{SvgGradient, SvgGradientKind};
 use hayro_interpret::pattern::Pattern;
 use hayro_interpret::util::x_y_advances;
 use kurbo::{Affine, BezPath, Rect, Shape};
 use std::sync::Arc;
 use vello_cpu::color::{AlphaColor, DynamicColor, Srgb};
 use vello_cpu::peniko::{ColorStop, Gradient, ImageQuality, ImageSampler};
-use vello_cpu::{Image, ImageSource, PaintType, PixelMetadata, Pixmap, peniko};
+use vello_cpu::{Image, ImageSource, Level, PaintType, PixelMetadata, Pixmap, peniko};
 
 impl Renderer<'_> {
     #[must_use]
@@ -49,32 +49,17 @@ impl Renderer<'_> {
                             self.ctx.height() as f64,
                         ));
 
-                        if let EncodedShadingType::RadialAxial(gradient) = &encoded.shading_type
-                            && let Some(native) = gradient.as_svg_gradient(&encoded, bbox)
-                        {
+                        let level = self.ctx.render_settings().level;
+                        let native = match &encoded.shading_type {
+                            EncodedShadingType::RadialAxial(gradient) => gradient
+                                .as_svg_gradient(&encoded, bbox)
+                                .and_then(|native| native_gradient(&native, level)),
+                            _ => None,
+                        };
+                        if let Some((gradient, transform)) = native {
                             paint_transform = path_transform.inverse()
                                 * Affine::translate((-0.5, -0.5))
-                                * native.transform;
-
-                            let stops = native
-                                .stops
-                                .iter()
-                                .map(|stop| ColorStop {
-                                    offset: stop.offset,
-                                    color: DynamicColor::from_alpha_color(AlphaColor::<Srgb>::new(
-                                        stop.color,
-                                    )),
-                                })
-                                .collect::<Vec<_>>();
-
-                            let gradient = match native.kind {
-                                SvgGradientKind::Linear { start, end } => {
-                                    Gradient::new_linear(start, end)
-                                }
-                            }
-                            .with_extend(peniko::Extend::Pad)
-                            .with_stops(stops.as_slice());
-
+                                * transform;
                             PaintType::Gradient(gradient)
                         } else {
                             let (width, height) = texture_dimensions(bbox, 1.0);
@@ -192,4 +177,36 @@ impl Renderer<'_> {
 
         clip_path
     }
+}
+
+/// The gradient vello draws for `native`, and its transform, where it paints
+/// within a level of its stops ([`SvgGradient::paints_within_a_level`]): its
+/// table of colors, as vello builds it at `level`, is fine enough for them.
+/// `None` where it is not, so the shading is sampled instead.
+fn native_gradient(native: &SvgGradient, level: Level) -> Option<(Gradient, Affine)> {
+    use vello_common::encode::{EncodeExt, EncodedPaint};
+    let stops = native
+        .stops
+        .iter()
+        .map(|stop| ColorStop {
+            offset: stop.offset,
+            color: DynamicColor::from_alpha_color(AlphaColor::<Srgb>::new(stop.color)),
+        })
+        .collect::<Vec<_>>();
+    let gradient = match native.kind {
+        SvgGradientKind::Linear { start, end } => Gradient::new_linear(start, end),
+    }
+    .with_extend(peniko::Extend::Pad)
+    .with_stops(stops.as_slice());
+    let mut paints = Vec::new();
+    gradient.encode_into(&mut paints, Affine::IDENTITY, None)?;
+    // Fewer than two stops encode a solid color, which needs no table.
+    let lut_fits = match paints.pop() {
+        Some(EncodedPaint::Gradient(encoded)) => vello_common::fearless_simd::dispatch!(
+            level,
+            simd => native.paints_within_a_level(encoded.u8_lut(simd).lut())
+        ),
+        _ => true,
+    };
+    lut_fits.then_some((gradient, native.transform))
 }

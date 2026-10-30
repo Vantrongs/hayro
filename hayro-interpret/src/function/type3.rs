@@ -1,6 +1,7 @@
 use crate::encode::Cost;
+use crate::function::shape::{self, Piece};
 use crate::function::{
-    Clamper, Costs, Function, StitchingBounds, TupleVec, Values, interpolate, sorting,
+    Clamper, Costs, Function, OVER_POINTS_COUNT, TupleVec, Values, clipped_shape, interpolate,
 };
 use hayro_syntax::object::Array;
 use hayro_syntax::object::Dict;
@@ -10,7 +11,7 @@ use smallvec::smallvec;
 
 #[cfg(test)]
 thread_local! {
-    /// The functions `stitching_bounds` has visited.
+    /// The functions `shape` has visited.
     pub(crate) static VISITED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -20,7 +21,7 @@ pub(crate) struct Type3 {
     functions: Vec<Function>,
     bounds: Vec<f32>,
     encode: TupleVec,
-    clamper: Clamper,
+    pub(super) clamper: Clamper,
 }
 
 impl Type3 {
@@ -56,8 +57,8 @@ impl Type3 {
     }
 
     /// The most steps `eval` takes, finding the one function the input falls to
-    /// and evaluating it, and those `stitching_bounds` takes, gathering the bounds
-    /// of every function under this one and sorting them.
+    /// and evaluating it, and those `shape` takes and the most points it holds,
+    /// of every function under this one.
     pub(super) fn cost(&self) -> Costs {
         let search = Cost::new(u64::from(usize::BITS - self.bounds.len().leading_zeros()));
         let eval = self
@@ -69,15 +70,25 @@ impl Type3 {
             + search
             + Cost::new(2)
             + self.clamper.cost();
-        let bounds = Cost::of(self.bounds.len())
-            + self
-                .functions
-                .iter()
-                .map(Function::bounds_cost)
-                .sum::<Cost>();
+        // Each function's points, and those `shape::over` adds at its sides,
+        // clipped again to the range.
+        let (own, steps) = self
+            .functions
+            .iter()
+            .fold((0_u64, Cost::ZERO), |(points, steps), f| {
+                (
+                    points
+                        .saturating_add(f.shape_points())
+                        .saturating_add(OVER_POINTS_COUNT),
+                    steps + f.shape_cost(),
+                )
+            });
+        let outputs = self.clamper.range.as_ref().map_or(0, |r| r.len() as u64);
+        let (points, shape) = clipped_shape(own, outputs);
         Costs {
             eval,
-            bounds: sorting(bounds),
+            shape: steps + shape,
+            points,
         }
     }
 
@@ -103,50 +114,51 @@ impl Type3 {
         Some(evaluated)
     }
 
-    pub(crate) fn stitching_bounds(&self) -> StitchingBounds {
-        let mut stitching_bounds = StitchingBounds::new();
-        if self.bounds.len() > 2 {
-            stitching_bounds.extend_from_slice(&self.bounds[1..self.bounds.len() - 1]);
+    /// The pieces of each function stitched, put where its interval of the
+    /// domain maps to them (`shape::mapped`), one after another, each step at a
+    /// bound two points at it, the lines then clipped to the range; an interval
+    /// with no function or encoding a curve, as `eval` gives it no value. Bounds
+    /// out of order, which `eval` searches as they are, make the whole a curve.
+    pub(crate) fn shape(&self) -> Vec<Piece> {
+        let Some(&(d0, d1)) = self.clamper.domain.first() else {
+            return vec![Piece::Curve(0.0, 1.0)];
+        };
+        if d0 > d1
+            || self
+                .bounds
+                .windows(2)
+                .any(|w| w[0].partial_cmp(&w[1]).is_none_or(|o| o.is_gt()))
+        {
+            return vec![Piece::Curve(d0, d1)];
         }
-
-        for (index, function) in self.functions.iter().enumerate() {
-            #[cfg(test)]
-            VISITED.set(VISITED.get() + 1);
-            let Some(bounds_i_minus_1) = self.bounds.get(index).copied() else {
-                continue;
-            };
-            let Some(bounds_i) = self.bounds.get(index + 1).copied() else {
-                continue;
-            };
-
-            let Some((encode_min, encode_max)) = self.encode.get(index).copied() else {
-                continue;
-            };
-
-            if (encode_max - encode_min).abs() <= f32::EPSILON {
+        let mut pieces = Vec::with_capacity(self.functions.len());
+        for (i, interval) in self.bounds.windows(2).enumerate() {
+            let (b0, b1) = (interval[0], interval[1]);
+            let (lo, hi) = (b0.max(d0), b1.min(d1));
+            if lo.partial_cmp(&hi) != Some(std::cmp::Ordering::Less) {
                 continue;
             }
-
-            for child_bound in function.stitching_bounds() {
-                let bound = interpolate(
-                    child_bound,
-                    encode_min,
-                    encode_max,
-                    bounds_i_minus_1,
-                    bounds_i,
-                );
-                let min_bound = bounds_i_minus_1.min(bounds_i);
-                let max_bound = bounds_i_minus_1.max(bounds_i);
-                if bound > min_bound && bound < max_bound {
-                    stitching_bounds.push(bound);
+            match (self.functions.get(i), self.encode.get(i)) {
+                (Some(function), Some(&encode)) => {
+                    #[cfg(test)]
+                    VISITED.set(VISITED.get() + 1);
+                    pieces.extend(shape::mapped(function, (lo, hi), (b0, b1), encode));
                 }
+                _ => pieces.push(Piece::Curve(lo, hi)),
             }
         }
-
-        stitching_bounds.sort_by(f32::total_cmp);
-        stitching_bounds.dedup_by(|a, b| (*a - *b).abs() <= f32::EPSILON);
-
-        stitching_bounds
+        if pieces.is_empty() {
+            return vec![Piece::Curve(d0, d1)];
+        }
+        shape::joined(pieces)
+            .into_iter()
+            .map(|piece| match piece {
+                Piece::Lines(points) => {
+                    Piece::Lines(shape::clipped(points, self.clamper.range.as_deref()))
+                }
+                curve => curve,
+            })
+            .collect()
     }
 }
 

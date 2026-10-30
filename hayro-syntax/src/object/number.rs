@@ -87,9 +87,8 @@ use core::fmt::{Debug, Display, Formatter};
 #[derive(Clone, Copy)]
 pub struct Number {
     /// The kind in the low byte; for a decimal its sign and whether it is long in
-    /// two bits above it and its scale in the high half; for a real its places in
-    /// the 24 bits above the kind and the bits of its 32-bit reading in the high
-    /// half.
+    /// two bits above it and its scale in the high half; for a real the bits of its
+    /// 32-bit reading in the high half.
     head: u64,
     /// The integer, the digits, or the bits of the value.
     body: u64,
@@ -100,8 +99,6 @@ const DECIMAL_KIND: u8 = 1;
 const REAL_KIND: u8 = 2;
 const NEGATIVE_BIT: u64 = 1 << 8;
 const LONG_BIT: u64 = 1 << 9;
-/// The most places a real's 24 bits hold.
-const MOST_PLACES: u32 = (1 << 24) - 1;
 
 #[derive(Clone, Copy, Debug)]
 enum Repr {
@@ -119,14 +116,8 @@ enum Repr {
         /// before the point (rule 12 of the module doc rather than rule 11).
         long: bool,
     },
-    /// Any other real: its value, its 32-bit reading, NaN where there is none,
-    /// and how many digits stand after its point, plus one, none where it has no
-    /// point (at most `MOST_PLACES`).
-    Real {
-        value: f64,
-        viewer: f32,
-        places: u32,
-    },
+    /// Any other real: its value, and its 32-bit reading, NaN where there is none.
+    Real { value: f64, viewer: f32 },
 }
 
 impl Number {
@@ -149,19 +140,8 @@ impl Number {
                     | (scale as u64) << 32,
                 body: digits,
             },
-            Repr::Real {
-                value,
-                viewer,
-                places,
-            } => Self {
-                head: REAL_KIND as u64
-                    | (if places < MOST_PLACES {
-                        places
-                    } else {
-                        MOST_PLACES
-                    } as u64)
-                        << 8
-                    | (viewer.to_bits() as u64) << 32,
+            Repr::Real { value, viewer } => Self {
+                head: REAL_KIND as u64 | (viewer.to_bits() as u64) << 32,
                 body: value.to_bits(),
             },
         }
@@ -180,7 +160,6 @@ impl Number {
             _ => Repr::Real {
                 value: f64::from_bits(self.body),
                 viewer: f32::from_bits((self.head >> 32) as u32),
-                places: (self.head >> 8) as u32 & MOST_PLACES,
             },
         }
     }
@@ -356,17 +335,6 @@ impl Number {
         }
     }
 
-    /// How many digits the number is written with after its point (`0.500` has
-    /// three, `5.` none); `None` where it is written without a point, an integer
-    /// of any size, or made rather than read ([`Number::from_f32`]).
-    pub fn fraction_digits(&self) -> Option<u32> {
-        match self.repr() {
-            Repr::Integer(_) => None,
-            Repr::Decimal { scale, .. } => Some(scale),
-            Repr::Real { places, .. } => places.checked_sub(1),
-        }
-    }
-
     /// The number in 32 bits as a viewer reads it from the digits as written, which
     /// for a real can differ from [`Number::as_f64`] rounded: `4294967297.5` reads as
     /// 1.5 (rules 10 to 13 of the module doc). `None` where no reading is
@@ -413,7 +381,6 @@ impl Number {
         Self::new(Repr::Real {
             value: num as f64,
             viewer: num,
-            places: 0,
         })
     }
 
@@ -473,7 +440,6 @@ impl Number {
         Self::new(Repr::Real {
             value,
             viewer: f32::NAN,
-            places: 0,
         })
     }
 }
@@ -652,7 +618,6 @@ impl Token {
         Number::new(Repr::Real {
             value: self.nearest(data),
             viewer,
-            places: scale.saturating_add(1),
         })
     }
 

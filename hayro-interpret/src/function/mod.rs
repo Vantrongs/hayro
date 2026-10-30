@@ -3,6 +3,7 @@
 //! PDF has the concept of functions, representing objects that take a certain number of values
 //! as input, do some processing on them and then return some output.
 
+pub(crate) mod shape;
 mod type0;
 mod type2;
 mod type3;
@@ -27,7 +28,6 @@ pub use type4::operators_run;
 
 /// The input/output type of functions.
 pub(crate) type Values = SmallVec<[f32; 4]>;
-pub(crate) type StitchingBounds = SmallVec<[f32; 3]>;
 type TupleVec = SmallVec<[(f32, f32); 4]>;
 
 #[derive(Debug)]
@@ -52,7 +52,24 @@ pub struct Function(Arc<(FunctionType, Costs)>);
 #[derive(Debug, Clone, Copy)]
 struct Costs {
     eval: Cost,
-    bounds: Cost,
+    /// The steps [`Function::shape`] takes, and the most points it holds.
+    shape: Cost,
+    points: u64,
+}
+
+/// The most points `shape::over` adds to a function's own: two at each side.
+pub(crate) const OVER_POINTS_COUNT: u64 = 4;
+
+/// The most points the shape of a function with `samples` points of its own and
+/// `outputs` outputs holds once clipped to its range, a line crossing each side
+/// of each output's range at most once, and the steps finding them takes: a few
+/// for each output of each point.
+fn clipped_shape(samples: u64, outputs: u64) -> (u64, Cost) {
+    let points = samples.saturating_mul(outputs.saturating_mul(2).saturating_add(1));
+    (
+        points,
+        Cost::new(points.saturating_mul(outputs.saturating_add(4))),
+    )
 }
 
 impl Function {
@@ -72,19 +89,32 @@ impl Function {
 
     /// The function of `function_type`, its cost found once.
     fn of(function_type: FunctionType) -> Self {
+        let curve = (0, Cost::new(1));
         let cost = match &function_type {
-            FunctionType::Type0(t0) => Costs {
-                eval: t0.cost(),
-                bounds: Cost::ZERO,
-            },
-            FunctionType::Type2(t2) => Costs {
-                eval: t2.cost(),
-                bounds: Cost::ZERO,
-            },
+            FunctionType::Type0(t0) => {
+                let (points, shape) = match t0.sizes() {
+                    [n] => clipped_shape(u64::from(*n).saturating_add(2), t0.outputs()),
+                    _ => curve,
+                };
+                Costs {
+                    eval: t0.cost(),
+                    shape,
+                    points,
+                }
+            }
+            FunctionType::Type2(t2) => {
+                let (points, shape) = clipped_shape(2, t2.outputs());
+                Costs {
+                    eval: t2.cost(),
+                    shape,
+                    points,
+                }
+            }
             FunctionType::Type3(t3) => t3.cost(),
             FunctionType::Type4(t4) => Costs {
                 eval: t4.cost(),
-                bounds: Cost::ZERO,
+                shape: curve.1,
+                points: curve.0,
             },
         };
         Self(Arc::new((function_type, cost)))
@@ -97,9 +127,42 @@ impl Function {
         self.0.1.eval
     }
 
-    /// The most steps [`stitching_bounds`](Self::stitching_bounds) takes.
-    pub(crate) fn bounds_cost(&self) -> Cost {
-        self.0.1.bounds
+    /// The steps [`shape`](Self::shape) takes.
+    pub(crate) fn shape_cost(&self) -> Cost {
+        self.0.1.shape
+    }
+
+    /// The most points [`shape`](Self::shape) holds.
+    pub(crate) fn shape_points(&self) -> u64 {
+        self.0.1.points
+    }
+
+    /// The domain of its first input, `None` where it has none.
+    pub(crate) fn domain(&self) -> Option<(f32, f32)> {
+        let clamper = match &self.0.0 {
+            FunctionType::Type0(t0) => &t0.clamper,
+            FunctionType::Type2(t2) => &t2.clamper,
+            FunctionType::Type3(t3) => &t3.clamper,
+            FunctionType::Type4(t4) => &t4.clamper,
+        };
+        clamper.domain.first().copied()
+    }
+
+    /// The function of its first input over its domain as it evaluates, piece by
+    /// piece ([`shape::Piece`]): straight lines where it is made of them, as a
+    /// sampled function of one input, an exponential one of exponent one, and a
+    /// stitching of such are, each step of a stitching at its bound; elsewhere
+    /// curves.
+    pub(crate) fn shape(&self) -> Vec<shape::Piece> {
+        match &self.0.0 {
+            FunctionType::Type0(t0) => vec![t0.shape()],
+            FunctionType::Type2(t2) => vec![t2.shape()],
+            FunctionType::Type3(t3) => t3.shape(),
+            FunctionType::Type4(t4) => {
+                let (d0, d1) = t4.clamper.domain.first().copied().unwrap_or((0.0, 1.0));
+                vec![shape::Piece::Curve(d0, d1)]
+            }
+        }
     }
 
     /// Evaluate the function with the given input.
@@ -109,13 +172,6 @@ impl Function {
             FunctionType::Type2(t2) => Some(t2.eval(*input.first()?)),
             FunctionType::Type3(t3) => t3.eval(*input.first()?),
             FunctionType::Type4(t4) => Some(t4.eval(input)?),
-        }
-    }
-
-    pub(crate) fn stitching_bounds(&self) -> StitchingBounds {
-        match &self.0.0 {
-            FunctionType::Type3(t3) => t3.stitching_bounds(),
-            _ => SmallVec::new(),
         }
     }
 }

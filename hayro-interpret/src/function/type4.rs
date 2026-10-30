@@ -13,7 +13,7 @@ use std::ops::Rem;
 #[derive(Debug)]
 pub(crate) struct Type4 {
     program: Vec<PostScriptOp>,
-    clamper: Clamper,
+    pub(super) clamper: Clamper,
 }
 
 impl Type4 {

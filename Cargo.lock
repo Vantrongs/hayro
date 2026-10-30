@@ -541,6 +541,7 @@ dependencies = [
  "kurbo",
  "log",
  "pic-scale",
+ "vello_common",
  "vello_cpu",
 ]
 

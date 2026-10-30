@@ -6,7 +6,8 @@ use crate::CacheKey;
 use crate::cache::Cache;
 use crate::color::{ColorComponents, ColorSpace};
 use crate::encode::Cost;
-use crate::function::{Function, StitchingBounds, Values, interpolate, sorting};
+use crate::function::shape::{self, Piece};
+use crate::function::{Function, OVER_POINTS_COUNT, Values, interpolate, sorting};
 use crate::interpret::annotation::entries::Entries;
 use crate::radial::{Lead, same};
 use crate::util::{PointExt, hash128};
@@ -46,12 +47,35 @@ impl ShadingFunction {
         }
     }
 
-    /// The most steps [`stitching_bounds`](Self::stitching_bounds) takes.
-    pub(crate) fn bounds_cost(&self) -> Cost {
-        sorting(match self {
-            Self::Single(function) => function.bounds_cost(),
-            Self::Multiple(functions) => functions.iter().map(Function::bounds_cost).sum(),
-        })
+    /// The steps [`shape`](Self::shape) takes, and the most points it holds.
+    pub(crate) fn shape_cost(&self) -> (Cost, u64) {
+        match self {
+            Self::Single(function) => (
+                function.shape_cost(),
+                function.shape_points().saturating_add(OVER_POINTS_COUNT),
+            ),
+            // Every point of each, from below and from above.
+            Self::Multiple(functions) => {
+                let points = functions
+                    .iter()
+                    .map(|f| f.shape_points().saturating_add(OVER_POINTS_COUNT))
+                    .fold(0_u64, u64::saturating_add)
+                    .saturating_mul(2);
+                let steps = functions.iter().map(Function::shape_cost).sum::<Cost>()
+                    + Cost::new(points.saturating_mul(functions.len() as u64 + 4));
+                (sorting(steps), points)
+            }
+        }
+    }
+
+    /// The function from `from` to `to`, `from` below `to`, piece by piece as it
+    /// evaluates ([`Function::shape`]): one function's own, past its domain the
+    /// value at its side; several, one for each output, side by side.
+    pub(crate) fn shape(&self, from: f32, to: f32) -> Vec<Piece> {
+        match self {
+            Self::Single(function) => shape::over(function, from, to),
+            Self::Multiple(functions) => shape::side_by_side(functions, from, to),
+        }
     }
 
     /// Evaluate the shading function.
@@ -70,23 +94,6 @@ impl ShadingFunction {
                 Some(out)
             }
         }
-    }
-
-    pub(crate) fn stitching_bounds(&self) -> StitchingBounds {
-        let mut bounds = StitchingBounds::new();
-
-        match self {
-            Self::Single(function) => bounds.extend(function.stitching_bounds()),
-            Self::Multiple(functions) => {
-                for function in functions {
-                    bounds.extend(function.stitching_bounds());
-                }
-            }
-        }
-
-        bounds.sort_by(f32::total_cmp);
-        bounds.dedup_by(|a, b| (*a - *b).abs() <= f32::EPSILON);
-        bounds
     }
 }
 

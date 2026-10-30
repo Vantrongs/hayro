@@ -493,6 +493,19 @@ impl ColorSpace {
         ToRgb::setup_cost(self)
     }
 
+    /// The color of `c` as straight RGB before [`to_rgba`](Self::to_rgba) clamps
+    /// each channel to `0..=1` and rounds it to 8 bits, where that is the same
+    /// affine map of the components everywhere: `DeviceGray`'s and `DeviceRGB`'s.
+    /// `None` for any other space, whose colors bend between two components.
+    pub(crate) fn straight_rgb(&self, c: &[f32]) -> Option<[f32; 3]> {
+        let at = |i: usize| c.get(i).copied().unwrap_or(0.0);
+        match self.0.as_ref() {
+            ColorSpaceType::DeviceGray(_) => Some([at(0); 3]),
+            ColorSpaceType::DeviceRgb(_) => Some([at(0), at(1), at(2)]),
+            _ => None,
+        }
+    }
+
     /// Turn the given component values and opacity into an RGBA color.
     #[inline]
     pub fn to_rgba(&self, c: &[f32], opacity: f32) -> AlphaColor {

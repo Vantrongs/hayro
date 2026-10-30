@@ -2,6 +2,7 @@
 
 use crate::color::{AlphaColor, ColorComponents, ColorSpace};
 use crate::flatten::ControlHull;
+use crate::function::shape::Piece;
 use crate::gradient::{SvgGradientStop, color_at};
 use crate::interpret::state::ActiveTransferFunction;
 use crate::pattern::ShadingPattern;
@@ -100,8 +101,8 @@ pub(crate) fn take(meter: &mut dyn Meter, steps: Cost) -> Result<(), Exhausted> 
 /// putting the result out.
 const POINT_COST: Cost = Cost::new(8);
 
-/// The steps finding a radial shading's color among its stops takes: a search of
-/// a few thousand stops at most, and a blend.
+/// The steps finding an axial or radial shading's color among its stops takes: a
+/// search of a few thousand stops at most, and a blend.
 const LOOKUP_COST: Cost = Cost::new(16);
 
 /// The steps placing a triangle of a mesh takes, its box found and cut by the
@@ -162,9 +163,9 @@ pub struct EncodedRadialAxialShading {
     pub(crate) params: RadialAxialParams,
     pub(crate) domain: [f32; 2],
     pub(crate) extend: [bool; 2],
-    /// A radial shading's colors from its start to its end, found when it is
-    /// first sampled ([`EncodedShadingPattern::ramp`]).
-    pub(crate) stops: OnceLock<Vec<SvgGradientStop>>,
+    /// Its function's shape over its domain, found when its stops are first
+    /// found ([`EncodedRadialAxialShading::stops_metered`]).
+    pub(crate) shape: OnceLock<Vec<Piece>>,
 }
 
 /// Encoded mesh shading, sampled at the device pixels a texture reads.
@@ -618,17 +619,23 @@ impl EncodedShadingPattern {
         let samples = self
             .samples_at(&mut Unmetered, |pixels| pixels.add(pos))
             .expect(UNMETERED);
-        let ramp = self.ramp(&mut Unmetered).expect(UNMETERED);
-        self.sample_in(pos, samples.as_ref(), ramp.as_ref())
+        let t = self.t_at(pos);
+        match self
+            .ramp(t.into_iter(), 1.0, &mut Unmetered)
+            .expect(UNMETERED)
+        {
+            Some(ramp) => ramp.color(t.flatten()),
+            None => self.sample_in(pos, samples.as_ref()),
+        }
     }
 
     /// The most steps sampling a point takes once the tables its color is looked up
     /// in are built ([`setup_cost`](Self::setup_cost)): its function's
     /// ([`Function::cost`](crate::Function::cost)), its color's
     /// ([`ColorSpace::cost`](crate::color::ColorSpace::cost)) and the transfer
-    /// function's. A mesh's triangles are placed besides, once for all points. A
-    /// radial shading's color is looked up in its stops instead, found as it is
-    /// first sampled, each of their samples taken as this.
+    /// function's. A mesh's triangles are placed besides, once for all points. An
+    /// axial or radial shading's color is looked up in its stops instead, found
+    /// for the part of it the points reach, each of their values taken as this.
     pub fn point_cost(&self) -> Cost {
         if self.ramps() {
             return POINT_COST + LOOKUP_COST;
@@ -637,7 +644,7 @@ impl EncodedShadingPattern {
     }
 
     /// The steps the shading's own color at a point takes,
-    /// [`point_cost`](Self::point_cost) but for a radial shading's stops.
+    /// [`point_cost`](Self::point_cost) but for an axial or radial shading's stops.
     pub(crate) fn value_cost(&self) -> Cost {
         let function = match &self.shading_type {
             EncodedShadingType::FunctionBased(shading) => shading.function.cost(),
@@ -700,56 +707,53 @@ impl EncodedShadingPattern {
             .map(|samples| Some(Located { samples, shift }))
     }
 
-    /// Whether its colors are looked up in its stops ([`ramp`](Self::ramp)): a
-    /// radial shading's, whose texture would otherwise evaluate its function and
-    /// color space, a tint transform's program among them, at every pixel. An
-    /// axial shading is drawn as a gradient of those stops where one reaches.
+    /// Whether its colors are looked up in its stops ([`ramp`](Self::ramp)): an
+    /// axial or radial shading's, whose texture would otherwise evaluate its
+    /// function and color space, a tint transform's program among them, at every
+    /// pixel.
     fn ramps(&self) -> bool {
-        matches!(
-            &self.shading_type,
-            EncodedShadingType::RadialAxial(EncodedRadialAxialShading {
-                params: RadialAxialParams::Radial { .. },
-                ..
-            })
-        )
+        matches!(&self.shading_type, EncodedShadingType::RadialAxial(_))
     }
 
-    /// For a radial shading, its stops and its color where none of its circles
-    /// passes, the stops found the first time, taking each sample of `meter` first
+    /// The parameter of an axial or radial shading at `pos`: `None` for any other
+    /// shading, `Some(None)` where it paints its background.
+    fn t_at(&self, pos: Point) -> Option<Option<f32>> {
+        match &self.shading_type {
+            EncodedShadingType::RadialAxial(shading) => Some(shading.t_at(pos)),
+            _ => None,
+        }
+    }
+
+    /// For an axial or radial shading, its stops over the parameters `ts` reach,
+    /// at a resolution of `scale` pixels per unit of the space points are
+    /// sampled in, and its color where none of its lines or circles passes,
+    /// taking their work and memory of `meter` first
     /// ([`EncodedRadialAxialShading::stops_metered`]).
-    fn ramp(&self, meter: &mut dyn Meter) -> Result<Option<Ramp<'_>>, Exhausted> {
+    fn ramp(
+        &self,
+        ts: impl Iterator<Item = Option<f32>>,
+        scale: f32,
+        meter: &mut dyn Meter,
+    ) -> Result<Option<Ramp>, Exhausted> {
         let EncodedShadingType::RadialAxial(shading) = &self.shading_type else {
             return Ok(None);
         };
-        if !self.ramps() {
-            return Ok(None);
-        }
-        let stops = match shading.stops.get() {
-            Some(stops) => stops,
-            None => {
-                let stops = shading.stops_metered(self, meter)?;
-                shading.stops.get_or_init(|| stops)
-            }
+        let range = ts.flatten().fold(None, |range: Option<(f32, f32)>, t| {
+            Some(range.map_or((t, t), |(lo, hi)| (lo.min(t), hi.max(t))))
+        });
+        let stops = match range {
+            Some(range) => shading.stops_metered(self, range, scale, meter)?,
+            None => Vec::new(),
         };
         Ok(Some(Ramp {
-            shading,
             stops,
             outside: self.finish(Some(self.background_color)),
         }))
     }
 
-    /// The shading at `pos`, a mesh's looked up in `samples`, a radial one's in
-    /// `ramp`.
+    /// The shading at `pos`, a mesh's looked up in `samples`.
     #[inline]
-    fn sample_in(
-        &self,
-        pos: Point,
-        samples: Option<&Located>,
-        ramp: Option<&Ramp<'_>>,
-    ) -> [f32; 4] {
-        if let Some(ramp) = ramp {
-            return ramp.at(pos);
-        }
+    fn sample_in(&self, pos: Point, samples: Option<&Located>) -> [f32; 4] {
         self.finish(
             self.shading_type
                 .eval(pos, self.background_color, &self.color_space, samples),
@@ -829,22 +833,43 @@ impl EncodedShadingPattern {
         })?;
         let inv_scale = 1.0 / scale as f64;
         let mut row = vec![[0.0_f32; 4]; width as usize];
-        if let Some(ramp) = self.ramp(meter)? {
+        if self.ramps() {
             // Each point placed from its pixel, as `sample_points_metered` places
             // it: steps added along a row of 10^4 pixels stray from it by as many
             // roundings, as far as 10^9 units out a circle is from its neighbour.
+            // The parameters first, so the stops are found for those they reach.
+            if !meter.hold(
+                usize::try_from(points)
+                    .unwrap_or(usize::MAX)
+                    .saturating_mul(size_of::<f32>()),
+            ) {
+                return Err(Exhausted);
+            }
+            let mut ts = Vec::with_capacity(width as usize * height as usize);
             for y in 0..height {
                 let y = bbox.y0 + (f64::from(y) + 0.5) * inv_scale;
-                for (x, out) in row.iter_mut().enumerate() {
-                    let x = bbox.x0 + (x as f64 + 0.5) * inv_scale;
-                    *out = ramp.at(self.base_transform * Point::new(x, y));
+                for x in 0..width {
+                    let x = bbox.x0 + (f64::from(x) + 0.5) * inv_scale;
+                    ts.push(
+                        self.t_at(self.base_transform * Point::new(x, y))
+                            .flatten()
+                            .unwrap_or(f32::NAN),
+                    );
+                }
+            }
+            let ramp = self
+                .ramp(ts.iter().map(|t| (!t.is_nan()).then_some(*t)), scale, meter)?
+                .expect("an axial or radial shading has stops");
+            for ts in ts.chunks_exact(width as usize) {
+                for (out, &t) in row.iter_mut().zip(ts) {
+                    *out = ramp.color((!t.is_nan()).then_some(t));
                 }
                 f(&row);
             }
         } else {
             let mut at = 0;
             self.texture_points(bbox, scale, |point| {
-                row[at] = self.sample_in(point, samples.as_ref(), None);
+                row[at] = self.sample_in(point, samples.as_ref());
                 at += 1;
                 if at == row.len() {
                     f(&row);
@@ -860,8 +885,11 @@ impl EncodedShadingPattern {
     }
 
     /// The shading at each of `points`, in the space of
-    /// [`sample_texture`](Self::sample_texture)'s `bbox`, passed to `f` in their
-    /// order as straight RGBA, its work and memory taken of `meter` first as
+    /// [`sample_texture`](Self::sample_texture)'s `bbox`, with `scale` pixels per
+    /// unit of it as there, passed to `f` in their order as straight RGBA: an
+    /// axial or radial shading's colors are looked up in stops found at that
+    /// resolution ([`EncodedRadialAxialShading::grid_step`]), so the points of a
+    /// texture's pixels are its colors. Its work and memory are taken of `meter` first as
     /// [`sample_texture_metered`](Self::sample_texture_metered) takes them.
     /// `Exhausted`, with no point passed to `f`, when `meter` refuses. A mesh is
     /// sampled where each point lies, not at its pixel's centre as a texture
@@ -870,6 +898,7 @@ impl EncodedShadingPattern {
     pub fn sample_points_metered(
         &self,
         points: &[Point],
+        scale: f32,
         meter: &mut dyn Meter,
         mut f: impl FnMut([f32; 4]),
     ) -> Result<(), Exhausted> {
@@ -889,9 +918,28 @@ impl EncodedShadingPattern {
             }
             return Ok(());
         }
-        let ramp = self.ramp(meter)?;
+        if self.ramps() {
+            if !meter.hold(points.len().saturating_mul(size_of::<f32>())) {
+                return Err(Exhausted);
+            }
+            let ts: Vec<f32> = points
+                .iter()
+                .map(|p| {
+                    self.t_at(self.base_transform * *p)
+                        .flatten()
+                        .unwrap_or(f32::NAN)
+                })
+                .collect();
+            let ramp = self
+                .ramp(ts.iter().map(|t| (!t.is_nan()).then_some(*t)), scale, meter)?
+                .expect("an axial or radial shading has stops");
+            for t in ts {
+                f(ramp.color((!t.is_nan()).then_some(t)));
+            }
+            return Ok(());
+        }
         for point in points {
-            f(self.sample_in(self.base_transform * *point, None, ramp.as_ref()));
+            f(self.sample_in(self.base_transform * *point, None));
         }
         Ok(())
     }
@@ -1084,7 +1132,7 @@ fn encode_axial_shading(
             params,
             domain,
             extend,
-            stops: OnceLock::new(),
+            shape: OnceLock::new(),
         }),
         initial_transform,
     )
@@ -1394,22 +1442,19 @@ impl EncodedRadialAxialShading {
     }
 }
 
-/// A radial shading's colors looked up in its stops
+/// An axial or radial shading's colors looked up in its stops
 /// ([`EncodedShadingPattern::ramp`]).
-struct Ramp<'a> {
-    shading: &'a EncodedRadialAxialShading,
-    stops: &'a [SvgGradientStop],
+struct Ramp {
+    stops: Vec<SvgGradientStop>,
     /// Its background, with its opacity and transfer function.
     outside: [f32; 4],
 }
 
-impl Ramp<'_> {
-    /// The color at `pos`, in the shading's space.
+impl Ramp {
+    /// The color at the parameter `t`, its background where it has none.
     #[inline]
-    fn at(&self, pos: Point) -> [f32; 4] {
-        self.shading
-            .t_at(pos)
-            .map_or(self.outside, |t| color_at(self.stops, t))
+    fn color(&self, t: Option<f32>) -> [f32; 4] {
+        t.map_or(self.outside, |t| color_at(&self.stops, t))
     }
 }
 
@@ -1516,9 +1561,9 @@ fn radial_pos(
     let dr = r.y - r0;
     let (px, py) = (pos.x, pos.y);
 
-    let a = lead.value();
     let b = -2.0 * (px * dx + py * dy + r0 * dr);
     let c = px * px + py * py - r0 * r0;
+    let a = lead.coefficient(b);
 
     let discriminant = b * b - 4.0 * a * c;
 
@@ -1862,6 +1907,9 @@ fn clip_to(a: Point, b: Point, rect: Rect) -> Option<(Point, Point)> {
 
 #[cfg(test)]
 mod tests {
+    mod against_functions;
+    mod stops;
+
     use super::span;
     use super::{
         Cost, EncodedSampledShading, EncodedShadingType, Exhausted, Meter, PATCH_TRIANGLES,
@@ -2243,11 +2291,12 @@ mod tests {
         }
     }
 
-    /// Gathering a stitching function's bounds, as each fill drawn as a native
+    /// Finding a stitching function's shape, as the first fill drawn as a native
     /// gradient does, walks no function past the last of its bounds and
-    /// encodings, which evaluating never reaches: with 1 to 10⁴ functions
-    /// stitched over an empty `/Bounds`, 100 fills visit one function each and
-    /// take the same steps, whatever the length of `/Functions`.
+    /// encodings, which evaluating never reaches, and later fills find it found:
+    /// with 1 to 10⁴ functions stitched over an empty `/Bounds`, 100 fills visit
+    /// one function and take the same steps, whatever the length of
+    /// `/Functions`.
     #[test]
     fn a_stitching_walks_only_the_functions_it_evaluates() {
         use crate::function::TYPE3_VISITED;
@@ -2279,7 +2328,7 @@ mod tests {
                     .expect("given all it asks")
                     .expect("a native gradient");
             }
-            assert_eq!(TYPE3_VISITED.get(), 100, "{n} functions");
+            assert_eq!(TYPE3_VISITED.get(), 1, "{n} functions");
             let asked: u64 = meter.asked.iter().sum();
             assert_eq!(*taken.get_or_insert(asked), asked, "{n} functions");
         }
@@ -2315,7 +2364,7 @@ mod tests {
         let at = |encoded: &super::EncodedShadingPattern, point: Point| {
             let mut color = [0.0; 4];
             encoded
-                .sample_points_metered(&[point], &mut super::Unmetered, |c| color = c)
+                .sample_points_metered(&[point], 1.0, &mut super::Unmetered, |c| color = c)
                 .expect("unmetered");
             color
         };
@@ -2659,7 +2708,9 @@ mod tests {
                     let points = [Point::new(50.0, 40.0), Point::ZERO, Point::new(-7.0, 1e6)];
                     let mut colors = Vec::new();
                     encoded
-                        .sample_points_metered(&points, &mut super::Unmetered, |c| colors.push(c))
+                        .sample_points_metered(&points, 1.0, &mut super::Unmetered, |c| {
+                            colors.push(c);
+                        })
                         .expect("unmetered");
                     assert_eq!(colors, [color; 3], "{case}");
                     encoded
@@ -2770,19 +2821,32 @@ mod tests {
             held: vec![],
         };
         let mut sampled = vec![];
-        encoded
-            .sample_points_metered(&points, &mut meter, |c| sampled.push(c))
+        // Each afresh, so each finds its function's shape.
+        pattern
+            .encode()
+            .sample_points_metered(&points, 1.0, &mut meter, |c| sampled.push(c))
             .expect("given all it asks");
         assert_eq!(sampled, texture);
-        let whole = encoded.setup_cost() + encoded.point_cost().times(points.len() as u64);
-        assert_eq!(meter.asked, vec![whole.steps()]);
+        let mut paid = Recording {
+            left: u64::MAX,
+            asked: vec![],
+            held: vec![],
+        };
+        pattern
+            .encode()
+            .sample_texture_metered(bbox, 1.0, &mut paid, |_| {})
+            .expect("given all it asks");
+        assert_eq!((&meter.asked, &meter.held), (&paid.asked, &paid.held));
+        let whole: u64 = meter.asked.iter().sum();
         let mut meter = Recording {
-            left: whole.steps() - 1,
+            left: whole - 1,
             asked: vec![],
             held: vec![],
         };
         let mut passed = 0;
-        let refused = encoded.sample_points_metered(&points, &mut meter, |_| passed += 1);
+        let refused = pattern
+            .encode()
+            .sample_points_metered(&points, 1.0, &mut meter, |_| passed += 1);
         assert_eq!((refused, passed), (Err(Exhausted), 0));
     }
 
@@ -2863,9 +2927,14 @@ mod tests {
                                     .collect();
                                 let mut sampled = vec![];
                                 encoded
-                                    .sample_points_metered(&points, &mut super::Unmetered, |c| {
-                                        sampled.push(c);
-                                    })
+                                    .sample_points_metered(
+                                        &points,
+                                        scale as f32,
+                                        &mut super::Unmetered,
+                                        |c| {
+                                            sampled.push(c);
+                                        },
+                                    )
                                     .expect("unmetered");
                                 let case =
                                     format!("{name} {size} {off} [{e}] {background:?} {bbox:?}");
@@ -2950,7 +3019,7 @@ mod tests {
             .collect();
         let mut sampled = vec![];
         encoded
-            .sample_points_metered(&centres, &mut super::Unmetered, |c| sampled.push(c))
+            .sample_points_metered(&centres, 1.0, &mut super::Unmetered, |c| sampled.push(c))
             .expect("unmetered");
         assert_eq!(sampled, texture);
         assert!(texture.iter().any(|c| c[3] == 1.0));
@@ -2969,7 +3038,7 @@ mod tests {
             held: vec![],
         };
         encoded
-            .sample_points_metered(&points, &mut meter, |c| sampled.push(c))
+            .sample_points_metered(&points, 1.0, &mut meter, |c| sampled.push(c))
             .expect("given all it asks");
         assert_eq!(sampled[0][3], 1.0, "{sampled:?}");
         assert_eq!(sampled[1], [0.0; 4], "{sampled:?}");
@@ -2997,7 +3066,7 @@ mod tests {
                 held: vec![],
             };
             let mut passed = 0;
-            let refused = encoded.sample_points_metered(&points, &mut meter, |_| passed += 1);
+            let refused = encoded.sample_points_metered(&points, 1.0, &mut meter, |_| passed += 1);
             assert_eq!((refused, passed), (Err(Exhausted), 0), "{left}");
         }
     }
@@ -3184,7 +3253,7 @@ mod tests {
             let mut color = [0.0; 4];
             encoded
                 .encode()
-                .sample_points_metered(&[point], &mut super::Unmetered, |c| color = c)
+                .sample_points_metered(&[point], 1.0, &mut super::Unmetered, |c| color = c)
                 .expect("unmetered");
             color
         };
@@ -3359,7 +3428,7 @@ mod tests {
         let color_at = |encoded: &super::EncodedShadingPattern, point: Point| {
             let mut color = [0.0; 4];
             encoded
-                .sample_points_metered(&[point], &mut super::Unmetered, |c| color = c)
+                .sample_points_metered(&[point], 1.0, &mut super::Unmetered, |c| color = c)
                 .expect("unmetered");
             color
         };

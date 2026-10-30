@@ -5,6 +5,7 @@ thread_local! {
     /// The evaluations run.
     pub(crate) static EVALS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
+use crate::function::shape::{Piece, clipped};
 use crate::function::{Clamper, TupleVec, Values, interpolate};
 use hayro_syntax::bit_reader::BitReader;
 use hayro_syntax::object::Array;
@@ -18,7 +19,7 @@ pub(crate) struct Type0 {
     sizes: IntVec,
     strides: Vec<usize>,
     table: Vec<u32>,
-    clamper: Clamper,
+    pub(super) clamper: Clamper,
     range: TupleVec,
     bits_per_sample: u8,
     encode: TupleVec,
@@ -95,6 +96,16 @@ impl Type0 {
         })
     }
 
+    /// The number of samples along each input.
+    pub(crate) fn sizes(&self) -> &[u32] {
+        &self.sizes
+    }
+
+    /// The number of outputs.
+    pub(crate) fn outputs(&self) -> u64 {
+        self.range.len() as u64
+    }
+
     /// The most steps `eval` takes: interpolating between the samples around a
     /// point reads 2^m of them for m inputs, each with all its outputs.
     pub(crate) fn cost(&self) -> Cost {
@@ -111,9 +122,82 @@ impl Type0 {
     }
 
     /// Evaluate a type 0 function with the given input.
-    pub(crate) fn eval(&self, mut input: Values) -> Option<Values> {
+    pub(crate) fn eval(&self, input: Values) -> Option<Values> {
         #[cfg(test)]
         EVALS.set(EVALS.get() + 1);
+        let mut out = self.decoded(input)?;
+        self.clamper.clamp_output(&mut out);
+        Some(out)
+    }
+
+    /// The function of one input as straight lines between its samples, as
+    /// `eval` interpolates them, whatever `/Order` says: a point where the input
+    /// encodes to each sample, and one at each side of its domain, clipped to its
+    /// range with a point where a line crosses a side of it. A function of more
+    /// inputs, or without its samples, is a curve.
+    pub(crate) fn shape(&self) -> Piece {
+        let curve = || {
+            let (d0, d1) = self.clamper.domain.first().copied().unwrap_or((0.0, 1.0));
+            Piece::Curve(d0, d1)
+        };
+        let (Some(&(d0, d1)), Some(&(e0, e1)), &[n]) = (
+            self.clamper.domain.first(),
+            self.encode.first(),
+            self.sizes.as_slice(),
+        ) else {
+            return curve();
+        };
+        let m = self.range.len();
+        let most = (2_u64.pow(u32::from(self.bits_per_sample)) - 1) as f32;
+        let sample = |k: u32| -> Option<Values> {
+            let at = (k as usize).checked_mul(m)?;
+            let samples = self.table.get(at..at.checked_add(m)?)?;
+            Some(
+                samples
+                    .iter()
+                    .zip(self.decode.iter())
+                    .map(|(x, decode)| interpolate(*x as f32, 0.0, most, decode.0, decode.1))
+                    .collect(),
+            )
+        };
+        let (Some(start), Some(end)) = (self.decoded(smallvec![d0]), self.decoded(smallvec![d1]))
+        else {
+            return curve();
+        };
+        if n == 0 || d0 > d1 {
+            return curve();
+        }
+        let last = (n - 1) as f32;
+        let key = |x: f32| interpolate(x, d0, d1, e0, e1).max(0.0).min(last);
+        let (k0, k1) = (key(d0), key(d1));
+        let mut points = vec![(d0, start)];
+        if d0 < d1 && e0 != e1 {
+            // The samples strictly between the keys of the domain's sides, in
+            // the order of the input.
+            let (lo, hi) = (k0.min(k1), k0.max(k1));
+            let first = lo.floor() as u32 + 1;
+            let last = hi.ceil() as u32;
+            let mut inner = Vec::with_capacity((last.saturating_sub(first)) as usize);
+            for k in first..last {
+                let x = interpolate(k as f32, e0, e1, d0, d1);
+                match sample(k) {
+                    Some(value) if x > d0 && x < d1 => inner.push((x, value)),
+                    Some(_) => {}
+                    None => return curve(),
+                }
+            }
+            if k1 < k0 {
+                inner.reverse();
+            }
+            points.extend(inner);
+        }
+        points.push((d1, end));
+        Piece::Lines(clipped(points, Some(&self.range)))
+    }
+
+    /// The samples interpolated at `input` and decoded, not yet clipped to the
+    /// range.
+    fn decoded(&self, mut input: Values) -> Option<Values> {
         if input.len() != self.sizes.len() {
             warn!("wrong number of arguments for sampled function");
 
@@ -142,7 +226,7 @@ impl Type0 {
 
         let interpolated = interpolator.interpolate(&self.table)?;
 
-        let mut out = interpolated
+        let out = interpolated
             .iter()
             .zip(self.decode.iter())
             .map(|(x, decode)| {
@@ -155,8 +239,6 @@ impl Type0 {
                 )
             })
             .collect::<SmallVec<_>>();
-
-        self.clamper.clamp_output(&mut out);
 
         Some(out)
     }

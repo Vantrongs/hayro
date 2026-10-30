@@ -1,4 +1,5 @@
 use crate::encode::Cost;
+use crate::function::shape::{Piece, clipped};
 use crate::function::{Clamper, Values};
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Number;
@@ -10,7 +11,7 @@ use smallvec::{SmallVec, smallvec};
 pub(crate) struct Type2 {
     c0: Values,
     delta: Values,
-    clamper: Clamper,
+    pub(super) clamper: Clamper,
     n: f32,
 }
 
@@ -31,9 +32,35 @@ impl Type2 {
         })
     }
 
+    /// The number of outputs.
+    pub(crate) fn outputs(&self) -> u64 {
+        self.c0.len() as u64
+    }
+
     /// The most steps `eval` takes: the power, and a step an output.
     pub(crate) fn cost(&self) -> Cost {
         Cost::new(2) + Cost::of(self.c0.len()).times(2) + self.clamper.cost()
+    }
+
+    /// A straight line from one side of its domain to the other, clipped to its
+    /// range with a point where it crosses a side of it, where its exponent is
+    /// one; otherwise a curve.
+    pub(crate) fn shape(&self) -> Piece {
+        let (d0, d1) = self.clamper.domain.first().copied().unwrap_or((0.0, 1.0));
+        if self.n != 1.0 || d0 > d1 {
+            return Piece::Curve(d0, d1);
+        }
+        let line = |x: f32| {
+            self.c0
+                .iter()
+                .zip(&self.delta)
+                .map(|(c0, delta)| *c0 + x * *delta)
+                .collect()
+        };
+        Piece::Lines(clipped(
+            vec![(d0, line(d0)), (d1, line(d1))],
+            self.clamper.range.as_deref(),
+        ))
     }
 
     /// Evaluate the function with the given input.
