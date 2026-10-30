@@ -429,14 +429,12 @@ pub fn texture_dimensions(bbox: Rect, scale: f32) -> (u32, u32) {
     )
 }
 
-/// The share of a circle's radius a path drawing it may reach past it and still
-/// be taken to end at it (`extend_within_metered`): four cubic arcs, as producers
-/// draw a circle, reach 0.027 % past it, and the chords a path is tested along
-/// stray 0.02 % more.
-const CIRCLE_SLACK: f64 = 5e-4;
-
-/// The share of `CIRCLE_SLACK` the chords a path is tested along may stray from it.
-const CHORD_SLACK: f64 = 2e-4;
+/// The share of the allowance past a circle (`extend_within_metered`) the lines a
+/// shape is tested along may stray from it: the rest is left to the shape's own
+/// reach past the circle, such as the 0.027 % of its radius four cubic arcs, as
+/// producers draw a circle, reach. A smaller share flattens a curve into more
+/// lines, as the square root of its inverse.
+const CHORD_SHARE: f64 = 1.0 / 8.0;
 
 impl EncodedShadingPattern {
     /// Extends the shading past each edge of the part it paints itself in that
@@ -448,9 +446,15 @@ impl EncodedShadingPattern {
     /// disc. A renderer that multiplies a shape's coverage of a pixel by the
     /// shading's there would cut such a pixel twice: a shape covering half of it
     /// would paint a quarter. A radial shading is extended only where one of its
-    /// circles holds the other, as elsewhere extending an end changes which circle
-    /// a point it painted lies on; a path may reach `CIRCLE_SLACK` of a circle's
-    /// radius past it besides, as cubic arcs do. A mesh has no such edges here.
+    /// circles holds the other as it is painted ([`radial_cone`]), as elsewhere
+    /// extending an end changes which circle a point it painted lies on. A mesh
+    /// has no such edges here.
+    ///
+    /// The reach past an edge is measured in device units, whatever the
+    /// shading's own sizes ([`Placement::span`]): a circle drawn as four cubic
+    /// arcs is extended where the 0.027 % of its radius they reach past it is
+    /// within `tolerance` less the share its test's lines take (`CHORD_SHARE`),
+    /// and a larger one is not, so nothing is painted past its circle.
     ///
     /// Only the part of `shape` within `window`, device pixels, is tested for a
     /// radial shading: past them it paints nothing, so an end may be extended
@@ -482,14 +486,7 @@ impl EncodedShadingPattern {
         let Some(placed) = Placement::new(self.base_transform, to_device, window) else {
             return Ok(());
         };
-        let [a, b, c, d, _, _] = placed.base.as_coeffs();
-        // The shading's units across a device unit along its axes, and the fewest
-        // along any direction.
-        let (per_x, per_y) = (a.hypot(c), b.hypot(d));
-        let det = (a * d - b * c).abs();
-        let squares = a * a + b * b + c * c + d * d;
-        let most = ((squares + (squares * squares - 4.0 * det * det).max(0.0).sqrt()) / 2.0).sqrt();
-        let fewest = if most > 0.0 { det / most } else { 0.0 };
+        let allowed = placed.span(tolerance);
         let edges = match &self.shading_type {
             EncodedShadingType::FunctionBased(shading) => !shading.extended.iter().all(|&e| e),
             EncodedShadingType::RadialAxial(shading) => shading.extend != [true, true],
@@ -522,7 +519,7 @@ impl EncodedShadingPattern {
                     return Ok(());
                 };
                 let domain = shading.domain;
-                let (x, y) = (tolerance * per_x - error, tolerance * per_y - error);
+                let (x, y) = (allowed.x - error, allowed.y - error);
                 shading.extended[0] |= bounds.x0 >= domain.x0 - x;
                 shading.extended[1] |= bounds.x1 <= domain.x1 + x;
                 shading.extended[2] |= bounds.y0 >= domain.y0 - y;
@@ -533,7 +530,7 @@ impl EncodedShadingPattern {
                     let Some((bounds, error)) = bounds()? else {
                         return Ok(());
                     };
-                    let t = tolerance * per_x - error;
+                    let t = allowed.x - error;
                     shading.extend[0] |= bounds.x0 >= -t;
                     shading.extend[1] |= bounds.x1 <= 1.0 + t;
                 }
@@ -543,8 +540,7 @@ impl EncodedShadingPattern {
                     // it or after: one end is the larger circle's inside, the other
                     // the smaller one's outside.
                     let grows = r1 >= r0;
-                    let nested = p1.to_vec2().hypot() <= (r1 - r0).abs() * (1.0 + 1e-9);
-                    if !nested {
+                    if radial_cone(p1, r).is_some() {
                         return Ok(());
                     }
                     let (large, small) = if grows {
@@ -558,17 +554,15 @@ impl EncodedShadingPattern {
                         return Ok(());
                     };
                     let error = placed.rounding(reach(bounds).max(reach(placed.window)));
-                    // The tolerance in the shading's units, which reach it along
-                    // every direction.
-                    let near = tolerance * fewest;
-                    let chord = large.1 * CHORD_SLACK + near / 2.0;
+                    // The shape lies within `chord` of its lines: those within
+                    // `near - chord` past the larger circle and short of the
+                    // smaller one bound it within `near`.
+                    let near = allowed.any;
+                    let chord = near * CHORD_SHARE;
                     let mut test = Nesting::new(
                         &placed,
-                        (
-                            large.0,
-                            large.1 * (1.0 + CIRCLE_SLACK - CHORD_SLACK) + near / 2.0,
-                        ),
-                        (small.0, small.1 * (1.0 - CIRCLE_SLACK) - near),
+                        (large.0, large.1 + (near - chord)),
+                        (small.0, small.1 - (near - chord)),
                         error,
                     );
                     // Lines past the window only wind around points in it; those
@@ -1410,6 +1404,24 @@ fn unit_to_line(p0: Point, p1: Point) -> Affine {
     ])
 }
 
+/// The leading coefficient of the quadratic [`radial_pos`] solves for the circle a
+/// point lies on, as it computes it, where it solves it as a quadratic and that is
+/// positive: the circles of a radial shading with centres `0` and `p1` and radii
+/// `r` form a cone as painted, and every point within the one ending it lies on a
+/// circle past that end too. `None` where one holds the other as painted: the
+/// coefficient is negative, or so near zero the painter solves a line, which
+/// meets each point's circles once.
+fn radial_cone(p1: Point, r: Point) -> Option<f32> {
+    let (dx, dy) = (p1.x as f32, p1.y as f32);
+    let dr = r.y as f32 - r.x as f32;
+    let a = dx * dx + dy * dy - dr * dr;
+    (a >= RADIAL_LINEAR).then_some(a)
+}
+
+/// The magnitude of the leading coefficient below which [`radial_pos`] solves a
+/// line, not a quadratic.
+const RADIAL_LINEAR: f32 = 1e-6;
+
 fn radial_pos(
     pos: &Point,
     p1: &Point,
@@ -1436,7 +1448,7 @@ fn radial_pos(
         return None;
     }
 
-    if a.abs() < 1e-6 {
+    if a.abs() < RADIAL_LINEAR {
         if b.abs() < 1e-6 {
             return None;
         }
@@ -1455,9 +1467,13 @@ fn radial_pos(
         return Some(t);
     }
 
+    // The root whose terms add, and the other from the roots' product `c / a`:
+    // `-b ± sqrt_d` cancels where `4ac` is small beside `b²`, as for circles one
+    // touches inside the other, which put a root inside them past their ends.
     let sqrt_d = discriminant.sqrt();
-    let t1 = (-b - sqrt_d) / (2.0 * a);
-    let t2 = (-b + sqrt_d) / (2.0 * a);
+    let q = -0.5 * (b + b.signum() * sqrt_d);
+    let t1 = q / a;
+    let t2 = if q == 0.0 { t1 } else { c / q };
 
     let max = t1.max(t2);
     let mut take_max = Some(max);
@@ -1503,9 +1519,10 @@ struct Nesting {
     leaves: bool,
     /// Whether a line's part within the window may reach into `hole`.
     enters: bool,
-    /// Points just inside the window's corners, and the window's point nearest the
-    /// hole's centre, the lines' winding around each, and whether a line passes
-    /// too near it for that winding to be known.
+    /// The window's corners, and its point nearest the hole's centre, the lines'
+    /// winding around each, and whether a line passes too near it for that
+    /// winding to be known: a corner a line passes through, as one of a shape
+    /// ending at the window's side, is held to `large` as one the shape holds.
     probes: [Point; 5],
     winding: [i32; 5],
     unsure: [bool; 5],
@@ -1516,10 +1533,6 @@ struct Nesting {
 impl Nesting {
     fn new(placed: &Placement, large: (Point, f64), hole: (Point, f64), error: f64) -> Self {
         let window = placed.window;
-        // A corner's probe lies inside it, off the window's sides, which a shape
-        // ending at them passes along.
-        let inset = 1e-9 * window.width().max(window.height()).max(f64::MIN_POSITIVE);
-        let inner = window.inset(-inset);
         let nearest = Point::new(
             hole.0.x.clamp(window.x0, window.x1),
             hole.0.y.clamp(window.y0, window.y1),
@@ -1532,10 +1545,10 @@ impl Nesting {
             leaves: false,
             enters: false,
             probes: [
-                Point::new(inner.x0, inner.y0),
-                Point::new(inner.x1, inner.y0),
-                Point::new(inner.x0, inner.y1),
-                Point::new(inner.x1, inner.y1),
+                Point::new(window.x0, window.y0),
+                Point::new(window.x1, window.y0),
+                Point::new(window.x0, window.y1),
+                Point::new(window.x1, window.y1),
                 nearest,
             ],
             winding: [0; 5],
@@ -1683,6 +1696,27 @@ impl Placement {
         })
     }
 
+    /// How far in the shading's space a point may lie past an edge of it and lie
+    /// at most `device` units past it in device space: past a side along which
+    /// its x is constant, one along which its y is, and past any edge, which a
+    /// point within `any` of it lies within `device` units of whichever way the
+    /// shading is turned, sheared or stretched. Each allowance a test gives a
+    /// shape past a shading's edge is one of these, so it holds in device units
+    /// at any of the shading's sizes.
+    fn span(&self, device: f64) -> Span {
+        let [a, b, c, d, _, _] = self.base.as_coeffs();
+        // The shading's x and y change by `(a, c)` and `(b, d)` along a device
+        // unit; along any direction by at least the smaller singular value.
+        let det = (a * d - b * c).abs();
+        let squares = a * a + b * b + c * c + d * d;
+        let most = ((squares + (squares * squares - 4.0 * det * det).max(0.0).sqrt()) / 2.0).sqrt();
+        Span {
+            x: device * a.hypot(c),
+            y: device * b.hypot(d),
+            any: device * (det / most),
+        }
+    }
+
     /// How far, along either axis in a shading's space, a point of a shape placed
     /// there through `to_device` and then `base`, as a test computes it, may lie from
     /// the same point as painted, where vello places it in device space through
@@ -1711,6 +1745,14 @@ impl Placement {
         let error = STEPS * f64::EPSILON * (spread * (reach + offset) + offset);
         if error.is_nan() { f64::INFINITY } else { error }
     }
+}
+
+/// Distances in a shading's space that span a distance in device space
+/// ([`Placement::span`]).
+struct Span {
+    x: f64,
+    y: f64,
+    any: f64,
 }
 
 /// The part of the line from `a` to `b` within `rect`, `None` where it misses it.
@@ -1743,8 +1785,9 @@ fn clip_to(a: Point, b: Point, rect: Rect) -> Option<(Point, Point)> {
 mod tests {
     use super::span;
     use super::{
-        Cost, EncodedSampledShading, EncodedShadingType, Exhausted, Meter, PATCH_TRIANGLES, Region,
-        Samples, TRIANGLE_COST, cut_by, plan, sample_planned, sample_triangles,
+        Cost, EncodedSampledShading, EncodedShadingType, Exhausted, Meter, PATCH_TRIANGLES,
+        RadialAxialParams, Region, Samples, TRIANGLE_COST, cut_by, plan, sample_planned,
+        sample_triangles,
     };
     use crate::color::ColorComponents;
     use crate::shading::{CoonsPatch, ShadingType, Triangle, TriangleVertex};
@@ -2266,50 +2309,26 @@ mod tests {
         assert_eq!(at(&domain, past), [1.0, 0.0, 0.0, 1.0]);
         assert_eq!(at(&domain, edge), [1.0, 0.0, 0.0, 1.0]);
 
-        // A circle as producers draw it: four cubic arcs reaching 0.027 % past it.
-        let arcs = |center: Point, r: f64, reversed: bool| {
-            const KAPPA: f64 = 0.552_284_749_8;
-            let (c, k) = (center, r * KAPPA);
-            let mut path = BezPath::new();
-            path.move_to((c.x + r, c.y));
-            let quarter = |path: &mut BezPath, s: f64| {
-                path.curve_to(
-                    (c.x + r, c.y + s * k),
-                    (c.x + k, c.y + s * r),
-                    (c.x, c.y + s * r),
-                );
-                path.curve_to(
-                    (c.x - k, c.y + s * r),
-                    (c.x - r, c.y + s * k),
-                    (c.x - r, c.y),
-                );
-                path.curve_to(
-                    (c.x - r, c.y - s * k),
-                    (c.x - k, c.y - s * r),
-                    (c.x, c.y - s * r),
-                );
-                path.curve_to(
-                    (c.x + k, c.y - s * r),
-                    (c.x + r, c.y - s * k),
-                    (c.x + r, c.y),
-                );
-            };
-            quarter(&mut path, if reversed { -1.0 } else { 1.0 });
-            path.close_path();
-            path
-        };
         let center = Point::new(50.0, 40.0);
         let radial = |coords: &str| {
             format!("<< /ShadingType 3 /ColorSpace /DeviceRGB /Coords [{coords}] {red_to_blue} >>")
         };
-        let disc = radial("50 40 0 50 40 300");
-        for matrix in [Affine::IDENTITY, Affine::scale(4.0) * turned] {
+        // The arcs reach 0.027 % of the radius past the circle: 0.016 pixels at a
+        // radius of 60, within the tolerance less its lines' share, 0.032 at 120,
+        // past it, where nothing past the circle is painted.
+        let disc = radial("50 40 0 50 40 30");
+        for (matrix, extends) in [
+            (Affine::IDENTITY, 0b10),
+            (Affine::scale(2.0) * turned, 0b10),
+            (Affine::scale(4.0) * turned, 0),
+        ] {
             assert_eq!(
-                extended(&disc, matrix, &arcs(center, 300.0, false)) & 0b10,
-                0b10
+                extended(&disc, matrix, &arcs(center, 30.0, false)) & 0b10,
+                extends,
+                "{matrix:?}"
             );
             assert_eq!(
-                extended(&disc, matrix, &arcs(center, 300.5, false)) & 0b10,
+                extended(&disc, matrix, &arcs(center, 30.5, false)) & 0b10,
                 0
             );
         }
@@ -2952,5 +2971,645 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A circle as producers draw it: four cubic arcs reaching 0.027 % of its
+    /// radius past it, clockwise where `reversed`.
+    fn arcs(center: Point, r: f64, reversed: bool) -> kurbo::BezPath {
+        const KAPPA: f64 = 0.552_284_749_8;
+        let (c, k, s) = (center, r * KAPPA, if reversed { -1.0 } else { 1.0 });
+        let mut path = kurbo::BezPath::new();
+        path.move_to((c.x + r, c.y));
+        path.curve_to(
+            (c.x + r, c.y + s * k),
+            (c.x + k, c.y + s * r),
+            (c.x, c.y + s * r),
+        );
+        path.curve_to(
+            (c.x - k, c.y + s * r),
+            (c.x - r, c.y + s * k),
+            (c.x - r, c.y),
+        );
+        path.curve_to(
+            (c.x - r, c.y - s * k),
+            (c.x - k, c.y - s * r),
+            (c.x, c.y - s * r),
+        );
+        path.curve_to(
+            (c.x + k, c.y - s * r),
+            (c.x + r, c.y - s * k),
+            (c.x + r, c.y),
+        );
+        path.close_path();
+        path
+    }
+
+    /// The least and the most a unit vector's length changes by under `t`.
+    fn singular_values(t: Affine) -> (f64, f64) {
+        let [a, b, c, d, _, _] = t.as_coeffs();
+        let det = (a * d - b * c).abs();
+        let squares = a * a + b * b + c * c + d * d;
+        let most = ((squares + (squares * squares - 4.0 * det * det).max(0.0).sqrt()) / 2.0).sqrt();
+        (det / most, most)
+    }
+
+    /// The device distance from a device point to the circle of `radius` about a
+    /// point `z` from it in a shading's space, `base` placing device space there:
+    /// the least length of `base⁻¹ (radius (cos θ, sin θ) − z)` over θ, sampled and
+    /// refined about the least samples.
+    fn to_circle(base: Affine, z: kurbo::Vec2, radius: f64) -> f64 {
+        const SAMPLES: usize = 1024;
+        let inverse = Affine::new({
+            let [a, b, c, d, _, _] = base.inverse().as_coeffs();
+            [a, b, c, d, 0.0, 0.0]
+        });
+        let at = |theta: f64| {
+            let on = kurbo::Vec2::new(theta.cos(), theta.sin()) * radius - z;
+            (inverse * on.to_point()).to_vec2().hypot()
+        };
+        let step = std::f64::consts::TAU / SAMPLES as f64;
+        let mut samples: Vec<(f64, f64)> = (0..SAMPLES)
+            .map(|i| (at(i as f64 * step), i as f64 * step))
+            .collect();
+        samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+        samples
+            .iter()
+            .take(4)
+            .map(|&(_, theta)| {
+                // Golden-section search over the samples either side.
+                let (mut lo, mut hi) = (theta - step, theta + step);
+                let ratio = (5.0_f64.sqrt() - 1.0) / 2.0;
+                for _ in 0..100 {
+                    let (m1, m2) = (hi - ratio * (hi - lo), lo + ratio * (hi - lo));
+                    if at(m1) < at(m2) {
+                        hi = m2;
+                    } else {
+                        lo = m1;
+                    }
+                }
+                at((lo + hi) / 2.0)
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// Points of `shape`'s outline placed by `to_device`, within `window`, its
+    /// curves split until each piece spans at most `fine` device units.
+    fn outline_points(
+        shape: &kurbo::BezPath,
+        to_device: Affine,
+        window: Rect,
+        fine: f64,
+    ) -> Vec<Point> {
+        use kurbo::{ParamCurve, ParamCurveExtrema};
+        let mut points = Vec::new();
+        let mut pieces: Vec<(kurbo::PathSeg, u32)> =
+            shape.segments().map(|seg| (to_device * seg, 0)).collect();
+        while let Some((seg, depth)) = pieces.pop() {
+            let bounds = seg.bounding_box();
+            if bounds.x1 < window.x0
+                || bounds.x0 > window.x1
+                || bounds.y1 < window.y0
+                || bounds.y0 > window.y1
+            {
+                continue;
+            }
+            if bounds.width().max(bounds.height()) <= fine || depth >= 80 {
+                for t in [0.0, 0.5, 1.0] {
+                    let p = seg.eval(t);
+                    if (window.x0..=window.x1).contains(&p.x)
+                        && (window.y0..=window.y1).contains(&p.y)
+                    {
+                        points.push(p);
+                    }
+                }
+                continue;
+            }
+            let (a, b) = seg.subdivide();
+            pieces.push((a, depth + 1));
+            pieces.push((b, depth + 1));
+        }
+        points
+    }
+
+    /// Each edge of its own a shading is extended past within a shape holds the
+    /// shape, as far as the test sees it, within `tolerance` device units past it,
+    /// against a reference measuring that reach in `f64` through the encoded
+    /// shading's own placement: generated axial shadings, function-based ones and
+    /// radial ones, the larger circle first or last, about the same centre or
+    /// another, touching it inside included, with a hole or around a point,
+    /// 10⁻² to 10⁹ units across, placed in device space at scales of 10⁻³ to 10³,
+    /// turned, sheared and stretched by up to ten either way; shapes of lines and
+    /// of cubic arcs inside their edges, on them, and past them by fractions of a
+    /// pixel up to thousands, and a rectangle wholly past a circle 10⁶ units
+    /// across, which a slack of a share of its radius extended into blue over a
+    /// page the shading leaves. A radial one extended paints within the shape as
+    /// before: circles one touches inside the other, a cone as painted, painted
+    /// its end's colour over most of the disc. The reference rounds within
+    /// `MARGIN` of its device distances, relative to the coordinates.
+    ///
+    /// And the test still extends what it exists for: rectangles a shading's ends
+    /// or domain bound, and circles drawn as four cubic arcs on its own circles,
+    /// at sizes whose arcs reach past them by at most half the tolerance.
+    #[test]
+    fn an_extended_edge_holds_the_shape_within_the_tolerance_past_it() {
+        use kurbo::{BezPath, Shape, Vec2};
+        /// The reference's own rounding, relative to the device coordinates.
+        const MARGIN: f64 = 1e-9;
+        let red_to_blue =
+            "/Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >>";
+        let encode = |shading: String, to_device: Affine| {
+            let mut pattern = shading_pattern(&[
+                "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+                shading,
+                "<< /FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1] /Length 22 >>\n\
+                 stream\n{ pop dup 1 exch sub 0 }\nendstream"
+                    .to_string(),
+            ]);
+            pattern.matrix = to_device;
+            pattern.encode()
+        };
+        let color_at = |encoded: &super::EncodedShadingPattern, point: Point| {
+            let mut color = [0.0; 4];
+            encoded
+                .sample_points_metered(&[point], &mut super::Unmetered, |c| color = c)
+                .expect("unmetered");
+            color
+        };
+        // A coordinate as a document writes it, read as `f32`.
+        let f = |v: f64| f64::from(v as f32);
+        let polygon = |points: &[Point]| {
+            let mut path = BezPath::new();
+            path.move_to(points[0]);
+            for &p in &points[1..] {
+                path.line_to(p);
+            }
+            path.close_path();
+            path
+        };
+
+        /// A generated or chosen case: the shading, the shape and its transform to
+        /// device space, the window, and the tolerance.
+        struct Case {
+            name: String,
+            shading: String,
+            shape: BezPath,
+            to_device: Affine,
+            window: Rect,
+            tolerance: f64,
+            /// The edges the test must extend: ordinary sizes ending at them.
+            must: u8,
+            /// User points within the shape a radial shading painted before.
+            inside: Vec<Point>,
+        }
+
+        // Checks one case; the edges it extended, and their farthest reach.
+        let check = |case: &Case| -> (u8, f64) {
+            let before = encode(case.shading.clone(), case.to_device);
+            let mut encoded = encode(case.shading.clone(), case.to_device);
+            encoded
+                .extend_within_metered(
+                    &case.shape,
+                    None,
+                    case.to_device,
+                    case.window,
+                    case.tolerance,
+                    &mut super::Unmetered,
+                )
+                .expect("unmetered");
+            let edges = encoded.extended_edges();
+            let name = &case.name;
+            assert_eq!(edges & case.must, case.must, "not extended: {name}");
+            if edges == 0 {
+                return (0, 0.0);
+            }
+            let base = encoded.base_transform;
+            let [a, b, c, d, _, _] = base.as_coeffs();
+            let (fewest, most) = singular_values(base);
+            let bound = |p: Point| MARGIN * (1.0 + p.to_vec2().hypot()) * (1.0 + most / fewest);
+            let mut farthest: f64 = 0.0;
+            let mut over = |reach: f64, p: Point, edge: u8| {
+                farthest = farthest.max(reach);
+                assert!(
+                    reach <= case.tolerance + bound(p),
+                    "{name}: edge {edge} extended, the shape reaches {reach} past it at {p:?}"
+                );
+            };
+            // The whole outline, each curve in a thousand pieces or more: an axial or
+            // function-based shading tests the whole shape.
+            let whole = || {
+                let bounds = case
+                    .to_device
+                    .transform_rect_bbox(case.shape.bounding_box());
+                let everywhere = Rect::new(f64::MIN, f64::MIN, f64::MAX, f64::MAX);
+                outline_points(
+                    &case.shape,
+                    case.to_device,
+                    everywhere,
+                    bounds.width().max(bounds.height()) / 1024.0,
+                )
+            };
+            match &encoded.shading_type {
+                EncodedShadingType::RadialAxial(shading) => match shading.params {
+                    RadialAxialParams::Axial => {
+                        let across = a.hypot(c);
+                        for p in whole() {
+                            let x = (base * p).x;
+                            if edges & 1 != 0 {
+                                over(-x / across, p, 0);
+                            }
+                            if edges & 2 != 0 {
+                                over((x - 1.0) / across, p, 1);
+                            }
+                        }
+                    }
+                    RadialAxialParams::Radial { p1, r } => {
+                        let grows = r.y >= r.x;
+                        let (large, small) = if grows {
+                            ((p1, r.y), (Point::ZERO, r.x))
+                        } else {
+                            ((Point::ZERO, r.x), (p1, r.y))
+                        };
+                        let (outer, inner) = if grows { (2, 1) } else { (1, 2) };
+                        let window = case.window;
+                        let mut points = outline_points(&case.shape, case.to_device, window, 0.25);
+                        let to_user = case.to_device.inverse();
+                        for corner in [
+                            Point::new(window.x0, window.y0),
+                            Point::new(window.x1, window.y0),
+                            Point::new(window.x0, window.y1),
+                            Point::new(window.x1, window.y1),
+                        ] {
+                            if case.shape.winding(to_user * corner) != 0 {
+                                points.push(corner);
+                            }
+                        }
+                        for &p in &points {
+                            let s = base * p;
+                            if edges & outer != 0 {
+                                let z = s - large.0;
+                                // Only a point the bounds leave unsure is measured.
+                                if z.hypot() > large.1
+                                    && (z.hypot() - large.1) / fewest > case.tolerance
+                                {
+                                    over(to_circle(base, z, large.1), p, outer);
+                                }
+                            }
+                            if edges & inner != 0 {
+                                let z = s - small.0;
+                                if z.hypot() < small.1
+                                    && (small.1 - z.hypot()) / fewest > case.tolerance
+                                {
+                                    over(to_circle(base, z, small.1), p, inner);
+                                }
+                            }
+                        }
+                        // The deepest point of the hole is its centre.
+                        let centre = base.inverse() * small.0;
+                        if edges & inner != 0
+                            && (window.x0..=window.x1).contains(&centre.x)
+                            && (window.y0..=window.y1).contains(&centre.y)
+                            && case.shape.winding(to_user * centre) != 0
+                        {
+                            over(small.1 / most, centre, inner);
+                        }
+                        for &user in &case.inside {
+                            let p = case.to_device * user;
+                            assert_eq!(
+                                color_at(&encoded, p),
+                                color_at(&before, p),
+                                "{name}: {user:?}"
+                            );
+                        }
+                    }
+                },
+                EncodedShadingType::FunctionBased(shading) => {
+                    let domain = shading.domain;
+                    let (across_x, across_y) = (a.hypot(c), b.hypot(d));
+                    for p in whole() {
+                        let s = base * p;
+                        for (edge, reach) in [
+                            ((domain.x0 - s.x) / across_x),
+                            ((s.x - domain.x1) / across_x),
+                            ((domain.y0 - s.y) / across_y),
+                            ((s.y - domain.y1) / across_y),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            if edges & (1 << edge) != 0 {
+                                over(reach, p, edge as u8);
+                            }
+                        }
+                    }
+                }
+                _ => unreachable!("{name}"),
+            }
+            (edges, farthest)
+        };
+
+        // The reviewer's page: a rectangle wholly past a circle 10⁶ units across.
+        let page = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let mut cases = vec![Case {
+            name: "a rectangle past a large circle".to_string(),
+            shading: format!(
+                "<< /ShadingType 3 /ColorSpace /DeviceRGB \
+                 /Coords [-1000000 0 0 -1000000 0 1000000] {red_to_blue} >>"
+            ),
+            shape: Rect::new(10.0, 10.0, 90.0, 90.0).to_path(0.1),
+            to_device: Affine::IDENTITY,
+            window: page,
+            tolerance: 1.0 / 32.0,
+            must: 0,
+            inside: vec![],
+        }];
+
+        let mut random = Random(0x2545_f491_4f6c_dd1d);
+        let mut uniform = |lo: f64, hi: f64| lo + random.below(1.0) * (hi - lo);
+        let mut placements = Vec::new();
+        for _ in 0..4000 {
+            // A transform turning, shearing and stretching, at a scale.
+            let scale = 10_f64.powf(uniform(-3.0, 3.0));
+            let stretch = 10_f64.powf(uniform(-1.0, 1.0));
+            let shear = uniform(-1.0, 1.0);
+            let to_device = Affine::translate((uniform(-1e3, 1e3), uniform(-1e3, 1e3)))
+                * Affine::rotate(uniform(0.0, 7.0))
+                * Affine::new([
+                    scale * stretch,
+                    0.0,
+                    scale * shear,
+                    scale / stretch,
+                    0.0,
+                    0.0,
+                ]);
+            let size = 10_f64.powf(uniform(-2.0, 9.0));
+            // How far past an edge, in device units, a shape is placed.
+            let past = match (uniform(0.0, 4.0)) as u32 {
+                0 => 0.0,
+                1 => -(10_f64.powf(uniform(-4.0, 3.0))),
+                _ => 10_f64.powf(uniform(-4.0, 3.0)),
+            };
+            let tolerance = if uniform(0.0, 1.0) < 0.5 {
+                1.0 / 32.0
+            } else {
+                1.0 / 8.0
+            };
+            let (fewest, most) = singular_values(to_device);
+            // User units for `past` device units: as few or as many as it takes.
+            let per_pixel = if uniform(0.0, 1.0) < 0.5 {
+                1.0 / most
+            } else {
+                1.0 / fewest
+            };
+            placements.push((
+                to_device,
+                size,
+                past * per_pixel,
+                tolerance,
+                uniform(0.0, 1.0),
+                uniform(0.0, 1.0),
+                uniform(0.0, 7.0),
+                uniform(0.0, 1.0),
+            ));
+        }
+        for (i, &(to_device, size, past, tolerance, u1, u2, angle, u3)) in
+            placements.iter().enumerate()
+        {
+            let origin = Point::new(f(size * (u1 - 0.5)), f(size * (u2 - 0.5)));
+            let along = Vec2::new(angle.cos(), angle.sin());
+            let kind = i % 4;
+            let (shading, shape, inside) = match kind {
+                0 => {
+                    let end = origin + along * size;
+                    let (x1, y1) = (f(end.x), f(end.y));
+                    let shading = format!(
+                        "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [{} {} {x1} {y1}] {red_to_blue} >>",
+                        origin.x, origin.y
+                    );
+                    let side = Vec2::new(-along.y, along.x) * size * (0.05 + u3);
+                    let (start, end) = (
+                        origin - along * past * u3,
+                        Point::new(x1, y1) + along * past,
+                    );
+                    let shape = if i % 8 == 0 {
+                        polygon(&[start - side, end - side, end + side, start + side])
+                    } else {
+                        let mid = origin.midpoint(Point::new(x1, y1));
+                        arcs(mid, size / 2.0 + past, false)
+                    };
+                    (shading, shape, vec![])
+                }
+                1 => {
+                    let side = Vec2::new(-along.y, along.x) * size * (0.2 + u3);
+                    let m = [
+                        along.x * size,
+                        along.y * size,
+                        side.x,
+                        side.y,
+                        origin.x,
+                        origin.y,
+                    ]
+                    .map(f);
+                    let shading = format!(
+                        "<< /ShadingType 1 /ColorSpace /DeviceRGB /Domain [0 1 0 1] \
+                         /Matrix [{} {} {} {} {} {}] /Function 6 0 R >>",
+                        m[0], m[1], m[2], m[3], m[4], m[5]
+                    );
+                    let matrix = Affine::new(m);
+                    // `past` in domain units, as near as the matrix's scale tells.
+                    let (dfew, _) = singular_values(matrix);
+                    let out = past / dfew.max(f64::MIN_POSITIVE);
+                    let shape = if i % 8 == 1 {
+                        matrix
+                            * polygon(&[
+                                Point::new(-out * u3, -out),
+                                Point::new(1.0 + out, -out * u3),
+                                Point::new(1.0 + out * u3, 1.0 + out),
+                                Point::new(-out, 1.0 + out * u3),
+                            ])
+                    } else {
+                        matrix * arcs(Point::new(0.5, 0.5), 0.5 + out, false)
+                    };
+                    (shading, shape, vec![])
+                }
+                _ => {
+                    let large = f(size);
+                    let small = if u3 < 0.3 { 0.0 } else { f(size * u3 * 0.9) };
+                    // The smaller circle's centre: the same, within, or touching
+                    // the larger one inside.
+                    let offset = match i % 3 {
+                        0 => 0.0,
+                        1 => (large - small) * u1 * 0.9,
+                        _ => large - small,
+                    };
+                    let centre = Point::new(
+                        f(origin.x + along.x * offset),
+                        f(origin.y + along.y * offset),
+                    );
+                    let grows = kind == 2;
+                    let (c0, r0, c1, r1) = if grows {
+                        (centre, small, origin, large)
+                    } else {
+                        (origin, large, centre, small)
+                    };
+                    let shading = format!(
+                        "<< /ShadingType 3 /ColorSpace /DeviceRGB /Coords [{} {} {r0} {} {} {r1}] \
+                         {red_to_blue} >>",
+                        c0.x, c0.y, c1.x, c1.y
+                    );
+                    let mut shape = match i % 5 {
+                        0 | 1 => arcs(origin, large + past, false),
+                        2 => {
+                            let n = 3 + (u2 * 10.0) as usize;
+                            let points: Vec<Point> = (0..n)
+                                .map(|k| {
+                                    let t = angle + std::f64::consts::TAU * k as f64 / n as f64;
+                                    origin + Vec2::new(t.cos(), t.sin()) * (large + past)
+                                })
+                                .collect();
+                            polygon(&points)
+                        }
+                        3 => {
+                            let edge = origin + along * (large + past);
+                            Rect::from_points(edge, origin + along * large * 0.3).to_path(0.1)
+                        }
+                        _ => {
+                            let edge = origin + along * (large + past);
+                            Rect::from_points(edge, edge + along * large * 0.5).to_path(0.1)
+                        }
+                    };
+                    if small > 0.0 && i % 2 == 0 {
+                        shape.extend(arcs(centre, small - past * u1, true));
+                    }
+                    // Points between the circles, within the shape.
+                    let inside = (0..16)
+                        .map(|k| {
+                            let t = angle + 0.7 * k as f64;
+                            let towards = Vec2::new(t.cos(), t.sin());
+                            origin + towards * large * (0.1 + 0.85 * (k as f64 / 16.0))
+                        })
+                        .filter(|&p| {
+                            p.distance(centre) > small * 1.02 + large * 1e-3
+                                && p.distance(origin) < large * 0.98
+                                && shape.winding(p) != 0
+                        })
+                        .collect();
+                    (shading, shape, inside)
+                }
+            };
+            // Radial shapes are seen within a window about a point of their outline.
+            let window = if kind >= 2 {
+                let at = to_device
+                    * shape.segments().nth(i % 4).map_or(origin, |seg| {
+                        use kurbo::ParamCurve;
+                        seg.eval(u1)
+                    });
+                let half = 2_f64.powf(uniform(2.0, 9.0));
+                Rect::new(at.x - half, at.y - half, at.x + half, at.y + half)
+            } else {
+                to_device.transform_rect_bbox(shape.bounding_box())
+            };
+            cases.push(Case {
+                name: format!("{i}: {shading} {to_device:?} past {past} tolerance {tolerance}"),
+                shading,
+                shape,
+                to_device,
+                window,
+                tolerance,
+                must: 0,
+                inside,
+            });
+        }
+
+        // Ordinary sizes ending at their edges.
+        let turned = Affine::rotate(0.4);
+        for to_device in [
+            Affine::IDENTITY,
+            Affine::scale(0.3) * turned,
+            Affine::translate((40.0, 7.0)) * Affine::new([2.0, 0.0, 0.5, 1.5, 0.0, 0.0]) * turned,
+        ] {
+            let (_, most) = singular_values(to_device);
+            for tolerance in [1.0 / 32.0, 1.0 / 8.0] {
+                for (size, x, y) in [
+                    (5.0, 10.25, 20.5),
+                    (30.0, 50.0, 40.0),
+                    (120.0, -7.5, 300.25),
+                ] {
+                    let rect = Rect::new(x, y - size, x + size, y + size / 2.0);
+                    cases.push(Case {
+                        name: format!("axial {size} {to_device:?}"),
+                        shading: format!(
+                            "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [{x} {y} {} {y}] {red_to_blue} >>",
+                            x + size
+                        ),
+                        shape: rect.to_path(0.1),
+                        to_device,
+                        window: to_device.transform_rect_bbox(rect),
+                        tolerance,
+                        must: 0b11,
+                        inside: vec![],
+                    });
+                    cases.push(Case {
+                        name: format!("function {size} {to_device:?}"),
+                        shading: format!(
+                            "<< /ShadingType 1 /ColorSpace /DeviceRGB /Domain [0 1 0 1] \
+                             /Matrix [{size} 0 0 {} {x} {}] /Function 6 0 R >>",
+                            size * 1.5,
+                            y - size
+                        ),
+                        shape: rect.to_path(0.1),
+                        to_device,
+                        window: to_device.transform_rect_bbox(rect),
+                        tolerance,
+                        must: 0b1111,
+                        inside: vec![],
+                    });
+                    // Arcs reaching past at most half the tolerance.
+                    if 2.75e-4 * size * most > tolerance / 2.0 {
+                        continue;
+                    }
+                    let centre = Point::new(x, y);
+                    let small = size / 4.0;
+                    let mut ring = arcs(centre, size, false);
+                    ring.extend(arcs(centre, small, true));
+                    for (coords, shape, must) in [
+                        (
+                            format!("{x} {y} {small} {x} {y} {size}"),
+                            ring.clone(),
+                            0b11,
+                        ),
+                        (format!("{x} {y} {size} {x} {y} {small}"), ring, 0b11),
+                        (
+                            format!("{} {y} {small} {x} {y} {size}", x + size / 4.0),
+                            arcs(centre, size, false),
+                            0b10,
+                        ),
+                    ] {
+                        cases.push(Case {
+                            name: format!("radial {coords} {to_device:?}"),
+                            shading: format!(
+                                "<< /ShadingType 3 /ColorSpace /DeviceRGB /Coords [{coords}] {red_to_blue} >>"
+                            ),
+                            window: to_device.transform_rect_bbox(shape.bounding_box()),
+                            shape,
+                            to_device,
+                            tolerance,
+                            must,
+                            inside: vec![],
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut extended = [0_usize; 2];
+        let mut near = 0;
+        for case in &cases {
+            let (edges, farthest) = check(case);
+            extended[usize::from(edges != 0)] += 1;
+            near += usize::from(edges != 0 && farthest > 0.0);
+        }
+        // The generated cases reach both answers, and extensions near the bound.
+        assert!(extended[0] > 500 && extended[1] > 500, "{extended:?}");
+        assert!(near > 50, "{near}");
     }
 }
