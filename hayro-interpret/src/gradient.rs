@@ -605,15 +605,11 @@ impl EncodedRadialAxialShading {
         };
         let shape = self.shape_metered(meter)?;
         let step = self.grid_step(pattern, scale);
-        let (shape_from, shape_to) = (
-            shape.first().map_or(f32::NAN, |p| p.span().0),
-            shape.last().map_or(f32::NAN, |p| p.span().1),
-        );
 
         // What each piece the range reaches holds: the points of its lines, and
         // the multiples of the step within it and the range where the colors
         // bend.
-        let reached: Vec<&Piece> = shape
+        let reached: Vec<&StopPiece> = shape
             .iter()
             .filter(|piece| {
                 let (a, b) = piece.span();
@@ -631,22 +627,20 @@ impl EncodedRadialAxialShading {
         let mut stops_held = 0_u64;
         for piece in &reached {
             match piece {
-                Piece::Lines(points) => {
-                    let (i0, i1) = within(points, x_lo, x_hi);
-                    let n = (i1 - i0 + 1) as u64;
+                StopPiece::Lines(points) => {
+                    let points = within(points, x_lo, x_hi);
+                    let n = points.len() as u64;
                     if lines_straight {
                         // A stop where any of three channels crosses 0 or 1.
                         stops_held = stops_held.saturating_add(n.saturating_mul(7));
                     } else {
-                        let (k0, k1) = grid_in(points[i0].0, points[i1].0);
+                        let (k0, k1) = grid_in(points[0].0, points[points.len() - 1].0);
                         let grid = (k1 - k0 + 1).max(0) as u64;
-                        let all: Vec<(&(f32, Values), ())> =
-                            points[i0..=i1].iter().map(|p| (p, ())).collect();
-                        let n = kept(&all, grid).count() as u64;
+                        let n = kept(points, grid).count() as u64;
                         stops_held = stops_held.saturating_add(n).saturating_add(grid);
                     }
                 }
-                Piece::Curve(a, b) => {
+                StopPiece::Curve(a, b) => {
                     let (k0, k1) = grid_in(*a, *b);
                     let grid = (k1 - k0 + 1).max(0) as u64 + 2;
                     stops_held = stops_held.saturating_add(grid);
@@ -673,40 +667,23 @@ impl EncodedRadialAxialShading {
         for piece in reached {
             let mut nodes: Vec<(f32, f32, [f32; 4])> = Vec::new();
             match piece {
-                Piece::Lines(all) => {
-                    let (i0, i1) = within(all, x_lo, x_hi);
-                    // A stop for each point but the value at an input
-                    // between the values from below and above it, which a
-                    // gradient's stops cannot hold, at the shape's ends
-                    // alone, where the gradient extends it.
-                    let points: Vec<(&(f32, Values), Side)> = (i0..=i1)
-                        .filter_map(|i| {
-                            let side = match shape::side_of(all, i) {
-                                None => Side::Point,
-                                Some(shape::Side::Below) => Side::Below,
-                                Some(shape::Side::At) => Side::At,
-                                Some(shape::Side::Above) => Side::Above,
-                            };
-                            let x = all[i].0;
-                            let end = x == shape_from || x == shape_to;
-                            (!matches!(side, Side::At) || end).then_some((&all[i], side))
-                        })
-                        .collect();
+                StopPiece::Lines(points) => {
+                    let points = within(points, x_lo, x_hi);
                     if lines_straight {
-                        straight_lines(&look, &points, &t_of, &mut nodes);
+                        straight_lines(&look, points, &t_of, &mut nodes);
                     } else {
-                        let (a, b) = (points[0].0.0, points[points.len() - 1].0.0);
+                        let (a, b) = (points[0].0, points[points.len() - 1].0);
                         let (k0, k1) = grid_in(a, b);
-                        for i in kept(&points, (k1 - k0 + 1).max(0) as u64) {
-                            let ((x, values), side) = points[i];
-                            nodes.push((*x, t_of(*x), at(meter, *x, Some((values, side)))?));
+                        for i in kept(points, (k1 - k0 + 1).max(0) as u64) {
+                            let (x, values, side) = &points[i];
+                            nodes.push((*x, t_of(*x), at(meter, *x, Some((values, *side)))?));
                         }
                         grid(&mut nodes, (k0, k1), step, (a, b), &x_at, &mut |x| {
                             at(meter, x, None)
                         })?;
                     }
                 }
-                Piece::Curve(a, b) => {
+                StopPiece::Curve(a, b) => {
                     // Its ends of its own values: from above at its start, as a
                     // stitching evaluates at a bound, and from below at its end.
                     nodes.push((*a, t_of(*a), at(meter, *a, None)?));
@@ -724,7 +701,7 @@ impl EncodedRadialAxialShading {
             }
             // In the order of the input; the ends stay first and last.
             nodes.sort_by(|p, q| p.0.total_cmp(&q.0));
-            if !(lines_straight && matches!(piece, Piece::Lines(_))) {
+            if !(lines_straight && matches!(piece, StopPiece::Lines(_))) {
                 refine(&mut nodes, (finest, bend), meter, &t_of, &mut |meter, x| {
                     at(meter, x, None)
                 })?;
@@ -755,7 +732,7 @@ impl EncodedRadialAxialShading {
 
     /// The function's shape over the shading's domain, found the first time,
     /// its work and memory taken of `meter` first.
-    fn shape_metered(&self, meter: &mut dyn Meter) -> Result<&[Piece], Exhausted> {
+    fn shape_metered(&self, meter: &mut dyn Meter) -> Result<&[StopPiece], Exhausted> {
         if let Some(shape) = self.memo.shape.get() {
             return Ok(shape);
         }
@@ -763,12 +740,12 @@ impl EncodedRadialAxialShading {
         take(meter, steps)?;
         let bytes = usize::try_from(points)
             .unwrap_or(usize::MAX)
-            .saturating_mul(size_of::<(f32, Values)>());
+            .saturating_mul(size_of::<StopPoint>());
         if !meter.hold(bytes) {
             return Err(Exhausted);
         }
         let [t0, t1] = self.domain;
-        let shape = self.function.shape(t0.min(t1), t0.max(t1));
+        let shape = StopPiece::of(&self.function.shape(t0.min(t1), t0.max(t1)));
         Ok(self.memo.shape.get_or_init(|| shape))
     }
 
@@ -826,9 +803,9 @@ impl EncodedRadialAxialShading {
 pub struct StopMemo {
     /// The shading's color space, which every color kept is converted in.
     color_space: ColorSpace,
-    /// Its function's shape over its domain
+    /// Its function's shape over its domain, as stops hold it
     /// ([`EncodedRadialAxialShading::shape_metered`]).
-    shape: OnceLock<Vec<Piece>>,
+    shape: OnceLock<Vec<StopPiece>>,
     /// The colors found, by the look, the input of the function, and whether
     /// it is the value evaluated there or a point of the shape and which of
     /// those at one input ([`Side`]). At most [`MEMO_ENTRIES`], then emptied.
@@ -974,13 +951,72 @@ type ColorKey = (LookKey, u32, u8);
 /// Where a color of a function at an input comes from: its value evaluated
 /// there, the only point of its shape there, or of several there the value
 /// from below the input, at it, or from above it.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Side {
     Evaluated = 0,
     Point = 1,
     Below = 2,
     At = 3,
     Above = 4,
+}
+
+/// A point of a function's lines as a stop: its input, its values, and which
+/// of the values at that input it is.
+type StopPoint = (f32, Values, Side);
+
+/// A piece of a function's shape ([`Piece`]) as a gradient's stops hold it,
+/// found once for every paint of a shading.
+#[derive(Debug)]
+enum StopPiece {
+    /// Its points, but for the value at an input between the values from
+    /// below and above it, which a gradient's stops cannot hold, at the
+    /// shape's ends alone, where the gradient extends it.
+    Lines(Vec<StopPoint>),
+    /// From one input to another, of no shape known here.
+    Curve(f32, f32),
+}
+
+impl StopPiece {
+    /// The pieces of `shape` as stops hold them.
+    fn of(shape: &[Piece]) -> Vec<Self> {
+        let (from, to) = (
+            shape.first().map_or(f32::NAN, |p| p.span().0),
+            shape.last().map_or(f32::NAN, |p| p.span().1),
+        );
+        shape
+            .iter()
+            .map(|piece| match piece {
+                Piece::Lines(points) => Self::Lines(
+                    points
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, (x, values))| {
+                            let side = match shape::side_of(points, i) {
+                                None => Side::Point,
+                                Some(shape::Side::Below) => Side::Below,
+                                Some(shape::Side::At) => Side::At,
+                                Some(shape::Side::Above) => Side::Above,
+                            };
+                            let end = *x == from || *x == to;
+                            (!matches!(side, Side::At) || end).then(|| (*x, values.clone(), side))
+                        })
+                        .collect(),
+                ),
+                Piece::Curve(a, b) => Self::Curve(*a, *b),
+            })
+            .collect()
+    }
+
+    /// Where the piece starts and ends.
+    fn span(&self) -> (f32, f32) {
+        match self {
+            Self::Lines(points) => (
+                points.first().map_or(f32::NAN, |p| p.0),
+                points.last().map_or(f32::NAN, |p| p.0),
+            ),
+            Self::Curve(a, b) => (*a, *b),
+        }
+    }
 }
 
 /// The most two colors' channels lie apart, in 8-bit levels.
@@ -1002,15 +1038,15 @@ fn clamped(rgb: [f32; 3]) -> [f32; 4] {
 /// channel crosses 0 or 1 between two.
 fn straight_lines(
     look: &Look<'_>,
-    points: &[(&(f32, Values), Side)],
+    points: &[StopPoint],
     t_of: &impl Fn(f32) -> f32,
     nodes: &mut Vec<(f32, f32, [f32; 4])>,
 ) {
     let rgb_of = |values: &[f32]| look.color_space.straight_rgb(values).unwrap_or([0.0; 3]);
     let opaque = |rgb: [f32; 3]| look.finish(Some(AlphaColor::new(clamped(rgb))));
-    for (i, ((x, values), _)) in points.iter().enumerate() {
+    for (i, (x, values, _)) in points.iter().enumerate() {
         let rgb = rgb_of(values);
-        if let Some(((x0, v0), _)) = i.checked_sub(1).map(|i| points[i])
+        if let Some((x0, v0, _)) = i.checked_sub(1).map(|i| &points[i])
             && x > x0
         {
             let before = rgb_of(v0);
@@ -1120,23 +1156,23 @@ fn refine(
 /// stop wherever two points lie a pixel's step apart and the rest are features
 /// narrower than a pixel, and evaluating the color at each of thousands of
 /// samples would cost what the pixels shown do not need.
-fn kept<T>(points: &[(&(f32, Values), T)], grid: u64) -> impl Iterator<Item = usize> {
+fn kept(points: &[StopPoint], grid: u64) -> impl Iterator<Item = usize> {
     let all = points.len() as u64 <= grid.saturating_add(2);
     let last = points.len().saturating_sub(1);
     points.iter().enumerate().filter_map(move |(i, point)| {
         let step = |j: Option<usize>| {
             j.and_then(|j| points.get(j))
-                .is_some_and(|p| p.0.0 == point.0.0)
+                .is_some_and(|p| p.0 == point.0)
         };
         (all || i == 0 || i == last || step(i.checked_sub(1)) || step(Some(i + 1))).then_some(i)
     })
 }
 
-/// The first and last of `points` that a line through them over `lo` to `hi`
-/// needs: the last at or before `lo`, every one at the first input where `lo`
-/// is at or before it, and every one at the first input at or past `hi`, as
-/// the values there from below, at it, and from above.
-fn within(points: &[(f32, Values)], lo: f32, hi: f32) -> (usize, usize) {
+/// The points of `points` that a line through them over `lo` to `hi` needs,
+/// from the last at or before `lo`, or every one at the first input where
+/// `lo` is at or before it, to every one at the first input at or past `hi`,
+/// as the values there from below, at it, and from above.
+fn within(points: &[StopPoint], lo: f32, hi: f32) -> &[StopPoint] {
     let last = points.len() - 1;
     let i0 = if lo <= points[0].0 {
         0
@@ -1145,7 +1181,7 @@ fn within(points: &[(f32, Values)], lo: f32, hi: f32) -> (usize, usize) {
     };
     let j = points.partition_point(|p| p.0 < hi).min(last);
     let i1 = points.partition_point(|p| p.0 <= points[j].0) - 1;
-    (i0, i1.max(i0))
+    &points[i0..=i1.max(i0)]
 }
 
 /// The color `stops` give at `t`, from the start, 0, to the end, 1: between the

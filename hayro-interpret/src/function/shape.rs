@@ -306,10 +306,21 @@ pub(crate) fn over(function: &Function, from: f32, to: f32) -> Vec<Piece> {
     let mut spans: Vec<Span> = Vec::new();
     let mut x = from;
     while x < to {
-        let span = function.span(x, Side::Above);
+        let mut span = function.span(x, Side::Above);
+        // Rounding may find an input at the end of the span before it, where
+        // mapping the input back onto samples or subdomains lands a unit of
+        // its last place short of a boundary mapped forward: the span above it
+        // is the one just past it, from it where that one starts at or before
+        // it, so its value there is that span's own end, not a value found
+        // along it a unit of the last place away. Where none starts by then,
+        // the span holds the least step past it.
+        if span.ends().1 <= x {
+            let next = function.span(x.next_up(), Side::Above);
+            if next.ends().0 <= x {
+                span = next;
+            }
+        }
         let (_, end) = span.ends();
-        // Rounding may put a span's end at its start: the span then holds the
-        // least step past it.
         let end = if end > x {
             end.min(to)
         } else {

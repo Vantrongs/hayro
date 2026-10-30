@@ -524,3 +524,54 @@ fn paints_under_other_transfer_functions_find_their_own_colors() {
     );
     assert_eq!(painted(&[without, with]), [alone_without, alone_with]);
 }
+
+/// A sampled function that is continuous, of 1365 samples over `[0 1]`, as
+/// written alone and stitched over `[0 2]`, has a shape of one point at each
+/// sample, and no input it holds twice: an input found at the end of one
+/// sample's line, which mapped back lands a unit of its last place short of
+/// the next sample, starts that next line there with its own sample, not a
+/// value a unit of the last place along it, which would read as a step of the
+/// function and hold each sample as two stops.
+#[test]
+fn a_continuous_sampled_function_has_one_point_at_each_sample() {
+    use crate::function::shape::{Piece, over};
+    const SIZE: usize = 1365;
+    let samples: String = (0..SIZE)
+        .map(|i| format!("{:02X}", (i * 7) % 256))
+        .collect();
+    let sampled = format!(
+        "<< /FunctionType 0 /BitsPerSample 8 /Domain [0 1] /Range [0 1] /Size [{SIZE}] \
+         /Filter /ASCIIHexDecode /Length {} >>\nstream\n{samples}>\nendstream",
+        samples.len() + 1
+    );
+    for (function, domain) in [
+        ("6 0 R", (0.0, 1.0)),
+        (
+            "<< /FunctionType 3 /Domain [0 2] /Functions [6 0 R] /Bounds [] /Encode [0 1] >>",
+            (0.0, 2.0),
+        ),
+    ] {
+        let encoded = shading_pattern(&[
+            "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+            format!(
+                "<< /ShadingType 2 /ColorSpace /DeviceGray /Coords [0 0 1000 0] \
+                 /Domain [{} {}] /Function {function} >>",
+                domain.0, domain.1
+            ),
+            sampled.clone(),
+        ])
+        .encode();
+        let EncodedShadingType::RadialAxial(shading) = &encoded.shading_type else {
+            unreachable!("an axial shading");
+        };
+        let crate::shading::ShadingFunction::Single(function) = &shading.function else {
+            unreachable!("one function");
+        };
+        let shape = over(function, domain.0, domain.1);
+        let [Piece::Lines(points)] = shape.as_slice() else {
+            panic!("lines: {shape:?}");
+        };
+        let twice = points.windows(2).filter(|w| w[0].0 == w[1].0).count();
+        assert_eq!((points.len(), twice), (SIZE, 0), "over {domain:?}");
+    }
+}
