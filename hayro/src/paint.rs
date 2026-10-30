@@ -31,8 +31,6 @@ impl Renderer<'_> {
 
                 match *p {
                     Pattern::Shading(s) => {
-                        const NATIVE_GRADIENT_TOLERANCE: f32 = 0.01;
-
                         clip_path = s.clip_path();
                         let encoded = s.encode();
                         let mut bbox = (*path_transform * path_bbox().to_path(0.0)).bounding_box();
@@ -52,8 +50,7 @@ impl Renderer<'_> {
                         ));
 
                         if let EncodedShadingType::RadialAxial(gradient) = &encoded.shading_type
-                            && let Some(native) =
-                                gradient.as_svg_gradient(&encoded, bbox, NATIVE_GRADIENT_TOLERANCE)
+                            && let Some(native) = gradient.as_svg_gradient(&encoded, bbox)
                         {
                             paint_transform = path_transform.inverse()
                                 * Affine::translate((-0.5, -0.5))

@@ -107,8 +107,6 @@ impl<'a> SvgRenderer<'a> {
             Paint::Pattern(p) => {
                 let id = match p.as_ref() {
                     Pattern::Shading(s) => {
-                        const NATIVE_GRADIENT_TOLERANCE: f32 = 0.01;
-
                         let mut basic_bbox = path_bbox();
 
                         if let Some(stroke_width) = stroke_props.map(|s| s.line_width) {
@@ -128,8 +126,7 @@ impl<'a> SvgRenderer<'a> {
                         let encoded = s.encode();
                         let shading_paint = if let EncodedShadingType::RadialAxial(gradient) =
                             &encoded.shading_type
-                            && let Some(native) =
-                                gradient.as_svg_gradient(&encoded, bbox, NATIVE_GRADIENT_TOLERANCE)
+                            && let Some(native) = gradient.as_svg_gradient(&encoded, bbox)
                         {
                             let gradient_key = gradient_key(shading_key, &native);
                             let gradient_id =

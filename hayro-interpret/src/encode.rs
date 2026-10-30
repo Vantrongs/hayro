@@ -2,6 +2,7 @@
 
 use crate::color::{AlphaColor, ColorComponents, ColorSpace};
 use crate::flatten::ControlHull;
+use crate::gradient::{SvgGradientStop, color_at};
 use crate::interpret::state::ActiveTransferFunction;
 use crate::pattern::ShadingPattern;
 use crate::radial::Lead;
@@ -11,7 +12,7 @@ use hayro_syntax::hash;
 use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape, Vec2};
 use smallvec::{SmallVec, ToSmallVec, smallvec};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Steps of work: an operator of a function run, a value read, computed or
 /// written, a pixel visited. Its arithmetic saturates, so a cost made of others
@@ -99,6 +100,10 @@ pub(crate) fn take(meter: &mut dyn Meter, steps: Cost) -> Result<(), Exhausted> 
 /// putting the result out.
 const POINT_COST: Cost = Cost::new(8);
 
+/// The steps finding a radial shading's color among its stops takes: a search of
+/// a few thousand stops at most, and a blend.
+const LOOKUP_COST: Cost = Cost::new(16);
+
 /// The steps placing a triangle of a mesh takes, its box found and cut by the
 /// region sampled, or a patch's cut out of it (`PATCH_TRIANGLES` of them a patch).
 const TRIANGLE_COST: Cost = Cost::new(64);
@@ -157,6 +162,9 @@ pub struct EncodedRadialAxialShading {
     pub(crate) params: RadialAxialParams,
     pub(crate) domain: [f32; 2],
     pub(crate) extend: [bool; 2],
+    /// A radial shading's colors from its start to its end, found when it is
+    /// first sampled ([`EncodedShadingPattern::ramp`]).
+    pub(crate) stops: OnceLock<Vec<SvgGradientStop>>,
 }
 
 /// Encoded mesh shading, sampled at the device pixels a texture reads.
@@ -610,15 +618,27 @@ impl EncodedShadingPattern {
         let samples = self
             .samples_at(&mut Unmetered, |pixels| pixels.add(pos))
             .expect(UNMETERED);
-        self.sample_in(pos, samples.as_ref())
+        let ramp = self.ramp(&mut Unmetered).expect(UNMETERED);
+        self.sample_in(pos, samples.as_ref(), ramp.as_ref())
     }
 
     /// The most steps sampling a point takes once the tables its color is looked up
     /// in are built ([`setup_cost`](Self::setup_cost)): its function's
     /// ([`Function::cost`](crate::Function::cost)), its color's
     /// ([`ColorSpace::cost`](crate::color::ColorSpace::cost)) and the transfer
-    /// function's. A mesh's triangles are placed besides, once for all points.
+    /// function's. A mesh's triangles are placed besides, once for all points. A
+    /// radial shading's color is looked up in its stops instead, found as it is
+    /// first sampled, each of their samples taken as this.
     pub fn point_cost(&self) -> Cost {
+        if self.ramps() {
+            return POINT_COST + LOOKUP_COST;
+        }
+        self.value_cost()
+    }
+
+    /// The steps the shading's own color at a point takes,
+    /// [`point_cost`](Self::point_cost) but for a radial shading's stops.
+    pub(crate) fn value_cost(&self) -> Cost {
         let function = match &self.shading_type {
             EncodedShadingType::FunctionBased(shading) => shading.function.cost(),
             EncodedShadingType::RadialAxial(shading) => shading.function.cost(),
@@ -680,9 +700,56 @@ impl EncodedShadingPattern {
             .map(|samples| Some(Located { samples, shift }))
     }
 
-    /// The shading at `pos`, a mesh's looked up in `samples`.
+    /// Whether its colors are looked up in its stops ([`ramp`](Self::ramp)): a
+    /// radial shading's, whose texture would otherwise evaluate its function and
+    /// color space, a tint transform's program among them, at every pixel. An
+    /// axial shading is drawn as a gradient of those stops where one reaches.
+    fn ramps(&self) -> bool {
+        matches!(
+            &self.shading_type,
+            EncodedShadingType::RadialAxial(EncodedRadialAxialShading {
+                params: RadialAxialParams::Radial { .. },
+                ..
+            })
+        )
+    }
+
+    /// For a radial shading, its stops and its color where none of its circles
+    /// passes, the stops found the first time, taking each sample of `meter` first
+    /// ([`EncodedRadialAxialShading::stops_metered`]).
+    fn ramp(&self, meter: &mut dyn Meter) -> Result<Option<Ramp<'_>>, Exhausted> {
+        let EncodedShadingType::RadialAxial(shading) = &self.shading_type else {
+            return Ok(None);
+        };
+        if !self.ramps() {
+            return Ok(None);
+        }
+        let stops = match shading.stops.get() {
+            Some(stops) => stops,
+            None => {
+                let stops = shading.stops_metered(self, meter)?;
+                shading.stops.get_or_init(|| stops)
+            }
+        };
+        Ok(Some(Ramp {
+            shading,
+            stops,
+            outside: self.finish(Some(self.background_color)),
+        }))
+    }
+
+    /// The shading at `pos`, a mesh's looked up in `samples`, a radial one's in
+    /// `ramp`.
     #[inline]
-    fn sample_in(&self, pos: Point, samples: Option<&Located>) -> [f32; 4] {
+    fn sample_in(
+        &self,
+        pos: Point,
+        samples: Option<&Located>,
+        ramp: Option<&Ramp<'_>>,
+    ) -> [f32; 4] {
+        if let Some(ramp) = ramp {
+            return ramp.at(pos);
+        }
         self.finish(
             self.shading_type
                 .eval(pos, self.background_color, &self.color_space, samples),
@@ -760,11 +827,24 @@ impl EncodedShadingPattern {
                 self.texture_points(bbox, scale, |point| reach.add(point));
             }
         })?;
-        self.texture_points(bbox, scale, |point| {
-            f(self.sample_in(point, samples.as_ref()));
-        });
-
         let inv_scale = 1.0 / scale as f64;
+        if let Some(ramp) = self.ramp(meter)? {
+            // Each point placed from its pixel, as `sample_points_metered` places
+            // it: steps added along a row of 10^4 pixels stray from it by as many
+            // roundings, as far as 10^9 units out a circle is from its neighbour.
+            for y in 0..height {
+                let y = bbox.y0 + (f64::from(y) + 0.5) * inv_scale;
+                for x in 0..width {
+                    let x = bbox.x0 + (f64::from(x) + 0.5) * inv_scale;
+                    f(ramp.at(self.base_transform * Point::new(x, y)));
+                }
+            }
+        } else {
+            self.texture_points(bbox, scale, |point| {
+                f(self.sample_in(point, samples.as_ref(), None));
+            });
+        }
+
         Ok((
             width,
             height,
@@ -802,8 +882,9 @@ impl EncodedShadingPattern {
             }
             return Ok(());
         }
+        let ramp = self.ramp(meter)?;
         for point in points {
-            f(self.sample_in(self.base_transform * *point, None));
+            f(self.sample_in(self.base_transform * *point, None, ramp.as_ref()));
         }
         Ok(())
     }
@@ -994,6 +1075,7 @@ fn encode_axial_shading(
             params,
             domain,
             extend,
+            stops: OnceLock::new(),
         }),
         initial_transform,
     )
@@ -1280,6 +1362,48 @@ fn encode_function_shading(domain: &[f32; 4], function: &ShadingFunction) -> Enc
     })
 }
 
+impl EncodedRadialAxialShading {
+    /// The parameter of the line or circle through `pos`, from its start, 0, to
+    /// its end, 1, a point past either taken at it where the shading is extended
+    /// past it; `None` where it paints its background.
+    #[inline]
+    fn t_at(&self, pos: Point) -> Option<f32> {
+        let extend = self.extend;
+        let t = match &self.params {
+            RadialAxialParams::Axial => pos.x as f32,
+            RadialAxialParams::Radial { p1, r, lead } => {
+                radial_pos(&pos, p1, *r, *lead, extend[0], extend[1])?
+            }
+        };
+        if t < 0.0 {
+            extend[0].then_some(0.0)
+        } else if t > 1.0 {
+            extend[1].then_some(1.0)
+        } else {
+            Some(t)
+        }
+    }
+}
+
+/// A radial shading's colors looked up in its stops
+/// ([`EncodedShadingPattern::ramp`]).
+struct Ramp<'a> {
+    shading: &'a EncodedRadialAxialShading,
+    stops: &'a [SvgGradientStop],
+    /// Its background, with its opacity and transfer function.
+    outside: [f32; 4],
+}
+
+impl Ramp<'_> {
+    /// The color at `pos`, in the shading's space.
+    #[inline]
+    fn at(&self, pos: Point) -> [f32; 4] {
+        self.shading
+            .t_at(pos)
+            .map_or(self.outside, |t| color_at(self.stops, t))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum RadialAxialParams {
     Axial,
@@ -1324,39 +1448,14 @@ impl EncodedShadingType {
                     Some(color_space.to_rgba(&out, 1.0))
                 }
             }
-            Self::RadialAxial(EncodedRadialAxialShading {
-                function,
-                params,
-                domain,
-                extend,
-            }) => {
-                let (t0, t1) = (domain[0], domain[1]);
-
-                let mut t = match params {
-                    RadialAxialParams::Axial => pos.x as f32,
-                    RadialAxialParams::Radial { p1, r, lead } => {
-                        radial_pos(&pos, p1, *r, *lead, extend[0], extend[1]).unwrap_or(f32::MIN)
-                    }
-                };
-
-                if t == f32::MIN {
+            Self::RadialAxial(shading) => {
+                let Some(t) = shading.t_at(pos) else {
                     return Some(bg_color);
-                }
-
-                if t < 0.0 {
-                    if extend[0] {
-                        t = 0.0;
-                    } else {
-                        return Some(bg_color);
-                    }
-                } else if t > 1.0 {
-                    if extend[1] {
-                        t = 1.0;
-                    } else {
-                        return Some(bg_color);
-                    }
-                }
-
+                };
+                let EncodedRadialAxialShading {
+                    function, domain, ..
+                } = shading;
+                let (t0, t1) = (domain[0], domain[1]);
                 let t = t0 + (t1 - t0) * t;
 
                 let val = function.eval(&smallvec![t])?;
@@ -2167,12 +2266,7 @@ mod tests {
             };
             for _ in 0..100 {
                 gradient
-                    .as_svg_gradient_metered(
-                        &encoded,
-                        Rect::new(0.0, 0.0, 10.0, 10.0),
-                        0.01,
-                        &mut meter,
-                    )
+                    .as_svg_gradient_metered(&encoded, Rect::new(0.0, 0.0, 10.0, 10.0), &mut meter)
                     .expect("given all it asks")
                     .expect("a native gradient");
             }
@@ -2680,6 +2774,118 @@ mod tests {
         let mut passed = 0;
         let refused = encoded.sample_points_metered(&points, &mut meter, |_| passed += 1);
         assert_eq!((refused, passed), (Err(Exhausted), 0));
+    }
+
+    /// A radial shading's texture is the colors its points have one by one, each
+    /// pixel placed from its own index rather than by steps along its row: near
+    /// touching circles, nested and cones, 10^-3 to 10^9 units across, in a whole
+    /// view and along a row of 10^4 pixels, every extension, with and without a
+    /// background, through a straight ramp and a curved one. Through the straight
+    /// one, whose two stops are exact, those are the colors the shading evaluates
+    /// to at each point, which its color space rounds to eight bits; the curved
+    /// one's stops stray between their samples as a native gradient's do.
+    #[test]
+    fn a_radial_texture_is_its_points_colors_from_its_stops() {
+        const ROUNDING: f32 = 0.5 / 255.0 + f32::EPSILON;
+        // The circles of a family at a size, moved off touching by a share.
+        type Circles = fn(f64, f64) -> [f64; 6];
+        let families: [(&str, Circles); 4] = [
+            ("apex", |s, d| [0.0, 0.0, 0.0, s * (1.0 + d), 0.0, s]),
+            ("ring", |s, d| [0.0, 0.0, s, s * (0.5 + d), 0.0, 1.5 * s]),
+            ("diagonal", |s, d| {
+                [0.0, 0.0, 0.1 * s, 0.3 * s, 0.4 * s * (1.0 + d), 0.6 * s]
+            }),
+            ("concentric", |s, d| [0.0, 0.0, 0.2 * s, s * d, 0.0, s]),
+        ];
+        let functions = [
+            "<< /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >>",
+            "<< /FunctionType 3 /Domain [0 1] /Bounds [0.4] /Encode [0 1 0 1] /Functions [\
+             << /FunctionType 2 /Domain [0 1] /C0 [1 1 0] /C1 [0 0.3 1] /N 3.8 >> \
+             << /FunctionType 2 /Domain [0 1] /C0 [0 0.3 1] /C1 [1 0 1] /N 1.6 >>] >>",
+        ];
+        let mut compared = 0;
+        for (name, coords) in families {
+            for size in [1e-3, 1.0, 1e6, 1e9] {
+                for off in [0.0, 1e-4, -1e-4] {
+                    let c = coords(size, off);
+                    let coords = c.map(|v| format!("{v}")).join(" ");
+                    for (e, (straight, function)) in
+                        ["false false", "true true", "false true", "true false"]
+                            .iter()
+                            .zip(
+                                functions
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, f)| (i == 0, f))
+                                    .cycle(),
+                            )
+                    {
+                        for background in ["", "/Background [0 1 0]"] {
+                            let pattern = shading_pattern(&[
+                                "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+                                format!(
+                                    "<< /ShadingType 3 /ColorSpace /DeviceRGB /Coords [{coords}] \
+                                     /Extend [{e}] {background} /Function {function} >>"
+                                ),
+                            ]);
+                            let encoded = pattern.encode();
+                            let reach = 2.2 * size;
+                            for (bbox, scale) in [
+                                (
+                                    Rect::new(-1.1 * size, -1.1 * size, 1.1 * size, 1.1 * size),
+                                    32.0 / reach,
+                                ),
+                                (
+                                    Rect::new(-0.6 * size, 0.0, 1.6 * size, 3.0 / 1e4 * reach),
+                                    1e4 / reach,
+                                ),
+                            ] {
+                                let mut texture = vec![];
+                                let (width, _, to_bbox) =
+                                    encoded.sample_texture(bbox, scale as f32, |c| texture.push(c));
+                                let points: Vec<Point> = (0..texture.len())
+                                    .map(|i| {
+                                        let (x, y) = (i as u32 % width, i as u32 / width);
+                                        to_bbox * Point::new(f64::from(x) + 0.5, f64::from(y) + 0.5)
+                                    })
+                                    .collect();
+                                let mut sampled = vec![];
+                                encoded
+                                    .sample_points_metered(&points, &mut super::Unmetered, |c| {
+                                        sampled.push(c);
+                                    })
+                                    .expect("unmetered");
+                                let case =
+                                    format!("{name} {size} {off} [{e}] {background:?} {bbox:?}");
+                                assert_eq!(sampled, texture, "{case}");
+                                if !straight {
+                                    continue;
+                                }
+                                for (point, color) in points.iter().zip(&texture) {
+                                    let own = encoded.finish(encoded.shading_type.eval(
+                                        encoded.base_transform * *point,
+                                        encoded.background_color,
+                                        &encoded.color_space,
+                                        None,
+                                    ));
+                                    let off = own
+                                        .iter()
+                                        .zip(color)
+                                        .map(|(a, b)| (a - b).abs())
+                                        .fold(0.0, f32::max);
+                                    assert!(
+                                        off <= ROUNDING,
+                                        "{case} at {point:?}: {color:?}, the shading's {own:?}"
+                                    );
+                                    compared += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(compared > 500_000, "{compared}");
     }
 
     /// A mesh's points are sampled where they lie: at pixel centres, as its
