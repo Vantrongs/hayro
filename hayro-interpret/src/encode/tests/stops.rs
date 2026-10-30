@@ -382,3 +382,66 @@ fn a_table_step_within_an_entry_is_allowed_where_the_tables_step() {
     }
     assert_eq!(drawn, 40);
 }
+
+/// A stitching of `pieces` lines in gray rising from 0 to 1 and falling back
+/// in turn.
+fn zigzag(pieces: usize) -> String {
+    let bounds: Vec<String> = (1..pieces)
+        .map(|i| format!("{}", i as f64 / pieces as f64))
+        .collect();
+    let functions: Vec<&str> = (0..pieces)
+        .map(|i| {
+            if i % 2 == 0 {
+                "<< /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >>"
+            } else {
+                "<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>"
+            }
+        })
+        .collect();
+    format!(
+        "<< /FunctionType 3 /Domain [0 1] /Bounds [{}] /Encode [{}] /Functions [{}] >>",
+        bounds.join(" "),
+        vec!["0 1"; pieces].join(" "),
+        functions.join(" ")
+    )
+}
+
+/// A gradient too steep for a table of 1024 colors over its length is drawn
+/// as a row of texels along its line that, read between the centres of its
+/// texels at each pixel's centre, holds the colors of the stops there within
+/// a level.
+#[test]
+fn a_row_holds_a_steep_gradient_at_each_pixel() {
+    let encoded = axial("0 0 1600 0", "/DeviceGray", &zigzag(40));
+    let EncodedShadingType::RadialAxial(shading) = &encoded.shading_type else {
+        unreachable!("an axial shading");
+    };
+    let gradient = shading
+        .as_svg_gradient(&encoded, Rect::new(0.0, 0.0, 1600.0, 1.0))
+        .expect("an axial shading within its extension");
+    assert!(!gradient.paints_within_a_level(&table(&gradient.stops, 1024)));
+    let row = gradient
+        .row_within_a_level_metered(&mut crate::encode::Unmetered, usize::MAX)
+        .expect("unmetered")
+        .expect("a row");
+    let to_texture = (gradient.transform * row.to_gradient).inverse();
+    let n = row.colors.len();
+    for x in 0..1600 {
+        let p = to_texture * Point::new(f64::from(x) + 0.5, 0.5);
+        // Read between the centres of the texels, padded.
+        let at = (p.x - 0.5).clamp(0.0, (n - 1) as f64);
+        let (i, f) = (at.floor() as usize, at.fract() as f32);
+        let j = (i + 1).min(n - 1);
+        let got = row.colors[i][0] + (row.colors[j][0] - row.colors[i][0]) * f;
+        let t = (f64::from(x) + 0.5) / 1600.0 * 40.0;
+        let want = if (t.floor() as usize).is_multiple_of(2) {
+            t.fract()
+        } else {
+            1.0 - t.fract()
+        };
+        assert!(
+            (f64::from(got) - want).abs() * 255.0 < 1.0,
+            "at {x}: {got}, the function's {want}, {n} texels"
+        );
+    }
+}

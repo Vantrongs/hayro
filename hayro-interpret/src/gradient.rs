@@ -173,7 +173,224 @@ impl SvgGradient {
         }
         true
     }
+
+    /// The work [`paints_within_a_level`](Self::paints_within_a_level) and
+    /// building the table of `entries` it checks take.
+    pub fn table_check_cost(&self, entries: usize) -> Cost {
+        Cost::of(entries.saturating_mul(2).saturating_add(self.stops.len()))
+    }
+
+    /// Whether every table of at least `entries` colors that holds at each
+    /// entry the stops' color at its place, rounded to 8 bits, paints within
+    /// a level of the stops, as [`paints_within_a_level`](Self::paints_within_a_level)
+    /// would find of it, from the stops alone: an entry is read up to an entry
+    /// after its place, so off by half a level of rounding and by as much as
+    /// the colors change over an entry before the place read, which the
+    /// steepest line within an entry before it bounds. Opaque stops only, and
+    /// lines no steeper than [`TABLE_BOUND_LINES`] in an entry; `false`, for
+    /// the table to be checked, otherwise. Linear in the stops.
+    pub fn within_a_level_of_any_table(&self, entries: usize) -> bool {
+        let stops = &self.stops;
+        if entries < 2 || stops.len() < 2 || stops.iter().any(|s| s.color[3] != 1.0) {
+            return false;
+        }
+        let cell = 1.0 / (entries - 1) as f64;
+        let budget = f64::from(LEVEL_TOLERANCE) - 0.5;
+        // Each line's steepest channel, in 8-bit levels over an entry.
+        let over_entry = |k: usize| -> f64 {
+            let (a, b) = (stops[k], stops[k + 1]);
+            let most = (0..3)
+                .map(|c| f64::from((b.color[c] - a.color[c]).abs()))
+                .fold(0.0, f64::max);
+            if most == 0.0 {
+                return 0.0;
+            }
+            let width = f64::from(b.offset - a.offset);
+            if width <= 0.0 {
+                return f64::INFINITY;
+            }
+            most * 255.0 * cell / width
+        };
+        let mut first = 0;
+        for k in 0..stops.len() - 1 {
+            // The lines within an entry before any place on line `k`.
+            let from = f64::from(stops[k].offset) - cell;
+            while first < k && f64::from(stops[first + 1].offset) <= from {
+                first += 1;
+            }
+            if k - first >= TABLE_BOUND_LINES {
+                return false;
+            }
+            if (first..=k).map(over_entry).fold(0.0, f64::max) >= budget {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The [`row`](Self::row) that paints within a level of the stops
+    /// ([`row_paints_within_a_level`](Self::row_paints_within_a_level)), of the
+    /// fewest texels a pixel among [`ROW_TEXELS_PER_PIXEL`] and no more than
+    /// `max_texels` texels: `None` when none does, as where the stops step within [`range`](Self::range) by twice
+    /// the tolerance or more, which a row read between its texels blends over
+    /// a texel at any width, found before any row is made. Each row
+    /// made, and checked, is taken of `meter` first.
+    pub fn row_within_a_level_metered(
+        &self,
+        meter: &mut dyn Meter,
+        max_texels: usize,
+    ) -> Result<Option<GradientRow>, Exhausted> {
+        let (r0, r1) = (f64::from(self.range.0), f64::from(self.range.1));
+        take(meter, Cost::of(self.stops.len()))?;
+        // A step of twice the tolerance or more is off by half of it or more
+        // from one side or the other wherever it lies between two texels.
+        let premultiplied = |c: [f32; 4]| [c[0] * c[3], c[1] * c[3], c[2] * c[3], c[3]];
+        let allowance = |k: usize| self.table_steps.get(k).copied().unwrap_or(0.0);
+        let steps = (1..self.stops.len()).any(|k| {
+            let (a, b) = (self.stops[k - 1], self.stops[k]);
+            a.offset == b.offset
+                && (r0..=r1).contains(&f64::from(a.offset))
+                && levels_apart(&premultiplied(a.color), &premultiplied(b.color))
+                    >= 2.0 * (LEVEL_TOLERANCE + allowance(k - 1).max(allowance(k)))
+        });
+        if steps {
+            return Ok(None);
+        }
+        let pixels = (r1 - r0) / f64::from(self.pixel_step).max(f64::from(f32::MIN_POSITIVE));
+        for per_pixel in ROW_TEXELS_PER_PIXEL {
+            let texels = (pixels * f64::from(per_pixel)).ceil().max(1.0);
+            if texels > max_texels as f64 {
+                return Ok(None);
+            }
+            let texels = texels as usize;
+            take(
+                meter,
+                Cost::of(texels.saturating_mul(3).saturating_add(self.stops.len())),
+            )?;
+            if !meter.hold(texels.saturating_mul(2 * size_of::<[f32; 4]>())) {
+                return Err(Exhausted);
+            }
+            let row = self.row(per_pixel);
+            if self.row_paints_within_a_level(&row) {
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The colors of a texture one texel high that holds the gradient along
+    /// its line, over the part of it its shape reaches: `per_pixel` texels for
+    /// each device pixel it spans, each the stops' color at the place of its
+    /// centre; and the transform from the texture to the gradient's own space,
+    /// where its line runs along `x` ([`transform`](Self::transform) takes
+    /// that to the device). A renderer that reads a texture between the
+    /// centres of its texels, padded past its ends, draws the gradient so.
+    pub fn row(&self, per_pixel: u32) -> GradientRow {
+        let SvgGradientKind::Linear { start, end } = self.kind;
+        let (r0, r1) = (f64::from(self.range.0), f64::from(self.range.1));
+        let pixels = (r1 - r0) / f64::from(self.pixel_step).max(f64::from(f32::MIN_POSITIVE));
+        let texels = ((pixels * f64::from(per_pixel)).ceil() as usize).max(1);
+        let width = (r1 - r0) / texels as f64;
+        let colors = (0..texels)
+            .map(|i| color_at(&self.stops, (r0 + (i as f64 + 0.5) * width) as f32))
+            .collect();
+        let length = end.x - start.x;
+        GradientRow {
+            colors,
+            to_gradient: Affine::new([width * length, 0.0, 0.0, 1.0, start.x + r0 * length, 0.0]),
+        }
+    }
+
+    /// Whether `row`, its colors rounded to 8 bits and read between the
+    /// centres of its texels, padded past its ends, paints every point of
+    /// [`range`](Self::range) within a level of the stops, as
+    /// [`paints_within_a_level`](Self::paints_within_a_level) checks a table:
+    /// within 1.5 levels at each stop and by its [`table_steps`](Self::table_steps)
+    /// besides, once 8-bit reads are rounded, a feature narrower than a pixel
+    /// too, as the shading sampled at each pixel paints it. Linear in the
+    /// texels and stops.
+    pub fn row_paints_within_a_level(&self, row: &GradientRow) -> bool {
+        let n = row.colors.len();
+        let stops = &self.stops;
+        if n == 0 || stops.is_empty() {
+            return false;
+        }
+        let premultiplied = |c: [f32; 4]| [c[0] * c[3], c[1] * c[3], c[2] * c[3], c[3]];
+        // The texels as a renderer holds them: premultiplied, in 8 bits.
+        let rounded: Vec<[f32; 4]> = row
+            .colors
+            .iter()
+            .map(|&c| premultiplied(c).map(|v| (v * 255.0 + 0.5).floor() / 255.0))
+            .collect();
+        let (r0, r1) = (f64::from(self.range.0), f64::from(self.range.1));
+        let width = (r1 - r0) / n as f64;
+        let centre = |i: usize| r0 + (i as f64 + 0.5) * width;
+        let allowance = |k: usize| self.table_steps.get(k).copied().unwrap_or(0.0);
+        // The row as read at `at`, and how far apart the two texels read there
+        // lie, in levels.
+        let read = |at: f64| -> ([f32; 4], f64) {
+            let j = ((at - r0) / width - 0.5).floor();
+            if j < 0.0 {
+                return (rounded[0], 0.0);
+            }
+            let i = (j as usize).min(n - 1);
+            if i + 1 >= n {
+                return (rounded[n - 1], 0.0);
+            }
+            let (a, b) = (rounded[i], rounded[i + 1]);
+            let apart = (0..4)
+                .map(|c| f64::from((b[c] - a[c]).abs()) * 255.0)
+                .fold(0.0, f64::max);
+            (lerp_color(a, b, ((at - centre(i)) / width) as f32), apart)
+        };
+        // A renderer that reads in 8 bits rounds the color read, and the
+        // weight of each texel, to 8 bits: off by half a level and by the
+        // texels' difference over 510 besides.
+        let off = |want: [f32; 4], (got, apart): ([f32; 4], f64), allowed: f32| {
+            let want = premultiplied(want);
+            let allowed = f64::from(LEVEL_TOLERANCE + allowed) - 0.5 - apart / 510.0;
+            (0..4).any(|c| (f64::from(got[c]) - f64::from(want[c])).abs() * 255.0 >= allowed)
+        };
+        let start = stops.partition_point(|s| f64::from(s.offset) < r0);
+        let end = stops.partition_point(|s| f64::from(s.offset) <= r1);
+        // The colors between the stops and the row are both straight but at
+        // the stops and the texels' centres, where the texels hold the
+        // colors, so they lie farthest apart at the stops and the ends.
+        let around = |next: usize| {
+            allowance(next.min(stops.len() - 1)).max(next.checked_sub(1).map_or(0.0, allowance))
+        };
+        for at in [r0, r1] {
+            let next = stops.partition_point(|s| f64::from(s.offset) <= at);
+            if off(lerp_between(stops, next, at as f32), read(at), around(next)) {
+                return false;
+            }
+        }
+        (start..end).all(|k| {
+            let at = f64::from(stops[k].offset);
+            !off(stops[k].color, read(at), allowance(k))
+        })
+    }
 }
+
+/// A gradient as a texture one texel high ([`SvgGradient::row`]).
+pub struct GradientRow {
+    /// The texels' colors, straight RGBA in sRGB, from the start of the part
+    /// of the gradient its shape reaches to its end.
+    pub colors: Vec<[f32; 4]>,
+    /// The transform from the texture, a texel a unit, to the gradient's own
+    /// space.
+    pub to_gradient: Affine,
+}
+
+/// How many texels a device pixel a gradient's [`row`](SvgGradient::row) is
+/// tried at: two, so a step read between two texels is read so within the
+/// pixel it falls in, and more where the colors bend between texels.
+pub const ROW_TEXELS_PER_PIXEL: [u32; 4] = [2, 4, 8, 16];
+
+/// The most lines of stops within an entry of a table before a place that
+/// [`SvgGradient::within_a_level_of_any_table`] bounds the colors by; past
+/// it the table is built and checked.
+const TABLE_BOUND_LINES: usize = 16;
 
 impl EncodedRadialAxialShading {
     /// Convert an axial shading into an SVG-like gradient over the part of it

@@ -36,12 +36,11 @@ impl Type3 {
                 .collect()
         })?;
         let domain = *clamper.domain.first()?;
-        let mut bounds = vec![domain.0 - 0.0001];
+        let mut bounds = vec![domain.0];
         if let Some(a) = dict.get::<Array<'_>>(BOUNDS) {
             bounds.extend(a.items::<f32>().map_while(|n| n));
         }
-        // Add a small delta so that the interval is considered to be closed on the right.
-        bounds.push(domain.1 + 0.0001);
+        bounds.push(domain.1);
 
         let encode = dict.get::<TupleVec>(ENCODE)?;
         // A function past the last interval the bounds make, or past the last
@@ -102,10 +101,15 @@ impl Type3 {
         let bounds_i = *self.bounds.get(index + 1)?;
         let bounds_i_minus_1 = *self.bounds.get(index)?;
 
-        // - 1 because we inserted a dummy bound in the constructor.
         let encoding = self.encode.get(index)?;
         let function = self.functions.get(index)?;
-        let encoded = interpolate(input[0], bounds_i_minus_1, bounds_i, encoding.0, encoding.1);
+        // A last bound at `Domain1` leaves `Domain1` alone in the last subdomain,
+        // which the specification encodes as its `Encode` start.
+        let encoded = if bounds_i_minus_1 == bounds_i {
+            encoding.0
+        } else {
+            interpolate(input[0], bounds_i_minus_1, bounds_i, encoding.0, encoding.1)
+        };
 
         let mut evaluated = function.eval(smallvec![encoded])?;
 
@@ -162,9 +166,15 @@ impl Type3 {
     }
 }
 
+/// The subdomain `x` falls in: each closed on the left and open on the right,
+/// but the last, closed on the right as well.
 fn find_interval(bounds: &[f32], x: f32) -> Option<usize> {
-    if x < *bounds.first()? || x >= *bounds.last()? {
+    let last = *bounds.last()?;
+    if !(x >= *bounds.first()? && x <= last) {
         return None;
+    }
+    if x == last {
+        return bounds.len().checked_sub(2);
     }
 
     match bounds.binary_search_by(|val| {
@@ -210,6 +220,34 @@ mod tests {
             both >= large && both < large + small,
             "{small} {large} {both}"
         );
+    }
+
+    /// Each subdomain maps to its encoding from the bounds the dictionary gives,
+    /// `Domain` at the ends (ISO 32000-1, 7.10.4): the first function sees its
+    /// `Encode` start at `Domain0` and the last its end at `Domain1`, and a last
+    /// bound at `Domain1` makes `Domain1` the last function's `Encode` start.
+    #[test]
+    fn a_stitching_encodes_each_subdomain_from_its_exact_bounds() {
+        let function = |domain: &str, bounds: &str, encode: &str| {
+            let ramp = "<< /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >>";
+            let data = format!(
+                "<< /FunctionType 3 /Domain [{domain}] /Functions [{ramp} {ramp}] \
+                 /Bounds [{bounds}] /Encode [{encode}] >>"
+            );
+            Function::new(&Object::from_bytes(data.as_bytes()).unwrap()).unwrap()
+        };
+        let at = |f: &Function, x: f32| f.eval(smallvec![x]).unwrap()[0];
+        let halves = function("0 1", "0.5", "0 1 0 1");
+        assert_eq!(at(&halves, 0.0), 0.0);
+        assert_eq!(at(&halves, 0.25), 0.5);
+        assert_eq!(at(&halves, 0.5), 0.0);
+        assert_eq!(at(&halves, 1.0), 1.0);
+        let reversed = function("2 4", "3", "1 0 1 0");
+        assert_eq!(at(&reversed, 2.0), 1.0);
+        assert_eq!(at(&reversed, 4.0), 0.0);
+        let last_at_end = function("0 1", "1", "0 1 0.25 1");
+        assert_eq!(at(&last_at_end, 1.0), 0.25);
+        assert_eq!(at(&last_at_end, 0.5), 0.5);
     }
 
     #[test]

@@ -1,11 +1,11 @@
 //! Axial and radial shadings against their functions evaluated directly, over
 //! generated functions and color spaces: every pixel of a texture, and every
-//! pixel an axial shading's gradient stops paint, is within a level of the
-//! color the shading's function and color space give at its parameter.
+//! pixel an axial shading's gradient stops and its row paint, is within a level
+//! of the color the shading's function and color space give at its parameter.
 
 use super::shading_pattern;
-use crate::encode::{EncodedShadingPattern, EncodedShadingType};
-use crate::gradient::levels_apart;
+use crate::encode::{EncodedShadingPattern, EncodedShadingType, Unmetered};
+use crate::gradient::{GradientRow, SvgGradient, SvgGradientKind, levels_apart};
 use kurbo::{Point, Rect};
 use smallvec::smallvec;
 
@@ -251,11 +251,24 @@ fn functions(rng: &mut Rng, outputs: usize) -> Vec<Generated> {
 struct Geometry {
     name: &'static str,
     entry: String,
+    /// The pattern's `/Matrix`.
+    matrix: [f64; 6],
     bbox: Rect,
     t: fn(Point) -> f64,
 }
 
-fn geometries() -> [Geometry; 3] {
+/// An axial shading along `[0 0 256 0]` placed by `m`: its parameter at `p`.
+fn axial_t(m: [f64; 6], p: Point) -> f64 {
+    let q = kurbo::Affine::new(m).inverse() * p;
+    (q.x / 256.0).clamp(0.0, 1.0)
+}
+
+const IDENTITY: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+/// Rotated by 30 degrees, moved so its line crosses the box drawn.
+const ROTATED: [f64; 6] = [0.866_025_4, 0.5, -0.5, 0.866_025_4, 16.0, -40.0];
+const SHEARED: [f64; 6] = [1.0, 0.0, 0.5, 1.0, 0.0, 0.0];
+
+fn geometries() -> [Geometry; 5] {
     // `t` of the circle `|p - c0 - t (c1 - c0)| = r0 + t (r1 - r0)` through
     // `p`, the larger, past either circle taken at it.
     fn radial(p: Point, [x0, y0, r0, x1, y1, r1]: [f64; 6]) -> f64 {
@@ -277,18 +290,35 @@ fn geometries() -> [Geometry; 3] {
         Geometry {
             name: "axial",
             entry: "/ShadingType 2 /Coords [0 0 256 0]".to_string(),
+            matrix: IDENTITY,
             bbox: Rect::new(0.0, 0.0, 256.0, 2.0),
-            t: |p| (p.x / 256.0).clamp(0.0, 1.0),
+            t: |p| axial_t(IDENTITY, p),
+        },
+        Geometry {
+            name: "axial rotated",
+            entry: "/ShadingType 2 /Coords [0 0 256 0]".to_string(),
+            matrix: ROTATED,
+            bbox: Rect::new(0.0, 0.0, 256.0, 16.0),
+            t: |p| axial_t(ROTATED, p),
+        },
+        Geometry {
+            name: "axial sheared",
+            entry: "/ShadingType 2 /Coords [0 0 256 0]".to_string(),
+            matrix: SHEARED,
+            bbox: Rect::new(0.0, 0.0, 256.0, 16.0),
+            t: |p| axial_t(SHEARED, p),
         },
         Geometry {
             name: "concentric",
             entry: format!("/ShadingType 3 /Coords [{}]", coords(CONCENTRIC)),
+            matrix: IDENTITY,
             bbox: Rect::new(0.0, 0.0, 128.0, 128.0),
             t: |p| radial(p, CONCENTRIC),
         },
         Geometry {
             name: "nested",
             entry: format!("/ShadingType 3 /Coords [{}]", coords(NESTED)),
+            matrix: IDENTITY,
             bbox: Rect::new(0.0, 0.0, 128.0, 128.0),
             t: |p| radial(p, NESTED),
         },
@@ -348,6 +378,33 @@ fn between(stops: &[crate::gradient::SvgGradientStop], t: f32) -> [f32; 4] {
     }
 }
 
+/// The color `row` paints at `p` as a renderer reads a texture of 8 bits
+/// between the centres of its texels, padded past its ends, placed by the
+/// gradient's transform: straight, for the comparison.
+fn row_at(gradient: &SvgGradient, row: &GradientRow, p: Point) -> [f32; 4] {
+    let n = row.colors.len();
+    let u = ((gradient.transform * row.to_gradient).inverse() * p).x - 0.5;
+    let at = u.clamp(0.0, (n - 1) as f64);
+    let (i, f) = (at.floor() as usize, at.fract() as f32);
+    let j = (i + 1).min(n - 1);
+    let texel = |c: [f32; 4]| {
+        let a = (c[3] * 255.0 + 0.5).floor();
+        let rgb = [0, 1, 2].map(|k| (c[k] * c[3] * 255.0 + 0.5).floor());
+        [rgb[0], rgb[1], rgb[2], a]
+    };
+    let (a, b) = (texel(row.colors[i]), texel(row.colors[j]));
+    let read = [0, 1, 2, 3].map(|k| (a[k] + (b[k] - a[k]) * f) / 255.0);
+    if read[3] == 0.0 {
+        return [0.0; 4];
+    }
+    [
+        read[0] / read[3],
+        read[1] / read[3],
+        read[2] / read[3],
+        read[3],
+    ]
+}
+
 /// What the comparisons found.
 #[derive(Default)]
 struct Tally {
@@ -405,8 +462,10 @@ impl Tally {
 }
 
 /// Every pixel an axial or radial shading's texture paints, and every pixel an
-/// axial one's gradient stops paint as a renderer draws them, is within a level
-/// of the color its function and color space give at the pixel's parameter:
+/// axial one's gradient stops paint as a renderer draws them and its row paints
+/// as a renderer reads a texture, along its line, rotated and sheared, is within
+/// a level of the color its function and color space give at the pixel's
+/// parameter:
 /// sampled functions of order 1 and 3 whose samples spike, exponential ones of
 /// `N` 0.5, 1, 2 and 7, stitchings of constant and linear parts that step at
 /// their bounds, PostScript ones that step, into gray, RGB, a `Separation`
@@ -419,6 +478,7 @@ fn shadings_paint_within_a_level_of_their_functions() {
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let mut tally = Tally::default();
     let mut lines_cases = 0;
+    let mut rows = 0;
     for space in &SPACES {
         for function in functions(&mut rng, space.outputs) {
             let lines = function.lines && space.straight;
@@ -427,8 +487,12 @@ fn shadings_paint_within_a_level_of_their_functions() {
             }
             for geometry in geometries() {
                 let case = format!("{} {} {}", geometry.name, space.name, function.name);
+                let m = geometry.matrix;
                 let mut objects = vec![
-                    "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+                    format!(
+                        "<< /PatternType 2 /Shading 5 0 R /Matrix [{} {} {} {} {} {}] >>",
+                        m[0], m[1], m[2], m[3], m[4], m[5]
+                    ),
                     format!(
                         "<< {} /ColorSpace {} /Extend [true true] /Function 6 0 R >>",
                         geometry.entry, space.entry
@@ -460,9 +524,12 @@ fn shadings_paint_within_a_level_of_their_functions() {
                     unreachable!("an axial or radial shading");
                 };
                 if let Some(gradient) = shading.as_svg_gradient(&encoded, geometry.bbox) {
+                    let SvgGradientKind::Linear { start, end } = gradient.kind;
+                    let to_gradient = gradient.transform.inverse();
                     for x in 0..geometry.bbox.width() as u32 {
                         let p = Point::new(f64::from(x) + 0.5, 0.5);
-                        let t = (encoded.base_transform * p).x as f32;
+                        let t = ((to_gradient * p - start).dot(end - start)
+                            / (end - start).hypot2()) as f32;
                         let got = between(&gradient.stops, t.clamp(0.0, 1.0));
                         tally.pixel(
                             &encoded,
@@ -472,6 +539,26 @@ fn shadings_paint_within_a_level_of_their_functions() {
                             (lines, space.straight),
                             &format!("{case} stops"),
                         );
+                    }
+                    if let Some(row) = gradient
+                        .row_within_a_level_metered(&mut Unmetered, usize::MAX)
+                        .expect("unmetered")
+                    {
+                        rows += 1;
+                        let (width, height) =
+                            (geometry.bbox.width() as u32, geometry.bbox.height() as u32);
+                        for i in 0..width * height {
+                            let p =
+                                Point::new(f64::from(i % width) + 0.5, f64::from(i / width) + 0.5);
+                            tally.pixel(
+                                &encoded,
+                                &geometry,
+                                p,
+                                row_at(&gradient, &row, p),
+                                (lines, space.straight),
+                                &format!("{case} row"),
+                            );
+                        }
                     }
                 }
             }
@@ -487,6 +574,7 @@ fn shadings_paint_within_a_level_of_their_functions() {
         eprintln!("  excused {n:6} {case}");
     }
     assert!(lines_cases > 20, "{lines_cases}");
+    assert!(rows > 100, "{rows}");
     assert!(
         tally.failures.is_empty(),
         "{} pixels off, among them:\n{}",
