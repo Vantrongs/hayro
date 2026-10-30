@@ -81,11 +81,14 @@ impl Renderer<'_> {
                             let mut image = Vec::with_capacity(width as usize * height as usize);
                             let mut may_have_transparency = false;
                             let (width, height, transform) =
-                                encoded.sample_texture(bbox, 1.0, |sample| {
-                                    let pixel =
-                                        AlphaColor::<Srgb>::new(sample).premultiply().to_rgba8();
-                                    may_have_transparency |= pixel.a != 255;
-                                    image.push(pixel);
+                                encoded.sample_texture(bbox, 1.0, |row| {
+                                    for &sample in row {
+                                        let pixel = AlphaColor::<Srgb>::new(sample)
+                                            .premultiply()
+                                            .to_rgba8();
+                                        may_have_transparency |= pixel.a != 255;
+                                        image.push(pixel);
+                                    }
                                 });
                             paint_transform = path_transform.inverse() * transform;
 

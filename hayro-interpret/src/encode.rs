@@ -776,9 +776,9 @@ impl EncodedShadingPattern {
     /// Sample the shading on a pixel grid covering `bbox`, with `scale`
     /// pixels per unit of `bbox`.
     ///
-    /// The callback is invoked once per pixel in row-major order with the
-    /// straight (non-premultiplied) RGBA sample, letting callers apply their
-    /// own conversion. Returns the dimensions of the grid (see
+    /// The callback is invoked once per row, the top row first, with the row's
+    /// straight (non-premultiplied) RGBA samples, letting callers apply their
+    /// own conversion to a row at once. Returns the dimensions of the grid (see
     /// [`texture_dimensions`]) and the transform from grid space to the space
     /// of `bbox`. No size cap is applied — callers that need to bound the
     /// texture size should check [`texture_dimensions`] first.
@@ -786,7 +786,7 @@ impl EncodedShadingPattern {
         &self,
         bbox: Rect,
         scale: f32,
-        f: impl FnMut([f32; 4]),
+        f: impl FnMut(&[[f32; 4]]),
     ) -> (u32, u32, Affine) {
         self.sample_texture_metered(bbox, scale, &mut Unmetered, f)
             .expect(UNMETERED)
@@ -797,13 +797,13 @@ impl EncodedShadingPattern {
     /// ([`setup_cost`](Self::setup_cost)), each point
     /// ([`point_cost`](Self::point_cost)), and for a mesh, each triangle placed and
     /// each pixel of its box visited, twice, and the samples held. `Exhausted`, with
-    /// no point passed to `f`, when `meter` refuses.
+    /// no row passed to `f`, when `meter` refuses.
     pub fn sample_texture_metered(
         &self,
         bbox: Rect,
         scale: f32,
         meter: &mut dyn Meter,
-        mut f: impl FnMut([f32; 4]),
+        mut f: impl FnMut(&[[f32; 4]]),
     ) -> Result<(u32, u32, Affine), Exhausted> {
         let (width, height) = texture_dimensions(bbox, scale);
         let points = u64::from(width) * u64::from(height);
@@ -828,23 +828,30 @@ impl EncodedShadingPattern {
             }
         })?;
         let inv_scale = 1.0 / scale as f64;
+        let mut row = vec![[0.0_f32; 4]; width as usize];
         if let Some(ramp) = self.ramp(meter)? {
             // Each point placed from its pixel, as `sample_points_metered` places
             // it: steps added along a row of 10^4 pixels stray from it by as many
             // roundings, as far as 10^9 units out a circle is from its neighbour.
             for y in 0..height {
                 let y = bbox.y0 + (f64::from(y) + 0.5) * inv_scale;
-                for x in 0..width {
-                    let x = bbox.x0 + (f64::from(x) + 0.5) * inv_scale;
-                    f(ramp.at(self.base_transform * Point::new(x, y)));
+                for (x, out) in row.iter_mut().enumerate() {
+                    let x = bbox.x0 + (x as f64 + 0.5) * inv_scale;
+                    *out = ramp.at(self.base_transform * Point::new(x, y));
                 }
+                f(&row);
             }
         } else {
+            let mut at = 0;
             self.texture_points(bbox, scale, |point| {
-                f(self.sample_in(point, samples.as_ref(), None));
+                row[at] = self.sample_in(point, samples.as_ref(), None);
+                at += 1;
+                if at == row.len() {
+                    f(&row);
+                    at = 0;
+                }
             });
         }
-
         Ok((
             width,
             height,
@@ -930,16 +937,18 @@ impl EncodedShadingPattern {
         let mut data = Vec::with_capacity(width as usize * height as usize * 4);
         let mut has_transparency = false;
 
-        let (_, _, transform) = self.sample_texture(bbox, scale, |sample| {
-            let converted = [
-                (sample[0] * 255.0 + 0.5) as u8,
-                (sample[1] * 255.0 + 0.5) as u8,
-                (sample[2] * 255.0 + 0.5) as u8,
-                (sample[3] * 255.0 + 0.5) as u8,
-            ];
+        let (_, _, transform) = self.sample_texture(bbox, scale, |row| {
+            for sample in row {
+                let converted = [
+                    (sample[0] * 255.0 + 0.5) as u8,
+                    (sample[1] * 255.0 + 0.5) as u8,
+                    (sample[2] * 255.0 + 0.5) as u8,
+                    (sample[3] * 255.0 + 0.5) as u8,
+                ];
 
-            has_transparency |= converted[3] != 255;
-            data.extend_from_slice(&converted);
+                has_transparency |= converted[3] != 255;
+                data.extend_from_slice(&converted);
+            }
         });
 
         ShadingTexture {
@@ -2223,7 +2232,7 @@ mod tests {
                 Rect::new(0.0, 0.0, 100.0, 100.0),
                 1.0,
                 &mut meter,
-                |_| sampled += 1,
+                |row| sampled += row.len(),
             );
             assert_eq!(refused, Err(Exhausted), "{space}");
             assert_eq!((sampled, TYPE0_EVALS.get()), (0, 0), "{space}");
@@ -2747,7 +2756,8 @@ mod tests {
         let encoded = pattern.encode();
         let bbox = Rect::new(0.0, 0.0, 10.0, 4.0);
         let mut texture = vec![];
-        let (width, _, to_bbox) = encoded.sample_texture(bbox, 1.0, |c| texture.push(c));
+        let (width, _, to_bbox) =
+            encoded.sample_texture(bbox, 1.0, |row| texture.extend_from_slice(row));
         let points: Vec<Point> = (0..texture.len())
             .map(|i| {
                 let (x, y) = (i as u32 % width, i as u32 / width);
@@ -2842,7 +2852,9 @@ mod tests {
                             ] {
                                 let mut texture = vec![];
                                 let (width, _, to_bbox) =
-                                    encoded.sample_texture(bbox, scale as f32, |c| texture.push(c));
+                                    encoded.sample_texture(bbox, scale as f32, |row| {
+                                        texture.extend_from_slice(row);
+                                    });
                                 let points: Vec<Point> = (0..texture.len())
                                     .map(|i| {
                                         let (x, y) = (i as u32 % width, i as u32 / width);
@@ -2928,7 +2940,8 @@ mod tests {
         let encoded = pattern.encode();
         let bbox = Rect::new(0.0, 0.0, 100.0, 100.0);
         let mut texture = vec![];
-        let (width, _, to_bbox) = encoded.sample_texture(bbox, 1.0, |c| texture.push(c));
+        let (width, _, to_bbox) =
+            encoded.sample_texture(bbox, 1.0, |row| texture.extend_from_slice(row));
         let centres: Vec<Point> = (0..texture.len())
             .map(|i| {
                 let (x, y) = (i as u32 % width, i as u32 / width);
@@ -3011,7 +3024,8 @@ mod tests {
         let encoded = pattern.encode();
         let texture = |bbox: Rect| {
             let mut texture = vec![];
-            let (width, _, _) = encoded.sample_texture(bbox, 1.0, |c| texture.push(c));
+            let (width, _, _) =
+                encoded.sample_texture(bbox, 1.0, |row| texture.extend_from_slice(row));
             (width as usize, texture)
         };
         let (whole_width, whole) = texture(Rect::new(0.0, 0.0, 60.0, 60.0));
