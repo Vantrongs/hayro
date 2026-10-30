@@ -7,7 +7,7 @@ use crate::cache::Cache;
 use crate::color::{ColorComponents, ColorSpace};
 use crate::encode::Cost;
 use crate::function::shape::{self, Piece};
-use crate::function::{Function, OVER_POINTS_COUNT, Values, interpolate, sorting};
+use crate::function::{Function, Values, interpolate, sorting};
 use crate::gradient::StopMemo;
 use crate::interpret::annotation::entries::Entries;
 use crate::radial::{Lead, same};
@@ -51,17 +51,14 @@ impl ShadingFunction {
     /// The steps [`shape`](Self::shape) takes, and the most points it holds.
     pub(crate) fn shape_cost(&self) -> (Cost, u64) {
         match self {
-            Self::Single(function) => (
-                function.shape_cost(),
-                function.shape_points().saturating_add(OVER_POINTS_COUNT),
-            ),
-            // Every point of each, from below and from above.
+            Self::Single(function) => (function.shape_cost(), function.shape_points()),
+            // Every input a point of one is at, three points there.
             Self::Multiple(functions) => {
                 let points = functions
                     .iter()
-                    .map(|f| f.shape_points().saturating_add(OVER_POINTS_COUNT))
+                    .map(Function::shape_points)
                     .fold(0_u64, u64::saturating_add)
-                    .saturating_mul(2);
+                    .saturating_mul(3);
                 let steps = functions.iter().map(Function::shape_cost).sum::<Cost>()
                     + Cost::new(points.saturating_mul(functions.len() as u64 + 4));
                 (sorting(steps), points)
@@ -70,7 +67,7 @@ impl ShadingFunction {
     }
 
     /// The function from `from` to `to`, `from` below `to`, piece by piece as it
-    /// evaluates ([`Function::shape`]): one function's own, past its domain the
+    /// evaluates ([`shape::over`]): one function's own, past its domain the
     /// value at its side; several, one for each output, side by side.
     pub(crate) fn shape(&self, from: f32, to: f32) -> Vec<Piece> {
         match self {
@@ -232,7 +229,7 @@ impl Shading {
                         coords,
                         lead: Lead::of(read),
                         axial,
-                        memo: Arc::default(),
+                        memo: Arc::new(StopMemo::new(color_space.clone())),
                     }
                 }
             }

@@ -194,3 +194,108 @@ fn a_steep_axial_shading_paints_its_function_at_each_pixel_at_any_angle() {
         assert_eq!(compared, 3 * SIZE as usize);
     }
 }
+
+/// The pixmap of a `size` × `size` page that fills `fill` with a shading
+/// pattern of `shading`, object 5, whose function is `function`, object 6,
+/// placed by `matrix`.
+fn painted(
+    size: u32,
+    fill: &str,
+    shading: &str,
+    function: &str,
+    matrix: &str,
+) -> vello_cpu::Pixmap {
+    let page = fixtures::one_page(
+        size,
+        "/Contents 4 0 R /Resources << /Pattern << /P 7 0 R >> >>",
+        vec![
+            fixtures::stream("", format!("/Pattern cs /P scn {fill} re f").as_bytes()),
+            shading.as_bytes().to_vec(),
+            function.as_bytes().to_vec(),
+            format!("<< /PatternType 2 /Shading 5 0 R /Matrix [{matrix}] >>").into_bytes(),
+        ],
+    );
+    let pdf = Pdf::new(page).expect("valid pdf");
+    render(
+        &pdf.pages()[0],
+        &RenderCache::new(),
+        &InterpreterSettings::default(),
+        &RenderSettings::default(),
+        &PixmapSettings {
+            x_scale: 1.0,
+            y_scale: 1.0,
+            bg_color: WHITE,
+        },
+    )
+}
+
+/// An axial shading whose function ramps from black to white over the first
+/// `ramp` of its parameter and stays white past it, along a line of `80 /
+/// ramp` units, paints its function at each pixel of a shape reaching 70
+/// pixels along it: the gradient's ends lie `ramp` apart in the shading's
+/// parameter, around and below the distance under which vello takes a
+/// gradient's ends for one point and paints its first color alone, but its
+/// colors span 80 pixels.
+#[test]
+fn an_axial_shading_whose_stops_lie_close_paints_its_ramp() {
+    for ramp in [8e-7, 5e-7, 9.99e-7, 1e-6, 1.01e-6, 2e-6, 1e-3] {
+        let length = 80.0 / ramp;
+        let pixmap = painted(
+            100,
+            "0 0 70 100",
+            &format!(
+                "<< /ShadingType 2 /ColorSpace /DeviceGray /Coords [0 0 {length} 0] \
+                 /Extend [true true] /Function 6 0 R >>"
+            ),
+            &format!(
+                "<< /FunctionType 3 /Domain [0 1] /Bounds [{ramp}] /Encode [0 1 0 1] /Functions [\
+                 << /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >> \
+                 << /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [1] /N 1 >>] >>"
+            ),
+            "1 0 0 1 0 0",
+        );
+        for x in 1..69_u16 {
+            let want = ((f64::from(x) + 0.5) / 80.0 * 255.0 + 0.5).floor();
+            let got = f64::from(pixmap.sample(x, 50).r);
+            assert!(
+                (got - want).abs() <= 1.0,
+                "ramp {ramp} at {x}: {got}, the function's {want}"
+            );
+        }
+    }
+}
+
+/// Radial circles written ten million times smaller under a matrix ten million
+/// times larger are the same circles, a cone, and paint the same pixels: the
+/// precision of their coordinates read relatively to their size, as well as
+/// absolutely, tells both from touching.
+#[test]
+fn radial_circles_scaled_against_their_matrix_paint_alike() {
+    let function = "<< /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >>";
+    let paint = |coords: &str, matrix: &str| {
+        painted(
+            200,
+            "0 0 200 200",
+            &format!(
+                "<< /ShadingType 3 /ColorSpace /DeviceGray /Coords [{coords}] \
+                 /Extend [true true] /Function 6 0 R >>"
+            ),
+            function,
+            matrix,
+        )
+    };
+    let written = paint("0 0 0 200 0 100", "1 0 0 1 0 0");
+    let scaled = paint("0 0 0 .00002 0 .00001", "10000000 0 0 10000000 0 0");
+    let mut apart = 0;
+    for y in 0..200 {
+        for x in 0..200 {
+            let (a, b) = (written.sample(x, y), scaled.sample(x, y));
+            if [a.r, a.g, a.b, a.a] != [b.r, b.g, b.b, b.a] {
+                apart += 1;
+            }
+        }
+    }
+    assert_eq!(apart, 0);
+    // The original cone leaves the page's centre (100, 100), outside it, unpainted.
+    assert_eq!(written.sample(100, 100).r, 255);
+}

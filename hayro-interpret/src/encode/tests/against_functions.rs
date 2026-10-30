@@ -335,7 +335,7 @@ fn direct(encoded: &EncodedShadingPattern, t: f64) -> [f32; 4] {
     encoded.finish(values.map(|v| encoded.color_space.to_rgba(&v, 1.0)))
 }
 
-/// The [`table_step`](crate::gradient::table_step) of the function's outputs
+/// The [`table_step`](crate::gradient::Look::table_step) of the function's outputs
 /// at `t`, the shading's own as its native gradient is checked against.
 fn table_step(encoded: &EncodedShadingPattern, t: f64) -> f32 {
     let EncodedShadingType::RadialAxial(shading) = &encoded.shading_type else {
@@ -344,7 +344,7 @@ fn table_step(encoded: &EncodedShadingPattern, t: f64) -> f32 {
     shading
         .function
         .eval(&smallvec![t as f32])
-        .map_or(0.0, |values| crate::gradient::table_step(encoded, &values))
+        .map_or(0.0, |values| shading.memo.look(encoded).table_step(&values))
 }
 
 /// Whether the color has a feature narrower than `step` within `step` of `t`:

@@ -17,6 +17,7 @@ use crate::function::type4::Type4;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::dict::keys::{DOMAIN, FUNCTION_TYPE, RANGE};
 use hayro_syntax::object::{Object, dict_or_stream};
+pub(crate) use shape::{Line, Side, Span};
 use smallvec::SmallVec;
 use std::sync::{Arc, OnceLock};
 #[cfg(test)]
@@ -48,28 +49,32 @@ pub(crate) fn sorting(gathered: Cost) -> Cost {
 #[derive(Debug, Clone)]
 pub struct Function(Arc<(FunctionType, Costs)>);
 
-/// What evaluating a function once may take, found once when it is read.
+/// What evaluating a function once may take, and walking its shape, found once
+/// when it is read.
 #[derive(Debug, Clone, Copy)]
 struct Costs {
     eval: Cost,
-    /// The steps [`Function::shape`] takes, and the most points it holds.
-    shape: Cost,
-    points: u64,
+    /// The steps one [`Function::span`] takes.
+    span: Cost,
+    /// The most spans above an input [`shape::over`] finds, over any interval:
+    /// lines and curves, those past either side of the domain among them.
+    spans: u64,
 }
 
-/// The most points `shape::over` adds to a function's own: two at each side.
-pub(crate) const OVER_POINTS_COUNT: u64 = 4;
+/// The most spans of a function whose own lines, between the sides of its
+/// domain, are `lines` and whose outputs are `outputs`, once clipped to its
+/// range, a line crossing each side of each output's range at most once,
+/// with the two past the sides of its domain.
+fn clipped_spans(lines: u64, outputs: u64) -> u64 {
+    lines
+        .saturating_mul(outputs.saturating_mul(2).saturating_add(1))
+        .saturating_add(2)
+}
 
-/// The most points the shape of a function with `samples` points of its own and
-/// `outputs` outputs holds once clipped to its range, a line crossing each side
-/// of each output's range at most once, and the steps finding them takes: a few
-/// for each output of each point.
-fn clipped_shape(samples: u64, outputs: u64) -> (u64, Cost) {
-    let points = samples.saturating_mul(outputs.saturating_mul(2).saturating_add(1));
-    (
-        points,
-        Cost::new(points.saturating_mul(outputs.saturating_add(4))),
-    )
+/// The steps a function's own part of [`Function::span`] takes for `outputs`
+/// outputs: finding its line and clipping it to the range.
+fn span_steps(outputs: u64) -> Cost {
+    Cost::new(outputs.saturating_mul(8).saturating_add(16))
 }
 
 impl Function {
@@ -89,33 +94,34 @@ impl Function {
 
     /// The function of `function_type`, its cost found once.
     fn of(function_type: FunctionType) -> Self {
-        let curve = (0, Cost::new(1));
+        let curve = |eval: Cost| Costs {
+            eval,
+            span: eval + Cost::new(4),
+            spans: 3,
+        };
         let cost = match &function_type {
-            FunctionType::Type0(t0) => {
-                let (points, shape) = match t0.sizes() {
-                    [n] => clipped_shape(u64::from(*n).saturating_add(2), t0.outputs()),
-                    _ => curve,
-                };
-                Costs {
-                    eval: t0.cost(),
-                    shape,
-                    points,
+            FunctionType::Type0(t0) => match t0.sizes() {
+                [n] => {
+                    let eval = t0.cost() + span_steps(t0.outputs());
+                    Costs {
+                        eval,
+                        span: eval + span_steps(t0.outputs()),
+                        spans: clipped_spans(u64::from(*n).saturating_add(2), t0.outputs()),
+                    }
                 }
-            }
-            FunctionType::Type2(t2) => {
-                let (points, shape) = clipped_shape(2, t2.outputs());
-                Costs {
-                    eval: t2.cost(),
-                    shape,
-                    points,
-                }
-            }
-            FunctionType::Type3(t3) => t3.cost(),
-            FunctionType::Type4(t4) => Costs {
-                eval: t4.cost(),
-                shape: curve.1,
-                points: curve.0,
+                _ => curve(t0.cost()),
             },
+            FunctionType::Type2(t2) if t2.straight() => {
+                let eval = t2.cost() + span_steps(t2.outputs());
+                Costs {
+                    eval,
+                    span: eval + span_steps(t2.outputs()),
+                    spans: clipped_spans(1, t2.outputs()),
+                }
+            }
+            FunctionType::Type2(t2) => curve(t2.cost()),
+            FunctionType::Type3(t3) => t3.cost(),
+            FunctionType::Type4(t4) => curve(t4.cost()),
         };
         Self(Arc::new((function_type, cost)))
     }
@@ -127,14 +133,26 @@ impl Function {
         self.0.1.eval
     }
 
-    /// The steps [`shape`](Self::shape) takes.
+    /// The steps [`shape::over`] takes, over any interval.
     pub(crate) fn shape_cost(&self) -> Cost {
-        self.0.1.shape
+        // A span above each input it walks from, and one at each end of each.
+        self.0.1.span.times(self.0.1.spans.saturating_mul(3))
     }
 
-    /// The most points [`shape`](Self::shape) holds.
+    /// The most points [`shape::over`] holds, over any interval: three where
+    /// two spans meet.
     pub(crate) fn shape_points(&self) -> u64 {
-        self.0.1.points
+        self.0.1.spans.saturating_add(1).saturating_mul(3)
+    }
+
+    /// The most steps one [`span`](Self::span) takes.
+    fn span_cost(&self) -> Cost {
+        self.0.1.span
+    }
+
+    /// The most spans [`shape::over`] finds of it.
+    fn spans(&self) -> u64 {
+        self.0.1.spans
     }
 
     /// The domain of its first input, `None` where it has none.
@@ -148,20 +166,37 @@ impl Function {
         clamper.domain.first().copied()
     }
 
-    /// The function of its first input over its domain as it evaluates, piece by
-    /// piece ([`shape::Piece`]): straight lines where it is made of them, as a
-    /// sampled function of one input, an exponential one of exponent one, and a
-    /// stitching of such are, each step of a stitching at its bound; elsewhere
-    /// curves.
-    pub(crate) fn shape(&self) -> Vec<shape::Piece> {
+    /// What the function of its first input is on `side` of `x` as it
+    /// evaluates ([`shape::Span`]): a line where it is straight there, as a
+    /// sampled function of one input is between its samples, an exponential
+    /// one of exponent one is, and a stitching of such is between its bounds,
+    /// each ending where the function bends or steps; elsewhere a curve. Past
+    /// either side of its domain, and at a side on the side past it, the line
+    /// of its value at that side, to infinity, as it clamps its input there.
+    /// Its evaluation at `x` is the value at `x` of its span there on
+    /// [`Side::At`] where that is a line, so the two agree.
+    pub(crate) fn span(&self, x: f32, side: Side) -> Span {
+        let Some((d0, d1)) = self.domain().filter(|(d0, d1)| d0 <= d1) else {
+            return Span::Curve(f32::NEG_INFINITY, f32::INFINITY);
+        };
+        let constant = |a: f32, b: f32, at: f32| match self.eval(smallvec::smallvec![at]) {
+            Some(value) => Span::Line(Line::constant(a, b, value)),
+            None => Span::Curve(a, b),
+        };
+        if x < d0 || x == d0 && side == Side::Below {
+            return constant(f32::NEG_INFINITY, d0, d0);
+        }
+        if x > d1 || x == d1 && side == Side::Above {
+            return constant(d1, f32::INFINITY, d1);
+        }
+        if d0 == d1 {
+            return constant(d0, d1, d0);
+        }
         match &self.0.0 {
-            FunctionType::Type0(t0) => vec![t0.shape()],
-            FunctionType::Type2(t2) => vec![t2.shape()],
-            FunctionType::Type3(t3) => t3.shape(),
-            FunctionType::Type4(t4) => {
-                let (d0, d1) = t4.clamper.domain.first().copied().unwrap_or((0.0, 1.0));
-                vec![shape::Piece::Curve(d0, d1)]
-            }
+            FunctionType::Type0(t0) => t0.span(x, side),
+            FunctionType::Type2(t2) => t2.span(x, side),
+            FunctionType::Type3(t3) => t3.span(x, side),
+            FunctionType::Type4(_) => Span::Curve(d0, d1),
         }
     }
 

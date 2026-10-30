@@ -303,7 +303,6 @@ fn a_gradient_spans_the_part_its_shape_reaches() {
 /// are checked against; in gray and RGB, none.
 #[test]
 fn stops_where_tables_step_carry_the_step() {
-    use crate::gradient::table_step;
     let lab = "[/Lab << /WhitePoint [0.9505 1 1.089] /Range [-128 127 -128 127] >>]";
     let function = "<< /FunctionType 2 /Domain [0 1] /C0 [0 -100 -100] /C1 [100 100 100] /N 1 >>";
     let encoded = axial("0 0 300 0", lab, function);
@@ -317,10 +316,10 @@ fn stops_where_tables_step_carry_the_step() {
     assert_eq!(gradient.table_steps.len(), stops.len());
     for (i, step) in gradient.table_steps.iter().enumerate() {
         let x = stops[i].offset;
-        let want = table_step(
-            &encoded,
-            &shading.function.eval(&smallvec![x]).expect("a value"),
-        );
+        let want = shading
+            .memo
+            .look(&encoded)
+            .table_step(&shading.function.eval(&smallvec![x]).expect("a value"));
         assert_eq!(*step, want, "stop {i} at {x}");
     }
     assert!(gradient.table_steps.iter().any(|s| *s > 0.0), "{stops:?}");
@@ -444,4 +443,84 @@ fn a_row_holds_a_steep_gradient_at_each_pixel() {
             "at {x}: {got}, the function's {want}, {n} texels"
         );
     }
+}
+
+/// Paints of one shading under a transfer function that maps the 8-bit
+/// values alternately to black and white, and under none, find the same stops
+/// and table steps in either order as each finds alone: its colors and steps
+/// are kept for the look they were found in, so a step of 255 levels the
+/// alternating table makes is never allowed a paint without it.
+#[test]
+fn paints_under_other_transfer_functions_find_their_own_colors() {
+    use crate::function::{Function, TransferFunction};
+    use crate::interpret::state::ActiveTransferFunction;
+    use hayro_syntax::object::{Dict, Object, ObjectIdentifier};
+    let program = "{ 255 mul round cvi 2 mod }";
+    let objects = [
+        "<< /PatternType 2 /Shading 5 0 R >>".to_string(),
+        "<< /ShadingType 2 /ColorSpace [/Separation /Spot /DeviceGray 7 0 R] \
+         /Coords [0 0 300 0] /Extend [true true] /Function 6 0 R >>"
+            .to_string(),
+        "<< /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >>".to_string(),
+        "<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>".to_string(),
+        format!(
+            "<< /FunctionType 4 /Domain [0 1] /Range [0 1] /Length {} >>\nstream\n{program}\nendstream",
+            program.len()
+        ),
+    ];
+    let mut all = crate::fixtures::one_page_objects(10, "");
+    all.extend(objects.iter().map(|o| o.clone().into_bytes()));
+    let pdf =
+        hayro_syntax::Pdf::new(crate::fixtures::file_with_aliases(all, &[])).expect("valid pdf");
+    let alternating = ActiveTransferFunction::Single(TransferFunction::new(
+        Function::new(
+            &pdf.xref()
+                .get::<Object<'_>>(ObjectIdentifier::new(8, 0))
+                .expect("a function"),
+        )
+        .expect("a function"),
+    ));
+    let dict = pdf
+        .xref()
+        .get::<Dict<'_>>(ObjectIdentifier::new(4, 0))
+        .expect("a pattern");
+    // The stops and table steps of each paint, in turn, of patterns read
+    // through one cache, as a page reads them where it paints them.
+    let painted = |transfers: &[Option<ActiveTransferFunction>]| {
+        let cache = crate::cache::Cache::new();
+        transfers
+            .iter()
+            .map(|transfer| {
+                let mut pattern =
+                    crate::pattern::ShadingPattern::new(&dict, &cache).expect("a shading");
+                pattern.transfer_function = transfer.clone();
+                let encoded = pattern.encode();
+                let EncodedShadingType::RadialAxial(shading) = &encoded.shading_type else {
+                    unreachable!("an axial shading");
+                };
+                let gradient = shading
+                    .as_svg_gradient(&encoded, Rect::new(0.0, 0.0, 300.0, 1.0))
+                    .expect("an axial shading within its extension");
+                (gradient.stops, gradient.table_steps)
+            })
+            .collect::<Vec<_>>()
+    };
+    let (with, without) = (Some(alternating), None);
+    let alone_with = painted(std::slice::from_ref(&with)).remove(0);
+    let alone_without = painted(std::slice::from_ref(&without)).remove(0);
+    assert!(
+        alone_with.1.iter().any(|s| *s > 200.0),
+        "{:?}",
+        alone_with.1
+    );
+    assert!(
+        alone_without.1.iter().all(|s| *s < 10.0),
+        "{:?}",
+        alone_without.1
+    );
+    assert_eq!(
+        painted(&[with.clone(), without.clone()]),
+        [alone_with.clone(), alone_without.clone()]
+    );
+    assert_eq!(painted(&[without, with]), [alone_without, alone_with]);
 }

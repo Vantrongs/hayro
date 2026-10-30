@@ -244,19 +244,21 @@ const LEAST_TABLE_ENTRIES: usize = 1024;
 /// ([`SvgGradient::within_a_level_of_any_table`]). `None` where it is not.
 fn native_gradient(native: &SvgGradient, level: Level) -> Option<(Gradient, Affine)> {
     let gradient = drawn(native);
-    if native.stops.len() >= 4 && native.within_a_level_of_any_table(LEAST_TABLE_ENTRIES) {
-        return Some((gradient, native.transform));
-    }
     let mut paints = Vec::new();
     gradient.encode_into(&mut paints, Affine::IDENTITY, None)?;
-    // Fewer than two stops encode a solid color, which needs no table.
-    let fits = match paints.pop() {
-        Some(EncodedPaint::Gradient(encoded)) => vello_common::fearless_simd::dispatch!(
+    // vello paints a gradient it takes for degenerate in its first color
+    // alone, encoding no table: that paints the stops only where they are all
+    // that color.
+    let Some(EncodedPaint::Gradient(encoded)) = paints.pop() else {
+        return native
+            .is_one_color()
+            .then_some((gradient, native.transform));
+    };
+    let fits = native.stops.len() >= 4 && native.within_a_level_of_any_table(LEAST_TABLE_ENTRIES)
+        || vello_common::fearless_simd::dispatch!(
             level,
             simd => native.paints_within_a_level(encoded.u8_lut(simd).lut())
-        ),
-        _ => true,
-    };
+        );
     fits.then_some((gradient, native.transform))
 }
 
@@ -347,6 +349,28 @@ mod tests {
         assert_eq!(lut[1638][0], 100);
         assert!(native.paints_within_a_level(&lut));
         assert!(native_gradient(&native, Level::new()).is_some());
+    }
+
+    /// A gradient whose ends vello takes for one point, which it paints in its
+    /// first color alone, is drawn natively only where its stops are all that
+    /// color: a ramp so drawn is not, and goes to a row.
+    #[test]
+    fn a_gradient_vello_paints_in_one_color_is_native_only_where_it_is_one() {
+        let point = |stops: Vec<SvgGradientStop>| SvgGradient {
+            kind: SvgGradientKind::Linear {
+                start: Point::ZERO,
+                end: Point::new(1e-7, 0.0),
+            },
+            ..along(stops, (0.0, 1.0), 1.0 / 100.0)
+        };
+        let ramp = point(vec![gray(0.0, 0.0), gray(1.0, 255.0)]);
+        assert!(native_gradient(&ramp, Level::new()).is_none());
+        assert!(matches!(
+            axial_paint(&ramp, Level::new()),
+            Some((vello_cpu::PaintType::Image(_), _))
+        ));
+        let flat = point(vec![gray(0.0, 40.0), gray(0.5, 40.0), gray(1.0, 40.0)]);
+        assert!(native_gradient(&flat, Level::new()).is_some());
     }
 
     /// Gray zigzagging 40 times between 0 and 255 across 1600 pixels, 6.4

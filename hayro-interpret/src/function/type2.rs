@@ -1,5 +1,5 @@
 use crate::encode::Cost;
-use crate::function::shape::{Piece, clipped};
+use crate::function::shape::{Line, Side, Span};
 use crate::function::{Clamper, Values};
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Number;
@@ -42,36 +42,52 @@ impl Type2 {
         Cost::new(2) + Cost::of(self.c0.len()).times(2) + self.clamper.cost()
     }
 
-    /// A straight line from one side of its domain to the other, clipped to its
-    /// range with a point where it crosses a side of it, where its exponent is
-    /// one; otherwise a curve.
-    pub(crate) fn shape(&self) -> Piece {
+    /// Whether it is straight, of exponent one.
+    pub(crate) fn straight(&self) -> bool {
+        self.n == 1.0
+    }
+
+    /// The function on `side` of `x`, within its domain
+    /// ([`Function::span`](crate::Function)): of exponent one, the straight line
+    /// from one side of its domain to the other, clipped to its range
+    /// ([`Line::clipped`]); otherwise a curve.
+    pub(crate) fn span(&self, x: f32, side: Side) -> Span {
         let (d0, d1) = self.clamper.domain.first().copied().unwrap_or((0.0, 1.0));
-        if self.n != 1.0 || d0 > d1 {
-            return Piece::Curve(d0, d1);
+        if !self.straight() || d0 > d1 {
+            return Span::Curve(d0, d1);
         }
-        let line = |x: f32| {
+        Span::Line(self.line(x, side))
+    }
+
+    /// Of exponent one, the line it is on at `side` of `x`, within its domain.
+    fn line(&self, x: f32, side: Side) -> Line {
+        let (d0, d1) = self.clamper.domain.first().copied().unwrap_or((0.0, 1.0));
+        let at = |x: f32| -> Values {
             self.c0
                 .iter()
                 .zip(&self.delta)
                 .map(|(c0, delta)| *c0 + x * *delta)
                 .collect()
         };
-        Piece::Lines(clipped(
-            vec![(d0, line(d0)), (d1, line(d1))],
-            self.clamper.range.as_deref(),
-        ))
+        Line {
+            x0: d0,
+            x1: d1,
+            v0: at(d0),
+            v1: at(d1),
+        }
+        .clipped(self.clamper.range.as_deref(), x, side)
     }
 
     /// Evaluate the function with the given input.
     pub(crate) fn eval(&self, input: f32) -> Values {
         let mut input = [input];
         self.clamper.clamp_input(&mut input);
-        let factor = if self.n == 1.0 {
-            input[0]
-        } else {
-            input[0].powf(self.n)
-        };
+        if self.straight() {
+            // The value at it of its line there, as its shape is.
+            let x = input[0];
+            return self.line(x, Side::At).at(x);
+        }
+        let factor = input[0].powf(self.n);
 
         let mut out = self
             .c0

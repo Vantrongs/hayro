@@ -5,7 +5,7 @@ thread_local! {
     /// The evaluations run.
     pub(crate) static EVALS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
-use crate::function::shape::{Piece, clipped};
+use crate::function::shape::{Line, Side, Span};
 use crate::function::{Clamper, TupleVec, Values, interpolate};
 use hayro_syntax::bit_reader::BitReader;
 use hayro_syntax::object::Array;
@@ -125,31 +125,52 @@ impl Type0 {
     pub(crate) fn eval(&self, input: Values) -> Option<Values> {
         #[cfg(test)]
         EVALS.set(EVALS.get() + 1);
+        if let ([x], [_]) = (input.as_slice(), self.sizes.as_slice()) {
+            // Of one input, the value at it of its line there, as its shape is.
+            let (d0, d1) = *self.clamper.domain.first()?;
+            let x = x.min(d1).max(d0);
+            return Some(self.line(x, Side::At)?.at(x));
+        }
         let mut out = self.decoded(input)?;
         self.clamper.clamp_output(&mut out);
         Some(out)
     }
 
-    /// The function of one input as straight lines between its samples, as
-    /// `eval` interpolates them, whatever `/Order` says: a point where the input
-    /// encodes to each sample, and one at each side of its domain, clipped to its
-    /// range with a point where a line crosses a side of it. A function of more
-    /// inputs, or without its samples, is a curve.
-    pub(crate) fn shape(&self) -> Piece {
-        let curve = || {
-            let (d0, d1) = self.clamper.domain.first().copied().unwrap_or((0.0, 1.0));
-            Piece::Curve(d0, d1)
-        };
+    /// The function of one input on `side` of `x`, within its domain, as
+    /// `eval` gives it ([`Function::span`](crate::Function)): straight between
+    /// two samples, whatever `/Order` says, as it interpolates them; flat where
+    /// the input encodes past the first or the last sample, and is clipped to
+    /// it; its values clipped to its range ([`Line::clipped`]). A curve where it
+    /// has more inputs or lacks samples.
+    pub(crate) fn span(&self, x: f32, side: Side) -> Span {
+        match self.line(x, side) {
+            Some(line) => Span::Line(line),
+            None => {
+                let (d0, d1) = self.clamper.domain.first().copied().unwrap_or((0.0, 1.0));
+                Span::Curve(d0, d1)
+            }
+        }
+    }
+
+    /// The line of a function of one input on `side` of `x`, within its domain,
+    /// `x` below its end where `side` is above and above its start where `side`
+    /// is below: the encoded input's cell of the samples, the first or the last
+    /// sample alone past them, put where it maps from and cut to the domain, its
+    /// values clipped to the range. `None` for more inputs, or a sample missing.
+    fn line(&self, x: f32, side: Side) -> Option<Line> {
         let (Some(&(d0, d1)), Some(&(e0, e1)), &[n]) = (
             self.clamper.domain.first(),
             self.encode.first(),
             self.sizes.as_slice(),
         ) else {
-            return curve();
+            return None;
         };
+        if n == 0 {
+            return None;
+        }
         let m = self.range.len();
         let most = (2_u64.pow(u32::from(self.bits_per_sample)) - 1) as f32;
-        let sample = |k: u32| -> Option<Values> {
+        let sample = |k: f32| -> Option<Values> {
             let at = (k as usize).checked_mul(m)?;
             let samples = self.table.get(at..at.checked_add(m)?)?;
             Some(
@@ -160,39 +181,50 @@ impl Type0 {
                     .collect(),
             )
         };
-        let (Some(start), Some(end)) = (self.decoded(smallvec![d0]), self.decoded(smallvec![d1]))
-        else {
-            return curve();
-        };
-        if n == 0 || d0 > d1 {
-            return curve();
-        }
         let last = (n - 1) as f32;
-        let key = |x: f32| interpolate(x, d0, d1, e0, e1).max(0.0).min(last);
-        let (k0, k1) = (key(d0), key(d1));
-        let mut points = vec![(d0, start)];
-        if d0 < d1 && e0 != e1 {
-            // The samples strictly between the keys of the domain's sides, in
-            // the order of the input.
-            let (lo, hi) = (k0.min(k1), k0.max(k1));
-            let first = lo.floor() as u32 + 1;
-            let last = hi.ceil() as u32;
-            let mut inner = Vec::with_capacity((last.saturating_sub(first)) as usize);
-            for k in first..last {
-                let x = interpolate(k as f32, e0, e1, d0, d1);
-                match sample(k) {
-                    Some(value) if x > d0 && x < d1 => inner.push((x, value)),
-                    Some(_) => {}
-                    None => return curve(),
-                }
+        let range = Some(self.range.as_slice());
+        // A side at the domain's ends is the side within it.
+        let side = match side {
+            Side::At if x < d1 => Side::Above,
+            Side::At => Side::Below,
+            side => side,
+        };
+        if n == 1 || e0 == e1 || d0 == d1 {
+            // One cell, or one place in it, for every input: `e0` itself, the
+            // first sample where the domain is a point, as encoding it reads.
+            let key = if d0 == d1 { 0.0 } else { e0.max(0.0).min(last) };
+            let (k0, k1) = (key.floor(), key.ceil());
+            let (v0, v1) = (sample(k0)?, sample(k1)?);
+            let value = Line {
+                x0: k0,
+                x1: k1,
+                v0,
+                v1,
             }
-            if k1 < k0 {
-                inner.reverse();
-            }
-            points.extend(inner);
+            .at(key);
+            return Some(Line::constant(d0, d1, value).clipped(range, x, side));
         }
-        points.push((d1, end));
-        Piece::Lines(clipped(points, Some(&self.range)))
+        let u = interpolate(x, d0, d1, e0, e1);
+        let side_k = side.through(e1 > e0);
+        let in_key = if u < 0.0 || u == 0.0 && side_k == Side::Below {
+            Line::constant(f32::NEG_INFINITY, 0.0, sample(0.0)?)
+        } else if u > last || u == last && side_k == Side::Above {
+            Line::constant(last, f32::INFINITY, sample(last)?)
+        } else {
+            let k = match side_k {
+                Side::Below => u.ceil() - 1.0,
+                Side::At | Side::Above => u.floor(),
+            }
+            .max(0.0)
+            .min(last - 1.0);
+            Line {
+                x0: k,
+                x1: k + 1.0,
+                v0: sample(k)?,
+                v1: sample(k + 1.0)?,
+            }
+        };
+        Some(in_key.mapped((d0, d1), (e0, e1)).clipped(range, x, side))
     }
 
     /// The samples interpolated at `input` and decoded, not yet clipped to the

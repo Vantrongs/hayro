@@ -762,18 +762,7 @@ impl EncodedShadingPattern {
     /// A color the shading evaluated to, with its opacity and transfer function.
     #[inline]
     pub(crate) fn finish(&self, color: Option<AlphaColor>) -> [f32; 4] {
-        color
-            .map(|v| {
-                let mut components = v.components();
-                components[3] *= self.opacity;
-
-                if let Some(tf) = &self.transfer_function {
-                    return tf.apply(&AlphaColor::new(components)).components();
-                }
-
-                components
-            })
-            .unwrap_or([0.0, 0.0, 0.0, 0.0])
+        crate::gradient::finished(color, self.opacity, self.transfer_function.as_ref())
     }
 
     /// Sample the shading on a pixel grid covering `bbox`, with `scale`
@@ -1916,6 +1905,7 @@ fn clip_to(a: Point, b: Point, rect: Rect) -> Option<(Point, Point)> {
 #[cfg(test)]
 mod tests {
     mod against_functions;
+    mod function_reference;
     mod stops;
 
     use super::span;
@@ -2311,9 +2301,9 @@ mod tests {
     /// Finding a stitching function's shape, as the first fill drawn as a native
     /// gradient does, walks no function past the last of its bounds and
     /// encodings, which evaluating never reaches, and later fills find it found:
-    /// with 1 to 10⁴ functions stitched over an empty `/Bounds`, 100 fills visit
-    /// one function and take the same steps, whatever the length of
-    /// `/Functions`.
+    /// with 1 to 10⁴ functions stitched over an empty `/Bounds`, 100 fills ask
+    /// one function for its spans three times and take the same steps,
+    /// whatever the length of `/Functions`.
     #[test]
     fn a_stitching_walks_only_the_functions_it_evaluates() {
         use crate::function::TYPE3_VISITED;
@@ -2345,7 +2335,9 @@ mod tests {
                     .expect("given all it asks")
                     .expect("a native gradient");
             }
-            assert_eq!(TYPE3_VISITED.get(), 1, "{n} functions");
+            // A span above its start, and one at each end of it, of its
+            // one function, on the first fill alone.
+            assert_eq!(TYPE3_VISITED.get(), 3, "{n} functions");
             let asked: u64 = meter.asked.iter().sum();
             assert_eq!(*taken.get_or_insert(asked), asked, "{n} functions");
         }

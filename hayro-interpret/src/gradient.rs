@@ -7,19 +7,20 @@
 //! SVG-like linear gradient a renderer draws natively. Where the color is
 //! straight between two inputs of the function, as a sampled function's is
 //! between its samples, the stops are those inputs, and exact
-//! ([`Function::shape`](crate::Function)); each step of the function is two stops
+//! ([`Function::span`](crate::Function)); each step of the function is two stops
 //! at one place, the values from either side. Elsewhere the color is tabulated
 //! at device resolution: at least a stop for each step the parameter takes
 //! from a pixel to its neighbour ([`EncodedRadialAxialShading::grid_step`]), so a
 //! feature of the function a pixel can show is between no two stops.
 
-use crate::color::AlphaColor;
+use crate::color::{AlphaColor, ColorSpace};
 use crate::encode::{
     Cost, EncodedRadialAxialShading, EncodedShadingPattern, Exhausted, Meter, RadialAxialParams,
     Unmetered, take,
 };
 use crate::function::Values;
-use crate::function::shape::Piece;
+use crate::function::shape::{self, Piece};
+use crate::interpret::state::ActiveTransferFunction;
 use hayro_syntax::hash;
 use kurbo::{Affine, Point, Rect};
 use smallvec::smallvec;
@@ -47,7 +48,8 @@ pub(crate) const LEVEL_TOLERANCE: f32 = 1.5;
 pub struct SvgGradient {
     /// The kind of the gradient.
     pub kind: SvgGradientKind,
-    /// The transform from encoded shading coordinates into the renderer's coordinate space.
+    /// The transform from the gradient's own space, where its line runs from
+    /// its `start` to its `end`, into the renderer's coordinate space.
     pub transform: Affine,
     /// The stops of the gradient in the sRGB color space, the first at its
     /// start and the last at its end: the shading's stops from the one at or
@@ -172,6 +174,12 @@ impl SvgGradient {
             }
         }
         true
+    }
+
+    /// Whether every stop is of one color, so a renderer that paints that color
+    /// alone paints them all.
+    pub fn is_one_color(&self) -> bool {
+        self.stops.windows(2).all(|w| w[0].color == w[1].color)
     }
 
     /// The work [`paints_within_a_level`](Self::paints_within_a_level) and
@@ -444,12 +452,18 @@ impl EncodedRadialAxialShading {
             stop.offset = ((stop.offset - first) / length).clamp(0.0, 1.0);
         }
         let along = |t: f32| ((t - first) / length).clamp(0.0, 1.0);
+        // The line runs from (0, 0) to (1, 0) of the gradient's own space, and
+        // the transform takes that to the stops' part of the shading's: a
+        // renderer that takes ends closer than a threshold for one point, as
+        // vello does before it applies the transform, then sees ends a unit
+        // apart however close the stops lie in the shading's parameter.
+        let onto_stops = Affine::new([f64::from(length), 0.0, 0.0, 1.0, f64::from(first), 0.0]);
         Ok(Some(SvgGradient {
             kind: SvgGradientKind::Linear {
-                start: Point::new(f64::from(first), 0.0),
-                end: Point::new(f64::from(last), 0.0),
+                start: Point::ZERO,
+                end: Point::new(1.0, 0.0),
             },
-            transform: pattern.base_transform.inverse(),
+            transform: pattern.base_transform.inverse() * onto_stops,
             stops,
             range: (along(range.0), along(range.1)),
             pixel_step: (a.hypot(c) / f64::from(length)) as f32,
@@ -468,16 +482,19 @@ impl EncodedRadialAxialShading {
         stops: &[SvgGradientStop],
         meter: &mut dyn Meter,
     ) -> Result<Vec<f32>, Exhausted> {
-        if pattern.color_space.straight_rgb(&[]).is_some() {
+        let look = self.memo.look(pattern);
+        if look.straight_space() {
             return Ok(Vec::new());
         }
+        let look_key = look.key();
         let [t0, t1] = self.domain;
         let value_cost = pattern.value_cost();
         let mut found = self.memo.table_steps.lock().unwrap();
         let mut steps = Vec::with_capacity(stops.len());
         for stop in stops {
             let x = t0 + (t1 - t0) * stop.offset;
-            let step = match found.get(&x.to_bits()) {
+            let key = (look_key, x.to_bits());
+            let step = match found.get(&key) {
                 Some(step) => *step,
                 None => {
                     take(meter, value_cost)?;
@@ -487,14 +504,14 @@ impl EncodedRadialAxialShading {
                     let step = match self.function.eval(&smallvec![x]) {
                         Some(values) => {
                             take(meter, value_cost.times(2 * values.len() as u64))?;
-                            table_step(pattern, &values)
+                            look.table_step(&values)
                         }
                         None => 0.0,
                     };
                     if found.len() >= MEMO_ENTRIES {
                         found.clear();
                     }
-                    found.insert(x.to_bits(), step);
+                    found.insert(key, step);
                     step
                 }
             };
@@ -536,12 +553,13 @@ impl EncodedRadialAxialShading {
             range.0.max(range.1).clamp(0.0, 1.0),
         );
         let value_cost = pattern.value_cost();
-        let straight_space = pattern.color_space.straight_rgb(&[]).is_some();
+        let look = self.memo.look(pattern);
+        let look_key = look.key();
         // Lines are straight colors where the color space and no transfer
         // function bends them; their colors, and those evaluated, are then
         // those before they are rounded to 8 bits, so they bend only as the
         // function does.
-        let lines_straight = straight_space && pattern.transfer_function.is_none();
+        let lines_straight = look.lines_straight();
         let mut colors = self.memo.colors.lock().unwrap();
         // The color at `x` of the function, or of its point `values` there:
         // looked up, or found, taken of `meter` first, and kept.
@@ -550,30 +568,26 @@ impl EncodedRadialAxialShading {
                       point: Option<(&Values, Side)>|
          -> Result<[f32; 4], Exhausted> {
             let side = point.map_or(Side::Evaluated, |(_, side)| side);
-            let key = (x.to_bits(), side as u8 | u8::from(lines_straight) << 2);
-            let raw = match colors.get(&key) {
-                Some(raw) => *raw,
+            let key = (look_key, x.to_bits(), side as u8);
+            let color = match colors.get(&key) {
+                Some(color) => *color,
                 None => {
                     take(meter, value_cost)?;
                     if !meter.hold(MEMO_ENTRY_BYTES) {
                         return Err(Exhausted);
                     }
-                    let raw = match point {
-                        Some((values, _)) => raw_color(pattern, Some(values), lines_straight),
-                        None => raw_color(
-                            pattern,
-                            self.function.eval(&smallvec![x]).as_ref(),
-                            lines_straight,
-                        ),
+                    let color = match point {
+                        Some((values, _)) => look.color(Some(values)),
+                        None => look.color(self.function.eval(&smallvec![x]).as_ref()),
                     };
                     if colors.len() >= MEMO_ENTRIES {
                         colors.clear();
                     }
-                    colors.insert(key, raw);
-                    raw
+                    colors.insert(key, color);
+                    color
                 }
             };
-            Ok(pattern.finish(raw.map(AlphaColor::new)))
+            Ok(color)
         };
         if t0 == t1 || !(t0.is_finite() && t1.is_finite()) {
             let color = at(meter, t0, None)?;
@@ -591,6 +605,10 @@ impl EncodedRadialAxialShading {
         };
         let shape = self.shape_metered(meter)?;
         let step = self.grid_step(pattern, scale);
+        let (shape_from, shape_to) = (
+            shape.first().map_or(f32::NAN, |p| p.span().0),
+            shape.last().map_or(f32::NAN, |p| p.span().1),
+        );
 
         // What each piece the range reaches holds: the points of its lines, and
         // the multiples of the step within it and the range where the colors
@@ -622,7 +640,9 @@ impl EncodedRadialAxialShading {
                     } else {
                         let (k0, k1) = grid_in(points[i0].0, points[i1].0);
                         let grid = (k1 - k0 + 1).max(0) as u64;
-                        let n = kept(&points[i0..=i1], grid).count() as u64;
+                        let all: Vec<(&(f32, Values), ())> =
+                            points[i0..=i1].iter().map(|p| (p, ())).collect();
+                        let n = kept(&all, grid).count() as u64;
                         stops_held = stops_held.saturating_add(n).saturating_add(grid);
                     }
                 }
@@ -653,23 +673,32 @@ impl EncodedRadialAxialShading {
         for piece in reached {
             let mut nodes: Vec<(f32, f32, [f32; 4])> = Vec::new();
             match piece {
-                Piece::Lines(points) => {
-                    let (i0, i1) = within(points, x_lo, x_hi);
-                    let points = &points[i0..=i1];
-                    if lines_straight {
-                        straight_lines(pattern, points, &t_of, &mut nodes);
-                    } else {
-                        let (a, b) = (points[0].0, points[points.len() - 1].0);
-                        let (k0, k1) = grid_in(a, b);
-                        for i in kept(points, (k1 - k0 + 1).max(0) as u64) {
-                            let (x, values) = &points[i];
-                            // The first of two points at one input is the
-                            // value from below it.
-                            let side = if points.get(i + 1).is_some_and(|next| next.0 == *x) {
-                                Side::Below
-                            } else {
-                                Side::Point
+                Piece::Lines(all) => {
+                    let (i0, i1) = within(all, x_lo, x_hi);
+                    // A stop for each point but the value at an input
+                    // between the values from below and above it, which a
+                    // gradient's stops cannot hold, at the shape's ends
+                    // alone, where the gradient extends it.
+                    let points: Vec<(&(f32, Values), Side)> = (i0..=i1)
+                        .filter_map(|i| {
+                            let side = match shape::side_of(all, i) {
+                                None => Side::Point,
+                                Some(shape::Side::Below) => Side::Below,
+                                Some(shape::Side::At) => Side::At,
+                                Some(shape::Side::Above) => Side::Above,
                             };
+                            let x = all[i].0;
+                            let end = x == shape_from || x == shape_to;
+                            (!matches!(side, Side::At) || end).then_some((&all[i], side))
+                        })
+                        .collect();
+                    if lines_straight {
+                        straight_lines(&look, &points, &t_of, &mut nodes);
+                    } else {
+                        let (a, b) = (points[0].0.0, points[points.len() - 1].0.0);
+                        let (k0, k1) = grid_in(a, b);
+                        for i in kept(&points, (k1 - k0 + 1).max(0) as u64) {
+                            let ((x, values), side) = points[i];
                             nodes.push((*x, t_of(*x), at(meter, *x, Some((values, side)))?));
                         }
                         grid(&mut nodes, (k0, k1), step, (a, b), &x_at, &mut |x| {
@@ -708,8 +737,13 @@ impl EncodedRadialAxialShading {
             stops.reverse();
         }
         // From the stop at or before the range's start to the one at or past its
-        // end.
-        let start = stops.partition_point(|s| s.offset <= lo).saturating_sub(1);
+        // end; from the first where the range starts at it, whose value the
+        // shading takes there and before it.
+        let start = if stops.first().is_some_and(|s| lo <= s.offset) {
+            0
+        } else {
+            stops.partition_point(|s| s.offset <= lo).saturating_sub(1)
+        };
         let end = stops
             .partition_point(|s| s.offset <= hi)
             .min(stops.len().saturating_sub(1));
@@ -784,21 +818,145 @@ impl EncodedRadialAxialShading {
 
 /// What finding a radial or axial shading's stops learns of it, kept for every
 /// paint of the shading: a page may paint one in hundreds of shapes, each a
-/// gradient over the part of it the shape reaches.
-#[derive(Debug, Default)]
+/// gradient over the part of it the shape reaches. Its colors and table steps
+/// are found from a [`Look`] alone, which only the memo makes, of its own color
+/// space, and kept under that look's key: paints under other transfer
+/// functions or opacities find their own.
+#[derive(Debug)]
 pub struct StopMemo {
+    /// The shading's color space, which every color kept is converted in.
+    color_space: ColorSpace,
     /// Its function's shape over its domain
     /// ([`EncodedRadialAxialShading::shape_metered`]).
     shape: OnceLock<Vec<Piece>>,
-    /// The colors found, by the input of the function, whether it is the value
-    /// evaluated there, a point of the shape, or the first of two points at one
-    /// input, and whether straight colors are not rounded to 8 bits; before the
-    /// pattern's opacity and transfer function. At most [`MEMO_ENTRIES`], then
-    /// emptied.
-    colors: Mutex<hash::Map<ColorKey, Option<[f32; 4]>>>,
-    /// The [`table_step`] found at each input of the function, at most
-    /// [`MEMO_ENTRIES`], then emptied.
-    table_steps: Mutex<hash::Map<u32, f32>>,
+    /// The colors found, by the look, the input of the function, and whether
+    /// it is the value evaluated there or a point of the shape and which of
+    /// those at one input ([`Side`]). At most [`MEMO_ENTRIES`], then emptied.
+    colors: Mutex<hash::Map<ColorKey, [f32; 4]>>,
+    /// The [`Look::table_step`] found at each input of the function, by the
+    /// look, at most [`MEMO_ENTRIES`], then emptied.
+    table_steps: Mutex<hash::Map<(LookKey, u32), f32>>,
+}
+
+impl StopMemo {
+    /// The memo of a shading in `color_space`.
+    pub(crate) fn new(color_space: ColorSpace) -> Self {
+        Self {
+            color_space,
+            shape: OnceLock::new(),
+            colors: Mutex::default(),
+            table_steps: Mutex::default(),
+        }
+    }
+
+    /// How `pattern`, a paint of the memo's shading, colors the function's
+    /// outputs.
+    pub(crate) fn look<'a>(&'a self, pattern: &'a EncodedShadingPattern) -> Look<'a> {
+        Look {
+            color_space: &self.color_space,
+            opacity: pattern.opacity,
+            transfer: pattern.transfer_function.as_ref(),
+        }
+    }
+}
+
+/// How a paint of a shading colors its function's outputs: converted in the
+/// shading's color space, then given the paint's opacity and transfer
+/// function. Every color a [`StopMemo`] keeps is found from this alone, and
+/// kept under its [`key`](Self::key).
+pub(crate) struct Look<'a> {
+    color_space: &'a ColorSpace,
+    opacity: f32,
+    transfer: Option<&'a ActiveTransferFunction>,
+}
+
+/// A [`Look`]'s place in a [`StopMemo`]: its opacity's bits, and what its
+/// transfer function maps each 8-bit value to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct LookKey(u32, Option<u128>);
+
+impl Look<'_> {
+    /// What the look's colors depend on but the memo's color space, which is
+    /// the same for every look of one memo.
+    pub(crate) fn key(&self) -> LookKey {
+        let Self {
+            color_space: _,
+            opacity,
+            transfer,
+        } = self;
+        LookKey(opacity.to_bits(), transfer.map(crate::CacheKey::cache_key))
+    }
+
+    /// Whether the color space's colors are straight in the function's outputs.
+    fn straight_space(&self) -> bool {
+        self.color_space.straight_rgb(&[]).is_some()
+    }
+
+    /// Whether colors are straight in the function's outputs, as the color
+    /// space and no transfer function leave them.
+    fn lines_straight(&self) -> bool {
+        self.straight_space() && self.transfer.is_none()
+    }
+
+    /// The color, after the opacity and transfer function, of a color in the
+    /// color space; transparent black of none.
+    fn finish(&self, color: Option<AlphaColor>) -> [f32; 4] {
+        finished(color, self.opacity, self.transfer)
+    }
+
+    /// The color of the function's `values`, transparent black of none. Of a
+    /// color space whose colors are straight, where colors are straight
+    /// ([`lines_straight`](Self::lines_straight)), as they are before they are
+    /// rounded to 8 bits and clamped as the color space clamps them.
+    fn color(&self, values: Option<&Values>) -> [f32; 4] {
+        let Some(values) = values else {
+            return self.finish(None);
+        };
+        if self.lines_straight()
+            && let Some(rgb) = self.color_space.straight_rgb(values)
+        {
+            return self.finish(Some(AlphaColor::new(clamped(rgb))));
+        }
+        self.finish(Some(self.color_space.to_rgba(values, 1.0)))
+    }
+
+    /// How far the color of the function's `values` moves where hayro's color
+    /// tables read one of them as the next 8-bit value, in 8-bit levels: a
+    /// color space other than gray and RGB reads each to 8 bits, so its colors
+    /// step from one to the next, and straight lines between stops cut across
+    /// the steps.
+    pub(crate) fn table_step(&self, values: &Values) -> f32 {
+        let color = |v: &[f32]| self.finish(Some(self.color_space.to_rgba(v, 1.0)));
+        let at = color(values);
+        let mut most = 0.0_f32;
+        for i in 0..values.len() {
+            for d in [-1.0 / 255.0, 1.0 / 255.0] {
+                let mut moved = values.clone();
+                moved[i] = (moved[i] + d).clamp(0.0, 1.0);
+                most = most.max(levels_apart(&color(&moved), &at));
+            }
+        }
+        most
+    }
+}
+
+/// `color` after `opacity` and `transfer`, transparent black of none: what a
+/// shading pattern does to the colors of its shading.
+pub(crate) fn finished(
+    color: Option<AlphaColor>,
+    opacity: f32,
+    transfer: Option<&ActiveTransferFunction>,
+) -> [f32; 4] {
+    color
+        .map(|v| {
+            let mut components = v.components();
+            components[3] *= opacity;
+            if let Some(tf) = transfer {
+                return tf.apply(&AlphaColor::new(components)).components();
+            }
+            components
+        })
+        .unwrap_or([0.0, 0.0, 0.0, 0.0])
 }
 
 /// The most colors a [`StopMemo`] keeps: those of a few thousand pixels' steps
@@ -807,38 +965,22 @@ const MEMO_ENTRIES: usize = 1 << 16;
 
 /// The memory a color kept in a [`StopMemo`] holds, its key and its table's
 /// share besides.
-const MEMO_ENTRY_BYTES: usize = 2 * size_of::<(ColorKey, Option<[f32; 4]>)>();
+const MEMO_ENTRY_BYTES: usize = 2 * size_of::<(ColorKey, [f32; 4])>();
 
-/// A color's place in a [`StopMemo`]: the bits of the function's input, and its
-/// [`Side`] with whether straight colors are left unrounded above it.
-type ColorKey = (u32, u8);
+/// A color's place in a [`StopMemo`]: the [`Look`] it is found in, the bits of
+/// the function's input, and its [`Side`].
+type ColorKey = (LookKey, u32, u8);
 
 /// Where a color of a function at an input comes from: its value evaluated
-/// there, a point of its shape, or the first of two points at that input, its
-/// value from below.
+/// there, the only point of its shape there, or of several there the value
+/// from below the input, at it, or from above it.
 #[derive(Clone, Copy)]
 enum Side {
     Evaluated = 0,
     Point = 1,
     Below = 2,
-}
-
-/// How far the color of the function's `values` moves where hayro's color
-/// tables read one of them as the next 8-bit value, in 8-bit levels: a color
-/// space other than gray and RGB reads each to 8 bits, so its colors step from
-/// one to the next, and straight lines between stops cut across the steps.
-pub(crate) fn table_step(pattern: &EncodedShadingPattern, values: &Values) -> f32 {
-    let color = |v: &[f32]| pattern.finish(Some(pattern.color_space.to_rgba(v, 1.0)));
-    let at = color(values);
-    let mut most = 0.0_f32;
-    for i in 0..values.len() {
-        for d in [-1.0 / 255.0, 1.0 / 255.0] {
-            let mut moved = values.clone();
-            moved[i] = (moved[i] + d).clamp(0.0, 1.0);
-            most = most.max(levels_apart(&color(&moved), &at));
-        }
-    }
-    most
+    At = 3,
+    Above = 4,
 }
 
 /// The most two colors' channels lie apart, in 8-bit levels.
@@ -847,22 +989,6 @@ pub(crate) fn levels_apart(a: &[f32; 4], b: &[f32; 4]) -> f32 {
         .zip(b)
         .map(|(a, b)| (a - b).abs() * 255.0)
         .fold(0.0, f32::max)
-}
-
-/// The color of the function's `values`, none where it has none; before the
-/// pattern's opacity and transfer function ([`EncodedShadingPattern::finish`]). Of a color space whose colors are
-/// straight, where `unrounded`, as they are before they are rounded to 8 bits
-/// and clamped as the color space clamps them.
-fn raw_color(
-    pattern: &EncodedShadingPattern,
-    values: Option<&Values>,
-    unrounded: bool,
-) -> Option<[f32; 4]> {
-    let values = values?;
-    if unrounded && let Some(rgb) = pattern.color_space.straight_rgb(values) {
-        return Some(clamped(rgb));
-    }
-    Some(pattern.color_space.to_rgba(values, 1.0).components())
 }
 
 /// A straight RGB color, opaque, clamped as the color space clamps it.
@@ -875,16 +1001,16 @@ fn clamped(rgb: [f32; 3]) -> [f32; 4] {
 /// clamped as the color space clamps it: the points, and a point wherever a
 /// channel crosses 0 or 1 between two.
 fn straight_lines(
-    pattern: &EncodedShadingPattern,
-    points: &[(f32, Values)],
+    look: &Look<'_>,
+    points: &[(&(f32, Values), Side)],
     t_of: &impl Fn(f32) -> f32,
     nodes: &mut Vec<(f32, f32, [f32; 4])>,
 ) {
-    let rgb_of = |values: &[f32]| pattern.color_space.straight_rgb(values).unwrap_or([0.0; 3]);
-    let opaque = |rgb: [f32; 3]| pattern.finish(Some(AlphaColor::new(clamped(rgb))));
-    for (i, (x, values)) in points.iter().enumerate() {
+    let rgb_of = |values: &[f32]| look.color_space.straight_rgb(values).unwrap_or([0.0; 3]);
+    let opaque = |rgb: [f32; 3]| look.finish(Some(AlphaColor::new(clamped(rgb))));
+    for (i, ((x, values), _)) in points.iter().enumerate() {
         let rgb = rgb_of(values);
-        if let Some((x0, v0)) = i.checked_sub(1).map(|i| &points[i])
+        if let Some(((x0, v0), _)) = i.checked_sub(1).map(|i| points[i])
             && x > x0
         {
             let before = rgb_of(v0);
@@ -994,36 +1120,45 @@ fn refine(
 /// stop wherever two points lie a pixel's step apart and the rest are features
 /// narrower than a pixel, and evaluating the color at each of thousands of
 /// samples would cost what the pixels shown do not need.
-fn kept(points: &[(f32, Values)], grid: u64) -> impl Iterator<Item = usize> {
+fn kept<T>(points: &[(&(f32, Values), T)], grid: u64) -> impl Iterator<Item = usize> {
     let all = points.len() as u64 <= grid.saturating_add(2);
     let last = points.len().saturating_sub(1);
     points.iter().enumerate().filter_map(move |(i, point)| {
         let step = |j: Option<usize>| {
             j.and_then(|j| points.get(j))
-                .is_some_and(|p| p.0 == point.0)
+                .is_some_and(|p| p.0.0 == point.0.0)
         };
         (all || i == 0 || i == last || step(i.checked_sub(1)) || step(Some(i + 1))).then_some(i)
     })
 }
 
 /// The first and last of `points` that a line through them over `lo` to `hi`
-/// needs: the last at or before `lo` and the first at or past `hi`.
+/// needs: the last at or before `lo`, every one at the first input where `lo`
+/// is at or before it, and every one at the first input at or past `hi`, as
+/// the values there from below, at it, and from above.
 fn within(points: &[(f32, Values)], lo: f32, hi: f32) -> (usize, usize) {
     let last = points.len() - 1;
-    let i0 = points
-        .partition_point(|p| p.0 <= lo)
-        .saturating_sub(1)
-        .min(last);
-    let i1 = points.partition_point(|p| p.0 < hi).min(last);
+    let i0 = if lo <= points[0].0 {
+        0
+    } else {
+        points.partition_point(|p| p.0 <= lo) - 1
+    };
+    let j = points.partition_point(|p| p.0 < hi).min(last);
+    let i1 = points.partition_point(|p| p.0 <= points[j].0) - 1;
     (i0, i1.max(i0))
 }
 
 /// The color `stops` give at `t`, from the start, 0, to the end, 1: between the
 /// last stop at or before it and the next, as a gradient's stops are drawn; at a
 /// bound where the function steps, two stops share it and the later one's color
-/// starts there, as the function's does.
+/// starts there, as the function's does; at or before the first stop, its
+/// color, as at its start the function's value there is the first of the
+/// stops there, before any from above it.
 pub(crate) fn color_at(stops: &[SvgGradientStop], t: f32) -> [f32; 4] {
-    lerp_between(stops, stops.partition_point(|stop| stop.offset <= t), t)
+    match stops.first() {
+        Some(first) if t <= first.offset => first.color,
+        _ => lerp_between(stops, stops.partition_point(|stop| stop.offset <= t), t),
+    }
 }
 
 /// The color at `t` of the line between the stop before `next` and `next`.

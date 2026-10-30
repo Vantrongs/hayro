@@ -14,16 +14,24 @@ use hayro_syntax::object::Number;
 /// A real in PDF holds about five significant decimal digits in its fractional
 /// part (ISO 32000-1, Annex C, Table C.1, "Number of significant decimal digits
 /// of precision in fractional part (approximate)"), whatever digits a writer
-/// prints: so each of the six, integers among them, states its value to within
-/// half a unit of the fifth place, `±0.5 × 10^-5`, and the circles touch wherever
-/// some values within that of the coordinates make the coefficient zero. So
+/// prints. That is read two ways, and the circles touch only where neither
+/// tells them from touching: absolutely, each of the six, integers among them,
+/// states its value to within half a unit of the fifth place, `±0.5 × 10^-5`;
+/// and relatively, to within `±0.5 × 10^-5` of its own size, as five
+/// significant digits do. Under each, the circles touch wherever some values
+/// within it of the coordinates make the coefficient zero. So
 /// `[-.223151 -.974784 0 0 0 1]`, a focal point a producer rounded to six places
 /// onto the circle, touches, though as written it lies 2 × 10^-7 outside, where a
 /// cone's further circles would sweep the end's colour over the whole inside; but
-/// `[0 0 0 1000000.25 0 1000000]`, whose coefficient of 5 × 10^5 those moves
-/// change by 40 at most, is a cone, and `[0 0 0 0 0 .1]` is a disc. The bound is
-/// the same for every writer, unlike the places one prints, which a writer that
-/// drops trailing zeros does not show.
+/// `[0 0 0 1000000.25 0 1000000]`, whose coefficient of 5 × 10^5 the absolute
+/// moves change by 40 at most, is a cone, and `[0 0 0 0 0 .1]` is a disc. The
+/// relative reading alone does not change when the coordinates and the
+/// shading's matrix trade a power of ten, so circles whose coefficient lies
+/// beyond what it moves are decided alike at every scale:
+/// `[0 0 0 .00002 0 .00001]` drawn ten million times larger is the cone
+/// `[0 0 0 200 0 100]` is, though the absolute reading alone would take it for
+/// touching. The bounds are the same for every writer, unlike the places one
+/// prints, which a writer that drops trailing zeros does not show.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Lead {
     /// The coefficient of the coordinates as written: of its exact sign, and
@@ -32,16 +40,37 @@ pub struct Lead {
     touching: bool,
 }
 
+/// A decimal as written: whether it is negative, its digits, and its places
+/// after the point, `digits × 10^-scale`.
+type Decimal = (bool, u64, u32);
+
 /// Half a unit of the fifth place after the point, as a decimal: how far a
-/// coordinate may lie from the value it states (`Lead`).
-const HALF_UNIT: (bool, u64, u32) = (false, 5, 6);
+/// coordinate may lie from the value it states, read absolutely (`Lead`).
+const HALF_UNIT: Decimal = (false, 5, 6);
+
+/// How far the decimal `value` may lie from the value it states, read
+/// absolutely: [`HALF_UNIT`].
+fn absolute(_: Decimal) -> Decimal {
+    HALF_UNIT
+}
+
+/// How far the decimal `value` may lie from the value it states, read
+/// relatively: `0.5 × 10^-5` of its size, exactly; for a decimal of more than
+/// 18 digits, which five times would not hold in 64 bits, half its digits
+/// rounded up a place further, larger by less than 10^-18 of itself.
+fn relative((_, digits, scale): Decimal) -> Decimal {
+    match digits.checked_mul(5) {
+        Some(five) => (false, five, scale + 6),
+        None => (false, digits.div_ceil(2), scale + 5),
+    }
+}
 
 impl Lead {
     /// Of `/Coords [x0 y0 r0 x1 y1 r1]`. Each number with at most 19 significant
     /// digits is its exact decimal ([`Number::as_decimal`]), and the coefficient's
     /// sign exact ([`decimal_sum`]), as are the signs of the least and the most it
-    /// reaches over the values within [`HALF_UNIT`] of the coordinates
-    /// ([`touching`]). A real of more digits, or an integer beyond 64 bits,
+    /// reaches over the values within either reading of the coordinates'
+    /// precision ([`absolute`], [`relative`]) of them ([`touching`]). A real of more digits, or an integer beyond 64 bits,
     /// hayro-syntax keeps only as the nearest `f64`: then each coordinate is read as
     /// its nearest `f64`, the coefficient of those is found exactly ([`exact_sum`]),
     /// and circles it lies within the rounding of those readings
@@ -80,7 +109,8 @@ impl Lead {
             let exact = decimal_sum(&terms);
             return Self {
                 exact,
-                touching: exact == 0.0 || touching(&d, exact > 0.0),
+                touching: exact == 0.0
+                    || touching(&d, exact > 0.0, absolute) && touching(&d, exact > 0.0, relative),
             };
         }
         let v = coords.map(nearest_f64);
@@ -95,16 +125,22 @@ impl Lead {
         }
         let exact = exact_sum(&parts);
         // How far the coefficient moves over the values the coordinates state:
-        // `(S + e)² - S²` along each axis, `S` the distance and `e` its precision.
-        let e = 2.0 * nearest_f64_of(HALF_UNIT);
-        let written: f64 = [(0, 3), (1, 4), (2, 5)]
-            .into_iter()
-            .map(|(i, j)| (2.0 * (v[j] - v[i]).abs() + e) * e)
-            .sum();
+        // `(S + e)² - S²` along each axis, `S` the distance and `e` its precision,
+        // read absolutely and relatively.
+        let half = nearest_f64_of(HALF_UNIT);
+        let moves = |e: &dyn Fn(usize, usize) -> f64| -> f64 {
+            [(0, 3), (1, 4), (2, 5)]
+                .into_iter()
+                .map(|(i, j)| (2.0 * (v[j] - v[i]).abs() + e(i, j)) * e(i, j))
+                .sum()
+        };
+        let within =
+            |written: f64| exact.abs() <= size * READ_ROUNDING + written * (1.0 + WRITTEN_ROUNDING);
+        let absolutely = moves(&|_, _| 2.0 * half);
+        let relatively = moves(&|i, j| half * (v[i].abs() + v[j].abs()));
         Self {
             exact,
-            touching: !exact.is_finite()
-                || exact.abs() <= size * READ_ROUNDING + written * (1.0 + WRITTEN_ROUNDING),
+            touching: !exact.is_finite() || within(absolutely) && within(relatively),
         }
     }
 
@@ -146,18 +182,18 @@ const READ_ROUNDING: f64 = {
 const WRITTEN_ROUNDING: f64 = 16.0 * f64::EPSILON;
 
 /// Whether the coefficient of circles whose coordinates are the decimals `d`,
-/// each stating its value to within [`HALF_UNIT`], is zero for some values they
+/// each stating its value to within `bound` of it, is zero for some values they
 /// state: the least it reaches is at most zero where the coefficient as written is
 /// positive (`positive`), the most at least zero where it is negative. Along each
-/// axis the distance `s = v1 - v0` lies within `e = 2 HALF_UNIT` of its value, so
+/// axis the distance `s = v1 - v0` lies within `e = bound(v0) + bound(v1)` of its value, so
 /// its square ranges from `(|s| - e)²`, or zero where `|s| <= e`, to `(|s| + e)²`;
 /// the coefficient adds those of the centres' axes and subtracts the radii's.
 /// Each bound is a sum of products of two decimals, its sign exact.
-fn touching(d: &[(bool, u64, u32); 6], positive: bool) -> bool {
+fn touching(d: &[Decimal; 6], positive: bool, bound: fn(Decimal) -> Decimal) -> bool {
     let mut terms = Vec::with_capacity(3 * 16);
     for (axis, (i, j)) in [(0, 3), (1, 4), (2, 5)].into_iter().enumerate() {
         let radius = axis == 2;
-        let negate = |(negative, digits, scale): (bool, u64, u32)| (!negative, digits, scale);
+        let negate = |(negative, digits, scale): Decimal| (!negative, digits, scale);
         let difference = [d[j], negate(d[i])];
         // `|s|`: the difference, negated where it is negative.
         let s = if decimal_sum(&difference.map(Term::of)) < 0.0 {
@@ -168,8 +204,8 @@ fn touching(d: &[(bool, u64, u32); 6], positive: bool) -> bool {
         // The bound needs `|s| + e` where the centres' distance is most and the
         // radii's least, so where `positive` the radii's most, and the other way.
         let most = radius == positive;
-        let mut side: Vec<(bool, u64, u32)> = s.to_vec();
-        for h in [HALF_UNIT; 2] {
+        let mut side: Vec<Decimal> = s.to_vec();
+        for h in [bound(d[i]), bound(d[j])] {
             side.push(if most { h } else { negate(h) });
         }
         if !most {
@@ -192,7 +228,7 @@ fn touching(d: &[(bool, u64, u32); 6], positive: bool) -> bool {
 }
 
 /// The `f64` nearest a decimal.
-fn nearest_f64_of((negative, digits, scale): (bool, u64, u32)) -> f64 {
+fn nearest_f64_of((negative, digits, scale): Decimal) -> f64 {
     let sign = if negative { "-" } else { "" };
     format!("{sign}{digits}e-{scale}")
         .parse()
@@ -209,7 +245,7 @@ pub(crate) fn same(a: Number, b: Number) -> bool {
 }
 
 /// A decimal with no trailing zeros after its point, and zero without a sign.
-fn normal((negative, mut digits, mut scale): (bool, u64, u32)) -> (bool, u64, u32) {
+fn normal((negative, mut digits, mut scale): Decimal) -> Decimal {
     while scale > 0 && digits % 10 == 0 {
         digits /= 10;
         scale -= 1;
@@ -236,7 +272,7 @@ struct Term {
 }
 
 impl Term {
-    fn of((negative, digits, scale): (bool, u64, u32)) -> Self {
+    fn of((negative, digits, scale): Decimal) -> Self {
         Self {
             negative,
             digits: u128::from(digits),
@@ -244,7 +280,7 @@ impl Term {
         }
     }
 
-    fn times((n0, d0, s0): (bool, u64, u32), (n1, d1, s1): (bool, u64, u32)) -> Self {
+    fn times((n0, d0, s0): Decimal, (n1, d1, s1): Decimal) -> Self {
         Self {
             negative: n0 ^ n1,
             digits: u128::from(d0) * u128::from(d1),
@@ -507,6 +543,7 @@ mod tests {
         };
         // Nested, touching, a cone, and touching though not as written.
         let mut seen = [0; 4];
+        let mut undecided = 0;
         for _ in 0..20_000 {
             let places = next(9) as u32;
             let size = 10_i64.pow(next(10) as u32).max(10);
@@ -538,7 +575,11 @@ mod tests {
             let half = 5 * 10_i128.pow(fine - 6);
             let (least, most) = reach([x1 - x0, y1 - y0, r1 - r0], [2 * half; 3]);
             let exact = (x1 - x0).pow(2) + (y1 - y0).pow(2) - (r1 - r0).pow(2);
-            let expected = if least <= 0 && most >= 0 {
+            let Some(relatively) = relatively_touching([x0, y0, r0, x1, y1, r1]) else {
+                undecided += 1;
+                continue;
+            };
+            let expected = if least <= 0 && most >= 0 && relatively {
                 0
             } else {
                 exact.signum()
@@ -557,6 +598,91 @@ mod tests {
             }
         }
         assert!(seen.iter().all(|&n| n > 1000), "{seen:?}");
+        assert!(undecided < 20, "{undecided}");
+    }
+
+    /// Whether the coefficient of circles of the integer coordinates `c` is zero
+    /// for some values within `0.5 × 10^-5` of each coordinate's size, found in
+    /// `f64`; `None` where its rounding could change the answer. Each axis's
+    /// distance `s` moves by `e = (|c0| + |c1|) / 200000`, so its square, times
+    /// 200000², ranges over `(200000 |s| ∓ (|c0| + |c1|))²`.
+    fn relatively_touching(c: [i128; 6]) -> Option<bool> {
+        let mut least = 0.0_f64;
+        let mut most = 0.0_f64;
+        let mut size = 0.0_f64;
+        for (axis, (i, j)) in [(0, 3), (1, 4), (2, 5)].into_iter().enumerate() {
+            let s = 200_000.0 * (c[j] - c[i]).abs() as f64;
+            let e = (c[i].abs() + c[j].abs()) as f64;
+            let (low, high) = (if s > e { (s - e).powi(2) } else { 0.0 }, (s + e).powi(2));
+            size += high;
+            if axis == 2 {
+                least -= high;
+                most -= low;
+            } else {
+                least += low;
+                most += high;
+            }
+        }
+        let margin = size * 1e-12;
+        if least.abs() <= margin || most.abs() <= margin {
+            return None;
+        }
+        Some(least <= 0.0 && most >= 0.0)
+    }
+
+    /// Circles whose coefficient lies beyond what moves within `0.5 × 10^-5` of
+    /// each coordinate's size change, a cone or nested, are decided alike when
+    /// their coordinates are written ten to the `k` times larger, as a shading
+    /// whose matrix is ten to the `k` times smaller draws them, for `k` from
+    /// -6 to 6: never touching, of the coefficient's sign. The absolute reading
+    /// alone would take the smallest of them for touching.
+    #[test]
+    fn circles_beyond_the_relative_precision_lie_alike_at_every_scale() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move |below: i64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % below as u64) as i64
+        };
+        let mut checked = 0;
+        let mut small = 0;
+        for _ in 0..4000 {
+            let size = 10_i64.pow(1 + next(6) as u32);
+            let places = next(4) as u32;
+            let c: [i64; 6] = [
+                next(2 * size) - size,
+                next(2 * size) - size,
+                next(size),
+                next(2 * size) - size,
+                next(2 * size) - size,
+                next(size),
+            ];
+            let wide = c.map(i128::from);
+            if relatively_touching(wide) != Some(false) {
+                continue;
+            }
+            let exact = (wide[3] - wide[0]).pow(2) + (wide[4] - wide[1]).pow(2)
+                - (wide[5] - wide[2]).pow(2);
+            for k in -6_i32..=6 {
+                // `c × 10^(k - places)`, written out.
+                let shift = places as i32 - k;
+                let written = c.map(|v| {
+                    if shift >= 0 {
+                        decimal(v, shift as u32)
+                    } else {
+                        decimal(v * 10_i64.pow((-shift) as u32), 0)
+                    }
+                });
+                let got = lead(written.each_ref().map(String::as_str));
+                assert_eq!(sign(got), exact.cmp(&0), "{written:?}");
+                if shift >= 6 {
+                    small += 1;
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 20_000 && small > 1000, "{checked} {small}");
     }
 
     /// Coordinates of very different scales are decided exactly too, in steps
@@ -585,16 +711,18 @@ mod tests {
         assert!((a - 500_000.062_5).abs() < 1e-9, "{a}");
     }
 
-    /// Circles touch where a move of each coordinate within half a unit of the
-    /// fifth place makes them touch, however many places they are written to:
-    /// focal points a producer rounded to six to eight places onto the circle,
-    /// either side of it, touch; circles of two places a hundredth off, a cone
-    /// `1000000.25` from `1000000`, and the same digits as integers, lie as
-    /// written, as does a disc of short numbers, `[0 0 0 0 0 .1]`, which the
-    /// precision of its digits alone would take for touching.
+    /// Circles touch where moves of each coordinate within half a unit of the
+    /// fifth place, and within half of 10^-5 of its size, both make them touch,
+    /// however many places they are written to: focal points a producer rounded
+    /// to six to eight places onto the circle, either side of it, touch; circles
+    /// of two places a hundredth off, a cone `1000000.25` from `1000000`, and the
+    /// same digits as integers, lie as written, as do discs of short numbers,
+    /// `[0 0 0 0 0 .1]`, which the precision of its digits alone would take for
+    /// touching, and of a millionth, which the absolute reading alone would; and
+    /// `[0 0 0 .00002 0 .00001]` is the cone `[0 0 0 200 0 100]` is.
     #[test]
     fn circles_touch_within_the_precision_of_pdf_reals() {
-        let cases: [([&str; 6], Ordering); 22] = [
+        let cases: [([&str; 6], Ordering); 25] = [
             (
                 ["-.223151", "-.974784", "0", "0", "0", "1"],
                 Ordering::Equal,
@@ -639,8 +767,11 @@ mod tests {
             ),
             (["0", "0", "0", "0", "0", ".1"], Ordering::Less),
             (["0", "0", "0", "0", "0", "1"], Ordering::Less),
-            (["0", "0", "0", "0", "0", ".000001"], Ordering::Equal),
+            (["0", "0", "0", "0", "0", ".000001"], Ordering::Less),
             ([".1", "0", "0", "0", "0", ".2"], Ordering::Less),
+            (["0", "0", "0", ".00002", "0", ".00001"], Ordering::Greater),
+            (["0", "0", "0", "200", "0", "100"], Ordering::Greater),
+            (["0", "0", "1", "0", "0", "1.000001"], Ordering::Equal),
         ];
         for (coords, expected) in cases {
             assert_eq!(sign(lead(coords)), expected, "{coords:?}");
@@ -649,11 +780,11 @@ mod tests {
 
     /// The painter's coefficient is zero for touching circles, but the one as
     /// written where the line through them holds no root: concentric circles
-    /// from a point closer than the precision of PDF reals touch, and at each
+    /// whose radii lie closer than the precision of PDF reals touch, and at each
     /// point the coefficient is theirs; nested and cone circles keep theirs.
     #[test]
     fn touching_circles_with_no_line_keep_their_coefficient() {
-        let disc = lead(["0", "0", "0", "0", "0", ".000001"]);
+        let disc = lead(["0", "0", "1", "0", "0", "1.000001"]);
         assert_eq!(disc.coefficient(1.0), 0.0);
         assert!((disc.coefficient(0.0) + 1e-12).abs() < 1e-24, "{disc:?}");
         let nested = lead(["0", "0", "0", "0", "0", ".1"]);
