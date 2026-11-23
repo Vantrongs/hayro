@@ -1,6 +1,7 @@
-use super::xobject_oc;
+use crate::annotation::entries::Entries;
 use crate::context::Context;
 use crate::device::Device;
+use crate::ocg::Kept;
 use crate::{ClipPath, FillRule, interpret};
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::object::Dict;
@@ -10,11 +11,17 @@ use hayro_syntax::page::Resources;
 use kurbo::{Affine, Rect, Shape};
 use std::borrow::Cow;
 
+pub(crate) fn box_and_matrix(dict: &Entries<'_>) -> Option<([f64; 4], [f64; 6])> {
+    let b = dict.numbers(BBOX, 4)?;
+    Some(([b[0], b[1], b[2], b[3]], dict.matrix(MATRIX)))
+}
+
 pub(crate) struct FormXObject<'a> {
     pub(crate) decoded: Cow<'a, [u8]>,
     pub(crate) matrix: Affine,
     pub(crate) bbox: [f32; 4],
     is_transparency_group: bool,
+    own_oc: bool,
     isolated: bool,
     knockout: bool,
     pub(crate) dict: Dict<'a>,
@@ -23,16 +30,16 @@ pub(crate) struct FormXObject<'a> {
 
 impl<'a> FormXObject<'a> {
     pub(crate) fn new(stream: &Stream<'a>) -> Option<Self> {
-        let dict = stream.dict();
+        let (bbox, matrix) = box_and_matrix(&Entries::detached(stream.dict().clone()))?;
+        Self::placed(stream, Affine::new(matrix), bbox.map(|v| v as f32))
+    }
 
+    /// The form of `stream` drawn with `matrix` and clipped to `bbox`, whatever its
+    /// own entries say.
+    pub(crate) fn placed(stream: &Stream<'a>, matrix: Affine, bbox: [f32; 4]) -> Option<Self> {
+        let dict = stream.dict();
         let decoded = stream.decoded_data().ok()?;
         let resources = dict.get(RESOURCES).map(Resources::new);
-
-        let matrix = Affine::new(
-            dict.get::<[f64; 6]>(MATRIX)
-                .unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
-        );
-        let bbox = dict.get::<[f32; 4]>(BBOX)?;
         let group = dict.get::<Dict<'_>>(GROUP);
         let flag = |key| {
             group
@@ -45,12 +52,22 @@ impl<'a> FormXObject<'a> {
             decoded,
             matrix,
             is_transparency_group: group.is_some(),
+            own_oc: true,
             isolated: flag(I),
             knockout: flag(K),
             bbox,
             dict: dict.clone(),
             resources,
         })
+    }
+
+    /// [`Self::placed`] for an annotation's appearance stream, drawn whatever its own
+    /// `/OC` says, as `MuPDF` draws one (`PyMuPDF` 1.28.2): only the annotation's
+    /// `/OC` hides it ([`crate::interpret::annotation`]).
+    pub(crate) fn appearance(stream: &Stream<'a>, matrix: Affine, bbox: [f32; 4]) -> Option<Self> {
+        let mut form = Self::placed(stream, matrix, bbox)?;
+        form.own_oc = false;
+        Some(form)
     }
 
     pub(crate) fn draw(
@@ -67,7 +84,10 @@ impl<'a> FormXObject<'a> {
             return;
         }
 
-        let has_oc = xobject_oc(&self.dict, context);
+        let has_oc = self.own_oc
+            && context
+                .ocg_state
+                .begin_named(&Kept::Document(self.dict.clone()), OC);
         if !context.ocg_state.is_visible() {
             if has_oc {
                 context.ocg_state.end_marked_content();

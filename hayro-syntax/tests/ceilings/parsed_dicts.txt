@@ -1,0 +1,2 @@
+read_peak_bytes 2838504
+read_allocations 3378

@@ -12,6 +12,7 @@ exclude = ["/tests/"]
 autotests = false
 
 [features]
+work-counters = ["std"]
 default = ["std"]
 std = []
 

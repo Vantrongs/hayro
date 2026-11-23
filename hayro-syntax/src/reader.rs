@@ -138,7 +138,61 @@ struct ReaderContextData<'a> {
     in_content_stream: bool,
     in_object_stream: bool,
     obj_number: Option<ObjectIdentifier>,
-    parent_chain: SmallVec<[ObjectIdentifier; 8]>,
+    /// The object whose key decrypts what is read: see [`ReaderContext::decryption`].
+    decrypt_as: Option<ObjectIdentifier>,
+    parent_chain: SmallVec<[Link; 8]>,
+    /// While a value shared by every resolution chain is computed: the least index in
+    /// the chain of an object a cycle check rejected (see [`ReaderContext::shared`]).
+    rejected: Option<Arc<Rejected>>,
+}
+
+/// What a chain of references is resolving, which a cycle check rejects where the
+/// chain reaches it again.
+///
+/// A body is named by where its bytes are (`Place::link`), not by the entry of the
+/// table read to reach it: every entry leading to one body is one link, so what is
+/// read from the body, which a cache keyed by the body keeps for every entry
+/// ([`crate::xref::ContentKey`], [`crate::xref::StreamId`]), is read alike through
+/// any of them. A reference back to a body being read is a cycle by whichever entry
+/// it names. Sixteen bytes, as a chain is copied with each context that extends it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Link {
+    /// The body at this offset of the file.
+    File(usize),
+    /// The body at this offset of the decoded data of the object stream kept at
+    /// this index ([`crate::data::Data::object_stream`], which keeps fewer than
+    /// 2^32).
+    Stream(u32, usize),
+}
+
+const _: () = assert!(size_of::<Link>() == 16);
+
+/// The least index in a resolution chain of an object a cycle check rejected.
+#[derive(Debug)]
+struct Rejected(
+    #[cfg(feature = "std")] core::sync::atomic::AtomicUsize,
+    #[cfg(not(feature = "std"))] core::cell::Cell<usize>,
+);
+
+impl Rejected {
+    fn new() -> Self {
+        Self(usize::MAX.into())
+    }
+
+    fn note(&self, index: usize) {
+        #[cfg(feature = "std")]
+        self.0
+            .fetch_min(index, core::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "std"))]
+        self.0.set(self.0.get().min(index));
+    }
+
+    fn least(&self) -> usize {
+        #[cfg(feature = "std")]
+        return self.0.load(core::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "std"))]
+        return self.0.get();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -157,8 +211,10 @@ impl<'a> ReaderContext<'a> {
             xref,
             in_content_stream,
             obj_number: None,
+            decrypt_as: None,
             in_object_stream: false,
             parent_chain: smallvec![],
+            rejected: None,
         })))
     }
 
@@ -206,10 +262,44 @@ impl<'a> ReaderContext<'a> {
         }
     }
 
+    /// The object whose key decrypts the strings and streams read in this context;
+    /// `None` where they are not decrypted. That is the object whose header the bytes
+    /// are under, whichever entry of the table they are read for ([`XRef::get_with`]
+    /// sets it): it is a function of where the bytes are, so a cache keyed by the bytes
+    /// ([`crate::xref::ContentKey`]) never holds what another entry would read
+    /// otherwise.
+    ///
+    /// [`XRef::get_with`]: crate::xref::XRef
+    #[inline]
+    pub(crate) fn decryption(&self) -> Option<ObjectIdentifier> {
+        if !self.xref().needs_decryption(self) {
+            return None;
+        }
+        match &self.0 {
+            ReaderContextInner::Shared(inner) => inner.decrypt_as,
+            ReaderContextInner::Dummy { .. } => None,
+        }
+    }
+
+    /// Reads as object `id`, decrypting as it, until [`Self::set_decryption`] says
+    /// otherwise.
     #[inline]
     pub(crate) fn set_obj_number(&mut self, id: ObjectIdentifier) {
         match &mut self.0 {
-            ReaderContextInner::Shared(inner) => Arc::make_mut(inner).obj_number = Some(id),
+            ReaderContextInner::Shared(inner) => {
+                let inner = Arc::make_mut(inner);
+                inner.obj_number = Some(id);
+                inner.decrypt_as = Some(id);
+            }
+            ReaderContextInner::Dummy { .. } => {}
+        }
+    }
+
+    /// Decrypts as object `id`.
+    #[inline]
+    pub(crate) fn set_decryption(&mut self, id: ObjectIdentifier) {
+        match &mut self.0 {
+            ReaderContextInner::Shared(inner) => Arc::make_mut(inner).decrypt_as = Some(id),
             ReaderContextInner::Dummy { .. } => {}
         }
     }
@@ -230,18 +320,94 @@ impl<'a> ReaderContext<'a> {
         }
     }
 
+    /// Whether `link` is being resolved already in this context's chain, which a cycle
+    /// check rejects: a value computed for [`Self::shared`] notes where.
     #[inline]
-    pub(crate) fn parent_chain_contains(&self, id: &ObjectIdentifier) -> bool {
+    pub(crate) fn rejects(&self, link: &Link) -> bool {
         match &self.0 {
-            ReaderContextInner::Shared(inner) => inner.parent_chain.contains(id),
+            ReaderContextInner::Shared(inner) => {
+                let Some(index) = inner.parent_chain.iter().position(|other| other == link) else {
+                    return false;
+                };
+                if let Some(rejected) = &inner.rejected {
+                    rejected.note(index);
+                }
+                true
+            }
             ReaderContextInner::Dummy { .. } => false,
         }
     }
 
+    /// The value `compute` finds for a body it resolves first, from this context, and
+    /// whether every resolution chain finds it, so that it may be kept for all.
+    ///
+    /// A cycle check rejects a link already being resolved in the chain ([`Link`]),
+    /// so what is computed from the body depends on the chain where a check rejected
+    /// a link the chain held before the body would be resolved, the body itself
+    /// included where the chain holds it already; a check rejecting the body or a link
+    /// resolved from it after that rejects it from any chain.
+    pub(crate) fn shared<T>(&self, compute: impl FnOnce(&Self) -> T) -> (T, bool) {
+        let ReaderContextInner::Shared(inner) = &self.0 else {
+            return (compute(self), true);
+        };
+        // The index the body is resolved at.
+        let own = inner.parent_chain.len();
+        let rejected = Arc::new(Rejected::new());
+        let mut ctx = self.clone();
+        Arc::make_mut(match &mut ctx.0 {
+            ReaderContextInner::Shared(inner) => inner,
+            ReaderContextInner::Dummy { .. } => unreachable!(),
+        })
+        .rejected = Some(rejected.clone());
+        let value = compute(&ctx);
+        let least = rejected.least();
+        // What depends on this chain depends on it for the value being computed
+        // around this one, if any.
+        if least != usize::MAX
+            && let Some(around) = &inner.rejected
+        {
+            around.note(least);
+        }
+        (value, least >= own)
+    }
+
+    /// This context as where a resolution starts, no reference being resolved in
+    /// it ([`Dict::as_root`](crate::object::Dict::as_root)).
+    pub(crate) fn as_root(&self) -> Self {
+        self.rooted_at(None)
+    }
+
+    /// [`Self::as_root`], but with the body what it reads lies in, the last of its
+    /// chain, still being resolved
+    /// ([`Stream::as_root`](crate::object::Stream::as_root)).
+    pub(crate) fn as_body_root(&self) -> Self {
+        match &self.0 {
+            ReaderContextInner::Shared(inner) => self.rooted_at(inner.parent_chain.last()),
+            ReaderContextInner::Dummy { .. } => self.clone(),
+        }
+    }
+
+    /// This context with `body` alone being resolved in it.
+    fn rooted_at(&self, body: Option<&Link>) -> Self {
+        match &self.0 {
+            ReaderContextInner::Shared(inner)
+                if inner.parent_chain.len() > usize::from(body.is_some())
+                    || inner.rejected.is_some() =>
+            {
+                Self(ReaderContextInner::Shared(Arc::new(ReaderContextData {
+                    parent_chain: body.copied().into_iter().collect(),
+                    rejected: None,
+                    ..(**inner).clone()
+                })))
+            }
+            _ => self.clone(),
+        }
+    }
+
     #[inline]
-    pub(crate) fn parent_chain_push(&mut self, id: ObjectIdentifier) {
+    pub(crate) fn parent_chain_push(&mut self, link: Link) {
         match &mut self.0 {
-            ReaderContextInner::Shared(inner) => Arc::make_mut(inner).parent_chain.push(id),
+            ReaderContextInner::Shared(inner) => Arc::make_mut(inner).parent_chain.push(link),
             ReaderContextInner::Dummy { .. } => {}
         }
     }

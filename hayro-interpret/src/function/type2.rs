@@ -23,6 +23,23 @@ impl Type2 {
         Some(Self { c0, delta, n })
     }
 
+    pub(super) fn unit_linear(&self, domain: [f32; 2], ranges: Option<&[super::Interval]>) -> bool {
+        self.n == 1.0
+            && self
+                .c0
+                .iter()
+                .zip(&self.delta)
+                .enumerate()
+                .all(|(i, (&base, &slope))| {
+                    domain.into_iter().all(|t| {
+                        let y = base + t * slope;
+                        (0.0..=1.0).contains(&y)
+                            && ranges
+                                .and_then(|r| r.get(i))
+                                .is_none_or(|r| r.clamp(y) == y)
+                    })
+                })
+    }
     pub(crate) fn num_outputs(&self) -> usize {
         self.c0.len()
     }

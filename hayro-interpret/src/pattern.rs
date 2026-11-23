@@ -1,5 +1,6 @@
 //! PDF patterns.
 
+use crate::annotation::entries::Entries;
 use crate::cache::Cache;
 use crate::color::{Color, ColorSpace};
 use crate::context::{Context, InterpreterCache};
@@ -7,7 +8,7 @@ use crate::device::Device;
 use crate::font::GlyphRun;
 use crate::interpret::state::{ActiveTransferFunction, State};
 use crate::shading::Shading;
-use crate::util::{Float32Ext, RectExt, hash128};
+use crate::util::{Float32Ext, hash128};
 use crate::x_object::soft_mask::SoftMask;
 use crate::{BlendMode, CacheKey, ClipPath, DrawMode, DrawProps, Image, ImageDrawProps};
 use crate::{FillRule, InterpreterSettings, Paint, interpret};
@@ -51,10 +52,15 @@ impl<'a> Pattern<'a> {
         match self {
             Self::Shading(p) => {
                 p.matrix = transform * p.matrix;
-                let transformed_clip_path = p.shading.clip_path.clone().map(|r| p.matrix * r);
-                Arc::make_mut(&mut p.shading).clip_path = transformed_clip_path;
             }
             Self::Tiling(p) => p.matrix = transform * p.matrix,
+        }
+    }
+
+    pub(crate) fn opacity(&self) -> f32 {
+        match self {
+            Self::Shading(p) => p.opacity,
+            Self::Tiling(p) => p.opacity,
         }
     }
 
@@ -95,16 +101,18 @@ pub struct ShadingPattern {
 }
 
 impl ShadingPattern {
+    /// The shading bounding box in paint coordinates.
+    pub fn clip_path(&self) -> Option<BezPath> {
+        self.shading.clip_path.as_ref().map(|p| self.matrix * p)
+    }
+
     pub(crate) fn new(dict: &Dict<'_>, cache: &Cache) -> Option<Self> {
         let shading = dict.get::<Object<'_>>(SHADING).and_then(|o| {
             let (dict, stream) = dict_or_stream(&o)?;
 
             Shading::new(dict, stream, cache)
         })?;
-        let matrix = dict
-            .get::<[f64; 6]>(MATRIX)
-            .map(Affine::new)
-            .unwrap_or_default();
+        let matrix = Affine::new(Entries::detached(dict.clone()).matrix(MATRIX));
 
         Some(Self {
             shading: Arc::new(shading),
@@ -119,6 +127,8 @@ impl CacheKey for ShadingPattern {
     fn cache_key(&self) -> u128 {
         hash128(&(
             self.shading.cache_key(),
+            self.shading.background.is_some(),
+            self.transfer_function.as_ref().map(CacheKey::cache_key),
             self.matrix.cache_key(),
             self.opacity.to_bits(),
         ))
@@ -161,19 +171,17 @@ impl<'a> TilingPattern<'a> {
         let cache_key = stream.cache_key();
         let dict = stream.dict();
 
-        let bbox = dict.get::<hayro_syntax::object::Rect>(BBOX)?.to_kurbo();
-        let x_step = dict.get::<f32>(X_STEP)?;
-        let y_step = dict.get::<f32>(Y_STEP)?;
+        let entries = Entries::detached(dict.clone());
+        let bbox = entries.rect(BBOX)?;
+        let x_step = entries.number(X_STEP).unwrap_or(0.0) as f32;
+        let y_step = entries.number(Y_STEP).unwrap_or(0.0) as f32;
 
         if x_step.is_nearly_zero() || y_step.is_nearly_zero() || bbox.is_zero_area() {
             return None;
         }
 
         let is_color = dict.get::<u8>(PAINT_TYPE)? == 1;
-        let matrix = dict
-            .get::<[f64; 6]>(MATRIX)
-            .map(Affine::new)
-            .unwrap_or_default();
+        let matrix = Affine::new(entries.matrix(MATRIX));
 
         let fill = ctx.fill_paint();
         let fill_cs = fill
@@ -210,6 +218,24 @@ impl<'a> TilingPattern<'a> {
         })
     }
 
+    /// Identifies the drawn cell independently of the opacity of its placement.
+    pub fn paint_key(&self, is_stroke: bool) -> u128 {
+        let color = (!self.is_color).then(|| {
+            let paint = if is_stroke {
+                &self.stroke_paint
+            } else {
+                &self.non_stroking_paint
+            };
+            paint.to_rgba().components().map(f32::to_bits)
+        });
+        hash128(&(
+            self.cache_key,
+            self.matrix.cache_key(),
+            self.nesting_depth,
+            color,
+        ))
+    }
+
     /// Interpret the contents of the pattern into the given device.
     pub fn interpret(
         &self,
@@ -227,6 +253,7 @@ impl<'a> TilingPattern<'a> {
             self.settings.clone(),
             state,
             self.nesting_depth,
+            None,
         );
 
         let decoded = self.stream.decoded_data().ok()?;
@@ -293,6 +320,7 @@ impl<'a, 'b, T: Device<'a>> StencilPatternDevice<'a, 'b, T> {
 impl<'a, T: Device<'a>> Device<'a> for StencilPatternDevice<'a, '_, T> {
     fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode) {
         let props = DrawProps {
+            knockout: crate::Knockout::None,
             paint: self.paint.clone(),
             ..props
         };

@@ -46,10 +46,10 @@ image = { version = "0.25", default-features = false }
 kurbo = { version = "0.13.0" }
 resvg = { version = "0.47.0" }
 flate2 = { version = "1" }
-miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
 zlib-rs = { version = "0.6.8", default-features = false, features = ["rust-allocator"] }
 phf = { version = "0.13.1", default-features = false }
 moxcms = { version = "0.8.1" }
+foldhash = { version = "0.2", default-features = false, features = ["std"] }
 rustc-hash = { version = "2" }
 siphasher = "1"
 skrifa = { version = "0.49.0" }
@@ -124,3 +124,13 @@ strip = "none"
 inherits = "release"
 debug = 1
 overflow-checks = true
+
+[patch.crates-io]
+zlib-rs = { git = "https://github.com/Vantrongs/zlib-rs", rev = "124359709a6ed94bda6fe1ff4d413e23bbae34e5" }
+zune-jpeg = { git = "https://github.com/Vantrongs/zune-image", rev = "4f919494d5037ffff1b873a7aa87afe0a13de248" }
+pdf-writer = { git = "https://github.com/Vantrongs/pdf-writer", rev = "daf9012abec3d7284d756c48ae9d5e5e01cf18b6" }
+vello_cpu = { git = "https://github.com/Vantrongs/vello", rev = "061fd7ee08e7fcfffba07c07338edad303b4f0dd" }
+vello_common = { git = "https://github.com/Vantrongs/vello", rev = "061fd7ee08e7fcfffba07c07338edad303b4f0dd" }
+
+html5ever = { git = "https://github.com/Vantrongs/html5ever", rev = "16c09dc3dab410bf600c2a721d8a5dfd500c9324" }
+string_cache = { git = "https://github.com/Vantrongs/string-cache", rev = "fa62c6494ca80e41784fb79760ca2e8e0d079ab4" }

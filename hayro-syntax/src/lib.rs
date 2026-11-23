@@ -51,8 +51,8 @@ We also unconditionally use the `smallvec` crate which uses unsafe internally, b
 it.
 
 For better performance, it is strongly recommended to enable the `unsafe` feature,
-which results in slightly more unsafe code but gives better performance:
-- We will use `zlib-rs` instead of `miniz_oxide` for decoding flate streams.
+which enables the following optimizations:
+- Flate decoding uses `zlib-rs` and supports independent decompressor checkpoints.
 - SIMD will be enabled to accelerate decoding of images.
 - `memchr` will be used to accelerate some of the fallback parsing code.
 
@@ -86,10 +86,13 @@ pub(crate) mod util;
 
 pub mod content;
 mod crypto;
+pub mod hash;
+pub mod lost;
 pub mod metadata;
 pub mod object;
 pub mod page;
 pub mod transform;
+pub mod work;
 pub mod xref;
 
 // Public only for hayro-interpret.

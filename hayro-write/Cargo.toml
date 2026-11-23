@@ -13,7 +13,10 @@ license = { workspace = true }
 hayro-syntax = { workspace = true, features = ["std"] }
 pdf-writer = { workspace = true }
 flate2 = { workspace = true }
-rustc-hash = { workspace = true }
+
+[dev-dependencies]
+hayro-syntax = { workspace = true, features = ["work-counters"] }
+md5 = "0.8"
 
 [lints]
 workspace = true

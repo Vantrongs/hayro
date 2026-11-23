@@ -1,4 +1,5 @@
-use crate::cache::{Cache, CacheKey};
+use crate::annotation::{Fields, Glyph};
+use crate::cache::Cache;
 use crate::color::{Color, ColorSpace};
 use crate::convert::convert_transform;
 use crate::font::{FontCache, PositionedGlyph, StandardFont};
@@ -6,7 +7,7 @@ use crate::interpret::stack::StateStack;
 use crate::interpret::state::{
     ClipType, CompositingState, PaintData, PaintState, State, TextState, TextStateFont,
 };
-use crate::ocg::OcgState;
+use crate::ocg::{OcgState, OptionalContent};
 use crate::util::{BezPathExt, Float64Ext};
 use crate::{
     ClipPath, Device, DrawProps, FillRule, InterpreterSettings, InterpreterWarning, Paint,
@@ -19,6 +20,7 @@ use hayro_syntax::page::Resources;
 use hayro_syntax::xref::XRef;
 use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape};
 use smallvec::smallvec;
+use std::rc::Rc;
 
 pub(crate) const MAX_NESTED_INTERPRETATION_DEPTH: u32 = 50;
 
@@ -27,6 +29,7 @@ pub(crate) const MAX_NESTED_INTERPRETATION_DEPTH: u32 = 50;
 // their object identifier), so a cache shared across documents can mix up their objects.
 #[derive(Clone)]
 pub struct InterpreterCache<'a> {
+    pub(crate) annotation_fields: Fields<'a>,
     pub(crate) font_cache: FontCache<'a>,
     pub(crate) object_cache: Cache,
 }
@@ -41,6 +44,7 @@ impl<'a> InterpreterCache<'a> {
     /// Create a new interpreter cache.
     pub fn new() -> Self {
         Self {
+            annotation_fields: Fields::default(),
             font_cache: FontCache::new(),
             object_cache: Cache::new(),
         }
@@ -51,15 +55,18 @@ impl<'a> InterpreterCache<'a> {
 pub struct Context<'a> {
     stack: StateStack<'a>,
     path: BezPath,
+    pub(crate) text_clip: Option<BezPath>,
     sub_path_start: Point,
     last_point: Point,
     clip: Option<FillRule>,
     root_transforms: Vec<Affine>,
     bbox: Vec<Rect>,
+    pub(crate) bbox_read: std::cell::Cell<bool>,
     pub(crate) settings: InterpreterSettings,
     pub(crate) interpreter_cache: InterpreterCache<'a>,
     pub(crate) xref: &'a XRef,
-    pub(crate) ocg_state: OcgState,
+    pub(crate) generated_glyphs: hayro_syntax::hash::Map<Rc<str>, Rc<Glyph>>,
+    pub(crate) ocg_state: OcgState<'a>,
     nesting_depth: u32,
     pub(crate) glyph_scratch: Vec<PositionedGlyph<'a>>,
 }
@@ -75,7 +82,16 @@ impl<'a> Context<'a> {
     ) -> Self {
         let state = State::new(initial_transform);
 
-        Self::new_with(initial_transform, bbox, cache, xref, settings, state, 0)
+        Self::new_with(
+            initial_transform,
+            bbox,
+            cache,
+            xref,
+            settings,
+            state,
+            0,
+            Some(cache.annotation_fields.optional_content(xref)),
+        )
     }
 
     pub(crate) fn new_with(
@@ -86,14 +102,9 @@ impl<'a> Context<'a> {
         settings: InterpreterSettings,
         state: State<'a>,
         nesting_depth: u32,
+        optional_content: Option<Rc<OptionalContent<'a>>>,
     ) -> Self {
-        let ocg_state = {
-            let root_ref = xref.root_id();
-            xref.get::<Dict<'_>>(root_ref)
-                .map(|catalog| OcgState::from_catalog(&catalog))
-                .unwrap_or_default()
-        };
-
+        let ocg_state = OcgState::new(optional_content);
         Self {
             stack: StateStack::new(state),
             settings,
@@ -103,8 +114,11 @@ impl<'a> Context<'a> {
             sub_path_start: Point::default(),
             clip: None,
             bbox: vec![bbox],
+            bbox_read: std::cell::Cell::new(false),
             path: BezPath::new(),
+            text_clip: None,
             interpreter_cache: cache.clone(),
+            generated_glyphs: hayro_syntax::hash::Map::default(),
             ocg_state,
             nesting_depth,
             glyph_scratch: Vec::new(),
@@ -116,6 +130,11 @@ impl<'a> Context<'a> {
     }
 
     pub(crate) fn bbox(&self) -> Rect {
+        self.bbox_read.set(true);
+        self.current_bbox()
+    }
+
+    fn current_bbox(&self) -> Rect {
         self.bbox
             .last()
             .copied()
@@ -123,7 +142,7 @@ impl<'a> Context<'a> {
     }
 
     fn push_bbox(&mut self, bbox: Rect) {
-        let new = self.bbox().intersect(bbox);
+        let new = self.current_bbox().intersect(bbox);
         self.bbox.push(new);
     }
 
@@ -204,6 +223,7 @@ impl<'a> Context<'a> {
 
     pub(crate) fn draw_props(&self, is_stroke: bool) -> DrawProps<'a> {
         DrawProps {
+            knockout: crate::Knockout::None,
             transform: self.ctm(),
             paint: self.get_paint(is_stroke),
             soft_mask: self.compositing().soft_mask.clone(),
@@ -344,11 +364,7 @@ impl<'a> Context<'a> {
         name: &Name<'_>,
     ) -> Option<ColorSpace> {
         let cs_object = resources.get_color_space(name)?;
-        self.interpreter_cache
-            .object_cache
-            .get_or_insert_with(cs_object.cache_key(), || {
-                ColorSpace::new(cs_object.clone(), &self.interpreter_cache.object_cache)
-            })
+        ColorSpace::new(cs_object, &self.interpreter_cache.object_cache)
     }
 
     pub(crate) fn num_states(&self) -> usize {

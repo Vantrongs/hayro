@@ -1,3 +1,4 @@
+use crate::encode::{Cost, Exhausted, Meter, take};
 mod type0;
 mod type2;
 mod type3;
@@ -57,6 +58,8 @@ enum FunctionType {
 
 #[derive(Debug)]
 struct Repr {
+    direct: bool,
+    cost: Cost,
     domain: Vec<Interval>,
     range: Option<Vec<Interval>>,
     num_outputs: usize,
@@ -68,6 +71,13 @@ struct Repr {
 pub struct Function(Arc<Repr>);
 
 impl Function {
+    /// The most steps one [`eval`](Self::eval) takes: an operator run, or a value
+    /// read, computed or written, whatever the input. Known before evaluating, so a
+    /// caller can bound the work of evaluating many times.
+    pub fn cost(&self) -> Cost {
+        self.0.cost
+    }
+
     /// Create a new function.
     pub fn new(obj: &Object<'_>) -> Option<Self> {
         Self::new_nested(obj, 0)
@@ -121,7 +131,21 @@ impl Function {
             return None;
         }
 
+        let cost = Cost::of(domain.len() + num_outputs)
+            + match &function_type {
+                FunctionType::Type0(f) => f.cost(),
+                FunctionType::Type2(_) => Cost::of(num_outputs + 1),
+                FunctionType::Type3(f) => f.cost(),
+                FunctionType::Type4(f) => f.cost(),
+            };
         Some(Self(Arc::new(Repr {
+            cost,
+            direct: match &function_type {
+                FunctionType::Type4(_) => true,
+                FunctionType::Type0(_) => false,
+                FunctionType::Type2(_) => false,
+                FunctionType::Type3(f) => f.requires_direct_sampling(),
+            },
             domain,
             range,
             num_outputs,
@@ -159,10 +183,25 @@ impl Function {
                 f.eval(input[0], output);
                 Some(())
             }),
-            FunctionType::Type3(f) => {
-                self.eval_samples(input, output, |input, output| f.eval(input[0], output))
-            }
+            FunctionType::Type3(f) => self.eval_samples(input, output, |input, output| {
+                f.eval(f64::from(input[0]), output)
+            }),
             FunctionType::Type4(f) => self.eval_samples(input, output, f.evaluator()),
+        }
+    }
+
+    fn eval_stitched(&self, x: f64, output: &mut [f32]) -> Option<()> {
+        if let FunctionType::Type3(f) = &self.0.function_type {
+            let d = self.0.domain[0];
+            f.eval(x.min(f64::from(d.max)).max(f64::from(d.min)), output)?;
+            if let Some(range) = &self.0.range {
+                for (value, range) in output.iter_mut().zip(range) {
+                    *value = range.clamp(*value);
+                }
+            }
+            Some(())
+        } else {
+            self.eval(&[x as f32], output)
         }
     }
 
@@ -196,11 +235,84 @@ impl Function {
         Some(())
     }
 
-    pub(crate) fn stitching_bounds(&self) -> Vec<f32> {
+    pub(crate) fn unit_linear(&self, domain: [f32; 2]) -> bool {
+        let range = self.0.domain[0];
+        matches!(&self.0.function_type, FunctionType::Type2(f) if domain.iter().all(|&x| range.clamp(x) == x) && f.unit_linear(domain,self.0.range.as_deref()))
+    }
+    pub(crate) fn unit_grid(&self, domain: [f32; 2]) -> Option<&[f32]> {
         match &self.0.function_type {
-            FunctionType::Type3(t3) => t3.stitching_bounds(),
-            _ => vec![],
+            FunctionType::Type0(f) => f.unit_grid(domain, self.0.range.as_ref()?),
+            _ => None,
         }
+    }
+
+    pub(crate) fn requires_direct_sampling(&self) -> bool {
+        self.0.direct
+    }
+
+    pub(crate) fn piece_ends(
+        &self,
+        interval: [u32; 2],
+        input: &dyn Fn(f32) -> f64,
+        ends: &mut Vec<f32>,
+        meter: &mut dyn Meter,
+        mapping_cost: Cost,
+    ) -> Result<(), Exhausted> {
+        let domain = self.0.domain[0];
+        let x = |t| input(t).min(domain.max.into()).max(domain.min.into());
+        let kind = &self.0.function_type;
+        let piece = |bits| {
+            let x = x(f32::from_bits(bits));
+            match kind {
+                FunctionType::Type0(f) => f.piece(x as f32),
+                FunctionType::Type2(_) => match (x as f32).total_cmp(&0.) {
+                    std::cmp::Ordering::Less => 0,
+                    std::cmp::Ordering::Equal => 1,
+                    std::cmp::Ordering::Greater => 2,
+                },
+                FunctionType::Type3(f) => f.piece(x),
+                FunctionType::Type4(_) => unreachable!(),
+            }
+        };
+        let [mut first, last] = interval;
+        take(meter, mapping_cost)?;
+        let final_piece = piece(last);
+        loop {
+            take(meter, mapping_cost)?;
+            let index = piece(first);
+            let mut end = last;
+            if index != final_piece {
+                let mut start = first;
+                while start + 1 < end {
+                    take(meter, mapping_cost)?;
+                    let middle = start + (end - start) / 2;
+                    if piece(middle) == index {
+                        start = middle;
+                    } else {
+                        end = middle;
+                    }
+                }
+                end = start;
+            }
+            if let FunctionType::Type3(f) = kind {
+                f.child(index).piece_ends(
+                    [first, end],
+                    &|t| f.map(index, x(t)),
+                    ends,
+                    meter,
+                    mapping_cost + Cost::new(8),
+                )?;
+            } else {
+                for bits in [first, end] {
+                    crate::encode::push_metered(ends, f32::from_bits(bits), meter)?;
+                }
+            }
+            if end == last {
+                break;
+            }
+            first = end + 1;
+        }
+        Ok(())
     }
 }
 
@@ -208,10 +320,20 @@ impl Function {
 #[derive(Clone, Debug)]
 pub struct TransferFunction {
     function: Function,
-    samples: Arc<OnceLock<[u8; 256]>>,
+    samples: Arc<OnceLock<([u8; 256], u128)>>,
 }
 
 impl TransferFunction {
+    /// The steps building the table [`apply_to`](Self::apply_to) maps by takes, until
+    /// it is built.
+    pub fn setup_cost(&self) -> Cost {
+        if self.samples.get().is_some() {
+            Cost::ZERO
+        } else {
+            (self.function.cost() + Cost::new(1)).times(256)
+        }
+    }
+
     pub(crate) fn new(function: Function) -> Self {
         Self {
             function,
@@ -236,17 +358,26 @@ impl TransferFunction {
         self.samples()[(value * 255.0 + 0.5) as u8 as usize] as f32 / 255.0
     }
 
-    fn samples(&self) -> &[u8; 256] {
+    pub(crate) fn key(&self) -> u128 {
+        self.table().1
+    }
+
+    pub(crate) fn samples(&self) -> &[u8; 256] {
+        &self.table().0
+    }
+
+    fn table(&self) -> &([u8; 256], u128) {
         self.samples.get_or_init(|| {
             let mut output = [0.0; MAX_COMPONENTS];
             let output = &mut output[..self.function.num_outputs()];
 
-            std::array::from_fn(|sample| {
-                match self.function.eval(&[sample as f32 * (1.0 / 255.0)], output) {
+            let samples = std::array::from_fn(|sample| {
+                match self.function.eval(&[sample as f32 / 255.0], output) {
                     Some(()) => (output[0] * 255.0 + 0.5) as u8,
                     None => sample as u8,
                 }
-            })
+            });
+            (samples, crate::util::hash128(&samples))
         })
     }
 }
@@ -316,4 +447,20 @@ mod tests {
     fn deep_function_chain_fails() {
         assert!(function_of_chain(20_000).is_none());
     }
+}
+
+#[cfg(test)]
+mod reference;
+/// The steps sorting the values gathering them took `gathered` steps for.
+pub(crate) fn sorting(gathered: Cost) -> Cost {
+    let n = gathered.steps();
+    gathered.times(u64::from(u64::BITS - n.leading_zeros()).max(1))
+}
+
+#[cfg(feature = "count-operators")]
+pub use type4::operators_run;
+
+#[cfg(test)]
+pub(crate) fn test_operator_count() -> u64 {
+    type4::RUN.get()
 }

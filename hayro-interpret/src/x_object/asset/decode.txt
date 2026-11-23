@@ -1,0 +1,371 @@
+# Images whose decode arrays are short, empty, not arrays, hold non-numbers, or
+# map 0 and 1 to values that do not sum to one, as PyMuPDF 1.28.2 draws them; the
+# format of short.txt. Written by observing PyMuPDF; regenerate rather than edit.
+case stencil, Decode []
+grid 16 2
+image /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Decode []
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case stencil, Decode [0]
+grid 16 2
+image /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Decode [0]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case stencil, Decode [1]
+grid 16 2
+image /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Decode [1]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect R R R R R R R R 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect R R R R R R R R 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+case stencil, Decode [0 0]
+grid 16 2
+image /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Decode [0 0]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case stencil, Decode [1 1]
+grid 16 2
+image /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Decode [1 1]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+case stencil, Decode [0 0.5]
+grid 16 2
+image /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Decode [0 0.5]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect 81007d 81007d 81007d 81007d 81007d 81007d 81007d 81007d R R R R R R R R
+expect 81007d 81007d 81007d 81007d 81007d 81007d 81007d 81007d R R R R R R R R
+case stencil, Decode [0.25 0.75]
+grid 16 2
+image /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Decode [0.25 0.75]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect 4000be 4000be 4000be 4000be 4000be 4000be 4000be 4000be c1003d c1003d c1003d c1003d c1003d c1003d c1003d c1003d
+expect 4000be 4000be 4000be 4000be 4000be 4000be 4000be 4000be c1003d c1003d c1003d c1003d c1003d c1003d c1003d c1003d
+case stencil, Decode [2 0]
+grid 16 2
+image /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Decode [2 0]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect R R R R R R R R 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect R R R R R R R R 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+case stencil, Decode [0 1 5]
+grid 16 2
+image /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Decode [0 1 5]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe R R R R R R R R
+expect 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe R R R R R R R R
+case stencil, Decode 5
+grid 16 2
+image /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Decode 5
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case stencil, Decode [/x]
+grid 16 2
+image /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Decode [/x]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case stencil, Decode [1 /x]
+grid 16 2
+image /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Decode [1 /x]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect R R R R R R R R 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+expect R R R R R R R R 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe 0000fe
+case soft mask 1-bit, Decode []
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Decode []
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case soft mask 1-bit, Decode [0]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [0]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case soft mask 1-bit, Decode [1]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [1]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect W W W W W W W W R R R R R R R R
+expect W W W W W W W W R R R R R R R R
+case soft mask 1-bit, Decode [0.5]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [0.5]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e R R R R R R R R
+expect ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e R R R R R R R R
+case soft mask 1-bit, Decode [0 0.5]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [0 0.5]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect R R R R R R R R ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e
+expect R R R R R R R R ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e
+case soft mask 4-bit, Decode []
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 4 /Decode []
+data 00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case soft mask 4-bit, Decode [0]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 4 /Decode [0]
+data 00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case soft mask 4-bit, Decode [1]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 4 /Decode [1]
+data 00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff
+expect W W W W W W W W R R R R R R R R
+expect W W W W W W W W R R R R R R R R
+case soft mask 4-bit, Decode [0.5]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 4 /Decode [0.5]
+data 00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff
+expect ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e R R R R R R R R
+expect ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e R R R R R R R R
+case soft mask 4-bit, Decode [0 0.5]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 4 /Decode [0 0.5]
+data 00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff
+expect R R R R R R R R ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e
+expect R R R R R R R R ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e
+case soft mask 8-bit, Decode []
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode []
+data 0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case soft mask 8-bit, Decode [0]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [0]
+data 0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case soft mask 8-bit, Decode [1]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [1]
+data 0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff
+expect W W W W W W W W R R R R R R R R
+expect W W W W W W W W R R R R R R R R
+case soft mask 8-bit, Decode [0.5]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [0.5]
+data 0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff
+expect ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e R R R R R R R R
+expect ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e R R R R R R R R
+case soft mask 8-bit, Decode [0 0.5]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [0 0.5]
+data 0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff
+expect R R R R R R R R ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e
+expect R R R R R R R R ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e
+case mask stream, Decode []
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Mask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Decode []
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case mask stream, Decode [0]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Mask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Decode [0]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect R R R R R R R R R R R R R R R R
+expect R R R R R R R R R R R R R R R R
+case mask stream, Decode [1]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Mask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Decode [1]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect R R R R R R R R W W W W W W W W
+expect R R R R R R R R W W W W W W W W
+case mask stream, Decode [0 0.5]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Mask 4 0 R
+data ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+mask /Width 16 /Height 8 /ImageMask true /BitsPerComponent 1 /Decode [0 0.5]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e R R R R R R R R
+expect ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e ff7e7e R R R R R R R R
+case gray 1-bit, Decode []
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Decode []
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case gray 1-bit, Decode [0]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [0]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case gray 1-bit, Decode [1]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [1]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect W W W W W W W W K K K K K K K K
+expect W W W W W W W W K K K K K K K K
+case gray 1-bit, Decode [0.5]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [0.5]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f K K K K K K K K
+expect 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f K K K K K K K K
+case gray 1-bit, Decode 5
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Decode 5
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case gray 4-bit, Decode []
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 4 /Decode []
+data 00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case gray 4-bit, Decode [0]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 4 /Decode [0]
+data 00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case gray 4-bit, Decode [1]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 4 /Decode [1]
+data 00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff
+expect W W W W W W W W K K K K K K K K
+expect W W W W W W W W K K K K K K K K
+case gray 4-bit, Decode [0.5]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 4 /Decode [0.5]
+data 00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff
+expect 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f K K K K K K K K
+expect 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f K K K K K K K K
+case gray 4-bit, Decode 5
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 4 /Decode 5
+data 00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff00000000ffffffff
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case gray 8-bit, Decode []
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode []
+data 0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case gray 8-bit, Decode [0]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [0]
+data 0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case gray 8-bit, Decode [1]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [1]
+data 0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff
+expect W W W W W W W W K K K K K K K K
+expect W W W W W W W W K K K K K K K K
+case gray 8-bit, Decode [0.5]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [0.5]
+data 0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff
+expect 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f K K K K K K K K
+expect 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f 7f7f7f K K K K K K K K
+case gray 8-bit, Decode 5
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode 5
+data 0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case rgb 1-bit, Decode []
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 1 /Decode []
+data 000000ffffff000000ffffff000000ffffff000000ffffff000000ffffff000000ffffff000000ffffff000000ffffff
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case rgb 1-bit, Decode [1 0]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 1 /Decode [1 0]
+data 000000ffffff000000ffffff000000ffffff000000ffffff000000ffffff000000ffffff000000ffffff000000ffffff
+expect R R R R R R R R K K K K K K K K
+expect R R R R R R R R K K K K K K K K
+case rgb 1-bit, Decode [1 0 1 0 1]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 1 /Decode [1 0 1 0 1]
+data 000000ffffff000000ffffff000000ffffff000000ffffff000000ffffff000000ffffff000000ffffff000000ffffff
+expect W W W W W W W W K K K K K K K K
+expect W W W W W W W W K K K K K K K K
+case rgb 8-bit, Decode []
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Decode []
+data 000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff
+expect K K K K K K K K K K K K K K K K
+expect K K K K K K K K K K K K K K K K
+case rgb 8-bit, Decode [1 0]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Decode [1 0]
+data 000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff
+expect R R R R R R R R K K K K K K K K
+expect R R R R R R R R K K K K K K K K
+case rgb 8-bit, Decode [1 0 1 0 1]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Decode [1 0 1 0 1]
+data 000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff
+expect W W W W W W W W K K K K K K K K
+expect W W W W W W W W K K K K K K K K
+case indexed 1-bit, Decode []
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace [/Indexed /DeviceRGB 1 <00FF000000FF>] /BitsPerComponent 1 /Decode []
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G
+case indexed 1-bit, Decode [1]
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace [/Indexed /DeviceRGB 1 <00FF000000FF>] /BitsPerComponent 1 /Decode [1]
+data 00ff00ff00ff00ff00ff00ff00ff00ff
+expect B B B B B B B B G G G G G G G G
+expect B B B B B B B B G G G G G G G G
+case indexed 8-bit, Decode []
+grid 16 2
+image /Width 16 /Height 8 /ColorSpace [/Indexed /DeviceRGB 1 <00FF000000FF>] /BitsPerComponent 8 /Decode []
+data 0000000000000000010101010101010100000000000000000101010101010101000000000000000001010101010101010000000000000000010101010101010100000000000000000101010101010101000000000000000001010101010101010000000000000000010101010101010100000000000000000101010101010101
+expect G G G G G G G G G G G G G G G G
+expect G G G G G G G G G G G G G G G G

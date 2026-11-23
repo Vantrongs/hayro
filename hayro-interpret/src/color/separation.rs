@@ -1,5 +1,7 @@
+use super::copy_cost;
 use super::{ColorSpace, ToRgb, U8Lookup};
-use crate::cache::Cache;
+use crate::cache::Building;
+use crate::encode::Cost;
 use crate::function::{Function, MAX_COMPONENTS};
 use hayro_syntax::object::{Array, Name, Object};
 
@@ -12,7 +14,7 @@ pub(crate) struct Separation {
 }
 
 impl Separation {
-    pub(super) fn new(array: &Array<'_>, cache: &Cache, depth: u8) -> Option<Self> {
+    pub(super) fn new(array: &Array<'_>, cache: &Building<'_>, depth: u8) -> Option<Self> {
         let mut iter = array.flex_iter();
         let _ = iter.next::<Name<'_>>()?;
         let name = iter.next::<Name<'_>>()?;
@@ -37,7 +39,7 @@ impl Separation {
         for n in input {
             if self
                 .tint_transform
-                .eval(&[*n as f32 * (1.0 / 255.0)], values)
+                .eval(&[*n as f32 / 255.0], values)
                 .is_some()
             {
                 evaluated.extend(self.alternate_space.encode_values(values));
@@ -59,6 +61,17 @@ impl Separation {
 }
 
 impl ToRgb for Separation {
+    fn cost(&self) -> Cost {
+        copy_cost(1)
+    }
+
+    /// The table a tint is looked up in, until it is built.
+    fn setup_cost(&self) -> Cost {
+        self.lookup
+            .setup_cost(self.tint_transform.cost() + self.alternate_space.cost())
+            + self.alternate_space.setup_cost()
+    }
+
     fn convert(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
         let lookup = self.u8_lookup()?;
         for (input, output) in input.iter().zip(output.as_chunks_mut::<3>().0) {

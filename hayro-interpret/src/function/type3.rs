@@ -1,4 +1,5 @@
-use crate::function::{Function, Interval, interpolate, read_intervals};
+use crate::encode::Cost;
+use crate::function::{Function, Interval, read_intervals};
 use hayro_syntax::object::Array;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Object;
@@ -12,6 +13,15 @@ pub(crate) struct Type3 {
 }
 
 impl Type3 {
+    pub(super) fn cost(&self) -> Cost {
+        Cost::new(2 + u64::from(self.bounds.len().ilog2()))
+            + self
+                .functions
+                .iter()
+                .map(Function::cost)
+                .max()
+                .unwrap_or_default()
+    }
     pub(crate) fn new(dict: &Dict<'_>, domain: Interval, depth: u8) -> Option<Self> {
         let functions = dict
             .get::<Array<'_>>(FUNCTIONS)?
@@ -49,64 +59,41 @@ impl Type3 {
         })
     }
 
+    pub(crate) fn requires_direct_sampling(&self) -> bool {
+        self.functions
+            .iter()
+            .any(Function::requires_direct_sampling)
+    }
+
     pub(crate) fn num_outputs(&self) -> usize {
         self.functions[0].num_outputs()
     }
 
-    pub(crate) fn eval(&self, input: f32, output: &mut [f32]) -> Option<()> {
-        let index = self.find_interval(input);
-        let interval = Interval {
-            min: self.bounds[index],
-            max: self.bounds[index + 1],
-        };
-
-        self.functions[index].eval(&[interval.map(input, self.encode[index])], output)
+    pub(crate) fn eval(&self, x: f64, output: &mut [f32]) -> Option<()> {
+        let i = self.piece(x);
+        self.functions[i].eval_stitched(self.map(i, x), output)
     }
 
-    fn find_interval(&self, x: f32) -> usize {
-        let inner = &self.bounds[1..self.bounds.len() - 1];
-
-        if inner.first() == Some(&self.bounds[0]) && x == self.bounds[0] {
-            return 0;
-        }
-
-        inner.partition_point(|bound| *bound <= x)
+    pub(super) fn piece(&self, x: f64) -> usize {
+        self.bounds[1..self.bounds.len() - 1].partition_point(|&b| f64::from(b) <= x)
     }
 
-    pub(crate) fn stitching_bounds(&self) -> Vec<f32> {
-        let mut stitching_bounds = self.bounds[1..self.bounds.len() - 1].to_vec();
+    pub(super) fn child(&self, index: usize) -> &Function {
+        &self.functions[index]
+    }
 
-        for (index, function) in self.functions.iter().enumerate() {
-            let (bounds_i_minus_1, bounds_i) = (self.bounds[index], self.bounds[index + 1]);
-            let Interval {
-                min: encode_min,
-                max: encode_max,
-            } = self.encode[index];
-
-            if (encode_max - encode_min).abs() <= f32::EPSILON {
-                continue;
-            }
-
-            for child_bound in function.stitching_bounds() {
-                let bound = interpolate(
-                    child_bound,
-                    encode_min,
-                    encode_max,
-                    bounds_i_minus_1,
-                    bounds_i,
-                );
-                let min_bound = bounds_i_minus_1.min(bounds_i);
-                let max_bound = bounds_i_minus_1.max(bounds_i);
-                if bound > min_bound && bound < max_bound {
-                    stitching_bounds.push(bound);
-                }
-            }
+    pub(super) fn map(&self, index: usize, x: f64) -> f64 {
+        let (lo, hi) = (
+            f64::from(self.bounds[index]),
+            f64::from(self.bounds[index + 1]),
+        );
+        let encode = self.encode[index];
+        let start = f64::from(encode.min);
+        if lo == hi {
+            start
+        } else {
+            start + (x - lo) * ((f64::from(encode.max) - start) / (hi - lo))
         }
-
-        stitching_bounds.sort_by(f32::total_cmp);
-        stitching_bounds.dedup_by(|a, b| (*a - *b).abs() <= f32::EPSILON);
-
-        stitching_bounds
     }
 }
 

@@ -1,4 +1,6 @@
+use super::ICC_COST;
 use super::{ToLuma, ToRgb, U8Lookup};
+use crate::encode::Cost;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::dict::keys::{BLACK_POINT, GAMMA, WHITE_POINT};
 
@@ -44,14 +46,22 @@ impl CalGray {
 
     fn u8_lookup(&self) -> Option<&[u8; 256]> {
         self.lookup.get_or_init_with(|input| {
-            Some(Box::new(core::array::from_fn(|index| {
+            Some(core::array::from_fn(|index| {
                 self.convert_value(input[index])
-            })))
+            }))
         })
     }
 }
 
 impl ToRgb for CalGray {
+    fn cost(&self) -> Cost {
+        ICC_COST + Cost::new(1)
+    }
+
+    fn setup_cost(&self) -> Cost {
+        Cost::ZERO
+    }
+
     fn convert(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
         let lookup = self.u8_lookup()?;
         for (input, output) in input.iter().zip(output.as_chunks_mut::<3>().0) {

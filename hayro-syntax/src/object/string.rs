@@ -1,39 +1,33 @@
 use crate::crypto::DecryptionTarget;
 use crate::filter::ascii_hex;
-use crate::object::Object;
 use crate::object::macros::object;
+use crate::object::{Bytes, Object};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::trivia::is_white_space_character;
-use alloc::vec::Vec;
 use core::borrow::Borrow;
 use core::hash::{Hash, Hasher};
 use core::ops::Deref;
 use smallvec::SmallVec;
 
-#[derive(Clone)]
-enum StringInner<'a> {
-    Borrowed(&'a [u8]),
-    Owned(SmallVec<[u8; 23]>),
-}
-
-impl AsRef<[u8]> for StringInner<'_> {
-    fn as_ref(&self) -> &[u8] {
-        match self {
-            Self::Borrowed(data) => data,
-            Self::Owned(data) => data,
-        }
-    }
-}
-
 /// A PDF string object.
 #[derive(Clone)]
-pub struct String<'a>(StringInner<'a>);
+pub struct String<'a>(Bytes<'a>);
 
 impl<'a> String<'a> {
     /// Returns the string data as a byte slice.
     pub fn as_bytes(&self) -> &[u8] {
         self.as_ref()
+    }
+
+    /// The string of `bytes`, decoded and decrypted.
+    pub(crate) fn from_bytes(bytes: Bytes<'a>) -> Self {
+        Self(bytes)
+    }
+
+    /// The string's bytes, decoded and decrypted.
+    pub(crate) fn into_bytes(self) -> Bytes<'a> {
+        self.0
     }
 }
 
@@ -47,10 +41,7 @@ impl Deref for String<'_> {
 
 impl AsRef<[u8]> for String<'_> {
     fn as_ref(&self) -> &[u8] {
-        match &self.0 {
-            StringInner::Borrowed(data) => data,
-            StringInner::Owned(data) => data,
-        }
+        self.0.as_ref()
     }
 }
 
@@ -104,31 +95,22 @@ impl Skippable for String<'_> {
 impl<'a> Readable<'a> for String<'a> {
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         let decoded = match r.peek_byte()? {
-            b'<' => StringInner::Owned(read_hex(r)?),
+            b'<' => Bytes::decoded(read_hex(r)?),
             b'(' => read_literal(r)?,
             _ => return None,
         };
 
-        let final_data = if ctx.xref().needs_decryption(ctx) {
-            if let Some(obj_number) = ctx.obj_number() {
-                ctx.xref()
-                    .decrypt(obj_number, decoded.as_ref(), DecryptionTarget::String)
-                    .map(StringInner::from)
-                    .unwrap_or(decoded)
-            } else {
-                decoded
-            }
-        } else {
-            decoded
+        // Apply decryption if needed.
+        let final_data = match ctx.decryption() {
+            Some(id) => ctx
+                .xref()
+                .decrypt(id, decoded.as_ref(), DecryptionTarget::String)
+                .map(Bytes::from)
+                .unwrap_or(decoded),
+            None => decoded,
         };
 
         Some(Self(final_data))
-    }
-}
-
-impl From<Vec<u8>> for StringInner<'_> {
-    fn from(value: Vec<u8>) -> Self {
-        Self::Owned(SmallVec::from_vec(value))
     }
 }
 
@@ -180,7 +162,7 @@ fn skip_literal(r: &mut Reader<'_>) -> Option<()> {
     Some(())
 }
 
-fn read_literal<'a>(r: &mut Reader<'a>) -> Option<StringInner<'a>> {
+fn read_literal<'a>(r: &mut Reader<'a>) -> Option<Bytes<'a>> {
     let start = r.offset();
     skip_literal(r)?;
     let end = r.offset();
@@ -188,7 +170,7 @@ fn read_literal<'a>(r: &mut Reader<'a>) -> Option<StringInner<'a>> {
     let data = r.range(start + 1..end - 1)?;
 
     if !data.iter().any(|b| matches!(b, b'\\' | b'\n' | b'\r')) {
-        return Some(StringInner::Borrowed(data));
+        return Some(Bytes::Borrowed(data));
     }
 
     let mut r = Reader::new(data);
@@ -239,11 +221,10 @@ fn read_literal<'a>(r: &mut Reader<'a>) -> Option<StringInner<'a>> {
                         _ => [b'0', b'0', next],
                     };
 
-                    let str = core::str::from_utf8(&bytes).unwrap();
-
-                    if let Ok(num) = u8::from_str_radix(str, 8) {
-                        result.push(num);
-                    }
+                    // Beyond a byte, its low 8 bits, as `MuPDF` reads `\777`
+                    // (`PyMuPDF` 1.28.2).
+                    let value = bytes.iter().fold(0_u16, |v, d| v * 8 + u16::from(d - b'0'));
+                    result.push(value as u8);
                 } else {
                     match next {
                         b'n' => result.push(0xA),
@@ -263,7 +244,7 @@ fn read_literal<'a>(r: &mut Reader<'a>) -> Option<StringInner<'a>> {
         }
     }
 
-    Some(StringInner::Owned(result))
+    Some(Bytes::decoded(result))
 }
 
 fn is_octal_digit(byte: u8) -> bool {
@@ -395,13 +376,33 @@ mod tests {
         );
     }
 
+    // As `MuPDF` reads them (`PyMuPDF` 1.28.2): an octal escape beyond a byte is
+    // its low 8 bits, and each end-of-line marker, a carriage return, a line feed
+    // or both, is one line feed, or nothing after a backslash.
     #[test]
     fn literal_string_2() {
-        assert!(
-            Reader::new(b"(Hi \\777)")
-                .read_without_context::<String<'_>>()
-                .is_some()
-        );
+        for (written, read) in [
+            (&b"(Hi \\777)"[..], &b"Hi \xff"[..]),
+            (b"(\\400)", b"\0"),
+            (b"(\\1234)", b"S4"),
+            (b"(\\08)", b"\08"),
+            (b"(a\n\nb)", b"a\n\nb"),
+            (b"(a\r\rb)", b"a\n\nb"),
+            (b"(a\r\n\r\nb)", b"a\n\nb"),
+            (b"(a\\\n\nb)", b"a\nb"),
+            (b"(a\\\r\r\nb)", b"a\nb"),
+            (b"(a\\\r\n\nb)", b"a\nb"),
+        ] {
+            assert_eq!(
+                Reader::new(written)
+                    .read_without_context::<String<'_>>()
+                    .unwrap()
+                    .as_bytes(),
+                read,
+                "{}",
+                alloc::string::String::from_utf8_lossy(written)
+            );
+        }
     }
 
     #[test]

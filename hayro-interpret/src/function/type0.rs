@@ -1,3 +1,4 @@
+use crate::encode::Cost;
 use crate::function::{Interval, MAX_COMPONENTS, read_intervals};
 use hayro_syntax::bit_reader::BitReader;
 use hayro_syntax::object::Array;
@@ -36,6 +37,30 @@ impl SampledInput {
 }
 
 impl Type0 {
+    pub(super) fn piece(&self, x: f32) -> usize {
+        self.inputs[0].sample_position(x).0
+    }
+    pub(super) fn unit_grid(&self, domain: [f32; 2], ranges: &[Interval]) -> Option<&[f32]> {
+        let [axis] = self.inputs.as_slice() else {
+            return None;
+        };
+        (self
+            .decode
+            .iter()
+            .zip(ranges)
+            .all(|(d, r)| d.min.min(d.max) >= r.min.max(0.0) && d.min.max(d.max) <= r.max.min(1.0))
+            && axis.size > 1
+            && domain == [axis.domain.min, axis.domain.max]
+            && axis.encode.min == 0.0
+            && axis.encode.max == (axis.size - 1) as f32)
+            .then_some(self.samples.as_slice())
+    }
+
+    pub(super) fn cost(&self) -> Cost {
+        let axes = self.inputs.iter().filter(|x| x.size > 1).count();
+        Cost::of(self.inputs.len() + self.decode.len())
+            + Cost::of(axes + self.decode.len()).times(1 << axes)
+    }
     pub(crate) fn new(
         stream: &Stream<'_>,
         domain: &[Interval],

@@ -27,7 +27,7 @@ impl<'a> SvgRenderer<'a> {
 
                 if !self.masks.contains(cache_key) {
                     self.with_dummy(|r| {
-                        mask.interpret(r);
+                        let _ = mask.interpret(r);
                     });
                 }
 
@@ -99,6 +99,7 @@ impl<'a> SvgRenderer<'a> {
                             )
                             .to_path(0.1),
                             DrawProps {
+                                knockout: hayro_interpret::Knockout::None,
                                 transform: Affine::IDENTITY,
                                 paint,
                                 soft_mask: None,
@@ -110,7 +111,7 @@ impl<'a> SvgRenderer<'a> {
                         self.xml.write_attribute("style", "isolation:isolate");
                     }
 
-                    mask.interpret(self);
+                    let _ = mask.interpret(self);
 
                     if use_bg {
                         self.xml.end_element();

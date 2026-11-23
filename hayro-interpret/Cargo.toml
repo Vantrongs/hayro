@@ -10,6 +10,8 @@ license = { workspace = true }
 readme = "README.md"
 
 [dependencies]
+html5ever = "0.39.0"
+unicode-bidi = { version = "0.3.18", default-features = false, features = ["hardcoded-data"] }
 hayro-cmap = { workspace = true }
 hayro-font = { workspace = true }
 hayro-postscript = { workspace = true }
@@ -22,9 +24,13 @@ bitflags = { workspace = true }
 rustc-hash = { workspace = true }
 
 [dev-dependencies]
+jpeg-encoder = "0.7"
+md5 = "0.8"
+flate2 = { workspace = true, features = ["zlib-rs"] }
 image = { workspace = true, features = ["png"] }
 
 [features]
+count-operators = []
 default = ["embed-fonts", "embed-cmaps"]
 # Embed a light-weight set of fonts (around 240KB) that can be used as a substitute for the 14 PDF standard fonts.
 embed-fonts = ["hayro-font/embed-fonts"]
@@ -33,3 +39,9 @@ embed-cmaps = ["hayro-cmap/embed-cmaps"]
 
 [lints]
 workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }

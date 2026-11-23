@@ -2,122 +2,146 @@ use crate::bit_reader::BitReader;
 use crate::context::{Color, DecoderContext, decode_1d_line, decode_2d_line};
 use crate::{DecodeError, Decoder, EncodingMode, Result};
 
-pub(crate) fn decode_1d(
-    ctx: &mut DecoderContext<'_>,
+/// Reads the EOL Group 3 data may start with, before its first line.
+pub(crate) fn start(
+    ctx: &mut DecoderContext,
     reader: &mut BitReader<'_>,
     decoder: &mut impl Decoder,
 ) -> Result<()> {
-    // PDF producers often set `end_of_line` wrongly, so always look for an EOL.
-    ctx.has_eols = reader.read_eol_if_available() > 0 || ctx.settings.end_of_line;
-
-    loop {
-        if ctx
-            .settings
-            .cancel
-            .as_ref()
-            .is_some_and(|cancel| cancel.is_cancelled())
-        {
-            return Err(DecodeError::Cancelled);
-        }
-
-        let line_start = reader.clone();
-
-        if let Err(e) = decode_1d_line(ctx, reader) {
-            recover(ctx, reader, line_start, e)?;
-        }
-
-        ctx.next_line(decoder);
-
-        if check_eob(ctx, reader)? {
-            break;
-        }
-    }
-
+    // It seems like PDF producers are a bit sloppy with the `end_of_line` flag,
+    // so we just always try to read one.
+    ctx.has_eols = reader.read_eol_if_available(decoder)? > 0 || ctx.settings.end_of_line;
     Ok(())
 }
 
-pub(crate) fn decode_2d(
-    ctx: &mut DecoderContext<'_>,
+/// Decodes the next line of Group 3 1D data (T.4 Section 4.1), after [`start`]:
+/// false, with no line decoded, once the data ended after the line before.
+pub(crate) fn step_1d(
+    ctx: &mut DecoderContext,
     reader: &mut BitReader<'_>,
     decoder: &mut impl Decoder,
-) -> Result<()> {
-    // PDF producers often set `end_of_line` wrongly, so always look for an EOL.
-    ctx.has_eols = reader.read_eol_if_available() > 0 || ctx.settings.end_of_line;
+) -> Result<bool> {
+    reader.poll(decoder)?;
+    if ended(ctx, reader, decoder)? {
+        return Ok(false);
+    }
+    let line_start = reader.clone();
 
-    loop {
-        if ctx
-            .settings
-            .cancel
-            .as_ref()
-            .is_some_and(|cancel| cancel.is_cancelled())
-        {
-            return Err(DecodeError::Cancelled);
-        }
-
-        let line_start = reader.clone();
-
-        let result = reader.read_bit().and_then(|tag_bit| {
-            if tag_bit == 1 {
-                decode_1d_line(ctx, reader)
-            } else {
-                decode_2d_line(ctx, reader)
-            }
-        });
-
-        if let Err(e) = result {
-            recover(ctx, reader, line_start, e)?;
-        }
-
-        ctx.next_line(decoder);
-
-        if check_eob(ctx, reader)? {
-            break;
+    if let Err(e) = decode_1d_line(ctx, reader, decoder) {
+        match ctx.salvage(reader, e, decoder) {
+            Ok(()) => return Ok(false),
+            Err(e) => recover(ctx, reader, line_start, e)?,
         }
     }
 
-    Ok(())
+    ctx.next_line(decoder);
+
+    Ok(true)
 }
 
+/// Decodes the next line of Group 3 2D data (T.4 Section 4.2), after [`start`]:
+/// false, with no line decoded, once the data ended after the line before.
+pub(crate) fn step_2d(
+    ctx: &mut DecoderContext,
+    reader: &mut BitReader<'_>,
+    decoder: &mut impl Decoder,
+) -> Result<bool> {
+    reader.poll(decoder)?;
+    if ended(ctx, reader, decoder)? {
+        return Ok(false);
+    }
+    let line_start = reader.clone();
+
+    let result = reader.read_bit().and_then(|tag_bit| {
+        if tag_bit == 1 {
+            decode_1d_line(ctx, reader, decoder)
+        } else {
+            decode_2d_line(ctx, reader, decoder)
+        }
+    });
+
+    if let Err(e) = result {
+        match ctx.salvage(reader, e, decoder) {
+            Ok(()) => return Ok(false),
+            Err(e) => recover(ctx, reader, line_start, e)?,
+        }
+    }
+
+    ctx.next_line(decoder);
+
+    Ok(true)
+}
+
+/// Whether the data ended after the line decoded last, if any: what follows a line
+/// is read before the next one, not after it, so that a line is pushed without
+/// waiting on the EOLs and data after it.
+fn ended(
+    ctx: &mut DecoderContext,
+    reader: &mut BitReader<'_>,
+    decoder: &mut impl Decoder,
+) -> Result<bool> {
+    Ok(ctx.decoded_rows > 0 && check_eob(ctx, reader, decoder)?)
+}
+
+/// Recover from a damaged line by continuing at the next EOL.
 #[cold]
 fn recover<'a>(
-    ctx: &mut DecoderContext<'_>,
+    ctx: &mut DecoderContext,
     reader: &mut BitReader<'a>,
     line_start: BitReader<'a>,
     error: DecodeError,
 ) -> Result<()> {
-    if !ctx.has_eols || ctx.settings.strict {
+    if error == DecodeError::Stopped || !ctx.has_eols || ctx.settings.strict {
         return Err(error);
     }
 
-    // The first EOL after the line start terminates the line, and `check_eob` skips to it.
+    // Valid data never contains an EOL, so the first EOL after the start of
+    // the line must be the one terminating it. Since the line won't be
+    // followed by an EOL from its start, `check_eob` will skip to it before
+    // the next line.
     *reader = line_start;
 
     ctx.color = Color::White;
     ctx.push_pixels(ctx.line_width - ctx.pixels_decoded)
 }
 
-fn check_eob(ctx: &mut DecoderContext<'_>, reader: &mut BitReader<'_>) -> Result<bool> {
-    // Without EOLs, alignment padding plus the next line's leading zeros could look like an EOL.
+/// Check for end-of-block, including RTC (T.4 Section 4.1.4).
+fn check_eob(
+    ctx: &mut DecoderContext,
+    reader: &mut BitReader<'_>,
+    decoder: &mut impl Decoder,
+) -> Result<bool> {
+    // If the data contains EOLs, we treat the zeros used for byte alignment as
+    // fill, so it doesn't matter whether the encoder aligned the start or the
+    // end of the EOL. Without EOLs, we need to align first, as the padding
+    // together with the leading zeros of the next line could otherwise be
+    // mistaken for an EOL.
     if ctx.settings.rows_are_byte_aligned && !ctx.has_eols {
         reader.align();
     }
 
-    let mut eol_count = read_eols(ctx, reader);
+    let mut eol_count = read_eols(ctx, reader, decoder)?;
     let rows_done = ctx.decoded_rows == ctx.settings.rows;
 
+    // If a line isn't followed by an EOL even though the data contains EOLs,
+    // the line contained more data than expected, so we skip the rest.
     if eol_count == 0 && ctx.has_eols && !rows_done && !reader.at_end() {
         if ctx.settings.strict {
             return Err(DecodeError::InvalidCode);
         }
 
-        if reader.skip_to_eol() {
-            eol_count = read_eols(ctx, reader);
+        if reader.skip_to_eol(decoder)? {
+            eol_count = read_eols(ctx, reader, decoder)?;
         } else {
+            // There are no more EOLs, so don't search for them again.
             ctx.has_eols = false;
         }
     }
 
-    // PDFBOX-2778 has 7 EOLs instead of 6.
+    // T.4 Section 4.1.4: "The end of a document transmission is indicated by
+    // sending six consecutive EOLs."
+    // PDFBOX-2778 has 7 EOL, although it should only be 6. Let's be lenient
+    // and check with >=.
     if ctx.settings.end_of_block && eol_count >= 6 {
         return Ok(true);
     }
@@ -125,12 +149,20 @@ fn check_eob(ctx: &mut DecoderContext<'_>, reader: &mut BitReader<'_>) -> Result
     Ok(rows_done || reader.at_end())
 }
 
-// In 2D data an RTC is six EOL+1 sequences, so tag bits between EOLs are consumed too.
-fn read_eols(ctx: &DecoderContext<'_>, reader: &mut BitReader<'_>) -> usize {
-    let mut eol_count = reader.read_eol_if_available();
+/// Read consecutive EOLs.
+///
+/// In 2D data, an RTC consists of six times EOL + 1 (T.4 Section 4.2.4), so
+/// tag bits between EOLs are skipped as well, including the one after the last
+/// EOL of an RTC.
+fn read_eols(
+    ctx: &DecoderContext,
+    reader: &mut BitReader<'_>,
+    decoder: &mut impl Decoder,
+) -> Result<usize> {
+    let mut eol_count = reader.read_eol_if_available(decoder)?;
 
     if !matches!(ctx.settings.encoding, EncodingMode::Group3_2D) {
-        return eol_count;
+        return Ok(eol_count);
     }
 
     while eol_count > 0 {
@@ -140,9 +172,10 @@ fn read_eols(ctx: &DecoderContext<'_>, reader: &mut BitReader<'_>) -> usize {
             break;
         }
 
-        match next.read_eol_if_available() {
+        match next.read_eol_if_available(decoder)? {
             0 => {
-                // Unless this is the last tag bit of an RTC, it belongs to the next line.
+                // Unless this is the last tag bit of an RTC, it belongs to the
+                // next line.
                 if eol_count >= 6 {
                     *reader = next;
                 }
@@ -156,5 +189,5 @@ fn read_eols(ctx: &DecoderContext<'_>, reader: &mut BitReader<'_>) -> usize {
         }
     }
 
-    eol_count
+    Ok(eol_count)
 }

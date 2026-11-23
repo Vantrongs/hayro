@@ -1,18 +1,26 @@
-use crate::object::Dict;
-use crate::object::Stream;
-use crate::object::dict::keys::JBIG2_GLOBALS;
-use crate::object::stream::{FilterResult, ImageColorSpace, ImageData, ImageDecodeParams};
+use crate::object::stream::{
+    FilterResult, ImageColorSpace, ImageData, ImageDecodeParams, OwnedStream,
+};
+use crate::work::Meter;
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
 
+/// Decode JBIG2 data from a PDF stream.
+///
+/// `globals` is the stream with shared symbol dictionaries its parameters'
+/// `JBIG2Globals` names.
 pub(crate) fn decode(
     data: &[u8],
-    params: &Dict<'_>,
+    globals: Option<&OwnedStream>,
     image_params: &ImageDecodeParams,
+    meter: &Meter<'_>,
 ) -> Option<FilterResult<'static>> {
-    let globals = params
-        .get::<Stream<'_>>(JBIG2_GLOBALS)
-        .and_then(|g| g.decoded_data().ok());
+    let globals = globals.and_then(|g| {
+        g.decoded_image_metered(&ImageDecodeParams::default(), meter)
+            .map(|d| d.data)
+            .ok()
+    });
+    meter.poll().ok()?;
 
     let settings = hayro_jbig2::DecodeSettings::default();
     let globals = globals
@@ -27,12 +35,13 @@ pub(crate) fn decode(
     let (decoded, bpc) = if image_params.is_indexed {
         let width = bitmap.width() as usize;
         let row_bytes = width.div_ceil(8);
-        let mut packed = Vec::with_capacity(row_bytes * bitmap.height() as usize);
+        let mut packed = meter.room(row_bytes.checked_mul(bitmap.height() as usize)?);
         let padding_mask = !0_u8 << ((8 - width % 8) % 8);
 
         for row in bitmap.rows() {
             packed.extend(bytes(row, row_bytes).map(|byte| !byte));
 
+            meter.work(row_bytes).ok()?;
             if let Some(last) = packed.last_mut() {
                 *last &= padding_mask;
             }
@@ -40,7 +49,9 @@ pub(crate) fn decode(
 
         (packed, 1)
     } else {
-        (bitmap.data_u8().ok()?, 8)
+        let pixels = bitmap.data_u8().ok()?;
+        meter.work(pixels.len()).ok()?;
+        (pixels, 8)
     };
 
     Some(FilterResult {
@@ -48,6 +59,7 @@ pub(crate) fn decode(
         image_data: Some(ImageData {
             alpha: None,
             color_space: Some(ImageColorSpace::Gray),
+            component_depths: Vec::new(),
             bits_per_component: bpc,
             width: bitmap.width(),
             height: bitmap.height(),

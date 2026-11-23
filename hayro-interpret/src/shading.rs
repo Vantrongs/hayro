@@ -3,15 +3,18 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::CacheKey;
+use crate::annotation::entries::Entries;
 use crate::cache::Cache;
 use crate::color::{ColorComponents, ColorSpace};
+use crate::encode::Cost;
 use crate::function::{Function, interpolate};
-use crate::util::{Float32Ext, PointExt, RectExt};
+use crate::radial::{Circles, same};
+use crate::util::PointExt;
 use hayro_syntax::bit_reader::BitReader;
 use hayro_syntax::object::Array;
 use hayro_syntax::object::Dict;
+use hayro_syntax::object::Number;
 use hayro_syntax::object::Object;
-use hayro_syntax::object::Rect;
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::{
     BACKGROUND, BBOX, BITS_PER_COMPONENT, BITS_PER_COORDINATE, BITS_PER_FLAG, COLORSPACE, COORDS,
@@ -31,6 +34,18 @@ pub enum ShadingFunction {
 }
 
 impl ShadingFunction {
+    /// The most steps one [`eval`](Self::eval) takes ([`Function::cost`]).
+    pub fn cost(&self) -> Cost {
+        match self {
+            Self::Single(function) => function.cost(),
+            // And a step each to put its output.
+            Self::Multiple(functions) => functions
+                .iter()
+                .map(|function| function.cost() + Cost::new(1))
+                .sum(),
+        }
+    }
+
     /// The number of output values of the shading function.
     pub fn num_outputs(&self) -> usize {
         match self {
@@ -57,21 +72,24 @@ impl ShadingFunction {
         }
     }
 
-    pub(crate) fn stitching_bounds(&self) -> Vec<f32> {
-        let mut bounds = vec![];
-
+    pub(crate) fn unit_linear(&self, domain: [f32; 2]) -> bool {
         match self {
-            Self::Single(function) => bounds.extend(function.stitching_bounds()),
-            Self::Multiple(functions) => {
-                for function in functions {
-                    bounds.extend(function.stitching_bounds());
-                }
-            }
+            Self::Single(f) => f.unit_linear(domain),
+            Self::Multiple(fs) => fs.iter().all(|f| f.unit_linear(domain)),
         }
+    }
+    pub(crate) fn requires_direct_sampling(&self) -> bool {
+        match self {
+            Self::Single(f) => f.requires_direct_sampling(),
+            Self::Multiple(fs) => fs.iter().any(Function::requires_direct_sampling),
+        }
+    }
 
-        bounds.sort_by(f32::total_cmp);
-        bounds.dedup_by(|a, b| (*a - *b).abs() <= f32::EPSILON);
-        bounds
+    pub(crate) fn functions(&self) -> &[Function] {
+        match self {
+            Self::Single(f) => std::slice::from_ref(f),
+            Self::Multiple(fs) => fs,
+        }
     }
 }
 
@@ -90,7 +108,9 @@ pub enum ShadingType {
     /// A radial-axial shading.
     RadialAxial {
         /// `x0 y0 x1 y1` for axial shadings, `x0 y0 r0 x1 y1 r1` for radial ones.
-        coords: [f32; 6],
+        coords: [f64; 6],
+        /// Prepared local circle geometry.
+        circles: Circles,
         /// The domain of the shading.
         domain: [f32; 2],
         /// The function forming the basis of the shading.
@@ -104,6 +124,8 @@ pub enum ShadingType {
     TriangleMesh {
         /// The triangles making up the shading.
         triangles: Vec<Triangle>,
+        /// The decoded range of the first component.
+        domain: [f32; 2],
         /// An optional function used for calculating the sampled color values.
         function: Option<ShadingFunction>,
     },
@@ -111,6 +133,8 @@ pub enum ShadingType {
     PatchMesh {
         /// The patches that make up the shading.
         patches: Vec<Patch>,
+        /// The decoded range of the first component.
+        domain: [f32; 2],
         /// An optional function used for calculating the sampled color values.
         function: Option<ShadingFunction>,
     },
@@ -130,6 +154,7 @@ pub struct Shading {
     pub clip_path: Option<BezPath>,
     /// The background color of the shading.
     pub background: Option<SmallVec<[f32; 4]>>,
+    pub(crate) unit_components: bool,
     pub(crate) mesh_bounds: Option<kurbo::Rect>,
 }
 
@@ -137,7 +162,14 @@ impl Shading {
     pub(crate) fn new(dict: &Dict<'_>, stream: Option<&Stream<'_>>, cache: &Cache) -> Option<Self> {
         let cache_key = stream.map_or_else(|| dict.cache_key(), |s| s.cache_key());
 
-        cache.get_or_insert_with(cache_key, || Self::parse(dict, stream, cache, cache_key))
+        cache.get_or_insert_with(cache_key, || {
+            Self::parse(
+                &dict.as_root(),
+                stream.map(Stream::as_root).as_ref(),
+                cache,
+                cache_key,
+            )
+        })
     }
 
     fn parse(
@@ -150,14 +182,17 @@ impl Shading {
 
         let color_space = ColorSpace::new(dict.get(COLORSPACE)?, cache)?;
 
+        let mut unit_components = false;
+        let mut mesh_decode = || {
+            let decode: Vec<_> = dict.get::<Array<'_>>(DECODE)?.iter::<f32>().collect();
+            unit_components = decode.get(4..)?.iter().all(|v| (0.0..=1.0).contains(v));
+            Some(decode)
+        };
         let mut mesh_bounds = None;
         let shading_type = match shading_num {
             1 => {
                 let domain = dict.get::<[f32; 4]>(DOMAIN).unwrap_or([0.0, 1.0, 0.0, 1.0]);
-                let matrix = dict
-                    .get::<[f64; 6]>(MATRIX)
-                    .map(Affine::new)
-                    .unwrap_or_default();
+                let matrix = Affine::new(Entries::detached(dict.clone()).matrix(MATRIX));
                 let function = read_function(dict, &color_space)?;
 
                 ShadingType::FunctionBased {
@@ -170,18 +205,17 @@ impl Shading {
                 let domain = dict.get::<[f32; 2]>(DOMAIN).unwrap_or([0.0, 1.0]);
                 let function = read_function(dict, &color_space)?;
                 let extend = dict.get::<[bool; 2]>(EXTEND).unwrap_or([false, false]);
-                let (coords, invalid) = if shading_num == 2 {
-                    let read = dict.get::<[f32; 4]>(COORDS)?;
-                    let invalid = (read[0] - read[2]).is_nearly_zero()
-                        && (read[1] - read[3]).is_nearly_zero();
-                    ([read[0], read[1], read[2], read[3], 0.0, 0.0], invalid)
+                let (read, invalid) = if shading_num == 2 {
+                    let [x0, y0, x1, y1] = dict.get::<[Number; 4]>(COORDS)?;
+                    let invalid = same(x0, x1) && same(y0, y1);
+                    ([x0, y0, x1, y1, Number::ZERO, Number::ZERO], invalid)
                 } else {
-                    let read = dict.get::<[f32; 6]>(COORDS)?;
-                    let invalid = (read[0] - read[3]).is_nearly_zero()
-                        && (read[1] - read[4]).is_nearly_zero()
-                        && (read[2] - read[5]).is_nearly_zero();
+                    let read = dict.get::<[Number; 6]>(COORDS)?;
+                    let invalid =
+                        same(read[0], read[3]) && same(read[1], read[4]) && same(read[2], read[5]);
                     (read, invalid)
                 };
+                let coords = read.map(|n| n.as_f64());
 
                 let axial = shading_num == 2;
 
@@ -193,6 +227,7 @@ impl Shading {
                         function,
                         extend,
                         coords,
+                        circles: Circles::of(read),
                         axial,
                     }
                 }
@@ -204,10 +239,7 @@ impl Shading {
                 let bp_comp = dict.get::<u8>(BITS_PER_COMPONENT)?;
                 let bpf = dict.get::<u8>(BITS_PER_FLAG)?;
                 let function = read_function(dict, &color_space);
-                let decode = dict
-                    .get::<Array<'_>>(DECODE)?
-                    .iter::<f32>()
-                    .collect::<Vec<_>>();
+                let decode = mesh_decode()?;
 
                 let (triangles, bounds) = read_free_form_triangles(
                     stream_data.as_ref(),
@@ -221,6 +253,7 @@ impl Shading {
 
                 ShadingType::TriangleMesh {
                     triangles,
+                    domain: decode.get(4..6)?.try_into().ok()?,
                     function,
                 }
             }
@@ -230,10 +263,7 @@ impl Shading {
                 let bp_coord = dict.get::<u8>(BITS_PER_COORDINATE)?;
                 let bp_comp = dict.get::<u8>(BITS_PER_COMPONENT)?;
                 let function = read_function(dict, &color_space);
-                let decode = dict
-                    .get::<Array<'_>>(DECODE)?
-                    .iter::<f32>()
-                    .collect::<Vec<_>>();
+                let decode = mesh_decode()?;
                 let vertices_per_row = dict.get::<u32>(VERTICES_PER_ROW)?;
 
                 let (triangles, bounds) = read_lattice_triangles(
@@ -248,6 +278,7 @@ impl Shading {
 
                 ShadingType::TriangleMesh {
                     triangles,
+                    domain: decode.get(4..6)?.try_into().ok()?,
                     function,
                 }
             }
@@ -258,10 +289,7 @@ impl Shading {
                 let bp_comp = dict.get::<u8>(BITS_PER_COMPONENT)?;
                 let bpf = dict.get::<u8>(BITS_PER_FLAG)?;
                 let function = read_function(dict, &color_space);
-                let decode = dict
-                    .get::<Array<'_>>(DECODE)?
-                    .iter::<f32>()
-                    .collect::<Vec<_>>();
+                let decode = mesh_decode()?;
 
                 let (patches, bounds) = read_patch_mesh(
                     stream_data.as_ref(),
@@ -274,7 +302,11 @@ impl Shading {
                 )?;
                 mesh_bounds = bounds;
 
-                ShadingType::PatchMesh { patches, function }
+                ShadingType::PatchMesh {
+                    patches,
+                    domain: decode.get(4..6)?.try_into().ok()?,
+                    function,
+                }
             }
             7 => {
                 let stream = stream?;
@@ -283,10 +315,7 @@ impl Shading {
                 let bp_comp = dict.get::<u8>(BITS_PER_COMPONENT)?;
                 let bpf = dict.get::<u8>(BITS_PER_FLAG)?;
                 let function = read_function(dict, &color_space);
-                let decode = dict
-                    .get::<Array<'_>>(DECODE)?
-                    .iter::<f32>()
-                    .collect::<Vec<_>>();
+                let decode = mesh_decode()?;
 
                 let (patches, bounds) = read_patch_mesh(
                     stream_data.as_ref(),
@@ -299,12 +328,16 @@ impl Shading {
                 )?;
                 mesh_bounds = bounds;
 
-                ShadingType::PatchMesh { patches, function }
+                ShadingType::PatchMesh {
+                    patches,
+                    domain: decode.get(4..6)?.try_into().ok()?,
+                    function,
+                }
             }
             _ => return None,
         };
 
-        let bbox = dict.get::<Rect>(BBOX).map(|r| r.to_kurbo());
+        let bbox = Entries::detached(dict.clone()).rect(BBOX);
         let background = dict
             .get::<Array<'_>>(BACKGROUND)
             .map(|a| a.iter::<f32>().collect::<SmallVec<_>>());
@@ -316,6 +349,7 @@ impl Shading {
             clip_path: bbox.map(|r| r.to_path(0.1)),
             background,
             mesh_bounds,
+            unit_components,
         })
     }
 }
@@ -419,7 +453,7 @@ struct InterpolationHelpers {
     bp_coord: u8,
     bp_comp: u8,
     coord_max: f32,
-    comp_max: f32,
+    comp_max: u32,
     x_min: f32,
     x_max: f32,
     y_min: f32,
@@ -429,7 +463,10 @@ struct InterpolationHelpers {
 impl InterpolationHelpers {
     fn new(bp_coord: u8, bp_comp: u8, x_min: f32, x_max: f32, y_min: f32, y_max: f32) -> Self {
         let coord_max = 2.0_f32.powi(bp_coord as i32) - 1.0;
-        let comp_max = 2.0_f32.powi(bp_comp as i32) - 1.0;
+        let comp_max = 1_u32
+            .checked_shl(u32::from(bp_comp))
+            .unwrap_or(0)
+            .wrapping_sub(1);
         Self {
             bp_coord,
             bp_comp,
@@ -447,7 +484,15 @@ impl InterpolationHelpers {
     }
 
     fn interpolate_comp(&self, n: u32, d_min: f32, d_max: f32) -> f32 {
-        interpolate(n as f32, 0.0, self.comp_max, d_min, d_max)
+        if n == 0 {
+            return d_min;
+        }
+        if n == self.comp_max {
+            return d_max;
+        }
+        let t = f64::from(n) / f64::from(self.comp_max);
+        let value = (f64::from(d_min) + (f64::from(d_max) - f64::from(d_min)) * t) as f32;
+        value.max(d_min.min(d_max)).min(d_min.max(d_max))
     }
 
     fn read_point(&self, reader: &mut BitReader<'_>) -> Option<Point> {

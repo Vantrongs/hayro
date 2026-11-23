@@ -23,7 +23,8 @@ use self::indexed::Indexed;
 use self::lab::Lab;
 use self::pattern::Pattern;
 use self::separation::Separation;
-use crate::cache::{Cache, CacheKey};
+use crate::cache::{Building, Cache};
+use crate::encode::Cost;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
 use hayro_syntax::object::Object;
@@ -39,7 +40,7 @@ const MAX_COLOR_SPACE_DEPTH: u8 = 32;
 pub type ColorComponents = SmallVec<[f32; 4]>;
 
 #[derive(Clone)]
-pub(super) struct U8Lookup<T>(Arc<OnceLock<Option<Box<[T; 256]>>>>);
+pub(super) struct U8Lookup<T>(Arc<OnceLock<Option<[T; 256]>>>);
 
 impl<T> Default for U8Lookup<T> {
     fn default() -> Self {
@@ -53,17 +54,43 @@ impl<T> std::fmt::Debug for U8Lookup<T> {
     }
 }
 
+/// The steps converting a color with a profile's transform takes, besides one a
+/// component.
+pub(super) const ICC_COST: Cost = Cost::new(16);
+
+/// The steps converting a color of `components` components by copying or looking
+/// it up takes: one, and one a component.
+pub(super) const fn copy_cost(components: u64) -> Cost {
+    Cost::new(1 + components)
+}
+
 impl<T> U8Lookup<T> {
+    /// Whether the table is built.
+    pub(super) fn is_built(&self) -> bool {
+        self.0.get().is_some()
+    }
+
+    /// The steps building the table takes until it is built, a value's taking
+    /// `each`.
+    pub(super) fn setup_cost(&self, each: Cost) -> Cost {
+        if self.is_built() {
+            Cost::ZERO
+        } else {
+            // And a step to put each value.
+            (each + Cost::new(1)).times(256)
+        }
+    }
+
     pub(super) fn get_or_init_with(
         &self,
-        init: impl FnOnce(&[u8; 256]) -> Option<Box<[T; 256]>>,
+        init: impl FnOnce(&[u8; 256]) -> Option<[T; 256]>,
     ) -> Option<&[T; 256]> {
         self.0
             .get_or_init(|| {
                 let input: [u8; 256] = core::array::from_fn(|index| index as u8);
                 init(&input)
             })
-            .as_deref()
+            .as_ref()
     }
 }
 
@@ -73,7 +100,7 @@ impl U8Lookup<[u8; 3]> {
         convert: impl FnOnce(&[u8], &mut [u8]) -> Option<()>,
     ) -> Option<&[[u8; 3]; 256]> {
         self.get_or_init_with(|input| {
-            let mut output = Box::new([[0; 3]; 256]);
+            let mut output = [[0; 3]; 256];
             convert(input, output.as_flattened_mut())?;
             Some(output)
         })
@@ -140,7 +167,7 @@ impl AlphaColor {
 }
 
 const fn u8_to_f32(x: u8) -> f32 {
-    x as f32 * (1.0 / 255.0)
+    x as f32 / 255.0
 }
 
 #[derive(Debug, Clone)]
@@ -159,7 +186,7 @@ pub(crate) enum ColorSpaceType {
 }
 
 impl ColorSpaceType {
-    fn new(object: Object<'_>, cache: &Cache, depth: u8) -> Option<Self> {
+    fn new(object: Object<'_>, cache: &Building<'_>, depth: u8) -> Option<Self> {
         if depth >= MAX_COLOR_SPACE_DEPTH {
             return None;
         }
@@ -167,7 +194,7 @@ impl ColorSpaceType {
         Self::new_inner(object, cache, depth)
     }
 
-    fn new_inner(object: Object<'_>, cache: &Cache, depth: u8) -> Option<Self> {
+    fn new_inner(object: Object<'_>, cache: &Building<'_>, depth: u8) -> Option<Self> {
         if let Object::Name(name) = object {
             return Self::new_from_name(&name);
         } else if let Object::Array(color_array) = object {
@@ -180,34 +207,29 @@ impl ColorSpaceType {
                     let dict = icc_stream.dict();
                     let num_components = dict.get::<usize>(N)?;
 
-                    return cache.get_or_insert_with(icc_stream.cache_key(), || {
-                        if let Some(decoded) = icc_stream.decoded_data().ok().as_ref() {
-                            ICCProfile::new(decoded, num_components)
-                                .map(|icc| {
-                                    // TODO: For SVG and PNG we can assume that the output color space is
-                                    // sRGB. If we ever implement PDF-to-PDF, we probably want to
-                                    // let the user pass the native color type and don't make this optimization
-                                    // if it's not sRGB.
-                                    if icc.is_srgb() {
-                                        Self::DeviceRgb(DeviceRgb)
-                                    } else {
-                                        Self::ICCBased(icc)
-                                    }
-                                })
-                                .or_else(|| {
-                                    dict.get::<Object<'_>>(ALTERNATE)
-                                        .and_then(|o| Self::new(o, cache, depth + 1))
-                                })
-                                .or_else(|| match dict.get::<u8>(N) {
-                                    Some(1) => Some(Self::DeviceGray(DeviceGray)),
-                                    Some(3) => Some(Self::DeviceRgb(DeviceRgb)),
-                                    Some(4) => Some(Self::DeviceCmyk(DeviceCmyk)),
-                                    _ => None,
-                                })
-                        } else {
-                            None
-                        }
-                    });
+                    return cache
+                        .of_stream(&icc_stream, num_components, ICCProfile::new)?
+                        .map(|icc| {
+                            // TODO: For SVG and PNG we can assume that the output color space is
+                            // sRGB. If we ever implement PDF-to-PDF, we probably want to
+                            // let the user pass the native color type and don't make this optimization
+                            // if it's not sRGB.
+                            if icc.is_srgb() {
+                                Self::DeviceRgb(DeviceRgb)
+                            } else {
+                                Self::ICCBased(icc)
+                            }
+                        })
+                        .or_else(|| {
+                            dict.get::<Object<'_>>(ALTERNATE)
+                                .and_then(|o| Self::new(o, cache, depth + 1))
+                        })
+                        .or_else(|| match dict.get::<u8>(N) {
+                            Some(1) => Some(Self::DeviceGray(DeviceGray)),
+                            Some(3) => Some(Self::DeviceRgb(DeviceRgb)),
+                            Some(4) => Some(Self::DeviceCmyk(DeviceCmyk)),
+                            _ => None,
+                        });
                 }
                 CALCMYK => return Some(Self::DeviceCmyk(DeviceCmyk)),
                 CALGRAY => {
@@ -271,11 +293,27 @@ impl ColorSpaceType {
 pub struct ColorSpace(Arc<ColorSpaceType>);
 
 impl ColorSpace {
-    pub(crate) fn new(object: Object<'_>, cache: &Cache) -> Option<Self> {
-        Self::new_nested(object, cache, 0)
+    /// The most steps [`to_rgba`](Self::to_rgba) takes for one color once the tables
+    /// it looks colors up in are built, those of every color space and function it
+    /// hands the color to included.
+    pub fn cost(&self) -> Cost {
+        ToRgb::cost(self)
     }
 
-    pub(super) fn new_nested(object: Object<'_>, cache: &Cache, depth: u8) -> Option<Self> {
+    /// The steps building the tables [`to_rgba`](Self::to_rgba) looks colors up in
+    /// takes, until they are built.
+    pub fn setup_cost(&self) -> Cost {
+        ToRgb::setup_cost(self)
+    }
+
+    pub(crate) fn new(object: Object<'_>, cache: &Cache) -> Option<Self> {
+        match object {
+            Object::Name(name) => Self::new_from_name(&name),
+            object => cache.rooted(&object, |o, cache| Self::new_nested(o, cache, 0)),
+        }
+    }
+
+    pub(super) fn new_nested(object: Object<'_>, cache: &Building<'_>, depth: u8) -> Option<Self> {
         Some(Self(Arc::new(ColorSpaceType::new(object, cache, depth)?)))
     }
 
@@ -314,6 +352,18 @@ impl ColorSpace {
 
     pub(crate) fn is_indexed(&self) -> bool {
         matches!(self.0.as_ref(), ColorSpaceType::Indexed(_))
+    }
+
+    pub(crate) fn ramp_compatible(&self) -> bool {
+        self.num_components() <= 4
+            && (self.is_device_gray_or_rgb()
+                || matches!(
+                    &*self.0,
+                    ColorSpaceType::DeviceCmyk(_)
+                        | ColorSpaceType::ICCBased(_)
+                        | ColorSpaceType::Separation(_)
+                        | ColorSpaceType::DeviceN(_)
+                ))
     }
 
     pub(crate) fn is_device_gray_or_rgb(&self) -> bool {
@@ -379,6 +429,14 @@ impl ColorSpace {
     }
 
     pub(crate) fn convert_values(&self, input: &[f32], output: &mut [u8]) -> Option<()> {
+        if let ColorSpaceType::DeviceN(space) = self.0.as_ref() {
+            let mut encoded = [255; crate::function::MAX_COMPONENTS];
+            let encoded = &mut encoded[..usize::from(space.num_components)];
+            for (byte, &value) in encoded.iter_mut().zip(input) {
+                *byte = f32_to_u8(value);
+            }
+            return space.convert(encoded, output);
+        }
         let converted = self.encode_values(input);
         self.convert(&converted, output)
     }
@@ -498,6 +556,38 @@ impl ColorSpace {
 }
 
 impl ToRgb for ColorSpace {
+    fn cost(&self) -> Cost {
+        match self.0.as_ref() {
+            ColorSpaceType::DeviceCmyk(i) => i.cost(),
+            ColorSpaceType::DeviceGray(i) => i.cost(),
+            ColorSpaceType::DeviceRgb(i) => i.cost(),
+            ColorSpaceType::Pattern(i) => i.cost(),
+            ColorSpaceType::Indexed(i) => i.cost(),
+            ColorSpaceType::ICCBased(i) => i.cost(),
+            ColorSpaceType::CalGray(i) => i.cost(),
+            ColorSpaceType::CalRgb(i) => i.cost(),
+            ColorSpaceType::Lab(i) => i.cost(),
+            ColorSpaceType::Separation(i) => i.cost(),
+            ColorSpaceType::DeviceN(i) => i.cost(),
+        }
+    }
+
+    fn setup_cost(&self) -> Cost {
+        match self.0.as_ref() {
+            ColorSpaceType::DeviceCmyk(i) => i.setup_cost(),
+            ColorSpaceType::DeviceGray(i) => i.setup_cost(),
+            ColorSpaceType::DeviceRgb(i) => i.setup_cost(),
+            ColorSpaceType::Pattern(i) => i.setup_cost(),
+            ColorSpaceType::Indexed(i) => i.setup_cost(),
+            ColorSpaceType::ICCBased(i) => i.setup_cost(),
+            ColorSpaceType::CalGray(i) => i.setup_cost(),
+            ColorSpaceType::CalRgb(i) => i.setup_cost(),
+            ColorSpaceType::Lab(i) => i.setup_cost(),
+            ColorSpaceType::Separation(i) => i.setup_cost(),
+            ColorSpaceType::DeviceN(i) => i.setup_cost(),
+        }
+    }
+
     fn convert(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
         match self.0.as_ref() {
             ColorSpaceType::DeviceCmyk(i) => i.convert(input, output),
@@ -606,6 +696,14 @@ impl Color {
         self.color_space.to_rgba(&self.components, self.opacity)
     }
 
+    pub(crate) fn opacity(&self) -> f32 {
+        self.opacity
+    }
+
+    pub(crate) fn set_opacity(&mut self, opacity: f32) {
+        self.opacity = opacity;
+    }
+
     /// Create a color from RGBA.
     #[inline]
     pub fn from_rgba(rgba: AlphaColor) -> Self {
@@ -619,6 +717,9 @@ impl Color {
 }
 
 pub(crate) trait ToRgb {
+    fn cost(&self) -> Cost;
+    fn setup_cost(&self) -> Cost;
+
     fn convert(&self, input: &[u8], output: &mut [u8]) -> Option<()>;
     fn convert_in_place(&self, _input: &mut [u8]) -> Option<()> {
         None

@@ -14,13 +14,13 @@ pub(crate) trait CacheKey {
 
 impl CacheKey for Dict<'_> {
     fn cache_key(&self) -> u128 {
-        hash128(self.data())
+        hash128(&(b"dict", self.content_key().value()))
     }
 }
 
 impl CacheKey for Stream<'_> {
     fn cache_key(&self) -> u128 {
-        match self.dict().obj_id() {
+        match self.identity() {
             Some(obj_id) => hash128(&obj_id),
             None => hash128(&(self.dict().data(), self.raw_data().as_ref())),
         }

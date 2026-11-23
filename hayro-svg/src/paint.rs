@@ -125,7 +125,7 @@ impl<'a> SvgRenderer<'a> {
                             bbox.y1.to_bits(),
                         ));
 
-                        let encoded = s.encode();
+                        let encoded = s.encode().prepare_for(bbox);
                         let shading_paint = if let EncodedShadingType::RadialAxial(gradient) =
                             &encoded.shading_type
                             && let Some(native) =
@@ -153,7 +153,7 @@ impl<'a> SvgRenderer<'a> {
                             }
                         };
 
-                        let clip_path = s.shading.clip_path.clone().map(|path| {
+                        let clip_path = s.clip_path().map(|path| {
                             self.clip_paths.insert(CachedClipPath::Path {
                                 path,
                                 fill_rule: FillRule::NonZero,
@@ -336,7 +336,7 @@ impl<'a> SvgRenderer<'a> {
         self.xml.write_attribute("id", "shading");
 
         for (id, shading) in shadings.iter() {
-            let encoded = shading.pattern.encode();
+            let encoded = shading.pattern.encode().prepare_for(shading.bbox);
             let texture = encoded.render_texture(shading.bbox, 1.0);
             let image = DynamicImage::ImageRgba8(
                 ImageBuffer::from_raw(texture.width, texture.height, texture.data).unwrap(),

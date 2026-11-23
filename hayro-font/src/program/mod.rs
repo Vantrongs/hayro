@@ -208,7 +208,7 @@ impl FontProgram {
         path.take()
     }
 
-    fn font(&self) -> &Font {
+    pub(crate) fn font(&self) -> &Font {
         &self.0.font
     }
 

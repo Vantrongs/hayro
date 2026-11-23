@@ -2,6 +2,7 @@ use crate::StrokeProps;
 use crate::color::{AlphaColor, ColorComponents, ColorSpace};
 use crate::context::Context;
 use crate::convert::{convert_line_cap, convert_line_join};
+use crate::encode::Cost;
 use crate::font::{Font, UNITS_PER_EM};
 use crate::function::{Function, TransferFunction};
 use crate::interpret::text::TextRenderingMode;
@@ -12,9 +13,10 @@ use hayro_syntax::content::ops::{LineCap, LineJoin};
 use hayro_syntax::object::dict::keys::{FONT, SMASK, TR, TR2};
 use hayro_syntax::object::{Array, Dict, Name, Number, Object};
 use hayro_syntax::page::Resources;
-use kurbo::{Affine, BezPath, Vec2};
-use smallvec::smallvec;
+use kurbo::{Affine, Vec2};
+use smallvec::{SmallVec, smallvec};
 use std::ops::Deref;
+use std::sync::Arc;
 
 /// A transfer function.
 #[derive(Clone, Debug)]
@@ -25,7 +27,29 @@ pub enum ActiveTransferFunction {
     Four([TransferFunction; 4]),
 }
 
+impl crate::CacheKey for ActiveTransferFunction {
+    fn cache_key(&self) -> u128 {
+        let keys = match self {
+            Self::Single(f) => [f.key(); 3],
+            Self::Four(fs) => [fs[0].key(), fs[1].key(), fs[2].key()],
+        };
+        crate::util::hash128(&keys)
+    }
+}
+
 impl ActiveTransferFunction {
+    /// The steps building the tables the functions map by takes, until they are
+    /// built.
+    pub fn setup_cost(&self) -> Cost {
+        match self {
+            Self::Single(f) => f.setup_cost(),
+            Self::Four(functions) => functions[..3]
+                .iter()
+                .map(TransferFunction::setup_cost)
+                .sum(),
+        }
+    }
+
     /// Apply the transfer function to the RGB channels of a color.
     pub fn apply(&self, color: &AlphaColor) -> AlphaColor {
         let mut rgba = color.components();
@@ -127,8 +151,6 @@ pub(crate) struct TextState<'a> {
 
     pub(crate) text_matrix: Affine,
     pub(crate) text_line_matrix: Affine,
-
-    pub(crate) clip_paths: BezPath,
 }
 
 impl<'a> TextState<'a> {
@@ -224,7 +246,6 @@ impl Default for TextState<'_> {
             text_matrix: Affine::IDENTITY,
             text_line_matrix: Affine::IDENTITY,
             rise: 0.0,
-            clip_paths: BezPath::default(),
         }
     }
 }
@@ -364,18 +385,39 @@ pub(crate) fn handle_gs_single<'a>(
             let dash_array = iter.next()?.into_array()?;
             let dash_phase = iter.next()?.into_number()?.as_f32();
 
-            context.stroke_props_mut().dash_offset = dash_phase;
-            context.stroke_props_mut().dash_array = dash_array
-                .iter::<f32>()
-                // kurbo apparently cannot properly deal with offsets that are exactly 0.
-                .map(|n| if n == 0.0 { 0.01 } else { n })
-                .collect();
+            set_dash(context.stroke_props_mut(), &dash_array, dash_phase);
         }
         "Type" => {}
         _ => {}
     }
 
     Some(())
+}
+
+/// Sets the dash pattern of the `d` operator or the `D` entry of a graphics state.
+///
+/// A pattern the PDF specification does not allow, with an entry negative or not
+/// finite or with every entry zero, is drawn as `MuPDF` draws it (observed in
+/// `PyMuPDF` 1.28.2): not at all if its entries sum to zero (`[1 -1]`, `[0 0]`), and
+/// otherwise solid (`[-1 -1]`, `[2 -1]`). Dashing never ends on a pattern whose
+/// entries sum to less than zero, and walks one with negative entries backwards.
+pub(crate) fn set_dash(props: &mut StrokeProps, array: &Array<'_>, phase: f32) {
+    let dashes: SmallVec<[f32; 4]> = array.items::<f32>().map_while(|n| n).collect();
+    let valid =
+        dashes.iter().all(|n| n.is_finite() && *n >= 0.0) && dashes.iter().any(|n| *n > 0.0);
+    props.dash_offset = phase;
+    props.dash_hides = false;
+    props.dash_array = if dashes.is_empty() {
+        // An empty array shares one allocation for all.
+        Arc::default()
+    } else if valid {
+        // kurbo apparently cannot properly deal with offsets that are exactly 0.
+        let dashes = dashes.iter().map(|&n| if n == 0.0 { 0.01 } else { n });
+        Arc::from_iter(dashes)
+    } else {
+        props.dash_hides = dashes.iter().map(|&n| f64::from(n)).sum::<f64>() == 0.0;
+        Arc::default()
+    };
 }
 
 fn convert_blend_mode(name: &str) -> Option<BlendMode> {

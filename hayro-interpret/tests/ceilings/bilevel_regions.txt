@@ -1,0 +1,9 @@
+image_4096_tile_peak 515607
+image_4096_thumbnail_peak 522959
+image_8192_tile_peak 1074842
+stencil_4096_tile_peak 514839
+stencil_4096_thumbnail_peak 522191
+stencil_8192_tile_peak 1074074
+ccitt_4096_tile_peak 31992
+ccitt_4096_thumbnail_peak 38840
+ccitt_8192_tile_peak 19192

@@ -9,7 +9,7 @@ const FUNCTION_TOLERANCE: f32 = 0.01;
 const FUNCTION_PIXEL_CELL: usize = 4;
 
 pub(crate) fn draw_function(
-    canvas: &mut Canvas,
+    canvas: &mut Canvas<'_>,
     domain: Rect,
     function: &ShadingFunction,
     transform: Affine,
@@ -90,7 +90,7 @@ impl FunctionSampler<'_> {
 }
 
 fn draw_function_cell(
-    canvas: &mut Canvas,
+    canvas: &mut Canvas<'_>,
     sampler: &FunctionSampler<'_>,
     [x, y]: [usize; 2],
     size: usize,
@@ -159,7 +159,7 @@ fn draw_function_cell(
 }
 
 fn fill_cell(
-    canvas: &mut Canvas,
+    canvas: &mut Canvas<'_>,
     sampler: &FunctionSampler<'_>,
     [x, y]: [usize; 2],
     size: usize,

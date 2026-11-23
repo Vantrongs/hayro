@@ -1,37 +1,83 @@
 use crate::bit_reader::BitReader;
 use crate::codes::Mode;
 use crate::{DecodeError, DecodeSettings, Decoder, Result};
-use alloc::vec;
 use alloc::vec::Vec;
 
-pub(crate) struct DecoderContext<'a> {
-    // Even indices are changes to black, odd ones to white.
+/// The most changes per line that room is made for before decoding.
+const MAX_RESERVED_CHANGES: usize = 1 << 8;
+
+/// The changes of the line above a search after a horizontal mode code passes a
+/// change at a time, before it gallops ([`DecoderContext::update_b_after_runs`]).
+const NEAR: usize = 8;
+
+/// A reusable context for decoding CCITT images.
+#[derive(Clone)]
+pub(crate) struct DecoderContext {
+    /// Positions of the color changes in the reference line (previous line).
+    ///
+    /// Since colors alternate and each line starts with white, changes at even
+    /// indices are changes to black and changes at odd indices to white.
     ref_changes: Vec<u32>,
+    /// The minimum index we need to start from when searching for b1.
     ref_pos: u32,
+    /// The current index of b1.
     b1_idx: u32,
+    /// Positions of the color changes in the coding line (current line being
+    /// decoded).
     coding_changes: Vec<u32>,
+    /// Current position in the coding line (number of pixels decoded).
     pub(crate) pixels_decoded: u32,
+    /// The width of a line in pixels (i.e. number of columns).
     pub(crate) line_width: u32,
+    /// The color of the next run to be decoded.
     pub(crate) color: Color,
+    /// How many rows have been decoded so far.
     pub(crate) decoded_rows: u32,
-    pub(crate) settings: &'a DecodeSettings,
+    /// The settings to apply during decoding.
+    pub(crate) settings: DecodeSettings,
+    /// Whether the data contains EOLs.
     pub(crate) has_eols: bool,
 }
 
-impl<'a> DecoderContext<'a> {
-    pub(crate) fn new(settings: &'a DecodeSettings) -> Self {
+impl DecoderContext {
+    /// Creates a new decoder context using the provided decode settings.
+    pub(crate) fn new(settings: DecodeSettings) -> Self {
+        // A line has at most as many changes as columns. Making room for them up to a
+        // bound spares small images growing both lists change by change.
+        let changes = (settings.columns as usize).min(MAX_RESERVED_CHANGES);
+
         Self {
-            ref_changes: vec![],
+            ref_changes: Vec::with_capacity(changes),
             ref_pos: 0,
             b1_idx: 0,
-            coding_changes: Vec::new(),
+            coding_changes: Vec::with_capacity(changes),
             pixels_decoded: 0,
             line_width: settings.columns,
+            // Each run starts with an imaginary white pixel on the left.
             color: Color::White,
             decoded_rows: 0,
             settings,
             has_eols: false,
         }
+    }
+
+    /// The heap bytes a copy of it holds: its two lines' colour changes, at most a
+    /// change per column each.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        (self.ref_changes.len() + self.coding_changes.len()) * size_of::<u32>()
+    }
+
+    /// A copy, its two lines' colour changes copied by `copy`.
+    pub(crate) fn copy_with<E>(
+        &self,
+        copy: &mut impl FnMut(&[u32]) -> core::result::Result<Vec<u32>, E>,
+    ) -> core::result::Result<Self, E> {
+        Ok(Self {
+            ref_changes: copy(&self.ref_changes)?,
+            coding_changes: copy(&self.coding_changes)?,
+            settings: self.settings.clone(),
+            ..*self
+        })
     }
 
     #[inline(always)]
@@ -45,10 +91,14 @@ impl<'a> DecoderContext<'a> {
         let count = count.min(remaining);
 
         if count > 0 {
+            // Since colors alternate, an odd number of changes means that the
+            // last pixel is black.
             let last_is_white = self.coding_changes.len().is_multiple_of(2);
 
             if last_is_white != self.color.is_white() {
+                let room = self.coding_changes.capacity();
                 self.coding_changes.push(self.pixels_decoded);
+                crate::reserved((self.coding_changes.capacity() - room) * size_of::<u32>());
             }
 
             self.pixels_decoded += count;
@@ -58,6 +108,11 @@ impl<'a> DecoderContext<'a> {
     }
 
     #[inline(always)]
+    /// The colour changes of the last row pushed (until the next is decoded).
+    pub(crate) fn last_row(&self) -> &[u32] {
+        &self.ref_changes
+    }
+
     pub(crate) fn next_line(&mut self, decoder: &mut impl Decoder) {
         decoder.push_row(&self.coding_changes);
         core::mem::swap(&mut self.ref_changes, &mut self.coding_changes);
@@ -67,19 +122,61 @@ impl<'a> DecoderContext<'a> {
         self.b1_idx = 0;
         self.color = Color::White;
         self.decoded_rows += 1;
-
-        self.update_b();
     }
 
+    /// Ends the line being decoded where the data ends within it, as `MuPDF` does
+    /// (observed through `PyMuPDF` 1.28.2): the pixels decoded of it are kept and the
+    /// rest are white, and it is pushed, unless no pixel was decoded. A code the end
+    /// cuts reads the bits past it as zero. Other errors, and errors before the end,
+    /// fail with `error`.
+    pub(crate) fn salvage(
+        &mut self,
+        reader: &BitReader<'_>,
+        error: DecodeError,
+        decoder: &mut impl Decoder,
+    ) -> Result<()> {
+        if error == DecodeError::Stopped || self.settings.strict || !reader.at_end() {
+            return Err(error);
+        }
+        self.finish_partial_row(decoder)
+    }
+
+    pub(crate) fn finish_partial_row(&mut self, decoder: &mut impl Decoder) -> Result<()> {
+        if self.pixels_decoded == 0 {
+            return Ok(());
+        }
+        self.color = Color::White;
+        self.push_pixels(self.line_width - self.pixels_decoded)?;
+        self.next_line(decoder);
+        Ok(())
+    }
+
+    /// Fails a line that a code cut by the end of the data completed, where decoding
+    /// is strict: the bits past the end, read as zero, are no data.
+    #[inline(always)]
+    fn check_complete(&self, reader: &BitReader<'_>) -> Result<()> {
+        if self.settings.strict && reader.overrun() {
+            return Err(DecodeError::UnexpectedEof);
+        }
+        Ok(())
+    }
+
+    /// `a0` refers to the first changing element on the current line.
     #[inline(always)]
     fn a0(&self) -> Option<u32> {
         if self.pixels_decoded == 0 {
+            // If we haven't coded anything yet, a0 conceptually points at the
+            // index -1. This is a bit of an edge case, and we therefore require
+            // callers of this method to handle the case themselves.
             None
         } else {
+            // Otherwise, the index points to the next element to be decoded.
             Some(self.pixels_decoded)
         }
     }
 
+    /// "The first changing element on the reference line to the right of a0 and
+    /// of opposite color to a0."
     #[inline(always)]
     fn b1(&self) -> u32 {
         self.ref_changes
@@ -88,6 +185,7 @@ impl<'a> DecoderContext<'a> {
             .unwrap_or(self.line_width)
     }
 
+    /// "The next changing element to the right of b1, on the reference line."
     #[inline(always)]
     fn b2(&self) -> u32 {
         self.ref_changes
@@ -96,17 +194,77 @@ impl<'a> DecoderContext<'a> {
             .unwrap_or(self.line_width)
     }
 
+    /// Compute the new position of b1 (and implicitly b2) after a vertical or a pass
+    /// mode code, searching the changes of the line above a change at a time from
+    /// where the line's last search ended: such a code moves a0 at most 3 past b1,
+    /// or to b2, so the search passes at most 5 changes.
     #[inline(always)]
     fn update_b(&mut self) {
-        let min_idx = self.a0().map_or(0, |a| a + 1);
         let mut idx = self.ref_pos as usize;
-
+        let min_idx = self.min_b1();
         while self.ref_changes.get(idx).is_some_and(|&c| c < min_idx) {
             idx += 1;
         }
+        crate::operation(idx - self.ref_pos as usize);
+        debug_assert!(
+            idx - self.ref_pos as usize <= 5,
+            "a long search after a code"
+        );
+        self.set_b1(idx);
+    }
 
+    /// [`Self::update_b`] after a horizontal mode code, whose two runs move a0 past
+    /// any number of changes of the line above: past the first few, passed a change
+    /// at a time, they are passed in steps twice the logarithm of their number,
+    /// doubling the step until it passes b1, then halving it, so that a code of a
+    /// few bits does a bounded amount of work over a line of any width.
+    #[inline(always)]
+    fn update_b_after_runs(&mut self) {
+        let min_idx = self.min_b1();
+        let start = self.ref_pos as usize;
+        let near = self.ref_changes.len().min(start + NEAR);
+        let mut idx = start;
+        while idx < near && self.ref_changes[idx] < min_idx {
+            idx += 1;
+        }
+        crate::operation(idx - start);
+        if idx == start + NEAR {
+            idx = self.gallop(idx, min_idx);
+        }
+        self.set_b1(idx);
+    }
+
+    /// The first change of the line above from `start` on that is not before
+    /// `min_idx`, found in steps twice the logarithm of how far it is.
+    #[cold]
+    #[inline(never)]
+    fn gallop(&self, start: usize, min_idx: u32) -> usize {
+        let rest = &self.ref_changes[start..];
+        let mut bound = 1;
+        while bound <= rest.len() && rest[bound - 1] < min_idx {
+            bound *= 2;
+        }
+        // The changes before `bound / 2` are before b1; the one at `bound - 1` is not,
+        // or is past the end.
+        let (from, to) = (bound / 2, bound.min(rest.len()));
+        crate::operation(2 * bound.trailing_zeros() as usize + 1);
+        start + from + rest[from..to].partition_point(|&c| c < min_idx)
+    }
+
+    /// The least position b1 may have: b1 must be strictly greater than a0.
+    #[inline(always)]
+    fn min_b1(&self) -> u32 {
+        self.a0().map_or(0, |a| a + 1)
+    }
+
+    /// Sets b1 to the change at `idx` or after it, the first change of the line above
+    /// at or past [`Self::min_b1`], of the colour opposite to a0's.
+    #[inline(always)]
+    fn set_b1(&mut self, mut idx: usize) {
         self.ref_pos = idx as u32;
 
+        // b1 refers to an element of the opposite color, i.e. a change to black
+        // (even index) if the current color is white and vice versa.
         if idx.is_multiple_of(2) != self.color.is_white() {
             idx += 1;
         }
@@ -120,33 +278,50 @@ impl<'a> DecoderContext<'a> {
     }
 }
 
+/// Decode a single 1D-coded line (T.4 Section 4.1.1, T.6 Section 2.2.4).
 #[inline(always)]
 pub(crate) fn decode_1d_line(
-    ctx: &mut DecoderContext<'_>,
+    ctx: &mut DecoderContext,
     reader: &mut BitReader<'_>,
+    decoder: &mut impl Decoder,
 ) -> Result<()> {
     while !ctx.at_eol() {
-        let run_length = reader.decode_run(ctx.color)?;
+        crate::operation(1);
+        reader.poll(decoder)?;
+        if reader.overrun() {
+            return Err(DecodeError::UnexpectedEof);
+        }
+        let run_length = reader.decode_run(ctx.color, decoder)?;
         ctx.push_pixels(run_length)?;
         ctx.color = ctx.color.opposite();
     }
 
-    Ok(())
+    ctx.check_complete(reader)
 }
 
+/// Decode a single 2D-coded line (T.4 Section 4.2, T.6 Section 2.2).
 #[inline(always)]
 pub(crate) fn decode_2d_line(
-    ctx: &mut DecoderContext<'_>,
+    ctx: &mut DecoderContext,
     reader: &mut BitReader<'_>,
+    decoder: &mut impl Decoder,
 ) -> Result<()> {
     while !ctx.at_eol() {
+        crate::operation(1);
+        reader.poll(decoder)?;
+        if reader.overrun() {
+            return Err(DecodeError::UnexpectedEof);
+        }
         let mode = reader.decode_mode()?;
 
         match mode {
+            // Pass mode (T.4 Section 4.2.1.3.2a, T.6 Section 2.2.3.1).
             Mode::Pass => {
                 ctx.push_pixels(ctx.b2() - ctx.a0().unwrap_or(0))?;
                 ctx.update_b();
+                // No color change happens in pass mode.
             }
+            // Vertical mode (T.4 Section 4.2.1.3.2b, T.6 Section 2.2.3.2).
             Mode::Vertical(i) => {
                 let b1 = ctx.b1();
                 let a1 = if i >= 0 {
@@ -162,30 +337,35 @@ pub(crate) fn decode_2d_line(
 
                 ctx.update_b();
             }
+            // Horizontal mode (T.4 Section 4.2.1.3.2c, T.6 Section 2.2.3.3).
             Mode::Horizontal => {
-                let a0a1 = reader.decode_run(ctx.color)?;
+                let a0a1 = reader.decode_run(ctx.color, decoder)?;
                 ctx.push_pixels(a0a1)?;
                 ctx.color = ctx.color.opposite();
 
-                let a1a2 = reader.decode_run(ctx.color)?;
+                let a1a2 = reader.decode_run(ctx.color, decoder)?;
                 ctx.push_pixels(a1a2)?;
                 ctx.color = ctx.color.opposite();
 
-                ctx.update_b();
+                ctx.update_b_after_runs();
             }
         }
     }
 
-    Ok(())
+    ctx.check_complete(reader)
 }
 
+/// Pixel color in a bi-level (black and white) image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Color {
+    /// White pixel.
     White,
+    /// Black pixel.
     Black,
 }
 
 impl Color {
+    /// Returns the opposite color.
     #[inline(always)]
     fn opposite(self) -> Self {
         match self {
@@ -194,6 +374,7 @@ impl Color {
         }
     }
 
+    /// Returns true if this color is white.
     #[inline(always)]
     fn is_white(self) -> bool {
         matches!(self, Self::White)

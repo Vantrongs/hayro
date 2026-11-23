@@ -1,3 +1,4 @@
+use crate::object::parsed::Items;
 use crate::object::r#ref::MaybeRef;
 use crate::object::{Object, ObjectLike};
 use crate::reader::Reader;
@@ -35,6 +36,13 @@ where
     T: ObjectLike<'a> + Debug + Clone,
     U: ObjectLike<'a> + Debug + Clone,
 {
+    const ONE_ENTRY: bool = false;
+
+    fn from_items(items: &mut Items<'_, 'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
+        let t = items.next_resolved::<T>(ctx)?;
+        let u = items.next_resolved::<U>(ctx)?;
+        Some((t, u))
+    }
 }
 
 impl<'a, T, U, V> Readable<'a> for (T, U, V)
@@ -74,6 +82,14 @@ where
     U: ObjectLike<'a> + Debug + Clone,
     V: ObjectLike<'a> + Debug + Clone,
 {
+    const ONE_ENTRY: bool = false;
+
+    fn from_items(items: &mut Items<'_, 'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
+        let t = items.next_resolved::<T>(ctx)?;
+        let u = items.next_resolved::<U>(ctx)?;
+        let v = items.next_resolved::<V>(ctx)?;
+        Some((t, u, v))
+    }
 }
 
 impl<'a, T, U, V, W> Readable<'a> for (T, U, V, W)
@@ -118,6 +134,15 @@ where
     V: ObjectLike<'a> + Debug + Clone,
     W: ObjectLike<'a> + Debug + Clone,
 {
+    const ONE_ENTRY: bool = false;
+
+    fn from_items(items: &mut Items<'_, 'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
+        let t = items.next_resolved::<T>(ctx)?;
+        let u = items.next_resolved::<U>(ctx)?;
+        let v = items.next_resolved::<V>(ctx)?;
+        let w = items.next_resolved::<W>(ctx)?;
+        Some((t, u, v, w))
+    }
 }
 
 impl<'a, T, U, V, W, X> Readable<'a> for (T, U, V, W, X)
@@ -167,4 +192,14 @@ where
     W: ObjectLike<'a> + Debug + Clone,
     X: ObjectLike<'a> + Debug + Clone,
 {
+    const ONE_ENTRY: bool = false;
+
+    fn from_items(items: &mut Items<'_, 'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
+        let t = items.next_resolved::<T>(ctx)?;
+        let u = items.next_resolved::<U>(ctx)?;
+        let v = items.next_resolved::<V>(ctx)?;
+        let w = items.next_resolved::<W>(ctx)?;
+        let x = items.next_resolved::<X>(ctx)?;
+        Some((t, u, v, w, x))
+    }
 }

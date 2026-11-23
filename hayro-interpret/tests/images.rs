@@ -1,0 +1,1381 @@
+//! Requesting a region of an image's asset costs memory in proportion to the region
+//! and the data the image holds, not to the size its dictionary declares: an image
+//! 100 000 × 100 000 with a one-byte stream must not reserve 10 GB. (`with_rgba` and
+//! `with_stencil` hand over every row the image declares, as large as the image
+//! intact.) `RasterImage::pixels_key` tells images apart that decode differently.
+
+use hayro_interpret::font::GlyphRun;
+use hayro_interpret::hayro_syntax::Pdf;
+use hayro_interpret::{
+    BlendMode, CacheKey, ClipPath, Device, DrawMode, DrawProps, Image, ImageData, ImageDrawProps,
+    ImageRequest, InterpreterSettings, Plane, RequestError, SoftMask,
+};
+use kurbo::BezPath;
+
+#[path = "../../hayro-syntax/tests/common/allocations.rs"]
+mod allocations;
+#[path = "../../hayro-syntax/tests/common/ceilings.rs"]
+mod ceilings;
+mod common;
+
+/// The width and height of each colour plane, alpha plane and stencil decoded.
+#[derive(Default)]
+struct Decoded(Vec<(u32, u32)>);
+
+impl<'a> Device<'a> for Decoded {
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(
+        &mut self,
+        _: f32,
+        _: Option<SoftMask<'a>>,
+        _: BlendMode,
+        _: bool,
+        _: bool,
+    ) {
+    }
+    fn draw_glyph_run(&mut self, _: &GlyphRun<'_, 'a>, _: DrawProps<'a>, _: &DrawMode) {}
+    fn draw_image(&mut self, image: Image<'a, '_>, _: ImageDrawProps<'a>) {
+        match image {
+            Image::Raster(r) => r.with_rgba(
+                |image, alpha| {
+                    self.0.push(match image {
+                        ImageData::Rgb(d) => (d.width, d.height),
+                        ImageData::Luma(d) => (d.width, d.height),
+                    });
+                    if let Some(a) = alpha {
+                        self.0.push((a.width, a.height));
+                    }
+                },
+                None,
+            ),
+            Image::Stencil(s) => s.with_stencil(|l, _| self.0.push((l.width, l.height)), None),
+        }
+    }
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
+}
+
+/// A 100 × 100 pt page with `content`, `resources`, and `objects` numbered from 5.
+fn page(content: &str, resources: &str, objects: Vec<Vec<u8>>) -> Pdf {
+    let mut all = vec![common::stream("", content.as_bytes())];
+    all.extend(objects);
+    let file = common::one_page(
+        100,
+        &format!("/Contents 4 0 R /Resources << {resources} >>"),
+        all,
+    );
+    Pdf::new(file).expect("valid pdf")
+}
+
+fn image(dict: &str, data: &[u8]) -> Vec<u8> {
+    common::stream(&format!("/Type /XObject /Subtype /Image {dict}"), data)
+}
+
+/// Draws the image `dict` with stream `data` (object 5) over the page, `extra` being
+/// object 6 (a mask, say), and returns the sizes decoded, asserting that decoding
+/// stayed under 64 MiB.
+fn draw(dict: &str, data: &[u8], extra: Option<(&str, &[u8])>) -> Vec<(u32, u32)> {
+    let mut objects = vec![image(dict, data)];
+    objects.extend(extra.map(|(dict, data)| image(dict, data)));
+    let pdf = page(
+        "q 100 0 0 100 0 0 cm /Im Do Q",
+        "/XObject << /Im 5 0 R >>",
+        objects,
+    );
+    let mut decoded = Decoded::default();
+    let ((), used) = allocations::measure(|| {
+        common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut decoded);
+    });
+    assert!(used.peak < 64 << 20, "{dict}: peak {} bytes", used.peak);
+    decoded.0
+}
+
+const HUGE: &str = "/Width 100000 /Height 100000";
+
+/// A region of 100 × 100 bins over `plane` of the image `dict` with stream `data`
+/// (object 5), `extra` being object 6 (a mask, say), asserting that opening and
+/// requesting it stayed under 64 MiB.
+fn huge_region(dict: &str, data: &[u8], extra: Option<(&str, &[u8])>, plane: Plane) -> Vec<u8> {
+    region_of(dict, data, extra, plane, |_, _| {
+        ((100, 100), [0, 0, 100, 100])
+    })
+}
+
+/// [`huge_region`], of the bins `bins` gives.
+fn region_of(
+    dict: &str,
+    data: &[u8],
+    extra: Option<(&str, &[u8])>,
+    plane: Plane,
+    bins: Bins,
+) -> Vec<u8> {
+    let mut objects = vec![image(dict, data)];
+    objects.extend(extra.map(|(dict, data)| image(dict, data)));
+    let pdf = page(
+        "q 100 0 0 100 0 0 cm /Im Do Q",
+        "/XObject << /Im 5 0 R >>",
+        objects,
+    );
+    let mut requested = Requested::new(plane, bins);
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+    let [(peak, data)] = requested.regions.try_into().expect("one image");
+    assert!(peak < 64 << 20, "{dict}: peak {peak} bytes");
+    data
+}
+
+/// Eight samples are far from a row of 100 000: every row reads as stored zero, black.
+#[test]
+fn a_huge_gray_image_with_one_byte_costs_little() {
+    let dict = format!("{HUGE} /ColorSpace /DeviceGray /BitsPerComponent 1");
+    let region = huge_region(&dict, &[0xAA], None, Plane::Image);
+    assert_eq!(region, vec![0; 100 * 100]);
+}
+
+#[test]
+fn a_huge_rgb_image_with_one_byte_costs_little() {
+    let dict = format!("{HUGE} /ColorSpace /DeviceRGB /BitsPerComponent 4");
+    let region = huge_region(&dict, &[0xAA], None, Plane::Image);
+    assert_eq!(region, vec![0; 3 * 100 * 100]);
+}
+
+/// A stencil's stored zero is painted.
+#[test]
+fn a_huge_stencil_with_one_byte_costs_little() {
+    let dict = format!("{HUGE} /ImageMask true /BitsPerComponent 1");
+    let region = huge_region(&dict, &[0xAA], None, Plane::Image);
+    assert_eq!(region, vec![255; 100 * 100]);
+}
+
+/// A soft mask's stored zero hides the colour.
+#[test]
+fn huge_soft_masks_with_one_byte_cost_little() {
+    let image = "/Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R";
+    for bpc in [1, 2] {
+        let mask = format!("{HUGE} /ColorSpace /DeviceGray /BitsPerComponent {bpc}");
+        let region = huge_region(image, &[255, 0, 0], Some((&mask, &[0xAA])), Plane::Mask);
+        assert_eq!(region, vec![0; 100 * 100], "{bpc}");
+    }
+}
+
+/// Images decoded whole hold the samples their data holds and one texel of stored zero
+/// for the rest: 16-bit samples, a filter only whole decoding reads (Flate under a
+/// predictor of 16-bit components), and a soft mask through one.
+#[test]
+fn huge_images_decoded_whole_with_little_data_cost_little() {
+    let gray = |bits: u8, extra: &str| {
+        format!("{HUGE} /ColorSpace /DeviceGray /BitsPerComponent {bits} {extra}")
+    };
+    let whole = "/Filter /FlateDecode /DecodeParms << /Predictor 2 /BitsPerComponent 16 >>";
+    let ones = common::stored_zlib(&[0xff, 0xff], 100);
+    let zeros = common::stored_zlib(&[0, 0], 100);
+    for (dict, data, fill) in [
+        (gray(16, ""), &b"\xff\xff"[..], 0),
+        (gray(16, "/Decode [1 0]"), b"\xff\xff", 255),
+        (gray(8, whole), &ones, 0),
+        (gray(8, &format!("{whole} /Decode [1 0]")), &zeros, 255),
+    ] {
+        let region = huge_region(&dict, data, None, Plane::Image);
+        assert_eq!(region, vec![fill; 100 * 100], "{dict}");
+    }
+    let image = "/Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R";
+    let mask = gray(8, whole);
+    let region = huge_region(image, &[255, 0, 0], Some((&mask, &ones)), Plane::Mask);
+    assert_eq!(region, vec![0; 100 * 100]);
+}
+
+/// Rows 2^30 samples wide of which the data holds a few bytes cost those bytes, not
+/// the width, whether decoded whole or streamed: 16-bit and 8-bit CMYK samples, which
+/// are decoded whole, and one-bit samples, a stencil and a soft mask in a filter only
+/// whole decoding reads (Flate under a predictor of 16-bit components) or in one read
+/// as it is streamed. Every bin of 100 × 3 is the fill, stored zero's colour.
+#[test]
+fn very_wide_images_with_little_data_cost_little() {
+    let bins: Bins = |_, h| ((100, h), [0, 0, 100, h]);
+    let wide = "/Width 1073741824 /Height 3";
+    let whole = "/Filter /FlateDecode /DecodeParms << /Predictor 2 /BitsPerComponent 16 >>";
+    let gray = |bits: u8, extra: &str| {
+        format!("{wide} /ColorSpace /DeviceGray /BitsPerComponent {bits} {extra}")
+    };
+    let flate = common::stored_zlib(&[0, 0], 100);
+    for (dict, data, fill) in [
+        (gray(16, "/Decode [1 0]"), &b"\0\0"[..], vec![255; 100 * 3]),
+        (
+            format!("{wide} /ColorSpace /DeviceCMYK /BitsPerComponent 8"),
+            &[0; 5][..],
+            vec![255; 3 * 100 * 3],
+        ),
+        (
+            gray(1, &format!("{whole} /Decode [1 0]")),
+            &flate,
+            vec![255; 100 * 3],
+        ),
+        (
+            gray(1, "/Filter /ASCIIHexDecode /Decode [1 0]"),
+            b"00>",
+            vec![255; 100 * 3],
+        ),
+        (
+            format!("{wide} /ImageMask true {whole}"),
+            &flate,
+            vec![255; 100 * 3],
+        ),
+    ] {
+        let region = region_of(&dict, data, None, Plane::Image, bins);
+        assert!(region == fill, "{dict}");
+    }
+    let image = "/Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R";
+    for mask in [gray(1, whole), gray(1, "/Filter /ASCIIHexDecode")] {
+        let data = if mask.contains("Flate") {
+            &flate[..]
+        } else {
+            b"ff>"
+        };
+        let region = region_of(image, &[255, 0, 0], Some((&mask, data)), Plane::Mask, bins);
+        assert!(region == vec![0; 100 * 3], "{mask}");
+    }
+}
+
+/// Whatever one byte decodes to, it is at most a few rows; the rest are black.
+#[test]
+fn a_huge_ccitt_image_with_one_byte_costs_little() {
+    let dict = format!(
+        "{HUGE} /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode \
+         /DecodeParms << /K -1 /Columns 100000 /Rows 100000 >>"
+    );
+    let region = huge_region(&dict, &[0x00], None, Plane::Image);
+    assert_eq!(region[100..], vec![0; 99 * 100]);
+}
+
+/// An image whose data stops in its second row keeps its declared rows: the first
+/// as its data holds it, and the rest, the second among them, stored zero.
+#[test]
+fn a_short_image_keeps_its_declared_rows() {
+    let dict = "/Width 16 /Height 4 /ColorSpace /DeviceGray /BitsPerComponent 1";
+    assert_eq!(draw(dict, &[0xFF, 0x00, 0xF0], None), [(16, 4)]);
+    let stencil = "/Width 16 /Height 4 /ImageMask true";
+    assert_eq!(draw(stencil, &[0xFF, 0x00, 0xF0], None), [(16, 4)]);
+    let mut pixels = Pixels::default();
+    let pdf = page(
+        "q 100 0 0 100 0 0 cm /Im Do Q",
+        "/XObject << /Im 5 0 R >>",
+        vec![image(dict, &[0xFF, 0x00, 0xF0])],
+    );
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut pixels);
+    let mut expected = [[255; 8], [0; 8]].concat();
+    expected.extend([0; 48]);
+    assert_eq!(pixels.0[0].1, expected);
+}
+
+/// The `pixels_key` and `cache_key` of each raster image drawn.
+#[derive(Default)]
+struct Keys(Vec<(Option<u128>, u128)>);
+
+impl<'a> Device<'a> for Keys {
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(
+        &mut self,
+        _: f32,
+        _: Option<SoftMask<'a>>,
+        _: BlendMode,
+        _: bool,
+        _: bool,
+    ) {
+    }
+    fn draw_glyph_run(&mut self, _: &GlyphRun<'_, 'a>, _: DrawProps<'a>, _: &DrawMode) {}
+    fn draw_image(&mut self, image: Image<'a, '_>, _: ImageDrawProps<'a>) {
+        if let Image::Raster(r) = image {
+            self.0.push((r.pixels_key(), r.cache_key()));
+        }
+    }
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
+}
+
+/// Drawing one image object twice gives one key; another object with the same
+/// dictionary, the same object under a transfer function, and an inline image give
+/// other keys or none.
+#[test]
+fn pixels_keys_tell_decoded_images_apart() {
+    let gray = "/Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8";
+    let pdf = page(
+        "/A Do /A Do /B Do q /Inv gs /A Do Q BI /W 1 /H 1 /CS /G /BPC 8 ID \x50 EI",
+        "/XObject << /A 5 0 R /B 6 0 R >> /ExtGState << /Inv << /TR 7 0 R >> >>",
+        vec![
+            image(gray, &[0x40]),
+            image(gray, &[0xC0]),
+            b"<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>".to_vec(),
+        ],
+    );
+    let mut keys = Keys::default();
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut keys);
+    let (k, cache): (Vec<_>, Vec<_>) = keys.0.into_iter().unzip();
+    assert_eq!(k.len(), 5, "{k:?}");
+    let (a, b, a_inverted) = (
+        k[0].expect("a key"),
+        k[2].expect("a key"),
+        k[3].expect("a key"),
+    );
+    assert_eq!(k[1], Some(a));
+    assert_eq!(cache[0], cache[1]);
+    assert_ne!(cache[0], cache[2]);
+    assert_ne!(a, b);
+    assert_ne!(a, a_inverted);
+    assert_eq!(k[4], None, "inline image");
+}
+
+/// The same object of two documents gives two keys.
+#[test]
+fn pixels_keys_tell_documents_apart() {
+    let gray = "/Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8";
+    let keys = |sample: u8| {
+        let pdf = page(
+            "/A Do",
+            "/XObject << /A 5 0 R >>",
+            vec![image(gray, &[sample])],
+        );
+        let mut keys = Keys::default();
+        common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut keys);
+        keys.0
+    };
+    let (a, b) = (keys(0x40), keys(0xC0));
+    assert!(a[0].0.is_some());
+    assert_ne!(a[0].0, b[0].0);
+    assert_ne!(a[0].1, b[0].1);
+}
+
+/// What a region request of each image drawn, raster or stencil mask, allocated at
+/// most, and its pixels: of `plane`, the grid and window `bins` gives for the plane's
+/// size.
+struct Requested {
+    plane: Plane,
+    bins: Bins,
+    regions: Vec<(usize, Vec<u8>)>,
+    /// The bytes of decoder states each asset saved for later requests.
+    saved: Vec<usize>,
+}
+
+/// The grid and window to request of a plane of a width and height.
+type Bins = fn(u32, u32) -> ((u32, u32), [u32; 4]);
+
+impl Requested {
+    fn new(plane: Plane, bins: Bins) -> Self {
+        Self {
+            plane,
+            bins,
+            regions: Vec::new(),
+            saved: Vec::new(),
+        }
+    }
+}
+
+impl<'a> Device<'a> for Requested {
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(
+        &mut self,
+        _: f32,
+        _: Option<SoftMask<'a>>,
+        _: BlendMode,
+        _: bool,
+        _: bool,
+    ) {
+    }
+    fn draw_glyph_run(&mut self, _: &GlyphRun<'_, 'a>, _: DrawProps<'a>, _: &DrawMode) {}
+    fn draw_image(&mut self, image: Image<'a, '_>, _: ImageDrawProps<'a>) {
+        let asset = match image {
+            Image::Raster(r) => r.asset(),
+            Image::Stencil(s) => s.asset(),
+        };
+        let (data, used) = allocations::measure(|| {
+            let mut source = asset.open(None, None).expect("streamed");
+            let plane = *source.layout().plane(self.plane).expect("the plane");
+            let (grid, window) = (self.bins)(plane.width, plane.height);
+            let request = ImageRequest {
+                plane: self.plane,
+                grid,
+                window,
+                cancel: None,
+            };
+            source.request(&request).expect("a region").data
+        });
+        self.regions.push((used.peak, data));
+        self.saved
+            .push(asset.checkpoint_bytes().expect("saved states"));
+    }
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
+}
+
+/// One output texel over rows two million samples wide, with a soft mask as wide,
+/// holds pieces of the rows, not whole rows or a sum per column.
+#[test]
+fn a_region_of_wide_rows_holds_pieces_of_them() {
+    let (w, h) = (2_000_000_u32, 2_u32);
+    let gray = format!("/Width {w} /Height {h} /ColorSpace /DeviceGray /BitsPerComponent 8");
+    let pdf = page(
+        "q 100 0 0 100 0 0 cm /Im Do Q",
+        "/XObject << /Im 5 0 R >>",
+        vec![
+            image(
+                &format!("{gray} /SMask 6 0 R"),
+                &vec![200; (w * h) as usize],
+            ),
+            image(&gray, &vec![255; (w * h) as usize]),
+        ],
+    );
+    let mut requested = Requested::new(Plane::Image, |_, _| ((1, 1), [0, 0, 1, 1]));
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+    let [(peak, data)] = &requested.regions[..] else {
+        panic!("one image")
+    };
+    assert_eq!(data, &[200, 255]);
+    assert!(*peak < 1 << 20, "peak {peak} bytes");
+}
+
+/// The peak bytes of opening the image `dict` with `data` and requesting the bins
+/// `bins` gives, and the bytes of the decoder states the request saved.
+fn region_cost(dict: &str, data: &[u8], bins: Bins) -> (usize, usize) {
+    let pdf = page(
+        "q 100 0 0 100 0 0 cm /Im Do Q",
+        "/XObject << /Im 5 0 R >>",
+        vec![image(dict, data)],
+    );
+    let mut requested = Requested::new(Plane::Image, bins);
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+    let [(peak, _)] = requested.regions[..] else {
+        panic!("one image")
+    };
+    (peak, requested.saved[0])
+}
+
+/// A small region of a large bilevel image or stencil mask with Flate data, or of a
+/// CCITT image, costs memory in proportion to the region, not to the image (whose
+/// decoding whole held a byte per pixel, 64 MiB for the larger): opening it and
+/// requesting a tile at full size or a thumbnail holds pieces of rows (a CCITT row's
+/// colour changes) and the bins, besides the Flate and CCITT decoder states a request
+/// saves for later ones (at most 2 MiB); a tile of an image four times as large holds the
+/// same, but for a piece of a row twice as wide. Each peak stays under its ceiling.
+#[test]
+fn a_small_region_of_a_large_bilevel_image_costs_the_region() {
+    let tile: Bins = |w, h| ((w, h), [w / 2, h - 64, w / 2 + 64, h]);
+    let thumbnail: Bins = |_, _| ((64, 64), [0, 0, 64, 64]);
+    let gray = "/ColorSpace /DeviceGray /BitsPerComponent 1";
+    // What a thread allocates once, before the first image is measured, is not
+    // counted.
+    region_cost(
+        &format!("{gray} /Width 16 /Height 16 /Filter /FlateDecode"),
+        &common::stored_zlib(&[0; 32], 1000),
+        |w, h| ((w, h), [0, 0, 1, 1]),
+    );
+    let mut measured = Vec::new();
+    /// The data of an image `side` pixels square.
+    type Data = fn(u32) -> Vec<u8>;
+    let flate = |side: u32| {
+        let packed = common::noise((side / 8 * side) as usize, side);
+        common::stored_zlib(&packed, 65_535)
+    };
+    // Group 4 rows, each white like the one above (vertical mode, no offset): a
+    // bit each.
+    let white_g4 = |side: u32| vec![0xFF; side as usize / 8];
+    let kinds: [(&str, String, Data); 3] = [
+        ("image", format!("{gray} /Filter /FlateDecode"), flate),
+        (
+            "stencil",
+            "/ImageMask true /Filter /FlateDecode".into(),
+            flate,
+        ),
+        (
+            "ccitt",
+            format!("{gray} /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns COLUMNS >>"),
+            white_g4,
+        ),
+    ];
+    for (name, kind, data) in kinds {
+        let mut working = Vec::new();
+        for side in [4096_u32, 8192] {
+            let data = data(side);
+            let kind = kind.replace("COLUMNS", &side.to_string());
+            let dict = format!("{kind} /Width {side} /Height {side}");
+            let (peak, saved) = region_cost(&dict, &data, tile);
+            assert!(saved <= 2 << 20, "{name} {side}: {saved} bytes saved");
+            working.push(peak - saved);
+            measured.push((format!("{name}_{side}_tile_peak"), peak));
+            if side == 4096 {
+                let (peak, _) = region_cost(&dict, &data, thumbnail);
+                measured.push((format!("{name}_{side}_thumbnail_peak"), peak));
+            }
+        }
+        // The larger image's rows are 512 bytes wider, which a skipped piece holds.
+        assert!(
+            working[1] <= working[0] + 512,
+            "{name}: {} bytes besides saved states for 4096, {} for 8192",
+            working[0],
+            working[1]
+        );
+        assert!(working[1] < 1 << 20, "{name}: {} bytes", working[1]);
+    }
+    let measured: Vec<_> = measured.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    ceilings::check_ceilings(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/ceilings/bilevel_regions.txt"
+        ),
+        "WRITE_CEILINGS=1 cargo test -p hayro-interpret --test images",
+        &measured,
+    );
+}
+
+/// A small first region of an image whose Flate data neither zlib nor raw deflate
+/// reads a byte of (stored blocks whose lengths do not check) costs memory in
+/// proportion to the region, as other Flate data does: the permissive decoder reads
+/// it as the request does, where decoding it whole held all of it (2 MiB for the
+/// smaller); an image four times as large costs the same, but for the piece of a row
+/// twice as wide that is read past.
+#[test]
+fn a_small_region_of_flate_only_the_permissive_decoder_reads_costs_the_region() {
+    let first: Bins = |w, h| ((w, h), [w / 2, 0, w / 2 + 64, 64]);
+    let gray = "/ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /FlateDecode";
+    region_cost(
+        &format!("{gray} /Width 16 /Height 16"),
+        &common::stored_zlib(&[0; 32], 1000),
+        |w, h| ((w, h), [0, 0, 1, 1]),
+    );
+    let mut peaks = Vec::new();
+    for side in [4096_u32, 8192] {
+        let packed = common::noise((side / 8 * side) as usize, side);
+        let mut encoded = common::stored_zlib(&packed, 65_535);
+        for block in (2..encoded.len() - 4).step_by(65_535 + 5) {
+            encoded[block + 3..block + 5].fill(1);
+        }
+        let (peak, _) = region_cost(
+            &format!("{gray} /Width {side} /Height {side}"),
+            &encoded,
+            first,
+        );
+        peaks.push(peak);
+    }
+    assert!(peaks[0] < 1 << 20, "{peaks:?}");
+    assert!(peaks[1] <= peaks[0] + 512, "{peaks:?}");
+}
+
+/// A small region of each kind of low-bit image that streams costs memory in
+/// proportion to the region, not to the image: colour of fewer than eight bits in
+/// colour spaces other than `DeviceGray` and `RGB`, soft masks of fewer than eight
+/// bits or through a decode array, read alongside the colour or on their own grid,
+/// stencil masks through a decode array, and TIFF prediction of fewer than eight
+/// bits. Decoding any of them whole held a byte or more per pixel (4 MiB and more
+/// for the smaller); a tile of an image four times as large holds the same, but for
+/// the pieces of rows twice as wide that are read past.
+#[test]
+fn a_small_region_of_each_low_bit_kind_costs_the_region() {
+    let tile: Bins = |w, h| ((w, h), [w / 2, h - 64, w / 2 + 64, h]);
+    region_cost(
+        "/ColorSpace /DeviceGray /BitsPerComponent 1 /Width 16 /Height 16 /Filter /FlateDecode",
+        &common::stored_zlib(&[0; 32], 1000),
+        |w, h| ((w, h), [0, 0, 1, 1]),
+    );
+    let flate = |side: u32, bits: u32| {
+        let packed = common::noise((side * bits / 8 * side) as usize, side + bits);
+        common::stored_zlib(&packed, 65_535)
+    };
+    let gray = |bits: u32, extra: &str| {
+        format!("/ColorSpace /DeviceGray /BitsPerComponent {bits} {extra} /Filter /FlateDecode")
+    };
+    /// A kind: its dictionary, its colour's bits per pixel, the plane requested, and
+    /// its mask (object 6): dictionary and bits per pixel.
+    type Kind = (&'static str, String, u32, Plane, Option<(String, u32)>);
+    let kinds: [Kind; 7] = [
+        (
+            "cmyk_2",
+            "/ColorSpace /DeviceCMYK /BitsPerComponent 2 /Filter /FlateDecode".into(),
+            8,
+            Plane::Image,
+            None,
+        ),
+        (
+            "lab_4",
+            "/ColorSpace [/Lab << /WhitePoint [0.95 1 1.09] >>] /BitsPerComponent 4 \
+             /Filter /FlateDecode"
+                .into(),
+            12,
+            Plane::Image,
+            None,
+        ),
+        (
+            "smask_5",
+            gray(1, "/SMask 6 0 R"),
+            1,
+            Plane::Image,
+            Some((gray(5, ""), 5)),
+        ),
+        (
+            "smask_1_decoded",
+            gray(2, "/SMask 6 0 R"),
+            2,
+            Plane::Image,
+            Some((gray(1, "/Decode [0.2 0.7]"), 1)),
+        ),
+        (
+            "smask_3_own_grid",
+            gray(1, "/SMask 6 0 R"),
+            1,
+            Plane::Mask,
+            Some((gray(3, "/Decode [1 0]"), 3)),
+        ),
+        (
+            "stencil_decoded",
+            "/ImageMask true /Decode [0.2 0.8] /Filter /FlateDecode".into(),
+            1,
+            Plane::Image,
+            None,
+        ),
+        (
+            "tiff_2",
+            gray(
+                2,
+                "/DecodeParms << /Predictor 2 /BitsPerComponent 2 /Columns COLUMNS >>",
+            ),
+            2,
+            Plane::Image,
+            None,
+        ),
+    ];
+    for (name, dict, bits, plane, mask) in kinds {
+        let mut working = Vec::new();
+        for side in [1024_u32, 2048] {
+            let dict = dict.replace("COLUMNS", &side.to_string());
+            let mut objects = vec![image(
+                &format!("{dict} /Width {side} /Height {side}"),
+                &flate(side, bits),
+            )];
+            // A mask on its own grid is half the image's size.
+            let mask_side = if plane == Plane::Mask { side / 2 } else { side };
+            if let Some((mask, mask_bits)) = &mask {
+                objects.push(image(
+                    &format!("{mask} /Width {mask_side} /Height {mask_side}"),
+                    &flate(mask_side, *mask_bits),
+                ));
+            }
+            let pdf = page(
+                "q 100 0 0 100 0 0 cm /Im Do Q",
+                "/XObject << /Im 5 0 R >>",
+                objects,
+            );
+            let mut requested = Requested::new(plane, tile);
+            common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+            let [(peak, _)] = requested.regions[..] else {
+                panic!("{name}: one image")
+            };
+            let saved = requested.saved[0];
+            assert!(saved <= 2 << 20, "{name} {side}: {saved} bytes saved");
+            working.push(peak - saved);
+        }
+        // The larger image's rows, and its mask's, are wider by as much again, which a
+        // piece read past holds, and for TIFF prediction the encoded and decoded rows.
+        let rows = if name.starts_with("tiff") { 3 } else { 1 };
+        let wider = rows * 1024 * (bits + mask.as_ref().map_or(0, |m| m.1)) as usize / 8;
+        assert!(
+            working[1] <= working[0] + wider,
+            "{name}: {} bytes besides saved states for 1024, {} for 2048",
+            working[0],
+            working[1]
+        );
+        assert!(working[1] < 1 << 20, "{name}: {} bytes", working[1]);
+    }
+}
+
+/// A small region of a CCITT image that is indexed or has a mask, or of an image
+/// whose mask is CCITT data, costs memory in proportion to the region, as other
+/// CCITT images do: decoding the larger whole held 64 MiB of samples and as much
+/// again of alpha (three times as much colour for the indexed image). A tile of an
+/// image four times as large holds the same, but for a piece of a mask's row twice
+/// as wide.
+#[test]
+fn a_small_region_of_an_indexed_or_masked_ccitt_image_costs_the_region() {
+    let tile: Bins = |w, h| ((w, h), [w / 2, h - 64, w / 2 + 64, h]);
+    region_cost(
+        "/ColorSpace /DeviceGray /BitsPerComponent 1 /Width 16 /Height 16 /Filter /FlateDecode",
+        &common::stored_zlib(&[0; 32], 1000),
+        |w, h| ((w, h), [0, 0, 1, 1]),
+    );
+    let ccitt = "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns SIDE >>";
+    let gray = "/ColorSpace /DeviceGray /BitsPerComponent 1";
+    // Group 4 rows, each white like the one above (vertical mode, no offset): a
+    // bit each.
+    let white_g4 = |side: u32| vec![0xFF; side as usize / 8];
+    let flate =
+        |side: u32| common::stored_zlib(&common::noise((side / 8 * side) as usize, side), 65_535);
+    /// A kind: its dictionary and data, and its mask's (object 6).
+    type Data = fn(u32) -> Vec<u8>;
+    type Kind = (&'static str, String, Data, Option<(String, Data)>);
+    let kinds: [Kind; 4] = [
+        (
+            "indexed",
+            format!(
+                "/ColorSpace [/Indexed /DeviceRGB 1 <ff0000 0000ff>] /BitsPerComponent 1 {ccitt}"
+            ),
+            white_g4,
+            None,
+        ),
+        (
+            "smask",
+            format!("{gray} /SMask 6 0 R {ccitt}"),
+            white_g4,
+            Some((format!("{gray} /Filter /FlateDecode"), flate)),
+        ),
+        (
+            "ccitt_smask",
+            format!("{gray} /SMask 6 0 R /Filter /FlateDecode"),
+            flate,
+            Some((format!("{gray} {ccitt}"), white_g4)),
+        ),
+        (
+            "ccitt_stencil_mask",
+            format!("{gray} /Mask 6 0 R {ccitt}"),
+            white_g4,
+            Some((format!("/ImageMask true {ccitt}"), white_g4)),
+        ),
+    ];
+    for (name, dict, data, mask) in kinds {
+        let mut working = Vec::new();
+        for side in [4096_u32, 8192] {
+            let size = format!("/Width {side} /Height {side}");
+            let dict = dict.replace("SIDE", &side.to_string());
+            let mut objects = vec![image(&format!("{dict} {size}"), &data(side))];
+            if let Some((mask, mask_data)) = &mask {
+                let mask = mask.replace("SIDE", &side.to_string());
+                objects.push(image(&format!("{mask} {size}"), &mask_data(side)));
+            }
+            let pdf = page(
+                "q 100 0 0 100 0 0 cm /Im Do Q",
+                "/XObject << /Im 5 0 R >>",
+                objects,
+            );
+            let mut requested = Requested::new(Plane::Image, tile);
+            common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+            let [(peak, _)] = requested.regions[..] else {
+                panic!("{name}: one image")
+            };
+            let saved = requested.saved[0];
+            assert!(saved <= 2 << 20, "{name} {side}: {saved} bytes saved");
+            working.push(peak - saved);
+        }
+        // The larger image's rows are 512 bytes wider, which a piece of a bilevel
+        // row read past holds.
+        assert!(
+            working[1] <= working[0] + 512,
+            "{name}: {} bytes besides saved states for 4096, {} for 8192",
+            working[0],
+            working[1]
+        );
+        assert!(working[1] < 1 << 20, "{name}: {} bytes", working[1]);
+    }
+}
+
+/// A small region of an image, stencil mask or soft mask stored through a chain of
+/// LZW, run length, ASCII and Flate filters, over CCITT data or not, costs memory in
+/// proportion to the region, as the same image stored through Flate alone does:
+/// decoding the larger whole held 4 MiB of samples (and each filter's output before
+/// that). A tile of an image four times as large holds the same, but for pieces of
+/// rows twice as wide.
+#[test]
+fn a_small_region_of_an_image_in_a_chain_of_filters_costs_the_region() {
+    use common::chains::{self, Rng};
+    let tile: Bins = |w, h| ((w, h), [w / 2, h - 64, w / 2 + 64, h]);
+    region_cost(
+        "/ColorSpace /DeviceGray /BitsPerComponent 1 /Width 16 /Height 16 /Filter /FlateDecode",
+        &common::stored_zlib(&[0; 32], 1000),
+        |w, h| ((w, h), [0, 0, 1, 1]),
+    );
+    let gray = "/ColorSpace /DeviceGray /BitsPerComponent 1";
+    /// Stored data of `side` × `side` samples of a bit each.
+    type Data = fn(u32) -> Vec<u8>;
+    fn packed(side: u32) -> Vec<u8> {
+        common::noise((side / 8 * side) as usize, side)
+    }
+    let lzw: Data = |side| chains::lzw(&packed(side), true, &mut Rng(side.into()));
+    let run_length: Data = |side| chains::run_length(&packed(side), &mut Rng(side.into()));
+    let a85_flate: Data = |side| {
+        chains::ascii_85(
+            &common::stored_zlib(&packed(side), 65_535),
+            &mut Rng(side.into()),
+        )
+    };
+    let hex_lzw: Data =
+        |side| chains::ascii_hex(&chains::lzw(&packed(side), true, &mut Rng(1)), &mut Rng(2));
+    // Group 4 rows, each white like the one above (vertical mode, no offset): a
+    // bit each.
+    let a85_g4: Data = |side| chains::ascii_85(&vec![0xFF; side as usize / 8], &mut Rng(3));
+    /// A kind: its dictionary and data, the plane requested, and its mask's
+    /// dictionary and data (object 6).
+    type Kind = (&'static str, String, Data, Plane, Option<(String, Data)>);
+    let raw: Data = packed;
+    let kinds: [Kind; 7] = [
+        (
+            "lzw",
+            format!("{gray} /Filter /LZWDecode"),
+            lzw,
+            Plane::Image,
+            None,
+        ),
+        (
+            "run_length",
+            format!("{gray} /Filter /RunLengthDecode"),
+            run_length,
+            Plane::Image,
+            None,
+        ),
+        (
+            "a85_flate",
+            format!("{gray} /Filter [/A85 /FlateDecode]"),
+            a85_flate,
+            Plane::Image,
+            None,
+        ),
+        (
+            "stencil_hex_lzw",
+            "/ImageMask true /Filter [/AHx /LZWDecode]".into(),
+            hex_lzw,
+            Plane::Image,
+            None,
+        ),
+        (
+            "smask_run_length",
+            format!("{gray} /SMask 6 0 R"),
+            raw,
+            Plane::Image,
+            Some((format!("{gray} /Filter /RunLengthDecode"), run_length)),
+        ),
+        (
+            "smask_a85_flate_own_plane",
+            format!("{gray} /SMask 6 0 R"),
+            raw,
+            Plane::Mask,
+            Some((format!("{gray} /Filter [/A85 /FlateDecode]"), a85_flate)),
+        ),
+        (
+            "a85_ccitt",
+            format!(
+                "{gray} /Filter [/A85 /CCITTFaxDecode] /DecodeParms [null << /K -1 /Columns SIDE >>]"
+            ),
+            a85_g4,
+            Plane::Image,
+            None,
+        ),
+    ];
+    for (name, dict, data, plane, mask) in kinds {
+        let mut working = Vec::new();
+        for side in [1024_u32, 2048] {
+            let size = format!("/Width {side} /Height {side}");
+            let dict = dict.replace("SIDE", &side.to_string());
+            let mut objects = vec![image(&format!("{dict} {size}"), &data(side))];
+            // A mask on its own grid is half the image's size.
+            let mask_side = if plane == Plane::Mask { side / 2 } else { side };
+            if let Some((mask, mask_data)) = &mask {
+                let size = format!("/Width {mask_side} /Height {mask_side}");
+                objects.push(image(&format!("{mask} {size}"), &mask_data(mask_side)));
+            }
+            let pdf = page(
+                "q 100 0 0 100 0 0 cm /Im Do Q",
+                "/XObject << /Im 5 0 R >>",
+                objects,
+            );
+            let mut requested = Requested::new(plane, tile);
+            common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+            let [(peak, _)] = requested.regions[..] else {
+                panic!("{name}: one image")
+            };
+            let saved = requested.saved[0];
+            assert!(saved <= 2 << 20, "{name} {side}: {saved} bytes saved");
+            working.push(peak - saved);
+        }
+        // The larger image's rows, and its mask's, are 128 bytes wider each, which a
+        // piece of a row read past holds; and what a decoder made ahead of the reads
+        // past a poll's worth, up to an LZW code's bytes, depends on where the rows
+        // fall in its output.
+        assert!(
+            working[1] <= working[0] + 1024,
+            "{name}: {} bytes besides saved states for 1024, {} for 2048",
+            working[0],
+            working[1]
+        );
+        assert!(working[1] < 1 << 20, "{name}: {} bytes", working[1]);
+    }
+}
+
+/// The last texel of a bilevel mask 40 million samples wide whose data ends halfway
+/// through its row reads as stored zero, as the whole row does, holding a piece of
+/// the row at most, not the bytes between the data's end and the texel.
+#[test]
+fn a_texel_past_a_masks_data_holds_a_piece() {
+    let w = 40_000_000_u32;
+    let pdf = page(
+        "q 100 0 0 100 0 0 cm /Im Do Q",
+        "/XObject << /Im 5 0 R >>",
+        vec![
+            image(
+                "/Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Mask 6 0 R",
+                &[200],
+            ),
+            image(
+                &format!("/Width {w} /Height 1 /ImageMask true"),
+                &vec![0xFF; (w / 16) as usize],
+            ),
+        ],
+    );
+    let mut requested = Requested::new(Plane::Mask, |w, h| ((w, h), [w - 1, 0, w, h]));
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+    let [(peak, data)] = &requested.regions[..] else {
+        panic!("one image")
+    };
+    assert_eq!(data, &[255]);
+    assert!(*peak < 1 << 20, "peak {peak} bytes");
+}
+
+/// The pixels and `pixels_key` of each raster image drawn.
+#[derive(Default)]
+struct Pixels(Vec<(Option<u128>, Vec<u8>)>);
+
+impl<'a> Device<'a> for Pixels {
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(
+        &mut self,
+        _: f32,
+        _: Option<SoftMask<'a>>,
+        _: BlendMode,
+        _: bool,
+        _: bool,
+    ) {
+    }
+    fn draw_glyph_run(&mut self, _: &GlyphRun<'_, 'a>, _: DrawProps<'a>, _: &DrawMode) {}
+    fn draw_image(&mut self, image: Image<'a, '_>, _: ImageDrawProps<'a>) {
+        if let Image::Raster(r) = image {
+            let key = r.pixels_key();
+            r.with_rgba(
+                |image, _| {
+                    self.0.push((
+                        key,
+                        match image {
+                            ImageData::Rgb(d) => d.data,
+                            ImageData::Luma(d) => d.data,
+                        },
+                    ));
+                },
+                None,
+            );
+        }
+    }
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
+}
+
+/// An image drawn through two entries of the table that lead to it, its `/DecodeParms`
+/// naming the second entry, has one key and the same pixels through both, in either
+/// order: a reference from the image back to itself is a cycle by either entry, so
+/// the predictor its own dictionary sets, which would make [65, 66] of [65, 1], is
+/// not applied (`MuPDF`, `PyMuPDF` 1.28.2, reads [65, 1] through the first entry).
+#[test]
+fn an_image_drawn_through_two_entries_decodes_alike() {
+    // zlib of [65, 1].
+    const DATA: &[u8] = &[120, 156, 115, 100, 4, 0, 0, 133, 0, 67];
+    for content in ["/A Do /B Do", "/B Do /A Do"] {
+        let mut objects = common::one_page_objects(
+            100,
+            "/Contents 4 0 R /Resources << /XObject << /A 5 0 R /B 6 0 R >> >>",
+        );
+        objects.extend([
+            common::stream("", content.as_bytes()),
+            image(
+                "/Width 2 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 \
+                 /Filter /FlateDecode /DecodeParms 6 0 R /Predictor 2 /Columns 2",
+                DATA,
+            ),
+        ]);
+        let pdf = Pdf::new(common::file_with_aliases(objects, &[5])).expect("valid pdf");
+        let mut pixels = Pixels::default();
+        common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut pixels);
+        let [first, second] = pixels.0.try_into().expect("two images");
+        assert!(first.0.is_some(), "{content}");
+        assert_eq!(first, second, "{content}");
+        assert_eq!(first.1, [65, 1], "{content}");
+    }
+}
+
+/// CCITT data after a Flate filter whose line is preceded by a run of zero fill
+/// bytes, 1, 4 or 16 MiB of it, before its EOL: a request of the line holds what the
+/// decoders hold, not the fill, whose bytes carry no data; its pixels are white, as
+/// the line codes them, and a request is cancelled while the fill is read.
+#[test]
+fn ccitt_fill_after_a_filter_takes_no_room() {
+    let dict = "/Width 8 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 1 \
+                /Filter [/FlateDecode /CCITTFaxDecode] /DecodeParms [null << /K 0 /Columns 8 >>]";
+    let fill = |mib: usize| {
+        let mut data = vec![0; mib << 20];
+        // The EOL's 1, eight white pixels (`10011`), then padding.
+        data.push(0b1100_1100);
+        common::chains::zlib(&data, 6)
+    };
+    let all: Bins = |w, h| ((w, h), [0, 0, w, h]);
+    // What a thread allocates once, before the first image is measured, is not
+    // counted.
+    region_cost(dict, &fill(0), all);
+    let mut peaks = Vec::new();
+    for mib in [1, 4, 16] {
+        let pdf = page(
+            "q 100 0 0 100 0 0 cm /Im Do Q",
+            "/XObject << /Im 5 0 R >>",
+            vec![image(dict, &fill(mib))],
+        );
+        let mut requested = Requested::new(Plane::Image, all);
+        common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+        let [(peak, data)] = &requested.regions[..] else {
+            panic!("one image")
+        };
+        assert_eq!(data, &[255; 8], "{mib} MiB");
+        peaks.push(*peak);
+    }
+    println!("peaks {peaks:?} for 1, 4 and 16 MiB of fill");
+    assert!(
+        peaks.iter().all(|&p| p < 1 << 20) && peaks[2] <= peaks[0] + (64 << 10),
+        "peaks {peaks:?} for 1, 4 and 16 MiB of fill"
+    );
+    let pdf = page(
+        "q 100 0 0 100 0 0 cm /Im Do Q",
+        "/XObject << /Im 5 0 R >>",
+        vec![image(dict, &fill(16))],
+    );
+    let mut cancelled = Cancelled::default();
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut cancelled);
+    assert_eq!(cancelled.results, [Err(RequestError::Cancelled)]);
+}
+
+/// The first pixel of images behind chains of 17 and 18 filters: Flate, then 16 run
+/// length filters of literal runs, over 256, 1024 and 4096 rows of 8192 samples;
+/// and Flate, then 17 ASCII base-85 filters, over 8 × 8 samples whose first ASCII
+/// base-85 data start with 1, 4 or 16 MiB of white space. A request of the pixel
+/// holds what the filters' decoders hold, not what the data expand to, and is
+/// cancelled while the white space is read.
+#[test]
+fn a_pixel_behind_a_long_chain_of_filters_costs_its_decoders() {
+    fn literal_runs(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(data.len() + data.len() / 128 + 2);
+        for piece in data.chunks(128) {
+            out.push(piece.len() as u8 - 1);
+            out.extend_from_slice(piece);
+        }
+        out.push(128);
+        out
+    }
+    fn ascii_85(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for group in data.chunks(4) {
+            let mut word = [0; 4];
+            word[..group.len()].copy_from_slice(group);
+            let mut value = u32::from_be_bytes(word);
+            let mut digits = [0; 5];
+            for d in digits.iter_mut().rev() {
+                *d = b'!' + (value % 85) as u8;
+                value /= 85;
+            }
+            out.extend_from_slice(&digits[..group.len() + 1]);
+        }
+        out.extend_from_slice(b"~>");
+        out
+    }
+    let first: Bins = |w, h| ((w, h), [0, 0, 1, 1]);
+    const GRAY: &str = "/ColorSpace /DeviceGray /BitsPerComponent 1";
+    fn run_length(rows: usize) -> (String, Vec<u8>) {
+        let mut data = vec![0; rows * 1024];
+        for _ in 0..16 {
+            data = literal_runs(&data);
+        }
+        let filters = ["/RL"; 16].join(" ");
+        let dict = format!("{GRAY} /Width 8192 /Height {rows} /Filter [/FlateDecode {filters}]");
+        (dict, common::chains::zlib(&data, 6))
+    }
+    fn white_space(mib: usize) -> (String, Vec<u8>) {
+        let mut data = vec![0x0F; 8];
+        for _ in 0..17 {
+            data = ascii_85(&data);
+        }
+        let mut spaced = vec![b' '; mib << 20];
+        spaced.extend(data);
+        let filters = ["/A85"; 17].join(" ");
+        let dict = format!("{GRAY} /Width 8 /Height 8 /Filter [/FlateDecode {filters}]");
+        (dict, common::chains::zlib(&spaced, 6))
+    }
+    // What a thread allocates once, before the first image is measured, is not
+    // counted.
+    let (dict, data) = white_space(0);
+    region_cost(&dict, &data, first);
+    type Case = (&'static str, [usize; 3], fn(usize) -> (String, Vec<u8>), u8);
+    let cases: [Case; 2] = [
+        ("run length", [256, 1024, 4096], run_length, 0),
+        ("white space", [1, 4, 16], white_space, 0),
+    ];
+    for (name, sizes, make, pixel) in cases {
+        let mut peaks = Vec::new();
+        for size in sizes {
+            let (dict, data) = make(size);
+            let pdf = page(
+                "q 100 0 0 100 0 0 cm /Im Do Q",
+                "/XObject << /Im 5 0 R >>",
+                vec![image(&dict, &data)],
+            );
+            let mut requested = Requested::new(Plane::Image, first);
+            common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+            let [(peak, data)] = &requested.regions[..] else {
+                panic!("{name}: one image")
+            };
+            assert_eq!(data, &[pixel], "{name} {size}");
+            peaks.push(*peak - requested.saved[0]);
+        }
+        println!("{name}: peaks {peaks:?} for {sizes:?}");
+        assert!(
+            peaks.iter().all(|&p| p < 2 << 20) && peaks[2] <= peaks[0] + (64 << 10),
+            "{name}: peaks {peaks:?} for {sizes:?}"
+        );
+    }
+    let (dict, data) = white_space(16);
+    let pdf = page(
+        "q 100 0 0 100 0 0 cm /Im Do Q",
+        "/XObject << /Im 5 0 R >>",
+        vec![image(&dict, &data)],
+    );
+    let mut cancelled = Cancelled::default();
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut cancelled);
+    assert_eq!(cancelled.results, [Err(RequestError::Cancelled)]);
+}
+
+/// Group 4 data after a Flate filter whose one line repeats codes that write
+/// nothing (horizontal mode with a white and a black run of 0) 100,000, 400,000 or
+/// 1,600,000 times before the code that ends it: a request of the line decodes it
+/// once, holding a bounded window of the codes, not all of them; its pixels are
+/// white, as whole decoding makes them; and a request is cancelled while the codes
+/// are read.
+#[test]
+fn ccitt_codes_writing_nothing_after_a_filter_take_bounded_room_and_linear_work() {
+    #[cfg(debug_assertions)]
+    use hayro_interpret::hayro_syntax::work::TOLD;
+    let dict = "/Width 8 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 1 \
+                /Filter [/FlateDecode /CCITTFaxDecode] /DecodeParms [null << /K -1 /Columns 8 >>]";
+    let codes = |times: usize| {
+        let mut bits = String::new();
+        for _ in 0..times {
+            bits.push_str("001" /* horizontal */);
+            bits.push_str("00110101" /* white 0 */);
+            bits.push_str("0000110111" /* black 0 */);
+        }
+        // Vertical mode, no offset, which ends the line; then EOFB.
+        bits.push_str("1000000000001000000000001");
+        let mut data = vec![0; bits.len().div_ceil(8)];
+        for (i, bit) in bits.bytes().enumerate() {
+            data[i / 8] |= (bit - b'0') << (7 - i % 8);
+        }
+        common::chains::zlib(&data, 6)
+    };
+    let all: Bins = |w, h| ((w, h), [0, 0, w, h]);
+    // What a thread allocates once, before the first image is measured, is not
+    // counted.
+    region_cost(dict, &codes(0), all);
+    let times = [100_000, 400_000, 1_600_000];
+    let (mut peaks, mut work) = (Vec::new(), Vec::new());
+    for n in times {
+        let pdf = page(
+            "q 100 0 0 100 0 0 cm /Im Do Q",
+            "/XObject << /Im 5 0 R >>",
+            vec![image(dict, &codes(n))],
+        );
+        let mut requested = Requested::new(Plane::Image, all);
+        #[cfg(debug_assertions)]
+        TOLD.set(0);
+        common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut requested);
+        #[cfg(debug_assertions)]
+        work.push(TOLD.get());
+        let [(peak, data)] = &requested.regions[..] else {
+            panic!("one image")
+        };
+        assert_eq!(data, &[255; 8], "{n} codes");
+        peaks.push(*peak);
+    }
+    println!("peaks {peaks:?}, work {work:?} for {times:?} codes");
+    assert!(
+        peaks.iter().all(|&p| p < 1 << 20) && peaks[2] <= peaks[0] + (64 << 10),
+        "peaks {peaks:?} for {times:?} codes"
+    );
+    // Each code's 21 bits are read once: a step each, besides the Flate work of
+    // its bytes.
+    for (w, n) in work.iter().zip(times) {
+        assert!((21 * n..30 * n).contains(w), "{w} work for {n} codes");
+    }
+    let pdf = page(
+        "q 100 0 0 100 0 0 cm /Im Do Q",
+        "/XObject << /Im 5 0 R >>",
+        vec![image(dict, &codes(times[2]))],
+    );
+    let mut cancelled = Cancelled::default();
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut cancelled);
+    assert_eq!(cancelled.results, [Err(RequestError::Cancelled)]);
+}
+
+/// Group 3 data after a Flate filter and a PNG predictor whose one row, 2 MiB wide,
+/// holds an EOL and then white lines of 8 pixels, `10011` each, without EOLs: after
+/// the first line the decoder looks through the rest of the row for the EOL that
+/// should end it, and finding none goes back to decode the next lines. The CCITT
+/// feed saves the filters' state, the predictor's whole row among it, once it drops
+/// the bytes from where that line's decoding started, and goes back to that state.
+/// Saving and going back count the bytes they copy on the request's meter a poll's
+/// worth at a time, so that a hook asking to stop while either copies stops it
+/// within a piece or two, not after the whole row; and the pixels are those of whole
+/// decoding.
+#[cfg(debug_assertions)]
+#[test]
+fn ccitt_feed_states_behind_a_wide_predictor_are_copied_on_the_meter() {
+    use hayro_interpret::hayro_syntax::work::{POLL_BYTES, STATE_COPIED};
+    const ROW: usize = 2 << 20;
+    // A filter byte (none), then the bits.
+    let mut row = vec![0; 1 + ROW];
+    for i in 0..8 * ROW {
+        let bit = match i.checked_sub(12) {
+            None => i == 11,
+            Some(i) => b"10011"[i % 5] == b'1',
+        };
+        row[1 + i / 8] |= u8::from(bit) << (7 - i % 8);
+    }
+    let dict = format!(
+        "/Width 8 /Height 64 /ColorSpace /DeviceGray /BitsPerComponent 1 \
+         /Filter [/FlateDecode /CCITTFaxDecode] \
+         /DecodeParms [<< /Predictor 10 /Columns {ROW} >> << /K 0 /Columns 8 >>]"
+    );
+    let pdf = page(
+        "q 100 0 0 100 0 0 cm /Im Do Q",
+        "/XObject << /Im 5 0 R >>",
+        vec![image(&dict, &common::chains::zlib(&row, 6))],
+    );
+    let mut whole = Pixels::default();
+    common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut whole);
+    let [(_, whole)] = &whole.0[..] else {
+        panic!("one image")
+    };
+    // Stopping once `stop_after` bytes of states were copied.
+    let request = |stop_after: usize| {
+        STATE_COPIED.set(0);
+        let mut hooked = Hooked::new(move || STATE_COPIED.get() > stop_after);
+        common::interpret_first_page(&pdf, InterpreterSettings::default(), &mut hooked);
+        let [result] = hooked.results.try_into().expect("one image");
+        (result, STATE_COPIED.get())
+    };
+    let (pixels, copied) = request(usize::MAX);
+    assert_eq!(pixels.as_ref(), Ok(whole));
+    // The row saved, and copied back.
+    assert!(copied >= 2 * ROW, "{copied} bytes copied");
+    // A stop as the state starts to be saved, and halfway through the row as it is
+    // copied back, the last copy.
+    for stop_after in [0, copied - ROW / 2] {
+        let (result, copied) = request(stop_after);
+        println!("stop after {stop_after}: {copied} bytes copied");
+        assert_eq!(
+            result,
+            Err(RequestError::Cancelled),
+            "stop after {stop_after}"
+        );
+        assert!(
+            copied <= stop_after + 2 * POLL_BYTES,
+            "{copied} bytes copied, stop after {stop_after}"
+        );
+    }
+}
+
+/// Requests each image's plane whole with `cancel` as its hook, and keeps what each
+/// request returns.
+struct Hooked<F> {
+    cancel: F,
+    results: Vec<Result<Vec<u8>, RequestError>>,
+}
+
+impl<F: Fn() -> bool> Hooked<F> {
+    fn new(cancel: F) -> Self {
+        Self {
+            cancel,
+            results: Vec::new(),
+        }
+    }
+}
+
+impl<'a, F: Fn() -> bool> Device<'a> for Hooked<F> {
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(
+        &mut self,
+        _: f32,
+        _: Option<SoftMask<'a>>,
+        _: BlendMode,
+        _: bool,
+        _: bool,
+    ) {
+    }
+    fn draw_glyph_run(&mut self, _: &GlyphRun<'_, 'a>, _: DrawProps<'a>, _: &DrawMode) {}
+    fn draw_image(&mut self, image: Image<'a, '_>, _: ImageDrawProps<'a>) {
+        let asset = match image {
+            Image::Raster(r) => r.asset(),
+            Image::Stencil(s) => s.asset(),
+        };
+        let mut source = asset.open(None, None).expect("streamed");
+        let plane = source.layout().image;
+        let request = ImageRequest {
+            plane: Plane::Image,
+            grid: (plane.width, plane.height),
+            window: [0, 0, plane.width, plane.height],
+            cancel: Some(&self.cancel),
+        };
+        self.results.push(source.request(&request).map(|r| r.data));
+    }
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
+}
+
+/// Requests each image's plane whole with a hook that asks to stop at its third poll.
+#[derive(Default)]
+struct Cancelled {
+    results: Vec<Result<(), RequestError>>,
+}
+
+impl<'a> Device<'a> for Cancelled {
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(
+        &mut self,
+        _: f32,
+        _: Option<SoftMask<'a>>,
+        _: BlendMode,
+        _: bool,
+        _: bool,
+    ) {
+    }
+    fn draw_glyph_run(&mut self, _: &GlyphRun<'_, 'a>, _: DrawProps<'a>, _: &DrawMode) {}
+    fn draw_image(&mut self, image: Image<'a, '_>, _: ImageDrawProps<'a>) {
+        let asset = match image {
+            Image::Raster(r) => r.asset(),
+            Image::Stencil(s) => s.asset(),
+        };
+        let polls = std::cell::Cell::new(0);
+        let cancel = || {
+            polls.set(polls.get() + 1);
+            polls.get() >= 3
+        };
+        let mut source = asset.open(None, None).expect("streamed");
+        let plane = source.layout().image;
+        let request = ImageRequest {
+            plane: Plane::Image,
+            grid: (plane.width, plane.height),
+            window: [0, 0, plane.width, plane.height],
+            cancel: Some(&cancel),
+        };
+        self.results.push(source.request(&request).map(|_| ()));
+    }
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
+}

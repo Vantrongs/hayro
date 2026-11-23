@@ -61,6 +61,7 @@ pub(crate) fn render_glyph<'a>(
         glyph.settings.clone(),
         state,
         glyph.nesting_depth,
+        glyph.optional_content.clone(),
     );
 
     let resources = program
@@ -71,7 +72,7 @@ pub(crate) fn render_glyph<'a>(
     let resources = resources.as_ref().unwrap_or(&glyph.parent_resources);
 
     if is_shape_glyph {
-        let mut device = Type3ShapeGlyphDevice::new(device, paint.clone());
+        let mut device = Type3ShapeGlyphDevice::new(device, paint.clone(), glyph.stroke.clone());
         interpret(iter, resources, &mut context, &mut device);
     } else {
         interpret(iter, resources, &mut context, device);
@@ -83,13 +84,17 @@ pub(crate) fn render_glyph<'a>(
 struct Type3ShapeGlyphDevice<'a, 'b, T: Device<'a>> {
     inner: &'b mut T,
     paint: Paint<'a>,
+    stroke: Paint<'a>,
+    forwarded_groups: Vec<bool>,
 }
 
 impl<'a, 'b, T: Device<'a>> Type3ShapeGlyphDevice<'a, 'b, T> {
-    pub(crate) fn new(device: &'b mut T, paint: Paint<'a>) -> Self {
+    pub(crate) fn new(device: &'b mut T, paint: Paint<'a>, stroke: Paint<'a>) -> Self {
         Self {
             inner: device,
             paint,
+            stroke,
+            forwarded_groups: Vec::new(),
         }
     }
 }
@@ -97,8 +102,22 @@ impl<'a, 'b, T: Device<'a>> Type3ShapeGlyphDevice<'a, 'b, T> {
 // Only filling, stroking of paths and stencil masks are allowed.
 impl<'a, T: Device<'a>> Device<'a> for Type3ShapeGlyphDevice<'a, '_, T> {
     fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        let in_group = self.forwarded_groups.last() == Some(&true);
+        let mut paint = if matches!(draw_mode, DrawMode::Stroke(_)) {
+            self.stroke.clone()
+        } else {
+            self.paint.clone()
+        };
+        if in_group {
+            paint.set_opacity(1.0);
+        }
         let props = DrawProps {
-            paint: self.paint.clone(),
+            knockout: if in_group {
+                props.knockout
+            } else {
+                crate::Knockout::None
+            },
+            paint,
             ..props
         };
         self.inner.draw_path(path, props, draw_mode);
@@ -111,11 +130,18 @@ impl<'a, T: Device<'a>> Device<'a> for Type3ShapeGlyphDevice<'a, '_, T> {
     fn push_transparency_group(
         &mut self,
         _: f32,
-        _: Option<SoftMask<'_>>,
-        _: BlendMode,
-        _: bool,
-        _: bool,
+        soft_mask: Option<SoftMask<'a>>,
+        blend_mode: BlendMode,
+        isolated: bool,
+        knockout: bool,
     ) {
+        let opacity = self.paint.opacity();
+        let forward = isolated && knockout && opacity == self.stroke.opacity();
+        if forward {
+            self.inner
+                .push_transparency_group(opacity, soft_mask, blend_mode, true, true);
+        }
+        self.forwarded_groups.push(forward);
     }
 
     fn draw_glyph_run(
@@ -131,7 +157,11 @@ impl<'a, T: Device<'a>> Device<'a> for Type3ShapeGlyphDevice<'a, '_, T> {
         self.inner.pop_clip();
     }
 
-    fn pop_transparency_group(&mut self) {}
+    fn pop_transparency_group(&mut self) {
+        if self.forwarded_groups.pop() == Some(true) {
+            self.inner.pop_transparency_group();
+        }
+    }
 
     fn draw_image(&mut self, image: Image<'a, '_>, props: ImageDrawProps<'a>) {
         if let Image::Stencil(mut s) = image {

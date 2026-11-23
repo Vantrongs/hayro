@@ -31,8 +31,10 @@
 
 extern crate alloc;
 
-use crate::bit_reader::BitReader;
+use crate::bit_reader::{BitReader, Data, Position};
 use crate::context::DecoderContext;
+use alloc::{rc::Rc, vec::Vec};
+use core::convert::Infallible;
 
 mod bit_reader;
 mod cancel;
@@ -53,23 +55,308 @@ pub fn decode(data: &[u8], decoder: &mut impl Decoder, settings: &DecodeSettings
         return Ok(0);
     }
 
-    let mut reader = BitReader::new(data);
-    let mut ctx = DecoderContext::new(settings);
+    let mut ctx = DecoderContext::new(settings.clone());
+    let mut reader = BitReader::new(Data::Slice(data));
+    start(&mut ctx, &mut reader, decoder)?;
+    while step(&mut ctx, &mut reader, decoder)? {}
+    finish(&mut reader, decoder)
+}
 
-    match settings.encoding {
-        EncodingMode::Group4 => group4::decode(&mut ctx, &mut reader, decoder)?,
-        EncodingMode::Group3_1D => group3::decode_1d(&mut ctx, &mut reader, decoder)?,
-        EncodingMode::Group3_2D => group3::decode_2d(&mut ctx, &mut reader, decoder)?,
+/// Encoded data read a few bytes at a time ([`RowDecoder::from_source`]). Decoding
+/// reads it mostly forward, and again from where a row's decoding started (the
+/// start of a damaged line in Group 3 data, or after looking ahead for an EOL),
+/// never from before it ([`RowDecoder::byte_position`]).
+pub trait Source {
+    /// Copies the bytes from `pos` on into `out` and returns how many the data holds
+    /// there: fewer than `out` holds only at its end.
+    fn read_at(&self, pos: usize, out: &mut [u8]) -> usize;
+}
+
+/// Decodes CCITT data a row at a time, as its reader asks for rows, rather than
+/// pushing them all as [`decode`] does: it pushes the same rows and ends the same.
+/// A copy decodes on from where the original was.
+#[derive(Clone)]
+pub struct RowDecoder<'a> {
+    reader: BitReader<'a>,
+    ctx: DecoderContext,
+    state: State,
+}
+
+/// Where a [`RowDecoder`] is, without its data, to go on from with
+/// [`RowDecoder::resume`] on a decoder of the same data and settings: the reader's
+/// position and the decoder's state, the colour changes of the last line among it.
+#[derive(Clone)]
+pub struct RowState {
+    position: Position,
+    ctx: DecoderContext,
+    state: State,
+}
+
+impl RowState {
+    /// The bytes it holds on the heap: at most [`Self::heap_bound`].
+    pub fn heap_bytes(&self) -> usize {
+        self.ctx.heap_bytes()
     }
 
+    /// The most bytes a state of a decoder with `settings` holds on the heap, at any
+    /// row.
+    pub fn heap_bound(settings: &DecodeSettings) -> usize {
+        2 * (settings.columns as usize + 1) * size_of::<u32>()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum State {
+    Start,
+    Rows,
+    /// The last row was pushed; the end of the data is still to be read.
+    Last,
+    Done,
+}
+
+impl<'a> RowDecoder<'a> {
+    /// A decoder of `data`, decoded with `settings`.
+    pub fn new(data: &'a [u8], settings: DecodeSettings) -> Self {
+        Self::with(Data::Slice(data), settings)
+    }
+
+    /// A decoder of the data `source` reads.
+    pub fn from_source(source: Rc<dyn Source + 'a>, settings: DecodeSettings) -> Self {
+        Self::with(Data::Source(source), settings)
+    }
+
+    /// A decoder of data a source lent to each call reads ([`Self::next_row_in`]):
+    /// so the source may borrow what holds for that call alone, such as a way to
+    /// stop it. Each source lent must read the same data.
+    pub fn detached(settings: DecodeSettings) -> Self {
+        Self::with(Data::Detached, settings)
+    }
+
+    fn with(data: Data<'a>, settings: DecodeSettings) -> Self {
+        Self {
+            reader: BitReader::new(data),
+            ctx: DecoderContext::new(settings),
+            state: State::Start,
+        }
+    }
+
+    /// The settings it decodes with.
+    pub fn settings(&self) -> &DecodeSettings {
+        &self.ctx.settings
+    }
+
+    /// Where it is, to go on from later with [`Self::resume`].
+    pub fn state(&self) -> RowState {
+        self.state_with(|changes| Ok::<_, Infallible>(changes.to_vec()))
+            .unwrap_or_else(|never| match never {})
+    }
+
+    /// [`Self::state`], each list of colour changes, as many as a line's columns,
+    /// copied by `copy`, which may fail, so that the caller can count the copying
+    /// and stop it.
+    pub fn state_with<E>(
+        &self,
+        mut copy: impl FnMut(&[u32]) -> core::result::Result<Vec<u32>, E>,
+    ) -> core::result::Result<RowState, E> {
+        Ok(RowState {
+            position: self.reader.position(),
+            ctx: self.ctx.copy_with(&mut copy)?,
+            state: self.state,
+        })
+    }
+
+    /// Goes on from `state`, taken of a decoder of the same data and settings, as
+    /// that decoder would have.
+    pub fn resume(&mut self, state: &RowState) {
+        self.resume_with(state, |changes| Ok::<_, Infallible>(changes.to_vec()))
+            .unwrap_or_else(|never| match never {});
+    }
+
+    /// [`Self::resume`], its lists of colour changes copied by `copy` (see
+    /// [`Self::state_with`]); where `copy` fails, the decoder is unchanged.
+    pub fn resume_with<E>(
+        &mut self,
+        state: &RowState,
+        mut copy: impl FnMut(&[u32]) -> core::result::Result<Vec<u32>, E>,
+    ) -> core::result::Result<(), E> {
+        self.ctx = state.ctx.copy_with(&mut copy)?;
+        self.reader.seek(&state.position);
+        self.state = state.state;
+        Ok(())
+    }
+
+    /// The rows pushed so far.
+    pub fn decoded_rows(&self) -> u32 {
+        self.ctx.decoded_rows
+    }
+
+    /// The byte of the data the next row's decoding starts in: it reads no byte
+    /// before it.
+    pub fn byte_position(&self) -> usize {
+        self.reader.byte_pos()
+    }
+
+    /// The colour changes of the last row pushed, as [`Decoder::push_row`] was given
+    /// them; empty before the first.
+    pub fn last_row(&self) -> &[u32] {
+        self.ctx.last_row()
+    }
+
+    /// Decodes the next row and pushes it to `decoder`: `Ok(true)` once it pushed
+    /// one, `Ok(false)` where the data ended, as [`decode`] returns `Ok` (with
+    /// `decoder` asked once more); an error where [`decode`] fails, after the rows
+    /// it pushes before failing. After `Ok(false)` or an error, it pushes no more.
+    pub fn next_row(&mut self, decoder: &mut impl Decoder) -> Result<bool> {
+        let result = advance(&mut self.ctx, &mut self.state, &mut self.reader, decoder);
+        if !matches!(result, Ok(true)) {
+            self.state = State::Done;
+        }
+        result
+    }
+
+    /// [`Self::next_row`] of a [`Self::detached`] decoder, reading `source`.
+    pub fn next_row_in(&mut self, source: &dyn Source, decoder: &mut impl Decoder) -> Result<bool> {
+        let mut reader = BitReader::lent(source, &self.reader.position());
+        let result = advance(&mut self.ctx, &mut self.state, &mut reader, decoder);
+        self.reader.seek(&reader.position());
+        if !matches!(result, Ok(true)) {
+            self.state = State::Done;
+        }
+        result
+    }
+}
+
+/// Decodes the next row of `reader`'s data and pushes it to `decoder`, as
+/// [`RowDecoder::next_row`] does.
+fn advance(
+    ctx: &mut DecoderContext,
+    state: &mut State,
+    reader: &mut BitReader<'_>,
+    decoder: &mut impl Decoder,
+) -> Result<bool> {
+    if *state == State::Start {
+        if ctx.settings.columns == 0 {
+            return Ok(false);
+        }
+        start(ctx, reader, decoder)?;
+        *state = State::Rows;
+    }
+    if *state == State::Rows {
+        let rows = ctx.decoded_rows;
+        let more = step(ctx, reader, decoder)?;
+        if !more {
+            *state = State::Last;
+        }
+        if ctx.decoded_rows > rows {
+            return Ok(true);
+        }
+    }
+    if *state == State::Last {
+        finish(reader, decoder)?;
+    }
+    Ok(false)
+}
+
+/// Reads what the data starts with, before its first line.
+fn start(
+    ctx: &mut DecoderContext,
+    reader: &mut BitReader<'_>,
+    decoder: &mut impl Decoder,
+) -> Result<()> {
+    match ctx.settings.encoding {
+        EncodingMode::Group4 => Ok(()),
+        EncodingMode::Group3_1D | EncodingMode::Group3_2D => group3::start(ctx, reader, decoder),
+    }
+}
+
+/// Decodes the next line, where the data holds one: false once the data ends.
+fn step(
+    ctx: &mut DecoderContext,
+    reader: &mut BitReader<'_>,
+    decoder: &mut impl Decoder,
+) -> Result<bool> {
+    if ctx
+        .settings
+        .cancel
+        .as_ref()
+        .is_some_and(CancelHandle::is_cancelled)
+    {
+        return Err(DecodeError::Cancelled);
+    }
+    match ctx.settings.encoding {
+        EncodingMode::Group4 => group4::step(ctx, reader, decoder),
+        EncodingMode::Group3_1D => group3::step_1d(ctx, reader, decoder),
+        EncodingMode::Group3_2D => group3::step_2d(ctx, reader, decoder),
+    }
+}
+
+/// Reads to the end of the data's last byte, and asks `decoder` once more: the
+/// bytes read.
+fn finish(reader: &mut BitReader<'_>, decoder: &mut impl Decoder) -> Result<usize> {
     reader.align();
+    reader.ask(decoder)?;
     Ok(reader.byte_pos())
 }
 
+#[cfg(all(any(debug_assertions, feature = "work-counters"), feature = "std"))]
+std::thread_local! {
+    /// The steps of the decoder's loops taken on this thread: a code read, a change
+    /// of the reference line searched. Counted where they are taken, apart from what
+    /// [`Decoder::stop`] is told, so that tests can bound the work between two asks
+    /// by it. Debug builds with the `std` feature only.
+    #[doc(hidden)]
+    pub static OPERATIONS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(all(any(debug_assertions, feature = "work-counters"), feature = "std"))]
+std::thread_local! {
+    /// The bytes of room made on this thread for a line's colour changes, filled a
+    /// change per code read: what tests tell an allocation filled as bits are read
+    /// from one made at once by. Debug builds with the `std` feature only.
+    #[doc(hidden)]
+    pub static RESERVED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Counts `steps` of the decoder's loops ([`OPERATIONS`]).
+#[inline(always)]
+pub(crate) fn operation(_steps: usize) {
+    #[cfg(all(any(debug_assertions, feature = "work-counters"), feature = "std"))]
+    OPERATIONS.set(OPERATIONS.get() + _steps);
+}
+
+/// Notes room of `bytes` made for colour changes ([`RESERVED`]).
+#[inline(always)]
+pub(crate) fn reserved(_bytes: usize) {
+    #[cfg(all(any(debug_assertions, feature = "work-counters"), feature = "std"))]
+    RESERVED.set(RESERVED.get() + _bytes);
+}
+
+/// The bits read after which [`Decoder::stop`] is asked again.
+pub const POLL_BITS: usize = 1 << 12;
+
 /// A sink for the rows of a CCITT image.
 pub trait Decoder {
-    /// Push a row as the ascending positions where its color changes, starting from white.
+    /// Push a decoded row.
+    ///
+    /// `changes` contains the positions at which the color changes, in strictly
+    /// ascending order and each smaller than the number of columns. Each row
+    /// starts white, so the pixels from `changes[0]` up to `changes[1]` are
+    /// black, those from `changes[2]` up to `changes[3]` again, and so on. If
+    /// the number of changes is odd, the row ends black.
     fn push_row(&mut self, changes: &[u32]);
+    /// Whether to stop decoding, which then fails with [`DecodeError::Stopped`].
+    /// Asked between codes and within runs of fill bits each time [`POLL_BITS`]
+    /// more bits were read, and once more when decoding succeeds, with `bits`,
+    /// the number of bits read since the previous ask. Every code takes at least
+    /// one bit, and each does a bounded amount of work, the search of the line
+    /// above for the changes it refers to included, whatever the line's width, so
+    /// the work between two asks is bounded whatever the data, apart from the rows
+    /// pushed meanwhile. Bits read again after a damaged line are told again; bits
+    /// looked at ahead and then not consumed may not be told. Never by default.
+    fn stop(&mut self, bits: usize) -> bool {
+        let _ = bits;
+        false
+    }
 }
 
 /// Settings to apply during decoding.
@@ -91,6 +378,23 @@ pub struct DecodeSettings {
     pub strict: bool,
     /// A check for cancelling decoding.
     pub cancel: Option<CancelHandle>,
+}
+
+impl DecodeSettings {
+    /// Creates new settings for an image with the given number of columns and
+    /// rows, using the default values for all other settings.
+    pub fn new(columns: u32, rows: u32) -> Self {
+        Self {
+            columns,
+            rows,
+            end_of_block: true,
+            end_of_line: false,
+            rows_are_byte_aligned: false,
+            encoding: EncodingMode::Group3_1D,
+            strict: false,
+            cancel: None,
+        }
+    }
 }
 
 /// A CCITT encoding mode.

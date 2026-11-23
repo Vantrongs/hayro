@@ -1,5 +1,7 @@
+use super::copy_cost;
 use super::{ColorSpace, ToRgb, U8Lookup};
-use crate::cache::Cache;
+use crate::cache::Building;
+use crate::encode::Cost;
 use crate::function::{Function, MAX_COMPONENTS};
 use hayro_syntax::object::{Array, Name, Object};
 use rustc_hash::FxHashMap;
@@ -16,7 +18,15 @@ pub(crate) struct DeviceN {
 }
 
 impl DeviceN {
-    pub(super) fn new(array: &Array<'_>, cache: &Cache, depth: u8) -> Option<Self> {
+    /// The steps evaluating a color takes: its tint transform's, and the alternate
+    /// space's.
+    fn evaluation_cost(&self) -> Cost {
+        Cost::of(usize::from(self.num_components))
+            + self.tint_transform.cost()
+            + self.alternate_space.cost()
+    }
+
+    pub(super) fn new(array: &Array<'_>, cache: &Building<'_>, depth: u8) -> Option<Self> {
         let mut iter = array.flex_iter();
         let _ = iter.next::<Name<'_>>()?;
         let names = iter
@@ -41,30 +51,33 @@ impl DeviceN {
         })
     }
 
-    fn evaluate(&self, input: &[u8]) -> Vec<u8> {
-        let num_components = self.num_components as usize;
-        let num_encoded = self.alternate_space.num_components() as usize;
-        let mut components = [0.0; MAX_COMPONENTS];
-        let components = &mut components[..num_components];
-        let mut values = [0.0; MAX_COMPONENTS];
+    fn evaluate_pixel(&self, pixel: &[u8]) -> smallvec::SmallVec<[u8; 4]> {
+        let mut components = [0.; MAX_COMPONENTS];
+        for (component, &byte) in components.iter_mut().zip(pixel) {
+            *component = super::u8_to_f32(byte);
+        }
+        let mut values = [0.; MAX_COMPONENTS];
         let values = &mut values[..self.tint_transform.num_outputs()];
-        let mut evaluate_pixel = |pixel: &[u8]| {
-            for (component, value) in components.iter_mut().zip(pixel) {
-                *component = *value as f32 * (1.0 / 255.0);
-            }
+        if self
+            .tint_transform
+            .eval(&components[..pixel.len()], values)
+            .is_some()
+        {
+            self.alternate_space.encode_values(values)
+        } else {
+            self.alternate_space
+                .encode_values(&self.alternate_space.initial_color())
+        }
+    }
 
-            if self.tint_transform.eval(components, values).is_some() {
-                self.alternate_space.encode_values(values)
-            } else {
-                self.alternate_space
-                    .encode_values(&self.alternate_space.initial_color())
-            }
-        };
+    fn evaluate(&self, input: &[u8]) -> Vec<u8> {
+        let num_components = usize::from(self.num_components);
+        let num_encoded = usize::from(self.alternate_space.num_components());
         let mut evaluated = Vec::with_capacity(input.len() / num_components * num_encoded);
 
         if num_components > 8 {
             for pixel in input.chunks_exact(num_components) {
-                evaluated.extend(evaluate_pixel(pixel));
+                evaluated.extend(self.evaluate_pixel(pixel));
             }
 
             return evaluated;
@@ -85,7 +98,7 @@ impl DeviceN {
                     Some(&offset) => Some(offset),
                     None if offsets.len() < MAX_CACHED_COLORS => {
                         let offset = cached.len();
-                        cached.extend(evaluate_pixel(pixel));
+                        cached.extend(self.evaluate_pixel(pixel));
                         offsets.insert(key, offset);
 
                         Some(offset)
@@ -99,7 +112,7 @@ impl DeviceN {
                     evaluated.extend_from_slice(&cached[offset..offset + num_encoded]);
                     previous = Some((key, offset));
                 }
-                None => evaluated.extend(evaluate_pixel(pixel)),
+                None => evaluated.extend(self.evaluate_pixel(pixel)),
             }
         }
 
@@ -107,6 +120,11 @@ impl DeviceN {
     }
 
     fn convert_inner(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
+        if input.len() == usize::from(self.num_components) {
+            return self
+                .alternate_space
+                .convert(&self.evaluate_pixel(input), output);
+        }
         let evaluated = self.evaluate(input);
         self.alternate_space.convert(&evaluated, output)
     }
@@ -118,6 +136,24 @@ impl DeviceN {
 }
 
 impl ToRgb for DeviceN {
+    fn cost(&self) -> Cost {
+        if self.num_components == 1 {
+            copy_cost(1)
+        } else {
+            self.evaluation_cost()
+        }
+    }
+
+    /// The table a tint of one component is looked up in, until it is built.
+    fn setup_cost(&self) -> Cost {
+        let table = if self.num_components == 1 {
+            self.lookup.setup_cost(self.evaluation_cost())
+        } else {
+            Cost::ZERO
+        };
+        table + self.alternate_space.setup_cost()
+    }
+
     fn convert(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
         if self.num_components == 1 {
             let lookup = self.u8_lookup()?;

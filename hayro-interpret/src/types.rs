@@ -1,12 +1,14 @@
 use crate::CacheKey;
 use crate::color::Color;
+use crate::interpret::state::ActiveTransferFunction;
 use crate::pattern::Pattern;
 use crate::util::hash128;
-use crate::x_object::ImageXObject;
+use crate::x_object::SampledImage;
 use crate::x_object::soft_mask::SoftMask;
 use hayro_syntax::object::Stream;
 use kurbo::{Affine, BezPath, Cap, Join};
 use smallvec::{SmallVec, smallvec};
+use std::sync::Arc;
 
 /// A clip path.
 #[derive(Debug, Clone)]
@@ -26,79 +28,162 @@ impl CacheKey for ClipPath {
 /// A stencil image.
 pub struct StencilImage<'a, 'b> {
     pub(crate) paint: Paint<'a>,
-    pub(crate) image_xobject: ImageXObject<'b>,
+    pub(crate) stream: Stream<'b>,
+    pub(crate) image: Arc<SampledImage>,
 }
 
 impl<'a, 'b> StencilImage<'a, 'b> {
-    /// Run `func` with the decoded stencil data, optionally hinting at the desired resolution.
+    /// Perform some operation with the stencil data of the image.
+    ///
+    /// The second argument allows you to give the image decoder a hint for
+    /// what resolution of the image you want to have. Note that this does not
+    /// mean that the resulting image will have that dimension. Instead, it allows
+    /// the image decoder to extract a lower-resolution version of the image in
+    /// certain cases.
+    ///
+    /// `func` is not called where the image cannot be decoded, nor where it cannot
+    /// be held whole, as large as the rows it declares: that is a decode failure.
     pub fn with_stencil(
         &self,
         func: impl FnOnce(LumaData, &Paint<'a>),
         target_dimension: Option<(u32, u32)>,
     ) {
-        if let Some(decoded) = self.image_xobject.decoded_mask(target_dimension) {
-            func(decoded.luma, &self.paint);
+        if let Some(decoded) = self.image.decoded_mask(target_dimension) {
+            match decoded.into_whole() {
+                Some(luma) => func(luma, &self.paint),
+                None => self.image.whole_failed(),
+            }
         }
     }
 
-    /// Return the underlying image stream.
+    /// Return the underlying stream.
     pub fn stream(&self) -> &Stream<'b> {
-        self.image_xobject.stream()
+        &self.stream
     }
 
-    // Hidden: clients should use the dimensions of the decoded data.
+    /// The paint the mask lets through.
+    pub fn paint(&self) -> &Paint<'a> {
+        &self.paint
+    }
+
+    /// The mask as an owned asset, as [`RasterImage::asset`]: its one plane
+    /// ([`Plane::Image`](crate::Plane::Image)) is the alpha the paint is drawn
+    /// through ([`PixelFormat::Alpha`](crate::PixelFormat::Alpha)), decoded whole when
+    /// opened.
+    pub fn asset(&self) -> crate::ImageAsset {
+        crate::ImageAsset::new(self.image.clone(), self.pixels_key())
+    }
+
+    /// Identifies the alpha the mask decodes to, as [`RasterImage::pixels_key`]: its
+    /// body, which no raster image's key names alone. `None` for an inline mask.
+    pub fn pixels_key(&self) -> Option<u128> {
+        let id = self.stream.identity()?;
+        Some(hash128(&(id, "stencil")))
+    }
+
+    // These are hidden since clients are supposed to call get the
+    // width/height from `LumaData` instead.
     #[doc(hidden)]
     pub fn width(&self) -> u32 {
-        self.image_xobject.width()
+        self.image.width()
     }
 
     #[doc(hidden)]
     pub fn height(&self) -> u32 {
-        self.image_xobject.height()
+        self.image.height()
     }
 }
 
 impl CacheKey for StencilImage<'_, '_> {
     fn cache_key(&self) -> u128 {
-        self.image_xobject.cache_key()
+        self.stream.cache_key()
     }
 }
 
 /// A raster image.
-pub struct RasterImage<'a>(pub(crate) ImageXObject<'a>);
+pub struct RasterImage<'a> {
+    pub(crate) stream: Stream<'a>,
+    pub(crate) image: Arc<SampledImage>,
+    /// Whether the colour space is a name looked up in the resources where the
+    /// image is drawn.
+    pub(crate) cs_by_name: bool,
+}
 
 impl RasterImage<'_> {
-    /// Run `func` with the decoded RGB and alpha data, optionally hinting at the desired resolution.
+    /// Perform some operation with the RGB and alpha channel of the image.
+    ///
+    /// The second argument allows you to give the image decoder a hint for
+    /// what resolution of the image you want to have. Note that this does not
+    /// mean that the resulting image will have that dimension. Instead, it allows
+    /// the image decoder to extract a lower-resolution version of the image in
+    /// certain cases.
+    ///
+    /// `func` is not called where the image cannot be decoded, nor where it cannot
+    /// be held whole, as large as the rows it declares: that is a decode failure.
     pub fn with_rgba(
         &self,
         func: impl FnOnce(ImageData, Option<LumaData>),
         target_dimension: Option<(u32, u32)>,
     ) {
-        if let Some(decoded) = self.0.decoded_image(target_dimension) {
-            func(decoded.image, decoded.alpha);
+        if let Some(decoded) = self.image.decoded_image(target_dimension) {
+            match decoded.into_whole() {
+                Some((image, alpha)) => func(image, alpha),
+                None => self.image.whole_failed(),
+            }
         }
     }
 
-    /// Return the underlying image stream.
+    /// Return the underlying stream object.
+    ///
+    /// This allows you to get access to the raw encoded image data, without doing any decoding.
     pub fn stream(&self) -> &Stream<'_> {
-        self.0.stream()
+        &self.stream
     }
 
-    // Hidden: clients should use the dimensions of the decoded data.
+    // These are hidden since clients are supposed to call get the
+    // width/height from `LumaData` instead.
     #[doc(hidden)]
     pub fn width(&self) -> u32 {
-        self.0.width()
+        self.image.width()
     }
 
     #[doc(hidden)]
     pub fn height(&self) -> u32 {
-        self.0.height()
+        self.image.height()
+    }
+
+    /// The image as an owned asset: a handle that outlives the content stream and
+    /// decodes regions of the image on request, keyed by [`Self::pixels_key`].
+    pub fn asset(&self) -> crate::ImageAsset {
+        crate::ImageAsset::new(self.image.clone(), self.pixels_key())
+    }
+
+    /// Identifies the pixels `with_rgba` decodes for a given `target_dimension`: the
+    /// image's body ([`Stream::identity`](hayro_syntax::object::Stream::identity),
+    /// unique among the documents loaded, one for every entry leading to it) and the
+    /// transfer function in effect. `None`
+    /// when there is no object to identify (an inline image) or the colour space is a
+    /// name looked up in the resources where the image is drawn.
+    pub fn pixels_key(&self) -> Option<u128> {
+        let id = self.stream.identity()?;
+        if self.cs_by_name {
+            return None;
+        }
+        let image = &self.image;
+        // Decoding applies the transfer function through these tables
+        // (`decode_image`): a luma image the single one, an RGB one the first three.
+        let tables: SmallVec<[&[u8; 256]; 3]> = match &image.transfer_function {
+            None => SmallVec::new(),
+            Some(ActiveTransferFunction::Single(f)) => smallvec![f.samples()],
+            Some(ActiveTransferFunction::Four(f)) => f[..3].iter().map(|f| f.samples()).collect(),
+        };
+        Some(hash128(&(id, tables)))
     }
 }
 
 impl CacheKey for RasterImage<'_> {
     fn cache_key(&self) -> u128 {
-        self.0.cache_key()
+        self.stream.cache_key()
     }
 }
 
@@ -111,7 +196,8 @@ pub enum Image<'a, 'b> {
 }
 
 impl Image<'_, '_> {
-    // Hidden: clients should use the dimensions of the decoded data.
+    // These are hidden since clients are supposed to call get the
+    // width/height from `LumaData/RgbData` instead.
     #[doc(hidden)]
     pub fn width(&self) -> u32 {
         match self {
@@ -120,7 +206,8 @@ impl Image<'_, '_> {
         }
     }
 
-    // Hidden: clients should use the dimensions of the decoded data.
+    // These are hidden since clients are supposed to call get the
+    // width/height from `LumaData/RgbData` instead.
     #[doc(hidden)]
     pub fn height(&self) -> u32 {
         match self {
@@ -142,7 +229,7 @@ impl CacheKey for Image<'_, '_> {
 /// A structure holding 3-channel RGB data.
 #[derive(Clone)]
 pub struct RgbData {
-    /// The pixel data, of length `width * height * 3`.
+    /// The actual data. It is guaranteed to have the length width * height * 3.
     pub data: Vec<u8>,
     /// The width.
     pub width: u32,
@@ -150,14 +237,25 @@ pub struct RgbData {
     pub height: u32,
     /// Whether the image should be interpolated.
     pub interpolate: bool,
-    /// The x and y factors to scale the image by so that it covers its intended area.
+    /// Additional scaling factors to apply to the image.
+    ///
+    /// In most cases, those factors will just be 1.0, and you can
+    /// ignore them. There are two situations in which they will not be equal
+    /// to 1:
+    /// 1) The PDF provided wrong metadata about the width/height of the image,
+    ///    which needs to be corrected
+    /// 2) A lower resolution of the image was requested, in which case it needs
+    ///    to be scaled up so that it still covers the same area.
+    ///
+    /// The first number indicates the x scaling factor, the second number the
+    /// y scaling factor.
     pub scale_factors: (f32, f32),
 }
 
 /// A structure holding 1-channel luma data.
 #[derive(Clone)]
 pub struct LumaData {
-    /// The pixel data, of length `width * height`.
+    /// The actual data. It is guaranteed to have the length width * height.
     pub data: Vec<u8>,
     /// The width.
     pub width: u32,
@@ -165,7 +263,18 @@ pub struct LumaData {
     pub height: u32,
     /// Whether the image should be interpolated.
     pub interpolate: bool,
-    /// The x and y factors to scale the image by so that it covers its intended area.
+    /// Additional scaling factors to apply to the image.
+    ///
+    /// In most cases, those factors will just be 1.0, and you can
+    /// ignore them. There are two situations in which they will not be equal
+    /// to 1:
+    /// 1) The PDF provided wrong metadata about the width/height of the image,
+    ///    which needs to be corrected
+    /// 2) A lower resolution of the image was requested, in which case it needs
+    ///    to be scaled up so that it still covers the same area.
+    ///
+    /// The first number indicates the x scaling factor, the second number the
+    /// y scaling factor.
     pub scale_factors: (f32, f32),
 }
 
@@ -210,6 +319,30 @@ impl ImageData {
             Self::Luma(d) => d.scale_factors,
         }
     }
+
+    /// The samples, the rows they hold, and the channels of a texel.
+    pub(crate) fn rows_mut(&mut self) -> (&mut Vec<u8>, &mut u32, usize) {
+        match self {
+            Self::Rgb(d) => (&mut d.data, &mut d.height, 3),
+            Self::Luma(d) => (&mut d.data, &mut d.height, 1),
+        }
+    }
+
+    /// Bytes per texel.
+    pub(crate) fn channels(&self) -> usize {
+        match self {
+            Self::Rgb(_) => 3,
+            Self::Luma(_) => 1,
+        }
+    }
+
+    /// The texels its data holds.
+    pub(crate) fn texels(&self) -> usize {
+        match self {
+            Self::Rgb(d) => d.data.len() / 3,
+            Self::Luma(d) => d.data.len(),
+        }
+    }
 }
 
 /// A type of paint.
@@ -219,6 +352,22 @@ pub enum Paint<'a> {
     Color(Color),
     /// A PDF pattern.
     Pattern(Box<Pattern<'a>>),
+}
+
+impl Paint<'_> {
+    pub(crate) fn opacity(&self) -> f32 {
+        match self {
+            Self::Color(c) => c.opacity(),
+            Self::Pattern(p) => p.opacity(),
+        }
+    }
+
+    pub(crate) fn set_opacity(&mut self, opacity: f32) {
+        match self {
+            Self::Color(c) => c.set_opacity(opacity),
+            Self::Pattern(p) => p.set_opacity(opacity),
+        }
+    }
 }
 
 impl CacheKey for Paint<'_> {
@@ -245,6 +394,26 @@ pub struct DrawProps<'a> {
     pub soft_mask: Option<SoftMask<'a>>,
     /// The blend mode.
     pub blend_mode: BlendMode,
+    /// How the drawing combines with what the current transparency group drew
+    /// beneath it.
+    pub knockout: Knockout,
+}
+
+/// How a drawing combines with what the current transparency group drew beneath it:
+/// the stroke of a path filled and stroked by one operator, which viewers paint as a
+/// knockout group (PDF 32000-1 11.4.6.2), hides the fill where it covers it. A device
+/// that composites every drawing over shows what the stroke should hide.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Knockout {
+    /// Composited over it.
+    #[default]
+    None,
+    /// Replaces it in proportion to how much of each pixel the drawing covers, so a
+    /// pixel the drawing covers in part is as opaque as the two together.
+    Replace,
+    /// Clears it in proportion to coverage, then is composited over it, so a pixel
+    /// the drawing covers in part shows less of either.
+    ClearThenOver,
 }
 
 /// Properties for an image drawing operation.
@@ -283,9 +452,12 @@ pub struct StrokeProps {
     /// The miter limit.
     pub miter_limit: f32,
     /// The dash array.
-    pub dash_array: SmallVec<[f32; 4]>,
+    pub dash_array: Arc<[f32]>,
     /// The dash offset.
     pub dash_offset: f32,
+    /// Whether the dash pattern hides the stroke (`set_dash`): the interpreter
+    /// draws no stroke while it does.
+    pub(crate) dash_hides: bool,
 }
 
 impl Default for StrokeProps {
@@ -295,9 +467,18 @@ impl Default for StrokeProps {
             line_cap: Cap::Butt,
             line_join: Join::Miter,
             miter_limit: 10.0,
-            dash_array: smallvec![],
+            dash_array: Arc::default(),
             dash_offset: 0.0,
+            dash_hides: false,
         }
+    }
+}
+
+impl StrokeProps {
+    /// Whether a stroke in these properties is drawn: not when its dash pattern
+    /// hides it.
+    pub(crate) fn drawn(&self) -> bool {
+        !self.dash_hides
     }
 }
 

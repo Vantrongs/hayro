@@ -1,5 +1,7 @@
-use crate::object::ObjectIdentifier;
-use crate::object::ObjectLike;
+//! Object references.
+
+use crate::object::{Kind, ObjectLike};
+use crate::object::{Number, ObjectIdentifier};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use core::fmt::{Debug, Display, Formatter};
@@ -41,20 +43,24 @@ impl From<ObjectIdentifier> for ObjRef {
     }
 }
 
+// As reading one reads it.
 impl Skippable for ObjRef {
     fn skip(r: &mut Reader<'_>, _: bool) -> Option<()> {
-        r.skip::<u32>(false)?;
-        r.skip_white_spaces();
-        r.skip::<i32>(false)?;
-        r.skip_white_spaces();
-        r.forward_tag(b"R")?;
-
-        Some(())
+        r.read_without_context::<Self>().map(|_| ())
     }
 }
 
 impl Readable<'_> for ObjRef {
     fn read(r: &mut Reader<'_>, _: &ReaderContext<'_>) -> Option<Self> {
+        // Most numbers start no reference: find that out without making their values.
+        let start = r.offset();
+        r.skip::<Number>(false)?;
+        r.skip_white_spaces();
+        r.skip::<Number>(false)?;
+        r.skip_white_spaces();
+        r.forward_tag(b"R")?;
+        r.jump(start);
+
         let obj_ref = r.read_without_context::<u32>()?;
         r.skip_white_spaces();
         let gen_num = r.read_without_context::<i32>()?;
@@ -65,8 +71,8 @@ impl Readable<'_> for ObjRef {
     }
 }
 
-/// Either an object or a reference to one.
-#[derive(PartialEq, Eq)]
+/// A struct that is either an object or a reference to an object.
+#[derive(Clone, PartialEq, Eq)]
 pub enum MaybeRef<T> {
     /// A reference to an object.
     Ref(ObjRef),
@@ -144,16 +150,22 @@ where
     }
 }
 
+// An object whose first token tells it is of another kind than `T`'s one is no `T`,
+// and is not read: a dictionary where a number is wanted costs nothing.
 impl<'a, T> Readable<'a> for MaybeRef<T>
 where
-    T: Readable<'a>,
+    T: ObjectLike<'a>,
 {
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         if let Some(obj) = r.read::<ObjRef>(ctx) {
-            Some(Self::Ref(obj))
-        } else {
-            Some(Self::NotRef(r.read::<T>(ctx)?))
+            return Some(Self::Ref(obj));
         }
+        if let Some(kind) = T::KIND
+            && Kind::of_token(r).is_some_and(|other| other != kind)
+        {
+            return None;
+        }
+        Some(Self::NotRef(r.read::<T>(ctx)?))
     }
 }
 

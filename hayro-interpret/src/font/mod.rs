@@ -89,7 +89,9 @@ impl<'run, 'a> GlyphRun<'run, 'a> {
 #[derive(Clone)]
 pub struct Type3Glyph<'a> {
     pub(crate) glyph: hayro_font::Type3Glyph<'a>,
+    pub(crate) optional_content: Option<std::rc::Rc<crate::ocg::OptionalContent<'a>>>,
     pub(crate) state: State<'a>,
+    pub(crate) stroke: Paint<'a>,
     pub(crate) bbox: Rect,
     pub(crate) parent_resources: Resources<'a>,
     pub(crate) cache: InterpreterCache<'a>,
@@ -128,7 +130,11 @@ impl<'a> Type3Glyph<'a> {
 
 impl CacheKey for Type3Glyph<'_> {
     fn cache_key(&self) -> u128 {
-        hash128(&(self.glyph.cache_key(), self.bbox.cache_key()))
+        hash128(&(
+            self.glyph.cache_key(),
+            self.bbox.cache_key(),
+            self.stroke.cache_key(),
+        ))
     }
 }
 
@@ -152,7 +158,9 @@ pub(crate) fn get_glyph<'a>(
 
             Glyph::Type3(Box::new(Type3Glyph {
                 glyph,
+                optional_content: ctx.ocg_state.content(),
                 state: ctx.snapshot(),
+                stroke: ctx.get_paint(true),
                 bbox: ctx.bbox(),
                 parent_resources: resources.clone(),
                 cache: ctx.interpreter_cache.clone(),

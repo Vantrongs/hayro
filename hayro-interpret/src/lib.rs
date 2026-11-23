@@ -27,7 +27,8 @@ This crate has two default features:
   cmap loading logic. This will add around ~250KB to your binary.
 */
 
-#![forbid(unsafe_code)]
+#![cfg_attr(not(test), forbid(unsafe_code))]
+#![cfg_attr(test, deny(unsafe_code))]
 #![deny(missing_docs)]
 
 mod cache;
@@ -40,11 +41,32 @@ mod function_shading;
 mod interpret;
 mod mesh;
 mod ocg;
+pub mod radial;
 mod types;
 mod x_object;
 
+#[cfg(test)]
+#[path = "../../hayro-syntax/tests/common/fixtures.rs"]
+#[allow(dead_code)]
+mod fixtures;
+
+#[cfg(test)]
+#[path = "../../hayro-syntax/tests/common/rc4.rs"]
+#[allow(dead_code)]
+mod rc4_fixtures;
+
+#[cfg(test)]
+#[path = "../../hayro-syntax/tests/common/chains.rs"]
+#[allow(dead_code)]
+mod chains;
+
+/// What the encoders of `chains` use.
+#[cfg(test)]
+use fixtures::{noise, stored_zlib};
+
 pub mod color;
 pub mod encode;
+pub mod flatten;
 pub mod font;
 pub mod gradient;
 pub mod pattern;
@@ -54,6 +76,8 @@ pub mod util;
 pub use cache::CacheKey;
 pub use context::*;
 pub use device::*;
+#[cfg(feature = "count-operators")]
+pub use flatten::{elements_flattened, elements_read};
 pub use function::{Function, TransferFunction};
 pub use hayro_cmap;
 pub use hayro_syntax;
@@ -61,4 +85,12 @@ pub use interpret::*;
 pub use kurbo;
 pub use types::*;
 pub use util::{RectExt, TransformExt};
+pub use x_object::area::{area_resample, area_texels};
+pub use x_object::asset::{
+    DecodeWork, ImageAsset, ImageLayout, ImageRegion, ImageRequest, ImageSource, PixelFormat,
+    Plane, PlaneLayout, RequestError,
+};
 pub use x_object::soft_mask::*;
+
+#[cfg(feature = "count-operators")]
+pub use function::operators_run;

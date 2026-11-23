@@ -1,5 +1,7 @@
+use super::copy_cost;
 use super::{ColorSpace, ToLuma, ToRgb, U8Lookup};
-use crate::cache::Cache;
+use crate::cache::Building;
+use crate::encode::Cost;
 use hayro_syntax::object::{self, Array, Name, Object, Stream};
 use std::borrow::Cow;
 
@@ -13,7 +15,7 @@ pub(crate) struct Indexed {
 }
 
 impl Indexed {
-    pub(super) fn new(array: &Array<'_>, cache: &Cache, depth: u8) -> Option<Self> {
+    pub(super) fn new(array: &Array<'_>, cache: &Building<'_>, depth: u8) -> Option<Self> {
         let mut iter = array.flex_iter();
         let _ = iter.next::<Name<'_>>()?;
         let base_color_space = ColorSpace::new_nested(iter.next::<Object<'_>>()?, cache, depth)?;
@@ -88,12 +90,21 @@ impl Indexed {
                 return None;
             }
 
-            Some(Box::new(core::array::from_fn(|index| rgb[index][0])))
+            Some(core::array::from_fn(|index| rgb[index][0]))
         })
     }
 }
 
 impl ToRgb for Indexed {
+    fn cost(&self) -> Cost {
+        copy_cost(1)
+    }
+
+    /// The table a palette entry is looked up in, until it is built.
+    fn setup_cost(&self) -> Cost {
+        self.lookup.setup_cost(self.base.cost()) + self.base.setup_cost()
+    }
+
     fn convert(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
         let lookup = self.u8_lookup()?;
         for (input, output) in input.iter().zip(output.as_chunks_mut::<3>().0) {

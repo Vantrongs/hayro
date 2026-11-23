@@ -135,6 +135,7 @@ impl<'a> SvgRenderer<'a> {
                 self.draw_path(
                     &Rect::new(0.0, 0.0, stencil.width as f64, stencil.height as f64).to_path(0.1),
                     DrawProps {
+                        knockout: hayro_interpret::Knockout::None,
                         transform,
                         paint: paint.clone(),
                         soft_mask: None,

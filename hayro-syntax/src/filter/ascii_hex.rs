@@ -1,11 +1,16 @@
 // Keep in sync with `hayro-postscript/src/string/ascii_hex.rs`.
 
+use crate::filter::bytewise::{self, Decoder};
 use crate::trivia::is_white_space_character;
 use crate::util::ByteBuf;
+use crate::work::Meter;
 use alloc::vec::Vec;
 
-pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
-    decode_into(data)
+/// The data decoded as [`decode_into`] does, each byte read counted on `meter`;
+/// `None` once its hook asks to stop, or where a strict decoder finds a character
+/// that is no digit.
+pub(crate) fn decode(data: &[u8], meter: &Meter<'_>, strict: bool) -> Option<Vec<u8>> {
+    bytewise::decode(Decoder::ascii_hex(), data, strict, meter)
 }
 
 pub(crate) fn decode_into<B: ByteBuf>(data: &[u8]) -> Option<B> {
@@ -75,7 +80,15 @@ pub(crate) fn decode_hex_digit(c: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use crate::filter::ascii_hex::decode;
+    use crate::filter::ascii_hex::decode_into;
+    use crate::work::Meter;
+    use alloc::vec::Vec;
+
+    fn decode(data: &[u8]) -> Option<Vec<u8>> {
+        let metered = super::decode(data, &Meter::default(), true);
+        assert_eq!(metered, decode_into(data));
+        metered
+    }
 
     #[test]
     fn decode_simple() {
@@ -99,5 +112,11 @@ mod tests {
     fn decode_with_padding() {
         let input = b"AF3E291>";
         assert_eq!(decode(input).unwrap(), vec![0xaf, 0x3e, 0x29, 0x10]);
+    }
+
+    #[test]
+    fn invalid_digits_fail_before_the_end_only() {
+        assert_eq!(decode(b"AF 3G>"), None);
+        assert_eq!(decode(b"AF 3>G"), Some(vec![0xaf, 0x30]));
     }
 }

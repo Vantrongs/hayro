@@ -1,22 +1,25 @@
 mod ascii_85;
 pub(crate) mod ascii_hex;
+pub(crate) mod bytewise;
 #[cfg(feature = "images")]
-mod ccitt;
+pub(crate) mod ccitt;
+pub(crate) mod chain;
 #[cfg(feature = "images")]
 mod dct;
 #[cfg(feature = "images")]
 mod jbig2;
 #[cfg(feature = "images")]
 mod jpx;
-mod lzw_flate;
+pub(crate) mod lzw_flate;
 mod png;
-mod predictor;
+pub(crate) mod reader;
 mod run_length;
 
-use crate::object::Dict;
-use crate::object::Name;
+use crate::filter::lzw_flate::PredictorParams;
 use crate::object::dict::keys::*;
-use crate::object::stream::{DecodeFailure, FilterResult, ImageDecodeParams};
+use crate::object::stream::{DecodeFailure, FilterResult, ImageDecodeParams, OwnedStream};
+use crate::object::{Dict, Name, Stream};
+use crate::work::Meter;
 use core::ops::Deref;
 
 /// A data filter.
@@ -60,48 +63,175 @@ impl Filter {
             _ => None,
         }
     }
+}
 
+/// A filter with what decoding it reads of its parameters, read from them once
+/// ([`Step::of`]): decoding reads nothing else of a stream's dictionary, so a key no
+/// filter reads is never resolved, and decoding needs no reader of the document.
+// Without image decoders, nothing reads the parameters of image filters.
+#[cfg_attr(not(feature = "images"), allow(dead_code))]
+#[derive(Clone, Debug)]
+pub(crate) enum Step {
+    AsciiHex,
+    Ascii85,
+    RunLength,
+    /// The predictor, `None` where its parameters are refused
+    /// ([`PredictorParams::from_params`]).
+    Lzw(Option<PredictorParams>),
+    /// As [`Self::Lzw`].
+    Flate(Option<PredictorParams>),
+    Ccitt(CcittParams),
+    /// `/ColorTransform`.
+    Dct(Option<u8>),
+    /// `/JBIG2Globals`, where it is a stream.
+    Jbig2(Option<OwnedStream>),
+    Jpx,
+    /// Passed over by decoding (rule 9 of the crypt filter rules, `crate::crypto`);
+    /// its `/Name` decides the decryption ([`crate::object::stream::Decoding`]).
+    Crypt,
+}
+
+impl Step {
+    /// `filter` with what decoding it reads of `params`, for an image `height` rows
+    /// high, 0 where none is given; JBIG2 globals only if `globals` (the globals of a
+    /// JBIG2 image, not those of its globals). `params` are resolved only for a
+    /// filter whose decoder reads them.
+    pub(crate) fn of<'a>(
+        filter: Filter,
+        params: impl FnOnce() -> Dict<'a>,
+        globals: bool,
+        height: u32,
+    ) -> Self {
+        match filter {
+            Filter::AsciiHexDecode => Self::AsciiHex,
+            Filter::Ascii85Decode => Self::Ascii85,
+            Filter::RunLengthDecode => Self::RunLength,
+            Filter::LzwDecode => Self::Lzw(PredictorParams::from_params(&params(), true)),
+            Filter::FlateDecode => Self::Flate(PredictorParams::from_params(&params(), false)),
+            Filter::CcittFaxDecode => Self::Ccitt(CcittParams::of(&params(), height)),
+            Filter::DctDecode => Self::Dct(params().get::<u8>(COLOR_TRANSFORM)),
+            Filter::Jbig2Decode => Self::Jbig2(
+                globals
+                    .then(|| params().get::<Stream<'_>>(JBIG2_GLOBALS))
+                    .flatten()
+                    .map(|g| g.owned(false, 0)),
+            ),
+            Filter::JpxDecode => Self::Jpx,
+            Filter::Crypt => Self::Crypt,
+        }
+    }
+
+    pub(crate) fn filter(&self) -> Filter {
+        match self {
+            Self::AsciiHex => Filter::AsciiHexDecode,
+            Self::Ascii85 => Filter::Ascii85Decode,
+            Self::RunLength => Filter::RunLengthDecode,
+            Self::Lzw(_) => Filter::LzwDecode,
+            Self::Flate(_) => Filter::FlateDecode,
+            Self::Ccitt(_) => Filter::CcittFaxDecode,
+            Self::Dct(_) => Filter::DctDecode,
+            Self::Jbig2(_) => Filter::Jbig2Decode,
+            Self::Jpx => Filter::JpxDecode,
+            Self::Crypt => Filter::Crypt,
+        }
+    }
+
+    /// The filter applied to `data`, its work counted on `meter`;
+    /// [`DecodeFailure::Cancelled`] once the meter's hook asks to stop. If `strict`,
+    /// data a lenient decoder would recover part of is a failure. `expected` is the
+    /// size the decoded data should have, 0 where none is known, which a decoder
+    /// that grows its output reserves no more than while it made less.
     pub(crate) fn apply(
         &self,
         data: &[u8],
-        params: &Dict<'_>,
         #[cfg_attr(not(feature = "images"), allow(unused))] image_params: &ImageDecodeParams,
+        meter: &Meter<'_>,
+        strict: bool,
+        expected: usize,
     ) -> Result<FilterResult<'static>, DecodeFailure> {
-        match self {
-            Self::AsciiHexDecode => ascii_hex::decode(data)
+        // `MuPDF` refuses a stream whose predictor parameters it refuses.
+        fn predictor(p: &Option<PredictorParams>) -> Result<&PredictorParams, DecodeFailure> {
+            p.as_ref().ok_or(DecodeFailure::StreamDecode)
+        }
+        let res = match self {
+            Self::AsciiHex => ascii_hex::decode(data, meter, strict)
                 .map(FilterResult::from_data)
                 .ok_or(DecodeFailure::StreamDecode),
-            Self::Ascii85Decode => ascii_85::decode(data)
+            Self::Ascii85 => ascii_85::decode(data, meter, strict)
                 .map(FilterResult::from_data)
                 .ok_or(DecodeFailure::StreamDecode),
-            Self::RunLengthDecode => run_length::decode(data)
+            Self::RunLength => run_length::decode(data, meter, strict)
                 .map(FilterResult::from_data)
                 .ok_or(DecodeFailure::StreamDecode),
-            Self::LzwDecode => lzw_flate::lzw::decode(data, params)
-                .map(FilterResult::from_data)
-                .ok_or(DecodeFailure::StreamDecode),
-            Self::FlateDecode => lzw_flate::flate::decode(data, params)
-                .map(FilterResult::from_data)
-                .ok_or(DecodeFailure::StreamDecode),
+            Self::Lzw(p) => predictor(p).and_then(|p| {
+                lzw_flate::lzw::decode(data, p, meter, strict)
+                    .map(FilterResult::from_data)
+                    .ok_or(DecodeFailure::StreamDecode)
+            }),
+            Self::Flate(p) => predictor(p).and_then(|p| {
+                lzw_flate::flate::decode(data, p, meter, strict, expected)
+                    .map(FilterResult::from_data)
+                    .ok_or(DecodeFailure::StreamDecode)
+            }),
             #[cfg(feature = "images")]
-            Self::DctDecode => {
-                dct::decode(data, params, image_params).ok_or(DecodeFailure::ImageDecode)
+            Self::Dct(color_transform) => dct::decode(data, *color_transform, image_params, meter)
+                .ok_or(DecodeFailure::ImageDecode),
+            #[cfg(feature = "images")]
+            Self::Ccitt(params) => {
+                ccitt::decode(data, params, image_params, meter).ok_or(DecodeFailure::ImageDecode)
             }
             #[cfg(feature = "images")]
-            Self::CcittFaxDecode => {
-                ccitt::decode(data, params, image_params).ok_or(DecodeFailure::ImageDecode)
-            }
+            Self::Jbig2(globals) => jbig2::decode(data, globals.as_ref(), image_params, meter)
+                .ok_or(DecodeFailure::ImageDecode),
             #[cfg(feature = "images")]
-            Self::Jbig2Decode => {
-                jbig2::decode(data, params, image_params).ok_or(DecodeFailure::ImageDecode)
-            }
-            #[cfg(feature = "images")]
-            Self::JpxDecode => jpx::decode(data, image_params).ok_or(DecodeFailure::ImageDecode),
+            Self::Jpx => jpx::decode(data, image_params, meter).ok_or(DecodeFailure::ImageDecode),
             #[cfg(not(feature = "images"))]
-            Self::DctDecode | Self::CcittFaxDecode | Self::Jbig2Decode | Self::JpxDecode => {
+            Self::Dct(_) | Self::Ccitt(_) | Self::Jbig2(_) | Self::Jpx => {
                 Err(DecodeFailure::ImageDecode)
             }
-            _ => Err(DecodeFailure::StreamDecode),
+            Self::Crypt => Err(DecodeFailure::StreamDecode),
+        };
+
+        // A decoder may end early on a stop as on data cut short.
+        if meter.cancelled() {
+            return Err(DecodeFailure::Cancelled);
+        }
+
+        res
+    }
+}
+
+/// What CCITT fax decoding reads of its parameters.
+#[cfg_attr(not(feature = "images"), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CcittParams {
+    pub(crate) k: i32,
+    pub(crate) columns: u32,
+    /// The image's height where it is given, else `/Rows`, which then alone is read:
+    /// `/Rows` should match the height, but where it does not, the height takes
+    /// precedence (as in other viewers).
+    pub(crate) rows: u32,
+    pub(crate) end_of_block: bool,
+    pub(crate) end_of_line: bool,
+    pub(crate) encoded_byte_align: bool,
+    pub(crate) black_is_1: bool,
+}
+
+impl CcittParams {
+    /// What decoding an image `height` rows high, 0 where none is given, reads of
+    /// `params`.
+    pub(crate) fn of(params: &Dict<'_>, height: u32) -> Self {
+        Self {
+            k: params.get::<i32>(K).unwrap_or(0),
+            columns: params.get::<usize>(COLUMNS).unwrap_or(1728) as u32,
+            rows: match height {
+                0 => params.get::<u32>(ROWS).unwrap_or(0),
+                height => height,
+            },
+            end_of_block: params.get::<bool>(END_OF_BLOCK).unwrap_or(true),
+            end_of_line: params.get::<bool>(END_OF_LINE).unwrap_or(false),
+            encoded_byte_align: params.get::<bool>(ENCODED_BYTE_ALIGN).unwrap_or(false),
+            black_is_1: params.get::<bool>(BLACK_IS_1).unwrap_or(false),
         }
     }
 }

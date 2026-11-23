@@ -6,30 +6,44 @@ use crate::device::Device;
 use crate::interpret::path::{
     close_path, end_path, fill_path, fill_path_impl, fill_stroke_path, stroke_path,
 };
-use crate::interpret::state::handle_gs;
+use crate::interpret::state::{handle_gs, set_dash};
 use crate::interpret::text::TextRenderingMode;
 use crate::pattern::{Pattern, ShadingPattern};
 use crate::shading::Shading;
-use crate::util::RectExt;
+
 use crate::x_object::{FormXObject, ImageXObject, XObject};
 use bitflags::bitflags;
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
-use hayro_syntax::object::dict::keys::{ANNOTS, AP, AS, F, N, OC, RECT};
-use hayro_syntax::object::{Array, Dict, Name, Object, Rect, Stream, dict_or_stream};
+use hayro_syntax::object::dict::keys::{ANNOTS, OC};
+use hayro_syntax::object::{Dict, Name, Object, dict_or_stream};
 use hayro_syntax::page::{Page, Resources};
 use kurbo::{Affine, Point, Shape};
 use rustc_hash::FxHashMap;
 use smallvec::smallvec;
 use std::sync::Arc;
 
+pub mod annotation;
+use crate::StrokeProps;
+use crate::ocg::Kept;
 pub(crate) mod path;
 pub(crate) mod stack;
 pub(crate) mod state;
 pub(crate) mod text;
 
-const ANNOTATION_HIDDEN: u32 = 1 << 1;
-const ANNOTATION_NO_VIEW: u32 = 1 << 5;
+/// Which annotations a page is drawn with (PDF 32000-1 12.5.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AnnotationSelection {
+    /// As for viewing: all but those flagged Hidden or `NoView`.
+    #[default]
+    View,
+    /// As for printing: those flagged Print, but not Hidden.
+    Print,
+    /// As when annotations are flattened into page content for printing what the
+    /// reader sees: all but links and those flagged Hidden or Invisible, whatever
+    /// their Print and `NoView` flags.
+    Flatten,
+}
 
 pub use state::ActiveTransferFunction;
 
@@ -48,6 +62,8 @@ pub struct InterpreterSettings {
     pub warning_sink: WarningSinkFn,
     /// Which parts of a page should be rendered.
     pub render_content: RenderContent,
+    /// Which annotations are drawn.
+    pub annotations: AnnotationSelection,
 }
 
 impl Default for InterpreterSettings {
@@ -56,16 +72,14 @@ impl Default for InterpreterSettings {
             #[cfg(not(feature = "embed-fonts"))]
             font_resolver: Arc::new(|_| None),
             #[cfg(feature = "embed-fonts")]
-            font_resolver: Arc::new(|query| match query {
-                crate::font::FontQuery::Standard(s) => Some(s.get_font_data()),
-                crate::font::FontQuery::Fallback(f) => Some(f.pick_standard_font().get_font_data()),
-            }),
+            font_resolver: Arc::new(|query| Some(query.standard_substitute().get_font_data())),
             #[cfg(feature = "embed-cmaps")]
             cmap_resolver: Arc::new(hayro_cmap::load_embedded),
             #[cfg(not(feature = "embed-cmaps"))]
             cmap_resolver: Arc::new(|_| None),
             warning_sink: Arc::new(|_| {}),
             render_content: RenderContent::all(),
+            annotations: AnnotationSelection::View,
         }
     }
 }
@@ -91,6 +105,8 @@ pub enum InterpreterWarning {
     ImageDecodeFailure,
     /// The normal appearance of an annotation could not be loaded.
     UnresolvedAnnotationAppearance,
+    /// No supported appearance could be generated.
+    UnsupportedAnnotation,
 }
 
 /// Interpret the page and render it into the device.
@@ -99,82 +115,107 @@ pub fn interpret_page<'a>(
     context: &mut Context<'a>,
     device: &mut impl Device<'a>,
 ) {
+    interpret_page_with_view(page, &annotation::View::of(page), context, device);
+}
+
+/// Interpret the page with the annotation view used by the caller.
+pub fn interpret_page_with_view<'a>(
+    page: &Page<'a>,
+    view: &annotation::View,
+    context: &mut Context<'a>,
+    device: &mut impl Device<'a>,
+) {
     let resources = page.resources();
-    let render_content = context.settings.render_content;
-
-    if render_content.contains(RenderContent::PAGE) {
-        interpret(page.typed_operations(), resources, context, device);
-    }
-
-    if render_content.contains(RenderContent::ANNOTATIONS)
-        && let Some(annot_arr) = page.raw().get::<Array<'_>>(ANNOTS)
+    if context
+        .settings
+        .render_content
+        .contains(RenderContent::PAGE)
     {
-        for annot in annot_arr.iter::<Dict<'_>>() {
-            interpret_annotation(&annot, resources, context, device);
+        let content = page.read_page_stream().unwrap_or_default();
+        interpret(TypedIter::new(&content), resources, context, device);
+    }
+    if context
+        .settings
+        .render_content
+        .contains(RenderContent::ANNOTATIONS)
+        && page.raw().contains_key(ANNOTS)
+    {
+        // The fields of the document's forms are read once for all its pages.
+        let appearances = annotation::Appearances::with_fields(
+            page.xref(),
+            context.settings.font_resolver.clone(),
+            context.interpreter_cache.annotation_fields.clone(),
+        );
+        let drawn = appearances.page(page, context.settings.annotations, view);
+        for annot in drawn.iter() {
+            match annot.look() {
+                annotation::Look::Stream { stream, placement } => {
+                    // The box and matrix as the placement reads them, as a writer
+                    // that copies the stream draws it.
+                    let Some(apx) = FormXObject::appearance(
+                        stream,
+                        Affine::new(placement.matrix().map(f64::from)),
+                        placement.bbox(),
+                    ) else {
+                        continue;
+                    };
+
+                    context.save_state();
+                    context.pre_concat_affine(Affine::new(placement.transform().map(f64::from)));
+                    context.push_root_transform();
+
+                    apx.draw(resources, context, device);
+                    context.pop_root_transform();
+                    context.restore_state(device);
+                }
+                annotation::Look::Generated(appearance) => {
+                    draw_generated(appearance, resources, context, device);
+                }
+                annotation::Look::Nothing => {}
+                annotation::Look::Unsupported(_) => {
+                    (context.settings.warning_sink)(InterpreterWarning::UnsupportedAnnotation);
+                }
+            }
         }
     }
 }
 
-fn interpret_annotation<'a>(
-    annot: &Dict<'a>,
+/// Draws an appearance generated for an annotation without one, from a fresh
+/// graphics state in default user space with its opacity and blend mode, which apply
+/// to each thing it paints.
+fn draw_generated<'a>(
+    appearance: &annotation::Appearance,
     resources: &Resources<'a>,
     context: &mut Context<'a>,
     device: &mut impl Device<'a>,
 ) {
-    let flags = annot.get::<u32>(F).unwrap_or(0);
-
-    if flags & (ANNOTATION_HIDDEN | ANNOTATION_NO_VIEW) != 0 {
-        return;
-    }
-
-    if let Some(apx) = appearance_stream(annot).and_then(|o| FormXObject::new(&o)) {
-        let Some(rect) = annot.get::<Rect>(RECT) else {
-            return;
-        };
-
-        let annot_rect = rect.to_kurbo();
-        let transformed_rect = (apx.matrix
-            * kurbo::Rect::new(
-                apx.bbox[0] as f64,
-                apx.bbox[1] as f64,
-                apx.bbox[2] as f64,
-                apx.bbox[3] as f64,
-            )
-            .to_path(0.1))
-        .bounding_box();
-
-        let sx = annot_rect.width() / transformed_rect.width();
-        let sy = annot_rect.height() / transformed_rect.height();
-        let affine = Affine::new([
-            sx,
-            0.0,
-            0.0,
-            sy,
-            annot_rect.x0 - sx * transformed_rect.x0,
-            annot_rect.y0 - sy * transformed_rect.y0,
-        ]);
-
-        context.save_state();
-        context.pre_concat_affine(affine);
-        context.push_root_transform();
-
-        apx.draw(resources, context, device);
-        context.pop_root_transform();
-        context.restore_state(device);
-    } else if annot.get::<Dict<'_>>(AP).is_some() {
-        (context.settings.warning_sink)(InterpreterWarning::UnresolvedAnnotationAppearance);
-    }
-}
-
-fn appearance_stream<'a>(annot: &Dict<'a>) -> Option<Stream<'a>> {
-    match annot.get::<Dict<'_>>(AP)?.get::<Object<'_>>(N)? {
-        Object::Stream(stream) => Some(stream),
-        Object::Dict(states) => annot
-            .get::<Name<'_>>(AS)
-            .and_then(|state| states.get::<Stream<'_>>(state))
-            .or_else(|| states.get::<Stream<'_>>(b"Off")),
-        _ => None,
-    }
+    context.path_mut().truncate(0);
+    context.save_state();
+    let paint = state::PaintState {
+        alpha: appearance.opacity,
+        ..Default::default()
+    };
+    *context.fill_paint_mut() = paint.clone();
+    *context.stroke_paint_mut() = paint;
+    *context.stroke_props_mut() = StrokeProps::default();
+    *context.compositing_mut() = state::CompositingState {
+        blend_mode: appearance.blend,
+        ..Default::default()
+    };
+    let glyphs = appearance
+        .glyphs
+        .iter()
+        .map(|g| (g.name_rc(), g.clone()))
+        .collect();
+    let outer = std::mem::replace(&mut context.generated_glyphs, glyphs);
+    interpret(
+        TypedIter::new(appearance.content.as_bytes()),
+        resources,
+        context,
+        device,
+    );
+    context.generated_glyphs = outer;
+    context.restore_state(device);
 }
 
 /// Interpret the instructions from `ops` and render them into the device.
@@ -184,6 +225,8 @@ pub fn interpret<'a>(
     context: &mut Context<'a>,
     device: &mut impl Device<'a>,
 ) {
+    let floor = context.ocg_state.open();
+    let outer_text_clip = context.text_clip.take();
     let num_states = context.num_states();
     let mut font_dict_cache = FxHashMap::<Name<'a>, Dict<'a>>::default();
 
@@ -398,12 +441,7 @@ pub fn interpret<'a>(
                 context.fill_paint_mut().color_space = cs;
             }
             TypedInstruction::DashPattern(p) => {
-                context.stroke_props_mut().dash_offset = p.1.as_f32();
-                // kurbo apparently cannot properly deal with offsets that are exactly 0.
-                context.stroke_props_mut().dash_array =
-                    p.0.iter::<f32>()
-                        .map(|n| if n == 0.0 { 0.01 } else { n })
-                        .collect();
+                set_dash(context.stroke_props_mut(), p.0, p.1.as_f32());
             }
             TypedInstruction::RenderingIntent(_) => {}
             TypedInstruction::NonStrokeColorNamed(n) => {
@@ -430,28 +468,14 @@ pub fn interpret<'a>(
                     .and_then(|name| resources.properties.get::<Dict<'_>>(name))
                     .or_else(|| dict_or_stream(bdc.1).map(|(props, _)| props.clone()));
 
-                let oc = bdc
-                    .1
-                    .clone()
-                    .into_name()
-                    .and_then(|name| {
-                        let r = resources.properties.get_ref(name.as_ref())?;
-                        let d = resources
-                            .properties
-                            .get::<Dict<'_>>(name)
-                            .unwrap_or_default();
-                        Some((d, r))
-                    })
-                    .or_else(|| {
-                        let (props, _) = dict_or_stream(bdc.1)?;
-                        let r = props.get_ref(OC)?;
-                        let d = props.get::<Dict<'_>>(OC).unwrap_or_default();
-                        Some((d, r))
+                let begun = bdc.0.as_ref() == OC
+                    && bdc.1.clone().into_name().is_some_and(|name| {
+                        context.ocg_state.begin_named(
+                            &Kept::Document(resources.properties.clone()),
+                            name.as_ref(),
+                        )
                     });
-
-                if let Some((dict, oc_ref)) = oc {
-                    context.ocg_state.begin_ocg(&dict, oc_ref.into());
-                } else {
+                if !begun && properties.is_some() {
                     context.ocg_state.begin_marked_content();
                 }
 
@@ -484,15 +508,11 @@ pub fn interpret<'a>(
                 context.text_state_mut().text_matrix = m;
             }
             TypedInstruction::EndText(_) => {
-                let has_outline = context.text_state().clip_paths.segments().next().is_some();
-
-                if has_outline {
-                    let clip_path = context.ctm() * context.text_state().clip_paths.clone();
-
+                if let Some(clip_path) = context.text_clip.take()
+                    && context.text_state().render_mode.clips()
+                {
                     context.push_clip_path(clip_path, FillRule::NonZero, device);
                 }
-
-                context.text_state_mut().clip_paths.truncate(0);
             }
             TypedInstruction::TextFont(t) => {
                 let name = t.0;
@@ -580,6 +600,20 @@ pub fn interpret<'a>(
             }
             TypedInstruction::ShapeGlyph(_) => {}
             TypedInstruction::XObject(x) => {
+                // A glyph of the generated appearance being drawn.
+                let glyph = std::str::from_utf8(x.0.as_ref())
+                    .ok()
+                    .and_then(|name| context.generated_glyphs.get(name).cloned());
+                if let Some(glyph) = glyph {
+                    interpret(
+                        TypedIter::new(glyph.content().as_bytes()),
+                        resources,
+                        context,
+                        device,
+                    );
+                    continue;
+                }
+
                 let cache = context.interpreter_cache.object_cache.clone();
                 let warning_sink = context.settings.warning_sink.clone();
                 let transfer_function = context.compositing().transfer_function.clone();
@@ -606,7 +640,7 @@ pub fn interpret<'a>(
                     &cache,
                     transfer_function,
                 ) {
-                    x_object.draw(context, device);
+                    x_object.draw(context, device, &Kept::Content(i.0.dict().clone()));
                 }
             }
             TypedInstruction::TextRise(t) => {
@@ -668,6 +702,8 @@ pub fn interpret<'a>(
     context.path_mut().truncate(0);
     *(context.clip_mut()) = None;
 
+    context.ocg_state.close(floor);
+    context.text_clip = outer_text_clip;
     while context.num_states() > num_states {
         context.restore_state(device);
     }

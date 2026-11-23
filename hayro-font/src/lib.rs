@@ -41,10 +41,12 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
+mod appearance;
 mod cid;
 mod generated;
 mod outline;
 mod program;
+pub use appearance::AppearanceFont;
 mod standard_font;
 mod true_type;
 mod type1;
@@ -246,7 +248,7 @@ impl<'a> FontCache<'a> {
             programs: self.program_loader(font_resolver),
             cmap_resolver,
         };
-        let font = Font::new(dict, &loader);
+        let font = Font::new(&dict.as_root(), &loader);
         self.0.fonts.borrow_mut().insert(key, font.clone());
 
         font
@@ -406,6 +408,34 @@ pub enum FontQuery {
     Standard(StandardFont),
     /// A query for a font that is not embedded in the PDF file.
     Fallback(FallbackFontQuery),
+    /// A query for the face generated annotation text is set in where it names no
+    /// family a viewer maps to a standard font: rich text (PDF 32000-1 12.7.3.4)
+    /// without a `font-family`, or with an unknown one or the generic `serif`.
+    /// Common viewers use a serif text face there that is wider than Times;
+    /// [`FontQuery::standard_substitute`] gives Times.
+    TextDefault {
+        /// Whether the face is bold.
+        bold: bool,
+        /// Whether the face is italic.
+        italic: bool,
+    },
+}
+
+impl FontQuery {
+    /// The standard font that stands in for the queried one when a resolver has
+    /// nothing closer.
+    pub fn standard_substitute(&self) -> StandardFont {
+        match self {
+            Self::Standard(font) => *font,
+            Self::Fallback(query) => query.pick_standard_font(),
+            Self::TextDefault { bold, italic } => match (bold, italic) {
+                (true, true) => StandardFont::TimesBoldItalic,
+                (true, false) => StandardFont::TimesBold,
+                (false, true) => StandardFont::TimesItalic,
+                (false, false) => StandardFont::TimesRoman,
+            },
+        }
+    }
 }
 
 /// A query for a font with specific properties.
@@ -590,7 +620,10 @@ impl ProgramLoader<'_> {
         let key = hash128(&("font program", stream.cache_key()));
 
         self.get_or_insert_with(key, || {
-            FontProgram::new(Arc::new(stream.decoded_data().ok()?.into_owned()), 0)
+            FontProgram::new(
+                Arc::new(stream.as_root().decoded_data().ok()?.into_owned()),
+                0,
+            )
         })
     }
 

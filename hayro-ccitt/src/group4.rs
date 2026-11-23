@@ -1,61 +1,49 @@
 use crate::bit_reader::BitReader;
-use crate::context::{Color, DecoderContext, decode_2d_line};
+use crate::context::{DecoderContext, decode_2d_line};
 use crate::{DecodeError, Decoder, Result};
 
-pub(crate) fn decode(
-    ctx: &mut DecoderContext<'_>,
+/// Decodes the next line of Group 4 data (T.6), if the data holds one: false,
+/// with no line decoded, once it ends.
+pub(crate) fn step(
+    ctx: &mut DecoderContext,
     reader: &mut BitReader<'_>,
     decoder: &mut impl Decoder,
-) -> Result<()> {
-    loop {
-        if ctx
-            .settings
-            .cancel
-            .as_ref()
-            .is_some_and(|cancel| cancel.is_cancelled())
-        {
-            return Err(DecodeError::Cancelled);
-        }
+) -> Result<bool> {
+    reader.poll(decoder)?;
+    // EOLs aren't part of Group 4, but PDF requires decoders to accept them
+    // anyway. An EOFB consists of two consecutive EOLs. Data that follows
+    // an EOFB (after padding to a byte boundary) can start like another
+    // EOL, so no more than that is read.
+    let eol_count = if ctx.settings.end_of_block {
+        reader.read_eols(2, decoder)?
+    } else {
+        reader.read_eol_if_available(decoder)?
+    };
 
-        // PDF allows EOLs; read at most an EOFB's two, as data after it can look like an EOL.
-        let eol_count = if ctx.settings.end_of_block {
-            reader.read_eols(2)
-        } else {
-            reader.read_eol_if_available()
-        };
-
-        if ctx.settings.end_of_block && eol_count >= 2 {
-            break;
-        }
-
-        if (ctx.settings.rows != 0 && ctx.decoded_rows == ctx.settings.rows) || reader.at_end() {
-            break;
-        }
-
-        if let Err(e) = decode_2d_line(ctx, reader) {
-            if ctx.settings.strict {
-                return Err(e);
-            }
-
-            if ctx.pixels_decoded > 0 {
-                ctx.color = Color::White;
-                ctx.push_pixels(ctx.line_width - ctx.pixels_decoded)?;
-                ctx.next_line(decoder);
-            }
-
-            if e == DecodeError::UnexpectedEof {
-                break;
-            }
-
-            return Err(e);
-        }
-
-        ctx.next_line(decoder);
-
-        if ctx.settings.rows_are_byte_aligned {
-            reader.align();
-        }
+    if ctx.settings.end_of_block && eol_count >= 2 {
+        return Ok(false);
     }
 
-    Ok(())
+    if (ctx.settings.rows != 0 && ctx.decoded_rows == ctx.settings.rows) || reader.at_end() {
+        return Ok(false);
+    }
+
+    if let Err(e) = decode_2d_line(ctx, reader, decoder) {
+        if ctx.settings.strict || e == DecodeError::Stopped {
+            return Err(e);
+        }
+        ctx.finish_partial_row(decoder)?;
+        return if e == DecodeError::UnexpectedEof || reader.at_end() {
+            Ok(false)
+        } else {
+            Err(e)
+        };
+    }
+    ctx.next_line(decoder);
+
+    if ctx.settings.rows_are_byte_aligned {
+        reader.align();
+    }
+
+    Ok(true)
 }
