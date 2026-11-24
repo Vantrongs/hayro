@@ -1986,8 +1986,7 @@ mod tests {
         assert_eq!(decoded, b"Hello");
     }
 
-    /// As flate2's reader decodes them: a stream cut short yields the bytes it holds,
-    /// and bytes after a stream's end are ignored.
+    /// Lenient decoding keeps the prefix emitted before EOF and ignores trailing data.
     #[cfg(feature = "unsafe")]
     #[test]
     fn decode_flate_cut_short_or_followed_by_more() {
@@ -1999,9 +1998,10 @@ mod tests {
         let encoded = encoder.finish().unwrap();
         let cut = &encoded[..encoded.len() / 2];
         let mut expected = Vec::new();
-        flate2::read::ZlibDecoder::new(cut)
+        let error = flate2::read::ZlibDecoder::new(cut)
             .read_to_end(&mut expected)
-            .unwrap();
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
         assert!(expected.len() > POLL_BYTES && data.starts_with(&expected));
         let decoded = flate::decode(cut, &PredictorParams::default(), &Meter::default(), false, 0);
         assert_eq!(decoded, Some(expected));
