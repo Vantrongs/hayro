@@ -1,6 +1,6 @@
 use crate::Renderer;
 use hayro_interpret::encode::{
-    EncodedShadingPattern, EncodedShadingType, Unmetered, texture_dimensions,
+    Cost, EncodedShadingPattern, EncodedShadingType, Unmetered, texture_dimensions,
 };
 use hayro_interpret::gradient::{SampleRamp, SvgGradientKind};
 use hayro_interpret::pattern::{Pattern, ShadingPattern};
@@ -16,6 +16,7 @@ pub(super) struct PreparedRamp {
     shading: u128,
     opacity: u32,
     samples: u64,
+    setup: Cost,
     ramp: Option<Arc<SampleRamp>>,
 }
 
@@ -31,18 +32,19 @@ impl Renderer<'_> {
         let shading = pattern.shading.cache_key();
         let opacity = pattern.opacity.to_bits();
         let mut slot = self.global.last_ramp.borrow_mut();
-        // A completed ramp fits any larger budget; an exhausted budget rules out smaller ones.
+        // Direct sampling can warm the tint table after preparation exhausted its budget.
         if let Some(previous) = slot.as_ref().filter(|previous| {
             previous.shading == shading
                 && previous.opacity == opacity
                 && if previous.ramp.is_some() {
                     samples >= previous.samples
                 } else {
-                    samples <= previous.samples
+                    samples <= previous.samples && previous.setup == encoded.setup_cost()
                 }
         }) {
             encoded.set_sample_ramp(previous.ramp.clone());
         } else {
+            let setup = encoded.setup_cost();
             let ramp = encoded
                 .sample_ramp_for(samples, &mut Unmetered)
                 .expect("unmetered");
@@ -50,6 +52,7 @@ impl Renderer<'_> {
             *slot = Some(PreparedRamp {
                 shading,
                 opacity,
+                setup,
                 samples,
                 ramp,
             });
@@ -186,5 +189,62 @@ impl Renderer<'_> {
         self.ctx.set_paint(paint);
 
         clip_path
+    }
+}
+
+#[cfg(test)]
+#[path = "../../hayro-syntax/tests/common/fixtures.rs"]
+#[allow(dead_code)]
+mod fixtures;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Context, GlobalState, Pdf, RenderCache, RenderContext, RenderSettings};
+    use hayro_interpret::{InterpreterSettings, hayro_syntax::content::TypedIter, interpret};
+
+    #[test]
+    fn warming_a_tint_table_changes_the_next_ramp_decision() {
+        let shading = b"<< /ShadingType 2 /Coords [0 0 10 0] /Extend [true true] /Function 5 0 R
+            /ColorSpace [/Separation /Spot /DeviceRGB
+            << /FunctionType 2 /Domain [0 1] /C0 [0 0 0] /C1 [1 0 0] /N 1 >>] >>";
+        let function = fixtures::stream(
+            "/FunctionType 0 /Domain [0 1] /Range [0 1] /Size [2] /BitsPerSample 8",
+            &[0, 1],
+        );
+        let pdf = Pdf::new(fixtures::one_page(
+            10,
+            "/Resources << /Shading << /S 4 0 R >> >>",
+            vec![shading.to_vec(), function],
+        ))
+        .unwrap();
+        let cache = RenderCache::new();
+        let global = GlobalState::new(&cache, &RenderSettings::default());
+        let mut ctx = RenderContext::new(10, 10);
+        let mut renderer = Renderer::new(&mut ctx, &global);
+        let mut state = Context::new(
+            Affine::IDENTITY,
+            Rect::new(0., 0., 10., 10.),
+            &cache.interpreter_cache,
+            pdf.xref(),
+            InterpreterSettings::default(),
+        );
+        let mut draw = || {
+            interpret(
+                TypedIter::new(b"/S sh"),
+                pdf.pages()[0].resources(),
+                &mut state,
+                &mut renderer,
+            );
+            let slot = global.last_ramp.borrow();
+            let prepared = slot.as_ref().unwrap();
+            (prepared.setup, prepared.ramp.is_some())
+        };
+        let (cold, first) = draw();
+        assert!(cold > Cost::ZERO && !first);
+        let second = draw();
+        global.last_ramp.take();
+        assert_eq!(second, draw());
+        assert_eq!(second, (Cost::ZERO, true));
     }
 }
