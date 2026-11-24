@@ -16,10 +16,12 @@ use crate::{
 use hayro_syntax::content::ops::Transform;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
+use hayro_syntax::page::PageStreamCache;
 use hayro_syntax::page::Resources;
 use hayro_syntax::xref::XRef;
 use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape};
 use smallvec::smallvec;
+use std::cell::RefCell;
 use std::rc::Rc;
 
 pub(crate) const MAX_NESTED_INTERPRETATION_DEPTH: u32 = 50;
@@ -29,6 +31,7 @@ pub(crate) const MAX_NESTED_INTERPRETATION_DEPTH: u32 = 50;
 // their object identifier), so a cache shared across documents can mix up their objects.
 #[derive(Clone)]
 pub struct InterpreterCache<'a> {
+    pub(crate) page_content: Rc<RefCell<PageStreamCache<'a>>>,
     pub(crate) annotation_fields: Fields<'a>,
     pub(crate) font_cache: FontCache<'a>,
     pub(crate) object_cache: Cache,
@@ -44,6 +47,7 @@ impl<'a> InterpreterCache<'a> {
     /// Create a new interpreter cache.
     pub fn new() -> Self {
         Self {
+            page_content: Rc::default(),
             annotation_fields: Fields::default(),
             font_cache: FontCache::new(),
             object_cache: Cache::new(),
@@ -445,4 +449,55 @@ pub(crate) fn path_as_rect(path: &BezPath) -> Option<Rect> {
     }
 
     Some(path.fast_bounding_box())
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+    use crate::fixtures::{file, stream};
+    use crate::{DummyDevice, interpret_page};
+    use hayro_syntax::Pdf;
+
+    #[test]
+    fn shares_only_the_active_page_across_views() {
+        let pdf = Pdf::new(file(
+            &[
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+                b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+                b"<< /Type /Page /Contents 5 0 R >>".to_vec(),
+                b"<< /Type /Page /Contents 6 0 R >>".to_vec(),
+                stream("", b"q Q"),
+                stream("", b"n"),
+            ],
+            "",
+        ))
+        .unwrap();
+        let cache = InterpreterCache::new();
+        let draw = |i: usize, z: f64| {
+            let mut ctx = Context::new(
+                Affine::scale(z),
+                Rect::new(z, z, 20., 30.),
+                &cache,
+                pdf.xref(),
+                InterpreterSettings::default(),
+            );
+            interpret_page(&pdf.pages()[i], &mut ctx, &mut DummyDevice);
+        };
+        let content = || {
+            cache
+                .page_content
+                .borrow_mut()
+                .get(&pdf.pages()[0])
+                .unwrap()
+        };
+        draw(0, 1.);
+        let first = std::sync::Arc::downgrade(&content());
+        draw(0, 4.);
+        assert!(std::sync::Arc::ptr_eq(
+            &first.upgrade().unwrap(),
+            &content()
+        ));
+        draw(1, 1.);
+        assert!(first.upgrade().is_none());
+    }
 }

@@ -18,6 +18,22 @@ fn decoded_content_is_not_copied() {
     assert!(used.peak < data.len() * 3 / 2, "{used:?}");
 }
 
+#[test]
+fn partial_content_is_returned_but_decoded_again() {
+    let pdf = Pdf::new(common::one_page(
+        100,
+        "/Contents [4 0 R 5 0 R]",
+        vec![common::stream("", b"q Q"), b"7".to_vec()],
+    ))
+    .unwrap();
+    let mut cache = hayro_syntax::page::PageStreamCache::default();
+    let first = cache.get(&pdf.pages()[0]).unwrap();
+    let next = cache.get(&pdf.pages()[0]).unwrap();
+    assert_eq!(first.as_slice(), b"q Q ");
+    assert_eq!(first, next);
+    assert_ne!(first.as_ptr(), next.as_ptr());
+}
+
 /// A content under a predictor whose last row is cut short keeps that row, by the
 /// strict and the lenient reading alike, as `MuPDF` draws it.
 #[test]

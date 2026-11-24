@@ -131,8 +131,15 @@ pub fn interpret_page_with_view<'a>(
         .render_content
         .contains(RenderContent::PAGE)
     {
-        let content = page.read_page_stream().unwrap_or_default();
-        interpret(TypedIter::new(&content), resources, context, device);
+        let content = context
+            .interpreter_cache
+            .page_content
+            .borrow_mut()
+            .get(page);
+        let bytes = content.as_ref().map_or(&[][..], |v| v.as_slice());
+        interpret(TypedIter::new(bytes), resources, context, device);
+    } else {
+        context.interpreter_cache.page_content.take();
     }
     if context
         .settings

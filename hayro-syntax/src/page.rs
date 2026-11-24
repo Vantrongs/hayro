@@ -12,7 +12,7 @@ use crate::object::dict::keys::*;
 use crate::object::stream::{DecodeFailure, ReadError, StrictReader};
 use crate::object::{MaybeRef, Null, Object, ObjectIdentifier};
 use crate::reader::ReaderContext;
-use crate::sync::OnceLock;
+use crate::sync::{Arc, OnceLock};
 use crate::transform::Transform;
 use crate::util::FloatExt;
 use crate::work::{Meter, POLL_BYTES};
@@ -163,6 +163,32 @@ impl<'a> Deref for Pages<'a> {
 
     fn deref(&self) -> &Self::Target {
         &self.pages
+    }
+}
+
+/// Decoded content retained for the most recently drawn page.
+#[derive(Default)]
+pub struct PageStreamCache<'a> {
+    active: Option<(ContentKey<'a>, Arc<Vec<u8>>)>,
+}
+
+impl<'a> PageStreamCache<'a> {
+    /// Read the page's content, reusing a complete read of the same dictionary.
+    pub fn get(&mut self, page: &Page<'a>) -> Option<Arc<Vec<u8>>> {
+        let key = page.raw().content_key();
+        if let Some((active, bytes)) = &self.active
+            && *active == key
+        {
+            return Some(bytes.clone());
+        }
+        self.active = None;
+        let mut complete = true;
+        let (bytes, lost) = page.xref().watch(|| page.decode_content(&mut complete));
+        let bytes = Arc::new(bytes?);
+        if complete && lost.is_none() {
+            self.active = Some((key, bytes.clone()));
+        }
+        Some(bytes)
     }
 }
 
@@ -436,6 +462,10 @@ impl<'a> Page<'a> {
     /// the document is open. What reading it lost is told to the computation being
     /// watched.
     pub fn read_page_stream(&self) -> Option<Vec<u8>> {
+        self.decode_content(&mut true)
+    }
+
+    fn decode_content(&self, complete: &mut bool) -> Option<Vec<u8>> {
         if let Some(stream) = self.inner.get::<Stream<'_>>(CONTENTS) {
             Some(stream.decoded().ok()?.into_owned())
         } else if let Some(array) = self.inner.get::<Array<'_>>(CONTENTS) {
@@ -455,6 +485,7 @@ impl<'a> Page<'a> {
                     MaybeRef::NotRef(object) => object.into_stream(),
                 };
                 let Some(stream) = stream else {
+                    *complete = false;
                     continue;
                 };
                 let start = collected.len();
@@ -463,6 +494,8 @@ impl<'a> Page<'a> {
                     collected.extend_from_slice(&data);
                     // Streams must have at least one whitespace in-between.
                     collected.push(b' ');
+                } else {
+                    *complete = false;
                 }
                 if let Some(key) = key {
                     ranges.insert(key, start..collected.len());
