@@ -268,3 +268,17 @@ fn recovered_filter_prefix_is_decoded_again() {
         assert!(!std::sync::Arc::ptr_eq(&first, &second));
     }
 }
+
+#[test]
+fn short_escaped_operators_allocate_nothing() {
+    let data = b"#71 #51 ".repeat(100);
+    let (_, allocations) = measure(|| {
+        let mut iter = hayro_syntax::content::UntypedIter::new(&data);
+        for _ in 0..100 {
+            assert_eq!(iter.next().unwrap().operator.as_ref(), b"q");
+            assert_eq!(iter.next().unwrap().operator.as_ref(), b"Q");
+        }
+        assert!(iter.next().is_none());
+    });
+    assert_eq!(allocations.count, 0);
+}

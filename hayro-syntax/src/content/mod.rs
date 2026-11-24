@@ -41,6 +41,7 @@ pub struct Operator<'a>(Spelling<'a>);
 #[derive(Clone)]
 enum Spelling<'a> {
     Borrowed(&'a [u8]),
+    Inline { data: [u8; 15], len: u8 },
     Decoded(Arc<[u8]>),
 }
 
@@ -53,10 +54,12 @@ impl PartialEq for Operator<'_> {
 impl Deref for Operator<'_> {
     type Target = [u8];
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         match &self.0 {
             Spelling::Borrowed(bytes) => bytes,
             Spelling::Decoded(bytes) => bytes,
+            Spelling::Inline { data, len } => &data[..usize::from(*len)],
         }
     }
 }
@@ -77,11 +80,24 @@ impl<'a> Readable<'a> for Operator<'a> {
 impl<'a> Operator<'a> {
     fn from_raw(raw: &'a [u8]) -> Self {
         if raw.contains(&b'#') {
-            let mut bytes = Vec::with_capacity(raw.len());
-            object::name::unescape(raw, |b| bytes.push(b));
-            Self(Spelling::Decoded(bytes.into()))
+            return Self::escaped(raw);
+        }
+        Self(Spelling::Borrowed(raw))
+    }
+
+    #[cold]
+    fn escaped(raw: &[u8]) -> Self {
+        let mut bytes = SmallVec::<[u8; 15]>::new();
+        object::name::unescape(raw, |b| bytes.push(b));
+        if bytes.spilled() {
+            Self(Spelling::Decoded(Arc::from(bytes.as_slice())))
         } else {
-            Self(Spelling::Borrowed(raw))
+            let len = bytes.len() as u8;
+            bytes.resize(15, 0);
+            Self(Spelling::Inline {
+                data: bytes.into_inner().unwrap(),
+                len,
+            })
         }
     }
 }
