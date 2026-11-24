@@ -110,7 +110,10 @@ impl Decoder {
                     Some(false) => break State::Done,
                     None if strict || meter.cancelled() => break State::Failed,
                     // The bytes of the codes before an invalid one are kept.
-                    None => break State::Done,
+                    None => {
+                        meter.note_recovery();
+                        break State::Done;
+                    }
                 }
             },
             Self::AsciiHex(high) => ascii_hex(input, high, out, until, strict, meter),
@@ -203,7 +206,10 @@ fn ascii_hex(
             (Some(digit), Some(high)) => out.push(high << 4 | digit),
             (Some(digit), None) => *high = Some(digit),
             (None, _) if strict => return State::Failed,
-            (None, _) => return State::Done,
+            (None, _) => {
+                meter.note_recovery();
+                return State::Done;
+            }
         }
     }
     if let Some(high) = high.take() {
@@ -222,7 +228,7 @@ fn ascii_85(
     strict: bool,
     meter: &Meter<'_>,
 ) -> State {
-    let end = |group: &mut Group, out: &mut Vec<u8>| match group.flush(out, strict) {
+    let end = |group: &mut Group, out: &mut Vec<u8>| match group.flush(out, strict, meter) {
         Some(()) => State::Done,
         None => State::Failed,
     };
@@ -241,7 +247,7 @@ fn ascii_85(
             b'!'..=b'u' => {
                 group.digits[usize::from(group.len)] = b - b'!';
                 group.len += 1;
-                if group.len == 5 && group.flush(out, strict).is_none() {
+                if group.len == 5 && group.flush(out, strict, meter).is_none() {
                     return State::Failed;
                 }
             }
@@ -249,7 +255,10 @@ fn ascii_85(
             b'~' => return end(group, out),
             // An invalid character, or a `z` within a group.
             _ if strict => return State::Failed,
-            _ => return State::Done,
+            _ => {
+                meter.note_recovery();
+                return State::Done;
+            }
         }
     }
     State::Going
@@ -258,30 +267,30 @@ fn ascii_85(
 impl Group {
     /// Appends the bytes of the group, the digits it lacks taken as `u`, and empties
     /// it; `None` where a strict decoder fails on it.
-    fn flush(&mut self, out: &mut Vec<u8>, strict: bool) -> Option<()> {
-        const POW_85: [u32; 5] = [52200625, 614125, 7225, 85, 1];
+    fn flush(&mut self, out: &mut Vec<u8>, strict: bool, meter: &Meter<'_>) -> Option<()> {
         let len = usize::from(core::mem::take(&mut self.len));
         match len {
             0 => return Some(()),
             // A single character is not valid.
             1 if strict => return None,
-            1 => return Some(()),
+            1 => {
+                meter.note_recovery();
+                return Some(());
+            }
             _ => {}
         }
         let mut digits = [u32::from(b'u' - b'!'); 5];
         for (digit, &d) in digits.iter_mut().zip(&self.digits[..len]) {
             *digit = u32::from(d);
         }
-        let value = match strict {
-            true => digits
-                .iter()
-                .zip(POW_85)
-                .try_fold(0_u32, |v, (&d, p)| v.checked_add(d.checked_mul(p)?))?,
-            false => digits
-                .iter()
-                .zip(POW_85)
-                .fold(0_u32, |v, (&d, p)| v.wrapping_add(d.wrapping_mul(p))),
-        };
+        let value = digits.iter().fold(0_u64, |v, d| v * 85 + u64::from(*d));
+        if value > u64::from(u32::MAX) {
+            if strict {
+                return None;
+            }
+            meter.note_recovery();
+        }
+        let value = value as u32;
         out.extend_from_slice(&value.to_be_bytes()[..len - 1]);
         Some(())
     }
@@ -297,13 +306,16 @@ fn run_length(
     strict: bool,
     meter: &Meter<'_>,
 ) -> State {
-    let cut = match strict {
+    let cut = || match strict {
         true => State::Failed,
-        false => State::Done,
+        false => {
+            meter.note_recovery();
+            State::Done
+        }
     };
     while out.len() < until && !input.low() {
         let Some(length) = input.next(meter) else {
-            return cut;
+            return cut();
         };
         if meter.work(usize::from(length) + 1).is_err() {
             return State::Failed;
@@ -320,7 +332,7 @@ fn run_length(
             }
             _ => {
                 let Some(byte) = input.next(meter) else {
-                    return cut;
+                    return cut();
                 };
                 out.extend(core::iter::repeat_n(byte, 257 - usize::from(length)));
             }

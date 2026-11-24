@@ -250,3 +250,21 @@ fn distinct_streams_share_only_the_collected_output() {
     }
     assert!(used.peak < data.len() + data.len() / 3, "{used:?}");
 }
+
+#[test]
+fn recovered_filter_prefix_is_decoded_again() {
+    for (contents, expected) in [("4 0 R", b"q Q".as_slice()), ("[4 0 R]", b"q Q ")] {
+        let pdf = Pdf::new(common::one_page(
+            10,
+            &format!("/Contents {contents}"),
+            vec![common::stream("/Filter /ASCIIHexDecode", b"712051x>")],
+        ))
+        .unwrap();
+        let mut cache = hayro_syntax::page::PageStreamCache::default();
+        let first = cache.get(&pdf.pages()[0]).unwrap();
+        let second = cache.get(&pdf.pages()[0]).unwrap();
+        assert_eq!(first.as_slice(), expected);
+        assert_eq!(first, second);
+        assert!(!std::sync::Arc::ptr_eq(&first, &second));
+    }
+}

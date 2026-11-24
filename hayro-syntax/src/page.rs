@@ -9,7 +9,7 @@ use crate::object::Name;
 use crate::object::Rect;
 use crate::object::Stream;
 use crate::object::dict::keys::*;
-use crate::object::stream::{DecodeFailure, ReadError, StrictReader};
+use crate::object::stream::{DecodeFailure, ImageDecodeParams, ReadError, StrictReader};
 use crate::object::{MaybeRef, Null, Object, ObjectIdentifier};
 use crate::reader::ReaderContext;
 use crate::sync::{Arc, OnceLock};
@@ -466,8 +466,14 @@ impl<'a> Page<'a> {
     }
 
     fn decode_content(&self, complete: &mut bool) -> Option<Vec<u8>> {
+        let meter = Meter::default();
+        let decode = |stream: Stream<'a>, complete: &mut bool| {
+            let result = stream.decoded_image_metered(&ImageDecodeParams::default(), &meter);
+            *complete &= !meter.recovered() && result.is_ok();
+            result.map(|result| result.data)
+        };
         if let Some(stream) = self.inner.get::<Stream<'_>>(CONTENTS) {
-            Some(stream.decoded().ok()?.into_owned())
+            Some(decode(stream, complete).ok()?.into_owned())
         } else if let Some(array) = self.inner.get::<Array<'_>>(CONTENTS) {
             let mut ranges = hash::Map::<_, core::ops::Range<usize>>::default();
             let mut collected = vec![];
@@ -489,13 +495,11 @@ impl<'a> Page<'a> {
                     continue;
                 };
                 let start = collected.len();
-                if let Ok(data) = stream.decoded() {
+                if let Ok(data) = decode(stream, complete) {
                     collected.reserve(data.len() + 1);
                     collected.extend_from_slice(&data);
                     // Streams must have at least one whitespace in-between.
                     collected.push(b' ');
-                } else {
-                    *complete = false;
                 }
                 if let Some(key) = key {
                     ranges.insert(key, start..collected.len());

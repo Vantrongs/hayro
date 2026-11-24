@@ -61,7 +61,10 @@ pub(crate) mod flate {
         for (tried, zlib) in [(0, true), (1, false)] {
             match inflate(data, zlib, meter, expected, limit).map_err(larger(tried))? {
                 Inflated::Whole(made) => decoded = Some(made),
-                Inflated::Broken(made) if !strict && !made.is_empty() => decoded = Some(made),
+                Inflated::Broken(made) if !strict && !made.is_empty() => {
+                    meter.note_recovery();
+                    decoded = Some(made);
+                }
                 Inflated::Broken(_) => continue,
                 Inflated::Cancelled => return Ok(None),
             }
@@ -241,8 +244,11 @@ pub(crate) mod flate {
             limit: usize,
         ) -> Result<Option<Vec<u8>>, Stopped> {
             let (decoded, corrupt) = run(data, meter, limit)?;
-            if corrupt && strict {
-                return Ok(None);
+            if corrupt {
+                if strict {
+                    return Ok(None);
+                }
+                meter.note_recovery();
             }
             Ok(Some(decoded))
         }

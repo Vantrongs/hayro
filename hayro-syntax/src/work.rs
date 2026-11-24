@@ -15,6 +15,7 @@ pub struct Meter<'a> {
     /// The work left before the next poll; 0 once the hook asked to stop.
     left: Cell<usize>,
     cancelled: Cell<bool>,
+    recovered: Cell<bool>,
 }
 
 #[cfg(all(any(debug_assertions, feature = "work-counters"), feature = "std"))]
@@ -185,6 +186,14 @@ pub(crate) fn read_bodies(_bytes: usize) {
 pub struct Cancelled;
 
 impl<'a> Meter<'a> {
+    pub(crate) fn note_recovery(&self) {
+        self.recovered.set(true);
+    }
+
+    pub(crate) fn recovered(&self) -> bool {
+        self.recovered.get()
+    }
+
     /// A meter polling `hook`, which returns true to stop; with `None`, the work is
     /// counted but never stopped.
     pub fn new(hook: Option<&'a dyn Fn() -> bool>) -> Self {
@@ -192,6 +201,7 @@ impl<'a> Meter<'a> {
             hook,
             left: Cell::new(POLL_BYTES),
             cancelled: Cell::new(false),
+            recovered: Cell::new(false),
         }
     }
 
