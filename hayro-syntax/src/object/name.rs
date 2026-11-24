@@ -163,7 +163,7 @@ pub(crate) fn lex_name_like<'a>(r: &mut Reader<'a>, solidus: bool) -> Option<&'a
 /// which no name holds; any other `#` is itself (`/A#2`, `/A#G1` and `/A#00` are
 /// `A#2`, `A#G1` and `A#00`, and `/A##41` is `A#A`).
 #[inline]
-fn unescape(data: &[u8], mut out: impl FnMut(u8)) {
+pub(crate) fn unescape(data: &[u8], mut out: impl FnMut(u8)) {
     let mut at = 0;
     while let Some(&b) = data.get(at) {
         let byte = (b == b'#')

@@ -10,6 +10,7 @@ use crate::object::name::{Name, lex_name_like};
 use crate::object::{Array, Number, Object, Stream};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
+use crate::sync::Arc;
 use crate::trivia::is_white_space_character;
 use crate::util::find_needle;
 use alloc::vec::Vec;
@@ -23,25 +24,40 @@ const INLINE_COLOR_COMPONENTS: usize = 4;
 
 impl Debug for Operator<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.0.as_str())
+        Display::fmt(self, f)
     }
 }
 
 impl Display for Operator<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.0.as_str())
+        f.write_str(core::str::from_utf8(self).unwrap_or("{non-ascii key}"))
     }
 }
 
 /// A content stream operator.
-#[derive(Clone, PartialEq)]
-pub struct Operator<'a>(Name<'a>);
+#[derive(Clone)]
+pub struct Operator<'a>(Spelling<'a>);
+
+#[derive(Clone)]
+enum Spelling<'a> {
+    Borrowed(&'a [u8]),
+    Decoded(Arc<[u8]>),
+}
+
+impl PartialEq for Operator<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.deref() == other.deref()
+    }
+}
 
 impl Deref for Operator<'_> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref()
+        match &self.0 {
+            Spelling::Borrowed(bytes) => bytes,
+            Spelling::Decoded(bytes) => bytes,
+        }
     }
 }
 
@@ -54,7 +70,19 @@ impl Skippable for Operator<'_> {
 
 impl<'a> Readable<'a> for Operator<'a> {
     fn read(r: &mut Reader<'a>, _: &ReaderContext<'a>) -> Option<Self> {
-        Some(Self(Name::new(lex_name_like(r, false)?)?))
+        Some(Self::from_raw(lex_name_like(r, false)?))
+    }
+}
+
+impl<'a> Operator<'a> {
+    fn from_raw(raw: &'a [u8]) -> Self {
+        if raw.contains(&b'#') {
+            let mut bytes = Vec::with_capacity(raw.len());
+            object::name::unescape(raw, |b| bytes.push(b));
+            Self(Spelling::Decoded(bytes.into()))
+        } else {
+            Self(Spelling::Borrowed(raw))
+        }
     }
 }
 
@@ -63,7 +91,7 @@ impl<'a> Readable<'a> for Operator<'a> {
 pub struct UntypedIter<'a> {
     reader: Reader<'a>,
     stack: Stack<'a>,
-    operator: Option<Operator<'a>>,
+    operator: Operator<'a>,
 }
 
 impl<'a> UntypedIter<'a> {
@@ -72,17 +100,13 @@ impl<'a> UntypedIter<'a> {
         Self {
             reader: Reader::new(data),
             stack: Stack::new(),
-            operator: None,
+            operator: Operator(Spelling::Borrowed(&[])),
         }
     }
 
     /// Create a new empty untyped iterator.
     pub fn empty() -> Self {
-        Self {
-            reader: Reader::new(&[]),
-            stack: Stack::new(),
-            operator: None,
-        }
+        Self::new(&[])
     }
 
     /// Return the next instruction.
@@ -90,16 +114,19 @@ impl<'a> UntypedIter<'a> {
     pub fn next(&mut self) -> Option<Instruction<'_, 'a>> {
         self.stack.clear();
 
-        let operator = read_instruction(&mut self.reader, &mut self.stack)?;
-        self.operator = Some(operator);
+        let raw = read_instruction(&mut self.reader, &mut self.stack)?;
+        self.operator = Operator::from_raw(raw);
+        if self.operator.as_ref() == b"BI" {
+            read_inline_image(&mut self.reader, &mut self.stack)?;
+        }
         Some(Instruction {
             operands: &self.stack,
-            operator: self.operator.as_ref().unwrap(),
+            operator: &self.operator,
         })
     }
 }
 
-fn read_instruction<'a>(r: &mut Reader<'a>, stack: &mut Stack<'a>) -> Option<Operator<'a>> {
+fn read_instruction<'a>(r: &mut Reader<'a>, stack: &mut Stack<'a>) -> Option<&'a [u8]> {
     // Keeps the read position in a register; must be written back before calling out.
     let mut cur = r.clone();
 
@@ -132,22 +159,11 @@ fn read_instruction<'a>(r: &mut Reader<'a>, stack: &mut Stack<'a>) -> Option<Ope
                 cur = r.clone();
             }
             _ => {
-                *r = cur;
-                // Returned as it is read: unwrapping and rewrapping it copies the
-                // operator field by field, and the wider reloads of those narrow stores
-                // stall store forwarding.
-                let operator = r.read_without_context::<Operator<'a>>();
-                match &operator {
-                    None => {
-                        r.jump_to_end();
-                    }
-                    // Inline images need special casing...
-                    Some(operator) if operator.as_ref() == b"BI" => {
-                        read_inline_image(r, stack)?;
-                    }
-                    Some(_) => {}
+                let operator = lex_name_like(&mut cur, false);
+                if operator.is_none() {
+                    cur.jump_to_end();
                 }
-
+                *r = cur;
                 return operator;
             }
         }
@@ -158,7 +174,7 @@ fn read_operand<'a>(r: &mut Reader<'a>, stack: &mut Stack<'a>) -> Option<()> {
     // A number glued to regular characters acts as an unknown operator; skip it (issue 994).
     if let Some(object) = r.read_without_context::<Object<'a>>() {
         stack.push(object)
-    } else if r.read_without_context::<Operator<'a>>().is_some() {
+    } else if r.skip::<Operator<'a>>(true).is_some() {
         stack.clear();
         Some(())
     } else {
@@ -356,7 +372,7 @@ impl<'a> TypedIter<'a> {
                     &b"h"[..],
                     &b"re"[..],
                 ]
-                .contains(&op.operator.0.deref())
+                .contains(&op.operator.deref())
                 {
                     None
                 } else {
@@ -696,4 +712,26 @@ mod macros {
     pub(crate) use op3;
     pub(crate) use op4;
     pub(crate) use op6;
+}
+
+#[cfg(test)]
+mod operator_tests {
+    use super::*;
+
+    #[test]
+    fn operator_spelling() {
+        let data = b"cm c#6d";
+        let mut iter = UntypedIter::new(data);
+        let plain = iter.next().unwrap().operator.clone();
+        assert_eq!(plain.as_ptr(), data.as_ptr());
+        assert_eq!(&plain, iter.next().unwrap().operator);
+        let mut data = b"#61".repeat(2048);
+        data.extend_from_slice(b"#00#G1#ff");
+        let mut iter = UntypedIter::new(&data);
+        let op = iter.next().unwrap().operator;
+        assert_eq!(&op[..2048], &[b'a'; 2048]);
+        assert_eq!(&op[2048..], b"#00#G1\xff");
+        assert_eq!(op.clone().as_ptr(), op.as_ptr());
+        assert_eq!(alloc::format!("{op}"), "{non-ascii key}");
+    }
 }
