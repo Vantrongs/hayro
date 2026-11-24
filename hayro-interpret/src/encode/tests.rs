@@ -956,3 +956,52 @@ fn deep_zoom_arch_flatness() {
     assert_eq!(sample_at(x, y_in), [0., 0., 0., 1.]);
     assert_eq!(sample_at(x, y_out), [0.; 4]);
 }
+
+#[test]
+fn metered_samples_distinguish_coverage_and_function_failure() {
+    let function = crate::fixtures::stream(
+        "/FunctionType 4 /Domain [0 1] /Range [0 1]",
+        b"{ .5 gt { pop } { 1 } ifelse }",
+    );
+    let axial = pattern(b"<< /ShadingType 2 /Coords [0 0 4 0] /ColorSpace /DeviceGray /Background [0] /Function 6 0 R >>".to_vec(),function.clone());
+    let mesh = pattern(
+        crate::fixtures::stream(
+            "/ShadingType 5 /VerticesPerRow 2 /BitsPerCoordinate 8 /BitsPerComponent 8 /Decode [0 4 0 4 0 1] /ColorSpace /DeviceGray /Background [0] /Function 6 0 R",
+            &[0, 0, 0, 255, 0, 255, 0, 255, 0, 255, 255, 255],
+        ),
+        function,
+    );
+    let area = Rect::new(-1., 0., 4., 1.);
+    let positions = [-0.5, 0.5, 1.5, 2.5, 3.5].map(|x| Point::new(x, 0.5));
+    for pattern in [axial, mesh] {
+        let mut rows = Vec::new();
+        pattern
+            .sample_texture_samples_metered(area, 1., &mut Unmetered, |r| rows.extend_from_slice(r))
+            .unwrap();
+        let mut points = Vec::new();
+        pattern
+            .sample_points_samples_metered(&positions, &mut Unmetered, |s| points.push(s))
+            .unwrap();
+        use ShadingSample::{Failed, Outside, Painted};
+        assert_eq!(
+            rows,
+            [Outside, Painted([1.; 4]), Painted([1.; 4]), Failed, Failed]
+        );
+        assert_eq!(points, rows);
+        let mut rgba = Vec::new();
+        pattern
+            .sample_texture_metered(area, 1., &mut Unmetered, |r| rgba.extend_from_slice(r))
+            .unwrap();
+        assert_eq!(pattern.background_rgba(), [0., 0., 0., 1.]);
+        assert_eq!(
+            rgba,
+            [
+                pattern.background_rgba(),
+                [1.; 4],
+                [1.; 4],
+                [0.; 4],
+                [0.; 4]
+            ]
+        );
+    }
+}

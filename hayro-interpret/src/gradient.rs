@@ -560,15 +560,6 @@ fn parameter_at([lo, hi]: [f32; 2], t: f32) -> f32 {
     }
 }
 
-pub(crate) fn sample_function(
-    function: &ShadingFunction,
-    range: [f32; 2],
-    pattern: &EncodedShadingPattern,
-    t: f32,
-) -> [f32; 4] {
-    pattern.eval(function, &[parameter_at(range, t)])
-}
-
 pub(crate) struct ParameterColors<'a> {
     cursor: std::cell::Cell<usize>,
     pattern: &'a EncodedShadingPattern,
@@ -596,9 +587,16 @@ impl<'a> ParameterColors<'a> {
             .map_or_else(|| self.pattern.point_cost(), |r| r.lookup_cost())
     }
     pub(crate) fn get(&self, t: f32) -> [f32; 4] {
+        self.color(t).unwrap_or([0.; 4])
+    }
+
+    pub(crate) fn color(&self, t: f32) -> Option<[f32; 4]> {
         self.pattern.ramp.as_ref().map_or_else(
-            || sample_function(self.function, self.range, self.pattern, t),
-            |r| r.get(t, &self.cursor),
+            || {
+                self.pattern
+                    .eval_color(self.function, &[parameter_at(self.range, t)])
+            },
+            |r| Some(r.get(t, &self.cursor)),
         )
     }
 }

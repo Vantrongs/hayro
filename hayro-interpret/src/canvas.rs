@@ -1,19 +1,19 @@
 use crate::encode::{
-    Cost, EncodedShadingPattern, Exhausted, Meter, capacity_after, push_metered, reserve_metered,
-    take,
+    Cost, EncodedShadingPattern, Exhausted, Meter, SamplePixel, capacity_after, push_metered,
+    reserve_metered, take,
 };
 use crate::gradient::ParameterColors;
 use kurbo::{Point, Rect};
 
-pub(crate) struct Canvas<'a> {
+pub(crate) struct Canvas<'a, P = [f32; 4]> {
     pub(crate) width: usize,
     pub(crate) height: usize,
     layout: Layout<'a>,
-    pub(crate) pixels: Vec<[f32; 4]>,
+    pub(crate) pixels: Vec<P>,
 }
 
-impl<'a> Canvas<'a> {
-    pub(crate) fn new(width: u32, height: u32, background: [f32; 4]) -> Self {
+impl<'a, P: SamplePixel> Canvas<'a, P> {
+    pub(crate) fn new(width: u32, height: u32, background: P) -> Self {
         let (width, height) = (width as usize, height as usize);
 
         Self {
@@ -24,7 +24,7 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    pub(crate) fn for_rows(width: u32, height: u32, background: [f32; 4]) -> Self {
+    pub(crate) fn for_rows(width: u32, height: u32, background: P) -> Self {
         Self {
             width: width as usize,
             height: height as usize,
@@ -45,7 +45,7 @@ impl<'a> Canvas<'a> {
     fn make_dense(&mut self, meter: &mut dyn Meter) -> Result<Rows, Exhausted> {
         let len = self.width.checked_mul(self.height).ok_or(Exhausted)?;
         let bytes = len
-            .checked_mul(size_of::<[f32; 4]>())
+            .checked_mul(size_of::<P>())
             .filter(|&n| n <= isize::MAX as usize)
             .ok_or(Exhausted)?;
         if !meter.hold(bytes) {
@@ -55,7 +55,7 @@ impl<'a> Canvas<'a> {
         let Layout::Rows { rows, .. } = std::mem::replace(&mut self.layout, Layout::Dense) else {
             unreachable!()
         };
-        let old_bytes = self.pixels.capacity() * size_of::<[f32; 4]>();
+        let old_bytes = self.pixels.capacity() * size_of::<P>();
         self.pixels.resize(len, self.pixels[0]);
         meter.release_bytes(old_bytes);
         Ok(rows)
@@ -63,9 +63,9 @@ impl<'a> Canvas<'a> {
 
     pub(crate) fn emit_rows(
         mut self,
-        background: [f32; 4],
+        background: P,
         meter: &mut dyn Meter,
-        mut emit: impl FnMut(&[[f32; 4]]),
+        mut emit: impl FnMut(&[P]),
     ) -> Result<(), Exhausted> {
         let Layout::Rows { mut rows, shade } = self.layout else {
             for row in self.pixels.chunks_exact(self.width) {
@@ -82,23 +82,33 @@ impl<'a> Canvas<'a> {
             while let Some(span) = spans.next_if(|s| s.y as usize == y) {
                 let pixels = &mut self.pixels[span.start as usize..span.end as usize];
                 match &shade {
-                    RowShade::Rgba => rows.paint(span, pixels, &|v: &[f32; 4]| *v),
+                    RowShade::Rgba => {
+                        rows.paint(span, pixels, &|v: &[f32; 4]| P::evaluated(Some(*v)));
+                    }
                     RowShade::Parameter(lut) => {
-                        rows.paint(span, pixels, &|v: &[f32; 1]| lut.get(v[0]));
+                        rows.paint(span, pixels, &|v: &[f32; 1]| P::evaluated(lut.color(v[0])));
                     }
                     RowShade::Direct {
                         pattern,
                         num_components,
                     } => match num_components {
-                        1 => rows.paint(span, pixels, &|v: &[f32; 1]| pattern.convert(v)),
-                        2 => rows.paint(span, pixels, &|v: &[f32; 2]| pattern.convert(v)),
-                        3 => rows.paint(span, pixels, &|v: &[f32; 3]| pattern.convert(v)),
-                        4 => rows.paint(span, pixels, &|v: &[f32; 4]| pattern.convert(v)),
+                        1 => rows.paint(span, pixels, &|v: &[f32; 1]| {
+                            P::evaluated(Some(pattern.convert(v)))
+                        }),
+                        2 => rows.paint(span, pixels, &|v: &[f32; 2]| {
+                            P::evaluated(Some(pattern.convert(v)))
+                        }),
+                        3 => rows.paint(span, pixels, &|v: &[f32; 3]| {
+                            P::evaluated(Some(pattern.convert(v)))
+                        }),
+                        4 => rows.paint(span, pixels, &|v: &[f32; 4]| {
+                            P::evaluated(Some(pattern.convert(v)))
+                        }),
                         _ => rows.paint(
                             span,
                             pixels,
                             &|v: &[f32; crate::function::MAX_COMPONENTS]| {
-                                pattern.convert(&v[..*num_components])
+                                P::evaluated(Some(pattern.convert(&v[..*num_components])))
                             },
                         ),
                     },
@@ -113,12 +123,12 @@ impl<'a> Canvas<'a> {
 
     pub(crate) fn for_points(
         points: &[Point],
-        background: [f32; 4],
+        background: P,
         meter: &mut dyn Meter,
     ) -> Result<Self, Exhausted> {
         let bytes = points
             .len()
-            .checked_mul(size_of::<(Point, usize)>() + size_of::<[f32; 4]>())
+            .checked_mul(size_of::<(Point, usize)>() + size_of::<P>())
             .ok_or(Exhausted)?;
         if !meter.hold(bytes) {
             return Err(Exhausted);
@@ -160,7 +170,7 @@ impl<'a> Canvas<'a> {
         &mut self,
         points: [Point; 3],
         values: [[f32; N]; 3],
-        shade: &impl Fn(&[f32; N]) -> [f32; 4],
+        shade: &impl Fn(&[f32; N]) -> P,
         sample_cost: Cost,
         meter: &mut dyn Meter,
     ) -> Result<(), Exhausted> {
@@ -250,7 +260,7 @@ impl<'a> Canvas<'a> {
             let dense_bytes = self
                 .width
                 .saturating_mul(self.height)
-                .saturating_mul(size_of::<[f32; 4]>());
+                .saturating_mul(size_of::<P>());
             if let Layout::Rows {
                 rows,
                 shade: row_shade,
@@ -342,11 +352,11 @@ impl Rows {
             .saturating_add(bytes(&self.data, coefficients))
     }
 
-    fn paint<const N: usize>(
+    fn paint<P, const N: usize>(
         &self,
         span: &Span,
-        pixels: &mut [[f32; 4]],
-        shade: &impl Fn(&[f32; N]) -> [f32; 4],
+        pixels: &mut [P],
+        shade: &impl Fn(&[f32; N]) -> P,
     ) {
         let plane = &self.planes[span.plane as usize];
         let coefficients = &self.data[plane.offset..plane.offset + self.components];
@@ -374,12 +384,12 @@ impl<const N: usize> PlaneRow<N> {
         self.0.map(|[base, dx]| (base + dx * x) as f32)
     }
 
-    fn paint(
+    fn paint<P>(
         &self,
         start: usize,
         origin: f64,
-        pixels: &mut [[f32; 4]],
-        shade: &impl Fn(&[f32; N]) -> [f32; 4],
+        pixels: &mut [P],
+        shade: &impl Fn(&[f32; N]) -> P,
     ) {
         for (x, pixel) in (start..).zip(pixels) {
             *pixel = shade(&self.at(x as f64 + 0.5 - origin));

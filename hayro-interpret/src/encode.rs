@@ -15,6 +15,40 @@ use crate::util::x_y_advances;
 use kurbo::{Affine, Point, Rect};
 use std::sync::Arc;
 
+/// The result of sampling a shading before compositing its background.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ShadingSample {
+    /// The shading does not cover the position.
+    Outside,
+    /// The shading function failed at this position.
+    Failed,
+    /// The straight RGBA color at this position.
+    Painted([f32; 4]),
+}
+
+pub(crate) trait SamplePixel: Copy + 'static {
+    fn outside(pattern: &EncodedShadingPattern) -> Self;
+    fn evaluated(color: Option<[f32; 4]>) -> Self;
+}
+
+impl SamplePixel for ShadingSample {
+    fn outside(_: &EncodedShadingPattern) -> Self {
+        Self::Outside
+    }
+    fn evaluated(color: Option<[f32; 4]>) -> Self {
+        color.map_or(Self::Failed, Self::Painted)
+    }
+}
+
+impl SamplePixel for [f32; 4] {
+    fn outside(pattern: &EncodedShadingPattern) -> Self {
+        pattern.background_rgba()
+    }
+    fn evaluated(color: Option<[f32; 4]>) -> Self {
+        color.unwrap_or([0.; 4])
+    }
+}
+
 /// Steps of work: an operator of a function run, a value read, computed or
 /// written, a pixel visited. Its arithmetic saturates, so a cost made of others
 /// is never less than any of them: work too large to count is never given.
@@ -235,6 +269,11 @@ pub fn texture_dimensions(bbox: Rect, scale: f32) -> (u32, u32) {
 }
 
 impl EncodedShadingPattern {
+    /// The straight RGBA background after opacity and transfer.
+    pub fn background_rgba(&self) -> [f32; 4] {
+        self.finish(self.background_color.components())
+    }
+
     /// Prepares colors within the work of directly evaluating the visible samples.
     pub fn sample_ramp_for(
         &self,
@@ -355,13 +394,15 @@ impl EncodedShadingPattern {
     }
 
     pub(crate) fn eval(&self, function: &ShadingFunction, input: &[f32]) -> [f32; 4] {
+        self.eval_color(function, input).unwrap_or([0.; 4])
+    }
+
+    pub(crate) fn eval_color(&self, function: &ShadingFunction, input: &[f32]) -> Option<[f32; 4]> {
         let mut out = [0.0; MAX_COMPONENTS];
         let out = &mut out[..function.num_outputs()];
 
-        match function.eval(input, out) {
-            Some(()) => self.convert(out),
-            None => [0.0; 4],
-        }
+        function.eval(input, out)?;
+        Some(self.convert(out))
     }
 
     /// Call `f` with the straight RGBA color of each pixel of a grid covering `bbox`, in row-major order.
@@ -384,7 +425,7 @@ impl EncodedShadingPattern {
         let (width, height) = texture_dimensions(bbox, scale);
         let grid_transform =
             Affine::translate((bbox.x0, bbox.y0)) * Affine::scale(1.0 / scale as f64);
-        let background = self.finish(self.background_color.components());
+        let background = self.background_rgba();
         let transform = grid_transform.inverse() * self.base_transform.inverse();
         let new_canvas = || Canvas::new(width, height, background);
         let canvas = match &self.shading_type {
@@ -422,7 +463,28 @@ impl EncodedShadingPattern {
         bbox: Rect,
         scale: f32,
         meter: &mut dyn Meter,
-        mut f: impl FnMut(&[[f32; 4]]),
+        f: impl FnMut(&[[f32; 4]]),
+    ) -> Result<(u32, u32, Affine), Exhausted> {
+        self.sample_texture_as(bbox, scale, meter, f)
+    }
+
+    /// Sample texture rows with coverage and evaluation status.
+    pub fn sample_texture_samples_metered(
+        &self,
+        bbox: Rect,
+        scale: f32,
+        meter: &mut dyn Meter,
+        f: impl FnMut(&[ShadingSample]),
+    ) -> Result<(u32, u32, Affine), Exhausted> {
+        self.sample_texture_as(bbox, scale, meter, f)
+    }
+
+    fn sample_texture_as<P: SamplePixel>(
+        &self,
+        bbox: Rect,
+        scale: f32,
+        meter: &mut dyn Meter,
+        mut f: impl FnMut(&[P]),
     ) -> Result<(u32, u32, Affine), Exhausted> {
         scratch(
             meter,
@@ -435,14 +497,14 @@ impl EncodedShadingPattern {
                 if !meter.hold(
                     usize::try_from(buffer)
                         .ok()
-                        .and_then(|n| n.checked_mul(size_of::<[f32; 4]>()))
+                        .and_then(|n| n.checked_mul(size_of::<P>()))
                         .filter(|&n| n <= isize::MAX as usize)
                         .ok_or(Exhausted)?,
                 ) {
                     return Err(Exhausted);
                 }
                 take(meter, self.setup_cost())?;
-                let bg = self.finish(self.background_color.components());
+                let bg = P::outside(self);
                 if let EncodedShadingType::Mesh(s) = &self.shading_type {
                     take(meter, Cost::new(count))?;
                     let mut canvas = Canvas::for_rows(width, height, bg);
@@ -477,7 +539,26 @@ impl EncodedShadingPattern {
         &self,
         points: &[Point],
         meter: &mut dyn Meter,
-        mut f: impl FnMut([f32; 4]),
+        f: impl FnMut([f32; 4]),
+    ) -> Result<(), Exhausted> {
+        self.sample_points_as(points, meter, f)
+    }
+
+    /// Sample the requested positions with coverage and evaluation status.
+    pub fn sample_points_samples_metered(
+        &self,
+        points: &[Point],
+        meter: &mut dyn Meter,
+        f: impl FnMut(ShadingSample),
+    ) -> Result<(), Exhausted> {
+        self.sample_points_as(points, meter, f)
+    }
+
+    fn sample_points_as<P: SamplePixel>(
+        &self,
+        points: &[Point],
+        meter: &mut dyn Meter,
+        mut f: impl FnMut(P),
     ) -> Result<(), Exhausted> {
         scratch(
             meter,
@@ -486,7 +567,7 @@ impl EncodedShadingPattern {
                     return Ok(());
                 }
                 take(meter, self.setup_cost())?;
-                let bg = self.finish(self.background_color.components());
+                let bg = P::outside(self);
                 if let EncodedShadingType::Mesh(s) = &self.shading_type {
                     let mut canvas = Canvas::for_points(points, bg, meter)?;
                     draw_mesh(&mut canvas, s, self.base_transform.inverse(), self, meter)?;
@@ -503,12 +584,12 @@ impl EncodedShadingPattern {
         )
     }
 
-    fn point_sampler(
+    fn point_sampler<P: SamplePixel>(
         &self,
         meter: &mut dyn Meter,
         count: u64,
-        bg: [f32; 4],
-    ) -> Result<impl Fn(Point) -> [f32; 4] + '_, Exhausted> {
+        bg: P,
+    ) -> Result<impl Fn(Point) -> P + '_, Exhausted> {
         let colors = match &self.shading_type {
             EncodedShadingType::RadialAxial(s) => {
                 Some(ParameterColors::new(self, &s.function, s.domain))
@@ -537,13 +618,15 @@ impl EncodedShadingPattern {
                     coordinate(p.x, s.domain.x0, s.domain.x1, s.extended[0], s.extended[1]),
                     coordinate(p.y, s.domain.y0, s.domain.y1, s.extended[2], s.extended[3]),
                 ) {
-                    (Some(x), Some(y)) => self.eval(&s.function, &[x as f32, y as f32]),
+                    (Some(x), Some(y)) => {
+                        P::evaluated(self.eval_color(&s.function, &[x as f32, y as f32]))
+                    }
                     _ => bg,
                 }
             }
             EncodedShadingType::RadialAxial(s) => s
                 .position(p)
-                .map_or(bg, |t| colors.as_ref().unwrap().get(t)),
+                .map_or(bg, |t| P::evaluated(colors.as_ref().unwrap().color(t))),
             _ => bg,
         })
     }

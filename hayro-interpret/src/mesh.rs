@@ -1,6 +1,8 @@
 use crate::canvas::{Canvas, RowShade, bounds};
 use crate::color::ColorComponents;
-use crate::encode::{Cost, EncodedMeshShading, EncodedShadingPattern, Exhausted, Meter, take};
+use crate::encode::{
+    Cost, EncodedMeshShading, EncodedShadingPattern, Exhausted, Meter, SamplePixel, take,
+};
 use crate::function::MAX_COMPONENTS;
 use crate::gradient::ParameterColors;
 use crate::shading::{Patch, ShadingFunction, ShadingType, Triangle};
@@ -9,14 +11,14 @@ use kurbo::{Affine, Point, Rect};
 const FLATNESS: f64 = 0.25;
 const MAX_DEPTH: u32 = 20;
 
-struct Target<'a, 'b> {
-    canvas: &'a mut Canvas<'b>,
+struct Target<'a, 'b, P> {
+    canvas: &'a mut Canvas<'b, P>,
     meter: &'a mut dyn Meter,
     vertex_cost: Cost,
 }
 
-pub(crate) fn draw_mesh<'b>(
-    canvas: &mut Canvas<'b>,
+pub(crate) fn draw_mesh<'b, P: SamplePixel>(
+    canvas: &mut Canvas<'b, P>,
     mesh: &'b EncodedMeshShading,
     transform: Affine,
     pattern: &'b EncodedShadingPattern,
@@ -97,12 +99,12 @@ pub(crate) fn draw_mesh<'b>(
             num_components: n,
         });
         match n {
-            1 => pieces.draw::<1>(&mut target, transform, &colors)?,
-            2 => pieces.draw::<2>(&mut target, transform, &colors)?,
-            3 => pieces.draw::<3>(&mut target, transform, &colors)?,
-            4 => pieces.draw::<4>(&mut target, transform, &colors)?,
+            1 => pieces.draw::<1, _>(&mut target, transform, &colors)?,
+            2 => pieces.draw::<2, _>(&mut target, transform, &colors)?,
+            3 => pieces.draw::<3, _>(&mut target, transform, &colors)?,
+            4 => pieces.draw::<4, _>(&mut target, transform, &colors)?,
             _ => {
-                pieces.draw::<MAX_COMPONENTS>(&mut target, transform, &colors)?;
+                pieces.draw::<MAX_COMPONENTS, _>(&mut target, transform, &colors)?;
             }
         }
     }
@@ -120,9 +122,9 @@ enum Pieces<'a> {
 }
 
 impl Pieces<'_> {
-    fn draw<const N: usize>(
+    fn draw<const N: usize, P: SamplePixel>(
         &self,
-        target: &mut Target<'_, '_>,
+        target: &mut Target<'_, '_, P>,
         transform: Affine,
         colors: &impl MeshColors<N>,
     ) -> Result<(), Exhausted> {
@@ -140,7 +142,7 @@ impl Pieces<'_> {
                         target.canvas.fill_triangle(
                             points,
                             values,
-                            &|v| colors.shade(v),
+                            &|v| P::evaluated(colors.shade(v)),
                             colors.cost(),
                             target.meter,
                         )?;
@@ -312,7 +314,7 @@ trait MeshColors<const N: usize> {
         Cost::ZERO
     }
     fn values(&self, components: &[f32]) -> [f32; N];
-    fn shade(&self, values: &[f32; N]) -> [f32; 4];
+    fn shade(&self, values: &[f32; N]) -> Option<[f32; 4]>;
 }
 
 struct Parameter<'a> {
@@ -348,8 +350,8 @@ impl MeshColors<1> for Parameter<'_> {
         }]
     }
 
-    fn shade(&self, values: &[f32; 1]) -> [f32; 4] {
-        self.lut.get(values[0])
+    fn shade(&self, values: &[f32; 1]) -> Option<[f32; 4]> {
+        self.lut.color(values[0])
     }
 }
 
@@ -374,8 +376,8 @@ impl<const N: usize> MeshColors<N> for DirectComponents<'_> {
         out
     }
 
-    fn shade(&self, values: &[f32; N]) -> [f32; 4] {
-        self.pattern.convert(&values[..self.num_components])
+    fn shade(&self, values: &[f32; N]) -> Option<[f32; 4]> {
+        Some(self.pattern.convert(&values[..self.num_components]))
     }
 }
 
@@ -388,8 +390,8 @@ impl MeshColors<4> for DirectLinear<'_> {
         self.pattern.convert(components)
     }
 
-    fn shade(&self, values: &[f32; 4]) -> [f32; 4] {
-        *values
+    fn shade(&self, values: &[f32; 4]) -> Option<[f32; 4]> {
+        Some(*values)
     }
 }
 
@@ -518,8 +520,8 @@ impl<'a> CanvasPatch<'a> {
     }
 }
 
-fn draw_patch_piece<const N: usize>(
-    target: &mut Target<'_, '_>,
+fn draw_patch_piece<const N: usize, P: SamplePixel>(
+    target: &mut Target<'_, '_, P>,
     patch: &CanvasPatch<'_>,
     points: [[Point; 4]; 4],
     [u_range, v_range]: [[f32; 2]; 2],
@@ -573,7 +575,7 @@ fn draw_patch_piece<const N: usize>(
             values(u1, v1),
         );
         let (p00, p10, p01, p11) = (points[0][0], points[3][0], points[0][3], points[3][3]);
-        let shade = |v: &[f32; N]| colors.shade(v);
+        let shade = |v: &[f32; N]| P::evaluated(colors.shade(v));
 
         target.canvas.fill_triangle(
             [p00, p10, p01],
