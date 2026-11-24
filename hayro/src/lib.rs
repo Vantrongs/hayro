@@ -218,6 +218,11 @@ pub struct RenderCache<'a> {
 }
 
 impl<'a> RenderCache<'a> {
+    /// Release the active page’s decoded content stream.
+    pub fn clear_page_content(&self) {
+        self.interpreter_cache.clear_page_content();
+    }
+
     /// Create a new render cache.
     pub fn new() -> Self {
         Self {

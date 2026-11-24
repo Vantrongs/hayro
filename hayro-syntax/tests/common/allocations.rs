@@ -19,6 +19,7 @@ pub(crate) struct Allocations {
     pub(crate) count: usize,
     /// The bytes requested in all, which grows with the work that makes values.
     pub(crate) allocated: usize,
+    pub(crate) freed: usize,
     /// Bytes it allocated and had not freed when it returned: what it left held.
     pub(crate) held: usize,
 }
@@ -41,6 +42,7 @@ fn record(allocated: usize, freed: usize) {
             t.total.largest = t.total.largest.max(allocated);
             t.total.count += usize::from(allocated != 0);
             t.total.allocated += allocated;
+            t.total.freed += freed;
             slot.set(Some(t));
         }
     });
