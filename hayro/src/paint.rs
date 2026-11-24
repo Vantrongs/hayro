@@ -1,16 +1,62 @@
 use crate::Renderer;
-use hayro_interpret::Paint;
-use hayro_interpret::encode::{EncodedShadingType, texture_dimensions};
-use hayro_interpret::gradient::SvgGradientKind;
-use hayro_interpret::pattern::Pattern;
+use hayro_interpret::encode::{
+    EncodedShadingPattern, EncodedShadingType, Unmetered, texture_dimensions,
+};
+use hayro_interpret::gradient::{SampleRamp, SvgGradientKind};
+use hayro_interpret::pattern::{Pattern, ShadingPattern};
 use hayro_interpret::util::x_y_advances;
+use hayro_interpret::{CacheKey, Paint};
 use kurbo::{Affine, BezPath, Rect};
 use std::sync::Arc;
 use vello_cpu::color::{AlphaColor, DynamicColor, Srgb};
 use vello_cpu::peniko::{ColorStop, Gradient, ImageQuality, ImageSampler};
 use vello_cpu::{Image, ImageSource, PaintType, PixelMetadata, Pixmap, peniko};
 
+pub(super) struct PreparedRamp {
+    shading: u128,
+    opacity: u32,
+    samples: u64,
+    ramp: Option<Arc<SampleRamp>>,
+}
+
 impl Renderer<'_> {
+    fn prepare_shading(&self, pattern: &ShadingPattern, bbox: Rect) -> EncodedShadingPattern {
+        let mut encoded = pattern.encode();
+        if pattern.transfer_function.is_some()
+            || !matches!(encoded.shading_type, EncodedShadingType::RadialAxial(_))
+        {
+            return encoded.prepare_for(bbox);
+        }
+        let samples = bbox.area().ceil() as u64;
+        let shading = pattern.shading.cache_key();
+        let opacity = pattern.opacity.to_bits();
+        let mut slot = self.global.last_ramp.borrow_mut();
+        // A completed ramp fits any larger budget; an exhausted budget rules out smaller ones.
+        if let Some(previous) = slot.as_ref().filter(|previous| {
+            previous.shading == shading
+                && previous.opacity == opacity
+                && if previous.ramp.is_some() {
+                    samples >= previous.samples
+                } else {
+                    samples <= previous.samples
+                }
+        }) {
+            encoded.set_sample_ramp(previous.ramp.clone());
+        } else {
+            let ramp = encoded
+                .sample_ramp_for(samples, &mut Unmetered)
+                .expect("unmetered");
+            encoded.set_sample_ramp(ramp.clone());
+            *slot = Some(PreparedRamp {
+                shading,
+                opacity,
+                samples,
+                ramp,
+            });
+        }
+        encoded
+    }
+
     #[must_use]
     pub(super) fn set_paint(
         &mut self,
@@ -50,7 +96,7 @@ impl Renderer<'_> {
                         const NATIVE_GRADIENT_TOLERANCE: f32 = 0.01;
 
                         clip_path = s.clip_path();
-                        let encoded = s.encode().prepare_for(bbox);
+                        let encoded = self.prepare_shading(&s, bbox);
 
                         if let EncodedShadingType::RadialAxial(gradient) = &encoded.shading_type
                             && let Some(native) =

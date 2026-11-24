@@ -385,11 +385,15 @@ impl EncodedShadingPattern {
         let grid_transform =
             Affine::translate((bbox.x0, bbox.y0)) * Affine::scale(1.0 / scale as f64);
         let background = self.finish(self.background_color.components());
-        let mut canvas = Canvas::new(width, height, background);
         let transform = grid_transform.inverse() * self.base_transform.inverse();
-
-        match &self.shading_type {
+        let new_canvas = || Canvas::new(width, height, background);
+        let canvas = match &self.shading_type {
+            EncodedShadingType::RadialAxial(shading) => {
+                shading.sample_grid(width, height, transform, self, background, f);
+                return (width, height, grid_transform);
+            }
             EncodedShadingType::FunctionBased(shading) => {
+                let mut canvas = new_canvas();
                 draw_function(
                     &mut canvas,
                     shading.domain,
@@ -397,15 +401,16 @@ impl EncodedShadingPattern {
                     transform,
                     self,
                 );
+                canvas
             }
-            EncodedShadingType::RadialAxial(shading) => shading.draw(&mut canvas, transform, self),
             EncodedShadingType::Mesh(shading) => {
+                let mut canvas = new_canvas();
                 draw_mesh(&mut canvas, shading, transform, self, &mut Unmetered)
                     .expect("unmetered");
+                canvas
             }
-            EncodedShadingType::Dummy(_) => {}
-        }
-
+            EncodedShadingType::Dummy(_) => new_canvas(),
+        };
         canvas.pixels.into_iter().for_each(f);
 
         (width, height, grid_transform)
@@ -719,18 +724,34 @@ pub(crate) enum RadialAxialParams {
 }
 
 impl EncodedRadialAxialShading {
-    fn draw(&self, canvas: &mut Canvas<'_>, transform: Affine, pattern: &EncodedShadingPattern) {
+    fn sample_grid(
+        &self,
+        width: u32,
+        height: u32,
+        transform: Affine,
+        pattern: &EncodedShadingPattern,
+        background: [f32; 4],
+        mut emit: impl FnMut([f32; 4]),
+    ) {
         let colors = ParameterColors::new(pattern, &self.function, self.domain);
         let to_shading = transform.inverse();
         let (x_advance, y_advance) = x_y_advances(&to_shading);
         let mut row_start = to_shading * Point::new(0.5, 0.5);
 
-        for row in canvas.pixels.chunks_exact_mut(canvas.width) {
+        let mut previous = None;
+        let mut color = background;
+        for _ in 0..height {
             let mut point = row_start;
 
-            for pixel in row {
+            for _ in 0..width {
                 if let Some(t) = self.position(point) {
-                    *pixel = colors.get(t);
+                    if previous != Some(t.to_bits()) {
+                        color = colors.get(t);
+                        previous = Some(t.to_bits());
+                    }
+                    emit(color);
+                } else {
+                    emit(background);
                 }
 
                 point += x_advance;

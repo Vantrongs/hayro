@@ -133,6 +133,22 @@ impl Type0 {
     }
 
     pub(crate) fn eval(&self, input: &[f32], output: &mut [f32]) {
+        if let [axis] = self.inputs.as_slice() {
+            let (index, fraction) = axis.sample_position(input[0]);
+            let offset = index * axis.stride;
+            let values = &self.samples[offset..offset + axis.stride];
+            output.copy_from_slice(values);
+            if let Some(t) = fraction {
+                let next = &self.samples[offset + axis.stride..];
+                for (value, &next) in output.iter_mut().zip(next) {
+                    *value = (1.0 - t) * *value + t * next;
+                }
+            }
+            for (value, &decode) in output.iter_mut().zip(&self.decode) {
+                *value = self.sample_range.map(*value, decode);
+            }
+            return;
+        }
         let mut offset = 0;
         let mut fractions = [(0, 0.0); MAX_COMPONENTS];
         let mut num_fractions = 0;
