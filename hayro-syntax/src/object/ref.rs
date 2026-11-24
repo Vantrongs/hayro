@@ -1,7 +1,7 @@
 //! Object references.
 
 use crate::object::{Kind, ObjectLike};
-use crate::object::{Number, ObjectIdentifier};
+use crate::object::{ObjectIdentifier, number::scan};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use core::fmt::{Debug, Display, Formatter};
@@ -53,19 +53,19 @@ impl Skippable for ObjRef {
 impl Readable<'_> for ObjRef {
     fn read(r: &mut Reader<'_>, _: &ReaderContext<'_>) -> Option<Self> {
         // Most numbers start no reference: find that out without making their values.
-        let start = r.offset();
-        r.skip::<Number>(false)?;
+        let object = scan(r)?;
+        if r.forward_tag(b" 0 R").is_some() {
+            return Some(Self::new(
+                object.number(r.data).as_i64().try_into().ok()?,
+                0,
+            ));
+        }
         r.skip_white_spaces();
-        r.skip::<Number>(false)?;
-        r.skip_white_spaces();
-        r.forward_tag(b"R")?;
-        r.jump(start);
-
-        let obj_ref = r.read_without_context::<u32>()?;
-        r.skip_white_spaces();
-        let gen_num = r.read_without_context::<i32>()?;
+        let generation = scan(r)?;
         r.skip_white_spaces();
         r.forward_tag(b"R")?;
+        let obj_ref = u32::try_from(object.number(r.data).as_i64()).ok()?;
+        let gen_num = i32::try_from(generation.number(r.data).as_i64()).ok()?;
 
         Some(Self::new(obj_ref, gen_num))
     }

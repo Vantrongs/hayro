@@ -480,7 +480,7 @@ impl Display for Number {
 }
 
 /// A number's token as [`scan`] finds it.
-struct Token {
+pub(super) struct Token {
     negative: bool,
     /// Whether a sign stands first.
     signed: bool,
@@ -517,7 +517,7 @@ fn gather(r: &mut Reader<'_>, mut byte: Option<u8>, digits: &mut u64) -> Option<
 /// module doc); `None` where no number starts there or a regular character follows
 /// the token. Reading and skipping a number both scan it here.
 #[inline(always)]
-fn scan(r: &mut Reader<'_>) -> Option<Token> {
+pub(super) fn scan(r: &mut Reader<'_>) -> Option<Token> {
     // On a copy, whose position stays in a register: moving `r` byte by byte stores
     // each position, and a copy of the number made just after waits for those
     // stores to reach the cache.
@@ -589,7 +589,7 @@ impl Token {
 
     /// The number the token in `data` is (rules 3 to 5 of the module doc).
     #[inline(always)]
-    fn number(&self, data: &[u8]) -> Number {
+    pub(super) fn number(&self, data: &[u8]) -> Number {
         Number::simple(
             self.negative,
             self.signed,
