@@ -213,10 +213,12 @@ impl<'a> Colour<'a> {
         self.components
     }
 
-    /// Whether the samples are 8-bit `DeviceGray` or `DeviceRGB`.
-    pub(super) fn device_bytes(&self) -> bool {
-        matches!(self.samples, Samples::Bytes { .. })
-            && matches!(&self.output, Output::Colour { color_space, .. } if color_space.is_device_gray_or_rgb())
+    pub(super) fn jpeg_gray_bytes(&self) -> bool {
+        self.components == 1
+            && matches!(self.samples, Samples::Bytes { .. })
+            && self
+                .color_space()
+                .is_some_and(|cs| cs.is_device_gray_or_rgb() || cs.is_icc_gray())
     }
 
     pub(super) fn is_stencil(&self) -> bool {

@@ -366,6 +366,10 @@ impl ColorSpace {
                 ))
     }
 
+    pub(crate) fn is_icc_gray(&self) -> bool {
+        matches!(self.0.as_ref(), ColorSpaceType::ICCBased(profile) if profile.number_components() == 1)
+    }
+
     pub(crate) fn is_device_gray_or_rgb(&self) -> bool {
         matches!(
             self.0.as_ref(),

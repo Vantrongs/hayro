@@ -106,8 +106,7 @@ impl<'a> JpegStreamed<'a> {
         if obj.masks.any {
             return Ok(None);
         }
-        let Some(colour) = Colour::new(obj).filter(|c| c.device_bytes() && c.components() == 1)
-        else {
+        let Some(colour) = Colour::new(obj).filter(Colour::jpeg_gray_bytes) else {
             return Ok(None);
         };
         let Ok(unread) = index.with(|index| matches!(index, JpegIndex::Unread)) else {
@@ -294,6 +293,42 @@ mod tests {
         pdf(&[(image(&dict, w, h), bytes.to_vec())])
     }
 
+    fn icc_jpeg(bytes: &[u8], w: u32, h: u32, extra: &str, gamma: f32) -> Pdf {
+        let dict =
+            format!("/ColorSpace [/ICCBased 4 0 R] /BitsPerComponent 8 /Filter /DCTDecode {extra}");
+        let profile = moxcms::ColorProfile::new_gray_with_gamma(gamma)
+            .encode()
+            .unwrap();
+        pdf(&[
+            (image(&dict, w, h), bytes.to_vec()),
+            ("/N 1".into(), profile),
+        ])
+    }
+
+    #[test]
+    fn icc_gray_bands_match_whole_image_conversion() {
+        let bytes = jpeg(33, 41, 3);
+        for gamma in [1., 2.2] {
+            for (extra, banded) in [
+                ("", true),
+                ("/Decode [1 0]", true),
+                ("/Decode [.2 .7]", false),
+                ("/Mask [30 50]", false),
+            ] {
+                for four in [None, Some(false), Some(true)] {
+                    let pdf = icc_jpeg(&bytes, 33, 41, extra, gamma);
+                    let mut asset = asset(&pdf);
+                    assert!(asset.0.image.color_space.as_ref().unwrap().is_icc_gray());
+                    set_transfer(&mut asset, four.map(transfer));
+                    assert_eq!(is_jpeg(&asset.open(None, None).unwrap()), banded);
+                    if banded {
+                        assert_asset_streams_as_decoded(&asset);
+                    }
+                }
+            }
+        }
+    }
+
     fn is_jpeg(source: &ImageSource<'_>) -> bool {
         matches!(source.inner, Inner::Jpeg(_))
     }
@@ -326,7 +361,7 @@ mod tests {
     #[test]
     fn a_reopened_image_resumes_from_a_saved_band() {
         let (w, h) = (257, 4097);
-        let pdf = jpeg_pdf(&jpeg(w as u16, h as u16, 7), w, h, "");
+        let pdf = icc_jpeg(&jpeg(w as u16, h as u16, 7), w, h, "", 1.8);
         let asset = asset(&pdf);
         drop(pdf);
         let window = [3, 2800, 250, 2820];
@@ -406,7 +441,7 @@ mod tests {
     #[test]
     fn a_failed_reader_leaves_the_image_to_whole_decoding() {
         let (w, h) = (257, 4097);
-        let pdf = jpeg_pdf(&jpeg(w as u16, h as u16, 7), w, h, "");
+        let pdf = icc_jpeg(&jpeg(w as u16, h as u16, 7), w, h, "", 1.8);
         let grid = (71, 113);
         for (window, bands) in [([0, 0, 71, 113], h), ([5, 60, 9, 62], 2248)] {
             let asset = asset(&pdf);
