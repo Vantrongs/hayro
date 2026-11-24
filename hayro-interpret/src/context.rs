@@ -53,6 +53,11 @@ impl<'a> InterpreterCache<'a> {
             object_cache: Cache::new(),
         }
     }
+
+    /// Release the cached decoded content stream for the active page.
+    pub fn clear_page_content(&self) {
+        self.page_content.take();
+    }
 }
 
 /// A per-page interpretation context that borrows shared data from an [`InterpreterCache`].
@@ -499,5 +504,14 @@ mod page_tests {
         ));
         draw(1, 1.);
         assert!(first.upgrade().is_none());
+        let second = std::sync::Arc::downgrade(
+            &cache
+                .page_content
+                .borrow_mut()
+                .get(&pdf.pages()[1])
+                .unwrap(),
+        );
+        cache.clear_page_content();
+        assert!(second.upgrade().is_none());
     }
 }
