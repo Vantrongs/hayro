@@ -1524,5 +1524,9 @@
   {
     "id": "shading_radial_precision",
     "file": "pdfs/custom/shading_radial_precision.pdf"
+  },
+  {
+    "id": "shading_mesh_decode_endpoint",
+    "file": "pdfs/custom/shading_mesh_decode_endpoint.pdf"
   }
 ]
