@@ -57,7 +57,7 @@ impl EncodedShadingPattern {
                 shading.extended[3] |= bounds.y1 <= domain.y1 + y;
             }
             EncodedShadingType::RadialAxial(shading) => match shading.params {
-                RadialAxialParams::Axial => {
+                RadialAxialParams::Axial { .. } => {
                     let Some((bounds, error)) = bounds()? else {
                         return Ok(());
                     };

@@ -912,7 +912,8 @@ fn flat_patch_narrow_step_contour() {
 fn deep_zoom_arch_flatness() {
     // Coons patch: bottom straight on y=0, top arch y(t) = 72000*t*(1-t) with x(t) = 24000*t.
     // Encode 16-bit coordinates over [0, 24000] x [0, 24000].
-    let enc = |v: u32| -> [u8; 2] { (((v * 65535 + 12000) / 24000).min(65535) as u16).to_be_bytes() };
+    let enc =
+        |v: u32| -> [u8; 2] { (((v * 65535 + 12000) / 24000).min(65535) as u16).to_be_bytes() };
     let pts: &[(u32, u32)] = &[
         (0, 0),
         (0, 0),
@@ -1031,11 +1032,11 @@ fn classified_grid(pattern: &EncodedShadingPattern, area: Rect, scale: f32) -> V
 }
 
 #[test]
-fn translated_bbox_matches_the_paint_clip() {
+fn classified_samples_leave_the_fractional_clip_to_the_caller() {
     use kurbo::Shape;
     let pdf = Pdf::new(crate::fixtures::one_page(100, "", vec![
         b"<< /PatternType 2 /Matrix [1 0 0 1 10 20] /Shading 5 0 R >>".to_vec(),
-        b"<< /ShadingType 2 /BBox [0 0 1 1] /Coords [0 0 4 0] /ColorSpace /DeviceGray /Function 6 0 R >>".to_vec(),
+        b"<< /ShadingType 2 /BBox [0 0 1.75 1] /Coords [0 0 4 0] /ColorSpace /DeviceGray /Function 6 0 R >>".to_vec(),
         b"<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [1] /N 1 >>".to_vec()
     ])).unwrap();
     let dict = pdf
@@ -1060,16 +1061,15 @@ fn translated_bbox_matches_the_paint_clip() {
         .unwrap();
     assert_eq!(points, texture);
     assert_eq!(metered, texture);
-    for ((sample, center), rgba) in coverage.into_iter().zip(centers).zip(texture) {
-        assert_eq!(
-            sample,
-            if clip.contains(center) {
-                ShadingSample::Painted(rgba)
-            } else {
-                ShadingSample::Outside
-            }
-        );
-    }
+    assert!(clip.contains(centers[1]));
+    assert!(!clip.contains(centers[2]));
+    assert_eq!(
+        coverage,
+        texture
+            .into_iter()
+            .map(ShadingSample::Painted)
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -1122,44 +1122,33 @@ fn unextended_axial_endpoints_use_geometric_precision() {
 
 #[test]
 fn axial_texture_includes_exact_last_center() {
-    let p = pattern(
-        b"<< /ShadingType 2 /Coords [0 0 9 0] /ColorSpace /DeviceGray /Function 6 0 R >>".to_vec(),
-        b"<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [1] /N 1 >>".to_vec(),
-    );
-    let area = Rect::new(0.5, 0., 9.5, 1.);
-    let mut legacy = Vec::new();
-    p.sample_texture(area, 1., |c| legacy.push(c));
-    assert_eq!(legacy, [[1.; 4]; 9]);
-    let mut rgba = Vec::new();
-    p.sample_texture_metered(area, 1., &mut Unmetered, |row| rgba.extend_from_slice(row))
-        .unwrap();
-    assert_eq!(rgba, legacy);
-    p.sample_points_metered(&[Point::new(9., 0.5)], &mut Unmetered, |pixel| {
-        assert_eq!(pixel, [1.; 4]);
-    })
-    .unwrap();
-    assert_eq!(
-        classified_at(&p, area),
-        [ShadingSample::Painted([1.; 4]); 9]
-    );
-}
-
-#[test]
-fn classified_bbox_uses_returned_grid_centers() {
-    let pdf = Pdf::new(crate::fixtures::one_page(100, "", vec![
-        b"<< /PatternType 2 /Matrix [3 0 0 1 0 0] /Shading 5 0 R >>".to_vec(),
-        b"<< /ShadingType 2 /BBox [0 0 1 1] /Extend [true true] /Coords [0 0 1 0] /ColorSpace /DeviceGray /Function 6 0 R >>".to_vec(),
-        b"<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [1] /N 1 >>".to_vec()
-    ])).unwrap();
-    let dict = pdf
-        .xref()
-        .get::<Dict<'_>>(ObjectIdentifier::new(4, 0))
-        .unwrap();
-    let p = ShadingPattern::new(&dict, &Cache::new()).unwrap().encode();
-    assert_eq!(
-        classified_at(&p, Rect::new(2.5, 0., 3.5, 1.)),
-        [ShadingSample::Outside]
-    );
+    for length in [9, 31] {
+        let p = pattern(
+            format!("<< /ShadingType 2 /Coords [0 0 {length} 0] /ColorSpace /DeviceGray /Function 6 0 R >>").into_bytes(),
+            b"<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [1] /N 1 >>".to_vec(),
+        );
+        for offset in [0., 2_f64.powi(-30)] {
+            let area = Rect::new(0.5 + offset, 0., f64::from(length) + 0.5 + offset, 1.);
+            let mut legacy = Vec::new();
+            p.sample_texture(area, 1., |c| legacy.push(c));
+            let mut rgba = Vec::new();
+            p.sample_texture_metered(area, 1., &mut Unmetered, |row| rgba.extend_from_slice(row))
+                .unwrap();
+            assert_eq!(legacy, rgba);
+            let classified = classified_at(&p, area);
+            assert_eq!(classified.len(), length as usize);
+            assert_eq!(legacy.len(), classified.len());
+            for (i, (&pixel, &sample)) in legacy.iter().zip(&classified).enumerate() {
+                if i + 1 == classified.len() && offset > 0. {
+                    assert_eq!(pixel, [0.; 4]);
+                    assert_eq!(sample, ShadingSample::Outside);
+                } else {
+                    assert_eq!(pixel, [1.; 4]);
+                    assert_eq!(sample, ShadingSample::Painted(pixel));
+                }
+            }
+        }
+    }
 }
 
 #[test]

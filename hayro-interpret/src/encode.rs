@@ -11,10 +11,10 @@ use crate::interpret::state::ActiveTransferFunction;
 use crate::mesh::draw_mesh;
 use crate::pattern::ShadingPattern;
 use crate::shading::{ShadingFunction, ShadingType};
-use kurbo::{Affine, Point, Rect, Shape};
+use kurbo::{Affine, Point, Rect, Vec2};
 use std::sync::Arc;
 
-/// The result of sampling a shading before compositing its background.
+/// Coverage and color within the shading's geometry. Callers apply [`ShadingPattern::clip_path`] once.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ShadingSample {
     /// The shading does not cover the position.
@@ -196,7 +196,6 @@ pub(crate) fn take(meter: &mut dyn Meter, steps: Cost) -> Result<(), Exhausted> 
 /// A shading pattern that was encoded so it can be sampled.
 #[derive(Clone, Debug)]
 pub struct EncodedShadingPattern {
-    clip: Option<(Rect, Affine)>,
     pub(crate) ramp: Option<Arc<crate::gradient::SampleRamp>>,
     /// The base transform of the shading pattern.
     pub base_transform: Affine,
@@ -471,7 +470,7 @@ impl EncodedShadingPattern {
         self.sample_texture_as(bbox, scale, meter, |row| f(row))
     }
 
-    /// Sample texture rows with coverage and evaluation status.
+    /// Classify texture samples within the shading's geometry. Callers apply [`ShadingPattern::clip_path`] once.
     pub fn sample_texture_samples_metered(
         &self,
         bbox: Rect,
@@ -479,22 +478,7 @@ impl EncodedShadingPattern {
         meter: &mut dyn Meter,
         mut f: impl FnMut(&[ShadingSample]),
     ) -> Result<(u32, u32, Affine), Exhausted> {
-        let Some((rect, inverse)) = self.clip else {
-            return self.sample_texture_as(bbox, scale, meter, |row| f(row));
-        };
-        let (width, height) = texture_dimensions(bbox, scale);
-        take(meter, Cost::new(u64::from(width) * u64::from(height)))?;
-        let grid = Affine::translate((bbox.x0, bbox.y0)) * Affine::scale(1. / f64::from(scale));
-        let mut y = 0.5;
-        self.sample_texture_as(bbox, scale, meter, |row| {
-            for (x, sample) in row.iter_mut().enumerate() {
-                if !rect.contains(inverse * (grid * Point::new(x as f64 + 0.5, y))) {
-                    *sample = ShadingSample::Outside;
-                }
-            }
-            f(row);
-            y += 1.;
-        })
+        self.sample_texture_as(bbox, scale, meter, |row| f(row))
     }
 
     fn sample_texture_as<P: SamplePixel>(
@@ -541,10 +525,7 @@ impl EncodedShadingPattern {
                     let mut row = vec![bg; width as usize];
                     for y in 0..height {
                         for (x, pixel) in row.iter_mut().enumerate() {
-                            *pixel = sample(
-                                self.base_transform
-                                    * (grid * Point::new(x as f64 + 0.5, f64::from(y) + 0.5)),
-                            );
+                            *pixel = sample(grid * Point::new(x as f64 + 0.5, f64::from(y) + 0.5));
                         }
                         f(&mut row);
                     }
@@ -565,25 +546,14 @@ impl EncodedShadingPattern {
         self.sample_points_as(points, meter, f)
     }
 
-    /// Sample the requested positions with coverage and evaluation status.
+    /// Classify point samples within the shading's geometry. Callers apply [`ShadingPattern::clip_path`] once.
     pub fn sample_points_samples_metered(
         &self,
         points: &[Point],
         meter: &mut dyn Meter,
-        mut f: impl FnMut(ShadingSample),
+        f: impl FnMut(ShadingSample),
     ) -> Result<(), Exhausted> {
-        let Some((rect, inverse)) = self.clip else {
-            return self.sample_points_as(points, meter, f);
-        };
-        take(meter, Cost::of(points.len()))?;
-        let mut positions = points.iter();
-        self.sample_points_as(points, meter, |sample| {
-            f(if rect.contains(inverse * *positions.next().unwrap()) {
-                sample
-            } else {
-                ShadingSample::Outside
-            });
-        })
+        self.sample_points_as(points, meter, f)
     }
 
     fn sample_points_as<P: SamplePixel>(
@@ -607,7 +577,7 @@ impl EncodedShadingPattern {
                 } else {
                     let sample = self.point_sampler(meter, points.len() as u64, bg)?;
                     for point in points {
-                        f(sample(self.base_transform * *point));
+                        f(sample(*point));
                     }
                 }
                 Ok(())
@@ -637,6 +607,7 @@ impl EncodedShadingPattern {
         )?;
         Ok(move |p: Point| match &self.shading_type {
             EncodedShadingType::FunctionBased(s) => {
+                let p = self.base_transform * p;
                 let coordinate = |x: f64, lo: f64, hi: f64, left: bool, right: bool| {
                     if x < lo {
                         left.then_some(lo)
@@ -657,7 +628,7 @@ impl EncodedShadingPattern {
                 }
             }
             EncodedShadingType::RadialAxial(s) => s
-                .position(p)
+                .position(p, self.base_transform)
                 .map_or(bg, |t| P::evaluated(colors.as_ref().unwrap().color(t))),
             _ => bg,
         })
@@ -727,8 +698,15 @@ impl ShadingPattern {
                 axial,
                 circles,
             } => {
-                let (encoded, initial_transform) =
-                    encode_axial_shading(*coords, *domain, function, *extend, *axial, *circles);
+                let (encoded, initial_transform) = encode_axial_shading(
+                    *coords,
+                    *domain,
+                    function,
+                    *extend,
+                    *axial,
+                    *circles,
+                    self.matrix.inverse(),
+                );
 
                 base_transform = initial_transform * self.matrix.inverse();
 
@@ -769,11 +747,6 @@ impl ShadingPattern {
                 )
             };
         EncodedShadingPattern {
-            clip: self
-                .shading
-                .clip_path
-                .as_ref()
-                .map(|path| (path.bounding_box(), self.matrix.inverse())),
             ramp: None,
             color_space,
             background_color,
@@ -792,6 +765,7 @@ fn encode_axial_shading(
     extend: [bool; 2],
     is_axial: bool,
     circles: crate::radial::Circles,
+    to_shading: Affine,
 ) -> (EncodedShadingType, Affine) {
     let initial_transform;
 
@@ -805,7 +779,14 @@ fn encode_axial_shading(
             Point::new(1.0, 0.0),
         );
 
-        RadialAxialParams::Axial
+        let origin = Point::new(x_0, y_0);
+        let axis = Point::new(x_1, y_1) - origin;
+        RadialAxialParams::Axial {
+            origin,
+            axis,
+            len_sq: axis.dot(axis),
+            to_shading,
+        }
     } else {
         initial_transform = Affine::translate((-coords[0], -coords[1]));
         RadialAxialParams::Radial(circles)
@@ -839,7 +820,12 @@ fn encode_function_shading(domain: &[f32; 4], function: &ShadingFunction) -> Enc
 
 #[derive(Clone, Debug)]
 pub(crate) enum RadialAxialParams {
-    Axial,
+    Axial {
+        origin: Point,
+        axis: Vec2,
+        len_sq: f64,
+        to_shading: Affine,
+    },
     Radial(crate::radial::Circles),
 }
 
@@ -858,9 +844,8 @@ impl EncodedRadialAxialShading {
         let mut color = background;
         for y in 0..height {
             for x in 0..width {
-                let point = pattern.base_transform
-                    * (transform * Point::new(f64::from(x) + 0.5, f64::from(y) + 0.5));
-                if let Some(t) = self.position(point) {
+                let point = transform * Point::new(f64::from(x) + 0.5, f64::from(y) + 0.5);
+                if let Some(t) = self.position(point, pattern.base_transform) {
                     if previous != Some(t.to_bits()) {
                         color = colors.get(t);
                         previous = Some(t.to_bits());
@@ -873,20 +858,31 @@ impl EncodedRadialAxialShading {
         }
     }
 
-    fn position(&self, pos: Point) -> Option<f32> {
-        let t = match self.params {
-            RadialAxialParams::Axial => pos.x,
-            RadialAxialParams::Radial(circles) => {
-                f64::from(radial_pos(&pos, circles, self.extend[0], self.extend[1])?)
-            }
+    fn position(&self, pos: Point, base_transform: Affine) -> Option<f32> {
+        let (projection, limit) = match self.params {
+            RadialAxialParams::Axial {
+                origin,
+                axis,
+                len_sq,
+                to_shading,
+            } => (((to_shading * pos) - origin).dot(axis), len_sq),
+            RadialAxialParams::Radial(circles) => (
+                f64::from(radial_pos(
+                    &(base_transform * pos),
+                    circles,
+                    self.extend[0],
+                    self.extend[1],
+                )?),
+                1.0,
+            ),
         };
 
-        if t < 0.0 {
+        if projection < 0.0 {
             self.extend[0].then_some(0.0)
-        } else if t > 1.0 {
+        } else if projection > limit {
             self.extend[1].then_some(1.0)
         } else {
-            Some(t as f32)
+            Some((projection / limit) as f32)
         }
     }
 }
