@@ -123,6 +123,8 @@ impl CacheKey for ShadingPattern {
     fn cache_key(&self) -> u128 {
         hash128(&(
             self.shading.cache_key(),
+            self.shading.background.is_some(),
+            self.transfer_function.as_ref().map(CacheKey::cache_key),
             self.matrix.cache_key(),
             self.opacity.to_bits(),
         ))
@@ -256,6 +258,7 @@ impl CacheKey for TilingPattern<'_> {
             self.matrix.cache_key(),
             self.opacity.to_bits(),
             color,
+            self.nesting_depth,
         ))
     }
 }

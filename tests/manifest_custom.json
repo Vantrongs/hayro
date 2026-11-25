@@ -1497,5 +1497,20 @@
   {
     "id": "ascii_hex_invalid_digit",
     "file": "pdfs/custom/ascii_hex_invalid_digit.pdf"
+  },
+  {
+    "id": "pattern_cache_transfer",
+    "file": "pdfs/custom/pattern_cache_transfer.pdf",
+    "svg": true
+  },
+  {
+    "id": "pattern_cache_background",
+    "file": "pdfs/custom/pattern_cache_background.pdf",
+    "svg": true
+  },
+  {
+    "id": "pattern_cache_depth",
+    "file": "pdfs/custom/pattern_cache_depth.pdf",
+    "svg": true
   }
 ]
