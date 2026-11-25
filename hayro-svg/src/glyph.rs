@@ -3,7 +3,7 @@ use crate::hash128;
 use crate::path::BezPathExt;
 use hayro_interpret::font::{Glyph, GlyphRun, Type3Glyph};
 use hayro_interpret::{CacheKey, DrawMode, DrawProps, Paint};
-use kurbo::{Affine, BezPath, Shape};
+use kurbo::{Affine, BezPath, Rect, Shape};
 
 pub(crate) struct CachedOutlineGlyph {
     path: BezPath,
@@ -15,6 +15,7 @@ pub(crate) struct CachedType3Glyph<'a> {
     glyph: Box<Type3Glyph<'a>>,
     transform: Affine,
     glyph_transform: Affine,
+    viewport: Rect,
     paint: Paint<'a>,
 }
 
@@ -105,7 +106,9 @@ impl<'a> SvgRenderer<'a> {
                 self.xml.end_element();
             }
             Glyph::Type3(glyph) => {
+                let viewport = self.visible_bounds();
                 let cache_key = hash128(&(
+                    viewport.cache_key(),
                     glyph.cache_key(),
                     props.transform.cache_key(),
                     glyph_transform.cache_key(),
@@ -114,7 +117,9 @@ impl<'a> SvgRenderer<'a> {
 
                 if !self.type3_glyphs.contains(cache_key) {
                     self.with_dummy(|r| {
-                        glyph.interpret(r, props.transform, glyph_transform, &props.paint);
+                        r.with_viewport(viewport, |r| {
+                            glyph.interpret(r, props.transform, glyph_transform, &props.paint);
+                        });
                     });
                 }
 
@@ -122,6 +127,7 @@ impl<'a> SvgRenderer<'a> {
                 let id = self
                     .type3_glyphs
                     .insert_with(cache_key, || CachedType3Glyph {
+                        viewport,
                         glyph: glyph.clone(),
                         transform: props.transform,
                         glyph_transform,
@@ -159,9 +165,11 @@ impl<'a> SvgRenderer<'a> {
             for (id, glyph) in type3_glyphs.iter() {
                 self.xml.start_element("g");
                 self.xml.write_attribute("id", &id);
-                glyph
-                    .glyph
-                    .interpret(self, glyph.transform, glyph.glyph_transform, &glyph.paint);
+                self.with_viewport(glyph.viewport, |r| {
+                    glyph
+                        .glyph
+                        .interpret(r, glyph.transform, glyph.glyph_transform, &glyph.paint);
+                });
                 self.xml.end_element();
             }
 

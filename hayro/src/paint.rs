@@ -1,7 +1,7 @@
 use crate::Renderer;
 use hayro_interpret::Paint;
 use hayro_interpret::encode::{EncodedShadingType, texture_dimensions};
-use hayro_interpret::gradient::SvgGradientKind;
+use hayro_interpret::gradient::{SvgGradientKind, SvgGradientStop};
 use hayro_interpret::pattern::Pattern;
 use hayro_interpret::util::x_y_advances;
 use kurbo::{Affine, BezPath, Rect};
@@ -9,6 +9,8 @@ use std::sync::Arc;
 use vello_cpu::color::{AlphaColor, DynamicColor, Srgb};
 use vello_cpu::peniko::{ColorStop, Gradient, ImageQuality, ImageSampler};
 use vello_cpu::{Image, ImageSource, PaintType, PixelMetadata, Pixmap, peniko};
+
+const STOP_TOLERANCE: f32 = 1.0 / 255.0;
 
 impl Renderer<'_> {
     #[must_use]
@@ -53,23 +55,12 @@ impl Renderer<'_> {
                         let encoded = s.encode();
 
                         if let EncodedShadingType::RadialAxial(gradient) = &encoded.shading_type
-                            && let Some(native) =
-                                gradient.as_svg_gradient(&encoded, NATIVE_GRADIENT_TOLERANCE)
+                            && let Some(native) = gradient.as_svg_gradient(&encoded, STOP_TOLERANCE)
+                            && lut_resolves(&native.stops, NATIVE_GRADIENT_TOLERANCE)
                         {
                             paint_transform = path_transform.inverse() * native.transform;
 
-                            let stops = native
-                                .stops
-                                .iter()
-                                .map(|stop| ColorStop {
-                                    offset: stop.offset,
-                                    color: DynamicColor::from_alpha_color(AlphaColor::<Srgb>::new(
-                                        stop.color,
-                                    )),
-                                })
-                                .collect::<Vec<_>>();
-
-                            let gradient = match native.kind {
+                            let mut gradient = match native.kind {
                                 SvgGradientKind::Linear { start, end } => {
                                     Gradient::new_linear(start, end)
                                 }
@@ -85,8 +76,15 @@ impl Renderer<'_> {
                                     end_radius,
                                 ),
                             }
-                            .with_extend(peniko::Extend::Pad)
-                            .with_stops(stops.as_slice());
+                            .with_extend(peniko::Extend::Pad);
+                            gradient
+                                .stops
+                                .extend(native.stops.into_iter().map(|stop| ColorStop {
+                                    offset: stop.offset,
+                                    color: DynamicColor::from_alpha_color(AlphaColor::<Srgb>::new(
+                                        stop.color,
+                                    )),
+                                }));
 
                             PaintType::Gradient(gradient)
                         } else {
@@ -140,5 +138,93 @@ impl Renderer<'_> {
         self.ctx.set_paint(paint);
 
         clip_path
+    }
+}
+
+fn lut_resolves(stops: &[SvgGradientStop], tolerance: f32) -> bool {
+    // Match vello_common::encode::{determine_lut_size, GradientLut::new_inner}.
+    let mut size = match stops.len() {
+        2 => 256,
+        3 => 512,
+        _ => 1024,
+    };
+    for pair in stops.windows(2) {
+        let width = pair[1].offset - pair[0].offset;
+        if width == 0.0 && pair[0].color != pair[1].color {
+            return false;
+        }
+        size = size.max(
+            ((1.0 / width).ceil() as usize)
+                .min(4096)
+                .next_power_of_two(),
+        );
+    }
+    let scale = (size - 1) as f32;
+    // The stop approximation spends one byte; rounding both colors can round the difference up.
+    let fits = |delta: f32| ((STOP_TOLERANCE + delta) * 255.0).ceil() <= tolerance * 255.0;
+    let channel = |stop: &SvgGradientStop, c: usize| {
+        if c == 3 {
+            stop.color[c]
+        } else {
+            stop.color[c] * stop.color[3]
+        }
+    };
+    for pair in stops.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        let width = b.offset - a.offset;
+        if width == 0.0 {
+            continue;
+        }
+        if !(0..4).all(|c| fits((channel(b, c) - channel(a, c)).abs() / (width * scale))) {
+            return false;
+        }
+        if stops.len() == 2 {
+            continue;
+        }
+        // Interior cells follow one slope. Boundary cells can extrapolate another slope.
+        for edge in [a.offset, b.offset] {
+            let idx = (edge * scale) as usize;
+            let segment = stops[1..stops.len() - 1]
+                .partition_point(|s| (s.offset * size as f32) as usize <= idx);
+            let (left, right) = (&stops[segment], &stops[segment + 1]);
+            let t = idx as f32 / scale;
+            for c in 0..4 {
+                let slope = (channel(right, c) - channel(left, c))
+                    / (right.offset - left.offset).max(1.0e-7);
+                let sample = slope
+                    .mul_add(t, channel(left, c) - left.offset * slope)
+                    .clamp(0.0, 1.0);
+                for x in [t.max(a.offset), ((idx + 1) as f32 / scale).min(b.offset)] {
+                    let expected =
+                        channel(a, c) + (channel(b, c) - channel(a, c)) * ((x - a.offset) / width);
+                    if !fits((sample - expected).abs()) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lut_rejects_stitched_band() {
+        let stops = [
+            (0.0, 0.0),
+            (0.025, 0.0),
+            (0.025, 1.0),
+            (0.075, 1.0),
+            (0.075, 0.0),
+            (1.0, 0.0),
+        ]
+        .map(|(offset, gray)| SvgGradientStop {
+            offset,
+            color: [gray, gray, gray, 1.0],
+        });
+        assert!(!lut_resolves(&stops, 0.01));
     }
 }

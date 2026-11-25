@@ -15,6 +15,8 @@ use std::sync::{Arc, OnceLock};
 
 pub(crate) const MAX_COMPONENTS: usize = 32;
 
+pub(crate) const MAX_LINEAR_PIECES: usize = 1024;
+
 const MAX_FUNCTION_DEPTH: u8 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -29,11 +31,17 @@ impl Interval {
     }
 
     pub(crate) fn map(self, x: f32, to: Self) -> f32 {
+        self.map_f64(f64::from(x), to) as f32
+    }
+
+    fn map_f64(self, x: f64, to: Self) -> f64 {
         if self.min == self.max {
-            return to.min;
+            return f64::from(to.min);
         }
 
-        interpolate(x, self.min, self.max, to.min, to.max)
+        let [x_min, x_max, y_min, y_max] = [self.min, self.max, to.min, to.max].map(f64::from);
+        let t = (x - x_min) / (x_max - x_min);
+        (1.0 - t) * y_min + t * y_max
     }
 }
 
@@ -67,6 +75,8 @@ struct Repr {
 /// A PDF function.
 #[derive(Debug, Clone)]
 pub struct Function(Arc<Repr>);
+
+type PieceEmitter<'a> = dyn FnMut([f32; 2], &[f32], &[f32], &mut usize) -> Option<()> + 'a;
 
 impl Function {
     /// Create a new function.
@@ -157,13 +167,40 @@ impl Function {
                 Some(())
             }),
             FunctionType::Type2(f) => self.eval_samples(input, output, |input, output| {
-                f.eval(input[0], output);
+                f.eval(f64::from(input[0]), output);
                 Some(())
             }),
-            FunctionType::Type3(f) => {
-                self.eval_samples(input, output, |input, output| f.eval(input[0], output))
-            }
+            FunctionType::Type3(f) => self.eval_samples(input, output, |input, output| {
+                f.eval(f64::from(input[0]), output)
+            }),
             FunctionType::Type4(f) => self.eval_samples(input, output, f.evaluator()),
+        }
+    }
+
+    pub(crate) fn eval_1d_f64(&self, x: f64, output: &mut [f32]) -> Option<()> {
+        let repr = &self.0;
+        let [domain] = repr.domain.as_slice() else {
+            return None;
+        };
+        if output.len() != repr.num_outputs {
+            return None;
+        }
+        let x = x.min(f64::from(domain.max)).max(f64::from(domain.min));
+        match &repr.function_type {
+            FunctionType::Type0(f) => f.eval_1d(x, output),
+            FunctionType::Type2(f) => f.eval(x, output),
+            FunctionType::Type3(f) => f.eval(x, output)?,
+            FunctionType::Type4(f) => f.evaluator()(&[x as f32], output)?,
+        }
+        self.clamp_output(output);
+        Some(())
+    }
+
+    fn clamp_output(&self, output: &mut [f32]) {
+        if let Some(range) = &self.0.range {
+            for (value, range) in output.iter_mut().zip(range) {
+                *value = range.clamp(*value);
+            }
         }
     }
 
@@ -187,13 +224,119 @@ impl Function {
 
             eval(clamped, output)?;
 
-            if let Some(range) = &repr.range {
-                for (value, range) in output.iter_mut().zip(range) {
-                    *value = range.clamp(*value);
+            self.clamp_output(output);
+        }
+
+        Some(())
+    }
+
+    pub(crate) fn linear_pieces(
+        &self,
+        domain: [f64; 2],
+        offsets: [f64; 2],
+        budget: &mut usize,
+        tolerance: Option<f32>,
+        emit: &mut impl FnMut([f32; 2], &[f32], &[f32]) -> Option<()>,
+    ) -> Option<()> {
+        self.ranged_pieces(domain, offsets, budget, tolerance, &mut |ts, a, b, _| {
+            a.iter()
+                .chain(b)
+                .all(|v| (0.0..=1.0).contains(v))
+                .then_some(())?;
+            emit(ts, a, b)
+        })
+    }
+
+    fn ranged_pieces(
+        &self,
+        domain: [f64; 2],
+        offsets: [f64; 2],
+        budget: &mut usize,
+        tolerance: Option<f32>,
+        emit: &mut PieceEmitter<'_>,
+    ) -> Option<()> {
+        let repr = &self.0;
+        if *budget == 0
+            || domain.iter().any(|&x| {
+                !x.is_finite()
+                    || x < f64::from(repr.domain[0].min)
+                    || x > f64::from(repr.domain[0].max)
+            })
+        {
+            return None;
+        }
+        let mut clamp = |ts, a: &[f32], b: &[f32], remaining: &mut usize| {
+            self.emit_clamped(ts, a, b, remaining, emit)
+        };
+        match &repr.function_type {
+            FunctionType::Type0(f) if tolerance.is_some() => {
+                f.linear_pieces(domain, offsets, budget, &mut clamp)
+            }
+            FunctionType::Type2(f) => {
+                f.linear_pieces(domain, offsets, budget, tolerance, &mut clamp)
+            }
+            FunctionType::Type3(f) => {
+                f.linear_pieces(domain, offsets, budget, tolerance?, &mut clamp)
+            }
+            _ => None,
+        }
+    }
+
+    fn emit_clamped(
+        &self,
+        ts: [f32; 2],
+        a: &[f32],
+        b: &[f32],
+        remaining: &mut usize,
+        emit: &mut PieceEmitter<'_>,
+    ) -> Option<()> {
+        let Some(ranges) = &self.0.range else {
+            return emit(ts, a, b, remaining);
+        };
+        if a.iter()
+            .zip(b)
+            .zip(ranges)
+            .all(|((&a, &b), r)| r.clamp(a) == a && r.clamp(b) == b)
+        {
+            return emit(ts, a, b, remaining);
+        }
+        if !a.iter().chain(b).all(|v| v.is_finite()) {
+            return None;
+        }
+        let mut cuts = smallvec::SmallVec::<[f64; 4]>::new();
+        for ((&a, &b), r) in a.iter().zip(b).zip(ranges) {
+            let mut previous = None;
+            for bound in [r.min, r.max] {
+                if a.min(b) < bound && bound < a.max(b) {
+                    let u = (f64::from(bound) - f64::from(a)) / (f64::from(b) - f64::from(a));
+                    if r.min != r.max && previous == Some(u) {
+                        return None;
+                    }
+                    cuts.push(u);
+                    previous = Some(u);
                 }
             }
         }
-
+        cuts.sort_unstable_by(f64::total_cmp);
+        cuts.dedup();
+        *remaining = remaining.checked_sub(cuts.len())?;
+        let mut left = [0.0; MAX_COMPONENTS];
+        let left = &mut left[..a.len()];
+        left.copy_from_slice(a);
+        self.clamp_output(left);
+        let mut start = ts[0];
+        for u in cuts.into_iter().chain([1.0]) {
+            let mut right = [0.0; MAX_COMPONENTS];
+            let right = &mut right[..a.len()];
+            for ((v, &a), &b) in right.iter_mut().zip(a).zip(b) {
+                *v = ((1.0 - u) * f64::from(a) + u * f64::from(b)) as f32;
+            }
+            self.clamp_output(right);
+            let end = ((1.0 - u) * f64::from(ts[0]) + u * f64::from(ts[1])) as f32;
+            emit([start, end], left, right, remaining)?;
+            left.copy_from_slice(right);
+            start = end;
+        }
         Some(())
     }
 
@@ -219,6 +362,12 @@ struct TransferFunctionRepr {
 impl CacheKey for TransferFunction {
     fn cache_key(&self) -> u128 {
         self.0.cache_key
+    }
+}
+
+impl std::hash::Hash for TransferFunction {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.samples().hash(state);
     }
 }
 

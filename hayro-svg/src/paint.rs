@@ -6,7 +6,7 @@ use hayro_interpret::gradient::{SvgGradient, SvgGradientKind};
 use hayro_interpret::pattern::{Pattern, ShadingPattern, TilingPattern};
 use hayro_interpret::{CacheKey, FillRule, Paint, StrokeProps};
 use image::{DynamicImage, ImageBuffer};
-use kurbo::{Affine, Rect, Shape};
+use kurbo::{Affine, Rect};
 
 #[derive(Clone)]
 pub(crate) struct CachedTilingPattern<'a> {
@@ -36,6 +36,13 @@ pub(crate) struct CachedShading {
 }
 
 impl<'a> SvgRenderer<'a> {
+    fn interpret_tile(&mut self, tile: &TilingPattern<'a>) {
+        let origin = Affine::translate((-tile.bbox.x0, -tile.bbox.y0));
+        self.with_viewport(origin.transform_rect_bbox(tile.bbox), |r| {
+            tile.interpret(r, origin);
+        });
+    }
+
     pub(crate) fn write_paint(
         &mut self,
         paint: &Paint<'a>,
@@ -116,7 +123,30 @@ impl<'a> SvgRenderer<'a> {
                                 basic_bbox.inflate(stroke_width as f64, stroke_width as f64);
                         }
 
-                        let bbox = (path_transform * basic_bbox.to_path(0.0)).bounding_box();
+                        let bbox = path_transform.transform_rect_bbox(basic_bbox);
+                        let encoded = s.encode();
+                        let native = match &encoded.shading_type {
+                            EncodedShadingType::RadialAxial(gradient) => {
+                                gradient.as_svg_gradient(&encoded, NATIVE_GRADIENT_TOLERANCE)
+                            }
+                            _ => None,
+                        };
+                        let bbox = if native.is_some() {
+                            bbox
+                        } else {
+                            let visible = bbox.intersect(self.visible_bounds());
+                            if visible.is_zero_area() {
+                                return ("none".into(), 1.0);
+                            }
+                            let visible = visible.inflate(1.0, 1.0).intersect(bbox);
+                            // Crop whole texels to preserve the sampling grid and its image transform.
+                            Rect::new(
+                                visible.x0 - (visible.x0 - bbox.x0).fract(),
+                                visible.y0 - (visible.y0 - bbox.y0).fract(),
+                                visible.x1 + (bbox.x1 - visible.x1).fract(),
+                                visible.y1 + (bbox.y1 - visible.y1).fract(),
+                            )
+                        };
                         let shading_key = hash128(&(
                             s.cache_key(),
                             bbox.x0.to_bits(),
@@ -125,33 +155,27 @@ impl<'a> SvgRenderer<'a> {
                             bbox.y1.to_bits(),
                         ));
 
-                        let encoded = s.encode();
-                        let shading_paint = if let EncodedShadingType::RadialAxial(gradient) =
-                            &encoded.shading_type
-                            && let Some(native) =
-                                gradient.as_svg_gradient(&encoded, NATIVE_GRADIENT_TOLERANCE)
-                        {
-                            let gradient_key = gradient_key(&native);
-                            let gradient_id =
-                                self.gradients
-                                    .insert_with(gradient_key, || CachedNativeGradient {
-                                        gradient: native,
-                                    });
-
-                            CachedShadingPaint::NativeGradient {
-                                gradient: gradient_id,
-                            }
-                        } else {
-                            let shading_id =
-                                self.shadings.insert_with(shading_key, || CachedShading {
-                                    pattern: s.clone(),
-                                    bbox,
+                        let shading_paint =
+                            if let Some(native) = native {
+                                let gradient_key = gradient_key(&native);
+                                let gradient_id = self.gradients.insert_with(gradient_key, || {
+                                    CachedNativeGradient { gradient: native }
                                 });
 
-                            CachedShadingPaint::Raster {
-                                shading: shading_id,
-                            }
-                        };
+                                CachedShadingPaint::NativeGradient {
+                                    gradient: gradient_id,
+                                }
+                            } else {
+                                let shading_id =
+                                    self.shadings.insert_with(shading_key, || CachedShading {
+                                        pattern: s.clone(),
+                                        bbox,
+                                    });
+
+                                CachedShadingPaint::Raster {
+                                    shading: shading_id,
+                                }
+                            };
 
                         let clip_path = s.shading.clip_path.clone().map(|path| {
                             self.clip_paths.insert(CachedClipPath::Path {
@@ -179,7 +203,7 @@ impl<'a> SvgRenderer<'a> {
 
                         if !self.tiling_patterns.contains(cache_key) {
                             self.with_dummy(|r| {
-                                t.interpret(r, Affine::translate((-t.bbox.x0, -t.bbox.y0)));
+                                r.interpret_tile(t);
                             });
                         }
 
@@ -305,13 +329,7 @@ impl<'a> SvgRenderer<'a> {
                 &format!("matrix({})", convert_transform(&transform)),
             );
 
-            pattern.tiling_pattern.interpret(
-                self,
-                Affine::translate((
-                    -pattern.tiling_pattern.bbox.x0,
-                    -pattern.tiling_pattern.bbox.y0,
-                )),
-            );
+            self.interpret_tile(&pattern.tiling_pattern);
 
             self.xml.end_element();
         }

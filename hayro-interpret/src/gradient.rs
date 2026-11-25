@@ -63,19 +63,89 @@ impl EncodedRadialAxialShading {
         let background = (background[3] > 0.0).then(|| pattern.finish(background));
         let range = self.padded_range(background.is_some())?;
 
+        let stops = self.native_stops(pattern, tolerance)?;
+
         Some(SvgGradient {
             kind: self.gradient_kind(range),
             transform: pattern.base_transform.inverse(),
-            stops: pad_stops(
-                approximate_gradient_stops(
-                    |t| sample_function(&self.function, self.domain, pattern, t),
-                    &normalized_stitching_bounds(&self.function, self.domain),
-                    tolerance,
-                ),
-                range,
-                background,
-            ),
+            stops: pad_stops(stops, range, background)?,
         })
+    }
+
+    fn native_stops(
+        &self,
+        pattern: &EncodedShadingPattern,
+        tolerance: f32,
+    ) -> Option<Vec<SvgGradientStop>> {
+        if !tolerance.is_finite() || tolerance < 0.0 {
+            return None;
+        }
+        let direct_color =
+            pattern.color_space.is_device_gray_or_rgb() && pattern.transfer_function.is_none();
+        if direct_color && tolerance < 1.0 / 255.0 {
+            return None;
+        }
+
+        let mut stops: Vec<SvgGradientStop> = Vec::new();
+        self.function.linear_pieces(
+            self.domain.map(f64::from),
+            direct_color.then_some(tolerance),
+            |[start, end], a, b| {
+                if start >= end {
+                    return None;
+                }
+                let (ca, cb) = (pattern.convert(a), pattern.convert(b));
+                if !direct_color {
+                    let expected = |t| lerp_color(ca, cb, (t - start) / (end - start));
+                    let sample = |t, color, values: &[f32]| ColorSample {
+                        t,
+                        color,
+                        codes: pattern.color_space.encode_values(values),
+                    };
+                    let mid = |t| {
+                        let [lo, hi] = self.domain.map(f64::from);
+                        let mut out = [0.0; crate::function::MAX_COMPONENTS];
+                        let out = &mut out[..self.function.num_outputs()];
+                        self.function
+                            .eval_1d_f64(lo + (hi - lo) * f64::from(t), out)?;
+                        Some(sample(t, pattern.convert(out), out))
+                    };
+                    check_color_interval(
+                        &sample(start, ca, a),
+                        &sample(end, cb, b),
+                        &mid,
+                        &expected,
+                        tolerance,
+                    )?;
+                }
+                if stops.last().is_none_or(|last| last.color != ca) {
+                    stops.push(SvgGradientStop {
+                        offset: start,
+                        color: ca,
+                    });
+                }
+                if let [.., left, middle] = &stops[..] {
+                    let width = f64::from(end) - f64::from(left.offset);
+                    let span = f64::from(middle.offset) - f64::from(left.offset);
+                    if left.offset < middle.offset
+                        && middle.offset < end
+                        && (0..4).all(|i| {
+                            (f64::from(middle.color[i]) - f64::from(left.color[i])) * width
+                                == (f64::from(cb[i]) - f64::from(left.color[i])) * span
+                        })
+                    {
+                        stops.pop();
+                    }
+                }
+                stops.push(SvgGradientStop {
+                    offset: end,
+                    color: cb,
+                });
+                Some(())
+            },
+        )?;
+
+        Some(stops)
     }
 
     // SVG gradients pad with their end stops, so a non-extended end gets a short stretch of background.
@@ -101,7 +171,7 @@ impl EncodedRadialAxialShading {
 
     fn gradient_kind(&self, [t0, t1]: [f64; 2]) -> SvgGradientKind {
         match &self.params {
-            RadialAxialParams::Axial => SvgGradientKind::Linear {
+            RadialAxialParams::Axial { .. } => SvgGradientKind::Linear {
                 start: Point::new(t0, 0.0),
                 end: Point::new(t1, 0.0),
             },
@@ -113,6 +183,42 @@ impl EncodedRadialAxialShading {
             },
         }
     }
+}
+
+struct ColorSample {
+    t: f32,
+    color: [f32; 4],
+    codes: smallvec::SmallVec<[u8; 4]>,
+}
+
+fn check_color_interval(
+    a: &ColorSample,
+    b: &ColorSample,
+    sample: &impl Fn(f32) -> Option<ColorSample>,
+    expected: &impl Fn(f32) -> [f32; 4],
+    tolerance: f32,
+) -> Option<()> {
+    let (left, right) = (expected(a.t), expected(b.t));
+    if color_error(a.color, left) > tolerance || color_error(b.color, right) > tolerance {
+        return None;
+    }
+    // A monotone input crossing at most one byte boundary can only produce the two endpoint colors.
+    let changes: u32 = a
+        .codes
+        .iter()
+        .zip(&b.codes)
+        .map(|(&x, &y)| u32::from(x.abs_diff(y)))
+        .sum();
+    if changes <= 1 && color_error(a.color, right).max(color_error(b.color, left)) <= tolerance {
+        return Some(());
+    }
+    let t = a.t + (b.t - a.t) * 0.5;
+    if t == a.t || t == b.t {
+        return None;
+    }
+    let m = sample(t)?;
+    check_color_interval(a, &m, sample, expected, tolerance)?;
+    check_color_interval(&m, b, sample, expected, tolerance)
 }
 
 pub(crate) fn function_lut(
@@ -133,7 +239,8 @@ fn sample_function(
     pattern: &EncodedShadingPattern,
     t: f32,
 ) -> [f32; 4] {
-    pattern.eval(function, &[t0 + (t1 - t0) * t])
+    let [lo, hi] = [t0, t1].map(f64::from);
+    pattern.eval_1d(function, lo + (hi - lo) * f64::from(t))
 }
 
 fn normalized_stitching_bounds(function: &ShadingFunction, [t0, t1]: [f32; 2]) -> Vec<f32> {
@@ -206,17 +313,23 @@ fn pad_stops(
     mut stops: Vec<SvgGradientStop>,
     [t0, t1]: [f64; 2],
     background: Option<[f32; 4]>,
-) -> Vec<SvgGradientStop> {
+) -> Option<Vec<SvgGradientStop>> {
     let (t0, t1) = (t0 as f32, t1 as f32);
     let padding = |offset| SvgGradientStop {
         offset,
         color: background.unwrap_or([0.0; 4]),
     };
 
-    for stop in &mut stops {
-        stop.offset = (stop.offset - t0) / (t1 - t0);
+    let padded = |offset: f32| (offset - t0) / (t1 - t0);
+    if stops
+        .windows(2)
+        .any(|s| s[0].offset < s[1].offset && padded(s[0].offset) >= padded(s[1].offset))
+    {
+        return None;
     }
-
+    for stop in &mut stops {
+        stop.offset = padded(stop.offset);
+    }
     if t0 < 0.0 {
         let edge = stops[0].offset;
         stops.splice(0..0, [padding(0.0), padding(edge)]);
@@ -227,7 +340,7 @@ fn pad_stops(
         stops.extend([padding(edge), padding(1.0)]);
     }
 
-    stops
+    Some(stops)
 }
 
 fn approximate_gradient_stops(
@@ -318,4 +431,86 @@ fn approximate_gradient_interval(
 
     approximate_gradient_interval(sample, stops, start, mid, tolerance, depth + 1);
     approximate_gradient_interval(sample, stops, mid, end, tolerance, depth + 1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::color::{AlphaColor, ColorSpace};
+    use crate::encode::EncodedShadingType;
+    use crate::function::Function;
+    use hayro_syntax::object::{Dict, FromBytes, Object};
+
+    #[test]
+    fn adjacent_offsets_with_two_changed_ink_codes_are_unresolved() {
+        let sample = |t, code| ColorSample {
+            t,
+            color: [0.0; 4],
+            codes: smallvec::smallvec![code, code],
+        };
+        let a = sample(0.5, 127);
+        let b = sample(a.t.next_up(), 128);
+        assert!(check_color_interval(&a, &b, &|_| unreachable!(), &|_| a.color, 0.01).is_none());
+    }
+
+    fn stops(dict: &[u8]) -> Option<Vec<SvgGradientStop>> {
+        let function = Function::new(&Object::Dict(Dict::from_bytes(dict).unwrap())).unwrap();
+        let pattern = EncodedShadingPattern {
+            base_transform: Affine::IDENTITY,
+            color_space: ColorSpace::device_gray(),
+            background_color: AlphaColor::TRANSPARENT,
+            shading_type: EncodedShadingType::RadialAxial(EncodedRadialAxialShading {
+                params: RadialAxialParams::Axial {
+                    sampling_transform: Affine::IDENTITY,
+                    expected_base_transform: Affine::IDENTITY,
+                    start: Point::ZERO,
+                    axis: kurbo::Vec2::new(1.0, 0.0),
+                },
+                domain: [0.0, 1.0],
+                function: ShadingFunction::Single(function),
+                extend: [true; 2],
+            }),
+            opacity: 1.0,
+            transfer_function: None,
+        };
+        let EncodedShadingType::RadialAxial(shading) = &pattern.shading_type else {
+            unreachable!()
+        };
+        Some(shading.as_svg_gradient(&pattern, 0.01)?.stops)
+    }
+
+    #[test]
+    fn linear_and_stitched_gradients_keep_native_stops() {
+        let line = "<< /FunctionType 2 /Domain [0 1] /N 1 >>";
+        assert_eq!(stops(line.as_bytes()).unwrap().len(), 2);
+        let constant = "<< /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 0 >>";
+        assert_eq!(
+            stops(constant.as_bytes())
+                .unwrap()
+                .iter()
+                .map(|s| (s.offset, s.color[0]))
+                .collect::<Vec<_>>(),
+            [(0.0, 1.0), (1.0, 1.0)]
+        );
+        let stitch = |bound, encode| {
+            format!(
+                "<< /FunctionType 3 /Domain [0 1] /Bounds [{bound}] /Encode [{encode}] /Functions [{line} {line}] >>"
+            )
+        };
+        let ramp = stops(stitch("0.5", "0 1 1 0").as_bytes()).unwrap();
+        assert_eq!(
+            ramp.iter()
+                .map(|s| (s.offset, s.color[0]))
+                .collect::<Vec<_>>(),
+            [(0.0, 0.0), (0.5, 1.0), (1.0, 0.0)]
+        );
+        assert!(stops(stitch("0.00001", "0 1 1 0").as_bytes()).is_some());
+        let jump = stops(stitch("0.5", "0 1 0 1").as_bytes()).unwrap();
+        assert_eq!(
+            jump.iter()
+                .map(|s| (s.offset, s.color[0]))
+                .collect::<Vec<_>>(),
+            [(0.0, 0.0), (0.5, 1.0), (0.5, 0.0), (1.0, 1.0)]
+        );
+    }
 }

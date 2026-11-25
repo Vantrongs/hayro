@@ -1,6 +1,5 @@
 //! PDF patterns.
 
-use crate::cache::Cache;
 use crate::color::{Color, ColorSpace};
 use crate::context::{Context, InterpreterCache};
 use crate::device::Device;
@@ -86,6 +85,15 @@ impl CacheKey for Pattern<'_> {
 }
 
 /// A shading pattern.
+///
+/// ```
+/// use hayro_interpret::pattern::ShadingPattern;
+///
+/// fn rebuild(pattern: ShadingPattern) -> ShadingPattern {
+///     let ShadingPattern { shading, matrix, opacity, transfer_function } = pattern;
+///     ShadingPattern { shading, matrix, opacity, transfer_function }
+/// }
+/// ```
 #[derive(Clone, Debug)]
 pub struct ShadingPattern {
     /// The underlying shading of the pattern.
@@ -99,7 +107,7 @@ pub struct ShadingPattern {
 }
 
 impl ShadingPattern {
-    pub(crate) fn new(dict: &Dict<'_>, cache: &Cache) -> Option<Self> {
+    pub(crate) fn new(dict: &Dict<'_>, cache: &crate::cache::Cache) -> Option<Self> {
         let shading = dict.get::<Object<'_>>(SHADING).and_then(|o| {
             let (dict, stream) = dict_or_stream(&o)?;
 

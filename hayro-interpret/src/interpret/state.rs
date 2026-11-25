@@ -18,7 +18,7 @@ use smallvec::smallvec;
 use std::ops::Deref;
 
 /// A transfer function.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub enum ActiveTransferFunction {
     /// A single transfer function applied to all components.
     Single(TransferFunction),
