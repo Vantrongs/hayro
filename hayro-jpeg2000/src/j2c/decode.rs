@@ -1,10 +1,11 @@
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use super::bitplane::{BitPlaneDecodeBuffers, BitPlaneDecodeContext};
 use super::build::{CodeBlock, Decomposition, Layer, Precinct, Segment, SubBand, SubBandType};
 use super::codestream::{ComponentInfo, Header, QuantizationStyle, WaveletTransform};
 use super::idwt::IDWTOutput;
-use super::progression::ProgressionIterator;
+use super::progression::{OwnershipIndex, ProgressionData, progression_iterator};
 use super::tag_tree::TagNode;
 use super::tile::{ComponentTile, ResolutionTile, Tile};
 use super::{ComponentData, bitplane, build, idwt, mct, segment, tile};
@@ -30,12 +31,32 @@ pub(crate) fn decode<'a>(
 
     ctx.reset(header, &tiles[0], cancel)?;
 
+    let inherited = if header.progression_changes.is_empty() {
+        None
+    } else {
+        Some(OwnershipIndex::new(
+            &header.progression_changes,
+            tiles.iter().filter(|t| t.progression_changes.is_empty()),
+            cancel,
+        )?)
+    };
+
     for tile in &tiles {
         cancel.check()?;
+
+        let local;
+        let index = if tile.progression_changes.is_empty() {
+            inherited.as_ref()
+        } else {
+            local = OwnershipIndex::new(&tile.progression_changes, core::iter::once(tile), cancel)?;
+            Some(&local)
+        };
+        let progression_iterator = progression_iterator(tile, index, cancel)?;
 
         decode_tile(
             tile,
             header,
+            progression_iterator,
             &mut ctx.tile_decode_context,
             &mut ctx.channel_data,
             &mut ctx.storage,
@@ -94,9 +115,10 @@ impl DecoderContext<'_> {
     }
 }
 
-fn decode_tile<'a>(
-    tile: &Tile<'a>,
+fn decode_tile<'a, 'b>(
+    tile: &'b Tile<'a>,
     header: &Header,
+    progression_iterator: Box<dyn Iterator<Item = Result<ProgressionData>> + '_>,
     tile_ctx: &mut TileDecodeContext,
     channel_data: &mut [ComponentData],
     storage: &mut DecompositionStorage<'a>,
@@ -104,9 +126,8 @@ fn decode_tile<'a>(
 ) -> Result<()> {
     storage.reset();
 
-    let packets = ProgressionIterator::new(tile, header, cancel)?;
     build::build(tile, storage, header.skipped_resolution_levels, cancel)?;
-    segment::parse(tile, header, packets, storage, cancel)?;
+    segment::parse(tile, progression_iterator, header, storage, cancel)?;
 
     for (idx, component_info) in header.component_infos.iter().enumerate() {
         cancel.check()?;
@@ -468,7 +489,8 @@ fn store<'a>(
             } else {
                 (scale_y as u32 * y) / y_shrink_factor
             };
-            let y_end = (scale_y as u32 * (y + 1)) / y_shrink_factor;
+            let y_end = (u64::from(scale_y) * (u64::from(y) + 1) / u64::from(y_shrink_factor))
+                .min(u64::from(image_height + image_y_offset)) as u32;
 
             for x in resolution_tile.rect.x0..resolution_tile.rect.x1 {
                 let relative_x = (x - idwt_output.rect.x0) as usize;
@@ -477,17 +499,15 @@ fn store<'a>(
                 } else {
                     (scale_x as u32 * x) / x_shrink_factor
                 };
-                let x_end = (scale_x as u32 * (x + 1)) / x_shrink_factor;
+                let x_end = (u64::from(scale_x) * (u64::from(x) + 1) / u64::from(x_shrink_factor))
+                    .min(u64::from(image_width + image_x_offset))
+                    as u32;
 
                 let sample = idwt_output.coefficients
                     [relative_y * idwt_output.rect.width() as usize + relative_x];
 
-                for x_position in u32::max(reference_grid_x, image_x_offset)
-                    ..u32::min(x_end, image_width + image_x_offset)
-                {
-                    for y_position in u32::max(reference_grid_y, image_y_offset)
-                        ..u32::min(y_end, image_height + image_y_offset)
-                    {
+                for x_position in u32::max(reference_grid_x, image_x_offset)..x_end {
+                    for y_position in u32::max(reference_grid_y, image_y_offset)..y_end {
                         let pos = (y_position - image_y_offset) as usize * image_width as usize
                             + (x_position - image_x_offset) as usize;
 

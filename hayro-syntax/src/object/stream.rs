@@ -536,7 +536,7 @@ mod tests {
                 .read_without_context::<Dict<'_>>()
                 .unwrap();
             assert_eq!(
-                Stream::read_after_dict(&mut reader, dict, &Unknown, &mut next)
+                Stream::read_after_dict(&mut reader, dict, &super::Unknown, &mut next)
                     .unwrap().0
                     .data,
                 b"x     !"

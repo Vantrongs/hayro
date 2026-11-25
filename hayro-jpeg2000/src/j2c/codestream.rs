@@ -810,6 +810,8 @@ pub(crate) fn poc_marker(reader: &mut BitReader<'_>, csiz: u16) -> Option<Vec<Pr
     };
 
     let entry_size = if csiz < 257 { 7 } else { 9 };
+    // ISO/IEC 15444-1:2024, Table A.32 assigns zero a width-dependent end component.
+    let zero_component_end = if csiz < 257 { 256 } else { 16_384 };
 
     (0..length as usize / entry_size)
         .map(|_| {
@@ -819,7 +821,7 @@ pub(crate) fn poc_marker(reader: &mut BitReader<'_>, csiz: u16) -> Option<Vec<Pr
                 layer_end: reader.read_u16()?,
                 resolution_end: reader.read_byte()?,
                 component_end: match read_component_index(&mut reader)? {
-                    0 => 256,
+                    0 => zero_component_end,
                     index => index,
                 },
                 progression_order: ProgressionOrder::from_u8(reader.read_byte()?).ok()?,

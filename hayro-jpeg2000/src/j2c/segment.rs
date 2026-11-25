@@ -1,8 +1,10 @@
+use alloc::boxed::Box;
+
 use super::build::Segment;
 use super::codestream::markers::{EPH, SOP};
 use super::codestream::{ComponentInfo, Header};
 use super::decode::DecompositionStorage;
-use super::progression::{ProgressionData, ProgressionIterator};
+use super::progression::ProgressionData;
 use super::tile::{Tile, TilePart};
 use crate::cancel::Cancel;
 use crate::error::{Result, TileError, bail};
@@ -10,10 +12,10 @@ use crate::reader::BitReader;
 
 pub(crate) const MAX_BITPLANE_COUNT: u8 = 32;
 
-pub(crate) fn parse<'a>(
-    tile: &Tile<'a>,
+pub(crate) fn parse<'a, 'b>(
+    tile: &'b Tile<'a>,
+    mut progression_iterator: Box<dyn Iterator<Item = Result<ProgressionData>> + '_>,
     header: &Header,
-    mut progression_iterator: ProgressionIterator<'_>,
     storage: &mut DecompositionStorage<'a>,
     cancel: Cancel<'_>,
 ) -> Result<()> {
@@ -37,7 +39,7 @@ pub(crate) fn parse<'a>(
 
 fn parse_inner<'a>(
     mut tile_part: TilePart<'a>,
-    progression_iterator: &mut ProgressionIterator<'_>,
+    progression_iterator: &mut dyn Iterator<Item = Result<ProgressionData>>,
     component_infos: &[ComponentInfo],
     storage: &mut DecompositionStorage<'a>,
     cancel: Cancel<'_>,
@@ -45,7 +47,7 @@ fn parse_inner<'a>(
     while !tile_part.header().at_end() {
         cancel.check()?;
 
-        let Some(packet) = progression_iterator.next_packet(cancel)? else {
+        let Some(packet) = progression_iterator.next().transpose()? else {
             return Ok(None);
         };
         if parse_packet(&mut tile_part, packet, component_infos, storage).is_none() {
@@ -63,8 +65,9 @@ fn parse_packet<'a>(
     storage: &mut DecompositionStorage<'a>,
 ) -> Option<()> {
     let resolution = progression_data.resolution;
-    let component_info = &component_infos[progression_data.component];
-    let tile_decompositions = &mut storage.tile_decompositions[progression_data.component];
+    let component_info = &component_infos[usize::from(progression_data.component)];
+    let tile_decompositions =
+        &mut storage.tile_decompositions[usize::from(progression_data.component)];
     let sub_band_iter = tile_decompositions.sub_band_iter(resolution, &storage.decompositions);
 
     let body_reader = tile_part.body();

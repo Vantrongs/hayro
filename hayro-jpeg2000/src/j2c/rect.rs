@@ -15,8 +15,8 @@ impl IntRect {
         Self {
             x0: x,
             y0: y,
-            x1: x + w,
-            y1: y + h,
+            x1: x.saturating_add(w),
+            y1: y.saturating_add(h),
         }
     }
 

@@ -135,28 +135,25 @@ fn build_precincts(
         let cb_width = resolution_tile.code_block_width();
         let cb_height = resolution_tile.code_block_height();
 
-        let cb_x0 = (u32::max(precinct_rect.x0, sub_band_rect.x0) / cb_width) * cb_width;
-        let cb_y0 = (u32::max(precinct_rect.y0, sub_band_rect.y0) / cb_height) * cb_height;
-        let cb_x1 = (u32::min(precinct_rect.x1, sub_band_rect.x1).div_ceil(cb_width)) * cb_width;
-        let cb_y1 = (u32::min(precinct_rect.y1, sub_band_rect.y1).div_ceil(cb_height)) * cb_height;
-
-        let code_block_area = IntRect::from_ltrb(cb_x0, cb_y0, cb_x1, cb_y1);
-
-        // Rounding would otherwise yield one code-block per axis for empty sub-bands.
+        let block_grid = IntRect::from_ltrb(
+            precinct_rect.x0.max(sub_band_rect.x0) / cb_width,
+            precinct_rect.y0.max(sub_band_rect.y0) / cb_height,
+            precinct_rect.x1.min(sub_band_rect.x1).div_ceil(cb_width),
+            precinct_rect.y1.min(sub_band_rect.y1).div_ceil(cb_height),
+        );
         let code_blocks_x = if sub_band_rect.width() == 0 {
             0
         } else {
-            code_block_area.width() / cb_width
+            block_grid.width()
         };
-
         let code_blocks_y = if sub_band_rect.height() == 0 {
             0
         } else {
-            code_block_area.height() / cb_height
+            block_grid.height()
         };
 
         let blocks = build_code_blocks(
-            code_block_area,
+            block_grid,
             sub_band_rect,
             resolution_tile,
             code_blocks_x,
@@ -184,7 +181,7 @@ fn build_precincts(
 }
 
 fn build_code_blocks(
-    code_block_area: IntRect,
+    block_grid: IntRect,
     sub_band_rect: IntRect,
     tile_instance: &ResolutionTile<'_>,
     code_blocks_x: u32,
@@ -193,8 +190,6 @@ fn build_code_blocks(
     storage: &mut DecompositionStorage<'_>,
     cancel: Cancel<'_>,
 ) -> Result<Range<usize>> {
-    let mut y = code_block_area.y0;
-
     let code_block_width = tile_instance.code_block_width();
     let code_block_height = tile_instance.code_block_height();
 
@@ -203,9 +198,10 @@ fn build_code_blocks(
     for y_idx in 0..code_blocks_y {
         cancel.check()?;
 
-        let mut x = code_block_area.x0;
+        let y = (block_grid.y0 + y_idx) * code_block_height;
 
         for x_idx in 0..code_blocks_x {
+            let x = (block_grid.x0 + x_idx) * code_block_width;
             let area = IntRect::from_xywh(x, y, code_block_width, code_block_height)
                 .intersect(sub_band_rect);
 
@@ -227,11 +223,7 @@ fn build_code_blocks(
                 layers: start..end,
                 non_empty_layer_count: 0,
             });
-
-            x += code_block_width;
         }
-
-        y += code_block_height;
     }
 
     let end = storage.code_blocks.len();
