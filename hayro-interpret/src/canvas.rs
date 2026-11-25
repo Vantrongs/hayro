@@ -65,10 +65,10 @@ impl<'a, P: SamplePixel> Canvas<'a, P> {
         mut self,
         background: P,
         meter: &mut dyn Meter,
-        mut emit: impl FnMut(&[P]),
+        mut emit: impl FnMut(&mut [P]),
     ) -> Result<(), Exhausted> {
         let Layout::Rows { mut rows, shade } = self.layout else {
-            for row in self.pixels.chunks_exact(self.width) {
+            for row in self.pixels.chunks_exact_mut(self.width) {
                 emit(row);
             }
             return Ok(());
@@ -114,7 +114,7 @@ impl<'a, P: SamplePixel> Canvas<'a, P> {
                     },
                 }
             }
-            emit(&self.pixels);
+            emit(&mut self.pixels);
         }
         drop(rows);
         meter.release_bytes(bytes);
@@ -192,6 +192,19 @@ impl<'a, P: SamplePixel> Canvas<'a, P> {
                 (d2 * e1.x - d1 * e2.x) / det,
             ]
         });
+        let mut sorted = points;
+        sorted.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
+        let [top, middle, bottom] = sorted;
+
+        let span = |y| {
+            let long = edge_x(top, bottom, y);
+            let short = if y < middle.y {
+                edge_x(top, middle, y)
+            } else {
+                edge_x(middle, bottom, y)
+            };
+            long.min(short)..long.max(short)
+        };
         if let Layout::Points(sparse) = &self.layout {
             let area = bounds(&points);
             let (lo, hi) = if sparse.by_x {
@@ -217,19 +230,13 @@ impl<'a, P: SamplePixel> Canvas<'a, P> {
                 (sample_cost + Cost::of(N + 4)).times((upper - lower) as u64),
             )?;
             for &(point, index) in &sparse.locations[lower..upper] {
-                let d = point - p0;
-                let u = d.cross(e2) / det;
-                let v = e1.cross(d) / det;
-                if u >= 0.0 && v >= 0.0 && u + v <= 1.0 {
+                if (top.y..bottom.y).contains(&point.y) && span(point.y).contains(&point.x) {
+                    let d = point - p0;
                     self.pixels[index] = shade(&PlaneRow::new(&coefficients, d.y).at(d.x));
                 }
             }
             return Ok(());
         }
-
-        let mut sorted = points;
-        sorted.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
-        let [top, middle, bottom] = sorted;
 
         let first_row = pixel_index(top.y, self.height);
         let end_row = pixel_index(bottom.y, self.height);
@@ -238,15 +245,9 @@ impl<'a, P: SamplePixel> Canvas<'a, P> {
         let mut plane = None;
         for y in first_row..end_row {
             let center_y = y as f64 + 0.5;
-            let long = edge_x(top, bottom, center_y);
-            let short = if center_y < middle.y {
-                edge_x(top, middle, center_y)
-            } else {
-                edge_x(middle, bottom, center_y)
-            };
-
-            let start = pixel_index(long.min(short), self.width);
-            let end = pixel_index(long.max(short), self.width);
+            let range = span(center_y);
+            let start = pixel_index(range.start, self.width);
+            let end = pixel_index(range.end, self.width);
 
             if start >= end {
                 continue;

@@ -1005,3 +1005,111 @@ fn metered_samples_distinguish_coverage_and_function_failure() {
         );
     }
 }
+
+fn classified_at(pattern: &EncodedShadingPattern, area: Rect) -> Vec<ShadingSample> {
+    let mut rows = Vec::new();
+    let (w, h, grid) = pattern
+        .sample_texture_samples_metered(area, 1., &mut Unmetered, |row| rows.extend_from_slice(row))
+        .unwrap();
+    let centers: Vec<_> = (0..h)
+        .flat_map(|y| {
+            (0..w).map(move |x| grid * Point::new(f64::from(x) + 0.5, f64::from(y) + 0.5))
+        })
+        .collect();
+    let mut points = Vec::new();
+    pattern
+        .sample_points_samples_metered(&centers, &mut Unmetered, |s| points.push(s))
+        .unwrap();
+    assert_eq!(rows, points);
+    points
+}
+
+#[test]
+fn translated_bbox_matches_the_paint_clip() {
+    use kurbo::Shape;
+    let pdf = Pdf::new(crate::fixtures::one_page(100, "", vec![
+        b"<< /PatternType 2 /Matrix [1 0 0 1 10 20] /Shading 5 0 R >>".to_vec(),
+        b"<< /ShadingType 2 /BBox [0 0 1 1] /Coords [0 0 4 0] /ColorSpace /DeviceGray /Function 6 0 R >>".to_vec(),
+        b"<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [1] /N 1 >>".to_vec()
+    ])).unwrap();
+    let dict = pdf
+        .xref()
+        .get::<Dict<'_>>(ObjectIdentifier::new(4, 0))
+        .unwrap();
+    let p = ShadingPattern::new(&dict, &Cache::new()).unwrap();
+    let clip = p.clip_path().unwrap();
+    let encoded = p.encode();
+    let area = Rect::new(10., 20., 13., 21.);
+    let coverage = classified_at(&encoded, area);
+    let mut texture = Vec::new();
+    encoded.sample_texture(area, 1., |c| texture.push(c));
+    let mut metered = Vec::new();
+    encoded
+        .sample_texture_metered(area, 1., &mut Unmetered, |r| metered.extend_from_slice(r))
+        .unwrap();
+    let centers = [10.5, 11.5, 12.5].map(|x| Point::new(x, 20.5));
+    let mut points = Vec::new();
+    encoded
+        .sample_points_metered(&centers, &mut Unmetered, |c| points.push(c))
+        .unwrap();
+    assert_eq!(points, texture);
+    assert_eq!(metered, texture);
+    for ((sample, center), rgba) in coverage.into_iter().zip(centers).zip(texture) {
+        assert_eq!(
+            sample,
+            if clip.contains(center) {
+                ShadingSample::Painted(rgba)
+            } else {
+                ShadingSample::Outside
+            }
+        );
+    }
+}
+
+#[test]
+fn isolated_mesh_uses_half_open_spans() {
+    for (code, covered) in [
+        (b"{ pop 1 }".as_slice(), ShadingSample::Painted([1.; 4])),
+        (b"{ pop pop }", ShadingSample::Failed),
+    ] {
+        let p = pattern(
+            crate::fixtures::stream(
+                "/ShadingType 4 /Function 6 0 R /ColorSpace /DeviceGray /BitsPerCoordinate 8 /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 4 0 4 0 1]",
+                &[0, 0, 0, 0, 0, 255, 0, 0, 0, 0, 255, 0],
+            ),
+            crate::fixtures::stream("/FunctionType 4 /Domain [0 1] /Range [0 1]", code),
+        );
+        for (i, sample) in classified_at(&p, Rect::new(0., 0., 4., 4.))
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                sample,
+                if i % 4 + i / 4 < 3 {
+                    covered
+                } else {
+                    ShadingSample::Outside
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn unextended_axial_endpoints_use_geometric_precision() {
+    let p = pattern(
+        b"<< /ShadingType 2 /Coords [0 0 1 0] /ColorSpace /DeviceGray /Function 6 0 R >>".to_vec(),
+        b"<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [1] /N 1 >>".to_vec(),
+    );
+    let epsilon = 2_f64.powi(-30);
+    for x in [-epsilon, 0., epsilon, 1. - epsilon, 1., 1. + epsilon] {
+        assert_eq!(
+            classified_at(&p, Rect::new(x - 0.5, 0., x + 0.5, 1.)),
+            [if (0.0..=1.0).contains(&x) {
+                ShadingSample::Painted([1.; 4])
+            } else {
+                ShadingSample::Outside
+            }]
+        );
+    }
+}
