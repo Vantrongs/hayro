@@ -407,7 +407,9 @@ impl<'a> SvgRenderer<'a> {
     // Defs are written in `finish`, so this first runs `f` on a throwaway writer to register them.
     pub(crate) fn with_dummy(&mut self, f: impl FnOnce(&mut Self)) {
         let mut old_xml = std::mem::replace(&mut self.xml, XmlWriter::new(Options::default()));
+        let outer_clips = std::mem::take(&mut self.active_clips);
         f(self);
+        self.active_clips = outer_clips;
         std::mem::swap(&mut self.xml, &mut old_xml);
     }
 
