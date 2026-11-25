@@ -403,12 +403,12 @@ impl TransferFunction {
             let mut output = [0.0; MAX_COMPONENTS];
             let output = &mut output[..function.num_outputs()];
 
-            std::array::from_fn(|sample| {
-                match function.eval(&[sample as f32 * (1.0 / 255.0)], output) {
+            std::array::from_fn(
+                |sample| match function.eval(&[sample as f32 / 255.0], output) {
                     Some(()) => (output[0] * 255.0 + 0.5) as u8,
                     None => sample as u8,
-                }
-            })
+                },
+            )
         })
     }
 }
