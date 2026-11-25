@@ -1245,11 +1245,8 @@ fn raw_data<'d>(
     let whole = decrypts_whole(decryptor, data, target);
     // Rule 11 of the crypt filter rules (`crate::crypto`): no data reads as empty
     // wherever they decrypt at all.
-    if !whole {
-        if strict || data.is_empty() {
-            return Err(DecodeFailure::Decryption);
-        }
-        meter.note_recovery();
+    if (strict || data.is_empty()) && !whole {
+        return Err(DecodeFailure::Decryption);
     }
     if data.is_empty() {
         return Ok(Cow::Borrowed(data));

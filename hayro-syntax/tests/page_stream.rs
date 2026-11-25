@@ -19,19 +19,33 @@ fn decoded_content_is_not_copied() {
 }
 
 #[test]
-fn partial_content_is_returned_but_decoded_again() {
-    let pdf = Pdf::new(common::one_page(
-        100,
-        "/Contents [4 0 R 5 0 R]",
-        vec![common::stream("", b"q Q"), b"7".to_vec()],
-    ))
-    .unwrap();
-    let mut cache = hayro_syntax::page::PageStreamCache::default();
-    let first = cache.get(&pdf.pages()[0]).unwrap();
-    let next = cache.get(&pdf.pages()[0]).unwrap();
-    assert_eq!(first.as_slice(), b"q Q ");
-    assert_eq!(first, next);
-    assert_ne!(first.as_ptr(), next.as_ptr());
+fn cache_reuses_content_unless_a_referenced_object_was_lost() {
+    for (entries, lost) in [
+        ("[4 0 R]", false),
+        ("[4 0 R null]", false),
+        ("[4 0 R 5 0 R]", false),
+        ("[4 0 R 6 0 R]", true),
+    ] {
+        let pdf = Pdf::new(common::one_page(
+            100,
+            &format!("/Contents {entries}"),
+            vec![
+                common::stream("", b"q Q"),
+                b"null".to_vec(),
+                b"<< /Length 9999 >>\nstream\nq".to_vec(),
+            ],
+        ))
+        .unwrap();
+        let page = &pdf.pages()[0];
+        let mut cache = hayro_syntax::page::PageStreamCache::default();
+        let mut read = || {
+            let (bytes, missing) = pdf.xref().watch(|| cache.get(page).unwrap());
+            assert_eq!(missing.is_some(), lost, "{entries}");
+            assert_eq!(bytes.as_slice(), b"q Q ");
+            bytes
+        };
+        assert_eq!(std::sync::Arc::ptr_eq(&read(), &read()), !lost, "{entries}");
+    }
 }
 
 /// A content under a predictor whose last row is cut short keeps that row, by the
@@ -252,7 +266,7 @@ fn distinct_streams_share_only_the_collected_output() {
 }
 
 #[test]
-fn recovered_filter_prefix_is_decoded_again() {
+fn recovered_filter_prefix_is_reused() {
     for (contents, expected) in [("4 0 R", b"q Q".as_slice()), ("[4 0 R]", b"q Q ")] {
         let pdf = Pdf::new(common::one_page(
             10,
@@ -265,7 +279,7 @@ fn recovered_filter_prefix_is_decoded_again() {
         let second = cache.get(&pdf.pages()[0]).unwrap();
         assert_eq!(first.as_slice(), expected);
         assert_eq!(first, second);
-        assert!(!std::sync::Arc::ptr_eq(&first, &second));
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
     }
 }
 
@@ -281,4 +295,40 @@ fn short_escaped_operators_allocate_nothing() {
         assert!(iter.next().is_none());
     });
     assert_eq!(allocations.count, 0);
+}
+
+#[test]
+fn escaped_operator_storage_matches_decoded_length() {
+    for len in [15, 16, 22, 23] {
+        let data = b"#71".repeat(len);
+        let (op, allocated) = measure(|| {
+            hayro_syntax::content::UntypedIter::new(&data)
+                .next()
+                .unwrap()
+                .operator
+                .clone()
+        });
+        assert_eq!(op.as_ref(), vec![b'q'; len]);
+        assert_eq!(allocated.count == 0, len <= 22);
+        if len > 22 {
+            let (copy, allocated) = measure(|| op.clone());
+            assert_eq!(allocated.count, 0);
+            assert_eq!(copy.as_ptr(), op.as_ptr());
+        }
+    }
+}
+
+#[test]
+fn unescaped_operator_borrows_the_input() {
+    let data = b"longUnescapedOperatorName";
+    let (op, allocated) = measure(|| {
+        hayro_syntax::content::UntypedIter::new(data)
+            .next()
+            .unwrap()
+            .operator
+            .clone()
+    });
+    assert_eq!(allocated.count, 0);
+    assert_eq!(op.as_ref(), data);
+    assert_eq!(op.as_ptr(), data.as_ptr());
 }

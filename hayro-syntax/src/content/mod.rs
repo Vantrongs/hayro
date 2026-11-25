@@ -38,10 +38,16 @@ impl Display for Operator<'_> {
 #[derive(Clone)]
 pub struct Operator<'a>(Spelling<'a>);
 
+const _: () = assert!(size_of::<Operator<'_>>() == 24);
+const INLINE_OPERATOR_BYTES: usize = 22;
+
 #[derive(Clone)]
 enum Spelling<'a> {
     Borrowed(&'a [u8]),
-    Inline { data: [u8; 15], len: u8 },
+    Inline {
+        data: [u8; INLINE_OPERATOR_BYTES],
+        len: u8,
+    },
     Decoded(Arc<[u8]>),
 }
 
@@ -87,13 +93,13 @@ impl<'a> Operator<'a> {
 
     #[cold]
     fn escaped(raw: &[u8]) -> Self {
-        let mut bytes = SmallVec::<[u8; 15]>::new();
+        let mut bytes = SmallVec::<[u8; INLINE_OPERATOR_BYTES]>::new();
         object::name::unescape(raw, |b| bytes.push(b));
         if bytes.spilled() {
             Self(Spelling::Decoded(Arc::from(bytes.as_slice())))
         } else {
             let len = bytes.len() as u8;
-            bytes.resize(15, 0);
+            bytes.resize(INLINE_OPERATOR_BYTES, 0);
             Self(Spelling::Inline {
                 data: bytes.into_inner().unwrap(),
                 len,

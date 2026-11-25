@@ -9,7 +9,7 @@ use crate::object::Name;
 use crate::object::Rect;
 use crate::object::Stream;
 use crate::object::dict::keys::*;
-use crate::object::stream::{DecodeFailure, ImageDecodeParams, ReadError, StrictReader};
+use crate::object::stream::{DecodeFailure, ReadError, StrictReader};
 use crate::object::{MaybeRef, Null, Object, ObjectIdentifier};
 use crate::reader::ReaderContext;
 use crate::sync::{Arc, OnceLock};
@@ -173,7 +173,7 @@ pub struct PageStreamCache<'a> {
 }
 
 impl<'a> PageStreamCache<'a> {
-    /// Read the page's content, reusing a complete read of the same dictionary.
+    /// Read the page's content, reusing a read of the same dictionary that lost no objects.
     pub fn get(&mut self, page: &Page<'a>) -> Option<Arc<Vec<u8>>> {
         let key = page.raw().content_key();
         if let Some((active, bytes)) = &self.active
@@ -182,10 +182,9 @@ impl<'a> PageStreamCache<'a> {
             return Some(bytes.clone());
         }
         self.active = None;
-        let mut complete = true;
-        let (bytes, lost) = page.xref().watch(|| page.decode_content(&mut complete));
+        let (bytes, lost) = page.xref().watch(|| page.read_page_stream());
         let bytes = Arc::new(bytes?);
-        if complete && lost.is_none() {
+        if lost.is_none() {
             self.active = Some((key, bytes.clone()));
         }
         Some(bytes)
@@ -462,18 +461,8 @@ impl<'a> Page<'a> {
     /// the document is open. What reading it lost is told to the computation being
     /// watched.
     pub fn read_page_stream(&self) -> Option<Vec<u8>> {
-        self.decode_content(&mut true)
-    }
-
-    fn decode_content(&self, complete: &mut bool) -> Option<Vec<u8>> {
-        let meter = Meter::default();
-        let decode = |stream: Stream<'a>, complete: &mut bool| {
-            let result = stream.decoded_image_metered(&ImageDecodeParams::default(), &meter);
-            *complete &= !meter.recovered() && result.is_ok();
-            result.map(|result| result.data)
-        };
         if let Some(stream) = self.inner.get::<Stream<'_>>(CONTENTS) {
-            Some(decode(stream, complete).ok()?.into_owned())
+            Some(stream.decoded().ok()?.into_owned())
         } else if let Some(array) = self.inner.get::<Array<'_>>(CONTENTS) {
             let mut ranges = hash::Map::<_, core::ops::Range<usize>>::default();
             let mut collected = vec![];
@@ -491,11 +480,10 @@ impl<'a> Page<'a> {
                     MaybeRef::NotRef(object) => object.into_stream(),
                 };
                 let Some(stream) = stream else {
-                    *complete = false;
                     continue;
                 };
                 let start = collected.len();
-                if let Ok(data) = decode(stream, complete) {
+                if let Ok(data) = stream.decoded() {
                     collected.reserve(data.len() + 1);
                     collected.extend_from_slice(&data);
                     // Streams must have at least one whitespace in-between.
