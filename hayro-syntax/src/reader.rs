@@ -276,6 +276,8 @@ impl<'a> ReaderContext<'a> {
 }
 
 pub trait Readable<'a>: Sized {
+    const HANDLES_TYPE_MISMATCH: bool = false;
+
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self>;
     fn read_indirect(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         Self::read(r, ctx)

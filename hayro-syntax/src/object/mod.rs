@@ -190,6 +190,20 @@ impl Object<'_> {
         depth: usize,
         ends: &impl Ends,
     ) -> Option<()> {
+        Self::skip_value(r, is_content_stream, depth, true, ends)
+    }
+
+    pub(crate) fn skip_indirect_value(r: &mut Reader<'_>) -> Option<()> {
+        Self::skip_value(r, false, 0, false, &Unknown)
+    }
+
+    fn skip_value(
+        r: &mut Reader<'_>,
+        is_content_stream: bool,
+        depth: usize,
+        allow_operator: bool,
+        ends: &impl Ends,
+    ) -> Option<()> {
         match r.peek_byte()? {
             b'n' => Null::skip(r, is_content_stream),
             b't' | b'f' => bool::skip(r, is_content_stream),
@@ -199,12 +213,17 @@ impl Object<'_> {
                 _ => String::skip_in(r, ends),
             },
             b'(' => String::skip_in(r, ends),
-            b'.' | b'+' | b'-' | b'0'..=b'9' => {
-                Number::skip(r, is_content_stream).or_else(|| skip_name_like(r, false))
-            }
+            b'.' | b'+' | b'-' | b'0'..=b'9' => Number::skip(r, is_content_stream).or_else(|| {
+                if allow_operator {
+                    skip_name_like(r, false)
+                } else {
+                    None
+                }
+            }),
             b'[' => Array::skip_in(r, is_content_stream, depth, ends),
             // Lenient: skip content operators inside arrays.
-            _ => skip_name_like(r, false),
+            _ if allow_operator => skip_name_like(r, false),
+            _ => None,
         }
     }
 
@@ -215,8 +234,12 @@ impl Object<'_> {
         depth: usize,
         ends: &impl Ends,
     ) -> Option<()> {
-        if !is_content_stream && r.skip::<ObjRef>(false).is_some() {
-            return Some(());
+        if !is_content_stream {
+            let mut probe = r.clone();
+            if ObjRef::read_in(&mut probe, ends).is_some() {
+                *r = probe;
+                return Some(());
+            }
         }
         Self::skip_in(r, is_content_stream, depth, ends)
     }
@@ -259,7 +282,15 @@ impl<'a> Readable<'a> for Object<'a> {
 
             if cloned.peek_tag(b"stream").is_some() {
                 *r = cloned;
-                return Some(Self::Stream(Stream::read_after_dict(r, dict, &Unknown, &mut stream::NextEndstream::default())?.0));
+                return Some(Self::Stream(
+                    Stream::read_after_dict(
+                        r,
+                        dict,
+                        &Unknown,
+                        &mut stream::NextEndstream::default(),
+                    )?
+                    .0,
+                ));
             }
 
             r.jump(cloned.offset());

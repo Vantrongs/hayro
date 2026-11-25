@@ -437,7 +437,7 @@ impl XRef {
         }
     }
 
-    pub(crate) fn objects(&self) -> impl IntoIterator<Item = Object<'_>> + '_ {
+    pub(crate) fn objects<'a, T: Readable<'a> + 'a>(&'a self) -> impl IntoIterator<Item = T> + 'a {
         match &self.0 {
             Inner::Dummy => unimplemented!(),
             Inner::Some(r) => {
@@ -478,6 +478,20 @@ impl XRef {
 
                     None
                 })
+            }
+        }
+    }
+
+    pub(crate) fn is_repaired(&self) -> bool {
+        matches!(&self.0, Inner::Some(r) if r.map.get().repaired)
+    }
+
+    pub(crate) fn retry_after_repair<T>(&self, read: impl Fn(bool) -> T) -> T {
+        loop {
+            let started_repaired = self.is_repaired();
+            let result = read(started_repaired);
+            if started_repaired || !self.is_repaired() {
+                return result;
             }
         }
     }
@@ -541,15 +555,15 @@ impl XRef {
         ctx: &ReaderContext<'a>,
     ) -> Option<T>
     where
-        T: ObjectLike<'a>,
+        T: Readable<'a>,
     {
-        if ctx.parent_chain_contains(&id) {
-            return None;
-        }
-
         let Inner::Some(repr) = &self.0 else {
             return None;
         };
+
+        if ctx.parent_chain_contains(&id) {
+            return None;
+        }
 
         // The flag must describe the map this entry came from.
         let (entry, was_repaired) = {
@@ -568,17 +582,17 @@ impl XRef {
                 ctx.set_in_object_stream(false);
                 r.jump(offset);
 
-                if let Some(object) = r.read_with_context::<IndirectObject<T>>(&ctx) {
-                    if object.id() == &id {
-                        return Some(object.get());
-                    }
-                } else if r.read_without_context::<ObjectIdentifier>() == Some(id) {
+                if r.read_without_context::<ObjectIdentifier>() == Some(id) {
+                    ctx.parent_chain_push(id);
                     r.skip_white_spaces_and_comments();
+                    if let Some(object) = r.read_indirect::<T>(&ctx) {
+                        return Some(object);
+                    }
                     // A valid object of another type needs no repair.
-                    if r.skip::<Object<'_>>(false).is_some() {
+                    if !T::HANDLES_TYPE_MISMATCH && r.skip::<Object<'_>>(false).is_some() {
                         return None;
                     }
-                };
+                }
 
                 self.repair_and_get(id, caller_ctx, was_repaired)
             }
@@ -598,7 +612,11 @@ impl XRef {
 
                 ctx.parent_chain_push(id);
 
-                let object_stream = repr.data.object_stream(obj_stream_id, &ctx)?;
+                let object_stream = repr.data.object_stream(obj_stream_id, was_repaired, &ctx);
+                if !was_repaired && repr.map.get().repaired {
+                    return self.get_with(id, caller_ctx);
+                }
+                let object_stream = object_stream?;
 
                 if object_stream.obj_number(index) == Some(id.obj_number) {
                     return object_stream.get(index, &ctx);
@@ -616,7 +634,7 @@ impl XRef {
         was_repaired: bool,
     ) -> Option<T>
     where
-        T: ObjectLike<'a>,
+        T: Readable<'a>,
     {
         if was_repaired {
             None
@@ -1080,7 +1098,7 @@ impl ObjectStream {
 
     fn get<'a, T>(&'a self, index: u32, ctx: &ReaderContext<'a>) -> Option<T>
     where
-        T: ObjectLike<'a>,
+        T: Readable<'a>,
     {
         let offset = self.offsets.get(index as usize)?.1?;
         let mut r = Reader::new(&self.data);

@@ -56,7 +56,7 @@ pub(crate) struct Data {
     data: PdfData,
     // 32 segments are more than enough as we can't have more objects than this.
     object_streams: SegmentList<ObjectStream, 32>,
-    map: Mutex<FxHashMap<ObjectIdentifier, usize>>,
+    map: Mutex<FxHashMap<(ObjectIdentifier, bool), usize>>,
 }
 
 impl Debug for Data {
@@ -81,24 +81,32 @@ impl Data {
     pub(crate) fn object_stream(
         &self,
         id: ObjectIdentifier,
+        repaired: bool,
         ctx: &ReaderContext<'_>,
     ) -> Option<&ObjectStream> {
-        if let Some(&idx) = self.map.get().get(&id) {
+        let key = (id, repaired);
+        if let Some(&idx) = self.map.get().get(&key) {
             return self.object_streams.get(idx);
         }
 
         // Decoding may resolve other objects, so do it without holding the cache lock.
         let stream = ctx.xref().get_with::<Stream<'_>>(id, ctx)?;
+        if !repaired && ctx.xref().is_repaired() {
+            return None;
+        }
         let object_stream = ObjectStream::new(&stream)?;
+        if !repaired && ctx.xref().is_repaired() {
+            return None;
+        }
 
         let mut locked = self.map.get();
-        if let Some(&idx) = locked.get(&id) {
+        if let Some(&idx) = locked.get(&key) {
             return self.object_streams.get(idx);
         }
 
         let idx = locked.len();
         let object_stream = self.object_streams.get_or_init(idx, || object_stream);
-        locked.insert(id, idx);
+        locked.insert(key, idx);
 
         Some(object_stream)
     }

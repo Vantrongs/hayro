@@ -238,41 +238,17 @@ fn read_inner<'a>(
 ) -> Option<Dict<'a>> {
     let mut offsets = Vec::with_capacity(8);
 
-    let depth = usize::from(start_tag.is_some());
-    let dict_data = r.tail()?;
-    let start_offset = r.offset();
-
-    if let Some(start_tag) = start_tag {
-        r.forward_tag(start_tag)?;
-    }
-
-    let data = loop {
-        r.skip_white_spaces_and_comments();
-
-        if let Some(()) = r.peek_tag(end_tag) {
-            r.forward_tag(end_tag)?;
-            let end_offset = r.offset() - start_offset;
-
-            break &dict_data[..end_offset];
-        } else {
-            let Some(name) = r.read_without_context::<Name<'_>>() else {
-                if start_tag.is_some() {
-                    // Lenient: skip garbage between entries (not in inline dicts).
-                    Object::skip_in(r, ctx.in_content_stream(), depth, &Unknown)?;
-                    continue;
-                } else {
-                    return None;
-                }
-            };
-            r.skip_white_spaces_and_comments();
-
-            let offset = r.offset() - start_offset;
-            // Null entries are kept: checking for them would resolve references before decryption is set up.
+    let data = parse_dict_with(
+        r,
+        ctx,
+        start_tag,
+        end_tag,
+        #[inline]
+        |name, offset, _| {
             offsets.push((name, offset));
-
-            Object::skip_maybe_ref_in(r, ctx.in_content_stream(), depth, &Unknown)?;
-        }
-    };
+            Some(())
+        },
+    )?;
 
     if offsets.len() > MAX_UNSORTED_LEN {
         offsets.sort_by(|(a, _), (b, _)| a.as_ref().cmp(b.as_ref()));
@@ -284,6 +260,76 @@ fn read_inner<'a>(
         offsets,
         ctx: ctx.clone(),
     }))))
+}
+
+pub(crate) fn read_dict_with_key<'a>(
+    r: &mut Reader<'a>,
+    ctx: &ReaderContext<'a>,
+    key: &[u8],
+) -> Option<Option<Dict<'a>>> {
+    let start = r.offset();
+    let mut found = false;
+    let scanned = parse_dict_with(r, ctx, Some(b"<<"), b">>", |name, _, _| {
+        found = name.as_ref() == key;
+        (!found).then_some(())
+    });
+    if found {
+        r.jump(start);
+        Some(Some(r.read_with_context(ctx)?))
+    } else {
+        scanned.map(|_| None)
+    }
+}
+
+fn parse_dict_with<'a, F>(
+    r: &mut Reader<'a>,
+    ctx: &ReaderContext<'a>,
+    start_tag: Option<&[u8]>,
+    end_tag: &[u8],
+    mut on_entry: F,
+) -> Option<&'a [u8]>
+where
+    F: FnMut(Name<'a>, usize, &Reader<'a>) -> Option<()>,
+{
+    let depth = usize::from(start_tag.is_some());
+    let dict_data = r.tail()?;
+    let start_offset = r.offset();
+
+    if let Some(start_tag) = start_tag {
+        r.forward_tag(start_tag)?;
+    }
+
+    loop {
+        r.skip_white_spaces_and_comments();
+
+        if let Some(()) = r.peek_tag(end_tag) {
+            r.forward_tag(end_tag)?;
+            let end_offset = r.offset() - start_offset;
+
+            break Some(&dict_data[..end_offset]);
+        } else {
+            let Some(name) = r.read_without_context::<Name<'_>>() else {
+                if start_tag.is_some() {
+                    // Lenient: skip garbage between entries (not in inline dicts).
+                    r.skip_with_depth::<Object<'_>>(ctx.in_content_stream(), depth)?;
+                    continue;
+                } else {
+                    return None;
+                }
+            };
+            r.skip_white_spaces_and_comments();
+
+            let offset = r.offset() - start_offset;
+            // Null entries are kept: checking for them would resolve references before decryption is set up.
+            on_entry(name, offset, r)?;
+
+            if ctx.in_content_stream() {
+                r.skip_with_depth::<Object<'_>>(ctx.in_content_stream(), depth)?;
+            } else {
+                r.skip_with_depth::<MaybeRef<Object<'_>>>(ctx.in_content_stream(), depth)?;
+            }
+        }
+    }
 }
 
 object!(Dict<'a>, Dict);

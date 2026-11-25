@@ -1,6 +1,6 @@
 use crate::object::ObjectIdentifier;
 use crate::object::ObjectLike;
-use crate::reader::Reader;
+use crate::reader::{Ends, Reader, Unknown, skip_white_spaces_and_comments_in};
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::trivia::is_regular_character;
 use core::fmt::{Debug, Display, Formatter};
@@ -50,8 +50,14 @@ impl Skippable for ObjRef {
 
 impl Readable<'_> for ObjRef {
     fn read(r: &mut Reader<'_>, _: &ReaderContext<'_>) -> Option<Self> {
-        let obj_number = read_ref_integer(r)?.try_into().ok()?;
-        let gen_number = read_ref_integer(r)?.try_into().ok()?;
+        Self::read_in(r, &Unknown)
+    }
+}
+
+impl ObjRef {
+    pub(super) fn read_in(r: &mut Reader<'_>, ends: &impl Ends) -> Option<Self> {
+        let obj_number = read_ref_integer(r, ends)?.try_into().ok()?;
+        let gen_number = read_ref_integer(r, ends)?.try_into().ok()?;
         r.forward_tag(b"R")?;
         if r.peek_byte().is_some_and(is_regular_character) {
             return None;
@@ -60,7 +66,7 @@ impl Readable<'_> for ObjRef {
     }
 }
 
-fn read_ref_integer(r: &mut Reader<'_>) -> Option<i64> {
+fn read_ref_integer(r: &mut Reader<'_>, ends: &impl Ends) -> Option<i64> {
     let negative = r.eat(|b| matches!(b, b'+' | b'-')) == Some(b'-');
     let start = r.offset();
     let mut value = 0_i64;
@@ -79,7 +85,7 @@ fn read_ref_integer(r: &mut Reader<'_>) -> Option<i64> {
         return None;
     }
     let end = r.offset();
-    r.skip_white_spaces_and_comments();
+    skip_white_spaces_and_comments_in(r, ends);
     (r.offset() != end).then_some(if negative { -value } else { value })
 }
 
