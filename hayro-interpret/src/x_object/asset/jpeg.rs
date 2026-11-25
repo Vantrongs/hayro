@@ -9,7 +9,7 @@ use crate::x_object::area::Area;
 use crate::x_object::decode::decode_image;
 use crate::x_object::image::SampledImage;
 use hayro_syntax::object::stream::{JpegCheckpoint, JpegRows};
-use hayro_syntax::work::{Cancelled, Meter};
+use hayro_syntax::work::{Cancelled, Meter, POLL_BYTES};
 use std::sync::Arc;
 
 /// JPEG states, by the row they resume at.
@@ -176,6 +176,8 @@ impl<'a> JpegStreamed<'a> {
         let (width, columns) = (self.obj.width() as usize, area.columns());
         let mut band = vec![0; rows.output_buffer_size()];
         let mut rgb = Vec::new();
+        let poll_texels = POLL_BYTES / (1 + self.colour.channels());
+        let mut remaining = poll_texels;
         while (rows.next_row() as u32) < wanted.end {
             let y = rows.next_row() as u32;
             let count = rows.read_mcu_row(&mut band).map_err(|_| Stop::Failed)?;
@@ -183,14 +185,17 @@ impl<'a> JpegStreamed<'a> {
             self.save(&mut rows)?;
             for (row, texels) in (y..).zip(band.chunks_exact_mut(width).take(count)) {
                 if wanted.contains(&row) {
-                    let texels = &mut texels[columns.start as usize..columns.end as usize];
-                    let piece = self.colour.conversion_piece(texels.len());
-                    for (i, part) in texels.chunks_mut(piece).enumerate() {
-                        if i > 0 {
+                    let mut first = columns.start as usize;
+                    while first < columns.end as usize {
+                        let end = (first + remaining).min(columns.end as usize);
+                        let converted = self.colour.convert(&mut texels[first..end], &mut rgb)?;
+                        area.push_texels(first as u32, converted)?;
+                        remaining -= end - first;
+                        if remaining == 0 {
                             meter.poll()?;
+                            remaining = poll_texels;
                         }
-                        let first = columns.start + (i * piece) as u32;
-                        area.push_texels(first, self.colour.convert(part, &mut rgb)?)?;
+                        first = end;
                     }
                     area.end_row()?;
                 }
@@ -276,7 +281,6 @@ mod tests {
     use hayro_syntax::Pdf;
     #[cfg(debug_assertions)]
     use hayro_syntax::work::TOLD;
-    use hayro_syntax::work::POLL_BYTES;
     use std::cell::Cell;
 
     /// A baseline grayscale JPEG of `w` × `h`, with a restart marker every `restart`
@@ -341,32 +345,37 @@ mod tests {
     #[test]
     fn wide_icc_band_can_stop_during_conversion_and_resume() {
         use crate::x_object::area::PUSHED;
-        let w = 60000;
-        let pdf = icc_jpeg(&jpeg(w as u16, 1, 0), w, 1, "", 1.8);
-        let mut asset = asset(&pdf);
-        set_transfer(&mut asset, Some(transfer(true)));
-        let mut source = asset.open(None, None).unwrap();
-        assert!(is_jpeg(&source));
-        PUSHED.set(0);
-        let stop = || PUSHED.get() > 0;
-        let request = ImageRequest {
-            plane: Plane::Image,
-            grid: (w, 1),
-            window: [0, 0, w, 1],
-            cancel: Some(&stop),
-        };
-        assert_eq!(
-            source.request(&request).unwrap_err(),
-            RequestError::Cancelled
-        );
-        assert!(PUSHED.get() * 4 <= POLL_BYTES as u64);
-        let request = ImageRequest {
-            cancel: None,
-            ..request
-        };
-        let expected = whole(&asset).request(&request).unwrap();
-        assert_eq!(expected.data.len(), w as usize * 3);
-        assert_eq!(source.request(&request).unwrap().data, expected.data);
+        for (w, h) in [(60000, 1), (16384, 8)] {
+            let pdf = icc_jpeg(&jpeg(w as u16, h as u16, 0), w, h, "", 1.8);
+            let mut asset = asset(&pdf);
+            set_transfer(&mut asset, Some(transfer(true)));
+            let mut source = asset.open(None, None).unwrap();
+            assert!(is_jpeg(&source));
+            PUSHED.set(0);
+            let previous = Cell::new(0);
+            let stop = || {
+                let pushed = PUSHED.get();
+                assert!((pushed - previous.replace(pushed)) * 4 <= POLL_BYTES as u64);
+                pushed >= u64::from(w) * u64::from(h) / 2
+            };
+            let request = ImageRequest {
+                plane: Plane::Image,
+                grid: (w, h),
+                window: [0, 0, w, h],
+                cancel: Some(&stop),
+            };
+            assert_eq!(
+                source.request(&request).unwrap_err(),
+                RequestError::Cancelled
+            );
+            let request = ImageRequest {
+                cancel: None,
+                ..request
+            };
+            let expected = whole(&asset).request(&request).unwrap();
+            assert_eq!(expected.data.len(), w as usize * h as usize * 3);
+            assert_eq!(source.request(&request).unwrap().data, expected.data);
+        }
     }
 
     fn is_jpeg(source: &ImageSource<'_>) -> bool {
