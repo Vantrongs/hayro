@@ -130,34 +130,17 @@ fn build_precincts(
     {
         cancel.check()?;
 
-        let precinct_rect = precinct_data.rect;
-
-        let cb_width = resolution_tile.code_block_width();
-        let cb_height = resolution_tile.code_block_height();
-
-        let block_grid = IntRect::from_ltrb(
-            precinct_rect.x0.max(sub_band_rect.x0) / cb_width,
-            precinct_rect.y0.max(sub_band_rect.y0) / cb_height,
-            precinct_rect.x1.min(sub_band_rect.x1).div_ceil(cb_width),
-            precinct_rect.y1.min(sub_band_rect.y1).div_ceil(cb_height),
-        );
-        let code_blocks_x = if sub_band_rect.width() == 0 {
-            0
-        } else {
-            block_grid.width()
-        };
-        let code_blocks_y = if sub_band_rect.height() == 0 {
-            0
-        } else {
-            block_grid.height()
-        };
+        let rect = precinct_data.rect.intersect(sub_band_rect);
+        let columns = block_indices(rect.x0, rect.x1, resolution_tile.code_block_width());
+        let rows = block_indices(rect.y0, rect.y1, resolution_tile.code_block_height());
+        let code_blocks_x = columns.end - columns.start;
+        let code_blocks_y = rows.end - rows.start;
 
         let blocks = build_code_blocks(
-            block_grid,
+            columns,
+            rows,
             sub_band_rect,
             resolution_tile,
-            code_blocks_x,
-            code_blocks_y,
             tile,
             storage,
             cancel,
@@ -180,12 +163,19 @@ fn build_precincts(
     Ok(start..end)
 }
 
+fn block_indices(start: u32, end: u32, size: u32) -> Range<u32> {
+    if start == end {
+        0..0
+    } else {
+        start / size..end.div_ceil(size)
+    }
+}
+
 fn build_code_blocks(
-    block_grid: IntRect,
+    columns: Range<u32>,
+    rows: Range<u32>,
     sub_band_rect: IntRect,
     tile_instance: &ResolutionTile<'_>,
-    code_blocks_x: u32,
-    code_blocks_y: u32,
     tile: &Tile<'_>,
     storage: &mut DecompositionStorage<'_>,
     cancel: Cancel<'_>,
@@ -195,13 +185,13 @@ fn build_code_blocks(
 
     let start = storage.code_blocks.len();
 
-    for y_idx in 0..code_blocks_y {
+    for row in rows.clone() {
         cancel.check()?;
 
-        let y = (block_grid.y0 + y_idx) * code_block_height;
+        let y = row * code_block_height;
 
-        for x_idx in 0..code_blocks_x {
-            let x = (block_grid.x0 + x_idx) * code_block_width;
+        for column in columns.clone() {
+            let x = column * code_block_width;
             let area = IntRect::from_xywh(x, y, code_block_width, code_block_height)
                 .intersect(sub_band_rect);
 
@@ -213,8 +203,8 @@ fn build_code_blocks(
             let end = storage.layers.len();
 
             storage.code_blocks.push(CodeBlock {
-                x_idx,
-                y_idx,
+                x_idx: column - columns.start,
+                y_idx: row - rows.start,
                 rect: area,
                 has_been_included: false,
                 missing_bit_planes: 0,

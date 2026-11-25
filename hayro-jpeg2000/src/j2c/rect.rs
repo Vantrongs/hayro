@@ -45,3 +45,17 @@ impl IntRect {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn padded_rect_at_grid_limit() {
+        let end = u32::MAX;
+        assert_eq!(
+            IntRect::from_xywh(end - 3, end - 7, 4, 8),
+            IntRect::from_ltrb(end - 3, end - 7, end, end),
+        );
+    }
+}

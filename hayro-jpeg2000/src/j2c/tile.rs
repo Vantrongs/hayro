@@ -551,31 +551,21 @@ impl<'a> ResolutionTile<'a> {
             .num_decomposition_levels()
             - self.resolution;
 
-        let x_stride =
-            1_u32.checked_shl(self.precinct_exponent_x().checked_add(nl_minus_r)? as u32)?;
-        let y_stride =
-            1_u32.checked_shl(self.precinct_exponent_y().checked_add(nl_minus_r)? as u32)?;
-
-        let precinct_x_step = (self
-            .component_tile
-            .component_info
-            .size_info
-            .horizontal_resolution as u32)
-            .checked_mul(x_stride)?;
-
-        let precinct_y_step = (self
-            .component_tile
-            .component_info
-            .size_info
-            .vertical_resolution as u32)
-            .checked_mul(y_stride)?;
+        let x_stride = 1_u64 << (self.precinct_exponent_x() + nl_minus_r);
+        let y_stride = 1_u64 << (self.precinct_exponent_y() + nl_minus_r);
+        let size_info = &self.component_tile.component_info.size_info;
+        let precinct_x_step = u64::from(size_info.horizontal_resolution) * x_stride;
+        let precinct_y_step = u64::from(size_info.vertical_resolution) * y_stride;
 
         let empty = num_precincts_x == 0 || num_precincts_y == 0;
+        if empty && (precinct_x_step > u64::from(u32::MAX) || precinct_y_step > u64::from(u32::MAX))
+        {
+            return None;
+        }
         let positions =
-            |origin: u32, resolution_origin: u32, stride: u32, step: u32, count: u32| {
-                let step = u64::from(step);
+            |origin: u32, resolution_origin: u32, stride: u64, step: u64, count: u32| {
                 let mut first = u64::from(origin);
-                if (u64::from(resolution_origin) << nl_minus_r).is_multiple_of(u64::from(stride)) {
+                if (u64::from(resolution_origin) << nl_minus_r).is_multiple_of(stride) {
                     first = first.next_multiple_of(step);
                 }
                 let count = if empty { 0 } else { count };
@@ -699,6 +689,58 @@ mod tests {
         CodingStyleParameters, ComponentSizeInfo, QuantizationInfo, QuantizationStyle, SizeData,
         WaveletTransform,
     };
+
+    #[test]
+    fn blocks_at_grid_limit() {
+        use crate::cancel::Cancel;
+        use crate::j2c::{build, decode::DecompositionStorage};
+
+        let end = u32::MAX;
+        let rect = IntRect::from_ltrb(end - 1, end - 1, end, end);
+        for levels in 0..=2 {
+            let tile = Tile {
+                rect,
+                num_layers: 1,
+                tile_parts: vec![],
+                progression_order: ProgressionOrder::LayerResolutionComponentPosition,
+                progression_changes: vec![],
+                mct: false,
+                component_infos: vec![ComponentInfo {
+                    size_info: ComponentSizeInfo {
+                        precision: 8,
+                        horizontal_resolution: 1,
+                        vertical_resolution: 1,
+                    },
+                    coding_style: CodingStyleComponent {
+                        flags: CodingStyleFlags::default(),
+                        parameters: CodingStyleParameters {
+                            num_decomposition_levels: levels,
+                            num_resolution_levels: levels + 1,
+                            code_block_width: 2,
+                            code_block_height: 2,
+                            code_block_style: CodeBlockStyle::default(),
+                            transformation: WaveletTransform::Irreversible97,
+                            precinct_exponents: vec![(15, 15); usize::from(levels + 1)],
+                        },
+                    },
+                    quantization_info: QuantizationInfo {
+                        quantization_style: QuantizationStyle::NoQuantization,
+                        guard_bits: 0,
+                        step_sizes: vec![],
+                    },
+                    roi_shift: 0,
+                }],
+            };
+            let mut storage = DecompositionStorage::default();
+            build::build(&tile, &mut storage, 0, Cancel(None)).unwrap();
+            assert_eq!(storage.code_blocks.len(), 1);
+            assert_eq!(storage.code_blocks[0].rect.area(), 1);
+            if levels == 0 {
+                assert_eq!(storage.precincts.len(), 1);
+                assert_eq!(storage.code_blocks[0].rect, rect);
+            }
+        }
+    }
 
     #[test]
     fn test_jpeg2000_standard_example_b4() {
