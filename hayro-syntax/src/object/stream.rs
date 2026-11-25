@@ -8,7 +8,9 @@ use crate::object::dict::keys::{DECODE_PARMS, DP, F, FILTER, IDENTITY, LENGTH, N
 use crate::object::{Array, ObjectIdentifier};
 use crate::object::{Object, ObjectLike, ObjectRefLike};
 use crate::reader::Reader;
-use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
+use crate::reader::{
+    Ends, Readable, ReaderContext, ReaderExt, Skippable, Unknown, skip_white_spaces_and_comments_in,
+};
 use crate::trivia::is_white_space_character;
 use crate::util::find_needle;
 use alloc::borrow::Cow;
@@ -61,7 +63,15 @@ impl<'a> Stream<'a> {
         ctx: &ReaderContext<'a>,
     ) -> Option<(Self, usize)> {
         let dict = r.read_with_context::<Dict<'_>>(ctx)?;
-        r.skip_white_spaces_and_comments();
+        Self::read_after_dict(r, dict, &Unknown)
+    }
+
+    pub(crate) fn read_after_dict(
+        r: &mut Reader<'a>,
+        dict: Dict<'a>,
+        ends: &impl Ends,
+    ) -> Option<(Self, usize)> {
+        skip_white_spaces_and_comments_in(r, ends);
         r.forward_tag(b"stream")?;
         r.read_eol()?;
         let start = r.offset();
