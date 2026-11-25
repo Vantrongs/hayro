@@ -12,6 +12,7 @@ use crate::object::dict::keys::{
 };
 use crate::object::dict::probe_dict;
 use crate::object::indirect::IndirectObject;
+use crate::object::stream::NextEndstream;
 use crate::object::{Array, MaybeRef};
 use crate::object::{DateTime, Dict};
 use crate::object::{Object, ObjectLike};
@@ -85,6 +86,7 @@ fn fallback_xref_map_inner<'a>(
     let mut r = Reader::new(data.as_ref());
 
     let mut last_obj_num = None;
+    let mut next_endstream = NextEndstream::default();
 
     loop {
         let cur_pos = r.offset();
@@ -125,17 +127,18 @@ fn fallback_xref_map_inner<'a>(
                         }
 
                         if dict.get::<Name<'_>>(TYPE).as_deref() == Some(b"ObjStm")
-                            && let Some((stream, _)) =
-                                Stream::read_after_dict(&mut r.clone(), dict, ends)
                             && let Some(last_obj_num) = last_obj_num
-                            && let Some(obj_stream) = ObjectStream::new(&stream)
+                            && let Some((stream, _)) =
+                                Stream::read_after_dict(&mut r.clone(), dict, ends, &mut next_endstream)
+                            && let Ok(data) = stream.decoded_data()
+                            && let Some(offsets) = ObjectStream::read_offsets(&stream, &data)
                         {
-                            for (idx, (obj_num, offset)) in obj_stream.offsets.iter().enumerate() {
+                            for (idx, (obj_num, offset)) in offsets.into_iter().enumerate() {
                                 if offset.is_none() {
                                     continue;
                                 }
 
-                                let id = ObjectIdentifier::new(*obj_num, 0);
+                                let id = ObjectIdentifier::new(obj_num, 0);
                                 if xref_map
                                     .get(&id)
                                     .is_none_or(|e| !matches!(e, &EntryType::Normal(_)))
@@ -1076,6 +1079,37 @@ fn parse_metadata(info_dict: &Dict<'_>) -> Metadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebuild_object_stream_offsets() {
+        let pdf = b"1 0 obj null endobj\n2 0 obj\n\
+            << /Type /ObjStm /N 3 /First 13 >> stream\n\
+            1 0 4 5 5 99 null null\nendstream\nendobj";
+        let data = PdfData::from(pdf.to_vec());
+        let (map, _) = fallback_xref_map(&data, b"");
+        let entry = |number| map.get(&ObjectIdentifier::new(number, 0));
+        assert_eq!(entry(1), Some(&EntryType::Normal(0)));
+        assert_eq!(entry(4), Some(&EntryType::ObjStream(2, 1)));
+        assert_eq!(entry(5), None);
+    }
+
+    #[test]
+    fn rebuild_object_stream_in_comment_before_cached_search() {
+        // The ASCII85 payload starts with a comment delimiter and decodes to "\r4 0 null".
+        let prefix = b"1 0 obj << /Type /ObjStm >>\n\
+            % 2 0 obj << /Type /ObjStm /N 1 /First 5 /Filter /ASCII85Decode >> stream\n\
+            %5]1]+Du=<C] endstream\n\
+            stream\n|";
+        for suffix in [b"".as_slice(), b" endstream"] {
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice(suffix);
+            let (map, _) = fallback_xref_map(&PdfData::from(bytes), b"");
+            assert_eq!(
+                map.get(&ObjectIdentifier::new(4, 0)),
+                Some(&EntryType::ObjStream(2, 0))
+            );
+        }
+    }
 
     #[test]
     fn circular_prev_chain() {

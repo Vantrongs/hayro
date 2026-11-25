@@ -63,13 +63,14 @@ impl<'a> Stream<'a> {
         ctx: &ReaderContext<'a>,
     ) -> Option<(Self, usize)> {
         let dict = r.read_with_context::<Dict<'_>>(ctx)?;
-        Self::read_after_dict(r, dict, &Unknown)
+        Self::read_after_dict(r, dict, &Unknown, &mut NextEndstream::default())
     }
 
     pub(crate) fn read_after_dict(
         r: &mut Reader<'a>,
         dict: Dict<'a>,
         ends: &impl Ends,
+        next: &mut NextEndstream,
     ) -> Option<(Self, usize)> {
         skip_white_spaces_and_comments_in(r, ends);
         r.forward_tag(b"stream")?;
@@ -82,13 +83,13 @@ impl<'a> Stream<'a> {
         let data = length
             .and_then(|length| {
                 let data = r.read_bytes(length)?;
-                r.skip_white_spaces();
+                next.skip_white_spaces(r);
                 r.forward_tag(b"endstream")?;
                 Some(data)
             })
             .or_else(|| {
                 r.jump(start);
-                parse_fallback(r)
+                next.read(r)
             })?;
         // A recovered terminator can precede the declared end of the payload.
         let payload_end = start.saturating_add(length.unwrap_or(0));
@@ -355,19 +356,47 @@ impl FilterResult<'_> {
     }
 }
 
-fn parse_fallback<'a>(r: &mut Reader<'a>) -> Option<&'a [u8]> {
-    // TODO: This search can take quadratic time in total when many streams with a wrong length
-    // have no `endstream` after them, or only a distant one.
-    let tail = r.tail()?;
-    let endstream_offset = find_needle(tail, b"endstream")?;
-    let data_end = trim_trailing_ascii_whitespace(&tail[..endstream_offset]);
-    let data = tail.get(..data_end)?;
+#[derive(Default)]
+pub(crate) struct NextEndstream {
+    searched_from: Option<usize>,
+    // None after a search means it reached EOF.
+    marker: Option<(usize, usize)>,
+    whitespace: core::ops::Range<usize>,
+}
 
-    r.read_bytes(endstream_offset)?;
-    r.skip_white_spaces();
-    r.forward_tag(b"endstream")?;
+impl NextEndstream {
+    fn skip_white_spaces(&mut self, r: &mut Reader<'_>) {
+        let start = r.offset();
+        while r.peek_byte().is_some_and(is_white_space_character) {
+            if self.whitespace.contains(&r.offset()) {
+                r.jump(self.whitespace.end);
+                break;
+            }
+            r.forward();
+        }
 
-    Some(data)
+        if start < r.offset() && !self.whitespace.contains(&start) {
+            self.whitespace = start..r.offset();
+        }
+    }
+
+    fn read<'a>(&mut self, r: &mut Reader<'a>) -> Option<&'a [u8]> {
+        let start = r.offset();
+        if self.searched_from.is_none_or(|from| start < from)
+            || self.marker.is_some_and(|(_, marker)| start > marker)
+        {
+            let tail = r.tail()?;
+            self.searched_from = Some(start);
+            self.marker = find_needle(tail, b"endstream").map(|offset| {
+                let whitespace = trim_trailing_ascii_whitespace(&tail[..offset]);
+                (start + whitespace, start + offset)
+            });
+        }
+
+        let (whitespace, marker) = self.marker?;
+        r.jump(marker + b"endstream".len());
+        r.range(start..whitespace.max(start))
+    }
 }
 
 fn trim_trailing_ascii_whitespace(data: &[u8]) -> usize {
@@ -423,13 +452,13 @@ mod tests {
 
     #[test]
     fn stream() {
-        let data = b"<< /Length 10 >> stream\nabcdefghij\nendstream";
+        let data = b"<< /Length 10 >> stream\nendstream!\nendstream";
         let mut r = Reader::new(data);
         let stream = r
             .read_indirect::<Stream<'_>>(&ReaderContext::dummy())
             .unwrap();
 
-        assert_eq!(stream.data, b"abcdefghij");
+        assert_eq!(stream.data, b"endstream!");
     }
 
     #[test]
@@ -441,6 +470,57 @@ mod tests {
             .unwrap();
 
         assert_eq!(stream.data, b"abcdefghij");
+    }
+
+    #[test]
+    fn endstream_cursor() {
+        use super::NextEndstream;
+
+        let input = b"abc  endstream def\nendstream";
+        let mut next = NextEndstream::default();
+        let mut r = Reader::new(input);
+        assert_eq!(next.read(&mut r).unwrap(), b"abc");
+        r.jump(4);
+        assert_eq!(next.read(&mut r).unwrap(), b"");
+        assert_eq!(next.searched_from, Some(0));
+        assert_eq!(next.marker, Some((3, 5)));
+        assert_eq!(next.read(&mut r).unwrap(), b" def");
+        assert!(next.read(&mut r).is_none());
+        assert!(next.read(&mut r).is_none());
+        assert_eq!(next.searched_from, Some(input.len()));
+        assert_eq!(next.marker, None);
+
+        r.jump(0);
+        assert_eq!(next.read(&mut r).unwrap(), b"abc");
+        assert_eq!(next.read(&mut r).unwrap(), b" def");
+        r.jump(1);
+        assert_eq!(next.read(&mut r).unwrap(), b"bc");
+    }
+
+    #[test]
+    fn declared_length_whitespace() {
+        use super::NextEndstream;
+        use crate::object::Dict;
+
+        let mut next = NextEndstream::default();
+        let body = b"stream\nx     ! endstream";
+        for (bytes, whitespace) in [
+            (b"<< /Length 3 >>", 10..13),
+            (b"<< /Length 4 >>", 10..13),
+            (b"<< /Length 1 >>", 8..13),
+        ] {
+            let mut reader = Reader::new(body);
+            let dict = Reader::new(bytes)
+                .read_without_context::<Dict<'_>>()
+                .unwrap();
+            assert_eq!(
+                Stream::read_body(&mut reader, dict, &mut next)
+                    .unwrap()
+                    .data,
+                b"x     !"
+            );
+            assert_eq!(next.whitespace, whitespace);
+        }
     }
 
     #[test]
