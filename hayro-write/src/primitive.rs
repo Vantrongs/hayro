@@ -2,8 +2,8 @@ use crate::ExtractionContext;
 use hayro_syntax::Filter;
 use hayro_syntax::object;
 use hayro_syntax::object::dict::keys::{
-    AF, DECODE_PARMS, DP, FILTER, LAST_MODIFIED, LENGTH, METADATA, OC, OPI, PIECE_INFO, PT_DATA,
-    REF, STRUCT_PARENT, STRUCT_PARENTS,
+    AF, DECODE_PARMS, DP, FILTER, LAST_MODIFIED, LENGTH, METADATA, OPI, PIECE_INFO, PT_DATA, REF,
+    STRUCT_PARENT, STRUCT_PARENTS,
 };
 use hayro_syntax::object::{MaybeRef, Null, Number, ObjectIdentifier, Stream};
 use hayro_syntax::object::{Object, array, dict};
@@ -18,7 +18,6 @@ static IGNORE_KEYS: LazyLock<HashSet<&'static [u8]>> = LazyLock::new(|| {
 
     m.insert(METADATA);
     m.insert(STRUCT_PARENT);
-    m.insert(OC);
     m.insert(AF);
     m.insert(PT_DATA);
     m.insert(REF);

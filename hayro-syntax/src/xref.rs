@@ -381,7 +381,11 @@ impl XRef {
                     version: None,
                 };
 
-                (td, false, Metadata::default())
+                (
+                    td,
+                    root.get::<Dict<'_>>(OCPROPERTIES).is_some(),
+                    Metadata::default(),
+                )
             }
         };
 

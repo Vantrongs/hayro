@@ -33,14 +33,13 @@ fn main() {
     )
     .unwrap();
 
-    let chunk = extraction_result.chunk;
     let page_ref = extraction_result.root_refs[0].unwrap();
     let parent = extraction_result.page_tree_parent_ref;
 
     let catalog_id = new_ref();
     let mut out_pdf = pdf_writer::Pdf::with_settings(ChunkSettings { pretty: false });
-    out_pdf.extend(&chunk);
-    out_pdf.catalog(catalog_id).pages(parent);
+    out_pdf.extend(&extraction_result.chunk);
+    extraction_result.write_catalog(&mut out_pdf.catalog(catalog_id));
     out_pdf.pages(parent).kids([page_ref]).count(1);
 
     std::fs::write(
