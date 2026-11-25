@@ -129,8 +129,8 @@ overflow-checks = true
 zlib-rs = { git = "https://github.com/Vantrongs/zlib-rs", rev = "124359709a6ed94bda6fe1ff4d413e23bbae34e5" }
 zune-jpeg = { git = "https://github.com/Vantrongs/zune-image", rev = "4f919494d5037ffff1b873a7aa87afe0a13de248" }
 pdf-writer = { git = "https://github.com/Vantrongs/pdf-writer", rev = "daf9012abec3d7284d756c48ae9d5e5e01cf18b6" }
-vello_cpu = { git = "https://github.com/Vantrongs/vello", rev = "061fd7ee08e7fcfffba07c07338edad303b4f0dd" }
-vello_common = { git = "https://github.com/Vantrongs/vello", rev = "061fd7ee08e7fcfffba07c07338edad303b4f0dd" }
+vello_cpu = { git = "https://github.com/Vantrongs/vello", rev = "7c07f1704aa4b94548e1074f4b777d2dbac31560" }
+vello_common = { git = "https://github.com/Vantrongs/vello", rev = "7c07f1704aa4b94548e1074f4b777d2dbac31560" }
 
 html5ever = { git = "https://github.com/Vantrongs/html5ever", rev = "16c09dc3dab410bf600c2a721d8a5dfd500c9324" }
 string_cache = { git = "https://github.com/Vantrongs/string-cache", rev = "fa62c6494ca80e41784fb79760ca2e8e0d079ab4" }
