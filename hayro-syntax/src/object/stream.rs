@@ -78,9 +78,7 @@ impl<'a> Stream<'a> {
         ends: &impl Ends,
         next: &mut NextEndstream,
     ) -> Option<(Self, usize)> {
-        skip_white_spaces_and_comments_in(r, ends);
-        r.forward_tag(b"stream")?;
-        r.read_eol()?;
+        forward_stream_opener(r, ends)?;
         let start = r.offset();
         let length = dict
             .get::<i64>(LENGTH)
@@ -317,8 +315,18 @@ impl<'a> Readable<'a> for Stream<'a> {
     }
 
     fn read_indirect(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
+        let mut after_dict = r.clone();
+        after_dict.skip::<Dict<'_>>(ctx.in_content_stream())?;
+        forward_stream_opener(&mut after_dict, &Unknown)?;
+
         Self::read_with_extent(r, ctx).map(|(stream, _)| stream)
     }
+}
+
+fn forward_stream_opener(r: &mut Reader<'_>, ends: &impl Ends) -> Option<()> {
+    skip_white_spaces_and_comments_in(r, ends);
+    r.forward_tag(b"stream")?;
+    r.read_eol()
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -537,7 +545,8 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 Stream::read_after_dict(&mut reader, dict, &super::Unknown, &mut next)
-                    .unwrap().0
+                    .unwrap()
+                    .0
                     .data,
                 b"x     !"
             );

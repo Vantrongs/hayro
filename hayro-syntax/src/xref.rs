@@ -572,9 +572,10 @@ impl XRef {
                     if object.id() == &id {
                         return Some(object.get());
                     }
-                } else {
+                } else if r.read_without_context::<ObjectIdentifier>() == Some(id) {
+                    r.skip_white_spaces_and_comments();
                     // A valid object of another type needs no repair.
-                    if r.skip::<IndirectObject<Object<'_>>>(false).is_some() {
+                    if r.skip::<Object<'_>>(false).is_some() {
                         return None;
                     }
                 };
