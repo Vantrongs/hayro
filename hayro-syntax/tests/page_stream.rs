@@ -288,6 +288,28 @@ fn partial_contents_array_is_read_again() {
 }
 
 #[test]
+fn ignored_content_string_cost_is_independent_of_length() {
+    let read = |length| {
+        let string = format!("<{}>", "ab".repeat(length)).into_bytes();
+        let pdf = Pdf::new(common::one_page(
+            10,
+            "/Contents [4 0 R 5 0 R]",
+            vec![common::stream("", b"q Q"), string],
+        ))
+        .unwrap();
+        let page = &pdf.pages()[0];
+        let mut cache = hayro_syntax::page::PageStreamCache::default();
+        let (first, used) = measure(|| cache.get(page).unwrap());
+        let second = cache.get(page).unwrap();
+        assert_eq!(first.as_slice(), b"q Q ");
+        assert_eq!(first, second);
+        assert!(!std::sync::Arc::ptr_eq(&first, &second));
+        (used.allocated, used.held)
+    };
+    assert_eq!(read(16), read(1 << 20));
+}
+
+#[test]
 fn recovered_filter_prefix_is_reused() {
     for (contents, expected) in [("4 0 R", b"q Q".as_slice()), ("[4 0 R]", b"q Q ")] {
         let pdf = Pdf::new(common::one_page(

@@ -493,16 +493,22 @@ impl<'a> Page<'a> {
                     collected.extend_from_within(range.clone());
                     continue;
                 }
-                let object = match item {
-                    MaybeRef::Ref(r) => self.xref().get_with::<Object<'_>>(r.into(), array.ctx()),
-                    MaybeRef::NotRef(object) => Some(object),
-                };
-                if matches!(object, None | Some(Object::Null(_))) {
-                    continue;
-                }
-                let Some(Object::Stream(stream)) = object else {
-                    *complete = false;
-                    continue;
+                let stream = match item {
+                    MaybeRef::Ref(r) => {
+                        let id = r.into();
+                        let Some(stream) = self.xref().get_with::<Stream<'_>>(id, array.ctx())
+                        else {
+                            *complete &= self.xref().get_with::<Null>(id, array.ctx()).is_some();
+                            continue;
+                        };
+                        stream
+                    }
+                    MaybeRef::NotRef(Object::Stream(stream)) => stream,
+                    MaybeRef::NotRef(Object::Null(_)) => continue,
+                    MaybeRef::NotRef(_) => {
+                        *complete = false;
+                        continue;
+                    }
                 };
                 let start = collected.len();
                 if let Ok(data) = stream.decoded() {
