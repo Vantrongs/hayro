@@ -106,6 +106,7 @@ impl String<'_> {
                 let start = r.offset();
 
                 if let Some(end) = ends.string_end(start) {
+                    let end = end.filter(|&offset| offset <= r.len());
                     r.jump(end.unwrap_or(r.len()));
                     end.map(|_| ())
                 } else {

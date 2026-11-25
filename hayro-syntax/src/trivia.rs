@@ -73,7 +73,7 @@ impl Comment<'_> {
         r.forward_tag(b"%")?;
 
         if let Some(end) = ends.comment_end(start) {
-            r.jump(end);
+            r.jump(end.min(r.len()));
         } else {
             r.forward_while(|b| !is_eol_character(b));
             ends.read(r.offset() - start);

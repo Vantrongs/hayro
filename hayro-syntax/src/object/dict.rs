@@ -238,18 +238,41 @@ fn read_inner<'a>(
 ) -> Option<Dict<'a>> {
     let mut offsets = Vec::with_capacity(8);
 
-    let data = parse_dict_with(
-        r,
-        ctx,
-        &Unknown,
-        start_tag,
-        end_tag,
-        #[inline]
-        |name, offset, _| {
+    let depth = usize::from(start_tag.is_some());
+    let dict_data = r.tail()?;
+    let start_offset = r.offset();
+
+    if let Some(start_tag) = start_tag {
+        r.forward_tag(start_tag)?;
+    }
+
+    let data = loop {
+        r.skip_white_spaces_and_comments();
+
+        if let Some(()) = r.peek_tag(end_tag) {
+            r.forward_tag(end_tag)?;
+            let end_offset = r.offset() - start_offset;
+
+            break &dict_data[..end_offset];
+        } else {
+            let Some(name) = r.read_without_context::<Name<'_>>() else {
+                if start_tag.is_some() {
+                    // Lenient: skip garbage between entries (not in inline dicts).
+                    Object::skip_in(r, ctx.in_content_stream(), depth, &Unknown)?;
+                    continue;
+                } else {
+                    return None;
+                }
+            };
+            r.skip_white_spaces_and_comments();
+
+            let offset = r.offset() - start_offset;
+            // Null entries are kept: checking for them would resolve references before decryption is set up.
             offsets.push((name, offset));
-            Some(())
-        },
-    )?;
+
+            Object::skip_maybe_ref_in(r, ctx.in_content_stream(), depth, &Unknown)?;
+        }
+    };
 
     if offsets.len() > MAX_UNSORTED_LEN {
         offsets.sort_by(|(a, _), (b, _)| a.as_ref().cmp(b.as_ref()));
@@ -261,95 +284,6 @@ fn read_inner<'a>(
         offsets,
         ctx: ctx.clone(),
     }))))
-}
-
-pub(crate) struct DictProbe<'a> {
-    pub(crate) data: &'a [u8],
-    pub(crate) has_root: bool,
-    pub(crate) has_type: bool,
-}
-
-pub(crate) fn probe_dict<'a>(
-    r: &mut Reader<'a>,
-    ctx: &ReaderContext<'a>,
-    ends: &impl Ends,
-    start_tag: Option<&[u8]>,
-    end_tag: &[u8],
-) -> Option<DictProbe<'a>> {
-    let mut has_root = false;
-    let mut has_type = false;
-
-    let data = parse_dict_with(
-        r,
-        ctx,
-        ends,
-        start_tag,
-        end_tag,
-        #[inline]
-        |name, _, _value_reader| {
-            if name.as_ref() == keys::ROOT {
-                has_root = true;
-            } else if name.as_ref() == keys::TYPE {
-                has_type = true;
-            }
-
-            Some(())
-        },
-    )?;
-
-    Some(DictProbe {
-        data,
-        has_root,
-        has_type,
-    })
-}
-
-fn parse_dict_with<'a, F>(
-    r: &mut Reader<'a>,
-    ctx: &ReaderContext<'a>,
-    ends: &impl Ends,
-    start_tag: Option<&[u8]>,
-    end_tag: &[u8],
-    mut on_entry: F,
-) -> Option<&'a [u8]>
-where
-    F: FnMut(Name<'a>, usize, &Reader<'a>) -> Option<()>,
-{
-    let depth = usize::from(start_tag.is_some());
-    let dict_data = r.tail()?;
-    let start_offset = r.offset();
-
-    if let Some(start_tag) = start_tag {
-        r.forward_tag(start_tag)?;
-    }
-
-    loop {
-        skip_white_spaces_and_comments_in(r, ends);
-
-        if let Some(()) = r.peek_tag(end_tag) {
-            r.forward_tag(end_tag)?;
-            let end_offset = r.offset() - start_offset;
-
-            break Some(&dict_data[..end_offset]);
-        } else {
-            let Some(name) = r.read_without_context::<Name<'_>>() else {
-                if start_tag.is_some() {
-                    // Lenient: skip garbage between entries (not in inline dicts).
-                    Object::skip_in(r, ctx.in_content_stream(), depth, ends)?;
-                    continue;
-                } else {
-                    return None;
-                }
-            };
-            skip_white_spaces_and_comments_in(r, ends);
-
-            let offset = r.offset() - start_offset;
-            // Null entries are kept: checking for them would resolve references before decryption is set up.
-            on_entry(name, offset, r)?;
-
-            Object::skip_maybe_ref_in(r, ctx.in_content_stream(), depth, ends)?;
-        }
-    }
 }
 
 object!(Dict<'a>, Dict);

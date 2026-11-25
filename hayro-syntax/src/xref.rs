@@ -10,7 +10,6 @@ use crate::object::dict::keys::{
     AUTHOR, CREATION_DATE, CREATOR, ENCRYPT, FIRST, ID, INDEX, INFO, KEYWORDS, MOD_DATE, N,
     OCPROPERTIES, PAGES, PREV, PRODUCER, ROOT, SIZE, SUBJECT, TITLE, TYPE, VERSION, W, XREF_STM,
 };
-use crate::object::dict::probe_dict;
 use crate::object::indirect::IndirectObject;
 use crate::object::stream::NextEndstream;
 use crate::object::{Array, MaybeRef};
@@ -33,6 +32,8 @@ use core::ops::Deref;
 use token_ends::LazyEnds;
 
 mod token_ends;
+
+mod containers;
 
 pub(crate) const XREF_ENTRY_LEN: usize = 20;
 
@@ -85,11 +86,13 @@ fn fallback_xref_map_inner<'a>(
 
     let mut r = Reader::new(data.as_ref());
 
+    let mut containers = containers::Containers::default();
     let mut last_obj_num = None;
     let mut next_endstream = NextEndstream::default();
 
     loop {
         let cur_pos = r.offset();
+        containers.evict_before(cur_pos);
 
         if r.peek_byte().is_some_and(|b: u8| b.is_ascii_digit()) {
             let mut header = r.clone();
@@ -97,7 +100,7 @@ fn fallback_xref_map_inner<'a>(
                 r = header;
                 let mut cloned = r.clone();
                 skip_white_spaces_and_comments_in(&mut cloned, ends);
-                if Object::skip_in(&mut cloned, false, 0, ends).is_some() {
+                if containers.skip_object(ends, &mut cloned).is_some() {
                     xref_map.insert(obj_id, EntryType::Normal(cur_pos));
                     last_obj_num = Some(obj_id);
                     dummy_ctx.set_obj_number(obj_id);
@@ -106,14 +109,12 @@ fn fallback_xref_map_inner<'a>(
                 r.forward_while(|b| !is_white_space_character(b));
             }
         } else {
-            let mut probe_reader = r.clone();
             if r.peek_bytes(2).is_some_and(|b| b == b"<<")
-                && let Some(probe) =
-                    { probe_dict(&mut probe_reader, &dummy_ctx, ends, Some(b"<<"), b">>") }
+                && let Some(probe) = containers.resolve(ends, r.clone())
             {
-                r = probe_reader;
+                r.jump(probe.end);
                 if probe.has_root || probe.has_type {
-                    let mut dict_reader = Reader::new(probe.data);
+                    let mut dict_reader = Reader::new(&data.as_ref()[cur_pos..probe.end]);
                     if let Some(dict) = dict_reader.read_with_context::<Dict<'_>>(&dummy_ctx) {
                         if probe.has_root && dict.contains_key(ROOT) {
                             trailer_dicts.push(dict.clone());
@@ -165,6 +166,8 @@ fn fallback_xref_map_inner<'a>(
             break;
         }
     }
+
+    drop(containers);
 
     let mut trailer_dict = None;
 
@@ -1116,6 +1119,50 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_entries_and_trailer_match_object_reads() {
+        for depth in [511, 512, 513] {
+            let trailer = b"<< /Root 2 0 R >>";
+            let catalog = b"<< /Type /Catalog /Pages 3 0 R >>";
+            let mut bytes = b"1 0 obj ".to_vec();
+            let body = bytes.len();
+            bytes.extend(iter::repeat_n(b'[', depth));
+            bytes.extend(iter::repeat_n(b']', depth));
+            bytes.extend_from_slice(b" endobj\n<< /Broken [\n");
+            let catalog_offset = bytes.len();
+            bytes.extend_from_slice(b"2 0 obj ");
+            bytes.extend_from_slice(catalog);
+            bytes.extend_from_slice(b" endobj\n");
+            let pages_offset = bytes.len();
+            bytes.extend_from_slice(b"3 0 obj << /Kids [] /Count 0 >> endobj\n");
+
+            let mut expected = XrefMap::default();
+            if Reader::new_with(&bytes, body)
+                .skip::<Object<'_>>(false)
+                .is_some()
+            {
+                expected.insert(ObjectIdentifier::new(1, 0), EntryType::Normal(0));
+            }
+            let root = ObjectIdentifier::new(2, 0);
+            expected.insert(root, EntryType::Normal(catalog_offset));
+            expected.insert(ObjectIdentifier::new(3, 0), EntryType::Normal(pages_offset));
+
+            for with_trailer in [false, true] {
+                if with_trailer {
+                    bytes.extend_from_slice(trailer);
+                }
+                let data = bytes.clone().into();
+                let (entries, input) = fallback_xref_map(&data, b"");
+                assert_eq!(entries, expected);
+                if with_trailer {
+                    assert!(matches!(input, Some(XRefInput::TrailerDictData(d)) if d == trailer));
+                } else {
+                    assert!(matches!(input, Some(XRefInput::RootRef(id)) if id == root));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn damaged_ascii_hex_object_stream() {
         let mut reader = Reader::new(
             b"<< /Type /ObjStm /N 1 /First 4 /Length 13 /Filter /ASCIIHexDecode >>\n\
@@ -1147,6 +1194,62 @@ mod tests {
 
         let pdf = crate::Pdf::new(pdf).unwrap();
         assert_eq!(pdf.xref().get::<i32>(ObjectIdentifier::new(3, 0)), Some(42));
+    }
+
+    #[test]
+    fn rebuild_nested_broken_families_match_expected_entries_and_trailer() {
+        const N: usize = 1024;
+        let obj_spaced_array = (1..=N).map(|i| format!("{i} 0 obj [ ")).collect::<String>();
+        let obj_adjacent_array = (1..=N).map(|i| format!("{i} 0 obj[ ")).collect::<String>();
+        let obj_spaced_dict = (1..=N)
+            .map(|i| format!("{i} 0 obj << "))
+            .collect::<String>();
+        let obj_adjacent_dict = (1..=N).map(|i| format!("{i} 0 obj<< ")).collect::<String>();
+        let families = [
+            ("dict_key_nested", "<< /A ".repeat(N)),
+            ("dict_array_nested", "<< /A [ ".repeat(N)),
+            ("spaced_dicts", "<< ".repeat(N)),
+            ("obj_spaced_array", obj_spaced_array),
+            ("obj_adjacent_array", obj_adjacent_array),
+            ("obj_spaced_dict", obj_spaced_dict),
+            ("obj_adjacent_dict", obj_adjacent_dict),
+        ];
+
+        let trailer = b"<< /Root 9001 0 R >>";
+        for (name, prefix) in families {
+            let mut bytes = prefix.into_bytes();
+            bytes.push(b'\n');
+            let catalog_offset = bytes.len();
+            bytes.extend_from_slice(b"9001 0 obj << /Type /Catalog /Pages 9002 0 R >> endobj\n");
+            let pages_offset = bytes.len();
+            bytes.extend_from_slice(b"9002 0 obj << /Kids [] /Count 0 >> endobj\n");
+
+            let root = ObjectIdentifier::new(9001, 0);
+            let pages = ObjectIdentifier::new(9002, 0);
+            let mut expected = XrefMap::default();
+            expected.insert(root, EntryType::Normal(catalog_offset));
+            expected.insert(pages, EntryType::Normal(pages_offset));
+
+            for with_trailer in [false, true] {
+                if with_trailer {
+                    bytes.extend_from_slice(trailer);
+                }
+                let data = bytes.clone().into();
+                let (entries, input) = fallback_xref_map(&data, b"");
+                assert_eq!(entries, expected, "{name} (with_trailer={with_trailer})");
+                if with_trailer {
+                    assert!(
+                        matches!(input, Some(XRefInput::TrailerDictData(d)) if d == trailer),
+                        "{name}"
+                    );
+                } else {
+                    assert!(
+                        matches!(input, Some(XRefInput::RootRef(id)) if id == root),
+                        "{name}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -207,11 +207,11 @@ fn step(byte: u8, depth: &mut isize, escaped: &mut bool) {
 #[cfg(test)]
 mod tests {
     use super::{LazyEnds, TokenEnds};
-    use crate::object::dict::probe_dict;
     use crate::object::{Object, ObjectIdentifier};
     use crate::reader::{Ends, ReaderExt};
     use crate::reader::{Reader, ReaderContext, Unknown, skip_white_spaces_and_comments_in};
     use crate::trivia::Comment;
+    use crate::xref::containers::Containers;
     use crate::xref::fallback_xref_map_inner;
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -341,12 +341,13 @@ mod tests {
                     Object::skip_in(&mut looked_up, false, 0, &ends).map(|_| looked_up.offset());
                 assert_eq!(found, expected, "case {case}, object at {at} of {text:?}");
 
-                let mut plain = Reader::new_with(&data, at);
-                let mut looked_up = plain.clone();
-                let expected = probe_dict(&mut plain, &ctx, &Unknown, Some(b"<<"), b">>")
-                    .map(|p| (plain.offset(), p.data, p.has_root, p.has_type));
-                let found = probe_dict(&mut looked_up, &ctx, &ends, Some(b"<<"), b">>")
-                    .map(|p| (looked_up.offset(), p.data, p.has_root, p.has_type));
+                let reader = Reader::new_with(&data, at);
+                let probe =
+                    |p: super::super::containers::Container| (p.end, p.has_root, p.has_type);
+                let expected = Containers::default()
+                    .resolve(&Unknown, reader.clone())
+                    .map(probe);
+                let found = Containers::default().resolve(&ends, reader).map(probe);
                 assert_eq!(
                     found, expected,
                     "case {case}, dictionary at {at} of {text:?}"
@@ -393,7 +394,11 @@ mod tests {
         assert_eq!(expected.len(), 20);
         assert_eq!(rebuild(), expected);
         assert!(ends.table.get().is_none());
-        for _ in 0..2 {
+        let scanned_per_rebuild = expected.len() * (value.len() + 2);
+        let rebuilds =
+            (data.as_ref().len() * super::SCAN_PASSES_BEFORE_INDEX).div_ceil(scanned_per_rebuild);
+        for _ in 2..rebuilds {
+            assert!(ends.table.get().is_none());
             assert_eq!(rebuild(), expected);
         }
         assert!(ends.table.get().is_some());

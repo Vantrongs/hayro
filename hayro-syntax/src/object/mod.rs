@@ -215,9 +215,10 @@ impl Object<'_> {
         depth: usize,
         ends: &impl Ends,
     ) -> Option<()> {
-        r.skip::<ObjRef>(is_content_stream)
-            .map(|_| {})
-            .or_else(|| Self::skip_in(r, is_content_stream, depth, ends))
+        if !is_content_stream && r.skip::<ObjRef>(false).is_some() {
+            return Some(());
+        }
+        Self::skip_in(r, is_content_stream, depth, ends)
     }
 }
 
