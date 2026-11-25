@@ -266,6 +266,28 @@ fn distinct_streams_share_only_the_collected_output() {
 }
 
 #[test]
+fn partial_contents_array_is_read_again() {
+    for (part, reusable) in [
+        (common::stream("/Filter /DCTDecode", b"invalid JPEG"), false),
+        (b"42".to_vec(), false),
+        (b"null".to_vec(), true),
+    ] {
+        let pdf = Pdf::new(common::one_page(
+            10,
+            "/Contents [4 0 R null 5 0 R]",
+            vec![common::stream("", b"q Q"), part],
+        ))
+        .unwrap();
+        let mut cache = hayro_syntax::page::PageStreamCache::default();
+        let first = cache.get(&pdf.pages()[0]).unwrap();
+        let second = cache.get(&pdf.pages()[0]).unwrap();
+        assert_eq!(first.as_slice(), b"q Q ");
+        assert_eq!(first, second);
+        assert_eq!(std::sync::Arc::ptr_eq(&first, &second), reusable);
+    }
+}
+
+#[test]
 fn recovered_filter_prefix_is_reused() {
     for (contents, expected) in [("4 0 R", b"q Q".as_slice()), ("[4 0 R]", b"q Q ")] {
         let pdf = Pdf::new(common::one_page(

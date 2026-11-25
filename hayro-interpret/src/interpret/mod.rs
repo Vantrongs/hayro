@@ -139,7 +139,11 @@ pub fn interpret_page_with_view<'a>(
         let bytes = content.as_ref().map_or(&[][..], |v| v.as_slice());
         interpret(TypedIter::new(bytes), resources, context, device);
     } else {
-        context.interpreter_cache.page_content.take();
+        context
+            .interpreter_cache
+            .page_content
+            .borrow_mut()
+            .retain_page(page);
     }
     if context
         .settings

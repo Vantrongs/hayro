@@ -173,6 +173,17 @@ pub struct PageStreamCache<'a> {
 }
 
 impl<'a> PageStreamCache<'a> {
+    /// Release decoded content belonging to another page.
+    pub fn retain_page(&mut self, page: &Page<'a>) {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|(key, _)| *key != page.raw().content_key())
+        {
+            self.active = None;
+        }
+    }
+
     /// Read the page's content, reusing a read of the same dictionary that lost no objects.
     pub fn get(&mut self, page: &Page<'a>) -> Option<Arc<Vec<u8>>> {
         let key = page.raw().content_key();
@@ -182,9 +193,12 @@ impl<'a> PageStreamCache<'a> {
             return Some(bytes.clone());
         }
         self.active = None;
-        let (bytes, lost) = page.xref().watch(|| page.read_page_stream());
+        let mut complete = true;
+        let (bytes, lost) = page
+            .xref()
+            .watch(|| page.read_page_stream_with(&mut complete));
         let bytes = Arc::new(bytes?);
-        if lost.is_none() {
+        if complete && lost.is_none() {
             self.active = Some((key, bytes.clone()));
         }
         Some(bytes)
@@ -461,6 +475,10 @@ impl<'a> Page<'a> {
     /// the document is open. What reading it lost is told to the computation being
     /// watched.
     pub fn read_page_stream(&self) -> Option<Vec<u8>> {
+        self.read_page_stream_with(&mut true)
+    }
+
+    fn read_page_stream_with(&self, complete: &mut bool) -> Option<Vec<u8>> {
         if let Some(stream) = self.inner.get::<Stream<'_>>(CONTENTS) {
             Some(stream.decoded().ok()?.into_owned())
         } else if let Some(array) = self.inner.get::<Array<'_>>(CONTENTS) {
@@ -475,11 +493,15 @@ impl<'a> Page<'a> {
                     collected.extend_from_within(range.clone());
                     continue;
                 }
-                let stream = match item {
-                    MaybeRef::Ref(r) => self.xref().get_with::<Stream<'_>>(r.into(), array.ctx()),
-                    MaybeRef::NotRef(object) => object.into_stream(),
+                let object = match item {
+                    MaybeRef::Ref(r) => self.xref().get_with::<Object<'_>>(r.into(), array.ctx()),
+                    MaybeRef::NotRef(object) => Some(object),
                 };
-                let Some(stream) = stream else {
+                if matches!(object, None | Some(Object::Null(_))) {
+                    continue;
+                }
+                let Some(Object::Stream(stream)) = object else {
+                    *complete = false;
                     continue;
                 };
                 let start = collected.len();
@@ -488,6 +510,8 @@ impl<'a> Page<'a> {
                     collected.extend_from_slice(&data);
                     // Streams must have at least one whitespace in-between.
                     collected.push(b' ');
+                } else {
+                    *complete = false;
                 }
                 if let Some(key) = key {
                     ranges.insert(key, start..collected.len());

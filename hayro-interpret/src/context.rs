@@ -478,13 +478,17 @@ mod page_tests {
         ))
         .unwrap();
         let cache = InterpreterCache::new();
-        let draw = |i: usize, z: f64| {
+        use crate::interpret::RenderContent;
+        let draw = |i: usize, z: f64, render_content| {
             let mut ctx = Context::new(
                 Affine::scale(z),
                 Rect::new(z, z, 20., 30.),
                 &cache,
                 pdf.xref(),
-                InterpreterSettings::default(),
+                InterpreterSettings {
+                    render_content,
+                    ..Default::default()
+                },
             );
             interpret_page(&pdf.pages()[i], &mut ctx, &mut DummyDevice);
         };
@@ -495,15 +499,17 @@ mod page_tests {
                 .get(&pdf.pages()[0])
                 .unwrap()
         };
-        draw(0, 1.);
+        draw(0, 1., RenderContent::PAGE);
         let first = std::sync::Arc::downgrade(&content());
-        draw(0, 4.);
+        draw(0, 1., RenderContent::ANNOTATIONS);
+        draw(0, 4., RenderContent::PAGE);
         assert!(std::sync::Arc::ptr_eq(
             &first.upgrade().unwrap(),
             &content()
         ));
-        draw(1, 1.);
+        draw(1, 1., RenderContent::ANNOTATIONS);
         assert!(first.upgrade().is_none());
+        draw(1, 1., RenderContent::PAGE);
         let second = std::sync::Arc::downgrade(
             &cache
                 .page_content
