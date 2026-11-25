@@ -66,9 +66,10 @@ impl Filter {
         data: &[u8],
         params: &Dict<'_>,
         #[cfg_attr(not(feature = "images"), allow(unused))] image_params: &ImageDecodeParams,
+        recover_ascii_hex: bool,
     ) -> Result<FilterResult<'static>, DecodeFailure> {
         match self {
-            Self::AsciiHexDecode => ascii_hex::decode(data)
+            Self::AsciiHexDecode => ascii_hex::decode_into(data, recover_ascii_hex)
                 .map(FilterResult::from_data)
                 .ok_or(DecodeFailure::StreamDecode),
             Self::Ascii85Decode => ascii_85::decode(data)

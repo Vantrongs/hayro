@@ -173,9 +173,7 @@ fn read_hex(r: &mut Reader<'_>) -> Option<SmallVec<[u8; 23]>> {
     let end = r.offset();
 
     let raw = r.range(start + 1..end - 1)?;
-    let decoded = ascii_hex::decode_into(raw)?;
-
-    Some(decoded)
+    ascii_hex::decode_into(raw, false)
 }
 
 fn skip_literal(r: &mut Reader<'_>) -> Option<()> {

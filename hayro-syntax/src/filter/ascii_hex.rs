@@ -1,66 +1,41 @@
-// Keep in sync with `hayro-postscript/src/string/ascii_hex.rs`.
-
 use crate::trivia::is_white_space_character;
 use crate::util::ByteBuf;
-use alloc::vec::Vec;
 
-pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
-    decode_into(data)
-}
-
-pub(crate) fn decode_into<B: ByteBuf>(data: &[u8]) -> Option<B> {
+pub(crate) fn decode_into<B: ByteBuf>(data: &[u8], recover_prefix: bool) -> Option<B> {
     let mut has_whitespace = false;
-    let mut end = data.len();
-
-    for (idx, byte) in data.iter().enumerate() {
-        has_whitespace |= is_white_space_character(*byte);
-
-        if *byte == b'>' {
-            end = idx;
+    let mut digit_count = 0;
+    for &byte in data {
+        if byte.is_ascii_hexdigit() {
+            digit_count += 1;
+        } else if is_white_space_character(byte) {
+            has_whitespace = true;
+        } else {
+            if byte != b'>' {
+                if !recover_prefix {
+                    return None;
+                }
+                digit_count -= digit_count % 2;
+            }
             break;
         }
     }
 
-    let data = &data[..end];
-    let mut decoded = B::with_capacity(data.len().div_ceil(2));
-
-    if !has_whitespace {
-        let (chunks, remainder) = data.as_chunks::<2>();
-
-        for &[hi, lo] in chunks {
-            decoded.push(decode_hex_digit(hi)? << 4 | decode_hex_digit(lo)?);
-        }
-
-        if let [hi] = remainder {
-            decoded.push(decode_hex_digit(*hi)? << 4);
-        }
+    let bytes = data.iter().copied();
+    Some(if has_whitespace {
+        decode_pairs(bytes.filter(|&b| !is_white_space_character(b)), digit_count)
     } else {
-        let mut iter = data.iter().copied();
-        let mut read_byte = || -> Option<u8> {
-            loop {
-                let b = iter.next()?;
-                if !is_white_space_character(b) {
-                    return Some(b);
-                }
-            }
-        };
+        decode_pairs(bytes, digit_count)
+    })
+}
 
-        loop {
-            match (read_byte(), read_byte()) {
-                (Some(hi), Some(lo)) => {
-                    decoded.push(decode_hex_digit(hi)? << 4 | decode_hex_digit(lo)?);
-                }
-                (Some(hi), None) => {
-                    decoded.push(decode_hex_digit(hi)? << 4);
-
-                    break;
-                }
-                (None, _) => break,
-            }
-        }
+fn decode_pairs<B: ByteBuf>(bytes: impl Iterator<Item = u8>, digit_count: usize) -> B {
+    let mut digits = bytes.take(digit_count).map_while(decode_hex_digit);
+    let mut decoded = B::with_capacity(digit_count.div_ceil(2));
+    while let Some(hi) = digits.next() {
+        decoded.push(hi << 4 | digits.next().unwrap_or(0));
     }
 
-    Some(decoded)
+    decoded
 }
 
 #[inline(always)]
@@ -75,29 +50,52 @@ pub(crate) fn decode_hex_digit(c: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use crate::filter::ascii_hex::decode;
+    use super::decode_into;
+    use alloc::vec::Vec;
 
     #[test]
     fn decode_simple() {
         let input = b"AF3E2901>";
-        assert_eq!(decode(input).unwrap(), vec![0xaf, 0x3e, 0x29, 0x01]);
+        assert_eq!(
+            decode_into::<Vec<u8>>(input, false).unwrap(),
+            vec![0xaf, 0x3e, 0x29, 0x01]
+        );
     }
 
     #[test]
     fn decode_whitespaces() {
         let input = b"AF3   E2   901>";
-        assert_eq!(decode(input).unwrap(), vec![0xaf, 0x3e, 0x29, 0x01]);
+        assert_eq!(
+            decode_into::<Vec<u8>>(input, false).unwrap(),
+            vec![0xaf, 0x3e, 0x29, 0x01]
+        );
     }
 
     #[test]
     fn decode_without_gt() {
         let input = b"AF3E2901";
-        assert_eq!(decode(input).unwrap(), vec![0xaf, 0x3e, 0x29, 0x01]);
+        assert_eq!(
+            decode_into::<Vec<u8>>(input, false).unwrap(),
+            vec![0xaf, 0x3e, 0x29, 0x01]
+        );
     }
 
     #[test]
     fn decode_with_padding() {
         let input = b"AF3E291>";
-        assert_eq!(decode(input).unwrap(), vec![0xaf, 0x3e, 0x29, 0x10]);
+        assert_eq!(
+            decode_into::<Vec<u8>>(input, false).unwrap(),
+            vec![0xaf, 0x3e, 0x29, 0x10]
+        );
+    }
+
+    #[test]
+    fn decode_invalid_low_nibble() {
+        for input in [b"AB3.45>".as_slice(), b"AB 3 .45>"] {
+            assert!(decode_into::<Vec<u8>>(input, false).is_none());
+            let decoded = decode_into::<Vec<u8>>(input, true).unwrap();
+            assert_eq!(decoded, vec![0xab]);
+            assert_eq!(decoded.capacity(), 1);
+        }
     }
 }

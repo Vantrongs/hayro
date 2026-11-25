@@ -53,6 +53,12 @@ pub struct ImageDecodeParams {
     pub height: u32,
 }
 
+enum DecodeTarget<'a> {
+    Data,
+    PageContent,
+    Image(&'a ImageDecodeParams),
+}
+
 impl<'a> Stream<'a> {
     pub(crate) fn new(data: &'a [u8], dict: Dict<'a>) -> Self {
         Self { dict, data }
@@ -201,19 +207,7 @@ impl<'a> Stream<'a> {
 
     /// Return the decoded data of a stream that doesn't use an image filter.
     pub fn decoded_data(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
-        if self.filters().iter().any(|filter| {
-            matches!(
-                filter,
-                Filter::DctDecode
-                    | Filter::JpxDecode
-                    | Filter::Jbig2Decode
-                    | Filter::CcittFaxDecode
-            )
-        }) {
-            return Err(DecodeFailure::ImageDecode);
-        }
-
-        self.decoded()
+        self.decode(DecodeTarget::Data).map(|r| r.data)
     }
 
     /// Return the decoded data of the stream, with image metadata if available.
@@ -221,6 +215,14 @@ impl<'a> Stream<'a> {
         &self,
         image_params: &ImageDecodeParams,
     ) -> Result<FilterResult<'a>, DecodeFailure> {
+        self.decode(DecodeTarget::Image(image_params))
+    }
+
+    pub(crate) fn decoded_page_content(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
+        self.decode(DecodeTarget::PageContent).map(|r| r.data)
+    }
+
+    fn decode(&self, target: DecodeTarget<'_>) -> Result<FilterResult<'a>, DecodeFailure> {
         if matches!(
             self.dict.get::<Object<'_>>(F),
             Some(Object::String(_) | Object::Dict(_))
@@ -228,8 +230,27 @@ impl<'a> Stream<'a> {
             return Err(DecodeFailure::StreamDecode);
         }
 
-        let data = self.raw_data();
         let filters_and_params = self.filters_and_params();
+        let image_params = match target {
+            DecodeTarget::Image(params) => params,
+            DecodeTarget::Data | DecodeTarget::PageContent => {
+                if filters_and_params.filters.iter().any(|filter| {
+                    matches!(
+                        filter,
+                        Filter::DctDecode
+                            | Filter::JpxDecode
+                            | Filter::Jbig2Decode
+                            | Filter::CcittFaxDecode
+                    )
+                }) {
+                    return Err(DecodeFailure::ImageDecode);
+                }
+
+                &ImageDecodeParams::default()
+            }
+        };
+
+        let data = self.raw_data();
 
         let mut current: Option<FilterResult<'a>> = None;
 
@@ -247,6 +268,7 @@ impl<'a> Stream<'a> {
                 current.as_ref().map(|c| c.data.as_ref()).unwrap_or(&data),
                 params,
                 image_params,
+                matches!(target, DecodeTarget::PageContent),
             )?;
             current = Some(new);
         }
@@ -514,8 +536,8 @@ mod tests {
                 .read_without_context::<Dict<'_>>()
                 .unwrap();
             assert_eq!(
-                Stream::read_body(&mut reader, dict, &mut next)
-                    .unwrap()
+                Stream::read_after_dict(&mut reader, dict, &Unknown, &mut next)
+                    .unwrap().0
                     .data,
                 b"x     !"
             );
@@ -534,6 +556,21 @@ mod tests {
         assert_eq!(stream.data, b"abc");
         assert!(stream.dict().contains_key(crate::object::dict::keys::F));
         assert!(stream.decoded().is_err());
+    }
+
+    #[test]
+    fn damaged_ascii_hex_image() {
+        let mut reader = Reader::new(
+            b"<< /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 1 /ColorSpace /DeviceGray \
+              /Filter /ASCIIHexDecode /Length 2 >> stream\n.>\nendstream",
+        );
+        let stream = reader
+            .read_indirect::<Stream<'_>>(&ReaderContext::dummy())
+            .unwrap();
+        assert!(matches!(
+            stream.decoded_image(&super::ImageDecodeParams::default()),
+            Err(super::DecodeFailure::StreamDecode)
+        ));
     }
 
     #[test]

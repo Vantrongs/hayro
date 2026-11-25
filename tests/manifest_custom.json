@@ -1305,11 +1305,11 @@
   },
   {
     "id": "serenity_26033_1",
-     "link": true     
+    "link": true
   },
   {
     "id": "serenity_26033_2",
-     "link": true     
+    "link": true
   },
   {
     "id": "issue_typst_7269",
@@ -1493,5 +1493,9 @@
     "id": "pattern_tiling_uncolored_stroke",
     "file": "pdfs/custom/pattern_tiling_uncolored_stroke.pdf",
     "svg": true
+  },
+  {
+    "id": "ascii_hex_invalid_digit",
+    "file": "pdfs/custom/ascii_hex_invalid_digit.pdf"
   }
 ]
