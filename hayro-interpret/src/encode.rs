@@ -11,7 +11,7 @@ use crate::interpret::state::ActiveTransferFunction;
 use crate::mesh::draw_mesh;
 use crate::pattern::ShadingPattern;
 use crate::shading::{ShadingFunction, ShadingType};
-use kurbo::{Affine, Point, Rect, Vec2};
+use kurbo::{Affine, Point, Rect};
 use std::sync::Arc;
 
 /// Coverage and color within the shading's geometry. Callers apply [`ShadingPattern::clip_path`] once.
@@ -26,13 +26,11 @@ pub enum ShadingSample {
 }
 
 pub(crate) trait SamplePixel: Copy + 'static {
-    const CLASSIFIED: bool;
     fn outside(pattern: &EncodedShadingPattern) -> Self;
     fn evaluated(color: Option<[f32; 4]>) -> Self;
 }
 
 impl SamplePixel for ShadingSample {
-    const CLASSIFIED: bool = true;
     fn outside(_: &EncodedShadingPattern) -> Self {
         Self::Outside
     }
@@ -42,7 +40,6 @@ impl SamplePixel for ShadingSample {
 }
 
 impl SamplePixel for [f32; 4] {
-    const CLASSIFIED: bool = false;
     fn outside(pattern: &EncodedShadingPattern) -> Self {
         pattern.background_rgba()
     }
@@ -509,15 +506,8 @@ impl EncodedShadingPattern {
                 let bg = P::outside(self);
                 if let EncodedShadingType::Mesh(s) = &self.shading_type {
                     take(meter, Cost::new(count))?;
-                    let (centers, transform) = if P::CLASSIFIED {
-                        (grid, self.base_transform.inverse())
-                    } else {
-                        (
-                            Affine::IDENTITY,
-                            grid.inverse() * self.base_transform.inverse(),
-                        )
-                    };
-                    let mut canvas = Canvas::for_rows(width, height, centers, bg);
+                    let transform = grid.inverse() * self.base_transform.inverse();
+                    let mut canvas = Canvas::for_rows(width, height, bg);
                     draw_mesh(&mut canvas, s, transform, self, meter)?;
                     canvas.emit_rows(bg, meter, f)?;
                 } else {
@@ -593,16 +583,17 @@ impl EncodedShadingPattern {
         bg: P,
     ) -> Result<impl Fn(Point) -> P + '_, Exhausted> {
         let colors = match &self.shading_type {
-            EncodedShadingType::RadialAxial(s) => {
-                Some(ParameterColors::new(self, &s.function, s.domain))
-            }
+            EncodedShadingType::RadialAxial(s) => Some((
+                ParameterColors::new(self, &s.function, s.domain),
+                s.positions(self.base_transform),
+            )),
             _ => None,
         };
         take(
             meter,
             colors
                 .as_ref()
-                .map_or_else(|| self.point_cost(), ParameterColors::cost)
+                .map_or_else(|| self.point_cost(), |(colors, _)| colors.cost())
                 .times(count),
         )?;
         Ok(move |p: Point| match &self.shading_type {
@@ -627,9 +618,10 @@ impl EncodedShadingPattern {
                     _ => bg,
                 }
             }
-            EncodedShadingType::RadialAxial(s) => s
-                .position(p, self.base_transform)
-                .map_or(bg, |t| P::evaluated(colors.as_ref().unwrap().color(t))),
+            EncodedShadingType::RadialAxial(_) => {
+                let (colors, position) = colors.as_ref().unwrap();
+                position(p).map_or(bg, |t| P::evaluated(colors.color(t)))
+            }
             _ => bg,
         })
     }
@@ -698,17 +690,17 @@ impl ShadingPattern {
                 axial,
                 circles,
             } => {
-                let (encoded, initial_transform) = encode_axial_shading(
+                let (encoded, transform) = encode_axial_shading(
                     *coords,
                     *domain,
                     function,
                     *extend,
                     *axial,
                     *circles,
-                    self.matrix.inverse(),
+                    self.matrix,
                 );
 
-                base_transform = initial_transform * self.matrix.inverse();
+                base_transform = transform;
 
                 encoded
             }
@@ -765,31 +757,22 @@ fn encode_axial_shading(
     extend: [bool; 2],
     is_axial: bool,
     circles: crate::radial::Circles,
-    to_shading: Affine,
+    matrix: Affine,
 ) -> (EncodedShadingType, Affine) {
-    let initial_transform;
-
-    let params = if is_axial {
-        let [x_0, y_0, x_1, y_1, _, _] = coords;
-
-        initial_transform = ts_from_line_to_line(
-            Point::new(x_0, y_0),
-            Point::new(x_1, y_1),
-            Point::ZERO,
-            Point::new(1.0, 0.0),
-        );
-
-        let origin = Point::new(x_0, y_0);
-        let axis = Point::new(x_1, y_1) - origin;
-        RadialAxialParams::Axial {
-            origin,
-            axis,
-            len_sq: axis.dot(axis),
-            to_shading,
-        }
+    let (params, transform) = if is_axial {
+        let [x0, y0, x1, y1, _, _] = coords;
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let placement = matrix * Affine::new([dx, dy, -dy, dx, x0, y0]);
+        let [a, b, c, d, e, f] = placement.as_coeffs();
+        let det = placement.determinant();
+        // Divide each cofactor directly to avoid rounding the reciprocal at axial endpoints.
+        let inverse = Affine::new([d, -b, -c, a, c * f - d * e, b * e - a * f].map(|v| v / det));
+        (RadialAxialParams::Axial, inverse)
     } else {
-        initial_transform = Affine::translate((-coords[0], -coords[1]));
-        RadialAxialParams::Radial(circles)
+        (
+            RadialAxialParams::Radial(circles),
+            Affine::translate((-coords[0], -coords[1])) * matrix.inverse(),
+        )
     };
 
     (
@@ -799,7 +782,7 @@ fn encode_axial_shading(
             domain,
             extend,
         }),
-        initial_transform,
+        transform,
     )
 }
 
@@ -820,12 +803,7 @@ fn encode_function_shading(domain: &[f32; 4], function: &ShadingFunction) -> Enc
 
 #[derive(Clone, Debug)]
 pub(crate) enum RadialAxialParams {
-    Axial {
-        origin: Point,
-        axis: Vec2,
-        len_sq: f64,
-        to_shading: Affine,
-    },
+    Axial,
     Radial(crate::radial::Circles),
 }
 
@@ -840,12 +818,13 @@ impl EncodedRadialAxialShading {
         mut emit: impl FnMut([f32; 4]),
     ) {
         let colors = ParameterColors::new(pattern, &self.function, self.domain);
+        let position = self.positions(pattern.base_transform);
         let mut previous = None;
         let mut color = background;
         for y in 0..height {
             for x in 0..width {
                 let point = transform * Point::new(f64::from(x) + 0.5, f64::from(y) + 0.5);
-                if let Some(t) = self.position(point, pattern.base_transform) {
+                if let Some(t) = position(point) {
                     if previous != Some(t.to_bits()) {
                         color = colors.get(t);
                         previous = Some(t.to_bits());
@@ -858,52 +837,38 @@ impl EncodedRadialAxialShading {
         }
     }
 
-    fn position(&self, pos: Point, base_transform: Affine) -> Option<f32> {
-        let (projection, limit) = match self.params {
-            RadialAxialParams::Axial {
-                origin,
-                axis,
-                len_sq,
-                to_shading,
-            } => (((to_shading * pos) - origin).dot(axis), len_sq),
-            RadialAxialParams::Radial(circles) => (
-                f64::from(radial_pos(
+    fn positions(&self, base_transform: Affine) -> impl Fn(Point) -> Option<f32> + '_ {
+        let [a, _, c, _, e, _] = base_transform.as_coeffs();
+        let scale = a.abs().max(c.abs());
+        let normal = kurbo::Vec2::new(a / scale, c / scale);
+        let offset = e / scale;
+        let det = base_transform.determinant();
+        move |pos| {
+            let projection = match self.params {
+                RadialAxialParams::Axial => {
+                    if det == 0.0 || !det.is_finite() {
+                        return None;
+                    }
+                    (normal.dot(pos.to_vec2()) + offset) * scale
+                }
+                RadialAxialParams::Radial(circles) => f64::from(radial_pos(
                     &(base_transform * pos),
                     circles,
                     self.extend[0],
                     self.extend[1],
                 )?),
-                1.0,
-            ),
-        };
-
-        if projection < 0.0 {
-            self.extend[0].then_some(0.0)
-        } else if projection > limit {
-            self.extend[1].then_some(1.0)
-        } else {
-            Some((projection / limit) as f32)
+            };
+            if !projection.is_finite() {
+                None
+            } else if projection < 0.0 {
+                self.extend[0].then_some(0.0)
+            } else if projection > 1.0 {
+                self.extend[1].then_some(1.0)
+            } else {
+                Some(projection as f32)
+            }
         }
     }
-}
-
-fn ts_from_line_to_line(src1: Point, src2: Point, dst1: Point, dst2: Point) -> Affine {
-    let unit_to_line1 = unit_to_line(src1, src2);
-    let line1_to_unit = unit_to_line1.inverse();
-    let unit_to_line2 = unit_to_line(dst1, dst2);
-
-    unit_to_line2 * line1_to_unit
-}
-
-fn unit_to_line(p0: Point, p1: Point) -> Affine {
-    Affine::new([
-        p1.y - p0.y,
-        p0.x - p1.x,
-        p1.x - p0.x,
-        p1.y - p0.y,
-        p0.x,
-        p0.y,
-    ])
 }
 
 fn radial_pos(

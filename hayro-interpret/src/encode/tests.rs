@@ -34,11 +34,15 @@ impl Meter for Allow {
 }
 
 fn pattern(shading: Vec<u8>, function: Vec<u8>) -> EncodedShadingPattern {
+    pattern_with_matrix(shading, function, "")
+}
+
+fn pattern_with_matrix(shading: Vec<u8>, function: Vec<u8>, matrix: &str) -> EncodedShadingPattern {
     let pdf = Pdf::new(crate::fixtures::one_page(
         100,
         "",
         vec![
-            b"<< /PatternType 2 /Shading 5 0 R >>".to_vec(),
+            format!("<< /PatternType 2 /Shading 5 0 R {matrix} >>").into_bytes(),
             shading,
             function,
         ],
@@ -1008,13 +1012,9 @@ fn metered_samples_distinguish_coverage_and_function_failure() {
 }
 
 fn classified_at(pattern: &EncodedShadingPattern, area: Rect) -> Vec<ShadingSample> {
-    classified_grid(pattern, area, 1.)
-}
-
-fn classified_grid(pattern: &EncodedShadingPattern, area: Rect, scale: f32) -> Vec<ShadingSample> {
     let mut rows = Vec::new();
     let (w, h, grid) = pattern
-        .sample_texture_samples_metered(area, scale, &mut Unmetered, |row| {
+        .sample_texture_samples_metered(area, 1., &mut Unmetered, |row| {
             rows.extend_from_slice(row);
         })
         .unwrap();
@@ -1122,7 +1122,7 @@ fn unextended_axial_endpoints_use_geometric_precision() {
 
 #[test]
 fn axial_texture_includes_exact_last_center() {
-    for length in [9, 31] {
+    for length in [9, 31, 93] {
         let p = pattern(
             format!("<< /ShadingType 2 /Coords [0 0 {length} 0] /ColorSpace /DeviceGray /Function 6 0 R >>").into_bytes(),
             b"<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [1] /N 1 >>".to_vec(),
@@ -1152,7 +1152,7 @@ fn axial_texture_includes_exact_last_center() {
 }
 
 #[test]
-fn classified_mesh_uses_returned_grid_centers() {
+fn triangle_texture_formats_agree_at_scale_seven() {
     let p = pattern(
         crate::fixtures::stream(
             "/ShadingType 4 /ColorSpace /DeviceGray /BitsPerCoordinate 8 /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 4 0 4 0 1]",
@@ -1160,6 +1160,114 @@ fn classified_mesh_uses_returned_grid_centers() {
         ),
         b"null".to_vec(),
     );
-    let samples = classified_grid(&p, Rect::new(-0.5, 0., 0.5, 1.), 7.);
-    assert_eq!(samples[3], ShadingSample::Painted([1.; 4]));
+    check_mesh_rows(&p, Rect::new(-0.5, 0., 0.5, 1.), 7.);
+}
+
+#[test]
+fn zoomed_arch_texture_formats_agree() {
+    let mut patch = vec![0];
+    for (x, y) in [
+        (0, 0),
+        (0, 0),
+        (0, 0),
+        (0, 0),
+        (85, 255),
+        (170, 255),
+        (255, 0),
+        (255, 0),
+        (255, 0),
+        (255, 0),
+        (170, 0),
+        (85, 0),
+    ] {
+        patch.extend([x, y]);
+    }
+    patch.extend([255; 4]);
+    let p = pattern(
+        crate::fixtures::stream(
+            "/ShadingType 6 /BitsPerFlag 8 /ColorSpace /DeviceGray /BitsPerCoordinate 8 /BitsPerComponent 8 /Decode [0 1 0 0.03125 0 1]",
+            &patch,
+        ),
+        b"null".to_vec(),
+    );
+    check_mesh_rows(&p, Rect::new(0., 0., 1., 1. / 32.), 128.);
+}
+
+fn check_mesh_rows(p: &EncodedShadingPattern, area: Rect, scale: f32) {
+    let mut rgba = Vec::new();
+    let grid = p
+        .sample_texture_metered(area, scale, &mut Unmetered, |row| {
+            rgba.extend_from_slice(row);
+        })
+        .unwrap();
+    let mut samples = Vec::new();
+    let classified_grid = p
+        .sample_texture_samples_metered(area, scale, &mut Unmetered, |row| {
+            samples.extend_from_slice(row);
+        })
+        .unwrap();
+    assert_eq!(grid, classified_grid);
+    assert!(rgba.contains(&[1.; 4]));
+    assert!(rgba.contains(&[0.; 4]));
+    assert_eq!(samples.len(), rgba.len());
+    for (pixel, sample) in rgba.into_iter().zip(samples) {
+        assert_eq!(
+            sample,
+            if pixel == [0.; 4] {
+                ShadingSample::Outside
+            } else {
+                ShadingSample::Painted(pixel)
+            }
+        );
+    }
+}
+
+#[test]
+fn axial_endpoints_follow_the_current_transform() {
+    let epsilon = 2_f64.powi(-30);
+    for (matrix, x0, x1, end) in [
+        ("", 0., 31., 31.),
+        ("/Matrix [75 0 0 1 0 0]", 0., 31., 2325.),
+        ("", 1., 6., 6.),
+    ] {
+        let mut p = pattern_with_matrix(
+            format!("<< /ShadingType 2 /Coords [{x0} 0 {x1} 0] /ColorSpace /DeviceGray /Function 6 0 R >>").into_bytes(),
+            b"<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [1] /N 1 >>".to_vec(),
+            matrix,
+        );
+        for start in [0., 8.] {
+            p.base_transform *= Affine::translate((-start, 0.));
+            for (x, covered) in [
+                (x0 + start - epsilon, false),
+                (x0 + start, true),
+                (end + start, true),
+                (end + start + epsilon, false),
+            ] {
+                let area = Rect::new(x - 0.5, 0., x + 0.5, 1.);
+                let mut legacy = Vec::new();
+                p.sample_texture(area, 1., |c| legacy.push(c));
+                let mut rgba = Vec::new();
+                p.sample_texture_metered(area, 1., &mut Unmetered, |row| {
+                    rgba.extend_from_slice(row);
+                })
+                .unwrap();
+                let pixel = if covered { [1.; 4] } else { [0.; 4] };
+                assert_eq!(legacy, [pixel], "{matrix} {x}");
+                assert_eq!(rgba, [pixel]);
+                assert_eq!(
+                    classified_at(&p, area),
+                    [if covered {
+                        ShadingSample::Painted(pixel)
+                    } else {
+                        ShadingSample::Outside
+                    }]
+                );
+            }
+        }
+        p.base_transform = Affine::scale_non_uniform(1., 0.);
+        assert_eq!(
+            classified_at(&p, Rect::new(0., 0., 1., 1.)),
+            [ShadingSample::Outside]
+        );
+    }
 }

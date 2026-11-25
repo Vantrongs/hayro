@@ -393,7 +393,7 @@ fn table_span(stops: &[SvgGradientStop], jumps: &[f32], size: usize) -> f64 {
 impl EncodedRadialAxialShading {
     fn device_span(&self, pattern: &EncodedShadingPattern) -> f64 {
         match self.params {
-            RadialAxialParams::Axial { .. } => {
+            RadialAxialParams::Axial => {
                 let [a, _, c, ..] = pattern.base_transform.as_coeffs();
                 1.0 / a.hypot(c)
             }
@@ -409,7 +409,7 @@ impl EncodedRadialAxialShading {
     pub fn native_extended(&self) -> bool {
         self.extend == [true; 2]
             && match self.params {
-                RadialAxialParams::Axial { .. } => true,
+                RadialAxialParams::Axial => true,
                 RadialAxialParams::Radial(crate::radial::Circles { p1, r, .. }) => {
                     p1 == Point::ZERO && r == Point::new(0., 1.)
                 }
@@ -536,7 +536,7 @@ impl EncodedRadialAxialShading {
 
     fn gradient_kind(&self, [t0, t1]: [f64; 2], scale: f64) -> SvgGradientKind {
         match &self.params {
-            RadialAxialParams::Axial { .. } => SvgGradientKind::Linear {
+            RadialAxialParams::Axial => SvgGradientKind::Linear {
                 start: Point::new(t0, 0.0),
                 end: Point::new(t1, 0.0),
             },

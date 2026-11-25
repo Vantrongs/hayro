@@ -3,12 +3,11 @@ use crate::encode::{
     reserve_metered, take,
 };
 use crate::gradient::ParameterColors;
-use kurbo::{Affine, Point, Rect};
+use kurbo::{Point, Rect};
 
 pub(crate) struct Canvas<'a, P = [f32; 4]> {
     pub(crate) width: usize,
     pub(crate) height: usize,
-    grid: Affine,
     bounds: Rect,
     layout: Layout<'a>,
     pub(crate) pixels: Vec<P>,
@@ -21,25 +20,18 @@ impl<'a, P: SamplePixel> Canvas<'a, P> {
         Self {
             width,
             height,
-            grid: Affine::IDENTITY,
             bounds: Rect::new(0., 0., width as f64, height as f64),
             layout: Layout::Dense,
             pixels: vec![background; width * height],
         }
     }
 
-    pub(crate) fn for_rows(width: u32, height: u32, grid: Affine, background: P) -> Self {
+    pub(crate) fn for_rows(width: u32, height: u32, background: P) -> Self {
         Self {
             width: width as usize,
             height: height as usize,
             pixels: vec![background; width as usize],
-            grid,
-            bounds: grid.transform_rect_bbox(Rect::new(
-                0.,
-                0.,
-                f64::from(width),
-                f64::from(height),
-            )),
+            bounds: Rect::new(0., 0., f64::from(width), f64::from(height)),
             layout: Layout::Rows {
                 rows: Rows::default(),
                 shade: RowShade::Rgba,
@@ -94,33 +86,28 @@ impl<'a, P: SamplePixel> Canvas<'a, P> {
                 let pixels = &mut self.pixels[span.start as usize..span.end as usize];
                 match &shade {
                     RowShade::Rgba => {
-                        rows.paint(self.grid, span, pixels, &|v: &[f32; 4]| {
-                            P::evaluated(Some(*v))
-                        });
+                        rows.paint(span, pixels, &|v: &[f32; 4]| P::evaluated(Some(*v)));
                     }
                     RowShade::Parameter(lut) => {
-                        rows.paint(self.grid, span, pixels, &|v: &[f32; 1]| {
-                            P::evaluated(lut.color(v[0]))
-                        });
+                        rows.paint(span, pixels, &|v: &[f32; 1]| P::evaluated(lut.color(v[0])));
                     }
                     RowShade::Direct {
                         pattern,
                         num_components,
                     } => match num_components {
-                        1 => rows.paint(self.grid, span, pixels, &|v: &[f32; 1]| {
+                        1 => rows.paint(span, pixels, &|v: &[f32; 1]| {
                             P::evaluated(Some(pattern.convert(v)))
                         }),
-                        2 => rows.paint(self.grid, span, pixels, &|v: &[f32; 2]| {
+                        2 => rows.paint(span, pixels, &|v: &[f32; 2]| {
                             P::evaluated(Some(pattern.convert(v)))
                         }),
-                        3 => rows.paint(self.grid, span, pixels, &|v: &[f32; 3]| {
+                        3 => rows.paint(span, pixels, &|v: &[f32; 3]| {
                             P::evaluated(Some(pattern.convert(v)))
                         }),
-                        4 => rows.paint(self.grid, span, pixels, &|v: &[f32; 4]| {
+                        4 => rows.paint(span, pixels, &|v: &[f32; 4]| {
                             P::evaluated(Some(pattern.convert(v)))
                         }),
                         _ => rows.paint(
-                            self.grid,
                             span,
                             pixels,
                             &|v: &[f32; crate::function::MAX_COMPONENTS]| {
@@ -163,7 +150,6 @@ impl<'a, P: SamplePixel> Canvas<'a, P> {
             width: 0,
             height: 0,
             pixels: vec![background; points.len()],
-            grid: Affine::IDENTITY,
             bounds: area,
             layout: Layout::Points(Sparse { locations, by_x }),
         })
@@ -249,17 +235,16 @@ impl<'a, P: SamplePixel> Canvas<'a, P> {
             return Ok(());
         }
 
-        let [step, _, _, _, left, top_y] = self.grid.as_coeffs();
-        let first_row = pixel_index(top.y, self.height, top_y, step);
-        let end_row = pixel_index(bottom.y, self.height, top_y, step);
+        let first_row = pixel_index(top.y, self.height);
+        let end_row = pixel_index(bottom.y, self.height);
 
         take(meter, Cost::of(end_row - first_row))?;
         let mut plane = None;
         for y in first_row..end_row {
-            let center_y = center(y, top_y, step);
+            let center_y = center(y);
             let range = span(center_y);
-            let start = pixel_index(range.start, self.width, left, step);
-            let end = pixel_index(range.end, self.width, left, step);
+            let start = pixel_index(range.start, self.width);
+            let end = pixel_index(range.end, self.width);
 
             if start >= end {
                 continue;
@@ -312,7 +297,6 @@ impl<'a, P: SamplePixel> Canvas<'a, P> {
                 for span in &rows.spans {
                     let offset = span.y as usize * self.width;
                     rows.paint(
-                        self.grid,
                         span,
                         &mut self.pixels[offset + span.start as usize..offset + span.end as usize],
                         shade,
@@ -323,8 +307,6 @@ impl<'a, P: SamplePixel> Canvas<'a, P> {
                 meter.release_bytes(bytes);
             }
             PlaneRow::new(&coefficients, center_y - p0.y).paint(
-                left,
-                step,
                 start,
                 p0.x,
                 &mut self.pixels[y * self.width + start..y * self.width + end],
@@ -370,19 +352,18 @@ impl Rows {
 
     fn paint<P, const N: usize>(
         &self,
-        grid: Affine,
         span: &Span,
         pixels: &mut [P],
         shade: &impl Fn(&[f32; N]) -> P,
     ) {
         let plane = &self.planes[span.plane as usize];
         let coefficients = &self.data[plane.offset..plane.offset + self.components];
-        let [step, _, _, _, left, top] = grid.as_coeffs();
-        PlaneRow::new(
-            coefficients,
-            center(span.y as usize, top, step) - plane.p0.y,
-        )
-        .paint(left, step, span.start as usize, plane.p0.x, pixels, shade);
+        PlaneRow::new(coefficients, center(span.y as usize) - plane.p0.y).paint(
+            span.start as usize,
+            plane.p0.x,
+            pixels,
+            shade,
+        );
     }
 }
 
@@ -403,15 +384,13 @@ impl<const N: usize> PlaneRow<N> {
 
     fn paint<P>(
         &self,
-        left: f64,
-        step: f64,
         start: usize,
         origin: f64,
         pixels: &mut [P],
         shade: &impl Fn(&[f32; N]) -> P,
     ) {
         for (x, pixel) in (start..).zip(pixels) {
-            *pixel = shade(&self.at(center(x, left, step) - origin));
+            *pixel = shade(&self.at(center(x) - origin));
         }
     }
 }
@@ -444,27 +423,12 @@ impl Sparse {
     }
 }
 
-fn center(index: usize, origin: f64, step: f64) -> f64 {
-    (index as f64 + 0.5) * step + origin
+fn center(index: usize) -> f64 {
+    index as f64 + 0.5
 }
 
-fn pixel_index(coordinate: f64, len: usize, origin: f64, step: f64) -> usize {
-    let index = (((coordinate - origin) / step - 0.5).ceil() as usize).min(len);
-    let before = |i| center(i, origin, step) < coordinate;
-    if (index == 0 || before(index - 1)) && (index == len || !before(index)) {
-        return index;
-    }
-    // Several centers may round to the same paint coordinate.
-    let (mut low, mut high) = (0, len);
-    while low < high {
-        let mid = low + (high - low) / 2;
-        if before(mid) {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    low
+fn pixel_index(coordinate: f64, len: usize) -> usize {
+    ((coordinate - 0.5).ceil() as usize).min(len)
 }
 
 fn edge_x(a: Point, b: Point, y: f64) -> f64 {
