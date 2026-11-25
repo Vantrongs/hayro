@@ -11,7 +11,6 @@ use crate::interpret::state::ActiveTransferFunction;
 use crate::mesh::draw_mesh;
 use crate::pattern::ShadingPattern;
 use crate::shading::{ShadingFunction, ShadingType};
-use crate::util::x_y_advances;
 use kurbo::{Affine, Point, Rect, Shape};
 use std::sync::Arc;
 
@@ -27,11 +26,13 @@ pub enum ShadingSample {
 }
 
 pub(crate) trait SamplePixel: Copy + 'static {
+    const CLASSIFIED: bool;
     fn outside(pattern: &EncodedShadingPattern) -> Self;
     fn evaluated(color: Option<[f32; 4]>) -> Self;
 }
 
 impl SamplePixel for ShadingSample {
+    const CLASSIFIED: bool = true;
     fn outside(_: &EncodedShadingPattern) -> Self {
         Self::Outside
     }
@@ -41,6 +42,7 @@ impl SamplePixel for ShadingSample {
 }
 
 impl SamplePixel for [f32; 4] {
+    const CLASSIFIED: bool = false;
     fn outside(pattern: &EncodedShadingPattern) -> Self {
         pattern.background_rgba()
     }
@@ -431,7 +433,7 @@ impl EncodedShadingPattern {
         let new_canvas = || Canvas::new(width, height, background);
         let canvas = match &self.shading_type {
             EncodedShadingType::RadialAxial(shading) => {
-                shading.sample_grid(width, height, transform, self, background, f);
+                shading.sample_grid(width, height, grid_transform, self, background, f);
                 return (width, height, grid_transform);
             }
             EncodedShadingType::FunctionBased(shading) => {
@@ -482,12 +484,11 @@ impl EncodedShadingPattern {
         };
         let (width, height) = texture_dimensions(bbox, scale);
         take(meter, Cost::new(u64::from(width) * u64::from(height)))?;
-        let grid =
-            inverse * Affine::translate((bbox.x0, bbox.y0)) * Affine::scale(1. / f64::from(scale));
+        let grid = Affine::translate((bbox.x0, bbox.y0)) * Affine::scale(1. / f64::from(scale));
         let mut y = 0.5;
         self.sample_texture_as(bbox, scale, meter, |row| {
             for (x, sample) in row.iter_mut().enumerate() {
-                if !rect.contains(grid * Point::new(x as f64 + 0.5, y)) {
+                if !rect.contains(inverse * (grid * Point::new(x as f64 + 0.5, y))) {
                     *sample = ShadingSample::Outside;
                 }
             }
@@ -524,23 +525,26 @@ impl EncodedShadingPattern {
                 let bg = P::outside(self);
                 if let EncodedShadingType::Mesh(s) = &self.shading_type {
                     take(meter, Cost::new(count))?;
-                    let mut canvas = Canvas::for_rows(width, height, bg);
-                    draw_mesh(
-                        &mut canvas,
-                        s,
-                        grid.inverse() * self.base_transform.inverse(),
-                        self,
-                        meter,
-                    )?;
+                    let (centers, transform) = if P::CLASSIFIED {
+                        (grid, self.base_transform.inverse())
+                    } else {
+                        (
+                            Affine::IDENTITY,
+                            grid.inverse() * self.base_transform.inverse(),
+                        )
+                    };
+                    let mut canvas = Canvas::for_rows(width, height, centers, bg);
+                    draw_mesh(&mut canvas, s, transform, self, meter)?;
                     canvas.emit_rows(bg, meter, f)?;
                 } else {
                     let sample = self.point_sampler(meter, count, bg)?;
-                    let transform = self.base_transform * grid;
                     let mut row = vec![bg; width as usize];
                     for y in 0..height {
                         for (x, pixel) in row.iter_mut().enumerate() {
-                            *pixel =
-                                sample(transform * Point::new(x as f64 + 0.5, f64::from(y) + 0.5));
+                            *pixel = sample(
+                                self.base_transform
+                                    * (grid * Point::new(x as f64 + 0.5, f64::from(y) + 0.5)),
+                            );
                         }
                         f(&mut row);
                     }
@@ -850,16 +854,12 @@ impl EncodedRadialAxialShading {
         mut emit: impl FnMut([f32; 4]),
     ) {
         let colors = ParameterColors::new(pattern, &self.function, self.domain);
-        let to_shading = transform.inverse();
-        let (x_advance, y_advance) = x_y_advances(&to_shading);
-        let mut row_start = to_shading * Point::new(0.5, 0.5);
-
         let mut previous = None;
         let mut color = background;
-        for _ in 0..height {
-            let mut point = row_start;
-
-            for _ in 0..width {
+        for y in 0..height {
+            for x in 0..width {
+                let point = pattern.base_transform
+                    * (transform * Point::new(f64::from(x) + 0.5, f64::from(y) + 0.5));
                 if let Some(t) = self.position(point) {
                     if previous != Some(t.to_bits()) {
                         color = colors.get(t);
@@ -869,11 +869,7 @@ impl EncodedRadialAxialShading {
                 } else {
                     emit(background);
                 }
-
-                point += x_advance;
             }
-
-            row_start += y_advance;
         }
     }
 

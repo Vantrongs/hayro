@@ -1007,9 +1007,15 @@ fn metered_samples_distinguish_coverage_and_function_failure() {
 }
 
 fn classified_at(pattern: &EncodedShadingPattern, area: Rect) -> Vec<ShadingSample> {
+    classified_grid(pattern, area, 1.)
+}
+
+fn classified_grid(pattern: &EncodedShadingPattern, area: Rect, scale: f32) -> Vec<ShadingSample> {
     let mut rows = Vec::new();
     let (w, h, grid) = pattern
-        .sample_texture_samples_metered(area, 1., &mut Unmetered, |row| rows.extend_from_slice(row))
+        .sample_texture_samples_metered(area, scale, &mut Unmetered, |row| {
+            rows.extend_from_slice(row);
+        })
         .unwrap();
     let centers: Vec<_> = (0..h)
         .flat_map(|y| {
@@ -1112,4 +1118,59 @@ fn unextended_axial_endpoints_use_geometric_precision() {
             }]
         );
     }
+}
+
+#[test]
+fn axial_texture_includes_exact_last_center() {
+    let p = pattern(
+        b"<< /ShadingType 2 /Coords [0 0 9 0] /ColorSpace /DeviceGray /Function 6 0 R >>".to_vec(),
+        b"<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [1] /N 1 >>".to_vec(),
+    );
+    let area = Rect::new(0.5, 0., 9.5, 1.);
+    let mut legacy = Vec::new();
+    p.sample_texture(area, 1., |c| legacy.push(c));
+    assert_eq!(legacy, [[1.; 4]; 9]);
+    let mut rgba = Vec::new();
+    p.sample_texture_metered(area, 1., &mut Unmetered, |row| rgba.extend_from_slice(row))
+        .unwrap();
+    assert_eq!(rgba, legacy);
+    p.sample_points_metered(&[Point::new(9., 0.5)], &mut Unmetered, |pixel| {
+        assert_eq!(pixel, [1.; 4]);
+    })
+    .unwrap();
+    assert_eq!(
+        classified_at(&p, area),
+        [ShadingSample::Painted([1.; 4]); 9]
+    );
+}
+
+#[test]
+fn classified_bbox_uses_returned_grid_centers() {
+    let pdf = Pdf::new(crate::fixtures::one_page(100, "", vec![
+        b"<< /PatternType 2 /Matrix [3 0 0 1 0 0] /Shading 5 0 R >>".to_vec(),
+        b"<< /ShadingType 2 /BBox [0 0 1 1] /Extend [true true] /Coords [0 0 1 0] /ColorSpace /DeviceGray /Function 6 0 R >>".to_vec(),
+        b"<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [1] /N 1 >>".to_vec()
+    ])).unwrap();
+    let dict = pdf
+        .xref()
+        .get::<Dict<'_>>(ObjectIdentifier::new(4, 0))
+        .unwrap();
+    let p = ShadingPattern::new(&dict, &Cache::new()).unwrap().encode();
+    assert_eq!(
+        classified_at(&p, Rect::new(2.5, 0., 3.5, 1.)),
+        [ShadingSample::Outside]
+    );
+}
+
+#[test]
+fn classified_mesh_uses_returned_grid_centers() {
+    let p = pattern(
+        crate::fixtures::stream(
+            "/ShadingType 4 /ColorSpace /DeviceGray /BitsPerCoordinate 8 /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 4 0 4 0 1]",
+            &[0, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255],
+        ),
+        b"null".to_vec(),
+    );
+    let samples = classified_grid(&p, Rect::new(-0.5, 0., 0.5, 1.), 7.);
+    assert_eq!(samples[3], ShadingSample::Painted([1.; 4]));
 }
