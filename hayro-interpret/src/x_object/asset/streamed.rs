@@ -327,6 +327,10 @@ impl<'a> Colour<'a> {
         }
     }
 
+    pub(super) fn conversion_piece(&self, columns: usize) -> usize {
+        piece_texels(columns, self.components + self.channels())
+    }
+
     /// Bytes per texel of the colour returned.
     pub(super) fn channels(&self) -> usize {
         match &self.output {
@@ -637,7 +641,7 @@ impl<'s, 'a> ImagePass<'s, 'a> {
             RawRows::new(image.obj, row_bytes, &image.ends.colour, meter)?.ok_or(Stop::Failed)?;
         let columns = area.columns();
         let start = columns.start as usize / colour.align() * colour.align();
-        let piece = piece_texels(columns.end as usize - start, n);
+        let piece = colour.conversion_piece(columns.end as usize - start);
         let (mut mask, mask_stream) = match &image.alpha {
             Alpha::Mask {
                 mask,
