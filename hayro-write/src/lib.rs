@@ -13,11 +13,10 @@ mod primitive;
 use crate::primitive::{WriteDirect, WriteIndirect};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
-use hayro_syntax::object::ObjRef;
-use hayro_syntax::object::Object;
 use hayro_syntax::object::dict::keys::{
-    COLORSPACE, EXT_G_STATE, FONT, GROUP, PATTERN, PROPERTIES, SHADING, XOBJECT,
+    COLORSPACE, EXT_G_STATE, FONT, GROUP, OCPROPERTIES, PATTERN, PROPERTIES, SHADING, XOBJECT,
 };
+use hayro_syntax::object::{Dict, MaybeRef, ObjRef, Object};
 use hayro_syntax::page::{Page, Resources, Rotation};
 use pdf_writer::{Chunk, Content, Filter, Finish, Name, Rect, Ref};
 use rustc_hash::FxHashMap;
@@ -55,6 +54,7 @@ pub fn extract<'a>(
         ctx.root_refs.push(res.map(|_| root_ref));
     }
 
+    let oc_properties = copy_oc_properties(pdf, &mut ctx);
     write_dependencies(pdf, &mut ctx);
 
     let mut global_chunk = Chunk::with_settings(chunk_settings);
@@ -65,6 +65,7 @@ pub fn extract<'a>(
 
     Ok(ExtractionResult {
         chunk: global_chunk,
+        oc_properties,
         root_refs: ctx.root_refs,
         page_tree_parent_ref: ctx.page_tree_parent_ref,
     })
@@ -116,10 +117,22 @@ pub enum ExtractionError {
 pub struct ExtractionResult {
     /// The chunk containing all objects as well as their dependencies.
     pub chunk: Chunk,
+    /// The source document’s optional content properties, including groups on omitted pages.
+    pub oc_properties: Option<Ref>,
     /// The root references of the pages/XObject, one for each extraction query.
     pub root_refs: Vec<Result<Ref, ExtractionError>>,
     /// The reference to the page tree parent that was generated.
     pub page_tree_parent_ref: Ref,
+}
+
+impl ExtractionResult {
+    /// Set the page tree and optional content properties of a single-source catalog.
+    pub fn write_catalog(&self, catalog: &mut pdf_writer::writers::Catalog<'_>) {
+        catalog.pages(self.page_tree_parent_ref);
+        if let Some(id) = self.oc_properties {
+            catalog.pair(Name(OCPROPERTIES), id);
+        }
+    }
 }
 
 struct ExtractionContext<'a> {
@@ -174,6 +187,28 @@ impl<'a> ExtractionContext<'a> {
     }
 }
 
+fn copy_oc_properties(pdf: &Pdf, ctx: &mut ExtractionContext<'_>) -> Option<Ref> {
+    let xref = pdf.xref();
+    if !xref.has_optional_content_groups() {
+        return None;
+    }
+
+    let catalog = xref.get::<Dict<'_>>(xref.root_id())?;
+    match catalog.get_raw::<Dict<'_>>(OCPROPERTIES)? {
+        MaybeRef::Ref(id) => {
+            ctx.to_visit_refs.push(id);
+            Some(ctx.map_ref(id))
+        }
+        MaybeRef::NotRef(dict) => {
+            let id = ctx.new_ref();
+            let mut chunk = Chunk::with_settings(ctx.chunk_settings);
+            dict.write_indirect(&mut chunk, id, ctx);
+            ctx.chunks.push(chunk);
+            Some(id)
+        }
+    }
+}
+
 fn write_dependencies(pdf: &Pdf, ctx: &mut ExtractionContext<'_>) {
     while let Some(ref_) = ctx.to_visit_refs.pop() {
         if ctx.visited_objects.contains(&ref_) {
@@ -213,8 +248,7 @@ pub fn extract_pages_to_pdf(hayro_pdf: &Pdf, page_indices: &[usize]) -> Vec<u8> 
         &requests,
     )
     .unwrap();
-    pdf.catalog(catalog_id)
-        .pages(extracted.page_tree_parent_ref);
+    extracted.write_catalog(&mut pdf.catalog(catalog_id));
     let count = extracted.root_refs.len();
     pdf.pages(extracted.page_tree_parent_ref)
         .kids(extracted.root_refs.iter().map(|r| r.unwrap()))
@@ -250,8 +284,7 @@ pub fn extract_pages_as_xobject_to_pdf(hayro_pdf: &Pdf, page_indices: &[usize]) 
     )
     .unwrap();
 
-    pdf.catalog(catalog_id)
-        .pages(extracted.page_tree_parent_ref);
+    extracted.write_catalog(&mut pdf.catalog(catalog_id));
     let mut page_refs = vec![];
 
     for (x_object_ref, page_idx) in extracted.root_refs.iter().zip(page_indices) {
