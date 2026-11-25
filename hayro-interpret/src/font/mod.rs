@@ -90,6 +90,7 @@ impl<'run, 'a> GlyphRun<'run, 'a> {
 pub struct Type3Glyph<'a> {
     pub(crate) glyph: hayro_font::Type3Glyph<'a>,
     pub(crate) state: State<'a>,
+    pub(crate) stroke_paint: Paint<'a>,
     pub(crate) bbox: Rect,
     pub(crate) parent_resources: Resources<'a>,
     pub(crate) cache: InterpreterCache<'a>,
@@ -137,6 +138,7 @@ impl CacheKey for Type3Glyph<'_> {
                 .transfer_function
                 .as_ref()
                 .map(CacheKey::cache_key),
+            self.stroke_paint.cache_key(),
         ))
     }
 }
@@ -160,6 +162,7 @@ pub(crate) fn get_glyph<'a>(
             let nesting_depth = ctx.nesting_depth() + 1;
 
             Glyph::Type3(Box::new(Type3Glyph {
+                stroke_paint: ctx.get_paint(true),
                 glyph,
                 state: ctx.snapshot(),
                 bbox: ctx.bbox(),
