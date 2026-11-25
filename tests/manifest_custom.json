@@ -1516,5 +1516,9 @@
     "id": "pattern_cache_depth",
     "file": "pdfs/custom/pattern_cache_depth.pdf",
     "svg": true
+  },
+  {
+    "id": "shading_radial_precision",
+    "file": "pdfs/custom/shading_radial_precision.pdf"
   }
 ]
