@@ -548,7 +548,7 @@ dependencies = [
 [[package]]
 name = "glifo"
 version = "0.5.0"
-source = "git+https://github.com/Vantrongs/vello?rev=a934ae333b1777868e942b528a5ada30eeac30aa#a934ae333b1777868e942b528a5ada30eeac30aa"
+source = "git+https://github.com/Vantrongs/vello?rev=83292e60514fc3bcc57616c13484be68819ffa74#83292e60514fc3bcc57616c13484be68819ffa74"
 dependencies = [
  "bytemuck",
  "foldhash",
@@ -1973,7 +1973,7 @@ dependencies = [
 [[package]]
 name = "vello_common"
 version = "0.4.0"
-source = "git+https://github.com/Vantrongs/vello?rev=a934ae333b1777868e942b528a5ada30eeac30aa#a934ae333b1777868e942b528a5ada30eeac30aa"
+source = "git+https://github.com/Vantrongs/vello?rev=83292e60514fc3bcc57616c13484be68819ffa74#83292e60514fc3bcc57616c13484be68819ffa74"
 dependencies = [
  "bytemuck",
  "fearless_simd",
@@ -1989,7 +1989,7 @@ dependencies = [
 [[package]]
 name = "vello_cpu"
 version = "0.4.0"
-source = "git+https://github.com/Vantrongs/vello?rev=a934ae333b1777868e942b528a5ada30eeac30aa#a934ae333b1777868e942b528a5ada30eeac30aa"
+source = "git+https://github.com/Vantrongs/vello?rev=83292e60514fc3bcc57616c13484be68819ffa74#83292e60514fc3bcc57616c13484be68819ffa74"
 dependencies = [
  "bytemuck",
  "fearless_simd",
