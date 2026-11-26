@@ -134,11 +134,13 @@ struct SoftMask<'a> {
 
 impl<'a> SoftMask<'a> {
     fn read(dict: &Dict<'a>) -> Self {
-        Self {
-            // Resolving the stream can itself trigger repair.
-            repaired: dict.xref().is_repaired(),
+        let was_repaired = dict.xref().is_repaired();
+        let mut mask = Self {
+            repaired: was_repaired,
             stream: dict.get(SMASK),
-        }
+        };
+        mask.current(dict);
+        mask
     }
 
     fn current(&mut self, dict: &Dict<'a>) -> &mut Option<Stream<'a>> {
@@ -312,13 +314,21 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
         key: Option<LumaData>,
         soft_mask: &mut SoftMask<'b>,
     ) -> Option<DecodedMask> {
-        if let Some((mut alpha, matte_rgb)) = soft_mask
-            .current(self.obj.stream.dict())
-            .as_ref()
-            .and_then(|s| self.resolve_matte(s))
-            && alpha.tail.width == self.ctx.width
-            && alpha.tail.declared == self.ctx.declared
-        {
+        let dict = self.obj.stream.dict();
+        let (matte, embedded) = loop {
+            let matte = soft_mask
+                .current(dict)
+                .as_ref()
+                .and_then(|s| self.resolve_matte(s))
+                .filter(|(alpha, _)| {
+                    alpha.tail.width == self.ctx.width && alpha.tail.declared == self.ctx.declared
+                });
+            let embedded = matte.is_none() && dict.get::<u8>(SMASK_IN_DATA) == Some(1);
+            if soft_mask.repaired == dict.xref().is_repaired() {
+                break (matte, embedded);
+            }
+        };
+        if let Some((mut alpha, matte_rgb)) = matte {
             alpha.tail.declared = self.ctx.height;
             alpha.luma.height = alpha.luma.height.min(self.ctx.height);
             alpha
@@ -336,9 +346,7 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
         }
 
         // Drop an invalid alpha channel so the image itself still renders (PDFJS-19611).
-        let dict = self.obj.stream.dict();
-
-        if let Some(1) = dict.get::<u8>(SMASK_IN_DATA) {
+        if embedded {
             let mut data = self
                 .ctx
                 .decoded

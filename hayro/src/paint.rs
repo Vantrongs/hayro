@@ -3,6 +3,7 @@ use hayro_interpret::Paint;
 use hayro_interpret::encode::{EncodedShadingPattern, EncodedShadingType, texture_dimensions};
 use hayro_interpret::gradient::{PreparedShading, SvgGradient, SvgGradientKind, SvgGradientStop};
 use hayro_interpret::pattern::{Pattern, ShadingPattern};
+use hayro_interpret::util::x_y_advances;
 use kurbo::{Affine, BezPath, Rect};
 use std::sync::Arc;
 use vello_cpu::color::{AlphaColor, DynamicColor, Srgb};
@@ -17,7 +18,7 @@ impl Renderer<'_> {
     pub(super) fn set_paint(
         &mut self,
         paint: &Paint<'_>,
-        path_bbox: impl Fn() -> Rect,
+        path_bbox: impl FnOnce(&kurbo::Stroke) -> Rect,
         is_stroke: bool,
     ) -> Option<BezPath> {
         let mut paint_transform = Affine::IDENTITY;
@@ -31,12 +32,13 @@ impl Renderer<'_> {
             Paint::Pattern(p) => {
                 let path_transform = *self.ctx.transform();
                 let bbox = {
-                    let bounds = path_bbox();
-                    let bbox = path_transform.transform_rect_bbox(if is_stroke {
-                        self.stroke_bounds(bounds)
-                    } else {
-                        bounds
-                    });
+                    let mut bbox = path_transform.transform_rect_bbox(path_bbox(self.ctx.stroke()));
+
+                    if is_stroke {
+                        let (a1, a2) = x_y_advances(&path_transform);
+                        let factor = a1.length().max(a2.length()) * self.ctx.stroke().width;
+                        bbox = bbox.inflate(factor, factor);
+                    }
 
                     bbox.intersect(Rect::new(
                         0.0,
@@ -532,7 +534,7 @@ mod tests {
                 end_center: kurbo::Point::new(1., 0.),
                 end_radius: 129.031,
             },
-            transform: Affine::translate((128.03, 0.)) * Affine::scale(64.),
+            transform: Affine::translate((128.03 * 64., 0.)) * Affine::scale(64.),
             stops: Vec::new(),
         };
         assert!(!raster_precision(&near_tangent, bbox));

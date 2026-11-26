@@ -38,6 +38,40 @@ fn image(pdf: &Pdf) -> ImageXObject<'_> {
     .unwrap()
 }
 
+fn replace_mask_on_repair(bytes: &mut [u8]) {
+    for (header, replacement) in [(b"5 0 obj", b'9'), (b"6 0 obj", b'4')] {
+        let offset = bytes
+            .windows(header.len())
+            .position(|w| w == header)
+            .unwrap();
+        bytes[offset] = replacement;
+    }
+}
+
+#[test]
+fn indirect_mask_length_repair_restores_color_key() {
+    use crate::fixtures::{file, stream};
+    let gray = "/ColorSpace /DeviceGray /Width 1 /Height 1 /BPC 8";
+    let mut bytes = file(
+        &[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec(),
+            stream(&format!("{gray} /SMask 4 0 R /Mask [128 128]"), &[128]),
+            format!("<< {gray} /Length 5 0 R >>\nstream\nA\nendstream").into_bytes(),
+            b"1".to_vec(),
+            b"null".to_vec(),
+        ],
+        "",
+    );
+    replace_mask_on_repair(&mut bytes);
+    let pdf = Pdf::new(bytes).unwrap();
+    let obj = image(&pdf);
+    assert!(!pdf.xref().is_repaired());
+    let decoded = obj.decoded_image(None).unwrap();
+    assert!(pdf.xref().is_repaired());
+    assert_eq!(decoded.alpha.unwrap().luma.data, [0]);
+}
+
 #[test]
 fn soft_mask_lookup_tracks_cross_reference_repair() {
     use crate::fixtures::{file, stream};
@@ -54,13 +88,7 @@ fn soft_mask_lookup_tracks_cross_reference_repair() {
             ],
             "",
         );
-        for (header, replacement) in [(b"5 0 obj", b'9'), (b"6 0 obj", b'4')] {
-            let offset = bytes
-                .windows(header.len())
-                .position(|w| w == header)
-                .unwrap();
-            bytes[offset] = replacement;
-        }
+        replace_mask_on_repair(&mut bytes);
 
         let pdf = Pdf::new(bytes).unwrap();
         let obj = image(&pdf);
@@ -71,6 +99,48 @@ fn soft_mask_lookup_tracks_cross_reference_repair() {
         assert!(pdf.xref().is_repaired());
         assert_eq!(decoded.alpha.unwrap().luma.data, [192]);
     }
+}
+
+#[test]
+fn indirect_matte_repair_replaces_the_mask_before_unblending() {
+    use crate::fixtures::{file, stream};
+    let gray = "/ColorSpace /DeviceGray /Width 1 /Height 1 /BPC 8";
+    let mut bytes = file(
+        &[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec(),
+            stream(&format!("{gray} /SMask 4 0 R"), &[128]),
+            stream(&format!("{gray} /Matte 5 0 R"), &[64]),
+            b"[0]".to_vec(),
+            stream(&format!("{gray} /Matte [1]"), &[192]),
+        ],
+        "",
+    );
+    replace_mask_on_repair(&mut bytes);
+    let decode = |pre_repair| {
+        let pdf = Pdf::new(bytes.clone()).unwrap();
+        let obj = image(&pdf);
+        assert!(!pdf.xref().is_repaired());
+        if pre_repair {
+            let _ = obj
+                .stream
+                .dict()
+                .get::<Stream<'_>>(b"SMask")
+                .unwrap()
+                .dict()
+                .get::<hayro_syntax::object::Array<'_>>(b"Matte");
+            assert!(pdf.xref().is_repaired());
+        }
+        let decoded = obj.decoded_image(None).unwrap();
+        assert!(pdf.xref().is_repaired());
+        let ImageData::Luma(color) = decoded.image else {
+            panic!()
+        };
+        (color.data, decoded.alpha.unwrap().luma.data)
+    };
+    let expected = decode(true);
+    assert_eq!(expected, (vec![86], vec![192]));
+    assert_eq!(decode(false), expected);
 }
 
 fn request(obj: &ImageXObject<'_>, plane: Plane) -> ImageRegion {
