@@ -12,8 +12,6 @@ use kurbo::Affine;
 
 #[derive(Clone)]
 pub(crate) struct ImageXObject<'a> {
-    pub(super) dict_bpc: Option<u8>,
-    pub(super) bpc_repaired: bool,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) color_space: Option<ColorSpace>,
@@ -113,14 +111,7 @@ impl<'a> ImageXObject<'a> {
             return None;
         }
 
-        let dict_bpc = dict
-            .get::<u8>(BPC)
-            .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT));
-        let bpc_repaired = stream.xref_is_repaired();
-
         Some(Self {
-            dict_bpc,
-            bpc_repaired,
             width,
             cache: cache.clone(),
             height,
@@ -131,16 +122,6 @@ impl<'a> ImageXObject<'a> {
             stream: stream.clone(),
             kind,
         })
-    }
-
-    pub(super) fn dict_bpc(&self) -> Option<u8> {
-        if self.bpc_repaired == self.stream.xref_is_repaired() {
-            self.dict_bpc
-        } else {
-            let dict = self.stream.dict();
-            dict.get::<u8>(BPC)
-                .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT))
-        }
     }
 
     pub(crate) fn draw<'b>(&self, context: &mut Context<'b>, device: &mut impl Device<'b>) {

@@ -1,5 +1,5 @@
 use crate::object::dict::keys::{
-    BLACK_IS_1, COLUMNS, ENCODED_BYTE_ALIGN, END_OF_BLOCK, END_OF_LINE, K, MASK, ROWS,
+    BLACK_IS_1, COLUMNS, D, DECODE, ENCODED_BYTE_ALIGN, END_OF_BLOCK, END_OF_LINE, K, MASK, ROWS,
 };
 use crate::object::stream::{FilterResult, ImageColorSpace, ImageData, ImageDecodeParams};
 use crate::object::{Array, Dict};
@@ -15,17 +15,16 @@ pub(crate) fn decode(
     Fax::new(params, image_params.height, None).decode(data, FaxRows::Packed)
 }
 
-pub(crate) fn can_expand(
-    dict: &Dict<'_>,
-    params: &ImageDecodeParams,
-    ranges: Option<&Array<'_>>,
-) -> bool {
+pub(crate) fn can_expand(dict: &Dict<'_>, params: &ImageDecodeParams) -> bool {
     !params.is_indexed
         && !dict.contains_key(MASK)
-        && ranges.is_none_or(|array| {
-            let mut pairs = array.iter::<(f32, f32)>();
-            matches!(pairs.next(), Some((0.0, 1.0) | (1.0, 0.0))) && pairs.next().is_none()
-        })
+        && dict
+            .get::<Array<'_>>(D)
+            .or_else(|| dict.get::<Array<'_>>(DECODE))
+            .is_none_or(|array| {
+                let mut pairs = array.iter::<(f32, f32)>();
+                matches!(pairs.next(), Some((0.0, 1.0) | (1.0, 0.0))) && pairs.next().is_none()
+            })
 }
 
 pub(crate) struct Fax {
