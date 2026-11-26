@@ -1,6 +1,6 @@
 //! Position-preserving annotation dictionary reads and document-local object identity.
 
-use super::Unsupported;
+use super::{Observed, Unsupported};
 use crate::hash;
 use hayro_interpret::OcgState;
 use hayro_syntax::object::{Array, Dict, MaybeRef, Name, Number, ObjRef, Object, Stream};
@@ -29,12 +29,7 @@ fn int(n: Number) -> i32 {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct Location(Option<hayro_syntax::object::ObjectIdentifier>, usize, usize);
-
-fn location(id: Option<hayro_syntax::object::ObjectIdentifier>, data: &[u8]) -> Location {
-    Location(id, data.as_ptr() as usize, data.len())
-}
+pub(crate) use hayro_syntax::xref::ContentKey as Location;
 
 #[derive(Clone)]
 pub(crate) struct Entries<'a>(Dict<'a>, Objects<'a>);
@@ -63,12 +58,12 @@ impl Text {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct Source {
-    held: Held,
+pub(crate) struct Source<'a> {
+    held: Held<'a>,
     key: &'static [u8],
 }
 
-impl Source {
+impl<'a> Source<'a> {
     pub(crate) fn is_object(&self) -> bool {
         matches!(self.held, Held::Object(_))
     }
@@ -82,11 +77,11 @@ impl Source {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum Held {
+enum Held<'a> {
     Object(ObjRef),
     Unread(ObjRef),
-    In(Location),
-    Item(Location, usize),
+    In(Location<'a>),
+    Item(Location<'a>, usize),
     Absent,
 }
 
@@ -94,24 +89,23 @@ enum Held {
 pub(crate) struct Objects<'a> {
     read: Option<Rc<Read<'a>>>,
     shared: bool,
-    owner: Option<hayro_syntax::object::ObjectIdentifier>,
 }
 
 type Place = (usize, usize);
 
-type Keyed<'a> = hash::Map<Box<[u8]>, Entry<'a>>;
+type Keyed<'a> = hash::Map<Box<[u8]>, Observed<Entry<'a>>>;
 
 type Item<'a> = (Found<'a>, Option<ObjRef>);
 
 type Prefix<'a> = (Vec<Item<'a>>, bool);
 
 struct Read<'a> {
-    pub(crate) xref: &'a XRef,
-    objects: RefCell<hash::Map<ObjRef, Found<'a>>>,
-    entries: RefCell<hash::Map<Location, Keyed<'a>>>,
-    prefixes: RefCell<hash::Map<Location, Prefix<'a>>>,
-    places: RefCell<hash::Map<ObjRef, Option<Place>>>,
-    derived: RefCell<hash::Map<(Location, TypeId), Made>>,
+    xref: &'a XRef,
+    objects: RefCell<hash::Map<ObjRef, Observed<Found<'a>>>>,
+    entries: RefCell<hash::Map<Location<'a>, Keyed<'a>>>,
+    prefixes: RefCell<hash::Map<Location<'a>, Prefix<'a>>>,
+    places: RefCell<hash::Map<ObjRef, Observed<Option<Place>>>>,
+    derived: RefCell<hash::Map<(Location<'a>, TypeId), Observed<Made>>>,
 }
 
 type Made = Rc<dyn Any>;
@@ -123,11 +117,13 @@ pub(crate) trait Derived: 'static {
 impl<'a> Read<'a> {
     fn kept(&self, r: ObjRef) -> Found<'a> {
         let known = self.objects.borrow().get(&r).cloned();
-        known.unwrap_or_else(|| {
-            let found = Found::of(self.xref.get(r.into()));
-            self.objects.borrow_mut().insert(r, found.clone());
-            found
-        })
+        known
+            .unwrap_or_else(|| {
+                let found = Observed::read(self.xref, || Found::of(self.xref.get(r.into())));
+                self.objects.borrow_mut().insert(r, found.clone());
+                found
+            })
+            .replay(self.xref)
     }
 }
 #[derive(Clone)]
@@ -178,7 +174,6 @@ impl<'a> Objects<'a> {
                 derived: RefCell::default(),
             })),
             shared: false,
-            owner: None,
         }
     }
 
@@ -189,7 +184,6 @@ impl<'a> Objects<'a> {
                 let shared = Self {
                     read: self.read.clone(),
                     shared: true,
-                    owner: Some(r.into()),
                 };
                 (found, shared)
             }
@@ -200,19 +194,19 @@ impl<'a> Objects<'a> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum Id {
+pub(crate) enum Id<'a> {
     Object(ObjRef),
-    Written(Location),
+    Written(Location<'a>),
 }
 
 pub(crate) enum Annots<'a> {
     Object(ObjRef, Objects<'a>),
-    Written(Array<'a>, Objects<'a>),
+    Written(Array<'a>),
 }
 
 pub(crate) struct Listed<'a> {
     pub(crate) index: usize,
-    pub(crate) id: Id,
+    pub(crate) id: Id<'a>,
     named: Named<'a>,
 }
 
@@ -225,13 +219,7 @@ impl<'a> Objects<'a> {
     pub(crate) fn annots(&self, page: &Dict<'a>) -> Option<Annots<'a>> {
         match page.get_raw::<Object<'a>>(b"Annots")? {
             MaybeRef::Ref(r) => Some(Annots::Object(r, self.clone())),
-            MaybeRef::NotRef(Object::Array(a)) => Some(Annots::Written(
-                a,
-                Self {
-                    owner: page.obj_id(),
-                    ..self.clone()
-                },
-            )),
+            MaybeRef::NotRef(Object::Array(a)) => Some(Annots::Written(a)),
             MaybeRef::NotRef(_) => None,
         }
     }
@@ -242,7 +230,6 @@ impl<'a> Objects<'a> {
         let objects = Self {
             read: self.read.clone(),
             shared: true,
-            owner: root.obj_id(),
         };
         Some(Entries(root, objects))
     }
@@ -262,13 +249,7 @@ impl<'a> Objects<'a> {
         ) {
             return None;
         }
-        Some(Entries(
-            dict.clone(),
-            Self {
-                owner: dict.obj_id(),
-                ..self.clone()
-            },
-        ))
+        Some(Entries(dict, self.clone()))
     }
 
     fn own(&self, dict: &Dict<'a>) -> Option<bool> {
@@ -279,36 +260,36 @@ impl<'a> Objects<'a> {
         let at = place(dict.data());
         let known = read.places.borrow().get(&r).copied();
         let outer = known.unwrap_or_else(|| {
-            let outer = match read.kept(r) {
+            let outer = Observed::read(read.xref, || match read.kept(r) {
                 Found::Object(Object::Dict(d)) => Some(place(d.data())),
                 Found::Object(Object::Array(a)) => Some(place(a.data())),
                 Found::Object(Object::Stream(s)) => Some(place(s.dict().data())),
                 _ => None,
-            };
+            });
             read.places.borrow_mut().insert(r, outer);
             outer
         });
-        let (start, len) = outer?;
+        let (start, len) = outer.replay(read.xref)?;
         if (start, len) == at {
             Some(true)
         } else {
-            // Held within the object's data.
+            // Held<'a> within the object's data.
             (start <= at.0 && at.0 + at.1 <= start + len).then_some(false)
         }
     }
 }
 
 impl<'a> Annots<'a> {
-    pub(crate) fn id(&self) -> Id {
+    pub(crate) fn id(&self) -> Id<'a> {
         match self {
             Self::Object(r, _) => Id::Object(*r),
-            Self::Written(a, o) => Id::Written(location(o.owner, a.data())),
+            Self::Written(a) => Id::Written(a.content_key()),
         }
     }
 
     pub(crate) fn entries(&self) -> impl Iterator<Item = Listed<'a>> + use<'a> {
         let array = match self {
-            Self::Written(a, _) => Some(a.clone()),
+            Self::Written(a) => Some(a.clone()),
             Self::Object(r, objects) => objects.read.as_ref().and_then(|read| {
                 match objects.found(read, Some(MaybeRef::Ref(*r))).0 {
                     Found::Object(Object::Array(a)) => Some(a),
@@ -322,10 +303,7 @@ impl<'a> Annots<'a> {
             .map(|(index, entry)| {
                 let (id, named) = match entry {
                     MaybeRef::Ref(r) => (Id::Object(r), Named::Object(r)),
-                    MaybeRef::NotRef(d) => (
-                        Id::Written(location(d.obj_id(), d.data())),
-                        Named::Written(d),
-                    ),
+                    MaybeRef::NotRef(d) => (Id::Written(d.content_key()), Named::Written(d)),
                 };
                 Listed { index, id, named }
             })
@@ -462,15 +440,15 @@ impl<'a> Items<'a> {
         let Some(read) = &self.1.read else {
             return Rc::new(T::derive(self));
         };
-        let key = (location(self.1.owner, self.0.data()), TypeId::of::<T>());
+        let key = (self.0.content_key(), TypeId::of::<T>());
         let known = read.derived.borrow().get(&key).cloned();
         let made = known.unwrap_or_else(|| {
-            let made = Rc::new(T::derive(self)) as Rc<dyn Any>;
+            let made = Observed::read(read.xref, || Rc::new(T::derive(self)) as Rc<dyn Any>);
             read.derived.borrow_mut().insert(key, made.clone());
             made
         });
         // Kept under the type it was made as.
-        made.downcast::<T>().expect("made as T")
+        made.replay(read.xref).downcast::<T>().expect("made as T")
     }
 
     pub(crate) fn each<T: Derived>(&self) -> Vec<Rc<T>> {
@@ -502,12 +480,12 @@ impl<'a> Items<'a> {
             let refs = self.0.raw_iter().map(|e| e.as_obj_ref());
             return self.iter().zip(refs).take(n).collect();
         };
-        let at = location(self.1.owner, self.0.data());
+        let at = self.0.content_key();
         let known = read.prefixes.borrow().get(&at).cloned();
         let found = match known {
             Some((found, all)) if all || found.len() >= n => found,
             _ => {
-                let (found, all) = {
+                let ((found, all), lost) = read.xref.watch(|| {
                     let mut entries = self.0.raw_iter();
                     let found: Vec<Item<'a>> = entries
                         .by_ref()
@@ -517,8 +495,10 @@ impl<'a> Items<'a> {
                         .collect();
                     let all = found.len() < n || entries.next().is_none();
                     (found, all)
-                };
-                read.prefixes.borrow_mut().insert(at, (found.clone(), all));
+                });
+                if lost.is_none() {
+                    read.prefixes.borrow_mut().insert(at, (found.clone(), all));
+                }
                 found
             }
         };
@@ -570,12 +550,12 @@ impl<'a> Items<'a> {
         self.prefix(n).iter().map(|(v, _)| number(v)).collect()
     }
 
-    fn held(&self, r: Option<ObjRef>, i: usize) -> Held {
+    fn held(&self, r: Option<ObjRef>, i: usize) -> Held<'a> {
         match (r, &self.1.read) {
             (Some(r), Some(_)) => Held::Object(r),
             // Read without objects: no document to find a body in.
             (Some(r), None) => Held::Unread(r),
-            (None, _) => Held::Item(location(self.1.owner, self.0.data()), i),
+            (None, _) => Held::Item(self.0.content_key(), i),
         }
     }
 
@@ -602,7 +582,7 @@ impl<'a> Items<'a> {
 }
 
 pub(crate) struct Label<'a> {
-    pub(crate) source: Source,
+    pub(crate) source: Source<'a>,
     pub(crate) value: Value<'a>,
 }
 
@@ -616,7 +596,6 @@ impl<'a> Entries<'a> {
         let objects = Objects {
             read: self.1.read.clone(),
             shared: true,
-            owner: self.1.owner,
         };
         Self(self.0.clone(), objects)
     }
@@ -640,7 +619,7 @@ impl<'a> Entries<'a> {
         if !self.1.shared {
             return fresh();
         }
-        let at = location(self.1.owner, self.0.data());
+        let at = self.0.content_key();
         let known = read
             .entries
             .borrow()
@@ -649,7 +628,7 @@ impl<'a> Entries<'a> {
         let entry = match known {
             Some(entry) => entry,
             None => {
-                let (entry, _) = fresh();
+                let entry = Observed::read(read.xref, || fresh().0);
                 read.entries
                     .borrow_mut()
                     .entry(at)
@@ -659,11 +638,14 @@ impl<'a> Entries<'a> {
             }
         };
         // Every entry of a shared object is read with the objects of shared ones.
-        (entry, self.1.clone())
+        (entry.replay(read.xref), self.1.clone())
     }
 
-    pub(crate) fn shown_in(&self, xref: &XRef, content: &mut OcgState) -> bool {
-        content.shows(xref, &self.0)
+    pub(crate) fn shown_in(&self, content: &mut OcgState) -> bool {
+        self.1
+            .read
+            .as_ref()
+            .is_none_or(|read| content.shows(read.xref, &self.0))
     }
 
     pub(crate) fn get(&self, key: &[u8]) -> Value<'a> {
@@ -742,7 +724,7 @@ impl<'a> Entries<'a> {
         Some(kurbo::Rect::new(n[0], n[1], n[2], n[3]).abs())
     }
 
-    pub(crate) fn source(&self, key: &'static [u8]) -> Source {
+    pub(crate) fn source(&self, key: &'static [u8]) -> Source<'a> {
         let entry = self.entry(key).0;
         let held = match (entry.r, &self.1.read) {
             (Some(r), Some(_)) => Held::Object(r),
@@ -754,8 +736,8 @@ impl<'a> Entries<'a> {
         Source { held, key }
     }
 
-    pub(crate) fn location(&self) -> Location {
-        location(self.1.owner, self.0.data())
+    pub(crate) fn location(&self) -> Location<'a> {
+        self.0.content_key()
     }
 
     pub(crate) fn box_and_matrix(&self) -> Option<([f64; 4], [f64; 6])> {

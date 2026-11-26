@@ -117,3 +117,20 @@ fn indirect_annotations_skip_a_reference_back_to_the_page() {
             .is_empty()
     );
 }
+
+#[test]
+fn cached_annotation_selection_reports_the_unreadable_object() {
+    let pdf = document("/Annots [5 0 R]", vec![stream("", ""), ")".into()]);
+    let page = &pdf.pages()[0];
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    for _ in 0..2 {
+        let (marks, lost) = pdf
+            .xref()
+            .watch(|| appearances.page(page, AnnotationSelection::View, &View::of(page)));
+        assert!(marks.is_empty());
+        assert_eq!(
+            lost,
+            Some(hayro::hayro_syntax::object::ObjectIdentifier::new(5, 0))
+        );
+    }
+}

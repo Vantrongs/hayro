@@ -7,7 +7,7 @@ use crate::cache::Cache;
 use crate::color::{ColorComponents, ColorSpace};
 use crate::encode::Cost;
 use crate::function::Function;
-use crate::util::{Float32Ext, PointExt, RectExt};
+use crate::util::PointExt;
 use hayro_syntax::bit_reader::{BitReader, bit_mask};
 use hayro_syntax::object::Array;
 use hayro_syntax::object::Dict;

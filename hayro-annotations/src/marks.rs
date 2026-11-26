@@ -218,6 +218,7 @@ impl Appearance {
                 continue;
             }
             let props = |color: &Color| DrawProps {
+                knockout: hayro_interpret::Knockout::None,
                 transform: state.transform,
                 paint: Paint::Color(color.clone()),
                 soft_mask: None,

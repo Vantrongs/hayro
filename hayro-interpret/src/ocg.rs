@@ -257,14 +257,19 @@ impl ViewingState {
 impl OcgState {
     /// Read the viewing configuration for a document.
     pub fn from_catalog(xref: &XRef, catalog: &Dict<'_>) -> Self {
-        Self { viewing: Some(std::rc::Rc::new(ViewingState::from_catalog(xref, catalog))), ..Self::default() }
+        Self {
+            viewing: Some(std::rc::Rc::new(ViewingState::from_catalog(xref, catalog))),
+            ..Self::default()
+        }
     }
 
     /// Whether the dictionary is visible under its optional-content membership.
     pub fn shows(&mut self, xref: &XRef, dict: &Dict<'_>) -> bool {
         let pushed = self.begin_named(xref, dict, b"OC");
         let visible = self.is_visible();
-        if pushed { self.end_marked_content(); }
+        if pushed {
+            self.end_marked_content();
+        }
         visible
     }
 

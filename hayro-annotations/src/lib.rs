@@ -186,7 +186,7 @@ enum Plan<'a> {
         placed: Option<Placement>,
     },
     Generate {
-        id: Id,
+        id: Id<'a>,
         annot: Entries<'a>,
         subtype: Option<Name<'a>>,
         refused: Option<Unsupported>,
@@ -257,6 +257,8 @@ fn selected(annot: &Entries<'_>, selection: AnnotationSelection) -> bool {
 
 /// Annotation preparation and glyph caches for one document and font resolver.
 pub struct Appearances<'a> {
+    xref: &'a XRef,
+    visibility_loss: hayro_syntax::lost::Lost,
     visibility: RefCell<OcgState>,
     objects: Objects<'a>,
     fonts: Fonts,
@@ -265,29 +267,44 @@ pub struct Appearances<'a> {
 
 #[derive(Default)]
 struct Known<'a> {
-    form: Option<Option<Entries<'a>>>,
-    plans: Kept<(Id, AnnotationSelection), Option<Rc<Plan<'a>>>>,
-    generated: Kept<(Id, ViewKey), Option<Rc<Annotation<'a>>>>,
-    lists: Kept<(Id, AnnotationSelection), Plans<'a>>,
-    pages: Kept<(Id, AnnotationSelection, ViewKey), Rc<[Drawn<'a>]>>,
-    states: Kept<(Location, Source), State<'a>>,
-    fields: Kept<Location, Option<Field<'a>>>,
-    shaped: Kept<TextKey, Result<Rc<Shaped>, Unsupported>>,
-    stamps: Kept<Source, Result<Rc<icons::StampText>, Unsupported>>,
-    styles: Kept<(Source, bool), Result<Style, Unsupported>>,
-    labels: Kept<Source, Rc<Vec<Label<'a>>>>,
-    appearances: Kept<Source, DefaultAppearance>,
-    form_appearance: Option<DefaultAppearance>,
-    field_text: Kept<TextKey, Result<widget::FieldText, Unsupported>>,
+    form: Option<Observed<Option<Entries<'a>>>>,
+    plans: Kept<(Id<'a>, AnnotationSelection), Option<Rc<Plan<'a>>>>,
+    generated: Kept<(Id<'a>, ViewKey), Option<Rc<Annotation<'a>>>>,
+    lists: Kept<(Id<'a>, AnnotationSelection), Plans<'a>>,
+    pages: Kept<(Id<'a>, AnnotationSelection, ViewKey), Rc<[Drawn<'a>]>>,
+    states: Kept<(Location<'a>, Source<'a>), State<'a>>,
+    fields: hash::Map<Location<'a>, Option<Field<'a>>>,
+    shaped: Kept<TextKey<'a>, Result<Rc<Shaped>, Unsupported>>,
+    stamps: Kept<Source<'a>, Result<Rc<icons::StampText>, Unsupported>>,
+    styles: Kept<(Source<'a>, bool), Result<Style, Unsupported>>,
+    labels: Kept<Source<'a>, Rc<Vec<Label<'a>>>>,
+    appearances: Kept<Source<'a>, DefaultAppearance>,
+    form_appearance: Option<Observed<DefaultAppearance>>,
+    field_text: Kept<TextKey<'a>, Result<widget::FieldText, Unsupported>>,
 }
 
-type Kept<K, V> = hash::Map<K, V>;
+type Kept<K, V> = hash::Map<K, Observed<V>>;
+
+#[derive(Clone, Copy)]
+struct Observed<T>(T, hayro_syntax::lost::Lost);
+
+impl<T> Observed<T> {
+    fn read(xref: &XRef, make: impl FnOnce() -> T) -> Self {
+        let (value, lost) = xref.apart(make);
+        Self(value, lost)
+    }
+
+    fn replay(self, xref: &XRef) -> T {
+        xref.note(self.1);
+        self.0
+    }
+}
 
 type DefaultAppearance = (Family, Option<f32>, Option<Color>);
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct TextKey {
-    sources: Vec<Source>,
+struct TextKey<'a> {
+    sources: Vec<Source<'a>>,
     face: Typeface,
     style: Option<StyleKey>,
     numbers: Vec<u64>,
@@ -299,8 +316,12 @@ const FREE_TEXT: u64 = 2;
 const FIELD: u64 = 3;
 const OPTION: u64 = 4;
 
-impl TextKey {
-    fn new(sources: impl IntoIterator<Item = Source>, face: Typeface, numbers: Vec<u64>) -> Self {
+impl<'a> TextKey<'a> {
+    fn new(
+        sources: impl IntoIterator<Item = Source<'a>>,
+        face: Typeface,
+        numbers: Vec<u64>,
+    ) -> Self {
         Self {
             sources: sources.into_iter().collect(),
             face,
@@ -320,9 +341,14 @@ impl TextKey {
 impl<'a> Appearances<'a> {
     /// Create the annotation cache for this document.
     pub fn new(xref: &'a XRef, font_resolver: hayro_font::FontResolverFn) -> Self {
-        let catalog = xref.get(xref.root_id()).unwrap_or_default();
+        let (visibility, visibility_loss) = xref.watch(|| {
+            let catalog = xref.get(xref.root_id()).unwrap_or_default();
+            OcgState::from_catalog(xref, &catalog)
+        });
         Self {
-            visibility: RefCell::new(OcgState::from_catalog(xref, &catalog)),
+            xref,
+            visibility_loss,
+            visibility: RefCell::new(visibility),
             objects: Objects::new(xref),
             fonts: Fonts::new(font_resolver),
             fields: RefCell::default(),
@@ -331,14 +357,17 @@ impl<'a> Appearances<'a> {
 
     fn form(&self) -> Option<Entries<'a>> {
         let known = self.fields.borrow().form.clone();
-        known.unwrap_or_else(|| {
-            let made = self
-                .objects
-                .catalog()
-                .and_then(|root| root.dict(b"AcroForm"));
-            self.fields.borrow_mut().form = Some(made.clone());
-            made
-        })
+        known
+            .unwrap_or_else(|| {
+                let made = Observed::read(self.xref, || {
+                    self.objects
+                        .catalog()
+                        .and_then(|root| root.dict(b"AcroForm"))
+                });
+                self.fields.borrow_mut().form = Some(made.clone());
+                made
+            })
+            .replay(self.xref)
     }
 
     /// Return the selected appearances on a page of this document, in annotation order.
@@ -348,6 +377,7 @@ impl<'a> Appearances<'a> {
         selection: AnnotationSelection,
         view: &View,
     ) -> Rc<[Drawn<'a>]> {
+        self.xref.note(self.visibility_loss);
         let Some(annots) = self.objects.annots(page.raw()) else {
             return Rc::from([]);
         };
@@ -396,7 +426,7 @@ impl<'a> Appearances<'a> {
             });
             Some(Rc::new(Plan::Fixed { annotation, placed }))
         };
-        if !selected(&annot, selection) || !annot.shown_in(self.objects.xref, &mut self.visibility.borrow_mut()) {
+        if !selected(&annot, selection) || !annot.shown_in(&mut self.visibility.borrow_mut()) {
             return None;
         }
         match self.prepare(&annot) {
@@ -714,17 +744,17 @@ impl<'a> Appearances<'a> {
         };
         let known = map(&mut self.fields.borrow_mut()).get(&key).cloned();
         if let Some(made) = known {
-            return made;
+            return made.replay(self.xref);
         }
         // Made without the map borrowed: making may look other things up.
-        let made = make();
+        let made = Observed::read(self.xref, make);
         map(&mut self.fields.borrow_mut()).insert(key, made.clone());
-        made
+        made.replay(self.xref)
     }
 
     fn shaped(
         &self,
-        key: TextKey,
+        key: TextKey<'a>,
         make: impl FnOnce() -> Result<Shaped, Unsupported>,
     ) -> Result<Rc<Shaped>, Unsupported> {
         self.once(|k| &mut k.shaped, Some(key), || make().map(Rc::new))
@@ -732,7 +762,7 @@ impl<'a> Appearances<'a> {
 
     fn plain(
         &self,
-        source: Source,
+        source: Source<'a>,
         face: Typeface,
         way: u64,
         text: impl FnOnce() -> Result<String, Unsupported>,
@@ -743,7 +773,7 @@ impl<'a> Appearances<'a> {
 
     fn labels(
         &self,
-        source: Source,
+        source: Source<'a>,
         items: impl FnOnce() -> Option<Items<'a>>,
     ) -> Rc<Vec<Label<'a>>> {
         self.once(
@@ -787,17 +817,19 @@ impl<'a> Appearances<'a> {
 
     fn default_appearance(
         &self,
-        source: Option<Source>,
+        source: Option<Source<'a>>,
         read: impl FnOnce() -> Option<Vec<u8>>,
     ) -> DefaultAppearance {
         let make = || text::default_appearance(&read().unwrap_or_default());
         if source.is_none() {
             let known = self.fields.borrow().form_appearance;
-            known.unwrap_or_else(|| {
-                let made = make();
-                self.fields.borrow_mut().form_appearance = Some(made);
-                made
-            })
+            known
+                .unwrap_or_else(|| {
+                    let made = Observed::read(self.xref, make);
+                    self.fields.borrow_mut().form_appearance = Some(made);
+                    made
+                })
+                .replay(self.xref)
         } else {
             self.once(|k| &mut k.appearances, source, make)
         }
@@ -806,8 +838,8 @@ impl<'a> Appearances<'a> {
     fn field(&self, annot: &Entries<'a>) -> Option<Field<'a>> {
         let mut on_walk = hash::Set::new();
         on_walk.insert(annot.location());
-        let mut walk: Vec<(Option<Location>, Entries<'a>)> = vec![(None, annot.clone())];
-        let mut field = {
+        let mut walk: Vec<(Option<Location<'a>>, Entries<'a>)> = vec![(None, annot.clone())];
+        let (mut field, walk_loss) = self.xref.watch(|| {
             loop {
                 let node = &walk[walk.len() - 1].1;
                 let Some(parent) = node.parent() else {
@@ -823,15 +855,18 @@ impl<'a> Appearances<'a> {
                 }
                 walk.push((Some(id), parent));
             }
-        };
-        let fields = {
+        });
+        let (fields, inherit_loss) = self.xref.watch(|| {
             let mut fields = Vec::new();
             for (id, node) in walk.into_iter().rev() {
                 field = field.clone().map(|above| above.below(&node));
                 fields.extend(id.map(|id| (id, field.clone())));
             }
             fields
-        };
+        });
+        if walk_loss.is_some() || inherit_loss.is_some() {
+            return field;
+        }
         let known = &mut self.fields.borrow_mut().fields;
         for (id, field) in fields {
             known.insert(id, field);
@@ -893,7 +928,7 @@ impl<'a> Field<'a> {
             .map_or(Value::Null, |d| d.get(key.key()))
     }
 
-    fn source(&self, key: Inherited) -> Source {
+    fn source(&self, key: Inherited) -> Source<'a> {
         match &self.0[key as usize] {
             Some(d) => d.source(key.key()),
             None => Source::absent(key.key()),

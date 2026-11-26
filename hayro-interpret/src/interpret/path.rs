@@ -111,7 +111,10 @@ pub(crate) fn stroke_path_impl<'a>(
     paint_path(
         device,
         path.unwrap_or(context.path()),
-        DrawProps { knockout, ..context.draw_props(true) },
+        DrawProps {
+            knockout,
+            ..context.draw_props(true)
+        },
         &DrawMode::Stroke(context.stroke_props().clone()),
     );
 }

@@ -593,11 +593,12 @@ impl XRef {
     /// Location a listed reference leads to.
     pub fn content_key(&self, id: ObjectIdentifier) -> Option<ContentKey<'_>> {
         let Inner::Some(r) = &self.0 else { return None };
-        let file = r.data.get().as_ref();
-        let (entry, repaired, end) = r.map.get().location(id, self, file.len())?;
+        let (entry, repaired, next) = r.map.get().location(id, self)?;
         let mut ctx = ReaderContext::new(self, false);
         let data = match entry {
             EntryType::Normal(at) => {
+                let file = r.data.get().as_ref();
+                let end = next.unwrap_or(file.len()).min(file.len());
                 let Some(bytes) = file.get(at..end) else {
                     self.note(Some(id));
                     return None;
@@ -671,7 +672,7 @@ impl XRef {
             if let EntryType::ObjStream(_, _) = entry {
                 rebuilt.entry(id).or_insert(entry);
             } else if let EntryType::Normal(at) = entry {
-                let end = locked.end(at, file.len());
+                let end = locked.next_offset(at).unwrap_or(file.len()).min(file.len());
                 let mut header = Reader::new_with(&file[..end], at);
                 if let Some(physical) =
                     ObjectIdentifier::read_in(&mut header, &crate::reader::Unknown)
@@ -751,8 +752,7 @@ impl XRef {
         }
 
         // The flag must describe the map this entry came from.
-        let file = repr.data.get().as_ref();
-        let (entry, was_repaired, end) = repr.map.get().location(id, self, file.len())?;
+        let (entry, was_repaired, next) = repr.map.get().location(id, self)?;
         let caller_ctx = ctx;
         let mut ctx = ctx.clone();
         ctx.set_obj_number(id);
@@ -760,6 +760,8 @@ impl XRef {
 
         match entry {
             EntryType::Normal(offset) => {
+                let file = repr.data.get().as_ref();
+                let end = next.unwrap_or(file.len()).min(file.len());
                 ctx.set_in_object_stream(false);
                 let mut r = Reader::new_with(&file[..end], offset);
                 if let Some(physical) = r.read_without_context::<ObjectIdentifier>() {
@@ -921,12 +923,11 @@ impl MapRepr {
         &self,
         id: ObjectIdentifier,
         xref: &XRef,
-        size: usize,
-    ) -> Option<(EntryType, bool, usize)> {
+    ) -> Option<(EntryType, bool, Option<usize>)> {
         let entry = self.entry(id, xref)?;
         let end = match entry {
-            EntryType::Normal(at) => self.end(at, size),
-            EntryType::ObjStream(_, _) => size,
+            EntryType::Normal(at) => self.next_offset(at),
+            EntryType::ObjStream(_, _) => None,
         };
         Some((entry, self.repaired, end))
     }
@@ -960,12 +961,10 @@ impl MapRepr {
             broken,
         }
     }
-    fn end(&self, at: usize, len: usize) -> usize {
+    fn next_offset(&self, at: usize) -> Option<usize> {
         self.offsets
             .get(self.offsets.partition_point(|o| *o <= at))
             .copied()
-            .unwrap_or(len)
-            .min(len)
     }
 }
 

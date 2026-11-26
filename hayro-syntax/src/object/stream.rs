@@ -586,7 +586,7 @@ impl<'a> Stream<'a> {
                     } else {
                         self.collect_filters(&filters_and_params, false, None)?
                     };
-                    return filter.apply(&stored, &options, params, false, false);
+                    return filter.apply(&stored, &options, params, false);
                 }
                 _ => params,
             },
@@ -613,7 +613,6 @@ impl<'a> Stream<'a> {
                 params,
                 image_params,
                 matches!(target, DecodeTarget::PageContent),
-                false,
             )?;
             current = Some(new);
         }

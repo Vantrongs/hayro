@@ -75,7 +75,6 @@ impl Filter {
         params: &Dict<'_>,
         #[cfg_attr(not(feature = "images"), allow(unused))] image_params: &ImageDecodeParams,
         recover_ascii_hex: bool,
-        checked: bool,
     ) -> Result<FilterResult<'static>, DecodeFailure> {
         match self {
             Self::AsciiHexDecode => ascii_hex::decode_into(data, recover_ascii_hex)
@@ -90,7 +89,7 @@ impl Filter {
             Self::LzwDecode => lzw_flate::lzw::decode(data, params)
                 .map(FilterResult::from_data)
                 .ok_or(DecodeFailure::StreamDecode),
-            Self::FlateDecode => lzw_flate::flate::decode_with(data, params, checked)
+            Self::FlateDecode => lzw_flate::flate::decode(data, params)
                 .map(FilterResult::from_data)
                 .ok_or(DecodeFailure::StreamDecode),
             #[cfg(feature = "images")]

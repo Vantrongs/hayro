@@ -364,7 +364,7 @@ impl Codec {
                 let raw = !matches!(header.as_slice(),[a,b] if a&15==8 && a>>4<=7 && u16::from_be_bytes([*a,*b]).is_multiple_of(31));
                 *started = true;
                 if raw && !header.is_empty() {
-                    let (used, done) = state.step(header, false, out)?;
+                    let (used, done) = state.step(header, false, strict, out)?;
                     if used != header.len() && !done {
                         return None;
                     }
@@ -372,7 +372,7 @@ impl Codec {
                 }
                 return Some((n, eof && data.is_empty() && header.is_empty()));
             }
-            return state.step(data, eof, out);
+            return state.step(data, eof, strict, out);
         }
         if let Self::Predict(p) = self {
             return p.step(data, eof, out);
@@ -526,7 +526,13 @@ impl Inflater {
         }
     }
 
-    fn step(&mut self, input: &[u8], eof: bool, out: &mut Vec<u8>) -> Option<(usize, bool)> {
+    fn step(
+        &mut self,
+        input: &[u8],
+        eof: bool,
+        strict: bool,
+        out: &mut Vec<u8>,
+    ) -> Option<(usize, bool)> {
         out.resize(BLOCK, 0);
         #[cfg(feature = "unsafe")]
         let (used, made, done) = {
@@ -552,7 +558,7 @@ impl Inflater {
             (r.bytes_consumed, r.bytes_written, done)
         };
         out.truncate(made);
-        if !done && used == 0 && made == 0 && !eof {
+        if !done && used == 0 && made == 0 && (!eof || strict) {
             return None;
         }
         Some((used, done || eof && used == 0 && made == 0))

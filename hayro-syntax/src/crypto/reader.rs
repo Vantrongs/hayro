@@ -128,7 +128,7 @@ mod tests {
             DecryptorData {
                 stream_filter: filter,
                 string_filter: filter,
-                crypt_filters: crate::sync::HashMap::new(),
+                crypt_filters: crate::hash::Map::default(),
             }
         };
         let codecs = [

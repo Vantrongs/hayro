@@ -70,7 +70,9 @@ impl<'a> FormXObject<'a> {
             return;
         }
 
-        let has_oc = context.ocg_state.begin_named(context.xref, &self.dict, b"OC");
+        let has_oc = context
+            .ocg_state
+            .begin_named(context.xref, &self.dict, b"OC");
         if !context.ocg_state.is_visible() {
             if has_oc {
                 context.ocg_state.end_marked_content();

@@ -361,7 +361,8 @@ impl<'a> SvgRenderer<'a> {
                     .encode(pattern.matrix)
             } else {
                 pattern.encode()
-            }.prepare_for(shading.bbox);
+            }
+            .prepare_for(shading.bbox);
             let texture = encoded.render_texture(shading.bbox, 1.0);
             let image = DynamicImage::ImageRgba8(
                 ImageBuffer::from_raw(texture.width, texture.height, texture.data).unwrap(),

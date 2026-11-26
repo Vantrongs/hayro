@@ -3,22 +3,15 @@ pub(crate) mod flate {
     use crate::object::Dict;
     use alloc::vec::Vec;
 
-    #[cfg(test)]
     pub(crate) fn decode(data: &[u8], params: &Dict<'_>) -> Option<Vec<u8>> {
-        decode_with(data, params, false)
-    }
-    pub(crate) fn decode_with(data: &[u8], params: &Dict<'_>, checked: bool) -> Option<Vec<u8>> {
         if data.is_empty() {
             return predictor::apply(Vec::new(), params);
         }
         let data = zlib_body(data).unwrap_or(data);
         // Broken encoders can refer to data before the start, which should read as zeros.
-        let decoded = inflate(data, false).or_else(|_| inflate(data, true));
-        let decoded = match decoded {
-            Ok(v) => v,
-            Err(v) if !checked => v,
-            Err(_) => return None,
-        };
+        let decoded = inflate(data, false)
+            .or_else(|_| inflate(data, true))
+            .unwrap_or_else(|partial| partial);
         predictor::apply(decoded, params)
     }
 

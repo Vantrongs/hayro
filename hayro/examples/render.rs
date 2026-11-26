@@ -135,7 +135,10 @@ fn render_advanced(pdf: &Pdf, interpreter_settings: &InterpreterSettings, output
         let (width, height) = page.render_dimensions();
 
         // Reset the context and pixmap to the requested size.
-        ctx.reset_with(hayro::vello_cpu::ResetOptions { size: Some((width as u16, height as u16)), ..Default::default() });
+        ctx.reset_with(vello_cpu::ResetOptions {
+            size: Some((width as u16, height as u16)),
+            ..Default::default()
+        });
         pixmap.resize(ctx.width(), ctx.height());
 
         // Zoom in by 50%, keeping the page center at the viewport center.
