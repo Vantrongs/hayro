@@ -211,10 +211,36 @@ impl EncodedRadialAxialShading {
             return None;
         }
         let [a, b] = self.domain.map(f64::from);
+        let start_color = pattern.eval_1d(&self.function, a);
+        let end_color = pattern.eval_1d(&self.function, b);
         let mut colors = Vec::with_capacity(len + 2);
-        colors.push(pattern.eval_1d(&self.function, a));
+        colors.push(start_color);
         let mut budget = len;
         let texels_per_cell = len / PARAMETER_CELLS;
+        let param = |k| {
+            if k == len {
+                b
+            } else {
+                a + (b - a) * (k as f64 / len as f64)
+            }
+        };
+        for &(pad_color, lo_idx, hi_idx) in &[
+            (start_color, 0, STRIP_ADDRESS_ERROR + 1),
+            (end_color, len - STRIP_ADDRESS_ERROR, len),
+        ] {
+            let (lo, hi) = color_bounds(
+                &self.function,
+                [param(lo_idx), param(hi_idx)],
+                pattern,
+                &mut budget,
+            )??;
+            if lo[3] != hi[3]
+                || lo[3] != pad_color[3]
+                || color_error(lo, pad_color).max(color_error(hi, pad_color)) > STRIP_COLOR_ERROR
+            {
+                return None;
+            }
+        }
         for i in 0..len {
             let first = i.saturating_sub(STRIP_ADDRESS_ERROR) / texels_per_cell;
             let last = ((i + STRIP_ADDRESS_ERROR + 1) / texels_per_cell).min(PARAMETER_CELLS - 1);
@@ -233,13 +259,6 @@ impl EncodedRadialAxialShading {
                 colors.push(color);
                 continue;
             }
-            let param = |k| {
-                if k == len {
-                    b
-                } else {
-                    a + (b - a) * (k as f64 / len as f64)
-                }
-            };
             let (lo, hi) = color_bounds(
                 &self.function,
                 [
@@ -262,7 +281,7 @@ impl EncodedRadialAxialShading {
                 colors.push(mid);
             }
         }
-        colors.push(pattern.eval_1d(&self.function, b));
+        colors.push(end_color);
         Some(colors)
     }
 
@@ -273,12 +292,24 @@ impl EncodedRadialAxialShading {
             return None;
         }
         let range = self.padded_range(pattern.background_color.components()[3] > 0.)?;
+        let kind = self.gradient_kind(range);
+        if let super::SvgGradientKind::Radial {
+            start_center,
+            start_radius,
+            end_center,
+            end_radius,
+        } = kind
+            && start_center != end_center
+            && (end_radius - start_radius).abs() < 1.0 / 4096.0
+        {
+            return None;
+        }
         let stops = ramp
             .native
             .get_or_init(|| self.raster_stops(pattern, ramp))
             .as_ref()?;
         Some(SvgGradient {
-            kind: self.gradient_kind(range),
+            kind,
             transform: pattern.base_transform.inverse(),
             stops: stops.clone(),
         })
@@ -357,5 +388,48 @@ mod tests {
         assert_eq!(ramp.get(0.25), Some([0., 0., 0., 1.]));
         assert!(ramp.get(0.5000003).is_none());
         assert_eq!(encoded.eval_1d(&g.function, 0.5000003), [1., 0., 0., 1.]);
+    }
+
+    #[test]
+    fn nonconcentric_nearly_equal_radial_declines_native_promotion() {
+        let dict = Dict::from_bytes(
+            b"<< /ShadingType 3 /Coords [0 .4 1 1 .4 1.0002] /Extend [true true]
+            /ColorSpace [/Separation /Ink /DeviceRGB << /FunctionType 2 /Domain [0 1] /N 1 /C0 [0 0 0] /C1 [0 0 0] >>]
+            /Function << /FunctionType 2 /Domain [0 1] /N 1 /C0 [0] /C1 [1] >> >>",
+        )
+        .unwrap();
+        let pattern = ShadingPattern {
+            shading: Arc::new(Shading::new(&dict, None, &Cache::default()).unwrap()),
+            matrix: Affine::IDENTITY,
+            opacity: 1.,
+            transfer_function: None,
+        };
+        let encoded = PreparedShading::new(pattern).encode(Affine::IDENTITY);
+        let EncodedShadingType::RadialAxial(g) = &encoded.shading_type else {
+            unreachable!()
+        };
+        assert!(g.as_raster_gradient(&encoded).is_none());
+    }
+
+    #[test]
+    fn axial_strip_rejects_unvalidated_endpoint_step() {
+        let dict = Dict::from_bytes(
+            b"<< /ShadingType 2 /Coords [0 0 512 512] /Extend [true true] /Domain [-1 1]
+            /ColorSpace [/Separation /Ink /DeviceGray << /FunctionType 2 /Domain [0 1] /N 0.75 /C0 [0] /C1 [1] >>]
+            /Function << /FunctionType 3 /Domain [-1 1] /Bounds [0.99999994] /Encode [0 0 1 1]
+            /Functions [<< /FunctionType 2 /Domain [0 1] /N 1 /C0 [0] /C1 [0] >> << /FunctionType 2 /Domain [0 1] /N 1 /C0 [0.004] /C1 [0.004] >>] >> >>",
+        )
+        .unwrap();
+        let pattern = ShadingPattern {
+            shading: Arc::new(Shading::new(&dict, None, &Cache::default()).unwrap()),
+            matrix: Affine::IDENTITY,
+            opacity: 1.,
+            transfer_function: None,
+        };
+        let encoded = PreparedShading::new(pattern).encode(Affine::IDENTITY);
+        let EncodedShadingType::RadialAxial(g) = &encoded.shading_type else {
+            unreachable!()
+        };
+        assert!(g.axial_strip(&encoded).is_none());
     }
 }

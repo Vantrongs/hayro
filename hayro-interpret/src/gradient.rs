@@ -327,9 +327,11 @@ fn pad_stops(
     };
 
     let padded = |offset: f32| (offset - t0) / (t1 - t0);
+    // SVG parsers such as usvg collapse distinct stops within 4 f32 ULPs.
+    let collapses = |a: f32, b: f32| a >= b || b.to_bits().saturating_sub(a.to_bits()) <= 4;
     if stops
         .windows(2)
-        .any(|s| s[0].offset < s[1].offset && padded(s[0].offset) >= padded(s[1].offset))
+        .any(|s| s[0].offset < s[1].offset && collapses(padded(s[0].offset), padded(s[1].offset)))
     {
         return None;
     }
