@@ -33,6 +33,7 @@ This crate has two default features:
 
 use fearless_simd::Level;
 use glyph_cache::GlyphCache;
+use hayro_annotations::{Appearances, Look, View};
 use hayro_interpret::Device;
 use hayro_interpret::InterpreterCache;
 use hayro_interpret::InterpreterSettings;
@@ -40,8 +41,10 @@ use hayro_interpret::font::{GlyphRun, HintingCache};
 use hayro_interpret::hayro_syntax::Pdf;
 use hayro_interpret::hayro_syntax::page::Page;
 use hayro_interpret::util::{RectExt, TransformExt};
+use hayro_interpret::{
+    AnnotationSelection, ClipPath, draw_appearance_stream, interpret_page_with_annotations,
+};
 use hayro_interpret::{BlendMode, Context, DrawMode, DrawProps, ImageDrawProps, SoftMask};
-use hayro_interpret::{ClipPath, interpret_page};
 use hayro_interpret::{FillRule, Knockout};
 use kurbo::{Affine, BezPath, Rect, Shape};
 use pic_scale::Scaler;
@@ -211,17 +214,43 @@ impl<'a, 'r> Device<'a> for Renderer<'r> {
 // TODO: Allow clearing the cache.
 #[derive(Default)]
 pub struct RenderCache<'a> {
+    annotations: RefCell<Option<AnnotationCache<'a>>>,
     pub(crate) interpreter_cache: InterpreterCache<'a>,
     pub(crate) outline_cache: Rc<RefCell<OutlineCache>>,
     pub(crate) glyph_cache: Rc<RefCell<GlyphCache>>,
     pub(crate) hinting_cache: HintingCache,
 }
 
+struct AnnotationCache<'a> {
+    xref: &'a hayro_syntax::xref::XRef,
+    fonts: hayro_interpret::FontResolverFn,
+    appearances: Rc<Appearances<'a>>,
+}
+
 impl<'a> RenderCache<'a> {
+    fn appearances(&self, page: &Page<'a>, settings: &InterpreterSettings) -> Rc<Appearances<'a>> {
+        let mut cache = self.annotations.borrow_mut();
+        let xref = page.xref();
+        if let Some(entry) = &*cache
+            && std::ptr::eq(entry.xref, xref)
+            && std::sync::Arc::ptr_eq(&entry.fonts, &settings.font_resolver)
+        {
+            return entry.appearances.clone();
+        }
+        let appearances = Rc::new(Appearances::new(xref, settings.font_resolver.clone()));
+        *cache = Some(AnnotationCache {
+            xref,
+            fonts: settings.font_resolver.clone(),
+            appearances: appearances.clone(),
+        });
+        appearances
+    }
+
     /// Create a new render cache.
     pub fn new() -> Self {
         Self {
             interpreter_cache: InterpreterCache::new(),
+            annotations: RefCell::default(),
             outline_cache: Rc::new(RefCell::new(FxHashMap::default())),
             glyph_cache: Rc::new(RefCell::new(GlyphCache::default())),
             hinting_cache: HintingCache::new(),
@@ -232,6 +261,8 @@ impl<'a> RenderCache<'a> {
 /// Settings for rendering a page.
 #[derive(Clone, Copy)]
 pub struct RenderSettings {
+    /// Which annotations the rasterizer draws.
+    pub annotations: AnnotationSelection,
     /// Whether all images should forcibly be rendered with bilinear interpolation.
     pub force_image_interpolation: bool,
     /// Coverage threshold above which pixels are painted, or `None` for anti-aliasing.
@@ -245,6 +276,7 @@ pub struct RenderSettings {
 impl Default for RenderSettings {
     fn default() -> Self {
         Self {
+            annotations: AnnotationSelection::View,
             force_image_interpolation: false,
             aliasing_threshold: None,
             hinting: true,
@@ -350,7 +382,30 @@ pub fn render_into<'a>(
         device.ctx.push_clip_rect(&crop_box);
     }
 
-    interpret_page(page, &mut state, &mut device);
+    interpret_page_with_annotations(page, &mut state, &mut device, |state, device| {
+        let appearances = cache.appearances(page, interpreter_settings);
+        for annotation in appearances
+            .page(page, render_settings.annotations, &View::of(page))
+            .iter()
+        {
+            match annotation.look() {
+                Look::Generated(appearance) => appearance.replay(device, transform),
+                Look::Stream { stream, placement } => draw_appearance_stream(
+                    stream,
+                    placement.bbox(),
+                    Affine::new(placement.matrix().map(f64::from)),
+                    Affine::new(placement.transform().map(f64::from)),
+                    page.resources(),
+                    state,
+                    device,
+                ),
+                Look::Unsupported(_) => (interpreter_settings.warning_sink)(
+                    hayro_interpret::InterpreterWarning::UnresolvedAnnotationAppearance,
+                ),
+                Look::Nothing => {}
+            }
+        }
+    });
 
     if clip_crop_box {
         device.pop_clip();

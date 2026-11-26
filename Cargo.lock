@@ -577,6 +577,7 @@ dependencies = [
  "ab_glyph_rasterizer",
  "bytemuck",
  "fearless_simd",
+ "hayro-annotations",
  "hayro-interpret",
  "image",
  "kurbo",
@@ -589,8 +590,14 @@ dependencies = [
 name = "hayro-annotations"
 version = "0.1.0"
 dependencies = [
+ "hayro-font",
+ "hayro-interpret",
+ "hayro-syntax",
  "html5ever",
  "html5gum",
+ "kurbo",
+ "smallvec",
+ "unicode-bidi",
 ]
 
 [[package]]

@@ -30,12 +30,16 @@ const MAX_DEPTH: usize = 256;
 /// style over the style of the element it is in, the outermost over `base`.
 /// Paragraphs (`p`, `div`) start and end a line, as does `br`; other whitespace is
 /// kept. A line is aligned by the `text-align` of the paragraph it is in.
-pub fn rich_text(xhtml: &str, base: &Style, positive: bool) -> Result<Vec<Span>, Unsupported> {
+pub(super) fn rich_text(
+    xhtml: &str,
+    base: &Style,
+    positive: bool,
+) -> Result<Vec<Span>, Unsupported> {
     walk(&parse(xhtml)?, base, positive)
 }
 
 /// `style` with the declarations of the CSS declaration list `css` (a `/DS`).
-pub fn css_style(css: &str, mut style: Style, positive: bool) -> Result<Style, Unsupported> {
+pub(super) fn css_style(css: &str, mut style: Style, positive: bool) -> Result<Style, Unsupported> {
     let size = style.size;
     if declarations(css, &mut style, size, positive)? {
         Ok(style)

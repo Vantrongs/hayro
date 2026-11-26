@@ -1,21 +1,33 @@
-use hayro_annotations::{Align, Color, Family, Size, Style, rich_text};
+//! End-to-end scaling for rich `FreeText` annotation synthesis.
 use std::fmt::Write;
 use std::time::{Duration, Instant};
 
-fn check(attributes: &str, count: usize) {
-    let input = format!("<p{attributes}>A</p>");
-    let style = Style {
-        face: Family::Sans.into(),
-        size: Size::Points(12.),
-        color: Color::BLACK,
-        align: Align::Left,
-    };
+use hayro_annotations::{Appearances, Look, Unsupported, View};
+use hayro_interpret::{AnnotationSelection, InterpreterSettings};
+
+mod common;
+
+fn generate(input: &str) -> Result<usize, Unsupported> {
+    let annotation = format!(
+        "<< /Subtype /FreeText /Rect [10 10 100 80] /BS << /W 0 >> /RC (\u{feff}{input}) >>"
+    );
+    let pdf = common::document("/Annots [4 0 R]", vec![annotation]);
+    let page = &pdf.pages()[0];
+    let appearances = Appearances::new(pdf.xref(), InterpreterSettings::default().font_resolver);
+    let drawn = appearances.page(page, AnnotationSelection::View, &View::of(page));
+    match drawn[0].look() {
+        Look::Generated(appearance) => Ok(appearance.glyphs.len()),
+        Look::Unsupported(why) => Err(*why),
+        _ => panic!("expected a synthesized annotation or refusal"),
+    }
+}
+
+fn check_rich(input: &str, count: usize) {
     let mut samples = [Duration::ZERO; 5];
     for sample in &mut samples {
         let start = Instant::now();
-        let spans = rich_text(&input, &style, true).unwrap();
+        assert_eq!(generate(input), Ok(1));
         *sample = start.elapsed();
-        assert_eq!(spans[0].text, "A\n");
     }
     samples.sort();
     eprintln!(
@@ -24,6 +36,10 @@ fn check(attributes: &str, count: usize) {
         samples[2]
     );
     assert!(samples[2] < Duration::from_secs(3));
+}
+
+fn check(attrs: &str, count: usize) {
+    check_rich(&format!("<p{attrs}>A</p>"), count);
 }
 
 #[test]
@@ -56,4 +72,48 @@ fn ignored_names_from_one_atom_bucket() {
         }
     }
     assert_eq!(count, 65_536);
+}
+
+fn attributes_whose_names_hash_alike() -> String {
+    const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut attributes = String::new();
+    for a in CHARS {
+        for b in CHARS {
+            for c in CHARS {
+                let abc = String::from_utf8(vec![*a, *b, *c]).unwrap();
+                write!(attributes, " {abc}z{abc}=x").unwrap();
+            }
+        }
+    }
+    attributes
+}
+
+#[test]
+fn short_names_in_a_paragraph_and_repeated_body() {
+    let attrs = attributes_whose_names_hash_alike();
+    check(&attrs, 46_656);
+    check_rich(&format!("<body{attrs}><body a=b><p>A</p>"), 46_656);
+}
+
+#[test]
+fn rich_text_recovery_bounds() {
+    let open: String = (0..200).map(|i| format!("<b title={i}>")).collect();
+    for (input, error) in [
+        (
+            format!("<p>漢{}</p>", "&".repeat(1_600_000)),
+            Unsupported::Character('漢'),
+        ),
+        (
+            format!("{}{}", "<span>".repeat(100_000), "</p>".repeat(100_000)),
+            Unsupported::RichText,
+        ),
+        (
+            format!("<p>{open}{}", "</p><p>x".repeat(50_000)),
+            Unsupported::RichText,
+        ),
+    ] {
+        let start = Instant::now();
+        assert_eq!(generate(&input), Err(error));
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
 }

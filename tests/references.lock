@@ -584,7 +584,7 @@ raster/pdfbox/1686.png 1fd3aa908daab819587bbe25963cab54
 raster/pdfbox/1689.png 1fc6d8419a1ef34e9f30bc27f5762d39
 raster/pdfbox/1693_p0.png 1f911ce698cc6d621acc4fd24b5038e1
 raster/pdfbox/1693_p1.png a7c4b8c7d544f780e8f2d5cae92b0ab1
-raster/pdfbox/1697.png 5119f2d382c8df43e4a079dde5628d2b
+raster/pdfbox/1697.png 5ee4aa27489df0416d78c4b5993b895d
 raster/pdfbox/1708.png dc0e559d7fb439edcbfc2df65c533f15
 raster/pdfbox/1727_p0.png 733fbab6fcc179c8bda588b683da3c65
 raster/pdfbox/1727_p1.png c2771c57c74f7584c61891f52b85d97c
@@ -2337,5 +2337,5 @@ write/custom/write_xobject_mediabox_3.png 5fe0ddf4c50536a4ca4a52e5a0efcb08
 write/custom/write_xobject_rotation_180.png 7ef23d5d10e18440b35b06b73d9268b5
 write/custom/write_xobject_rotation_270.png 3c6b91e04921f2f873cd089307774ad6
 write/custom/write_xobject_rotation_90.png 80dcb2478079b82966ea959a31398e2b
-write/custom/write_xobject_rotation_and_cropbox.png b1dfd9618cb09a966c29579aefe0e8d8
+write/custom/write_xobject_rotation_and_cropbox.png 67f023339138f5760402a241f7900df1
 write/custom/write_xobject_rotation_none.png d36d4b2f779076d69b8c92e29122d732

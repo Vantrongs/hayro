@@ -8,8 +8,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+hayro-font = { workspace = true }
+hayro-interpret = { workspace = true }
+hayro-syntax = { workspace = true, features = ["std"] }
 html5ever = "0.39"
 html5gum = "0.9"
+kurbo = { workspace = true }
+smallvec = { workspace = true }
+unicode-bidi = { version = "0.3.18", default-features = false, features = ["hardcoded-data"] }
+
+[dev-dependencies]
+hayro-interpret = { workspace = true, features = ["embed-fonts"] }
 
 [lints]
 workspace = true

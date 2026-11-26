@@ -15,6 +15,7 @@ struct Ignored {
     fingerprint: u64,
 }
 
+// The fingerprint is order-independent; equality always compares the actual pairs.
 impl Hash for Ignored {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.fingerprint.hash(state);
@@ -65,6 +66,10 @@ fn relevant(name: &[u8]) -> bool {
     )
 }
 
+fn formatting(tag: &Tag) -> bool {
+    matches!(&*tag.name, "b" | "strong" | "i" | "em" | "u" | "span")
+}
+
 impl Tags {
     fn attribute(&mut self) {
         let Some(name) = self.attr.take() else { return };
@@ -73,13 +78,11 @@ impl Tags {
             let local = LocalName::from(std::str::from_utf8(&name).unwrap());
             if !tag.attrs.iter().any(|a| a.name.local == local) {
                 tag.attrs.push(Attribute {
-                    name: QualName::new(None, Default::default(), local),
+                    name: QualName::new(None, html5ever::Namespace::default(), local),
                     value: string(&self.value),
                 });
             }
-        } else if matches!(&*tag.name, "b" | "strong" | "i" | "em")
-            && !self.ignored.pairs.contains_key(&name)
-        {
+        } else if formatting(tag) && !self.ignored.pairs.contains_key(&name) {
             self.ignored.fingerprint ^= self.hash.hash_one((&name, &self.value));
             self.ignored
                 .pairs
@@ -93,9 +96,11 @@ impl Tags {
             CallbackEvent::OpenStartTag { name } => self.tag = Some(tag(name, TagKind::StartTag)),
             CallbackEvent::AttributeName { name } => {
                 self.attribute();
-                if self.tag.as_ref().is_some_and(|t| {
-                    relevant(name) || matches!(&*t.name, "b" | "strong" | "i" | "em")
-                }) {
+                if self
+                    .tag
+                    .as_ref()
+                    .is_some_and(|t| relevant(name) || formatting(t))
+                {
                     self.attr = Some(name.into());
                 }
             }
@@ -115,7 +120,11 @@ impl Tags {
                         .entry(std::mem::take(&mut self.ignored))
                         .or_insert(next);
                     tag.attrs.push(Attribute {
-                        name: QualName::new(None, Default::default(), LocalName::from("id")),
+                        name: QualName::new(
+                            None,
+                            html5ever::Namespace::default(),
+                            LocalName::from("id"),
+                        ),
                         value: id.to_string().into(),
                     });
                 }
@@ -148,7 +157,7 @@ impl Tags {
 }
 
 pub(super) fn parse(input: &str, dom: Dom) -> Result<Dom, Unsupported> {
-    let tree = TreeBuilder::new(dom, Default::default());
+    let tree = TreeBuilder::new(dom, html5ever::tree_builder::TreeBuilderOpts::default());
     let mut tags = Tags::default();
     let callback = CallbackEmitter::new(|event: CallbackEvent<'_>, _: Span<()>| tags.token(event));
     let mut tokens = Tokenizer::new_with_emitter(input, callback);

@@ -10,6 +10,7 @@ license = { workspace = true }
 readme = "README.md"
 
 [dependencies]
+hayro-annotations = { path = "../hayro-annotations", version = "0.1.0" }
 ab_glyph_rasterizer = { workspace = true }
 hayro-interpret = { workspace = true }
 kurbo = { workspace = true }
