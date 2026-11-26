@@ -137,7 +137,9 @@ pub(crate) fn try_load_pdf(path: &str, password: &str) -> Result<Pdf, String> {
 pub(crate) fn interpreter_settings() -> InterpreterSettings {
     InterpreterSettings {
         font_resolver: Arc::new(|query| match query {
-            FontQuery::Standard(s) => Some((get_standard(s)?, 0)),
+            FontQuery::Standard(_) | FontQuery::TextDefault { .. } => {
+                Some((get_standard(&query.standard_substitute())?, 0))
+            }
             FontQuery::Fallback(f) => {
                 if let Some(data) = get_noto_fallback(f) {
                     return Some((data, 0));

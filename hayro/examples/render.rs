@@ -32,7 +32,8 @@ fn main() {
 
     let interpreter_settings = InterpreterSettings {
         font_resolver: Arc::new(move |query| match query {
-            FontQuery::Standard(s) => {
+            FontQuery::Standard(_) | FontQuery::TextDefault { .. } => {
+                let s = &query.standard_substitute();
                 let name = pick_standard_font(s);
                 load_asset(name).or_else(|| Some(s.get_font_data()))
             }

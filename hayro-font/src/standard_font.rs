@@ -94,7 +94,8 @@ impl StandardFont {
         (Arc::new(data), 0)
     }
 
-    pub(crate) fn code_to_name(&self, code: u8) -> Option<&'static str> {
+    /// Resolve a code in the built-in encoding.
+    pub fn code_to_name(&self, code: u8) -> Option<&'static str> {
         match self {
             Self::Symbol => symbol::get(code),
             Self::ZapfDingBats => zapf_dings::get(code),
