@@ -40,8 +40,7 @@ pub(super) fn rich_text(
 
 /// `style` with the declarations of the CSS declaration list `css` (a `/DS`).
 pub(super) fn css_style(css: &str, mut style: Style, positive: bool) -> Result<Style, Unsupported> {
-    let size = style.size;
-    if declarations(css, &mut style, size, positive)? {
+    if declarations(css)?.apply(&mut style, positive)? {
         Ok(style)
     } else {
         Err(Unsupported::RichText)
@@ -85,6 +84,7 @@ fn walk(document: &Rc<Node>, base: &Style, positive: bool) -> Result<Vec<Span>, 
             paragraph: bool,
         },
     }
+    let mut parsed_styles = std::collections::HashMap::new();
     let mut spans: Vec<Span> = Vec::new();
     // The style of each open element, outermost first, with its `text-align`, and
     // the alignment of the lines of the paragraph it is in.
@@ -129,7 +129,16 @@ fn walk(document: &Rc<Node>, base: &Style, positive: bool) -> Result<Vec<Span>, 
         for attr in attrs.borrow().iter() {
             let value: &str = &attr.value;
             match &*attr.name.local {
-                "style" => shown &= declarations(value, &mut style, parent.size, positive)?,
+                "style" => {
+                    // The live DOM owns these tendrils, including the backing shared by reconstructed elements.
+                    let key = (value.as_ptr(), value.len());
+                    use std::collections::hash_map::Entry;
+                    let parsed = match parsed_styles.entry(key) {
+                        Entry::Occupied(entry) => entry.into_mut(),
+                        Entry::Vacant(entry) => entry.insert(declarations(value)?),
+                    };
+                    shown &= parsed.apply(&mut style, positive)?;
+                }
                 // Presentational attributes viewers draw by.
                 "align" | "hidden" | "bgcolor" | "background" | "text" => {
                     return Err(Unsupported::RichText);
@@ -188,20 +197,69 @@ fn end_line(spans: &mut Vec<Span>, style: &Style) {
     }
 }
 
-/// Applies the CSS declarations of a `style` attribute to `style`, the element's
-/// style so far; `parent` is the size relative sizes are of, and `positive` whether
-/// the base size is. Whether the element is shown.
-fn declarations(
-    css: &str,
-    style: &mut Style,
-    parent: Size,
-    positive: bool,
-) -> Result<bool, Unsupported> {
+#[derive(Default)]
+struct Declarations {
+    size: Option<FontSize>,
+    min_em: Option<f32>,
+    min_percent: Option<f32>,
+    family: Option<Family>,
+    bold: Option<bool>,
+    italic: Option<bool>,
+    color: Option<Color>,
+    align: Option<Align>,
+    hidden: bool,
+}
+
+impl Declarations {
+    fn set_size(&mut self, size: FontSize) {
+        let min = match size {
+            FontSize::Em(n) => Some((&mut self.min_em, n)),
+            FontSize::Percent(n) => Some((&mut self.min_percent, n)),
+            FontSize::Points(_) => None,
+        };
+        if let Some((min, n)) = min {
+            *min = Some(min.map_or(n, |prior| prior.min(n)));
+        }
+        self.size = Some(size);
+    }
+
+    fn apply(&self, style: &mut Style, positive: bool) -> Result<bool, Unsupported> {
+        let parent = style.size;
+        for size in [
+            self.min_em.map(FontSize::Em),
+            self.min_percent.map(FontSize::Percent),
+            self.size,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            style.size = size.resolve(parent, positive)?;
+        }
+        if let Some(v) = self.family {
+            style.face.family = v;
+        }
+        if let Some(v) = self.bold {
+            style.face.bold = v;
+        }
+        if let Some(v) = self.italic {
+            style.face.italic = v;
+        }
+        if let Some(v) = self.color {
+            style.color = v;
+        }
+        if let Some(v) = self.align {
+            style.align = v;
+        }
+        Ok(!self.hidden)
+    }
+}
+
+fn declarations(css: &str) -> Result<Declarations, Unsupported> {
     let unsupported = Err(Unsupported::RichText);
     if css.contains("/*") || css.contains(['"', '\'']) && !quotes_balanced(css) {
         return unsupported;
     }
-    let mut shown = true;
+    let mut rules = Declarations::default();
     for declaration in split_outside_quotes(css, ';') {
         let declaration = declaration.trim();
         if declaration.is_empty() {
@@ -216,22 +274,22 @@ fn declarations(
             .strip_suffix("!important")
             .map_or(value, str::trim_end);
         match property {
-            "font-size" => style.size = font_size(value, parent, positive)?,
-            "font-family" => style.face.family = family(value)?,
-            "font-weight" => style.face.bold = bold(value)?,
-            "font-style" => style.face.italic = italic(value)?,
-            "font" => font(value, style, parent, positive)?,
-            "color" => style.color = color(value)?,
+            "font-size" => rules.set_size(FontSize::parse(value)?),
+            "font-family" => rules.family = Some(family(value)?),
+            "font-weight" => rules.bold = Some(bold(value)?),
+            "font-style" => rules.italic = Some(italic(value)?),
+            "font" => font(value, &mut rules)?,
+            "color" => rules.color = Some(color(value)?),
             "text-align" => {
-                style.align = match value {
+                rules.align = Some(match value {
                     "left" => Align::Left,
                     "center" => Align::Center,
                     "right" => Align::Right,
                     "justify" => Align::Justify,
                     _ => return unsupported,
-                }
+                });
             }
-            "display" if value == "none" => shown = false,
+            "display" if value == "none" => rules.hidden = true,
             // Declarations that draw nothing differently at these values.
             "text-decoration" if value == "none" => {}
             "vertical-align" if value == "baseline" => {}
@@ -248,7 +306,7 @@ fn declarations(
             _ => return unsupported,
         }
     }
-    Ok(shown)
+    Ok(rules)
 }
 
 fn quotes_balanced(css: &str) -> bool {
@@ -320,22 +378,40 @@ fn zero(value: &str) -> bool {
 /// and `%` of `parent`, which must be positive (a relative size of the base size
 /// is when `positive`). A size too large to write is kept: text drawn in it fails
 /// the appearance as every number too large to write does.
-fn font_size(value: &str, parent: Size, positive: bool) -> Result<Size, Unsupported> {
-    let (n, unit) = number(value).ok_or(Unsupported::RichText)?;
-    let size = match unit.to_ascii_lowercase().as_str() {
-        "pt" | "px" => Size::Points(n),
-        "em" => parent.times(n),
-        "%" => parent.percent(n),
-        _ => return Err(Unsupported::RichText),
-    };
-    let ok = match size {
-        Size::Points(p) => p > 0.0,
-        Size::Base(k) => positive && k > 0.0,
-    };
-    if ok {
-        Ok(size)
-    } else {
-        Err(Unsupported::RichText)
+#[derive(Clone, Copy)]
+enum FontSize {
+    Points(f32),
+    Em(f32),
+    Percent(f32),
+}
+
+impl FontSize {
+    fn parse(value: &str) -> Result<Self, Unsupported> {
+        let (n, unit) = number(value)
+            .filter(|(n, _)| *n > 0.0)
+            .ok_or(Unsupported::RichText)?;
+        match unit.to_ascii_lowercase().as_str() {
+            "pt" | "px" => Ok(Self::Points(n)),
+            "em" => Ok(Self::Em(n)),
+            "%" => Ok(Self::Percent(n)),
+            _ => Err(Unsupported::RichText),
+        }
+    }
+    fn resolve(self, parent: Size, positive: bool) -> Result<Size, Unsupported> {
+        let size = match self {
+            Self::Points(n) => Size::Points(n),
+            Self::Em(n) => parent.times(n),
+            Self::Percent(n) => parent.percent(n),
+        };
+        let ok = match size {
+            Size::Points(p) => p > 0.0,
+            Size::Base(k) => positive && k > 0.0,
+        };
+        if ok {
+            Ok(size)
+        } else {
+            Err(Unsupported::RichText)
+        }
     }
 }
 
@@ -404,7 +480,7 @@ fn italic(value: &str) -> Result<bool, Unsupported> {
 /// and weight keywords, a size (with `/normal` line height), and the family names
 /// in the remaining words. Style and weight not given are normal, a family not
 /// given the default; a size not given stays.
-fn font(value: &str, style: &mut Style, parent: Size, positive: bool) -> Result<(), Unsupported> {
+fn font(value: &str, rules: &mut Declarations) -> Result<(), Unsupported> {
     let (mut bold, mut italic) = (false, false);
     let mut words = Vec::new();
     for word in value.split_whitespace() {
@@ -421,20 +497,20 @@ fn font(value: &str, style: &mut Style, parent: Size, positive: bool) -> Result<
                         if line_height != "normal" {
                             return Err(Unsupported::RichText);
                         }
-                        style.size = font_size(size, parent, positive)?;
+                        rules.set_size(FontSize::parse(size)?);
                     }
                 }
             }
             _ => words.push(word),
         }
     }
-    style.face.bold = bold;
-    style.face.italic = italic;
-    style.face.family = if words.is_empty() {
+    rules.bold = Some(bold);
+    rules.italic = Some(italic);
+    rules.family = Some(if words.is_empty() {
         Family::Text
     } else {
         family(&words.join(" "))?
-    };
+    });
     Ok(())
 }
 
@@ -783,6 +859,17 @@ mod tests {
     }
 
     const RED: Color = Color::Rgb([1.0, 0.0, 0.0]);
+
+    #[test]
+    fn a_reconstructed_style_inherits_each_paragraph_size() {
+        let spans = rich_text("<p style='font-size:10pt'><b style='color:red;font-size:2em'>A</p><p style='font-size:7pt'>B</p>", &base(), true).unwrap();
+        for (ch, size) in [('A', 20.0), ('B', 14.0)] {
+            let span = spans.iter().find(|span| span.text.contains(ch)).unwrap();
+            assert!(span.style.face.bold);
+            assert_eq!(span.style.color, RED);
+            assert_eq!(span.style.size, Size::Points(size));
+        }
+    }
 
     fn text(xhtml: &str) -> String {
         let spans = rich_text(xhtml, &base(), true).expect("supported");

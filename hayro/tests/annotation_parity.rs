@@ -27,7 +27,7 @@ fn raster(pdf: &Pdf, settings: &InterpreterSettings) -> Pixmap {
     )
 }
 
-fn compare(dict: &str, text: bool) {
+fn compare(dict: &str, text: bool, expected_blend: BlendMode) {
     let background = "0.2 0.6 0.9 rg 0 0 128 96 re f\n";
     let source = document(
         "/Annots [5 0 R]",
@@ -40,15 +40,19 @@ fn compare(dict: &str, text: bool) {
     let Look::Generated(a) = annots[0].look() else {
         panic!("expected a generated appearance")
     };
+    assert_eq!(a.blend, expected_blend);
     let content = a.content();
     if text {
         assert_eq!(a.glyphs.len(), 1);
         assert_eq!(content.matches(" Do\n").count(), 4);
     } else {
-        assert_eq!(a.blend, BlendMode::Multiply);
         assert_eq!(a.opacity, 0.5);
     }
-    let blend = if text { "Normal" } else { "Multiply" };
+    let blend = if a.blend == BlendMode::Multiply {
+        "Multiply"
+    } else {
+        "Normal"
+    };
     let mut objects = vec![
         stream("", &format!("{background}q /State gs\n{content}Q")),
         format!("<< /BM /{blend} /ca {} /CA {} >>", a.opacity, a.opacity),
@@ -88,6 +92,7 @@ fn repeated_freetext_glyphs() {
     compare(
         "<< /Subtype /FreeText /Rect [10 15 116 80] /BS << /W 0 >> /DA (/Helv 16 Tf 0 g) /Contents (AAAA) >>",
         true,
+        BlendMode::Normal,
     );
 }
 
@@ -96,6 +101,7 @@ fn overlapping_multiply_highlights() {
     compare(
         "<< /Subtype /Highlight /Rect [10 15 115 80] /C [1 0.7 0.2] /CA 0.5 /QuadPoints [10 56 90 56 10 30 90 30 45 68 115 68 45 42 115 42] >>",
         false,
+        BlendMode::Multiply,
     );
 }
 
@@ -133,4 +139,13 @@ fn cached_annotation_selection_reports_the_unreadable_object() {
             Some(hayro::hayro_syntax::object::ObjectIdentifier::new(5, 0))
         );
     }
+}
+
+#[test]
+fn translucent_bordered_square() {
+    compare(
+        "<< /Subtype /Square /Rect [10 15 90 80] /IC [0 1 0] /C [1 0 0] /BS << /W 6 >> /CA 0.5 >>",
+        false,
+        BlendMode::Normal,
+    );
 }

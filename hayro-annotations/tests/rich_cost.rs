@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 use hayro_annotations::{Appearances, Look, Unsupported, View};
 use hayro_interpret::{AnnotationSelection, InterpreterSettings};
 
+#[path = "../../hayro-syntax/tests/common/allocations.rs"]
+mod allocations;
 mod common;
 
 fn generate(input: &str) -> Result<usize, Unsupported> {
@@ -30,12 +32,10 @@ fn check_rich(input: &str, count: usize) {
         *sample = start.elapsed();
     }
     samples.sort();
-    eprintln!(
-        "{count} attributes, {} bytes, median {:?}",
-        input.len(),
-        samples[2]
+    assert!(
+        samples[2] < Duration::from_secs(3),
+        "{count} attributes: {samples:?}"
     );
-    assert!(samples[2] < Duration::from_secs(3));
 }
 
 fn check(attrs: &str, count: usize) {
@@ -116,4 +116,21 @@ fn rich_text_recovery_bounds() {
         assert_eq!(generate(&input), Err(error));
         assert!(start.elapsed() < Duration::from_secs(10));
     }
+}
+
+#[test]
+fn reconstructed_formatting_preserves_its_style() {
+    let cost = |n| {
+        let input = format!(
+            "<p><b style='{}color:red'>A</p>{}",
+            "margin:0;".repeat(n),
+            "<p>A</p>".repeat(n)
+        );
+        let (glyphs, memory) = allocations::measure(|| generate(&input));
+        assert_eq!(glyphs, Ok(1));
+        memory.allocated
+    };
+    let small = cost(256);
+    let large = cost(1024);
+    assert!(large < 6 * small, "allocated {small} and {large} bytes");
 }

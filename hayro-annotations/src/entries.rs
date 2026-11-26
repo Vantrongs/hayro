@@ -273,7 +273,7 @@ impl<'a> Objects<'a> {
         if (start, len) == at {
             Some(true)
         } else {
-            // Held<'a> within the object's data.
+            // Held within the object's data.
             (start <= at.0 && at.0 + at.1 <= start + len).then_some(false)
         }
     }

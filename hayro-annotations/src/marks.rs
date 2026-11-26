@@ -1,6 +1,6 @@
 use crate::{Appearance, Glyph};
-use hayro_interpret::color::Color;
 use hayro_interpret::paint_path;
+use hayro_interpret::{BlendMode, Knockout};
 use hayro_interpret::{ClipPath, Device, DrawMode, DrawProps, FillRule, Paint, StrokeProps};
 use kurbo::{Affine, BezPath, Cap, Join, Rect, Shape};
 use std::fmt::{self, Write};
@@ -49,7 +49,8 @@ impl Ink {
             Self::Cmyk(v) => v,
         }
     }
-    fn color(self, opacity: f32) -> Color {
+    fn color(self, opacity: f32) -> hayro_interpret::color::Color {
+        use hayro_interpret::color::Color;
         match self {
             Self::Gray(v) => Color::gray(v, opacity),
             Self::Rgb(v) => Color::rgb(v, opacity),
@@ -189,8 +190,8 @@ impl fmt::Display for Marks {
 #[derive(Clone)]
 struct State {
     transform: Affine,
-    fill: Color,
-    stroke: Color,
+    fill: Ink,
+    stroke: Ink,
     pen: StrokeProps,
     clips: usize,
 }
@@ -203,10 +204,10 @@ impl Appearance {
 
     /// Replay the appearance into a device in the supplied page transform.
     pub fn replay<'a>(&self, device: &mut impl Device<'a>, transform: Affine) {
-        let black = Color::gray([0.0], self.opacity);
+        let black = Ink::Gray([0.0]);
         let mut state = State {
             transform,
-            fill: black.clone(),
+            fill: black,
             stroke: black,
             pen: StrokeProps::default(),
             clips: 0,
@@ -217,12 +218,24 @@ impl Appearance {
             if m.add_path(&mut path) {
                 continue;
             }
-            let props = |color: &Color| DrawProps {
-                knockout: hayro_interpret::Knockout::None,
+            let grouped = matches!(
+                m,
+                Mark::Paint {
+                    fill: true,
+                    stroke: true,
+                    ..
+                }
+            ) && (self.opacity < 1.0 || self.blend != BlendMode::Normal);
+            let props = |ink: Ink, knockout| DrawProps {
+                knockout,
                 transform: state.transform,
-                paint: Paint::Color(color.clone()),
+                paint: Paint::Color(ink.color(if grouped { 1.0 } else { self.opacity })),
                 soft_mask: None,
-                blend_mode: self.blend,
+                blend_mode: if grouped {
+                    BlendMode::Normal
+                } else {
+                    self.blend
+                },
             };
             match m {
                 Mark::Discard => path.truncate(0),
@@ -250,9 +263,9 @@ impl Appearance {
                 }
                 Mark::Color { stroke, components } => {
                     if *stroke {
-                        state.stroke = components.color(self.opacity);
+                        state.stroke = *components;
                     } else {
-                        state.fill = components.color(self.opacity);
+                        state.fill = *components;
                     }
                 }
                 Mark::Dash(v) => state.pen.dash_array = v.as_ref().into(),
@@ -265,7 +278,7 @@ impl Appearance {
                     paint_path(
                         device,
                         &g.path,
-                        props(&state.fill),
+                        props(state.fill, Knockout::None),
                         &DrawMode::Fill(FillRule::NonZero),
                     );
                     device.pop_clip();
@@ -278,11 +291,14 @@ impl Appearance {
                     if *close {
                         path.close_path();
                     }
+                    if grouped {
+                        device.push_transparency_group(self.opacity, None, self.blend, true, true);
+                    }
                     if *fill {
                         paint_path(
                             device,
                             &path,
-                            props(&state.fill),
+                            props(state.fill, Knockout::None),
                             &DrawMode::Fill(FillRule::NonZero),
                         );
                     }
@@ -290,9 +306,21 @@ impl Appearance {
                         paint_path(
                             device,
                             &path,
-                            props(&state.stroke),
+                            props(
+                                state.stroke,
+                                if !grouped {
+                                    Knockout::None
+                                } else if self.opacity < 1.0 {
+                                    Knockout::ClearThenOver
+                                } else {
+                                    Knockout::Replace
+                                },
+                            ),
                             &DrawMode::Stroke(state.pen.clone()),
                         );
+                    }
+                    if grouped {
+                        device.pop_transparency_group();
                     }
                     path.truncate(0);
                 }
