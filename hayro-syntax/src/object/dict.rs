@@ -179,6 +179,18 @@ impl Skippable for Dict<'_> {
     }
 
     fn skip_with_depth(r: &mut Reader<'_>, is_content_stream: bool, depth: usize) -> Option<()> {
+        Self::skip_select(r, is_content_stream, depth, None).map(|_| ())
+    }
+}
+
+impl Dict<'_> {
+    pub(crate) fn skip_select(
+        r: &mut Reader<'_>,
+        is_content_stream: bool,
+        depth: usize,
+        key: Option<&[u8]>,
+    ) -> Option<bool> {
+        let mut found = key.is_none();
         if depth >= super::MAX_OBJECT_NESTING_DEPTH {
             return None;
         }
@@ -189,14 +201,17 @@ impl Skippable for Dict<'_> {
             r.skip_white_spaces_and_comments();
 
             if let Some(()) = r.forward_tag(b">>") {
-                break Some(());
+                break Some(found);
             } else {
-                let Some(_) = r.skip::<Name<'_>>(is_content_stream) else {
+                let Some(raw) = r.skip::<Name<'_>>(is_content_stream) else {
                     // In case there is garbage in-between, be lenient and just try to skip it.
                     r.skip_with_depth::<Object<'_>>(is_content_stream, depth + 1)?;
                     continue;
                 };
 
+                if !found && let Some(key) = key {
+                    found = super::name::decoded_bytes(&raw[1..]).eq(key.iter().copied());
+                }
                 r.skip_white_spaces_and_comments();
 
                 if is_content_stream {

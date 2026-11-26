@@ -27,7 +27,7 @@ use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::max;
-use core::iter;
+
 use core::ops::Deref;
 
 pub(crate) const XREF_ENTRY_LEN: usize = 20;
@@ -194,7 +194,11 @@ fn fallback_xref_map_inner<'a>(
                                 && {
                                     if let Some(object_stream) = ObjectStream::new(&stream.get())
                                         && let Some(obj) =
-                                            object_stream.get::<Dict<'_>>(*idx, &dummy_ctx)
+                                            object_stream.reader(*idx).and_then(|mut r| {
+                                                let mut ctx = dummy_ctx.clone();
+                                                ctx.set_in_object_stream(true);
+                                                r.read_with_context::<Dict<'_>>(&ctx)
+                                            })
                                     {
                                         check(&obj)
                                     } else {
@@ -300,6 +304,11 @@ impl XRef {
             }
         }
 
+        let read_catalog = |id| {
+            xref.get_dict(id, &ReaderContext::new(&xref, false), None)
+                .accepted()
+                .ok_or(XRefError::Unknown)
+        };
         let (trailer_data, has_ocgs, metadata) = match input {
             XRefInput::TrailerDictData(trailer_dict_data) => {
                 let mut r = Reader::new(trailer_dict_data);
@@ -309,9 +318,7 @@ impl XRef {
                     .ok_or(XRefError::Unknown)?;
 
                 let root_ref = trailer_dict.get_ref(ROOT).ok_or(XRefError::Unknown)?;
-                let root = trailer_dict
-                    .get::<Dict<'_>>(ROOT)
-                    .ok_or(XRefError::Unknown)?;
+                let root = read_catalog(root_ref.into())?;
                 let metadata = trailer_dict
                     .get::<Dict<'_>>(INFO)
                     .map(|d| parse_metadata(&d))
@@ -331,7 +338,7 @@ impl XRef {
                 (td, has_ocgs, metadata)
             }
             XRefInput::RootRef(root_ref) => {
-                let root = xref.get::<Dict<'_>>(root_ref).ok_or(XRefError::Unknown)?;
+                let root = read_catalog(root_ref)?;
                 let pages_ref = root.get_ref(PAGES).ok_or(XRefError::Unknown)?;
 
                 let td = TrailerData {
@@ -396,7 +403,11 @@ impl XRef {
         }
     }
 
-    pub(crate) fn objects(&self) -> impl IntoIterator<Item = Object<'_>> + '_ {
+    pub(crate) fn objects(&self) -> impl Iterator<Item = Object<'_>> {
+        self.object_ids().filter_map(|id| self.get(id))
+    }
+
+    pub(crate) fn object_ids(&self) -> impl Iterator<Item = ObjectIdentifier> {
         match &self.0 {
             Inner::Dummy => unimplemented!(),
             Inner::Some(r) => {
@@ -424,19 +435,7 @@ impl XRef {
 
                 elements.sort_by_key(|e1| e1.1);
 
-                let mut iter = elements.into_iter();
-
-                iter::from_fn(move || {
-                    for next in iter.by_ref() {
-                        if let Some(obj) = self.get_with(next.0, &ReaderContext::new(self, false)) {
-                            return Some(obj);
-                        } else {
-                            continue;
-                        }
-                    }
-
-                    None
-                })
+                elements.into_iter().map(|(id, _)| id)
             }
         }
     }
@@ -516,14 +515,51 @@ impl XRef {
     where
         T: ObjectLike<'a>,
     {
+        self.resolve(id, ctx, |r, ctx| {
+            let value = if ctx.in_object_stream() {
+                r.read_with_context(ctx)
+            } else {
+                r.read_indirect(ctx)
+            };
+            match value {
+                Some(value) => Selection::Accepted(value),
+                None if r.skip::<Object<'_>>(false).is_some() => Selection::WrongKind,
+                None => Selection::Malformed,
+            }
+        })
+        .accepted()
+    }
+
+    pub(crate) fn get_dict<'a>(
+        &'a self,
+        id: ObjectIdentifier,
+        ctx: &ReaderContext<'a>,
+        key: Option<&[u8]>,
+    ) -> Selection<Dict<'a>> {
+        self.resolve(id, ctx, |r, ctx| select_dict(r, ctx, key))
+    }
+
+    fn resolve<'a, T>(
+        &'a self,
+        id: ObjectIdentifier,
+        ctx: &ReaderContext<'a>,
+        select: impl Fn(&mut Reader<'a>, &ReaderContext<'a>) -> Selection<T>,
+    ) -> Selection<T> {
         let Inner::Some(repr) = &self.0 else {
-            return None;
+            return Selection::Malformed;
         };
+
+        if ctx.parent_chain_contains(&id) {
+            return Selection::Malformed;
+        }
 
         // The flag must describe the map this entry came from.
         let (entry, was_repaired) = {
             let locked = repr.map.get();
-            (*locked.xref_map.get(&id)?, locked.repaired)
+            let Some(&entry) = locked.xref_map.get(&id) else {
+                return Selection::Malformed;
+            };
+            (entry, locked.repaired)
         };
 
         let mut r = Reader::new(repr.data.get().as_ref());
@@ -537,70 +573,58 @@ impl XRef {
                 ctx.set_in_object_stream(false);
                 r.jump(offset);
 
-                if let Some(object) = r.read_with_context::<IndirectObject<T>>(&ctx) {
-                    if object.id() == &id {
-                        return Some(object.get());
+                if r.read_without_context::<ObjectIdentifier>() == Some(id) {
+                    ctx.parent_chain_push(id);
+                    r.skip_white_spaces_and_comments();
+                    match select(&mut r, &ctx) {
+                        Selection::Malformed => {}
+                        result => return result,
                     }
-                } else {
-                    // A valid object of another type needs no repair.
-                    if r.skip::<IndirectObject<Object<'_>>>(false).is_some() {
-                        return None;
-                    }
-                };
-
-                self.repair_and_get(id, caller_ctx, was_repaired)
+                }
             }
             EntryType::ObjStream(obj_stram_gen_num, index) => {
                 let obj_stream_id = ObjectIdentifier::new(obj_stram_gen_num, 0);
 
-                if obj_stream_id == id || ctx.parent_chain_contains(&id) {
-                    return None;
+                if obj_stream_id == id {
+                    return Selection::Malformed;
                 }
 
                 if !matches!(
                     repr.map.get().xref_map.get(&obj_stream_id),
                     Some(EntryType::Normal(_))
                 ) {
-                    return None;
+                    return Selection::Malformed;
                 }
 
                 ctx.parent_chain_push(id);
 
                 let object_stream = repr.data.object_stream(obj_stream_id, was_repaired, &ctx);
                 if !was_repaired && repr.map.get().repaired {
-                    return self.get_with(id, caller_ctx);
+                    return self.resolve(id, caller_ctx, select);
                 }
-                let object_stream = object_stream?;
+                let Some(object_stream) = object_stream else {
+                    return Selection::Malformed;
+                };
 
-                if object_stream.obj_number(index) == Some(id.obj_number) {
-                    let member = object_stream.get(index, &ctx);
+                if object_stream.obj_number(index) == Some(id.obj_number)
+                    && let Some(mut reader) = object_stream.reader(index)
+                {
+                    ctx.set_in_object_stream(true);
+                    let result = select(&mut reader, &ctx);
                     if !was_repaired && repr.map.get().repaired {
-                        return self.get_with(id, caller_ctx);
+                        return self.resolve(id, caller_ctx, select);
                     }
-                    return member;
+                    if !matches!(result, Selection::Malformed) {
+                        return result;
+                    }
                 }
-
-                self.repair_and_get(id, caller_ctx, was_repaired)
             }
         }
-    }
-
-    fn repair_and_get<'a, T>(
-        &'a self,
-        id: ObjectIdentifier,
-        ctx: &ReaderContext<'a>,
-        was_repaired: bool,
-    ) -> Option<T>
-    where
-        T: ObjectLike<'a>,
-    {
         if was_repaired {
-            None
-        } else {
-            self.repair();
-
-            self.get_with::<T>(id, ctx)
+            return Selection::Malformed;
         }
+        self.repair();
+        self.resolve(id, caller_ctx, select)
     }
 }
 
@@ -992,9 +1016,11 @@ fn get_decryptor(trailer_dict: &Dict<'_>, password: &[u8]) -> Result<Decryptor, 
     }
 }
 
+type MemberOffsets = Vec<(u32, Option<core::ops::Range<usize>>)>;
+
 pub(crate) struct ObjectStream {
     data: Vec<u8>,
-    offsets: Vec<(u32, Option<usize>)>,
+    offsets: MemberOffsets,
 }
 
 impl ObjectStream {
@@ -1005,32 +1031,37 @@ impl ObjectStream {
         Some(Self { data, offsets })
     }
 
-    fn read_offsets(stream: &Stream<'_>, data: &[u8]) -> Option<Vec<(u32, Option<usize>)>> {
+    fn read_offsets(stream: &Stream<'_>, data: &[u8]) -> Option<MemberOffsets> {
         let num_objects = stream.dict().get::<usize>(N)?;
         let first_offset = stream.dict().get::<usize>(FIRST)?;
 
-        let mut r = Reader::new(data);
+        let mut r = Reader::new(data.get(..first_offset)?);
 
-        let mut offsets = vec![];
-        let mut last_offset = None;
+        let mut offsets: MemberOffsets = vec![];
+        let mut previous: Option<usize> = None;
 
         for _ in 0..num_objects {
             r.skip_white_spaces_and_comments();
             let obj_num = r.read_without_context::<u32>()?;
             r.skip_white_spaces_and_comments();
             let relative_offset = r.read_without_context::<usize>()?;
-            let offset = first_offset + relative_offset;
-
-            // Offsets must strictly increase, or members could overlap.
-            if offset >= data.len() || last_offset.is_some_and(|last| offset <= last) {
-                offsets.push((obj_num, None));
-            } else {
-                let mut member = Reader::new(data);
-                member.jump(offset);
-                member.skip_white_spaces_and_comments();
-                last_offset = Some(member.offset());
-                offsets.push((obj_num, Some(member.offset())));
+            let mut range = None;
+            if let Some(start) = first_offset.checked_add(relative_offset)
+                && start < data.len()
+            {
+                let prev = previous.and_then(|i| offsets[i].1.as_mut());
+                if prev.as_ref().is_some_and(|r| start < r.start) {
+                    return None;
+                }
+                if prev.as_ref().is_none_or(|r| r.start < start) {
+                    if let Some(prev) = prev {
+                        prev.end = start;
+                    }
+                    previous = Some(offsets.len());
+                    range = Some(start..data.len());
+                }
             }
+            offsets.push((obj_num, range));
         }
 
         Some(offsets)
@@ -1040,18 +1071,11 @@ impl ObjectStream {
         Some(self.offsets.get(index as usize)?.0)
     }
 
-    fn get<'a, T>(&'a self, index: u32, ctx: &ReaderContext<'a>) -> Option<T>
-    where
-        T: ObjectLike<'a>,
-    {
-        let offset = self.offsets.get(index as usize)?.1?;
-        let mut r = Reader::new(&self.data);
-        r.jump(offset);
-
-        let mut ctx = ctx.clone();
-        ctx.set_in_object_stream(true);
-
-        r.read_with_context::<T>(&ctx)
+    fn reader(&self, index: u32) -> Option<Reader<'_>> {
+        let range = self.offsets.get(index as usize)?.1.clone()?;
+        let mut r = Reader::new(self.data.get(range)?);
+        r.skip_white_spaces_and_comments();
+        Some(r)
     }
 }
 
@@ -1129,5 +1153,72 @@ mod tests {
             xref_stream_subsection(&mut Reader::new(&data), u32::MAX, 2, 1, 1, 0, &mut xref_map);
         assert!(result.is_none());
         assert!(xref_map.contains_key(&ObjectIdentifier::new(u32::MAX, 0)));
+    }
+}
+
+pub(crate) enum Selection<T> {
+    Accepted(T),
+    WrongKind,
+    Malformed,
+}
+
+impl<T> Selection<T> {
+    pub(crate) fn accepted(self) -> Option<T> {
+        match self {
+            Self::Accepted(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+impl<T> From<Option<T>> for Selection<T> {
+    fn from(value: Option<T>) -> Self {
+        value.map_or(Self::Malformed, Self::Accepted)
+    }
+}
+
+fn select_dict<'a>(
+    r: &mut Reader<'a>,
+    ctx: &ReaderContext<'a>,
+    key: Option<&[u8]>,
+) -> Selection<Dict<'a>> {
+    if r.at_end() {
+        return Selection::Malformed;
+    }
+    if r.peek_bytes(2) != Some(b"<<") {
+        return if ctx.in_object_stream()
+            || (key.is_none() && r.peek_byte() == Some(b'['))
+            || Object::skip_indirect_value(r).is_some()
+        {
+            Selection::WrongKind
+        } else {
+            Selection::Malformed
+        };
+    }
+    let mut probe = r.clone();
+    match Dict::skip_select(&mut probe, false, 0, key) {
+        None => return Selection::Malformed,
+        Some(false) => return Selection::WrongKind,
+        Some(true) => {}
+    }
+    probe.skip_white_spaces_and_comments();
+    if probe.peek_tag(b"stream").is_some() {
+        return Selection::WrongKind;
+    }
+    Selection::from(r.read_with_context(ctx))
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn unfinished_array_parent_does_not_trigger_repair() {
+        let mut reader = Reader::new(b"[ 0 1");
+        assert!(matches!(
+            select_dict(&mut reader, ReaderContext::dummy_ref(), None),
+            Selection::WrongKind
+        ));
+        assert_eq!(reader.peek_byte(), Some(b'['));
     }
 }

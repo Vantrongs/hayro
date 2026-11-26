@@ -59,9 +59,9 @@ impl<'a> Pages<'a> {
     pub(crate) fn new_brute_force(ctx: &ReaderContext<'a>, xref: &'a XRef) -> Option<Self> {
         let mut pages = vec![];
 
-        for object in xref.objects() {
-            if let Some(dict) = object.into_dict()
-                && let Some(page) = Page::new(&dict, &PagesContext::new(), ctx, true)
+        for id in xref.object_ids() {
+            if let Some(dict) = xref.get_dict(id, ctx, Some(CONTENTS)).accepted()
+                && let Some(page) = Page::new(&dict, &PagesContext::new(), ctx)
             {
                 pages.push(page);
             }
@@ -162,7 +162,7 @@ fn resolve_pages<'a>(
             }
             // Lenient: treat a missing or unknown `Type` as a page (corpus 0083781).
             _ => {
-                if let Some(page) = Page::new(&dict, &frame.ctx, reader_ctx, false) {
+                if let Some(page) = Page::new(&dict, &frame.ctx, reader_ctx) {
                     entries.push(page);
                 }
             }
@@ -201,12 +201,7 @@ impl<'a> Page<'a> {
         dict: &Dict<'a>,
         ctx: &PagesContext<'a>,
         reader_ctx: &ReaderContext<'a>,
-        brute_force: bool,
     ) -> Option<Self> {
-        if brute_force && !dict.contains_key(CONTENTS) {
-            return None;
-        }
-
         let media_box = dict.get::<Rect>(MEDIA_BOX).or(ctx.media_box).unwrap_or(A4);
 
         let crop_box = dict
@@ -517,11 +512,8 @@ pub(crate) mod cached {
             let ctx = ReaderContext::new(xref_reference, false);
             let pages = xref.retry_after_repair(|repaired| {
                 let pages_ref = xref_reference
-                    .get_with::<crate::object::Object<'_>>(xref.root_id(), &ctx)
-                    .and_then(|object| match object {
-                        crate::object::Object::Dict(dict) => Some(dict),
-                        _ => None,
-                    })
+                    .get_dict(xref.root_id(), &ctx, None)
+                    .accepted()
                     .and_then(|catalog| catalog.get_ref(crate::object::dict::keys::PAGES))
                     .map(Into::into)
                     .unwrap_or(xref.trailer_data().pages_ref);

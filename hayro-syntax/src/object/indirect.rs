@@ -1,10 +1,9 @@
-use crate::object::{ObjectIdentifier, ObjectLike};
+use crate::object::ObjectIdentifier;
 use crate::reader::Reader;
-use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
+use crate::reader::{Readable, ReaderContext, ReaderExt};
 
 #[derive(Debug, Clone)]
 pub(crate) struct IndirectObject<T> {
-    id: ObjectIdentifier,
     inner: T,
 }
 
@@ -12,15 +11,11 @@ impl<T> IndirectObject<T> {
     pub(crate) fn get(self) -> T {
         self.inner
     }
-
-    pub(crate) fn id(&self) -> &ObjectIdentifier {
-        &self.id
-    }
 }
 
 impl<'a, T> Readable<'a> for IndirectObject<T>
 where
-    T: ObjectLike<'a>,
+    T: Readable<'a>,
 {
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         let mut ctx = ctx.clone();
@@ -38,22 +33,6 @@ where
         // We are lenient and don't require it.
         r.forward_tag(b"endobj");
 
-        Some(Self { id, inner })
-    }
-}
-
-impl<T> Skippable for IndirectObject<T>
-where
-    T: Skippable,
-{
-    fn skip(r: &mut Reader<'_>, _: bool) -> Option<()> {
-        r.skip::<ObjectIdentifier>(false)?;
-        r.skip_white_spaces_and_comments();
-        r.skip::<T>(false)?;
-        r.skip_white_spaces_and_comments();
-        // We are lenient and don't require it.
-        r.forward_tag(b"endobj");
-
-        Some(())
+        Some(Self { inner })
     }
 }

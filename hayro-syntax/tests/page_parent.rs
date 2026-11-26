@@ -7,6 +7,10 @@ use hayro_syntax::{
 };
 use std::fmt::Write;
 
+fn document(objects: &[&str]) -> Pdf {
+    Pdf::new(document_bytes(objects, |_| {})).unwrap()
+}
+
 fn document_bytes(objects: &[&str], edit: impl FnOnce(&mut [Option<usize>])) -> Vec<u8> {
     let mut data = String::from("%PDF-1.7\n");
     let mut offsets = Vec::new();
@@ -140,6 +144,41 @@ mod allocations {
         };
         let padding = 64 * 1024;
         assert_eq!(retained(2 * padding) - retained(padding), padding);
+    }
+
+    #[test]
+    fn escaped_contents_last_accepts_only_standalone_dicts() {
+        let allocated = |count, stream| {
+            let mut header = "<< /Length 99 0 R ".to_owned();
+            for i in 0..count {
+                write!(header, "/LongEscaped#4beyForAllocationCheck{i} 0 ").unwrap();
+            }
+            header.push_str("/Cont#65nts [] >>");
+            if stream {
+                header.push_str("\nstream\n\nendstream");
+            }
+            measure(
+                &[
+                    CATALOG.into(),
+                    "<< >>".into(),
+                    "<< /Contents [] >>".into(),
+                    header,
+                ],
+                |pdf| {
+                    assert_eq!(pdf.pages().len(), if stream { 1 } else { 2 });
+                },
+            )
+        };
+        allocated(256, false);
+        assert_eq!(allocated(1, true), allocated(256, true));
+    }
+
+    fn measure(objects: &[String], check: impl FnOnce(&Pdf)) -> usize {
+        let objects: Vec<_> = objects.iter().map(String::as_str).collect();
+        let data = document_bytes(&objects, |_| {});
+        let before = BYTES.get();
+        check(&Pdf::new(data).unwrap());
+        BYTES.get() - before
     }
 }
 
@@ -342,6 +381,24 @@ fn repaired_tree_with_missing_kid_recovers_page() {
     }
 }
 
+#[test]
+fn invalid_body_triggers_page_recovery() {
+    for invalid in [
+        "garbage",
+        "trueish",
+        "falsehood",
+        "nullable",
+        "12bad",
+        "12garbage",
+        "[ 1 2",
+    ] {
+        let body = format!("{invalid}\nendobj\n3 0 obj\n<< /Contents [] /Rotate 90 >>");
+        let pdf = document(&[CATALOG, "<< >>", &body]);
+        assert_eq!(pdf.pages().len(), 1, "{invalid}");
+        assert_eq!(pdf.pages()[0].rotation(), Rotation::Horizontal);
+    }
+}
+
 enum Carrier {
     BadOffset,
     BadFilterOffset,
@@ -381,4 +438,101 @@ fn member_pdf(root: &str, page: &str, member: &str, variant: Carrier) -> Vec<u8>
         carrier + usize::from(matches!(variant, Carrier::BadOffset)),
         &extra,
     )
+}
+
+fn adjacent_members(tree: &str, first: &str, second: &str, standalone: &str) -> Pdf {
+    let (mut data, offsets) = member_pdf_prefix(tree, "<< /Type /Page /Contents [] >>");
+    let carrier = data.len();
+    let header = format!("6 0 9 {} ", first.len());
+    writeln!(data, "7 0 obj\n<< /Type /ObjStm /N 2 /First {} /Length {} >>\nstream\n{header}{first}{second}\nendstream\nendobj\n{standalone}",header.len(),header.len()+first.len()+second.len()).unwrap();
+    Pdf::new(finish_compressed_pdf(data, offsets, carrier, &[(2, 7, 1)])).unwrap()
+}
+
+#[test]
+fn decreasing_member_offsets_reject_the_header() {
+    let (mut data, offsets) = member_pdf_prefix("<< /Kids [3 0 R] >>", "<< >>");
+    let carrier = data.len();
+    let header = "6 0 9 20 10 10 ";
+    let members = "[0 0      47 18]    90";
+    writeln!(data, "7 0 obj\n<< /Type /ObjStm /N 3 /First {} /Length {} >>\nstream\n{header}{members}\nendstream\nendobj", header.len(), header.len()+members.len()).unwrap();
+    let pdf = Pdf::new(finish_compressed_pdf(
+        data,
+        offsets,
+        carrier,
+        &[(2, 7, 1), (2, 7, 2)],
+    ))
+    .unwrap();
+    assert!(
+        pdf.xref()
+            .get::<Rect>(ObjectIdentifier::new(6, 0))
+            .is_none()
+    );
+}
+
+#[test]
+fn empty_member_recovers_replacement_page() {
+    let pdf = adjacent_members(
+        "<< >>",
+        "   ",
+        "null",
+        "6 0 obj\n<< /Contents [] /Rotate 90 >>\nendobj",
+    );
+    assert_eq!(pdf.pages().len(), 2);
+    assert_eq!(pdf.pages()[1].rotation(), Rotation::Horizontal);
+}
+
+#[test]
+fn stream_keyword_must_belong_to_the_selected_member() {
+    for (first, second, pages) in [
+        ("<< /Contents [] >> stream", "null", 1),
+        ("<< /Contents [] >> ", "stream", 2),
+    ] {
+        assert_eq!(
+            adjacent_members("<< >>", first, second, "").pages().len(),
+            pages
+        );
+    }
+}
+
+#[test]
+fn stream_header_cannot_supply_initial_catalog() {
+    assert!(
+        Pdf::new(document_bytes(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R /Length 0 >>\nstream\n\nendstream",
+                "<< /Kids [] >>",
+            ],
+            |_| {}
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn adjacent_compressed_rotations_are_independent() {
+    let pdf = adjacent_members("<< /Kids [3 0 R] /Rotate 6 0 R >>", "90", "180", "");
+    assert_eq!(pdf.pages()[0].rotation(), Rotation::Horizontal);
+    for (id, value) in [(6, 90), (9, 180)] {
+        assert_eq!(
+            pdf.xref().get::<i32>(ObjectIdentifier::new(id, 0)),
+            Some(value)
+        );
+    }
+}
+
+#[test]
+fn incomplete_compressed_dict_requires_repair() {
+    for standalone in ["", "6 0 obj\n<< /Contents [] /Rotate 90 >>\nendobj"] {
+        let pdf = adjacent_members("<< >>", "<< /Contents [] /Rotate 180 ", ">>", standalone);
+        if standalone.is_empty() {
+            assert!(
+                pdf.xref()
+                    .get::<hayro_syntax::object::Dict<'_>>(ObjectIdentifier::new(6, 0))
+                    .is_none()
+            );
+        } else {
+            assert_eq!(pdf.pages().len(), 2);
+            assert_eq!(pdf.pages()[1].rotation(), Rotation::Horizontal);
+        }
+    }
 }

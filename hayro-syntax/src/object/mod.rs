@@ -176,6 +176,21 @@ impl Skippable for Object<'_> {
     }
 
     fn skip_with_depth(r: &mut Reader<'_>, is_content_stream: bool, depth: usize) -> Option<()> {
+        Object::skip_value(r, is_content_stream, depth, true)
+    }
+}
+
+impl Object<'_> {
+    pub(crate) fn skip_indirect_value(r: &mut Reader<'_>) -> Option<()> {
+        Self::skip_value(r, false, 0, false)
+    }
+
+    fn skip_value(
+        r: &mut Reader<'_>,
+        is_content_stream: bool,
+        depth: usize,
+        allow_operator: bool,
+    ) -> Option<()> {
         match r.peek_byte()? {
             b'n' => Null::skip(r, is_content_stream),
             b't' | b'f' => bool::skip(r, is_content_stream),
@@ -188,7 +203,8 @@ impl Skippable for Object<'_> {
             b'.' | b'+' | b'-' | b'0'..=b'9' => Number::skip(r, is_content_stream),
             b'[' => Array::skip_with_depth(r, is_content_stream, depth),
             // Lenient: skip content operators inside arrays.
-            _ => skip_name_like(r, false),
+            _ if allow_operator => skip_name_like(r, false),
+            _ => None,
         }
     }
 }
