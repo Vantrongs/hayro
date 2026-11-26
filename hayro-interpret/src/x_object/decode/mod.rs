@@ -119,15 +119,22 @@ pub(crate) fn short_rows_transparent(obj: &ImageXObject<'_>, components: u8) -> 
     {
         return mask.dict().get::<Array<'_>>(MATTE).is_some();
     }
-    color_key(obj, components).is_some()
+    color_key(
+        obj,
+        components,
+        dict.get::<hayro_syntax::object::Stream<'_>>(SMASK)
+            .is_some(),
+    )
+    .is_some()
 }
 
-fn color_key(obj: &ImageXObject<'_>, components: u8) -> Option<SmallVec<[u16; 8]>> {
+fn color_key(
+    obj: &ImageXObject<'_>,
+    components: u8,
+    has_soft_mask: bool,
+) -> Option<SmallVec<[u16; 8]>> {
     let dict = obj.stream.dict();
-    if dict
-        .get::<hayro_syntax::object::Stream<'_>>(SMASK)
-        .is_some()
-    {
+    if has_soft_mask {
         return None;
     }
     let components = usize::from(components);

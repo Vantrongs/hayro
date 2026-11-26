@@ -207,6 +207,13 @@ impl<'a> Dict<'a> {
 
     fn offset(&self, key: &[u8]) -> Option<Range<usize>> {
         let offsets = self.offsets();
+        const LINEAR_SEARCH_LIMIT: usize = 16;
+        if offsets.len() <= LINEAR_SEARCH_LIMIT {
+            return offsets
+                .iter()
+                .find(|(name, _)| name.as_ref() == key)
+                .map(|(_, range)| range.clone());
+        }
         let index = offsets
             .binary_search_by(|(name, _)| name.as_ref().cmp(key))
             .ok()?;
@@ -1235,6 +1242,23 @@ mod tests {
 mod last_key {
     use super::*;
     use crate::object::FromBytes;
+    #[test]
+    fn lookup_at_linear_search_boundary() {
+        for size in [16, 17] {
+            let mut data = String::from("<< /K0 100");
+            for i in (0..size).rev() {
+                data.push_str(&format!(" /K{i} {i}"));
+            }
+            data.push_str(" >>");
+            let dict = Dict::from_bytes(data.as_bytes()).unwrap();
+            assert_eq!(dict.len(), size);
+            for i in 0..size {
+                assert_eq!(dict.get::<usize>(format!("K{i}")), Some(i));
+            }
+            assert!(!dict.contains_key(b"missing"));
+        }
+    }
+
     #[test]
     fn decoded_duplicates_use_last_value() {
         let dict = Dict::from_bytes(b"<< /A 1 /#41 2 >>").unwrap();

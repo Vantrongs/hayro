@@ -38,6 +38,41 @@ fn image(pdf: &Pdf) -> ImageXObject<'_> {
     .unwrap()
 }
 
+#[test]
+fn soft_mask_lookup_tracks_cross_reference_repair() {
+    use crate::fixtures::{file, stream};
+    let gray = "/ColorSpace /DeviceGray /Width 1 /Height 1 /BPC 8";
+    for old_mask in [None, Some(37)] {
+        let mut bytes = file(
+            &[
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+                b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec(),
+                stream(&format!("{gray} /SMask 4 0 R /SMaskInData 5 0 R"), &[255]),
+                old_mask.map_or_else(|| b"null".to_vec(), |v| stream(gray, &[v])),
+                b"0".to_vec(),
+                stream(gray, &[192]),
+            ],
+            "",
+        );
+        for (header, replacement) in [(b"5 0 obj", b'9'), (b"6 0 obj", b'4')] {
+            let offset = bytes
+                .windows(header.len())
+                .position(|w| w == header)
+                .unwrap();
+            bytes[offset] = replacement;
+        }
+
+        let pdf = Pdf::new(bytes).unwrap();
+        let obj = image(&pdf);
+        let initial = obj.stream.dict().get::<Stream<'_>>(b"SMask");
+        assert_eq!(initial.map(|s| s.raw_data()[0]), old_mask);
+        assert!(!pdf.xref().is_repaired());
+        let decoded = obj.decoded_image(None).unwrap();
+        assert!(pdf.xref().is_repaired());
+        assert_eq!(decoded.alpha.unwrap().luma.data, [192]);
+    }
+}
+
 fn request(obj: &ImageXObject<'_>, plane: Plane) -> ImageRegion {
     let asset = obj.asset(None);
     let mut source = asset.open(None).unwrap();

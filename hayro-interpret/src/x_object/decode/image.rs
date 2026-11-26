@@ -4,8 +4,8 @@ use crate::color::{ColorComponents, ToLuma, ToRgb};
 use crate::interpret::state::ActiveTransferFunction;
 use crate::x_object::image::ImageXObject;
 use crate::{ImageData, LumaData, RgbData};
-use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::*;
+use hayro_syntax::object::{Dict, Stream};
 use smallvec::SmallVec;
 
 pub(crate) struct DecodedImage {
@@ -113,7 +113,7 @@ pub(crate) fn convert_band(
         ctx,
         target_dimension: None,
     };
-    let alpha = decoder.decode_color_key_mask();
+    let alpha = decoder.decode_color_key_mask(obj.stream.dict().get::<Stream<'_>>(SMASK).is_some());
     let (data, c) = match decoder.decode_image()? {
         ImageData::Luma(d) => (d.data, 1),
         ImageData::Rgb(d) => (d.data, 3),
@@ -124,6 +124,30 @@ pub(crate) fn convert_band(
         Some((out, c + 1))
     } else {
         Some((data, c))
+    }
+}
+
+struct SoftMask<'a> {
+    repaired: bool,
+    stream: Option<Stream<'a>>,
+}
+
+impl<'a> SoftMask<'a> {
+    fn read(dict: &Dict<'a>) -> Self {
+        Self {
+            // Resolving the stream can itself trigger repair.
+            repaired: dict.xref().is_repaired(),
+            stream: dict.get(SMASK),
+        }
+    }
+
+    fn current(&mut self, dict: &Dict<'a>) -> &mut Option<Stream<'a>> {
+        if !self.repaired && dict.xref().is_repaired() {
+            self.stream = None;
+            self.repaired = true;
+            self.stream = dict.get(SMASK);
+        }
+        &mut self.stream
     }
 }
 
@@ -146,9 +170,10 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
 
     fn decode(mut self) -> Option<DecodedImage> {
         let tail = super::Tail::of(&self.ctx, self.obj)?;
-        let key = self.decode_color_key_mask();
+        let mut soft_mask = SoftMask::read(self.obj.stream.dict());
+        let key = self.decode_color_key_mask(soft_mask.stream.is_some());
         let mut image = self.decode_image()?;
-        let alpha = self.decode_alpha(&mut image, key);
+        let alpha = self.decode_alpha(&mut image, key, &mut soft_mask);
 
         Some(DecodedImage { image, alpha, tail })
     }
@@ -285,8 +310,12 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
         &mut self,
         image: &mut ImageData,
         key: Option<LumaData>,
+        soft_mask: &mut SoftMask<'b>,
     ) -> Option<DecodedMask> {
-        if let Some((mut alpha, matte_rgb)) = self.resolve_matte()
+        if let Some((mut alpha, matte_rgb)) = soft_mask
+            .current(self.obj.stream.dict())
+            .as_ref()
+            .and_then(|s| self.resolve_matte(s))
             && alpha.tail.width == self.ctx.width
             && alpha.tail.declared == self.ctx.declared
         {
@@ -326,8 +355,9 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
                 scale_factors: self.ctx.scale_factors,
             }))
             // `SMask` takes precedence over `Mask`.
-        } else if let Some(s_mask) = dict
-            .get::<Stream<'_>>(SMASK)
+        } else if let Some(s_mask) = soft_mask
+            .current(dict)
+            .take()
             .or_else(|| dict.get::<Stream<'_>>(MASK))
         {
             let obj = ImageXObject::new_mask(&s_mask, &self.obj.warning_sink, &self.obj.cache)?;
@@ -338,8 +368,7 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
         }
     }
 
-    fn resolve_matte(&self) -> Option<(DecodedMask, [u8; 3])> {
-        let s_mask = self.obj.stream.dict().get::<Stream<'_>>(SMASK)?;
+    fn resolve_matte(&self, s_mask: &Stream<'_>) -> Option<(DecodedMask, [u8; 3])> {
         let matte = s_mask.dict().get::<ColorComponents>(MATTE)?;
 
         if matte.len() != self.ctx.color_space.num_components() as usize {
@@ -350,14 +379,18 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
         let mut matte_rgb = [0_u8; 3];
         self.ctx.color_space.convert_values(&matte, &mut matte_rgb);
 
-        let mask_obj = ImageXObject::new_mask(&s_mask, &self.obj.warning_sink, &self.obj.cache)?;
+        let mask_obj = ImageXObject::new_mask(s_mask, &self.obj.warning_sink, &self.obj.cache)?;
         let alpha = decode_mask(&mask_obj, self.target_dimension)?;
 
         Some((alpha, matte_rgb))
     }
 
-    fn decode_color_key_mask(&self) -> Option<LumaData> {
-        let color_key_mask = super::color_key(self.obj, self.ctx.color_space.num_components())?;
+    fn decode_color_key_mask(&self, has_soft_mask: bool) -> Option<LumaData> {
+        let color_key_mask = super::color_key(
+            self.obj,
+            self.ctx.color_space.num_components(),
+            has_soft_mask,
+        )?;
         let num_components = self.ctx.color_space.num_components() as usize;
         let components = unpack_samples(
             &self.ctx.decoded.data,
