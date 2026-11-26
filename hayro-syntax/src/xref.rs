@@ -793,8 +793,10 @@ impl XRef {
                     } else {
                         lost
                     };
-                    if value.is_none() && lost == Some(id) && !was_repaired {
-                        self.repair();
+                    if value.is_none() && !was_repaired {
+                        if lost == Some(id) {
+                            self.repair();
+                        }
                         if repr
                             .map
                             .get()
