@@ -10,6 +10,8 @@ license = { workspace = true }
 readme = "README.md"
 
 [dependencies]
+self_cell = "1.3"
+tempfile = "3"
 hayro-cmap = { workspace = true }
 hayro-font = { workspace = true }
 hayro-postscript = { workspace = true }

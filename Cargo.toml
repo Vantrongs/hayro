@@ -57,7 +57,7 @@ smallvec = { version = "1" }
 pdf-writer = { version = "0.15" }
 xmlwriter = { version = "0.1" }
 base64 = { version = "0.22" }
-zune-jpeg = { version = "0.5", default-features = false }
+zune-jpeg = { version = "=0.5.16-rc4", default-features = false }
 vello_cpu = { version = "0.4", default-features = false, features = ["std", "png", "u8_pipeline"] }
 pic-scale = { version = "0.7.12", default-features = false }
 fearless_simd = "1.0.0"
@@ -127,3 +127,7 @@ overflow-checks = true
 
 [patch.crates-io]
 pdf-writer = { git = "https://github.com/Vantrongs/pdf-writer", rev = "3bac7d8da8103978ad4d6bd555abbbe191a7845f" }
+zune-core = { git = "https://github.com/Vantrongs/zune-image", rev = "fdfad543194f1b8f79a1b78fd733a7ccc6ee4651" }
+zune-jpeg = { git = "https://github.com/Vantrongs/zune-image", rev = "fdfad543194f1b8f79a1b78fd733a7ccc6ee4651" }
+vello_cpu = { git = "https://github.com/Vantrongs/vello", rev = "ba95211fcfa8dd76c61d14fb4f805d30aa09a6d2" }
+vello_common = { git = "https://github.com/Vantrongs/vello", rev = "ba95211fcfa8dd76c61d14fb4f805d30aa09a6d2" }

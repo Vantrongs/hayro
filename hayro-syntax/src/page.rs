@@ -344,7 +344,7 @@ impl<'a> Page<'a> {
             let emit = |id, object, spaced, out: &mut dyn FnMut(&[u8])| match object {
                 Object::Stream(stream) => {
                     let data = stream
-                        .checked_page_content()
+                        .decoded_strict()
                         .map_err(|e| ContentError::Decode(id, e))?;
                     out(&data);
                     if spaced {

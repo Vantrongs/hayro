@@ -11,8 +11,18 @@ use smallvec::SmallVec;
 pub(crate) struct DecodedImage {
     pub(crate) image: ImageData,
     pub(crate) alpha: Option<LumaData>,
+    pub(in crate::x_object) tail: super::Tail,
 }
 
+impl DecodedImage {
+    pub(crate) fn into_whole(mut self) -> Option<(ImageData, Option<LumaData>)> {
+        match &mut self.image {
+            ImageData::Rgb(d) => self.tail.complete(&mut d.data, d.width, &mut d.height)?,
+            ImageData::Luma(d) => self.tail.complete(&mut d.data, d.width, &mut d.height)?,
+        }
+        Some((self.image, self.alpha))
+    }
+}
 pub(crate) fn decode_image(
     obj: &ImageXObject<'_>,
     target_dimension: Option<(u32, u32)>,
@@ -20,33 +30,72 @@ pub(crate) fn decode_image(
     ImageDecoder::new(obj, target_dimension)?.decode()
 }
 
+pub(crate) fn convert_band(
+    obj: &ImageXObject<'_>,
+    data: Vec<u8>,
+    metadata: Option<hayro_syntax::object::stream::ImageData>,
+    width: u32,
+    rows: u32,
+) -> Option<(Vec<u8>, usize)> {
+    let mut ctx = super::sample_context(
+        obj,
+        hayro_syntax::object::stream::FilterResult {
+            data: std::borrow::Cow::Owned(data),
+            image_data: metadata,
+        },
+    )?;
+    ctx.width = width;
+    ctx.height = rows;
+    if obj.kind != crate::x_object::image::ImageKind::Image {
+        return super::mask::decode_mask_data(
+            ctx,
+            obj.kind == crate::x_object::image::ImageKind::StencilMask,
+        )
+        .map(|(v, _)| (v, 1));
+    }
+    let mut decoder = ImageDecoder {
+        obj,
+        ctx,
+        target_dimension: None,
+    };
+    let alpha = decoder.decode_color_key_mask();
+    let (data, c) = match decoder.decode_image()? {
+        ImageData::Luma(d) => (d.data, 1),
+        ImageData::Rgb(d) => (d.data, 3),
+    };
+    if let Some(alpha) = alpha {
+        let mut out = Vec::with_capacity(data.len() + alpha.data.len());
+        premultiply(&mut out, &data, c, &alpha.data);
+        Some((out, c + 1))
+    } else {
+        Some((data, c))
+    }
+}
+
 struct ImageDecoder<'a, 'b> {
     obj: &'a ImageXObject<'b>,
     ctx: DecodeContext<'b>,
     target_dimension: Option<(u32, u32)>,
-    color_key_mask: Option<SmallVec<[u16; 4]>>,
-    decoded_color_key_mask: Option<LumaData>,
 }
 
 impl<'a, 'b> ImageDecoder<'a, 'b> {
     fn new(obj: &'a ImageXObject<'b>, target_dimension: Option<(u32, u32)>) -> Option<Self> {
         let ctx = decode_context(obj, target_dimension)?;
-        let color_key_mask = obj.stream.dict().get::<SmallVec<[u16; 4]>>(MASK);
 
         Some(Self {
             obj,
             ctx,
             target_dimension,
-            color_key_mask,
-            decoded_color_key_mask: None,
         })
     }
 
     fn decode(mut self) -> Option<DecodedImage> {
+        let tail = super::Tail::of(&self.ctx, self.obj)?;
+        let key = self.decode_color_key_mask();
         let mut image = self.decode_image()?;
-        let alpha = self.decode_alpha(&mut image);
+        let alpha = self.decode_alpha(&mut image, key);
 
-        Some(DecodedImage { image, alpha })
+        Some(DecodedImage { image, alpha, tail })
     }
 
     fn decode_image(&mut self) -> Option<ImageData> {
@@ -94,10 +143,6 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
                 0,
                 num_components,
             )?;
-
-            if self.color_key_mask.is_some() {
-                self.decoded_color_key_mask = self.decode_color_key_mask();
-            }
 
             if invert {
                 for value in self.ctx.decoded.data.to_mut() {
@@ -181,12 +226,20 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
         }
     }
 
-    fn decode_alpha(&mut self, image: &mut ImageData) -> Option<LumaData> {
-        if let Some((alpha, matte_rgb)) = self.resolve_matte()
+    fn decode_alpha(&mut self, image: &mut ImageData, key: Option<LumaData>) -> Option<LumaData> {
+        if let Some((mut alpha, matte_rgb)) = self.resolve_matte()
             && alpha.width == self.ctx.width
-            && alpha.height == self.ctx.height
+            && alpha.height == self.ctx.declared
         {
-            unpremultiply(image, &alpha.data, &matte_rgb);
+            alpha.height = self.ctx.height;
+            alpha
+                .data
+                .truncate(alpha.width as usize * alpha.height as usize);
+            let (color, c) = match image {
+                ImageData::Luma(d) => (&mut d.data, 1),
+                ImageData::Rgb(d) => (&mut d.data, 3),
+            };
+            unblend_matte(color, c, &alpha.data, matte_rgb);
 
             return Some(alpha);
         }
@@ -217,13 +270,9 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
         {
             let obj = ImageXObject::new_mask(&s_mask, &self.obj.warning_sink, &self.obj.cache)?;
 
-            decode_mask(&obj, self.target_dimension).map(|decoded| decoded.luma)
-        } else if self.color_key_mask.is_some() {
-            self.decoded_color_key_mask
-                .take()
-                .or_else(|| self.decode_color_key_mask())
+            decode_mask(&obj, self.target_dimension)?.into_whole()
         } else {
-            None
+            key
         }
     }
 
@@ -240,13 +289,13 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
         self.ctx.color_space.convert_values(&matte, &mut matte_rgb);
 
         let mask_obj = ImageXObject::new_mask(&s_mask, &self.obj.warning_sink, &self.obj.cache)?;
-        let alpha = decode_mask(&mask_obj, self.target_dimension)?.luma;
+        let alpha = decode_mask(&mask_obj, self.target_dimension)?.into_whole()?;
 
         Some((alpha, matte_rgb))
     }
 
     fn decode_color_key_mask(&self) -> Option<LumaData> {
-        let color_key_mask = self.color_key_mask.as_deref()?;
+        let color_key_mask = super::color_key(self.obj, self.ctx.color_space.num_components())?;
         let num_components = self.ctx.color_space.num_components() as usize;
         let components = unpack_samples(
             &self.ctx.decoded.data,
@@ -282,29 +331,33 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
     }
 }
 
-fn unpremultiply(image: &mut ImageData, alpha: &[u8], matte_rgb: &[u8]) {
-    match image {
-        ImageData::Rgb(rgb) => {
-            for (pixel, &a) in rgb.data.as_chunks_mut::<3>().0.iter_mut().zip(alpha.iter()) {
-                if a == 0 {
-                    continue;
-                }
-                let inv_alpha = 255.0 / a as f32;
-                for (c, &m) in pixel.iter_mut().zip(matte_rgb.iter()) {
-                    let m = m as f32;
-                    *c = (m + (*c as f32 - m) * inv_alpha) as u8;
-                }
+pub(in crate::x_object) fn unblend_matte(
+    color: &mut [u8],
+    channels: usize,
+    alpha: &[u8],
+    matte: [u8; 3],
+) {
+    for (pixel, &a) in color.chunks_exact_mut(channels).zip(alpha) {
+        if a != 0 {
+            let inv = 255.0 / f32::from(a);
+            for (c, m) in pixel.iter_mut().zip(matte) {
+                let m = f32::from(m);
+                *c = (m + (f32::from(*c) - m) * inv) as u8;
             }
         }
-        ImageData::Luma(luma) => {
-            let m = matte_rgb[0] as f32;
-            for (c, &a) in luma.data.iter_mut().zip(alpha.iter()) {
-                if a == 0 {
-                    continue;
-                }
-                let inv_alpha = 255.0 / a as f32;
-                *c = (m + (*c as f32 - m) * inv_alpha) as u8;
-            }
+    }
+}
+
+pub(in crate::x_object) fn premultiply(
+    out: &mut Vec<u8>,
+    color: &[u8],
+    channels: usize,
+    alpha: &[u8],
+) {
+    for (pixel, &a) in color.chunks_exact(channels).zip(alpha) {
+        for &v in pixel {
+            out.push((u16::from(v) * u16::from(a) / 255) as u8);
         }
+        out.push(a);
     }
 }

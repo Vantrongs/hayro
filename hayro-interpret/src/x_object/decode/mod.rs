@@ -1,4 +1,5 @@
 mod image;
+pub(super) use image::{convert_band, premultiply, unblend_matte};
 mod mask;
 
 pub(crate) use image::{DecodedImage, decode_image};
@@ -19,6 +20,7 @@ struct DecodeContext<'a> {
     decoded: FilterResult<'a>,
     width: u32,
     height: u32,
+    declared: u32,
     scale_factors: (f32, f32),
     color_space: ColorSpace,
     bits_per_component: u8,
@@ -51,6 +53,143 @@ fn decode_context<'a>(
         .map_err(|_| (obj.warning_sink)(InterpreterWarning::ImageDecodeFailure))
         .ok()?;
 
+    let mut ctx = sample_context(obj, decoded)?;
+    let stride = (ctx.width as usize)
+        .checked_mul(usize::from(ctx.color_space.num_components()))?
+        .checked_mul(usize::from(ctx.bits_per_component))?
+        .div_ceil(8);
+    if stride == 0 {
+        return None;
+    }
+    let transparent = short_rows_transparent(obj, ctx.color_space.num_components());
+    let available = fit_rows(
+        ctx.decoded.data.len(),
+        stride,
+        ctx.height,
+        ctx.bits_per_component,
+        transparent,
+    );
+    ctx.height = u32::try_from(available.div_ceil(stride)).ok()?;
+    match &mut ctx.decoded.data {
+        std::borrow::Cow::Owned(v) => v.truncate(available),
+        std::borrow::Cow::Borrowed(v) => *v = &v[..available],
+    }
+    if !available.is_multiple_of(stride) {
+        ctx.decoded
+            .data
+            .to_mut()
+            .resize(available.next_multiple_of(stride), 0);
+    }
+    Some(ctx)
+}
+
+pub(crate) fn fit_rows(
+    bytes: usize,
+    stride: usize,
+    rows: u32,
+    bits: u8,
+    transparent: bool,
+) -> usize {
+    let n = bytes.min(stride.saturating_mul(rows as usize));
+    if transparent || bits != 8 {
+        n / stride * stride
+    } else {
+        n
+    }
+}
+
+pub(crate) fn short_rows_transparent(obj: &ImageXObject<'_>, components: u8) -> bool {
+    if obj.kind != ImageKind::Image {
+        return false;
+    }
+    let dict = obj.stream.dict();
+    if let Some(mask) = dict
+        .get::<hayro_syntax::object::Stream<'_>>(SMASK)
+        .or_else(|| dict.get::<hayro_syntax::object::Stream<'_>>(MASK))
+    {
+        return mask.dict().get::<Array<'_>>(MATTE).is_some();
+    }
+    color_key(obj, components).is_some()
+}
+
+fn color_key(obj: &ImageXObject<'_>, components: u8) -> Option<SmallVec<[u16; 8]>> {
+    let dict = obj.stream.dict();
+    if dict
+        .get::<hayro_syntax::object::Stream<'_>>(SMASK)
+        .is_some()
+    {
+        return None;
+    }
+    let components = usize::from(components);
+    let key: SmallVec<_> = dict
+        .get::<Array<'_>>(MASK)?
+        .iter::<u16>()
+        .take(2 * components)
+        .collect();
+    (components > 0 && key.len() == 2 * components).then_some(key)
+}
+
+pub(super) struct Tail {
+    pub(super) declared: u32,
+    pub(super) texel: Option<Vec<u8>>,
+}
+
+impl Tail {
+    fn of(ctx: &DecodeContext<'_>, obj: &ImageXObject<'_>) -> Option<Self> {
+        let texel =
+            if ctx.height < ctx.declared
+                && !short_rows_transparent(obj, ctx.color_space.num_components())
+            {
+                let info = ctx.decoded.image_data.as_ref().map(|d| {
+                    hayro_syntax::object::stream::ImageData {
+                        width: 1,
+                        height: 1,
+                        color_space: d.color_space,
+                        bits_per_component: d.bits_per_component,
+                        alpha: None,
+                    }
+                });
+                let bytes = (usize::from(ctx.bits_per_component)
+                    * usize::from(ctx.color_space.num_components()))
+                .div_ceil(8);
+                Some(convert_band(obj, vec![0; bytes], info, 1, 1)?.0)
+            } else {
+                None
+            };
+        Some(Self {
+            declared: ctx.declared,
+            texel,
+        })
+    }
+
+    fn complete(&self, data: &mut Vec<u8>, width: u32, height: &mut u32) -> Option<()> {
+        if let Some(texel) = &self.texel {
+            let len = (width as usize)
+                .checked_mul(self.declared as usize)?
+                .checked_mul(texel.len())?;
+            data.try_reserve_exact(len.checked_sub(data.len())?).ok()?;
+            if texel.len() == 1 {
+                data.resize(len, texel[0]);
+            } else {
+                while data.len() < len {
+                    data.extend_from_slice(texel);
+                }
+            }
+            *height = self.declared;
+        }
+        Some(())
+    }
+}
+
+fn sample_context<'a>(
+    obj: &ImageXObject<'a>,
+    decoded: FilterResult<'a>,
+) -> Option<DecodeContext<'a>> {
+    let dict = obj.stream.dict();
+    let dict_bpc = dict
+        .get::<u8>(BPC)
+        .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT));
+    let color_space = obj.color_space.clone();
     let (mut scale_x, mut scale_y) = (1.0, 1.0);
 
     let (width, height) = decoded
@@ -104,6 +243,7 @@ fn decode_context<'a>(
         decoded,
         width,
         height,
+        declared: height,
         scale_factors: (scale_x, scale_y),
         color_space,
         bits_per_component,
@@ -131,11 +271,7 @@ fn fix_image_length<T: Copy>(
         }
     }
 
-    if width == 0 || *height == 0 {
-        None
-    } else {
-        Some(())
-    }
+    if width == 0 { None } else { Some(()) }
 }
 
 fn decode_u8_samples(

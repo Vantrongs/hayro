@@ -1,8 +1,13 @@
 //! Streams.
 
-use crate::crypto::DecryptionTarget;
+pub use crate::crypto::reader::DecryptedReader;
+use crate::crypto::{DecryptionTarget, Decryptor};
 use crate::filter::Filter;
+#[cfg(feature = "images")]
+pub use crate::filter::dct::JpegRows;
+pub use crate::filter::forward::DecodedReader;
 use crate::object::Name;
+use crate::object::dict::InlineImageDict;
 use crate::object::dict::keys::{DECODE_PARMS, DP, F, FILTER, IDENTITY, LENGTH, NAME, TYPE, XREF};
 use crate::object::{Array, ObjectIdentifier};
 use crate::object::{Dict, Written};
@@ -13,9 +18,12 @@ use crate::reader::{
 };
 use crate::trivia::is_white_space_character;
 use crate::util::find_needle;
+use crate::xref::XRef;
 use alloc::borrow::Cow;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
+use core::sync::atomic::AtomicBool;
 use smallvec::SmallVec;
 
 /// Filters and parameters in their source order.
@@ -231,7 +239,6 @@ pub struct ImageDecodeParams {
 enum DecodeTarget<'a> {
     Data,
     PageContent,
-    CheckedPageContent,
     Image(&'a ImageDecodeParams),
 }
 
@@ -299,6 +306,140 @@ impl<'a> Stream<'a> {
     /// Filters paired with their original parameters.
     pub fn filter_entries(&self) -> FilterEntries<'a> {
         FilterEntries::of(&self.dict)
+    }
+
+    /// Decodes a terminal CCITT filter to packed rows.
+    #[cfg(feature = "images")]
+    pub fn fax_image(
+        &self,
+        params: &ImageDecodeParams,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Option<FilterResult<'static>> {
+        let mut prefix = self.filters_and_params();
+        if prefix.filters.pop() != Some(Filter::CcittFaxDecode) {
+            return None;
+        }
+        let fax =
+            crate::filter::ccitt::Fax::new(&prefix.params.pop()?, params.height, cancel.clone());
+        let data = self.image_input(&prefix, cancel)?;
+        fax.decode(&data)
+    }
+
+    #[cfg(feature = "images")]
+    fn image_input(
+        &self,
+        prefix: &FiltersAndParams<'_>,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Option<Cow<'a, [u8]>> {
+        if prefix.filters.is_empty() {
+            self.try_raw_data().ok()
+        } else {
+            self.collect_filters(prefix, false, cancel).ok()
+        }
+    }
+
+    /// Opens a terminal DCT filter that can emit native scanlines.
+    #[cfg(feature = "images")]
+    pub fn jpeg_rows(
+        &self,
+        params: &ImageDecodeParams,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Option<JpegRows<'a>> {
+        let mut prefix = self.filters_and_params();
+        if prefix.filters.pop() != Some(Filter::DctDecode) {
+            return None;
+        }
+        let jpeg_params = prefix.params.pop()?;
+        let data = self.image_input(&prefix, cancel.clone())?;
+        JpegRows::new(data, &jpeg_params, params, cancel)?.streaming()
+    }
+
+    /// Opens a forward reader of the stream's data filters.
+    pub fn decoded_reader(
+        &self,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<DecodedReader<'a>, DecodeFailure> {
+        self.forward(&self.filters_and_params(), cancel, &[], false)
+    }
+
+    fn forward(
+        &self,
+        filters: &FiltersAndParams<'_>,
+        cancel: Option<Arc<AtomicBool>>,
+        raw: &[(usize, crate::filter::forward::FlateMode)],
+        strict: bool,
+    ) -> Result<DecodedReader<'a>, DecodeFailure> {
+        if matches!(
+            self.dict.get::<Object<'_>>(F),
+            Some(Object::String(_) | Object::Dict(_))
+        ) {
+            return Err(DecodeFailure::StreamDecode);
+        }
+
+        let mut reader = DecodedReader::new(self.decrypted_reader()?, cancel, strict);
+        for (i, (filter, params)) in filters.filters.iter().zip(&filters.params).enumerate() {
+            if i == 0 && *filter == Filter::Crypt {
+                continue;
+            }
+            reader
+                .add(*filter, params, raw)
+                .ok_or(DecodeFailure::StreamDecode)?;
+        }
+        Ok(reader)
+    }
+
+    /// Decodes all data filters, discarding tentative output on failure.
+    pub fn decoded_strict(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
+        let filters = self.filters_and_params();
+        if filters.filters.is_empty()
+            && !matches!(
+                self.dict.get::<Object<'_>>(F),
+                Some(Object::String(_) | Object::Dict(_))
+            )
+            && !self.dict.ctx().xref().needs_decryption(self.dict.ctx())
+        {
+            return Ok(Cow::Borrowed(self.data));
+        }
+        self.collect_filters(&filters, true, None)
+    }
+
+    fn collect_filters(
+        &self,
+        filters: &FiltersAndParams<'_>,
+        strict: bool,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Cow<'a, [u8]>, DecodeFailure> {
+        let mut raw = Vec::new();
+        loop {
+            let mut reader = self.forward(filters, cancel.clone(), &raw, strict)?;
+            match reader.collect_strict() {
+                Err(_) if reader.retry().is_some() => {
+                    let (index, mode) = reader.retry().unwrap();
+                    raw.retain(|&(i, _)| i < index);
+                    raw.push((index, mode));
+                }
+                result => return result.map(Cow::Owned),
+            }
+        }
+    }
+
+    /// Opens the stored bytes for incremental decryption.
+    pub fn decrypted_reader(&self) -> Result<DecryptedReader<'a>, DecodeFailure> {
+        let ctx = self.dict.ctx();
+        let encrypted = self.dict.obj_id().is_some()
+            && ctx.xref().needs_decryption(ctx)
+            && self.dict.get::<Name<'_>>(TYPE).as_deref() != Some(XREF);
+        let decryptor = if encrypted {
+            ctx.xref().decryptor()
+        } else {
+            &Decryptor::None
+        };
+        let filter = encrypted.then(|| self.crypt_filter()).flatten();
+        let target = filter.as_ref().map_or(DecryptionTarget::Stream, |name| {
+            DecryptionTarget::Named(name)
+        });
+        DecryptedReader::new(self.data, decryptor, self.obj_id(), target)
+            .ok_or(DecodeFailure::Decryption)
     }
 
     /// Return the decrypted but undecoded data of the stream.
@@ -378,10 +519,6 @@ impl<'a> Stream<'a> {
         self.decode(DecodeTarget::PageContent).map(|r| r.data)
     }
 
-    pub(crate) fn checked_page_content(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
-        self.decode(DecodeTarget::CheckedPageContent)
-            .map(|r| r.data)
-    }
     fn decode(&self, target: DecodeTarget<'_>) -> Result<FilterResult<'a>, DecodeFailure> {
         if matches!(
             self.dict.get::<Object<'_>>(F),
@@ -390,24 +527,35 @@ impl<'a> Stream<'a> {
             return Err(DecodeFailure::StreamDecode);
         }
 
-        let filters_and_params = self.filters_and_params();
+        let mut filters_and_params = self.filters_and_params();
+        let first_image = filters_and_params.filters.iter().position(Filter::is_image);
         let image_params = match target {
-            DecodeTarget::Image(params) => params,
-            DecodeTarget::Data | DecodeTarget::PageContent | DecodeTarget::CheckedPageContent => {
-                if filters_and_params.filters.iter().any(|filter| {
-                    matches!(
-                        filter,
-                        Filter::DctDecode
-                            | Filter::JpxDecode
-                            | Filter::Jbig2Decode
-                            | Filter::CcittFaxDecode
-                    )
-                }) {
-                    return Err(DecodeFailure::ImageDecode);
+            DecodeTarget::Image(params) => match first_image {
+                None => {
+                    let data = if filters_and_params.filters.is_empty() {
+                        self.try_raw_data()?
+                    } else {
+                        self.collect_filters(&filters_and_params, false, None)?
+                    };
+                    return Ok(FilterResult {
+                        data,
+                        image_data: None,
+                    });
                 }
-
-                &ImageDecodeParams::default()
-            }
+                Some(i) if i + 1 == filters_and_params.filters.len() => {
+                    let filter = filters_and_params.filters.pop().unwrap();
+                    let options = filters_and_params.params.pop().unwrap();
+                    let stored = if filters_and_params.filters.is_empty() {
+                        self.try_raw_data()?
+                    } else {
+                        self.collect_filters(&filters_and_params, false, None)?
+                    };
+                    return filter.apply(&stored, &options, params, false, false);
+                }
+                _ => params,
+            },
+            _ if first_image.is_some() => return Err(DecodeFailure::ImageDecode),
+            _ => &ImageDecodeParams::default(),
         };
 
         let data = self.try_raw_data()?;
@@ -429,7 +577,7 @@ impl<'a> Stream<'a> {
                 params,
                 image_params,
                 matches!(target, DecodeTarget::PageContent),
-                matches!(target, DecodeTarget::CheckedPageContent),
+                false,
             )?;
             current = Some(new);
         }
@@ -441,7 +589,9 @@ impl<'a> Stream<'a> {
     }
 
     fn crypt_filter(&self) -> Option<Name<'a>> {
-        let FiltersAndParams { filters, params } = self.filters_and_params();
+        let FiltersAndParams {
+            filters, params, ..
+        } = self.filters_and_params();
 
         (filters.first() == Some(&Filter::Crypt)).then(|| {
             params
@@ -449,6 +599,53 @@ impl<'a> Stream<'a> {
                 .and_then(|params| params.get::<Name<'a>>(NAME))
                 .unwrap_or(Name::new_unescaped(IDENTITY))
         })
+    }
+
+    /// Owns the data needed to reopen this stream.
+    pub fn to_owned_stream(&self) -> OwnedStream {
+        let ctx = self.dict.ctx();
+        OwnedStream(match self.dict.obj_id() {
+            Some(id) => OwnedInner::Indirect {
+                xref: ctx.xref().clone(),
+                id,
+            },
+            None => OwnedInner::Inline {
+                xref: ctx.xref().clone(),
+                dict: Arc::from(self.dict.data()),
+                data: Arc::from(self.data),
+            },
+        })
+    }
+}
+
+/// A stream that owns what it needs to read it again (see [`Stream::to_owned_stream`]).
+#[derive(Clone)]
+pub struct OwnedStream(OwnedInner);
+
+#[derive(Clone)]
+enum OwnedInner {
+    Indirect {
+        xref: XRef,
+        id: ObjectIdentifier,
+    },
+    Inline {
+        xref: XRef,
+        dict: Arc<[u8]>,
+        data: Arc<[u8]>,
+    },
+}
+
+impl OwnedStream {
+    /// The stream; `None` if it can no longer be read.
+    pub fn get(&self) -> Option<Stream<'_>> {
+        match &self.0 {
+            OwnedInner::Indirect { xref, id } => xref.get::<Stream<'_>>(*id),
+            OwnedInner::Inline { xref, dict, data } => {
+                let dict = Reader::new(dict)
+                    .read_with_context::<InlineImageDict<'_>>(&ReaderContext::new(xref, true))?;
+                Some(Stream::new(data, dict.get_dict().clone()))
+            }
+        }
     }
 }
 
@@ -495,6 +692,8 @@ pub(crate) fn forward_stream_opener(r: &mut Reader<'_>, ends: &impl Ends) -> Opt
 #[derive(Debug, Copy, Clone)]
 /// A failure that can occur during decoding a data stream.
 pub enum DecodeFailure {
+    /// Decoding was cancelled.
+    Cancelled,
     /// An image stream failed to decode.
     ImageDecode,
     /// A data stream failed to decode.
@@ -519,6 +718,7 @@ pub enum ImageColorSpace {
 }
 
 /// Additional data that is extracted from some image streams.
+#[derive(Clone)]
 pub struct ImageData {
     /// An optional alpha channel of the image.
     pub alpha: Option<Vec<u8>>,

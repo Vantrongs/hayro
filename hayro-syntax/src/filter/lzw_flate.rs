@@ -187,13 +187,13 @@ pub(crate) mod lzw {
         }
     }
 
-    struct Table {
+    pub(in crate::filter) struct Table {
         early_change: bool,
         entries: Vec<Option<Vec<u8>>>,
     }
 
     impl Table {
-        fn new(early_change: bool) -> Self {
+        pub(in crate::filter) fn new(early_change: bool) -> Self {
             let mut entries: Vec<_> = (0..=255).map(|b| Some(vec![b])).collect();
 
             entries.push(None);
@@ -214,7 +214,7 @@ pub(crate) mod lzw {
             }
         }
 
-        fn register(&mut self, prev: usize, new_byte: u8) -> Option<&[u8]> {
+        pub(in crate::filter) fn register(&mut self, prev: usize, new_byte: u8) -> Option<&[u8]> {
             let prev_entry = self.get(prev)?;
 
             let mut new_entry = Vec::with_capacity(prev_entry.len() + 1);
@@ -223,19 +223,19 @@ pub(crate) mod lzw {
             self.push(new_entry)
         }
 
-        fn get(&self, index: usize) -> Option<&[u8]> {
+        pub(in crate::filter) fn get(&self, index: usize) -> Option<&[u8]> {
             self.entries.get(index)?.as_ref().map(|v| &**v)
         }
 
-        fn clear(&mut self) {
+        pub(in crate::filter) fn clear(&mut self) {
             self.entries.truncate(INITIAL_SIZE as usize);
         }
 
-        fn size(&self) -> usize {
+        pub(in crate::filter) fn size(&self) -> usize {
             self.entries.len()
         }
 
-        fn code_length(&self) -> u8 {
+        pub(in crate::filter) fn code_length(&self) -> u8 {
             const TEN: usize = 512;
             const ELEVEN: usize = 1024;
             const TWELVE: usize = 2048;

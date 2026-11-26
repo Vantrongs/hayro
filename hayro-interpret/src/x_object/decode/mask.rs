@@ -18,6 +18,15 @@ static BILEVEL_MASK_LUT: LazyLock<Box<[u64; 256]>> = LazyLock::new(|| {
 
 pub(crate) struct DecodedMask {
     pub(crate) luma: LumaData,
+    pub(in crate::x_object) tail: super::Tail,
+}
+
+impl DecodedMask {
+    pub(crate) fn into_whole(mut self) -> Option<LumaData> {
+        self.tail
+            .complete(&mut self.luma.data, self.luma.width, &mut self.luma.height)?;
+        Some(self.luma)
+    }
 }
 
 pub(crate) fn decode_mask(
@@ -25,6 +34,7 @@ pub(crate) fn decode_mask(
     target_dimension: Option<(u32, u32)>,
 ) -> Option<DecodedMask> {
     let ctx = decode_context(obj, target_dimension)?;
+    let tail = super::Tail::of(&ctx, obj)?;
     let width = ctx.width;
     let scale_factors = ctx.scale_factors;
 
@@ -33,6 +43,7 @@ pub(crate) fn decode_mask(
     let (data, height) = decode_mask_data(ctx, invert)?;
 
     Some(DecodedMask {
+        tail,
         luma: LumaData {
             data,
             width,
@@ -43,7 +54,7 @@ pub(crate) fn decode_mask(
     })
 }
 
-fn decode_mask_data(mut ctx: DecodeContext<'_>, invert: bool) -> Option<(Vec<u8>, u32)> {
+pub(super) fn decode_mask_data(mut ctx: DecodeContext<'_>, invert: bool) -> Option<(Vec<u8>, u32)> {
     let default_decode = ctx
         .color_space
         .default_decode_arr(ctx.bits_per_component as f32);

@@ -17,6 +17,7 @@ use core::ops::Deref;
 mod aes;
 mod md5;
 mod rc4;
+pub(crate) mod reader;
 mod sha256;
 mod sha384;
 mod sha512;
@@ -93,29 +94,32 @@ impl Decryptor {
         data: &[u8],
         target: DecryptionTarget<'_>,
     ) -> Option<Vec<u8>> {
-        if matches!(target, DecryptionTarget::Named(IDENTITY)) {
-            return Some(data.to_vec());
+        let (key, method) = self.method(target)?;
+        match method {
+            DecryptorTag::None => Some(data.to_vec()),
+            DecryptorTag::Rc4 => decrypt_rc4(key, data, id),
+            DecryptorTag::Aes128 => decrypt_aes128(key, data, id),
+            DecryptorTag::Aes256 => decrypt_aes256(key, data),
         }
+    }
 
+    fn method(&self, target: DecryptionTarget<'_>) -> Option<(&[u8], DecryptorTag)> {
+        if matches!(target, DecryptionTarget::Named(IDENTITY)) {
+            return Some((&[], DecryptorTag::None));
+        }
         match self {
-            Self::None => Some(data.to_vec()),
-            Self::Rc4 { key } => match target {
-                DecryptionTarget::Named(_) => None,
-                _ => decrypt_rc4(key, data, id),
-            },
+            Self::None => Some((&[], DecryptorTag::None)),
+            Self::Rc4 { key } if !matches!(target, DecryptionTarget::Named(_)) => {
+                Some((key, DecryptorTag::Rc4))
+            }
+            Self::Rc4 { .. } => None,
             Self::Aes128 { key, dict } | Self::Aes256 { key, dict } => {
-                let crypt_dict = match target {
+                let filter = match target {
                     DecryptionTarget::String => dict.string_filter,
                     DecryptionTarget::Stream => dict.stream_filter,
                     DecryptionTarget::Named(name) => *dict.crypt_filters.get(name)?,
                 };
-
-                match crypt_dict.cfm {
-                    DecryptorTag::None => Some(data.to_vec()),
-                    DecryptorTag::Rc4 => decrypt_rc4(key, data, id),
-                    DecryptorTag::Aes128 => decrypt_aes128(key, data, id),
-                    DecryptorTag::Aes256 => decrypt_aes256(key, data),
-                }
+                Some((key, filter.cfm))
             }
         }
     }
@@ -238,12 +242,12 @@ fn decrypt_rc4(key: &[u8], data: &[u8], id: ObjectIdentifier) -> Option<Vec<u8>>
     })
 }
 
-fn decrypt_rc_aes(
+fn decrypt_rc_aes<T>(
     key: &[u8],
     id: ObjectIdentifier,
     aes: bool,
-    with_key: impl FnOnce(&[u8]) -> Option<Vec<u8>>,
-) -> Option<Vec<u8>> {
+    with_key: impl FnOnce(&[u8]) -> Option<T>,
+) -> Option<T> {
     let n = key.len();
     let mut key = key.to_vec();
 

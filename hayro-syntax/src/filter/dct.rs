@@ -2,63 +2,185 @@ use crate::object::Dict;
 use crate::object::dict::keys::COLOR_TRANSFORM;
 use crate::object::stream::{FilterResult, ImageColorSpace, ImageData, ImageDecodeParams};
 use alloc::borrow::Cow;
+use alloc::vec::Vec;
 use core::num::NonZeroU32;
 use zune_jpeg::zune_core::bytestream::ZCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::colorspace::ColorSpace::CMYK;
 use zune_jpeg::zune_core::options::DecoderOptions;
 
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
+use zune_jpeg::{JpegDecoder, ScanlineReadStatus, ScanlineStatus};
+
+/// A forward reader of native JPEG samples after the PDF color transform.
+pub struct JpegRows<'a> {
+    decoder: JpegDecoder<ZCursor<Cow<'a, [u8]>>>,
+    colorspace: ColorSpace,
+    stride: usize,
+    streaming: bool,
+}
+
 pub(crate) fn decode(
     data: &[u8],
     params: &Dict<'_>,
     image_params: &ImageDecodeParams,
 ) -> Option<FilterResult<'static>> {
-    if image_params.width > u16::MAX as u32 || image_params.height > u16::MAX as u32 {
-        return None;
+    let mut rows = JpegRows::new(Cow::Borrowed(data), params, image_params, None)?;
+    if !rows.streaming {
+        return rows.decode_whole();
     }
-
-    // Some JPEGs have bogus oversized dimensions, so patch them from the image dictionary.
-    let data = maybe_patch_jpeg_dimensions(data, image_params)?;
-
-    let options = DecoderOptions::default()
-        .set_max_width(u16::MAX as usize)
-        .set_max_height(u16::MAX as usize);
-    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(&*data), options);
-    decoder.decode_headers().ok()?;
-
-    let color_transform = params.get::<u8>(COLOR_TRANSFORM);
-    let input_color_space = decoder.input_colorspace().unwrap();
-
-    let mut out_colorspace = if let Some(num_components) = image_params.num_components
-        && !matches!(num_components, 1 | 3 | 4)
-    {
-        ColorSpace::MultiBand(NonZeroU32::new(num_components as u32)?)
-    } else {
-        match input_color_space {
-            ColorSpace::YCbCr => {
-                if color_transform.is_none_or(|c| c == 1) {
-                    ColorSpace::RGB
-                } else {
-                    ColorSpace::YCbCr
-                }
+    let mut output = alloc::vec![0; rows.stride.checked_mul(16)?];
+    let mut samples = Vec::new();
+    loop {
+        match rows.read(&mut output) {
+            Some(0) => break,
+            Some(n) => samples.extend_from_slice(&output[..n * rows.stride]),
+            None => {
+                drop(samples);
+                let whole = JpegRows::new(Cow::Borrowed(data), params, image_params, None)?;
+                return whole.decode_whole();
             }
-            ColorSpace::RGB | ColorSpace::RGBA => ColorSpace::RGB,
-            ColorSpace::Luma | ColorSpace::LumaA => ColorSpace::Luma,
-            // TODO: Find test case with color transform on cmyk
-            CMYK => CMYK,
-            ColorSpace::YCCK => ColorSpace::YCCK,
-            _ => ColorSpace::RGB,
         }
-    };
+    }
+    Some(rows.result(samples))
+}
 
-    // In case image had APP14 marker, we might have to override the colorspace.
-    if input_color_space == CMYK && decoder.info().unwrap().components == 3 {
-        out_colorspace = ColorSpace::RGB;
+impl<'a> JpegRows<'a> {
+    /// Opens the JPEG data with its PDF decode parameters and optional cancellation token.
+    pub fn new(
+        data: Cow<'a, [u8]>,
+        params: &Dict<'_>,
+        image_params: &ImageDecodeParams,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Option<Self> {
+        if image_params.width > u16::MAX as u32 || image_params.height > u16::MAX as u32 {
+            return None;
+        }
+
+        // Some JPEGs have bogus oversized dimensions, so patch them from the image dictionary.
+        let data = maybe_patch_jpeg_dimensions(data, image_params)?;
+
+        let streaming = find_marker(&data, true)
+            .and_then(|i| data.get(i + 4))
+            .copied();
+        let options = DecoderOptions::default()
+            .set_max_width(u16::MAX as usize)
+            .set_max_height(u16::MAX as usize);
+        let mut decoder = JpegDecoder::new_with_options(ZCursor::new(data), options);
+        if let Some(cancel) = cancel {
+            decoder.set_cancel(move || cancel.load(Ordering::Relaxed));
+        }
+        decoder.decode_headers().ok()?;
+
+        let color_transform = params.get::<u8>(COLOR_TRANSFORM);
+        let input_color_space = decoder.input_colorspace().unwrap();
+
+        let mut out_colorspace = if let Some(num_components) = image_params.num_components
+            && !matches!(num_components, 1 | 3 | 4)
+        {
+            ColorSpace::MultiBand(NonZeroU32::new(num_components as u32)?)
+        } else {
+            match input_color_space {
+                ColorSpace::YCbCr => {
+                    if color_transform.is_none_or(|c| c == 1) {
+                        ColorSpace::RGB
+                    } else {
+                        ColorSpace::YCbCr
+                    }
+                }
+                ColorSpace::RGB | ColorSpace::RGBA => ColorSpace::RGB,
+                ColorSpace::Luma | ColorSpace::LumaA => ColorSpace::Luma,
+                // TODO: Find test case with color transform on cmyk
+                CMYK => CMYK,
+                ColorSpace::YCCK => ColorSpace::YCCK,
+                _ => ColorSpace::RGB,
+            }
+        };
+
+        // In case image had APP14 marker, we might have to override the colorspace.
+        if input_color_space == CMYK && decoder.info().unwrap().components == 3 {
+            out_colorspace = ColorSpace::RGB;
+        }
+
+        decoder.set_options(options.jpeg_set_out_colorspace(out_colorspace));
+        let stride = decoder
+            .dimensions()?
+            .0
+            .checked_mul(out_colorspace.num_components())?;
+        let streaming = decoder.decoded_scans().is_none()
+            && decoder.dimensions()?.1 != 0
+            && streaming == Some(decoder.info()?.components);
+        (stride != 0).then_some(Self {
+            decoder,
+            colorspace: out_colorspace,
+            stride,
+            streaming,
+        })
     }
 
-    decoder.set_options(DecoderOptions::default().jpeg_set_out_colorspace(out_colorspace));
-    let mut decoded = decoder.decode().ok()?;
+    pub(crate) fn streaming(self) -> Option<Self> {
+        self.streaming.then_some(self)
+    }
 
+    fn decode_whole(mut self) -> Option<FilterResult<'static>> {
+        let mut data = self.decoder.decode().ok()?;
+        transform(self.colorspace, &mut data);
+        Some(self.result(data))
+    }
+
+    /// Returns the number of sample bytes per row.
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    /// Reads complete rows, returning their count, zero at EOF, or None on failure.
+    pub fn read(&mut self, output: &mut [u8]) -> Option<usize> {
+        if output.len() < self.stride {
+            return None;
+        }
+        let mut session = self.decoder.scanline_output();
+        match session.read_scanlines(output, self.stride).ok()? {
+            ScanlineReadStatus::RowsProcessed { rows } if rows > 0 => {
+                transform(self.colorspace, &mut output[..rows * self.stride]);
+                Some(rows)
+            }
+            ScanlineReadStatus::Complete if session.finish().ok()? == ScanlineStatus::Complete => {
+                Some(0)
+            }
+            _ => None,
+        }
+    }
+
+    /// The dimensions and sample format produced by the decoder.
+    pub fn metadata(&self) -> ImageData {
+        let width = self.decoder.dimensions().unwrap().0 as u32;
+        let height = self.decoder.dimensions().unwrap().1 as u32;
+
+        ImageData {
+            alpha: None,
+            color_space: match self.colorspace {
+                ColorSpace::RGB | ColorSpace::YCbCr => Some(ImageColorSpace::Rgb),
+                ColorSpace::Luma => Some(ImageColorSpace::Gray),
+                ColorSpace::YCCK | CMYK => Some(ImageColorSpace::Cmyk),
+                ColorSpace::MultiBand(_) => None,
+                _ => None,
+            },
+            bits_per_component: 8,
+            width,
+            height,
+        }
+    }
+
+    fn result(&self, decoded: Vec<u8>) -> FilterResult<'static> {
+        FilterResult {
+            data: Cow::Owned(decoded),
+            image_data: Some(self.metadata()),
+        }
+    }
+}
+
+fn transform(out_colorspace: ColorSpace, decoded: &mut [u8]) {
     if out_colorspace == ColorSpace::YCCK {
         // See <https://github.com/mozilla/pdf.js/blob/69595a29192b7704733404a42a2ebb537601117b/src/core/jpg.js#L1331>
         for c in decoded.chunks_mut(4) {
@@ -70,35 +192,13 @@ pub(crate) fn decode(
             c[2] = (481.816 - y - 1.772 * cb) as u8;
         }
     }
-
-    let width = decoder.dimensions().unwrap().0 as u32;
-    let height = decoder.dimensions().unwrap().1 as u32;
-
-    let image_data = ImageData {
-        alpha: None,
-        color_space: match out_colorspace {
-            ColorSpace::RGB | ColorSpace::YCbCr => Some(ImageColorSpace::Rgb),
-            ColorSpace::Luma => Some(ImageColorSpace::Gray),
-            ColorSpace::YCCK | CMYK => Some(ImageColorSpace::Cmyk),
-            ColorSpace::MultiBand(_) => None,
-            _ => None,
-        },
-        bits_per_component: 8,
-        width,
-        height,
-    };
-
-    Some(FilterResult {
-        data: Cow::Owned(decoded),
-        image_data: Some(image_data),
-    })
 }
 
 fn maybe_patch_jpeg_dimensions<'a>(
-    data: &'a [u8],
+    mut data: Cow<'a, [u8]>,
     image_params: &ImageDecodeParams,
 ) -> Option<Cow<'a, [u8]>> {
-    let sof_offset = find_sof_marker(data)?;
+    let sof_offset = find_marker(&data, false)?;
 
     let height_offset = sof_offset.checked_add(5)?;
     let width_offset = sof_offset.checked_add(7)?;
@@ -117,20 +217,20 @@ fn maybe_patch_jpeg_dimensions<'a>(
     let need_patch = jpeg_area > image_area;
 
     if !need_patch {
-        return Some(Cow::Borrowed(data));
+        return Some(data);
     }
 
     let target_w = (image_params.width as u16).to_be_bytes();
     let target_h = (image_params.height as u16).to_be_bytes();
 
-    let mut patched = data.to_vec();
+    let patched = data.to_mut();
     patched[height_offset..height_offset.checked_add(2)?].copy_from_slice(&target_h);
     patched[width_offset..width_offset.checked_add(2)?].copy_from_slice(&target_w);
 
-    Some(Cow::Owned(patched))
+    Some(data)
 }
 
-fn find_sof_marker(data: &[u8]) -> Option<usize> {
+fn find_marker(data: &[u8], sos: bool) -> Option<usize> {
     let mut i = 0_usize;
 
     while i.checked_add(1).is_some_and(|next| next < data.len()) {
@@ -143,7 +243,8 @@ fn find_sof_marker(data: &[u8]) -> Option<usize> {
 
         match marker {
             // SOF0–SOF15, excluding DHT, JPG and DAC.
-            0xC0..=0xCF if marker != 0xC4 && marker != 0xC8 && marker != 0xCC => {
+            0xDA if sos => return Some(i),
+            0xC0..=0xCF if !sos && marker != 0xC4 && marker != 0xC8 && marker != 0xCC => {
                 return Some(i);
             }
             0xFF => {

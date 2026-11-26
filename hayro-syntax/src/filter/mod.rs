@@ -1,9 +1,10 @@
 mod ascii_85;
 pub(crate) mod ascii_hex;
 #[cfg(feature = "images")]
-mod ccitt;
+pub(crate) mod ccitt;
 #[cfg(feature = "images")]
-mod dct;
+pub(crate) mod dct;
+pub(crate) mod forward;
 #[cfg(feature = "images")]
 mod jbig2;
 #[cfg(feature = "images")]
@@ -45,6 +46,13 @@ pub enum Filter {
 }
 
 impl Filter {
+    pub(crate) fn is_image(&self) -> bool {
+        matches!(
+            self,
+            Self::DctDecode | Self::JpxDecode | Self::Jbig2Decode | Self::CcittFaxDecode
+        )
+    }
+
     pub(crate) fn from_name(name: Name<'_>) -> Option<Self> {
         match name.deref() {
             ASCII_HEX_DECODE | ASCII_HEX_DECODE_ABBREVIATION => Some(Self::AsciiHexDecode),

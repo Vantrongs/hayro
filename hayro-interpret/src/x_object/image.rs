@@ -13,8 +13,8 @@ use kurbo::Affine;
 
 #[derive(Clone)]
 pub(crate) struct ImageXObject<'a> {
-    width: u32,
-    height: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     pub(crate) color_space: Option<ColorSpace>,
     pub(crate) cache: Cache,
     pub(crate) interpolate: bool,
@@ -24,7 +24,7 @@ pub(crate) struct ImageXObject<'a> {
     pub(crate) warning_sink: WarningSinkFn,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ImageKind {
     Image,
     Mask,
@@ -227,6 +227,28 @@ impl<'a> ImageXObject<'a> {
 
     pub(crate) fn stream(&self) -> &Stream<'a> {
         &self.stream
+    }
+
+    pub(crate) fn pixels_key(&self) -> Option<u128> {
+        let dict = self.stream.dict();
+        let id = dict.obj_id()?;
+        if dict
+            .get::<Name<'_>>(CS)
+            .or_else(|| dict.get::<Name<'_>>(COLORSPACE))
+            .is_some_and(|name| {
+                !matches!(
+                    name.as_ref(),
+                    DEVICE_GRAY | DEVICE_RGB | DEVICE_CMYK | G | RGB | CMYK
+                )
+            })
+        {
+            return None;
+        }
+        Some(crate::util::hash128(&(
+            id,
+            self.kind,
+            &self.transfer_function,
+        )))
     }
 
     fn has_mask(&self) -> bool {

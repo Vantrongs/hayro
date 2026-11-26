@@ -30,14 +30,28 @@ pub struct StencilImage<'a, 'b> {
 }
 
 impl<'a, 'b> StencilImage<'a, 'b> {
+    /// Owns the source for region requests.
+    pub fn asset(&self) -> crate::ImageAsset {
+        self.image_xobject.asset(self.pixels_key())
+    }
+
+    /// Identifies the image pixels within the document.
+    pub fn pixels_key(&self) -> Option<u128> {
+        self.image_xobject.pixels_key()
+    }
+
     /// Run `func` with the decoded stencil data, optionally hinting at the desired resolution.
     pub fn with_stencil(
         &self,
         func: impl FnOnce(LumaData, &Paint<'a>),
         target_dimension: Option<(u32, u32)>,
     ) {
-        if let Some(decoded) = self.image_xobject.decoded_mask(target_dimension) {
-            func(decoded.luma, &self.paint);
+        if let Some(decoded) = self
+            .image_xobject
+            .decoded_mask(target_dimension)
+            .and_then(|d| d.into_whole())
+        {
+            func(decoded, &self.paint);
         }
     }
 
@@ -68,14 +82,28 @@ impl CacheKey for StencilImage<'_, '_> {
 pub struct RasterImage<'a>(pub(crate) ImageXObject<'a>);
 
 impl RasterImage<'_> {
+    /// Owns the source for region requests.
+    pub fn asset(&self) -> crate::ImageAsset {
+        self.0.asset(self.pixels_key())
+    }
+
+    /// Identifies the image pixels within the document.
+    pub fn pixels_key(&self) -> Option<u128> {
+        self.0.pixels_key()
+    }
+
     /// Run `func` with the decoded RGB and alpha data, optionally hinting at the desired resolution.
     pub fn with_rgba(
         &self,
         func: impl FnOnce(ImageData, Option<LumaData>),
         target_dimension: Option<(u32, u32)>,
     ) {
-        if let Some(decoded) = self.0.decoded_image(target_dimension) {
-            func(decoded.image, decoded.alpha);
+        if let Some((image, alpha)) = self
+            .0
+            .decoded_image(target_dimension)
+            .and_then(|d| d.into_whole())
+        {
+            func(image, alpha);
         }
     }
 

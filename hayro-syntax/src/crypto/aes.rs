@@ -430,36 +430,38 @@ impl<const KEY_SIZE: usize, const ROUNDS: usize> AESCipher<KEY_SIZE, ROUNDS> {
 
     pub(crate) fn decrypt_cbc(&self, data: &[u8], iv: &[u8; 16], unpad: bool) -> Vec<u8> {
         let mut result = Vec::new();
-        let mut prev_block = *iv;
+        let mut prev_block = iv;
 
-        for chunk in data.as_chunks::<16>().0 {
-            let mut block = [0_u8; 16];
-            block.copy_from_slice(chunk);
-
-            let decrypted = self.decrypt_block(&block);
-
-            let mut plain_block = [0_u8; 16];
-            for i in 0..16 {
-                plain_block[i] = decrypted[i] ^ prev_block[i];
-            }
-
-            result.extend_from_slice(&plain_block);
+        for block in data.as_chunks::<16>().0 {
+            result.extend_from_slice(&self.decrypt_cbc_block(block, prev_block));
             prev_block = block;
         }
 
-        if unpad
-            && let Some(&pad_len) = result.last()
-            && pad_len > 0
-            && pad_len <= 16
-            && result.len() >= pad_len as usize
-        {
-            let start = result.len() - pad_len as usize;
-            if result[start..].iter().all(|&b| b == pad_len) {
-                result.truncate(start);
-            }
+        if unpad && let Some(last) = result.last_chunk::<16>() {
+            result.truncate(result.len() - padding_len(last));
         }
 
         result
+    }
+
+    /// Decrypts `block`, which followed `previous` (or the IV) in CBC mode.
+    pub(crate) fn decrypt_cbc_block(&self, block: &[u8; 16], previous: &[u8; 16]) -> [u8; 16] {
+        let mut plain = self.decrypt_block(block);
+        for (p, v) in plain.iter_mut().zip(previous) {
+            *p ^= v;
+        }
+        plain
+    }
+}
+
+/// The length of the PKCS #7 padding that ends `last`, the last decrypted block; 0
+/// when its padding bytes do not all agree.
+pub(crate) fn padding_len(last: &[u8; 16]) -> usize {
+    let len = usize::from(last[15]);
+    if (1..=16).contains(&len) && last[16 - len..].iter().all(|&b| usize::from(b) == len) {
+        len
+    } else {
+        0
     }
 }
 

@@ -4,7 +4,6 @@ use crate::object::dict::keys::{
 };
 use crate::object::stream::{FilterResult, ImageColorSpace, ImageData, ImageDecodeParams};
 use alloc::borrow::Cow;
-use alloc::vec;
 use alloc::vec::Vec;
 use hayro_ccitt::{DecodeSettings, Decoder, EncodingMode};
 
@@ -13,41 +12,61 @@ pub(crate) fn decode(
     params: &Dict<'_>,
     image_params: &ImageDecodeParams,
 ) -> Option<FilterResult<'static>> {
-    let k = params.get::<i32>(K).unwrap_or(0);
+    Fax::new(params, image_params.height, None).decode(data)
+}
 
-    let columns = params.get::<usize>(COLUMNS).unwrap_or(1728) as u32;
-    // The image height takes precedence over `Rows`.
-    let rows = if image_params.height > 0 {
-        image_params.height
-    } else {
-        params.get::<u32>(ROWS).unwrap_or(0)
-    };
-    let output_len = (columns as usize).checked_mul(rows as usize)?;
+pub(crate) struct Fax {
+    settings: DecodeSettings,
+    white: u8,
+}
 
-    let settings = DecodeSettings {
-        columns,
-        rows,
-        end_of_block: params.get::<bool>(END_OF_BLOCK).unwrap_or(true),
-        end_of_line: params.get::<bool>(END_OF_LINE).unwrap_or(false),
-        rows_are_byte_aligned: params.get::<bool>(ENCODED_BYTE_ALIGN).unwrap_or(false),
-        encoding: if k < 0 {
-            EncodingMode::Group4
-        } else if k == 0 {
-            EncodingMode::Group3_1D
+impl Fax {
+    pub(crate) fn new(
+        params: &Dict<'_>,
+        height: u32,
+        cancel: Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>,
+    ) -> Self {
+        let k = params.get::<i32>(K).unwrap_or(0);
+
+        let columns = params.get::<usize>(COLUMNS).unwrap_or(1728) as u32;
+        // The image height takes precedence over `Rows`.
+        let rows = if height > 0 {
+            height
         } else {
-            EncodingMode::Group3_2D
-        },
-        strict: false,
-        cancel: None,
-    };
-    let white: u8 = if params.get::<bool>(BLACK_IS_1).unwrap_or(false) {
-        0x00
-    } else {
-        0xFF
-    };
+            params.get::<u32>(ROWS).unwrap_or(0)
+        };
 
-    // Expand to 8 bpc unless indexed, for easier RGBA8 conversion.
-    let (decoded, bpc, decoded_rows) = if image_params.is_indexed {
+        let settings = DecodeSettings {
+            columns,
+            rows,
+            end_of_block: params.get::<bool>(END_OF_BLOCK).unwrap_or(true),
+            end_of_line: params.get::<bool>(END_OF_LINE).unwrap_or(false),
+            rows_are_byte_aligned: params.get::<bool>(ENCODED_BYTE_ALIGN).unwrap_or(false),
+            encoding: if k < 0 {
+                EncodingMode::Group4
+            } else if k == 0 {
+                EncodingMode::Group3_1D
+            } else {
+                EncodingMode::Group3_2D
+            },
+            strict: false,
+            cancel: cancel.map(|flag| {
+                hayro_ccitt::CancelHandle::new(move || {
+                    flag.load(core::sync::atomic::Ordering::Relaxed)
+                })
+            }),
+        };
+        let white: u8 = if params.get::<bool>(BLACK_IS_1).unwrap_or(false) {
+            0x00
+        } else {
+            0xFF
+        };
+
+        Self { settings, white }
+    }
+
+    pub(crate) fn decode(&self, data: &[u8]) -> Option<FilterResult<'static>> {
+        let (columns, rows, white) = (self.settings.columns, self.settings.rows, self.white);
         struct BitPackDecoder {
             output: Vec<u8>,
             columns: u32,
@@ -59,12 +78,10 @@ pub(crate) fn decode(
 
         impl Decoder for BitPackDecoder {
             fn push_row(&mut self, changes: &[u32]) {
-                let start = self.decoded_rows as usize * self.stride;
+                let start = self.output.len();
                 let end = start + self.stride;
 
-                if self.output.len() < end {
-                    self.output.resize(end, self.white);
-                }
+                self.output.resize(end, self.white);
 
                 let row = &mut self.output[start..end];
 
@@ -93,83 +110,41 @@ pub(crate) fn decode(
 
         let stride = (columns as usize).div_ceil(8);
         let mut decoder = BitPackDecoder {
-            output: vec![white; stride.checked_mul(rows as usize)?],
+            output: Vec::new(),
             columns,
             stride,
             white,
             last_byte_mask: 0xFF_u8 << ((8 - columns % 8) % 8),
             decoded_rows: 0,
         };
-        let result = hayro_ccitt::decode(data, &mut decoder, &settings);
+        let result = hayro_ccitt::decode(data, &mut decoder, &self.settings);
 
         // Lenient: return partial output if at least one row decoded (0001763.pdf).
-        if result.is_err() && decoder.decoded_rows == 0 {
+        if self
+            .settings
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.is_cancelled())
+            || result.is_err() && decoder.decoded_rows == 0
+        {
             return None;
         }
 
-        decoder
-            .output
-            .truncate(decoder.decoded_rows as usize * stride);
-
-        (decoder.output, 1, decoder.decoded_rows)
-    } else {
-        struct Luma8Decoder {
-            output: Vec<u8>,
-            columns: u32,
-            white: u8,
-            decoded_rows: u32,
-        }
-
-        impl Decoder for Luma8Decoder {
-            fn push_row(&mut self, changes: &[u32]) {
-                let start = self.decoded_rows as usize * self.columns as usize;
-                let end = start + self.columns as usize;
-
-                if self.output.len() < end {
-                    self.output.resize(end, self.white);
-                }
-
-                let row = &mut self.output[start..end];
-
-                for (start, end) in black_spans(changes, self.columns) {
-                    fill_short(&mut row[start..end], !self.white);
-                }
-
-                self.decoded_rows += 1;
-            }
-        }
-
-        let mut decoder = Luma8Decoder {
-            output: vec![white; output_len],
-            columns,
-            white,
-            decoded_rows: 0,
-        };
-        let result = hayro_ccitt::decode(data, &mut decoder, &settings);
-
-        if result.is_err() && decoder.decoded_rows == 0 {
-            return None;
-        }
-
-        if result.is_err() || rows == 0 {
-            decoder
-                .output
-                .truncate(decoder.decoded_rows as usize * columns as usize);
-        }
-
-        (decoder.output, 8, decoder.decoded_rows)
-    };
-
-    Some(FilterResult {
-        data: Cow::Owned(decoded),
-        image_data: Some(ImageData {
-            alpha: None,
-            color_space: Some(ImageColorSpace::Gray),
-            bits_per_component: bpc,
-            width: columns,
-            height: if rows == 0 { decoded_rows } else { rows },
-        }),
-    })
+        Some(FilterResult {
+            data: Cow::Owned(decoder.output),
+            image_data: Some(ImageData {
+                alpha: None,
+                color_space: Some(ImageColorSpace::Gray),
+                bits_per_component: 1,
+                width: columns,
+                height: if rows == 0 {
+                    decoder.decoded_rows
+                } else {
+                    rows
+                },
+            }),
+        })
+    }
 }
 
 fn black_spans(changes: &[u32], columns: u32) -> impl Iterator<Item = (usize, usize)> + '_ {
@@ -220,7 +195,7 @@ mod tests {
 
         let decoded = decode(&[0x35, 0x14], &params, &ImageDecodeParams::default()).unwrap();
 
-        assert_eq!(decoded.data.as_ref(), &[0; 8]);
+        assert_eq!(decoded.data.as_ref(), &[0]);
         assert_eq!(decoded.image_data.unwrap().height, 1);
     }
 
@@ -229,7 +204,7 @@ mod tests {
         let params = Dict::from_bytes(b"<< /K 0 /Columns 8 >>").unwrap();
 
         let decoded = decode(&[0x35, 0x14], &params, &ImageDecodeParams::default()).unwrap();
-        assert_eq!(decoded.data.as_ref(), &[0; 8]);
+        assert_eq!(decoded.data.as_ref(), &[0]);
         assert_eq!(decoded.image_data.unwrap().height, 1);
 
         let image_params = ImageDecodeParams {

@@ -40,34 +40,41 @@ fn tiff(
     row_len: usize,
 ) -> Vec<u8> {
     for row in data.chunks_mut(row_len) {
-        match bits_per_component {
-            8 => png::unfilter_row(RowFilter::Sub, colors, &[], row),
-            16 => {
-                let distance = 2 * colors;
+        tiff_row(row, colors, bits_per_component, columns);
+    }
+    data
+}
 
-                for i in (distance..row.len() - 1).step_by(2) {
-                    let left = u16::from_be_bytes([row[i - distance], row[i - distance + 1]]);
-                    let value = u16::from_be_bytes([row[i], row[i + 1]]).wrapping_add(left);
-                    row[i..i + 2].copy_from_slice(&value.to_be_bytes());
-                }
+pub(super) fn tiff_row(row: &mut [u8], colors: usize, bits_per_component: usize, columns: usize) {
+    match bits_per_component {
+        8 => png::unfilter_row(RowFilter::Sub, colors, &[], row),
+        16 => {
+            let distance = 2 * colors;
+
+            for i in (distance..row.len() - 1).step_by(2) {
+                let left = u16::from_be_bytes([row[i - distance], row[i - distance + 1]]);
+                let value = u16::from_be_bytes([row[i], row[i + 1]]).wrapping_add(left);
+                row[i..i + 2].copy_from_slice(&value.to_be_bytes());
             }
-            _ => {
-                let per_byte = 8 / bits_per_component;
-                let mask = (1_u8 << bits_per_component) - 1;
-                let shift = |k: usize| 8 - bits_per_component * (k % per_byte + 1);
-                let num_components = (columns * colors).min(row.len() * per_byte);
+        }
+        _ => {
+            let per_byte = 8 / bits_per_component;
+            let mask = (1_u8 << bits_per_component) - 1;
+            let shift = |k: usize| 8 - bits_per_component * (k % per_byte + 1);
+            let num_components = (columns * colors).min(row.len() * per_byte);
 
-                for k in colors..num_components {
-                    let left = row[(k - colors) / per_byte] >> shift(k - colors);
-                    let byte = &mut row[k / per_byte];
-                    let value = (*byte >> shift(k)).wrapping_add(left) & mask;
-                    *byte = (*byte & !(mask << shift(k))) | (value << shift(k));
-                }
+            for k in colors..num_components {
+                let left = row[(k - colors) / per_byte] >> shift(k - colors);
+                let byte = &mut row[k / per_byte];
+                let value = (*byte >> shift(k)).wrapping_add(left) & mask;
+                *byte = (*byte & !(mask << shift(k))) | (value << shift(k));
+            }
+            let used = num_components * bits_per_component % 8;
+            if used != 0 {
+                *row.last_mut().unwrap() &= 0xff << (8 - used);
             }
         }
     }
-
-    data
 }
 
 fn png(mut data: Vec<u8>, bytes_per_pixel: usize, row_len: usize) -> Vec<u8> {

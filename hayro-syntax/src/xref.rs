@@ -703,6 +703,13 @@ impl XRef {
         }
     }
 
+    pub(crate) fn decryptor(&self) -> &Decryptor {
+        match &self.0 {
+            Inner::Dummy => &Decryptor::None,
+            Inner::Some(r) => &r.decryptor,
+        }
+    }
+
     #[inline]
     pub(crate) fn decrypt(
         &self,
