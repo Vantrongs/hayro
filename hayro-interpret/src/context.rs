@@ -6,7 +6,7 @@ use crate::interpret::stack::StateStack;
 use crate::interpret::state::{
     ClipType, CompositingState, PaintData, PaintState, State, TextState, TextStateFont,
 };
-use crate::ocg::OcgState;
+use crate::ocg::{OcgState, ViewingState};
 use crate::util::{BezPathExt, Float64Ext};
 use crate::{
     ClipPath, Device, DrawProps, FillRule, InterpreterSettings, InterpreterWarning, Paint,
@@ -19,12 +19,12 @@ use hayro_syntax::page::Resources;
 use hayro_syntax::xref::XRef;
 use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape};
 use smallvec::smallvec;
+use std::rc::Rc;
 
 pub(crate) const MAX_NESTED_INTERPRETATION_DEPTH: u32 = 50;
 
 /// A cache shared by interpreter invocations on the same document.
-// TODO: Cache keys are only unique within a document (streams, for example, are keyed by
-// their object identifier), so a cache shared across documents can mix up their objects.
+// TODO: Some keys are only unique within a document.
 #[derive(Clone)]
 pub struct InterpreterCache<'a> {
     pub(crate) font_cache: FontCache<'a>,
@@ -78,22 +78,22 @@ impl<'a> Context<'a> {
     ) -> Self {
         let state = State::new(initial_transform);
 
-        let mut context = Self::new_with(initial_transform, bbox, cache, xref, settings, state, 0);
-        context.ocg_state.viewing = xref.get::<Dict<'_>>(xref.root_id()).map(|catalog| {
-            std::rc::Rc::new(crate::ocg::ViewingState::from_catalog(xref, &catalog))
-        });
-        context
+        let viewing = xref
+            .get::<Dict<'_>>(xref.root_id())
+            .map(|catalog| Rc::new(ViewingState::from_catalog(xref, &catalog)));
+        Self::new_with(bbox, cache, xref, settings, state, viewing, 0)
     }
 
     pub(crate) fn new_with(
-        initial_transform: Affine,
         bbox: Rect,
         cache: &InterpreterCache<'a>,
         xref: &'a XRef,
         settings: InterpreterSettings,
         state: State<'a>,
+        viewing: Option<Rc<ViewingState>>,
         nesting_depth: u32,
     ) -> Self {
+        let initial_transform = state.ctm;
         Self {
             stack: StateStack::new(state),
             settings,
@@ -107,7 +107,7 @@ impl<'a> Context<'a> {
             path: BezPath::new(),
             text_clip: None,
             interpreter_cache: cache.clone(),
-            ocg_state: OcgState::default(),
+            ocg_state: OcgState::new(viewing),
             nesting_depth,
             shape_paints: None,
             glyph_scratch: Vec::new(),

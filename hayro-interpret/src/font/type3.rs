@@ -54,16 +54,14 @@ pub(crate) fn render_glyph<'a>(
     };
 
     let mut context = Context::new_with(
-        state.ctm,
         glyph.bbox,
         &glyph.cache,
         glyph.xref,
         glyph.settings.clone(),
         state,
+        glyph.viewing.clone(),
         glyph.nesting_depth,
     );
-
-    context.ocg_state.viewing.clone_from(&glyph.viewing);
     let resources = program
         .dict()
         .get(RESOURCES)

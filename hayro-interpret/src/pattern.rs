@@ -156,6 +156,7 @@ pub struct TilingPattern<'a> {
     pub(crate) cache: InterpreterCache<'a>,
     pub(crate) settings: InterpreterSettings,
     pub(crate) xref: &'a XRef,
+    viewing: Option<std::rc::Rc<crate::ocg::ViewingState>>,
     nesting_depth: u32,
 }
 
@@ -208,6 +209,7 @@ impl<'a> TilingPattern<'a> {
             resources,
             cache: ctx.interpreter_cache.clone(),
             xref: ctx.xref,
+            viewing: ctx.ocg_state.viewing.clone(),
             nesting_depth,
         })
     }
@@ -217,12 +219,12 @@ impl<'a> TilingPattern<'a> {
         let state = State::new(initial_transform);
 
         let mut context = Context::new_with(
-            state.ctm,
             initial_transform.transform_rect_bbox(self.bbox),
             &self.cache,
             self.xref,
             self.settings.clone(),
             state,
+            self.viewing.clone(),
             self.nesting_depth,
         );
 

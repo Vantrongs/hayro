@@ -174,7 +174,9 @@ fn interpret_annotation<'a>(
 ) {
     let flags = annot.get::<u32>(F).unwrap_or(0);
 
-    if flags & (ANNOTATION_HIDDEN | ANNOTATION_NO_VIEW) != 0 {
+    if flags & (ANNOTATION_HIDDEN | ANNOTATION_NO_VIEW) != 0
+        || !context.ocg_state.shows(context.xref, annot)
+    {
         return;
     }
 
@@ -485,7 +487,7 @@ pub fn interpret<'a>(
                             name.as_ref(),
                         )
                     });
-                if !begun && properties.is_some() {
+                if !begun {
                     context.ocg_state.begin_marked_content();
                 }
 

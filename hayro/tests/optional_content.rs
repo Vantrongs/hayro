@@ -162,7 +162,7 @@ fn nested_content_inherits_parent_visibility() {
         OFF,
         "5 0 R",
         &[GROUP],
-        "/OC /M BDC /Span << >> BDC 0 1 0 rg 0 0 50 50 re f EMC EMC"
+        "/OC /M BDC /Span /Missing BDC EMC /Span << >> BDC 0 1 0 rg 0 0 50 50 re f EMC EMC"
     ));
 }
 
@@ -186,5 +186,44 @@ fn hidden_text_can_clip_subsequent_visible_content() {
             "/OC /M BDC BT /F 40 Tf 7 Tr 1 0 0 1 60 60 Tm (A) Tj {mode_at_end} Tr ET EMC 0 1 0 rg 0 0 50 50 re f"
         );
         assert_eq!(page_shows(OFF, "5 0 R", &[GROUP], &content, font), visible);
+    }
+}
+
+#[test]
+fn nested_patterns_and_masks_share_the_view_configuration() {
+    let form = |dict: &str| {
+        format!(
+            "<< {dict} /Resources << /Properties << /M 5 0 R >> >> /Length {} >>\nstream\n{FILL}\nendstream",
+            FILL.len()
+        )
+    };
+    let pattern = form(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 50 50] /XStep 50 /YStep 50",
+    );
+    let mask = form("/Subtype /Form /Group << /S /Transparency >> /BBox [0 0 50 50]");
+    for (config, visible) in [
+        (OFF, false),
+        ("/OCGs [5 0 R] /D << /BaseState /ON >>", true),
+    ] {
+        assert_eq!(
+            page_shows(
+                config,
+                "5 0 R",
+                &[GROUP, &pattern],
+                "/Pattern cs /P scn 0 0 50 50 re f",
+                "/Pattern << /P 6 0 R >>"
+            ),
+            visible
+        );
+        assert_eq!(
+            page_shows(
+                config,
+                "5 0 R",
+                &[GROUP, &mask],
+                "/G gs 0 1 0 rg 0 0 50 50 re f",
+                "/ExtGState << /G << /SMask << /S /Alpha /G 6 0 R >> >> >>"
+            ),
+            visible
+        );
     }
 }

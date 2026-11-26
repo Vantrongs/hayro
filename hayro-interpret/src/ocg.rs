@@ -97,6 +97,7 @@ impl ViewingState {
         let Some(props) = catalog.get::<Dict<'_>>(b"OCProperties") else {
             return Self::default();
         };
+        // View configuration and Usage/View precedence follow PDFium’s CPDF_OCContext.
         let config = props
             .get::<Array<'_>>(b"Configs")
             .and_then(|a| a.dictionaries().find(|c| views(xref, c) == Some(true)))
@@ -255,6 +256,13 @@ impl ViewingState {
 }
 
 impl OcgState {
+    pub(crate) fn new(viewing: Option<std::rc::Rc<ViewingState>>) -> Self {
+        Self {
+            viewing,
+            ..Self::default()
+        }
+    }
+
     /// Read the viewing configuration for a document.
     pub fn from_catalog(xref: &XRef, catalog: &Dict<'_>) -> Self {
         Self {

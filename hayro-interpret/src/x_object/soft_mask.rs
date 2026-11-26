@@ -42,6 +42,7 @@ struct Repr<'a> {
     settings: InterpreterSettings,
     background: Color,
     xref: &'a XRef,
+    viewing: Option<Rc<crate::ocg::ViewingState>>,
     nesting_depth: u32,
 }
 
@@ -191,6 +192,7 @@ impl<'a> SoftMask<'a> {
             xref: context.xref,
             background,
             parent_resources,
+            viewing: context.ocg_state.viewing.clone(),
             nesting_depth,
         })))
     }
@@ -199,12 +201,12 @@ impl<'a> SoftMask<'a> {
     pub fn interpret(&self, device: &mut impl Device<'a>) -> Interpreted {
         let state = State::new(self.0.root_transform);
         let mut ctx = Context::new_with(
-            self.0.root_transform,
             self.0.bbox,
             &self.0.interpreter_cache,
             self.0.xref,
             self.0.settings.clone(),
             state,
+            self.0.viewing.clone(),
             self.0.nesting_depth,
         );
         self.0
