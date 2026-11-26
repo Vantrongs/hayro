@@ -166,6 +166,8 @@ struct ReaderContextData<'a> {
     in_content_stream: bool,
     in_object_stream: bool,
     obj_number: Option<ObjectIdentifier>,
+    storage: core::ops::Range<usize>,
+    cut: Option<u8>,
     parent_chain: SmallVec<[ObjectIdentifier; 8]>,
 }
 
@@ -186,6 +188,8 @@ impl<'a> ReaderContext<'a> {
             in_content_stream,
             obj_number: None,
             in_object_stream: false,
+            storage: 0..0,
+            cut: None,
             parent_chain: smallvec![],
         })))
     }
@@ -205,6 +209,33 @@ impl<'a> ReaderContext<'a> {
             Arc::make_mut(inner).parent_chain = body.into_iter().collect();
         }
         result
+    }
+    pub(crate) fn mark_storage(&mut self, bytes: &[u8]) {
+        if let ReaderContextInner::Shared(inner) = &mut self.0 {
+            let start = bytes.as_ptr() as usize;
+            Arc::make_mut(inner).storage = start..start + bytes.len();
+        }
+    }
+
+    pub(crate) fn set_cut(&mut self, cut: Option<u8>) {
+        if let ReaderContextInner::Shared(inner) = &mut self.0 {
+            Arc::make_mut(inner).cut = cut;
+        }
+    }
+    pub(crate) fn cut(&self) -> Option<u8> {
+        match &self.0 {
+            ReaderContextInner::Shared(inner) => inner.cut,
+            _ => None,
+        }
+    }
+    pub(crate) fn stored(&self, bytes: &[u8]) -> bool {
+        let ReaderContextInner::Shared(inner) = &self.0 else {
+            return false;
+        };
+        let start = bytes.as_ptr() as usize;
+        !inner.in_content_stream
+            && inner.storage.start <= start
+            && start + bytes.len() <= inner.storage.end
     }
 
     pub(crate) fn dummy_ref() -> &'static Self {

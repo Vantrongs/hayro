@@ -1,7 +1,7 @@
 use crate::object::ObjectIdentifier;
-use crate::object::Stream;
+
+use crate::hash::Map;
 use crate::reader::ReaderContext;
-use crate::sync::FxHashMap;
 use crate::sync::{Arc, Mutex, MutexExt};
 use crate::util::SegmentList;
 use crate::xref::ObjectStream;
@@ -53,10 +53,14 @@ impl From<Vec<u8>> for PdfData {
 
 // Gives decoded object streams the same lifetime as the original data.
 pub(crate) struct Data {
+    pub(crate) watched: crate::lost::Watched,
+    pub(crate) dictionaries: Mutex<Map<usize, (usize, crate::object::dict::Index)>>,
+    pub(crate) arrays: Mutex<Map<usize, usize>>,
+    pub(crate) rectangles: Mutex<Map<usize, [crate::object::MaybeRef<f32>; 4]>>,
     data: PdfData,
     // 32 segments are more than enough as we can't have more objects than this.
     object_streams: SegmentList<ObjectStream, 32>,
-    map: Mutex<FxHashMap<(ObjectIdentifier, bool), usize>>,
+    map: Mutex<Map<(ObjectIdentifier, bool), (usize, crate::lost::Lost)>>,
 }
 
 impl Debug for Data {
@@ -69,8 +73,12 @@ impl Data {
     pub(crate) fn new(data: PdfData) -> Self {
         Self {
             data,
+            dictionaries: Mutex::default(),
+            arrays: Mutex::default(),
+            rectangles: Mutex::default(),
+            watched: crate::lost::Watched::default(),
             object_streams: SegmentList::new(),
-            map: Mutex::new(FxHashMap::default()),
+            map: Mutex::new(Map::default()),
         }
     }
 
@@ -85,29 +93,32 @@ impl Data {
         ctx: &ReaderContext<'_>,
     ) -> Option<&ObjectStream> {
         let key = (id, repaired);
-        if let Some(&idx) = self.map.get().get(&key) {
+        if let Some(&(idx, lost)) = self.map.get().get(&key) {
+            ctx.xref().note(lost);
             return self.object_streams.get(idx);
         }
 
         // Decoding may resolve other objects, so do it without holding the cache lock.
-        let stream = ctx.xref().get_with::<Stream<'_>>(id, ctx)?;
+        let (object_stream, lost) = ctx.xref().apart(|| {
+            let crate::xref::Carrier(stream, cut) = ctx.xref().get_with(id, ctx)?;
+            if !repaired && ctx.xref().is_repaired() {
+                return None;
+            }
+            let mut object_stream = ObjectStream::new(&stream)?;
+            object_stream.next_byte = cut;
+            Some(object_stream)
+        });
         if !repaired && ctx.xref().is_repaired() {
             return None;
         }
-        let object_stream = ObjectStream::new(&stream)?;
-        if !repaired && ctx.xref().is_repaired() {
-            return None;
-        }
-
+        let object_stream = object_stream?;
         let mut locked = self.map.get();
-        if let Some(&idx) = locked.get(&key) {
-            return self.object_streams.get(idx);
-        }
-
-        let idx = locked.len();
-        let object_stream = self.object_streams.get_or_init(idx, || object_stream);
-        locked.insert(key, idx);
-
-        Some(object_stream)
+        let next = locked.len();
+        let (idx, lost) = *locked.entry(key).or_insert_with(|| {
+            self.object_streams.get_or_init(next, || object_stream);
+            (next, lost)
+        });
+        ctx.xref().note(lost);
+        self.object_streams.get(idx)
     }
 }

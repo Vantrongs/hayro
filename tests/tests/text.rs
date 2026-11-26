@@ -60,7 +60,9 @@ impl<'a> Device<'a> for TextCollector {
     fn begin_marked_content(&mut self, tag: &[u8], properties: Option<&Dict<'_>>) {
         write!(self.0, "<{}", String::from_utf8_lossy(tag)).unwrap();
         if let Some(properties) = properties {
-            for key in properties.keys() {
+            let mut keys: Vec<_> = properties.keys().collect();
+            keys.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+            for key in keys {
                 let value = properties.get::<Object<'_>>(&key).unwrap();
                 write!(self.0, " {key} {value}").unwrap();
             }
@@ -117,7 +119,7 @@ fn marked_content() {
 
     assert_eq!(
         page_text(file),
-        r#"<P /MCID 0>Hi</><Span /MCID 1 /ActualText "fi">x</><Artifact>.</>"#
+        r#"<P /MCID 0>Hi</><Span /ActualText "fi" /MCID 1>x</><Artifact>.</>"#
     );
 }
 

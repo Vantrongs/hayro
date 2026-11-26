@@ -388,8 +388,18 @@ mod tests {
             .collect();
         let data = crate::PdfData::from(text.into_bytes());
         let ends = LazyEnds::new(data.as_ref());
-        let rebuild =
-            || fallback_xref_map_inner(&data, &ends, ReaderContext::dummy(), false, b"").0;
+        let rebuild = || {
+            fallback_xref_map_inner(
+                &data,
+                &ends,
+                ReaderContext::dummy(),
+                false,
+                b"",
+                &mut crate::xref::Broken::default(),
+                None,
+            )
+            .0
+        };
         let expected = rebuild();
         assert_eq!(expected.len(), 20);
         assert_eq!(rebuild(), expected);

@@ -7,6 +7,7 @@ use crate::reader::Reader;
 use crate::reader::{
     Ends, Readable, ReaderContext, ReaderExt, Skippable, Unknown, skip_white_spaces_and_comments_in,
 };
+use crate::sync::MutexExt;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
 use core::marker::PhantomData;
@@ -33,6 +34,19 @@ impl<'a> Array<'a> {
             data: self.data,
             ctx: self.ctx.rooted(false),
         }
+    }
+    /// Location and decryption context of this value.
+    pub fn content_key(&self) -> crate::xref::ContentKey<'a> {
+        crate::xref::ContentKey::new(self.data(), self.ctx())
+    }
+    pub(crate) fn ctx(&self) -> &ReaderContext<'a> {
+        &self.ctx
+    }
+
+    /// Items as written, preserving number spellings and references.
+    pub fn written(&self) -> impl Iterator<Item = super::Written<'a>> + '_ {
+        let mut r = Reader::new(self.data);
+        core::iter::from_fn(move || super::Written::read(&mut r, &self.ctx))
     }
 
     /// Returns an iterator over the objects of the array.
@@ -92,19 +106,6 @@ impl<'a> Array<'a> {
     /// Return the raw data of the array.
     pub fn data(&self) -> &'a [u8] {
         self.data
-    }
-
-    pub(crate) fn refs(&self) -> impl Iterator<Item = ObjRef> {
-        let mut reader = Reader::new(self.data);
-        core::iter::from_fn(move || {
-            loop {
-                reader.skip_white_spaces_and_comments();
-                if let Some(reference) = reader.read_without_context::<ObjRef>() {
-                    return Some(reference);
-                }
-                reader.skip::<Object<'_>>(false)?;
-            }
-        })
     }
 }
 
@@ -179,7 +180,19 @@ impl Default for Array<'_> {
 
 impl<'a> Readable<'a> for Array<'a> {
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
-        let bytes = r.skip::<Array<'_>>(ctx.in_content_stream())?;
+        let tail = r.tail()?;
+        let at = tail.as_ptr() as usize;
+        let cache = ctx.xref().storage().filter(|_| ctx.stored(tail));
+        let len = cache.and_then(|c| c.arrays.get().get(&at).copied());
+        let bytes = if let Some(len) = len {
+            r.read_bytes(len)?
+        } else {
+            let bytes = r.skip::<Array<'_>>(ctx.in_content_stream())?;
+            if let Some(c) = cache {
+                c.arrays.get().insert(at, bytes.len());
+            }
+            bytes
+        };
 
         Some(Self {
             data: &bytes[1..bytes.len() - 1],
@@ -214,8 +227,14 @@ impl<'a> Iterator for ArrayIter<'a> {
         }
 
         // Skipping accepts some items that can't be read.
-        self.reader
-            .read_with_context::<MaybeRef<Object<'_>>>(&self.ctx)
+        let value = self
+            .reader
+            .read_with_context::<MaybeRef<Object<'_>>>(&self.ctx);
+        if value.is_none() {
+            self.ctx.xref().note(self.ctx.obj_number());
+            self.reader.jump_to_end();
+        }
+        value
     }
 }
 

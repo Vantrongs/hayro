@@ -13,7 +13,15 @@ license = { workspace = true }
 hayro-syntax = { workspace = true, features = ["std"] }
 pdf-writer = { workspace = true }
 flate2 = { workspace = true }
-rustc-hash = { workspace = true }
+
+[dev-dependencies]
+md5 = "0.8"
 
 [lints]
 workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }

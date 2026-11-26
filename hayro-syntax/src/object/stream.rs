@@ -2,10 +2,10 @@
 
 use crate::crypto::DecryptionTarget;
 use crate::filter::Filter;
-use crate::object::Dict;
 use crate::object::Name;
 use crate::object::dict::keys::{DECODE_PARMS, DP, F, FILTER, IDENTITY, LENGTH, NAME, TYPE, XREF};
 use crate::object::{Array, ObjectIdentifier};
+use crate::object::{Dict, Written};
 use crate::object::{Object, ObjectLike, ObjectRefLike};
 use crate::reader::Reader;
 use crate::reader::{
@@ -17,6 +17,181 @@ use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
 use smallvec::SmallVec;
+
+/// Filters and parameters in their source order.
+#[derive(Clone, Debug)]
+pub struct FilterEntries<'a> {
+    /// The key the filters are read from: /Filter, or /F, its abbreviation.
+    pub key: &'static [u8],
+    filters: Filters<'a>,
+    params: Params<'a>,
+}
+
+/// The filters of a dictionary (filter rule 1).
+#[derive(Clone, Debug)]
+enum Filters<'a> {
+    None,
+    /// A filter given by name: the entry as written, and the filter it names.
+    One(Written<'a>, Option<Filter>),
+    /// An array of filters, reached through a reference or not.
+    Many(Array<'a>),
+}
+
+/// The parameters of a dictionary's filters (filter rule 3).
+#[derive(Clone, Debug)]
+enum Params<'a> {
+    None,
+    /// The parameters of a filter given by name, as written, and the context they
+    /// are resolved in.
+    One(Written<'a>, ReaderContext<'a>),
+    /// An array of parameters, whether it is reached through a reference.
+    Many(Array<'a>, bool),
+}
+
+/// `written`, a reference resolved in `ctx`, where it is a `T`.
+fn resolved<'a, T: ObjectLike<'a>>(written: &Written<'a>, ctx: &ReaderContext<'a>) -> Option<T> {
+    let object = match written {
+        Written::Ref(reference) => return ctx.xref().get_with((*reference).into(), ctx),
+        Written::Name(name) => Object::Name(name.clone()),
+        Written::Dict(dict) => Object::Dict(dict.clone()),
+        Written::Array(array) => Object::Array(array.clone()),
+        _ => return None,
+    };
+    object.cast()
+}
+
+/// An entry of a stream's filters ([`FilterEntries`]).
+#[derive(Clone, Debug)]
+pub struct FilterEntry<'a> {
+    /// The filter the entry names; `None` where it names none, which decoding
+    /// passes over in its place: an entry that is no name, a reference to no
+    /// object, or a name of no filter.
+    pub filter: Option<Filter>,
+    /// The entry as written.
+    pub written: Written<'a>,
+    /// The entry of the parameters in the same place, as written; `None` where
+    /// they have none there.
+    pub params_written: Option<Written<'a>>,
+    /// Whether the parameters are reached through a reference: their entry, or
+    /// the array of parameters it is in.
+    pub params_by_reference: bool,
+    /// The context `params_written` is resolved in, where there is one.
+    params_ctx: Option<ReaderContext<'a>>,
+}
+
+impl<'a> FilterEntry<'a> {
+    /// The parameters, resolved: empty where they are no dictionary. They are
+    /// resolved at each call, and at none where the reading asks for none.
+    pub fn params(&self) -> Dict<'a> {
+        match (&self.params_written, &self.params_ctx) {
+            (Some(written), Some(ctx)) => resolved::<Dict<'a>>(written, ctx).unwrap_or_default(),
+            _ => Dict::empty(),
+        }
+    }
+}
+
+impl<'a> FilterEntries<'a> {
+    /// The filters of a stream with dictionary `dict`, read by the rules of
+    /// [`FilterEntries`].
+    pub fn of(dict: &Dict<'a>) -> Self {
+        let ctx = dict.ctx();
+        // Each key is read once, its value resolved once.
+        let read = |key: &[u8]| {
+            let written = dict.get_written(key)?;
+            let object = resolved::<Object<'a>>(&written, ctx);
+            Some((written, object))
+        };
+        let one = |written, name| Filters::One(written, Filter::from_name(name));
+        let (key, filters) = match read(F) {
+            Some((written, Some(Object::Name(name)))) => (F, one(written, name)),
+            f => match (f, read(FILTER)) {
+                (_, Some((written, Some(Object::Name(name))))) => (FILTER, one(written, name)),
+                (Some((_, Some(Object::Array(array)))), _) => (F, Filters::Many(array)),
+                (_, Some((_, Some(Object::Array(array))))) => (FILTER, Filters::Many(array)),
+                _ => (FILTER, Filters::None),
+            },
+        };
+        let params = match filters {
+            Filters::None => None,
+            _ => match dict.get_written(DP) {
+                Some(Written::Null) | None => dict.get_written(DECODE_PARMS),
+                dp => dp,
+            },
+        };
+        let params = match (&filters, params) {
+            (Filters::One(..), Some(written)) => Params::One(written, ctx.clone()),
+            (Filters::Many(_), Some(written)) => match resolved::<Array<'a>>(&written, ctx) {
+                Some(array) => Params::Many(array, matches!(written, Written::Ref(_))),
+                None => Params::None,
+            },
+            _ => Params::None,
+        };
+        Self {
+            key,
+            filters,
+            params,
+        }
+    }
+
+    /// The entries in order, each with the parameters in its place.
+    pub fn entries(&self) -> impl Iterator<Item = FilterEntry<'a>> + '_ {
+        let one = match (&self.filters, &self.params) {
+            (Filters::One(written, filter), params) => {
+                let (params_written, params_ctx) = match params {
+                    Params::One(written, ctx) => (Some(written.clone()), Some(ctx.clone())),
+                    _ => (None, None),
+                };
+                Some(FilterEntry {
+                    filter: *filter,
+                    written: written.clone(),
+                    params_by_reference: matches!(params_written, Some(Written::Ref(_))),
+                    params_written,
+                    params_ctx,
+                })
+            }
+            _ => None,
+        };
+        let many = match &self.filters {
+            Filters::Many(array) => Some((array.written(), array.ctx())),
+            _ => None,
+        };
+        let mut params = match &self.params {
+            Params::Many(array, by_reference) => {
+                Some((array.written(), array.ctx(), *by_reference))
+            }
+            _ => None,
+        };
+        let many = many.into_iter().flat_map(|(written, ctx)| {
+            written.map(move |written| (resolved::<Name<'a>>(&written, ctx), written))
+        });
+        one.into_iter().chain(many.map(move |(name, written)| {
+            // The parameters in the filter's place, whatever the entry names.
+            let (params_written, params_ctx, params_by_reference) = match &mut params {
+                Some((items, ctx, by_reference)) => match items.next() {
+                    Some(item) => {
+                        let by_reference = *by_reference || matches!(item, Written::Ref(_));
+                        (Some(item), Some((*ctx).clone()), by_reference)
+                    }
+                    None => (None, None, false),
+                },
+                None => (None, None, false),
+            };
+            FilterEntry {
+                filter: name.and_then(Filter::from_name),
+                written,
+                params_written,
+                params_by_reference,
+                params_ctx,
+            }
+        }))
+    }
+
+    /// The entries that name a filter, the ones decoding applies.
+    pub fn applied(&self) -> impl Iterator<Item = (Filter, FilterEntry<'a>)> + '_ {
+        self.entries()
+            .filter_map(|entry| Some((entry.filter?, entry)))
+    }
+}
 
 struct FiltersAndParams<'a> {
     filters: SmallVec<[Filter; 2]>,
@@ -56,6 +231,7 @@ pub struct ImageDecodeParams {
 enum DecodeTarget<'a> {
     Data,
     PageContent,
+    CheckedPageContent,
     Image(&'a ImageDecodeParams),
 }
 
@@ -89,7 +265,7 @@ impl<'a> Stream<'a> {
         forward_stream_opener(r, ends)?;
         let start = r.offset();
         let length = dict
-            .get::<i64>(LENGTH)
+            .get_single::<i64>(LENGTH)
             .filter(|&n| n >= 0)
             .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
         let data = length
@@ -112,57 +288,32 @@ impl<'a> Stream<'a> {
     }
 
     fn filters_and_params(&self) -> FiltersAndParams<'a> {
-        let mut collected_filters = SmallVec::new();
-        let mut collected_params = SmallVec::new();
+        let (filters, params) = self
+            .filter_entries()
+            .applied()
+            .map(|(f, e)| (f, e.params()))
+            .unzip();
+        FiltersAndParams { filters, params }
+    }
 
-        if let Some(filter) = self
-            .dict
-            .get::<Name<'_>>(F)
-            .or_else(|| self.dict.get::<Name<'_>>(FILTER))
-            .and_then(Filter::from_name)
-        {
-            let params = self
-                .dict
-                .get::<Dict<'_>>(DP)
-                .or_else(|| self.dict.get::<Dict<'_>>(DECODE_PARMS))
-                .unwrap_or_default();
-
-            collected_filters.push(filter);
-            collected_params.push(params);
-        } else if let Some(filters) = self
-            .dict
-            .get::<Array<'_>>(F)
-            .or_else(|| self.dict.get::<Array<'_>>(FILTER))
-        {
-            let filters = filters.iter::<Name<'_>>().map(Filter::from_name);
-            let mut params = self
-                .dict
-                .get::<Array<'_>>(DP)
-                .or_else(|| self.dict.get::<Array<'_>>(DECODE_PARMS))
-                .map(|a| a.iter::<Object<'_>>());
-
-            for filter in filters {
-                let params = params
-                    .as_mut()
-                    .and_then(|p| p.next())
-                    .and_then(|p| p.into_dict())
-                    .unwrap_or_default();
-
-                if let Some(filter) = filter {
-                    collected_filters.push(filter);
-                    collected_params.push(params);
-                }
-            }
-        }
-
-        FiltersAndParams {
-            filters: collected_filters,
-            params: collected_params,
-        }
+    /// Filters paired with their original parameters.
+    pub fn filter_entries(&self) -> FilterEntries<'a> {
+        FilterEntries::of(&self.dict)
     }
 
     /// Return the decrypted but undecoded data of the stream.
     pub fn raw_data(&self) -> Cow<'a, [u8]> {
+        self.try_raw_data().unwrap_or_default()
+    }
+
+    /// Decrypted stream bytes or a decryption error.
+    pub fn try_raw_data(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
+        if matches!(
+            self.dict.get::<Object<'_>>(F),
+            Some(Object::String(_) | Object::Dict(_))
+        ) {
+            return Err(DecodeFailure::StreamDecode);
+        }
         let ctx = self.dict.ctx();
 
         if ctx.xref().needs_decryption(ctx)
@@ -175,16 +326,15 @@ impl<'a> Stream<'a> {
             };
 
             match self.dict.obj_id() {
-                Some(obj_id) => Cow::Owned(
+                Some(obj_id) => Ok(Cow::Owned(
                     ctx.xref()
                         .decrypt(obj_id, self.data, target)
-                        // TODO: MAybe an error would be better?
-                        .unwrap_or_default(),
-                ),
-                None => Cow::Borrowed(self.data),
+                        .ok_or(DecodeFailure::StreamDecode)?,
+                )),
+                None => Ok(Cow::Borrowed(self.data)),
             }
         } else {
-            Cow::Borrowed(self.data)
+            Ok(Cow::Borrowed(self.data))
         }
     }
 
@@ -228,6 +378,10 @@ impl<'a> Stream<'a> {
         self.decode(DecodeTarget::PageContent).map(|r| r.data)
     }
 
+    pub(crate) fn checked_page_content(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
+        self.decode(DecodeTarget::CheckedPageContent)
+            .map(|r| r.data)
+    }
     fn decode(&self, target: DecodeTarget<'_>) -> Result<FilterResult<'a>, DecodeFailure> {
         if matches!(
             self.dict.get::<Object<'_>>(F),
@@ -239,7 +393,7 @@ impl<'a> Stream<'a> {
         let filters_and_params = self.filters_and_params();
         let image_params = match target {
             DecodeTarget::Image(params) => params,
-            DecodeTarget::Data | DecodeTarget::PageContent => {
+            DecodeTarget::Data | DecodeTarget::PageContent | DecodeTarget::CheckedPageContent => {
                 if filters_and_params.filters.iter().any(|filter| {
                     matches!(
                         filter,
@@ -256,7 +410,7 @@ impl<'a> Stream<'a> {
             }
         };
 
-        let data = self.raw_data();
+        let data = self.try_raw_data()?;
 
         let mut current: Option<FilterResult<'a>> = None;
 
@@ -275,6 +429,7 @@ impl<'a> Stream<'a> {
                 params,
                 image_params,
                 matches!(target, DecodeTarget::PageContent),
+                matches!(target, DecodeTarget::CheckedPageContent),
             )?;
             current = Some(new);
         }
@@ -331,7 +486,7 @@ impl<'a> Readable<'a> for Stream<'a> {
     }
 }
 
-fn forward_stream_opener(r: &mut Reader<'_>, ends: &impl Ends) -> Option<()> {
+pub(crate) fn forward_stream_opener(r: &mut Reader<'_>, ends: &impl Ends) -> Option<()> {
     skip_white_spaces_and_comments_in(r, ends);
     r.forward_tag(b"stream")?;
     r.read_eol()
@@ -403,7 +558,7 @@ pub(crate) struct NextEndstream {
 }
 
 impl NextEndstream {
-    fn skip_white_spaces(&mut self, r: &mut Reader<'_>) {
+    pub(crate) fn skip_white_spaces(&mut self, r: &mut Reader<'_>) {
         let start = r.offset();
         while r.peek_byte().is_some_and(is_white_space_character) {
             if self.whitespace.contains(&r.offset()) {

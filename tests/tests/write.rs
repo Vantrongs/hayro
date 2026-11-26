@@ -336,9 +336,15 @@ fn write_null_objects() {
         .unwrap()
         .get::<hayro_syntax::object::Dict>("Font")
         .unwrap();
-    let data = dict.data();
-
-    assert_eq!(data, b"<<\n      /F1 5 0 R\n      /F2 null\n    >>");
+    let font = dict.get::<Dict<'_>>(b"F1").unwrap();
+    assert_eq!(
+        font.get::<hayro_syntax::object::Name<'_>>(b"BaseFont")
+            .unwrap()
+            .as_ref(),
+        b"Helvetica"
+    );
+    let missing = dict.get_ref(b"F2").unwrap();
+    assert!(reread.xref().written(missing.into()).is_none());
 }
 
 fn write_without_crypt_filters() {

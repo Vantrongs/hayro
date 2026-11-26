@@ -124,3 +124,6 @@ strip = "none"
 inherits = "release"
 debug = 1
 overflow-checks = true
+
+[patch.crates-io]
+pdf-writer = { git = "https://github.com/Vantrongs/pdf-writer", rev = "3bac7d8da8103978ad4d6bd555abbbe191a7845f" }

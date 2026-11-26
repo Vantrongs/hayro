@@ -1,5 +1,5 @@
 use crate::object::Array;
-use crate::object::{Object, ObjectLike};
+use crate::object::{MaybeRef, Object, ObjectLike};
 use crate::reader::{Readable, ReaderContext, ReaderExt};
 
 use crate::reader::Reader;
@@ -58,12 +58,34 @@ impl<'a> Readable<'a> for Rect {
 }
 
 fn from_arr(array: &Array<'_>) -> Option<Rect> {
-    let mut iter = array.iter::<f32>();
-    let x0 = iter.next()? as f64;
-    let y0 = iter.next()? as f64;
-    let x1 = iter.next()? as f64;
-    let y1 = iter.next()? as f64;
-
+    use crate::sync::MutexExt;
+    const CACHE_MIN_BYTES: usize = 256;
+    let bytes = array.data();
+    let ctx = array.ctx();
+    let cache = ctx
+        .xref()
+        .storage()
+        .filter(|_| bytes.len() >= CACHE_MIN_BYTES && ctx.stored(bytes));
+    let at = bytes.as_ptr() as usize;
+    let cached = cache.and_then(|c| c.rectangles.get().get(&at).cloned());
+    let mut coords = [0.; 4];
+    if let Some(items) = cached {
+        for (coord, item) in coords.iter_mut().zip(items) {
+            *coord = f64::from(item.resolve(ctx)?);
+        }
+    } else {
+        let mut r = Reader::new(bytes);
+        let mut items = [const { MaybeRef::NotRef(0.) }; 4];
+        for (coord, item) in coords.iter_mut().zip(&mut items) {
+            r.skip_white_spaces_and_comments();
+            *item = r.read::<MaybeRef<f32>>(ctx)?;
+            *coord = f64::from(item.clone().resolve(ctx)?);
+        }
+        if let Some(cache) = cache {
+            cache.rectangles.get().insert(at, items);
+        }
+    }
+    let [x0, y0, x1, y1] = coords;
     Some(Rect::new(x0.min(x1), y0.min(y1), x1.max(x0), y1.max(y0)))
 }
 

@@ -92,16 +92,13 @@ fn cyclic_parents_preserve_each_pages_nearest_values() {
 }
 
 #[test]
-fn stream_parent_is_ignored() {
+fn stream_parent_supplies_its_dictionary() {
     let pdf = document(&[
         CATALOG,
         "<< /MediaBox [0 0 20 10] /Length 0 >>\nstream\n\nendstream",
         "<< /Type /Page /Contents [] /Parent 2 0 R >>",
     ]);
-    assert_eq!(
-        pdf.pages()[0].render_dimensions(),
-        (A4.width() as f32, A4.height() as f32)
-    );
+    assert_eq!(pdf.pages()[0].render_dimensions(), (20.0, 10.0));
 }
 
 #[test]
@@ -151,7 +148,7 @@ fn repaired_tree_preserves_blank_pages_and_kids_order() {
 }
 
 #[test]
-fn unusable_attributes_preserve_inheritance() {
+fn direct_null_inherits_but_other_entries_stop_the_lookup() {
     let pdf = document(&[
         CATALOG,
         "<< /MediaBox [0 0 32 18] /CropBox [0 0 12 10] /Rotate 90 /Resources << /Font << /A << >> >> >> >>",
@@ -160,17 +157,18 @@ fn unusable_attributes_preserve_inheritance() {
         "<< /Type /Page /Contents [] /Parent 3 0 R /Rotate 17 >>",
     ]);
     let pages = pdf.pages();
+    assert_eq!(pages.len(), 2);
+    assert_eq!(pages[0].media_box().width(), A4.width());
+    assert_eq!(pages[1].media_box().width(), 32.0);
     for page in pages.iter() {
-        assert_eq!(page.media_box().width(), 32.0);
-        assert_eq!(page.crop_box().height(), 10.0);
+        assert_eq!(page.crop_box().height(), page.media_box().height());
         assert!(
             page.resources()
                 .get_font(&Name::new_unescaped(b"A"))
-                .is_some()
+                .is_none()
         );
+        assert_eq!(page.rotation(), Rotation::None);
     }
-    assert_eq!(pages[0].rotation(), Rotation::Horizontal);
-    assert_eq!(pages[1].rotation(), Rotation::None);
 }
 
 mod allocations {
@@ -359,6 +357,13 @@ mod allocations {
     fn measure(objects: &[String], check: impl FnOnce(&Pdf)) -> usize {
         let objects: Vec<_> = objects.iter().map(String::as_str).collect();
         let data = document_bytes(&objects, |_| {});
+        // Initialize the thread-local loss observer outside the per-document measurement.
+        thread_local! {
+            static WARM: () = {
+                let _ = document(&[CATALOG, "<< /Type /Pages /Kids [] >>"]);
+            };
+        }
+        WARM.with(|_| ());
         let before = BYTES.get();
         check(&Pdf::new(data).unwrap());
         BYTES.get() - before
@@ -449,7 +454,12 @@ mod allocations {
                     })
                 };
             let growth = |pages| allocated(pages, 256) - allocated(pages, 1);
-            assert!(growth(32) <= 2 * growth(1));
+            assert!(
+                growth(32) <= 2 * growth(1),
+                "stream={stream} 32={}, one={}",
+                growth(32),
+                growth(1)
+            );
         }
     }
 }
@@ -562,7 +572,12 @@ fn repair_refreshes_compressed_rectangle() {
             let pdf = Pdf::new(data).unwrap();
             let expected = if corrupt { 32.0 } else { 11.0 };
             let sizes: Vec<_> = pdf.pages().iter().map(|p| p.render_dimensions()).collect();
-            assert_eq!(sizes, [(expected, 18.0); 2], "{kids:?} corrupt={corrupt}");
+            let count = if !corrupt && !kids.is_empty() { 3 } else { 2 };
+            assert_eq!(
+                sizes,
+                vec![(expected, 18.0); count],
+                "{kids:?} corrupt={corrupt}"
+            );
         }
     }
 }
@@ -576,12 +591,11 @@ fn self_referencing_resources_respect_the_referring_page() {
             );
             let pdf = document(&[CATALOG, &format!("<< /Type /Pages {kids} >>"), &page, &page]);
             assert_eq!(pdf.pages().len(), 2);
-            for (index, page) in pdf.pages().iter().enumerate() {
-                assert_eq!(
+            for page in pdf.pages().iter() {
+                assert!(
                     page.resources()
                         .get_font(&Name::new_unescaped(b"A"))
-                        .is_some(),
-                    index + 3 != self_id
+                        .is_some()
                 );
             }
         }
@@ -589,7 +603,7 @@ fn self_referencing_resources_respect_the_referring_page() {
 }
 
 #[test]
-fn stream_resources_preserve_inherited_fonts() {
+fn stream_resources_shadow_inherited_fonts() {
     let pdf = document(&[
         CATALOG,
         "<< /Resources << /Font << /A << >> >> >> >>",
@@ -601,7 +615,7 @@ fn stream_resources_preserve_inherited_fonts() {
         pdf.pages()[0]
             .resources()
             .get_font(&Name::new_unescaped(b"A"))
-            .is_some()
+            .is_none()
     );
 }
 
@@ -618,12 +632,11 @@ fn shared_resource_subcategories_keep_their_referring_context() {
                 &format!("<< /Font {target} 0 R >>"),
             ]);
             assert_eq!(pdf.pages().len(), 2);
-            for (index, page) in pdf.pages().iter().enumerate() {
-                assert_eq!(
+            for page in pdf.pages().iter() {
+                assert!(
                     page.resources()
                         .get_font(&Name::new_unescaped(b"A"))
-                        .is_some(),
-                    index + 3 != target
+                        .is_some()
                 );
             }
         }
@@ -631,7 +644,7 @@ fn shared_resource_subcategories_keep_their_referring_context() {
 }
 
 #[test]
-fn rejected_stream_resources_preserve_fonts_without_reading_length() {
+fn unreadable_stream_resources_shadow_fonts_and_report_loss() {
     let kids = (6..22).map(|id| format!("{id} 0 R ")).collect::<String>();
     let root = format!("<< /Kids [{kids}] /Resources << /Font << /A << >> >> >> >>");
     for tail in [1, 4096] {
@@ -650,9 +663,13 @@ fn rejected_stream_resources_preserve_fonts_without_reading_length() {
         assert!(
             pdf.pages()
                 .iter()
-                .all(|p| p.resources().get_font(&Name::new_unescaped(b"A")).is_some())
+                .all(|p| p.resources().get_font(&Name::new_unescaped(b"A")).is_none())
         );
-        assert_eq!(pdf.xref().get::<i32>(ObjectIdentifier::new(5, 0)), None);
+        assert!(
+            pdf.pages()
+                .iter()
+                .all(|p| p.unreadable() == Some(ObjectIdentifier::new(3, 0)))
+        );
     }
 }
 

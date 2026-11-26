@@ -76,6 +76,8 @@ The supported features include:
 
 extern crate alloc;
 
+pub mod hash;
+pub mod lost;
 pub(crate) mod sync;
 
 mod data;

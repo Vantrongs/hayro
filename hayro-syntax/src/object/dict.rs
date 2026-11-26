@@ -8,10 +8,12 @@ use crate::reader::Reader;
 use crate::reader::{
     Ends, Readable, ReaderContext, ReaderExt, Skippable, Unknown, skip_white_spaces_and_comments_in,
 };
-use crate::sync::Arc;
+use crate::sync::{Arc, MutexExt, OnceLock};
+pub(crate) type Index = Arc<OnceLock<Vec<(Name<'static>, Range<usize>)>>>;
 use alloc::format;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
+use core::ops::Range;
 
 /// A PDF dictionary.
 #[derive(Clone)]
@@ -49,6 +51,22 @@ impl<'a> Dict<'a> {
         }
         result
     }
+    /// Location and decryption context of this value.
+    pub fn content_key(&self) -> crate::xref::ContentKey<'a> {
+        crate::xref::ContentKey::new(self.data(), self.ctx())
+    }
+    /// Entries in key order, preserving number spellings and references.
+    pub fn written(&self) -> impl Iterator<Item = (Name<'a>, super::Written<'a>)> + '_ {
+        self.keys()
+            .filter_map(|name| self.get_written(&name).map(|v| (name, v)))
+    }
+
+    /// An entry as written.
+    pub fn get_written(&self, key: impl AsRef<[u8]>) -> Option<super::Written<'a>> {
+        let range = self.offset(key.as_ref())?;
+        super::Written::read(&mut Reader::new(&self.data()[range]), self.ctx())
+    }
+
     /// Create a new empty dictionary.
     pub fn empty() -> Self {
         Self(Inner::Empty)
@@ -94,9 +112,9 @@ impl<'a> Dict<'a> {
         if self.ctx().in_content_stream() {
             return None;
         }
-        let offset = self.offset(key.as_ref())?;
+        let range = self.offset(key.as_ref())?;
 
-        Reader::new(&self.data()[offset..]).read_with_context::<ObjRef>(self.ctx())
+        Reader::new(&self.data()[range]).read_with_context::<ObjRef>(self.ctx())
     }
 
     /// Returns an iterator over all keys in the dictionary, in no particular order.
@@ -106,11 +124,7 @@ impl<'a> Dict<'a> {
 
     /// An iterator over all entries in the dictionary, sorted by key.
     pub fn entries(&self) -> impl Iterator<Item = (Name<'a>, MaybeRef<Object<'a>>)> + '_ {
-        let mut sorted_keys = self.keys().collect::<Vec<_>>();
-        sorted_keys.sort_by(|n1, n2| n1.as_ref().cmp(n2.as_ref()));
-        sorted_keys.dedup_by(|n1, n2| n1.as_ref() == n2.as_ref());
-        sorted_keys
-            .into_iter()
+        self.keys()
             .filter_map(|k| self.get_raw(k.as_ref()).map(|obj| (k, obj)))
     }
 
@@ -125,9 +139,34 @@ impl<'a> Dict<'a> {
     where
         T: Readable<'a>,
     {
-        let offset = self.offset(key.as_ref())?;
+        let range = self.offset(key.as_ref())?;
 
-        Reader::new(&self.data()[offset..]).read_with_context::<MaybeRef<T>>(self.ctx())
+        Reader::new(&self.data()[range]).read_with_context::<MaybeRef<T>>(self.ctx())
+    }
+
+    pub(crate) fn get_single<T: ObjectLike<'a>>(&self, key: &[u8]) -> Option<T> {
+        let Inner::Some(repr) = &self.0 else {
+            return None;
+        };
+        if repr.offsets.get().is_some() {
+            return self.get(key);
+        }
+        let mut found = None;
+        parse_dict_with(
+            &mut Reader::new(repr.data),
+            &repr.ctx,
+            repr.start,
+            repr.end,
+            |name, range| {
+                if name.as_ref() == key {
+                    found = Some(range);
+                }
+                Some(())
+            },
+        )?;
+        Reader::new(&repr.data[found?])
+            .read::<MaybeRef<T>>(&repr.ctx)?
+            .resolve(&repr.ctx)
     }
 
     pub(crate) fn ctx(&self) -> &ReaderContext<'a> {
@@ -137,28 +176,36 @@ impl<'a> Dict<'a> {
         }
     }
 
-    fn offsets(&self) -> &[(Name<'a>, usize)] {
+    fn offsets(&self) -> &[(Name<'a>, Range<usize>)] {
         match &self.0 {
             Inner::Empty => &[],
-            Inner::Some(repr) => &repr.offsets,
+            Inner::Some(repr) => repr.offsets.get_or_init(|| {
+                let mut offsets = Vec::new();
+                parse_dict_with(
+                    &mut Reader::new(repr.data),
+                    &repr.ctx,
+                    repr.start,
+                    repr.end,
+                    |name, range| {
+                        offsets.push((name.into_owned(), range));
+                        Some(())
+                    },
+                )
+                .expect("dictionary syntax was validated on read");
+                offsets.reverse();
+                offsets.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+                offsets.dedup_by(|a, b| a.0.as_ref() == b.0.as_ref());
+                offsets
+            }),
         }
     }
 
-    fn offset(&self, key: &[u8]) -> Option<usize> {
+    fn offset(&self, key: &[u8]) -> Option<Range<usize>> {
         let offsets = self.offsets();
-
-        if offsets.len() <= MAX_UNSORTED_LEN {
-            offsets
-                .iter()
-                .find(|(name, _)| name.as_ref() == key)
-                .map(|(_, offset)| *offset)
-        } else {
-            let idx = offsets
-                .binary_search_by(|(name, _)| name.as_ref().cmp(key))
-                .ok()?;
-
-            Some(offsets[idx].1)
-        }
+        let index = offsets
+            .binary_search_by(|(name, _)| name.as_ref().cmp(key))
+            .ok()?;
+        Some(offsets[index].1.clone())
     }
 }
 
@@ -240,68 +287,74 @@ impl<'a> Readable<'a> for Dict<'a> {
     }
 }
 
-const MAX_UNSORTED_LEN: usize = 16;
-
 fn read_inner<'a>(
     r: &mut Reader<'a>,
     ctx: &ReaderContext<'a>,
-    start_tag: Option<&[u8]>,
-    end_tag: &[u8],
+    start_tag: Option<&'static [u8]>,
+    end_tag: &'static [u8],
 ) -> Option<Dict<'a>> {
-    let mut offsets = Vec::with_capacity(8);
-
-    let data = parse_dict_with(
-        r,
-        ctx,
-        start_tag,
-        end_tag,
-        #[inline]
-        |name, offset, _| {
-            offsets.push((name, offset));
-            Some(())
-        },
-    )?;
-
-    if offsets.len() > MAX_UNSORTED_LEN {
-        offsets.sort_by(|(a, _), (b, _)| a.as_ref().cmp(b.as_ref()));
-        offsets.dedup_by(|(a, _), (b, _)| a.as_ref() == b.as_ref());
+    let tail = r.tail()?;
+    let cache = ctx
+        .xref()
+        .storage()
+        .filter(|_| start_tag.is_some() && ctx.stored(tail));
+    let at = tail.as_ptr() as usize;
+    if let Some((len, index)) = cache.and_then(|c| c.dictionaries.get().get(&at).cloned()) {
+        return Some(Dict(Inner::Some(Arc::new(Repr {
+            data: r.read_bytes(len)?,
+            offsets: index,
+            start: start_tag,
+            end: end_tag,
+            ctx: ctx.clone(),
+        }))));
     }
-
+    let data = if start_tag.is_some() {
+        r.skip::<Dict<'_>>(ctx.in_content_stream())?
+    } else {
+        parse_dict_with(r, ctx, start_tag, end_tag, |_, _| Some(()))?
+    };
+    let index = if let Some(cache) = cache {
+        cache
+            .dictionaries
+            .get()
+            .entry(at)
+            .or_insert_with(|| (data.len(), Index::default()))
+            .1
+            .clone()
+    } else {
+        Index::default()
+    };
     Some(Dict(Inner::Some(Arc::new(Repr {
         data,
-        offsets,
+        offsets: index,
+        start: start_tag,
+        end: end_tag,
         ctx: ctx.clone(),
     }))))
 }
 
-pub(crate) fn read_dict_with_key<'a>(
-    r: &mut Reader<'a>,
-    ctx: &ReaderContext<'a>,
-    key: &[u8],
-) -> Option<Option<Dict<'a>>> {
-    let start = r.offset();
+pub(crate) fn has_key<'a>(r: &mut Reader<'a>, ctx: &ReaderContext<'a>, key: &[u8]) -> Option<bool> {
     let mut found = false;
-    let scanned = parse_dict_with(r, ctx, Some(b"<<"), b">>", |name, _, _| {
+    let scanned = parse_dict_with(r, ctx, Some(b"<<"), b">>", |name, _| {
         found = name.as_ref() == key;
         (!found).then_some(())
     });
     if found {
-        r.jump(start);
-        Some(Some(r.read_with_context(ctx)?))
+        Some(true)
     } else {
-        scanned.map(|_| None)
+        scanned.map(|_| false)
     }
 }
 
 fn parse_dict_with<'a, F>(
     r: &mut Reader<'a>,
     ctx: &ReaderContext<'a>,
-    start_tag: Option<&[u8]>,
-    end_tag: &[u8],
+    start_tag: Option<&'static [u8]>,
+    end_tag: &'static [u8],
     mut on_entry: F,
 ) -> Option<&'a [u8]>
 where
-    F: FnMut(Name<'a>, usize, &Reader<'a>) -> Option<()>,
+    F: FnMut(Name<'a>, Range<usize>) -> Option<()>,
 {
     let depth = usize::from(start_tag.is_some());
     let dict_data = r.tail()?;
@@ -333,13 +386,13 @@ where
 
             let offset = r.offset() - start_offset;
             // Null entries are kept: checking for them would resolve references before decryption is set up.
-            on_entry(name, offset, r)?;
 
             if ctx.in_content_stream() {
                 r.skip_with_depth::<Object<'_>>(ctx.in_content_stream(), depth)?;
             } else {
                 r.skip_with_depth::<MaybeRef<Object<'_>>>(ctx.in_content_stream(), depth)?;
             }
+            on_entry(name, offset..r.offset() - start_offset)?;
         }
     }
 }
@@ -349,7 +402,9 @@ object!(Dict<'a>, Dict);
 #[derive(Clone)]
 struct Repr<'a> {
     data: &'a [u8],
-    offsets: Vec<(Name<'a>, usize)>,
+    offsets: Index,
+    start: Option<&'static [u8]>,
+    end: &'static [u8],
     ctx: ReaderContext<'a>,
 }
 
@@ -1168,5 +1223,17 @@ mod tests {
         let dict = Dict::from_bytes(b"<< /A <<>>stream /B true >>").unwrap();
         let _ = dict.entries().count();
         let _ = format!("{dict:?}");
+    }
+}
+
+#[cfg(test)]
+mod last_key {
+    use super::*;
+    use crate::object::FromBytes;
+    #[test]
+    fn decoded_duplicates_use_last_value() {
+        let dict = Dict::from_bytes(b"<< /A 1 /#41 2 >>").unwrap();
+        assert_eq!(dict.get::<i32>(b"A"), Some(2));
+        assert_eq!(dict.len(), 1);
     }
 }

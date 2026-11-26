@@ -4,16 +4,16 @@ use crate::object::macros::object;
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, Skippable};
 use crate::trivia::is_regular_character;
+use alloc::vec::Vec;
 use core::borrow::Borrow;
 use core::fmt::{self, Debug, Display, Formatter};
 use core::hash::{Hash, Hasher};
 use core::ops::Deref;
-use smallvec::SmallVec;
 
 #[derive(Clone)]
 enum NameInner<'a> {
     Borrowed(&'a [u8]),
-    Owned(SmallVec<[u8; 23]>),
+    Owned(crate::sync::Arc<[u8]>),
 }
 
 /// A PDF name object.
@@ -89,7 +89,16 @@ impl<'a> Name<'a> {
     /// Create a new name from bytes that may contain escape sequences.
     #[inline]
     pub fn new_escaped(data: &'a [u8]) -> Option<Self> {
-        Some(Self(NameInner::Owned(decoded_bytes(data).collect())))
+        Some(Self(NameInner::Owned(
+            decoded_bytes(data).collect::<Vec<_>>().into(),
+        )))
+    }
+
+    pub(crate) fn into_owned(self) -> Name<'static> {
+        Name(NameInner::Owned(match self.0 {
+            NameInner::Borrowed(bytes) => bytes.into(),
+            NameInner::Owned(bytes) => bytes,
+        }))
     }
 
     /// Return the name as a string, or a placeholder if it isn't UTF-8.

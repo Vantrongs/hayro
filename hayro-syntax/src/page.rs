@@ -1,203 +1,80 @@
 //! Reading the pages of a PDF document.
 
 use crate::content::{TypedIter, UntypedIter};
+use crate::hash;
+use crate::lost::{Lost, Memo};
 use crate::object::Array;
 use crate::object::Dict;
 use crate::object::Name;
 use crate::object::Rect;
 use crate::object::Stream;
 use crate::object::dict::keys::*;
-use crate::object::{MaybeRef, Object, ObjectIdentifier};
-use crate::reader::{Readable, Reader, ReaderContext, ReaderExt};
-use crate::sync::{FxHashMap, FxHashSet, OnceLock};
+use crate::object::stream::DecodeFailure;
+use crate::object::{MaybeRef, Null, Object, ObjectIdentifier};
+use crate::reader::ReaderContext;
+use crate::sync::OnceLock;
 use crate::transform::Transform;
 use crate::util::FloatExt;
-use crate::xref::XRef;
+
+use crate::xref::{ContentKey, XRef};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Deref;
 
-struct DictOnly<'a, const PAGE_CANDIDATE: bool = false>(Option<Dict<'a>>);
+mod inherit;
+mod tree;
 
-impl<'a, const PAGE_CANDIDATE: bool> Readable<'a> for DictOnly<'a, PAGE_CANDIDATE> {
-    const HANDLES_TYPE_MISMATCH: bool = true;
+pub use inherit::{Inheritable, Inheritance, InheritanceError};
 
-    fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
-        if r.peek_bytes(2) != Some(b"<<") {
-            return Some(Self(None));
-        }
-        if PAGE_CANDIDATE {
-            crate::object::dict::read_dict_with_key(r, ctx, CONTENTS).map(Self)
-        } else {
-            Dict::read(r, ctx).map(|dict| Self(Some(dict)))
-        }
-    }
-
-    fn read_indirect(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
-        if r.peek_bytes(2) != Some(b"<<") {
-            if PAGE_CANDIDATE || r.peek_byte() != Some(b'[') {
-                Object::skip_indirect_value(r)?;
-            }
-            return Some(Self(None));
-        }
-
-        let mut probe = r.clone();
-        if probe.skip::<Dict<'_>>(false).is_some() {
-            probe.skip_white_spaces_and_comments();
-            if probe.peek_tag(b"stream").is_some() {
-                return Some(Self(None));
-            }
-        }
-        Self::read(r, ctx)
-    }
-}
-
-#[derive(Default)]
-struct Attributes<'a> {
-    media_box: OnceLock<Option<Rect>>,
-    crop_box: OnceLock<Option<Rect>>,
-    rotate: OnceLock<Option<i32>>,
-    resources: OnceLock<Option<Resources<'a>>>,
-}
-
-struct InheritedNode<'a> {
-    dict: Dict<'a>,
-    parent: Option<usize>,
-    cycle_len: usize,
-    cached: Attributes<'a>,
-}
-
-impl<'a> InheritedNode<'a> {
-    fn new(dict: Dict<'a>, parent: Option<usize>) -> Self {
-        Self {
-            dict,
-            parent,
-            cycle_len: 0,
-            cached: Attributes::default(),
-        }
-    }
-}
-
-fn inherited<'a, T: Clone>(
-    dict: &Dict<'a>,
-    nodes: &[InheritedNode<'a>],
-    mut parent: Option<usize>,
-    cache: impl for<'b> Fn(&'b Attributes<'a>) -> &'b OnceLock<Option<T>>,
-    mut read: impl FnMut(&Dict<'a>) -> Option<T>,
-) -> Option<T> {
-    if let Some(value) = read(dict) {
-        return Some(value);
-    }
-    let mut path = Vec::new();
-    let mut cycle_left = None;
-    let value = loop {
-        let Some(index) = parent else { break None };
-        let node = &nodes[index];
-        if let Some(value) = cache(&node.cached).get() {
-            break value.clone();
-        }
-        if node.cycle_len != 0 {
-            let left = cycle_left.get_or_insert(node.cycle_len);
-            if *left == 0 {
-                break None;
-            }
-            *left -= 1;
-        }
-        path.push(index);
-        if let Some(value) = read(&node.dict) {
-            break Some(value);
-        }
-        parent = node.parent;
-    };
-    for index in path {
-        cache(&nodes[index].cached).get_or_init(|| value.clone());
-    }
-    value
-}
-
-#[derive(Default)]
-struct PageParents<'a> {
-    parents: FxHashMap<ObjectIdentifier, Option<usize>>,
-    nodes: Vec<InheritedNode<'a>>,
-}
-
-impl<'a> PageParents<'a> {
-    fn link(&mut self, page: &Dict<'a>, xref: &'a XRef) -> Option<usize> {
-        let start = self.nodes.len();
-        let mut next = page.get_raw::<Dict<'a>>(PARENT);
-        let mut tail = None;
-        while let Some(parent) = next {
-            let dict = match parent {
-                MaybeRef::NotRef(dict) => dict,
-                MaybeRef::Ref(reference) => {
-                    let id = reference.into();
-                    if let Some(&known) = self.parents.get(&id) {
-                        tail = known;
-                        if let Some(index) = known.filter(|&index| index >= start) {
-                            let cycle = &mut self.nodes[index..];
-                            let len = cycle.len();
-                            for node in cycle {
-                                node.cycle_len = len;
-                            }
-                        }
-                        break;
-                    }
-                    let ctx = ReaderContext::new(xref, false);
-                    let dict = xref.get_with::<DictOnly<'_>>(id, &ctx).and_then(|d| d.0);
-                    self.parents
-                        .insert(id, dict.as_ref().map(|_| self.nodes.len()));
-                    let Some(dict) = dict else { break };
-                    dict
-                }
-            };
-            next = dict.get_raw(PARENT);
-            self.nodes
-                .push(InheritedNode::new(dict, Some(self.nodes.len() + 1)));
-        }
-        if let Some(last) = self.nodes[start..].last_mut() {
-            last.parent = tail;
-            Some(start)
-        } else {
-            tail
-        }
-    }
-}
-
-/// A structure holding the pages of a PDF document.
+/// The pages in listing order, including repeated leaves.
 pub struct Pages<'a> {
     pages: Vec<Page<'a>>,
     xref: &'a XRef,
+    lost: Lost,
+    root: Option<tree::Key<'a>>,
 }
 
 impl<'a> Pages<'a> {
-    pub(crate) fn new(
-        pages_dict: &Dict<'a>,
-        ctx: &ReaderContext<'a>,
-        xref: &'a XRef,
-    ) -> Option<(Self, bool)> {
-        let mut pages = vec![];
-        let saw_kid = resolve_pages(pages_dict, &mut pages, ctx)?;
-
-        Some((Self { pages, xref }, saw_kid))
+    pub(crate) fn new(ctx: &ReaderContext<'a>, xref: &'a XRef) -> Option<Self> {
+        let (walked, walk_lost) = xref.apart(|| {
+            let (id, root) = tree::root(xref)?;
+            let kids = root.get_single::<Array<'_>>(KIDS);
+            if kids.is_none() && root.get_single::<Name<'_>>(TYPE).as_deref() != Some(PAGE) {
+                return None;
+            }
+            let (tree, pages) = tree::walk(xref, id, root);
+            if xref.is_repaired()
+                && kids.is_some_and(|a| a.raw_iter().next().is_some())
+                && pages.is_empty()
+            {
+                return None;
+            }
+            Some((tree, pages))
+        });
+        let ((tree, listed), lost) = match walked {
+            Some((tree, listed)) => ((tree, listed), walk_lost),
+            _ => {
+                let (scanned, lost) = xref.apart(|| tree::scan(xref));
+                let lost = lost.or(walk_lost);
+                ((tree::Tree::default(), scanned), lost)
+            }
+        };
+        let pages = Inherited::find(xref, &tree, &listed)
+            .into_iter()
+            .zip(listed)
+            .map(|((inherited, unreadable), listed)| Page::new(listed, inherited, unreadable, ctx))
+            .collect();
+        Some(Self {
+            pages,
+            xref,
+            lost,
+            root: tree.root,
+        })
     }
 
-    pub(crate) fn new_brute_force(ctx: &ReaderContext<'a>, xref: &'a XRef) -> Option<Self> {
-        let mut pages = vec![];
-        let mut parents = PageParents::default();
-        let mut rejected_resources = FxHashSet::default();
-        for DictOnly(candidate) in xref.objects::<DictOnly<'_, true>>() {
-            if let Some(dict) = candidate {
-                let inherited = parents.link(&dict, xref);
-                pages.push(Page::new(
-                    &dict,
-                    &parents.nodes,
-                    inherited,
-                    ctx,
-                    &mut rejected_resources,
-                ));
-            }
-        }
-        (!pages.is_empty()).then_some(Self { pages, xref })
+    /// The first unreadable listed object encountered while reading this item.
+    pub fn unreadable(&self) -> Option<ObjectIdentifier> {
+        self.lost
     }
 
     /// Return the xref table (of the document the pages belong to).
@@ -214,78 +91,22 @@ impl<'a> Deref for Pages<'a> {
     }
 }
 
-fn kids_has_entries(kids: &Array<'_>) -> bool {
-    let mut r = Reader::new(kids.data());
-    r.skip_white_spaces_and_comments();
-    !r.at_end()
+/// An error reading a page content stream or an element of its contents array.
+#[derive(Debug, Copy, Clone)]
+pub enum ContentError {
+    /// The part is no stream, or its object cannot be parsed.
+    Unreadable(Option<ObjectIdentifier>),
+    /// The part's stream cannot be decrypted or decoded.
+    Decode(Option<ObjectIdentifier>, DecodeFailure),
 }
 
-fn resolve_pages<'a>(
-    pages_dict: &Dict<'a>,
-    entries: &mut Vec<Page<'a>>,
-    reader_ctx: &ReaderContext<'a>,
-) -> Option<bool> {
-    let mut rejected_resources = FxHashSet::default();
-    let mut visited = FxHashSet::default();
-
-    if let Some(id) = pages_dict.obj_id() {
-        visited.insert(id);
-    }
-
-    let root_kids = pages_dict.get::<Array<'_>>(KIDS)?;
-    let mut saw_kid = kids_has_entries(&root_kids);
-    let mut stack = vec![root_kids.raw_iter()];
-    let mut nodes = vec![InheritedNode::new(pages_dict.clone(), None)];
-
-    while let Some(frame) = stack.last_mut() {
-        let Some(kid) = frame.next() else {
-            stack.pop();
-            nodes.pop();
-
-            continue;
-        };
-
-        saw_kid = true;
-        let dict = match kid {
-            MaybeRef::Ref(id) => {
-                if !visited.insert(id.into()) {
-                    continue;
-                }
-
-                reader_ctx
-                    .xref()
-                    .get_with::<Dict<'a>>(id.into(), reader_ctx)
-            }
-            MaybeRef::NotRef(object) => object.into_dict(),
-        };
-
-        let Some(dict) = dict else {
-            continue;
-        };
-
-        let parent = Some(nodes.len() - 1);
-        match dict.get::<Name<'_>>(TYPE).as_deref() {
-            Some(PAGES) => {
-                if let Some(kids) = dict.get::<Array<'_>>(KIDS) {
-                    saw_kid |= kids_has_entries(&kids);
-                    nodes.push(InheritedNode::new(dict, parent));
-                    stack.push(kids.raw_iter());
-                }
-            }
-            // Lenient: treat a missing or unknown `Type` as a page (corpus 0083781).
-            _ => {
-                entries.push(Page::new(
-                    &dict,
-                    &nodes,
-                    parent,
-                    reader_ctx,
-                    &mut rejected_resources,
-                ));
-            }
-        }
-    }
-
-    Some(saw_kid)
+/// A page dictionary with its effective resources, boxes and rotation.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct PageKey<'a> {
+    dict: ContentKey<'a>,
+    resources: [ContentKey<'a>; 7],
+    boxes: [u64; 8],
+    rotation: u8,
 }
 
 /// The rotation of the page.
@@ -301,72 +122,151 @@ pub enum Rotation {
     FlippedHorizontal,
 }
 
+struct Inherited<'a> {
+    media_box: Option<Rect>,
+    crop_box: Option<Rect>,
+    rotation: Rotation,
+    resources: Resources<'a>,
+}
+
+impl<'a> Inherited<'a> {
+    fn find(
+        xref: &'a XRef,
+        tree: &tree::Tree<'a>,
+        listed: &[tree::Listed<'a>],
+    ) -> Vec<(Self, Lost)> {
+        let mut lookups = inherit::Lookups::new(xref, tree.root, Some(tree));
+        let mut boxes = Memo::<ContentKey<'a>, Option<Rect>>::default();
+        let mut resources = Memo::<ContentKey<'a>, Resources<'a>>::default();
+        let mut each = |lookups: &mut inherit::Lookups<'_, 'a>| -> Vec<(Self, Lost)> {
+            listed
+                .iter()
+                .map(|page| {
+                    let start = inherit::Start {
+                        key: tree::Key::of(page.id, &page.dict),
+                        dict: &page.dict,
+                        under: page.under,
+                    };
+                    xref.apart(|| {
+                        let [media_box, crop_box, rotate, found] =
+                            Inheritable::ALL.map(|key| lookups.get(&start, key).ok().flatten());
+                        let mut rect = |value: Option<Object<'a>>| match value {
+                            Some(Object::Array(array)) => {
+                                *boxes.get(xref, array.content_key(), || {
+                                    Rect::try_from(Object::Array(array.clone())).ok()
+                                })
+                            }
+                            _ => None,
+                        };
+                        let media_box = rect(media_box);
+                        let crop_box = rect(crop_box);
+                        let resources = match found {
+                            Some(Object::Dict(dict)) => resources
+                                .get(xref, dict.content_key(), || {
+                                    Resources::read(|key| tree::value(xref, &dict, key))
+                                })
+                                .clone(),
+                            _ => Resources::new(Dict::empty()),
+                        };
+                        Self {
+                            media_box,
+                            crop_box,
+                            rotation: rotation(rotate),
+                            resources,
+                        }
+                    })
+                })
+                .collect()
+        };
+        let found = each(&mut lookups);
+        if lookups.repaired() {
+            each(&mut lookups)
+        } else {
+            found
+        }
+    }
+}
+
+fn rotation(value: Option<Object<'_>>) -> Rotation {
+    let Some(Object::Number(number)) = value else {
+        return Rotation::None;
+    };
+    let Ok(degrees) = i32::try_from(number.as_i64()) else {
+        return Rotation::None;
+    };
+    match degrees.rem_euclid(360) {
+        90 => Rotation::Horizontal,
+        180 => Rotation::Flipped,
+        270 => Rotation::FlippedHorizontal,
+        _ => Rotation::None,
+    }
+}
+
 /// A PDF page.
 pub struct Page<'a> {
+    id: Option<ObjectIdentifier>,
     inner: Dict<'a>,
     media_box: Rect,
     crop_box: Rect,
     rotation: Rotation,
-    page_streams: OnceLock<Option<Vec<u8>>>,
+    page_streams: OnceLock<(Option<Vec<u8>>, Lost)>,
     resources: Resources<'a>,
+    unreadable: Lost,
     ctx: ReaderContext<'a>,
+    under: Option<u32>,
 }
 
 impl<'a> Page<'a> {
     fn new(
-        dict: &Dict<'a>,
-        nodes: &[InheritedNode<'a>],
-        parent: Option<usize>,
+        listed: tree::Listed<'a>,
+        inherited: Inherited<'a>,
+        unreadable: Lost,
         reader_ctx: &ReaderContext<'a>,
-        rejected_resources: &mut FxHashSet<ObjectIdentifier>,
     ) -> Self {
-        let media_box =
-            inherited(dict, nodes, parent, |c| &c.media_box, |d| d.get(MEDIA_BOX)).unwrap_or(A4);
-        let crop_box = inherited(dict, nodes, parent, |c| &c.crop_box, |d| d.get(CROP_BOX))
-            .unwrap_or(media_box);
-        let rotate = inherited(dict, nodes, parent, |c| &c.rotate, |d| d.get(ROTATE));
-        let resources = inherited(
-            dict,
-            nodes,
-            parent,
-            |c| &c.resources,
-            |d| {
-                let resources = match d.get_raw::<Dict<'_>>(RESOURCES)? {
-                    MaybeRef::NotRef(dict) => dict,
-                    MaybeRef::Ref(id) => {
-                        let id = id.into();
-                        if rejected_resources.contains(&id) {
-                            return None;
-                        }
-                        let DictOnly(dict) =
-                            d.ctx().xref().get_with::<DictOnly<'_>>(id, d.ctx())?;
-                        if dict.is_none() {
-                            rejected_resources.insert(id);
-                        }
-                        dict?
-                    }
-                };
-                Some(Resources::new(resources))
-            },
-        )
-        .unwrap_or_default();
-        let rotation = match rotate.unwrap_or(0).rem_euclid(360) {
-            0 => Rotation::None,
-            90 => Rotation::Horizontal,
-            180 => Rotation::Flipped,
-            270 => Rotation::FlippedHorizontal,
-            _ => Rotation::None,
-        };
+        let media_box = inherited.media_box.unwrap_or(A4);
+        let crop_box = inherited.crop_box.unwrap_or(media_box);
 
         Self {
-            inner: dict.clone(),
+            id: listed.id,
+            inner: listed.dict,
             media_box,
             crop_box,
-            rotation,
+            rotation: inherited.rotation,
             page_streams: OnceLock::new(),
-            resources,
+            resources: inherited.resources,
+            unreadable,
             ctx: reader_ctx.clone(),
+            under: listed.under,
         }
+    }
+
+    /// Identify pages with the same dictionary and inherited drawing parameters.
+    pub fn key(&self) -> PageKey<'a> {
+        let r = &self.resources;
+        let corners = |rect: Rect| [rect.x0, rect.y0, rect.x1, rect.y1].map(f64::to_bits);
+        let [m0, m1, m2, m3] = corners(self.media_box);
+        let [c0, c1, c2, c3] = corners(self.crop_box);
+        PageKey {
+            dict: self.inner.content_key(),
+            resources: [
+                &r.ext_g_states,
+                &r.fonts,
+                &r.properties,
+                &r.color_spaces,
+                &r.x_objects,
+                &r.patterns,
+                &r.shadings,
+            ]
+            .map(Dict::content_key),
+            boxes: [m0, m1, m2, m3, c0, c1, c2, c3],
+            rotation: self.rotation as u8,
+        }
+    }
+
+    /// The page object's identifier; `None` for a page written directly into a /Kids
+    /// array. A /Kids entry that is not a dictionary is a page with no entries.
+    pub fn obj_id(&self) -> Option<ObjectIdentifier> {
+        self.id
     }
 
     fn operations_impl(&self) -> Option<UntypedIter<'_>> {
@@ -376,38 +276,116 @@ impl<'a> Page<'a> {
         Some(iter)
     }
 
-    /// Return the decoded content stream of the page.
+    /// Return the cached decoded content of the page.
     pub fn page_stream(&self) -> Option<&[u8]> {
-        let convert_single = |s: Stream<'_>| {
-            let data = s.decoded_page_content().ok()?;
-            Some(data.into_owned())
-        };
+        let (data, lost) = self
+            .page_streams
+            .get_or_init(|| self.xref().watch(|| self.read_page_stream()));
+        self.xref().note(*lost);
+        data.as_deref()
+    }
 
-        self.page_streams
-            .get_or_init(|| {
-                if let Some(stream) = self.inner.get::<Stream<'_>>(CONTENTS) {
-                    convert_single(stream)
-                } else if let Some(array) = self.inner.get::<Array<'_>>(CONTENTS) {
-                    let streams = array
-                        .refs()
-                        .filter_map(|r| self.xref().get_with::<Stream<'_>>(r.into(), &self.ctx))
-                        .flat_map(convert_single);
-
-                    let mut collected = vec![];
-
-                    for stream in streams {
-                        collected.extend(stream);
-                        // Streams must have at least one whitespace in-between.
-                        collected.push(b' ');
-                    }
-
-                    Some(collected)
-                } else {
-                    None
+    /// Decode and concatenate the readable content streams.
+    pub fn read_page_stream(&self) -> Option<Vec<u8>> {
+        if let Some(stream) = self.inner.get::<Stream<'_>>(CONTENTS) {
+            Some(stream.decoded_page_content().ok()?.into_owned())
+        } else if let Some(array) = self.inner.get::<Array<'_>>(CONTENTS) {
+            let mut ranges = hash::Map::<_, core::ops::Range<usize>>::default();
+            let mut collected = vec![];
+            // A part that is no stream is passed over, as `MuPDF` passes it
+            // over (`PyMuPDF` 1.28.2, observed): a null, a number, a dictionary,
+            // a reference to none.
+            for item in array.raw_iter() {
+                let key = self.body_key(&item);
+                if let Some(range) = key.and_then(|k| ranges.get(&k)) {
+                    collected.extend_from_within(range.clone());
+                    continue;
                 }
-            })
-            .as_ref()
-            .map(|d| d.as_slice())
+                let stream = match item {
+                    MaybeRef::Ref(r) => self.xref().get_with::<Stream<'_>>(r.into(), array.ctx()),
+                    MaybeRef::NotRef(object) => object.into_stream(),
+                };
+                let Some(stream) = stream else {
+                    continue;
+                };
+                let start = collected.len();
+                if let Ok(data) = stream.decoded_page_content() {
+                    collected.reserve(data.len() + 1);
+                    collected.extend_from_slice(&data);
+                    // Streams must have at least one whitespace in-between.
+                    collected.push(b' ');
+                }
+                if let Some(key) = key {
+                    ranges.insert(key, start..collected.len());
+                }
+            }
+
+            Some(collected)
+        } else {
+            None
+        }
+    }
+
+    /// Return the concatenated decoded content or the first content error.
+    pub fn try_page_stream(&self) -> Result<Vec<u8>, ContentError> {
+        let mut content = vec![];
+        self.try_page_stream_to(&mut |data| content.extend_from_slice(data))?;
+        Ok(content)
+    }
+
+    /// Emits each decoded content stream and the separators between array entries.
+    pub fn try_page_stream_to(&self, out: &mut dyn FnMut(&[u8])) -> Result<(), ContentError> {
+        let xref = self.xref();
+        let (result, lost) = xref.watch(|| {
+            let resolve = |item: MaybeRef<Object<'a>>| {
+                let id = item.as_obj_ref().map(Into::into);
+                (id, item.resolve(&self.ctx).unwrap_or(Object::Null(Null)))
+            };
+            let emit = |id, object, spaced, out: &mut dyn FnMut(&[u8])| match object {
+                Object::Stream(stream) => {
+                    let data = stream
+                        .checked_page_content()
+                        .map_err(|e| ContentError::Decode(id, e))?;
+                    out(&data);
+                    if spaced {
+                        out(b" ");
+                    }
+                    Ok(())
+                }
+                Object::Null(_) => Ok(()),
+                _ => Err(ContentError::Unreadable(id)),
+            };
+            if let Some(contents) = self.inner.get_raw(CONTENTS) {
+                let (id, value) = resolve(contents);
+                if let Object::Array(array) = value {
+                    for item in array.raw_iter() {
+                        let (id, obj) = resolve(item);
+                        emit(id, obj, true, out)?;
+                    }
+                } else {
+                    emit(id, value, false, out)?;
+                }
+            } else if self.inner.contains_key(CONTENTS) {
+                return Err(ContentError::Unreadable(self.id));
+            }
+            Ok(())
+        });
+        match lost {
+            Some(id) => Err(ContentError::Unreadable(Some(id))),
+            None => result,
+        }
+    }
+
+    fn body_key<T>(&self, item: &MaybeRef<T>) -> Option<ContentKey<'a>> {
+        match item {
+            MaybeRef::Ref(r) => self.ctx.xref().content_key((*r).into()),
+            MaybeRef::NotRef(_) => None,
+        }
+    }
+
+    /// The first unreadable listed object encountered while reading this item.
+    pub fn unreadable(&self) -> Option<ObjectIdentifier> {
+        self.unreadable
     }
 
     /// Get the resources of the page.
@@ -528,7 +506,7 @@ impl<'a> Page<'a> {
 }
 
 /// A structure keeping track of the resources of a page.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Resources<'a> {
     /// The raw dictionary of external graphics states.
     pub ext_g_states: Dict<'a>,
@@ -549,22 +527,19 @@ pub struct Resources<'a> {
 impl<'a> Resources<'a> {
     /// Create a new `Resources` object.
     pub fn new(resources: Dict<'a>) -> Self {
-        let ext_g_states = resources.get::<Dict<'_>>(EXT_G_STATE).unwrap_or_default();
-        let fonts = resources.get::<Dict<'_>>(FONT).unwrap_or_default();
-        let color_spaces = resources.get::<Dict<'_>>(COLORSPACE).unwrap_or_default();
-        let x_objects = resources.get::<Dict<'_>>(XOBJECT).unwrap_or_default();
-        let patterns = resources.get::<Dict<'_>>(PATTERN).unwrap_or_default();
-        let shadings = resources.get::<Dict<'_>>(SHADING).unwrap_or_default();
-        let properties = resources.get::<Dict<'_>>(PROPERTIES).unwrap_or_default();
+        Self::read(|key| resources.get::<Dict<'_>>(key))
+    }
 
+    fn read(mut category: impl FnMut(&'static [u8]) -> Option<Dict<'a>>) -> Self {
+        let mut category = |key| category(key).unwrap_or_default();
         Self {
-            ext_g_states,
-            fonts,
-            color_spaces,
-            properties,
-            x_objects,
-            patterns,
-            shadings,
+            ext_g_states: category(EXT_G_STATE),
+            fonts: category(FONT),
+            color_spaces: category(COLORSPACE),
+            x_objects: category(XOBJECT),
+            patterns: category(PATTERN),
+            shadings: category(SHADING),
+            properties: category(PROPERTIES),
         }
     }
 
@@ -641,23 +616,7 @@ pub(crate) mod cached {
             let xref_reference: &'static XRef = unsafe { core::mem::transmute(xref.deref()) };
 
             let ctx = ReaderContext::new(xref_reference, false);
-            let pages = xref.retry_after_repair(|repaired| {
-                let pages_ref = xref_reference
-                    .get_with::<crate::object::Dict<'_>>(xref.root_id(), &ctx)
-                    .and_then(|catalog| catalog.get_ref(crate::object::dict::keys::PAGES))
-                    .map(Into::into)
-                    .unwrap_or(xref.trailer_data().pages_ref);
-                let tree = xref_reference
-                    .get_with(pages_ref, &ctx)
-                    .and_then(|p| Pages::new(&p, &ctx, xref_reference));
-                match tree {
-                    Some((pages, true)) if repaired && pages.is_empty() => {
-                        Pages::new_brute_force(&ctx, xref_reference).or(Some(pages))
-                    }
-                    Some((pages, _)) => Some(pages),
-                    None => Pages::new_brute_force(&ctx, xref_reference),
-                }
-            })?;
+            let pages = xref.retry_after_repair(|_| Pages::new(&ctx, xref_reference))?;
 
             Some(Self { pages, _xref: xref })
         }
@@ -665,20 +624,5 @@ pub(crate) mod cached {
         pub(crate) fn get(&self) -> &Pages<'_> {
             &self.pages
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unfinished_array_parent_does_not_trigger_repair() {
-        let mut reader = Reader::new(b"[ 0 1");
-        assert!(matches!(
-            DictOnly::<'_, false>::read_indirect(&mut reader, ReaderContext::dummy_ref()),
-            Some(DictOnly(None))
-        ));
-        assert_eq!(reader.peek_byte(), Some(b'['));
     }
 }

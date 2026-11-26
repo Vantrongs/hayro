@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 #[derive(Clone)]
 enum StringInner<'a> {
     Borrowed(&'a [u8]),
-    Owned(SmallVec<[u8; 23]>),
+    Owned(crate::sync::Arc<[u8]>),
 }
 
 impl AsRef<[u8]> for StringInner<'_> {
@@ -123,17 +123,21 @@ impl String<'_> {
 impl<'a> Readable<'a> for String<'a> {
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         let decoded = match r.peek_byte()? {
-            b'<' => StringInner::Owned(read_hex(r)?),
+            b'<' => StringInner::Owned(read_hex(r)?.into_vec().into()),
             b'(' => read_literal(r)?,
             _ => return None,
         };
 
         let final_data = if ctx.xref().needs_decryption(ctx) {
             if let Some(obj_number) = ctx.obj_number() {
-                ctx.xref()
-                    .decrypt(obj_number, decoded.as_ref(), DecryptionTarget::String)
-                    .map(StringInner::from)
-                    .unwrap_or(decoded)
+                let Some(plain) =
+                    ctx.xref()
+                        .decrypt(obj_number, decoded.as_ref(), DecryptionTarget::String)
+                else {
+                    ctx.xref().note(Some(obj_number));
+                    return None;
+                };
+                StringInner::from(plain)
             } else {
                 decoded
             }
@@ -147,7 +151,7 @@ impl<'a> Readable<'a> for String<'a> {
 
 impl From<Vec<u8>> for StringInner<'_> {
     fn from(value: Vec<u8>) -> Self {
-        Self::Owned(SmallVec::from_vec(value))
+        Self::Owned(value.into())
     }
 }
 
@@ -209,7 +213,7 @@ fn read_literal<'a>(r: &mut Reader<'a>) -> Option<StringInner<'a>> {
     }
 
     let mut r = Reader::new(data);
-    let mut result = SmallVec::new();
+    let mut result = SmallVec::<[u8; 23]>::new();
 
     loop {
         if r.read_eol().is_some() {
@@ -280,7 +284,7 @@ fn read_literal<'a>(r: &mut Reader<'a>) -> Option<StringInner<'a>> {
         }
     }
 
-    Some(StringInner::Owned(result))
+    Some(StringInner::Owned(result.into_vec().into()))
 }
 
 fn is_octal_digit(byte: u8) -> bool {

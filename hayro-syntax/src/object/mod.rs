@@ -216,7 +216,9 @@ impl Object<'_> {
     ) -> Option<()> {
         match r.peek_byte()? {
             b'n' => Null::skip(r, is_content_stream),
-            b't' | b'f' => bool::skip(r, is_content_stream),
+            b't' | b'f' if r.peek_tag(b"true").is_some() || r.peek_tag(b"false").is_some() => {
+                bool::skip(r, is_content_stream)
+            }
             b'/' => Name::skip(r, is_content_stream),
             b'<' => match r.peek_bytes(2)? {
                 b"<<" => Dict::skip_in(r, is_content_stream, depth, ends),
@@ -259,7 +261,9 @@ impl<'a> Readable<'a> for Object<'a> {
     fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
         let object = match r.peek_byte()? {
             b'n' => Self::Null(Null::read(r, ctx)?),
-            b't' | b'f' => Self::Boolean(bool::read(r, ctx)?),
+            b't' | b'f' if r.peek_tag(b"true").is_some() || r.peek_tag(b"false").is_some() => {
+                Self::Boolean(bool::read(r, ctx)?)
+            }
             b'/' => Self::Name(Name::read(r, ctx)?),
             b'<' => match r.peek_bytes(2)? {
                 b"<<" => Self::Dict(Dict::read(r, ctx)?),
@@ -373,6 +377,84 @@ pub fn dict_or_stream<'a, 'b>(
         Some((stream.dict(), Some(stream)))
     } else {
         obj.cast_ref::<Dict<'a>>().map(|dict| (dict, None))
+    }
+}
+
+/// A source value with its original number spelling.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Written<'a> {
+    /// A reference, which only an item or a value is.
+    Ref(ObjRef),
+    /// The null object.
+    Null,
+    /// A boolean.
+    Boolean(bool),
+    /// A number, as the bytes it is written as: a sign, digits, points and minuses.
+    Number(&'a [u8]),
+    /// A string, decoded and decrypted.
+    String(String<'a>),
+    /// A name, decoded.
+    Name(Name<'a>),
+    /// A dictionary.
+    Dict(Dict<'a>),
+    /// An array.
+    Array(Array<'a>),
+    /// A stream, which only an object of its own is.
+    Stream(Stream<'a>),
+}
+
+impl<'a> Written<'a> {
+    /// The item `r` is at, read in `ctx` as a `MaybeRef<Object>` is read, after
+    /// white space and comments.
+    pub(crate) fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
+        r.skip_white_spaces_and_comments();
+        let at = r.offset();
+        if r.at_end() {
+            return None;
+        }
+        let Some(value) = r.read_with_context::<MaybeRef<Object<'a>>>(ctx) else {
+            ctx.xref().note(ctx.obj_number());
+            return None;
+        };
+        Some(match value {
+            MaybeRef::Ref(reference) => Self::Ref(reference),
+            MaybeRef::NotRef(object) => Self::of(object, r.range(at..r.offset())?),
+        })
+    }
+
+    /// `object`, read from `bytes`.
+    pub(crate) fn of(object: Object<'a>, bytes: &'a [u8]) -> Self {
+        match object {
+            Object::Null(_)
+                if !bytes.is_empty()
+                    && bytes
+                        .iter()
+                        .all(|b| b.is_ascii_digit() || matches!(b, b'-' | b'+' | b'.')) =>
+            {
+                Self::Number(bytes)
+            }
+            Object::Null(_) => Self::Null,
+            Object::Boolean(value) => Self::Boolean(value),
+            Object::Number(_) => Self::Number(bytes),
+            Object::String(string) => Self::String(string),
+            Object::Name(name) => Self::Name(name),
+            Object::Dict(dict) => Self::Dict(dict),
+            Object::Array(array) => Self::Array(array),
+            Object::Stream(stream) => Self::Stream(stream),
+        }
+    }
+}
+
+impl<'a> Readable<'a> for Written<'a> {
+    fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
+        let start = r.offset();
+        let obj = r.read::<Object<'a>>(ctx)?;
+        Some(Self::of(obj, r.range(start..r.offset())?))
+    }
+    fn read_indirect(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
+        let start = r.offset();
+        let obj = r.read_indirect::<Object<'a>>(ctx)?;
+        Some(Self::of(obj, r.range(start..r.offset())?))
     }
 }
 

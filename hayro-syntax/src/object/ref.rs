@@ -90,7 +90,7 @@ fn read_ref_integer(r: &mut Reader<'_>, ends: &impl Ends) -> Option<i64> {
 }
 
 /// Either an object or a reference to one.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum MaybeRef<T> {
     /// A reference to an object.
     Ref(ObjRef),

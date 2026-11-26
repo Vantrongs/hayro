@@ -24,6 +24,11 @@ impl Number {
     /// The number one.
     pub const ONE: Self = Self::from_i32(1);
 
+    /// Whether this value was read as an integer.
+    pub const fn is_integer(&self) -> bool {
+        matches!(self.0, InternalNumber::Integer(_))
+    }
+
     /// Returns the number as a f64.
     pub fn as_f64(&self) -> f64 {
         match self.0 {
