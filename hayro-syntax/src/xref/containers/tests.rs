@@ -414,3 +414,21 @@ fn nested_results_match_fresh_readers() {
         (dict.contains_key(ROOT), dict.contains_key(TYPE))
     );
 }
+
+#[test]
+fn shared_tail_keeps_each_dictionarys_keys_and_height() {
+    let headers = "<< /Root 1 % << /Type [[2]] % << /Other 3 %";
+    for tail in ["/Z [1] >>", "/Z ["] {
+        let input = format!("{headers}\n {tail}");
+        let mut shared = Containers::default();
+        let shape = |c: Container| (c.end, c.has_root, c.has_type, c.height);
+        for (at, _) in headers.match_indices("<<") {
+            let reader = Reader::new_with(input.as_bytes(), at);
+            let fresh = Containers::default().resolve(&Unknown, reader.clone());
+            assert_eq!(
+                shared.resolve(&Unknown, reader).map(shape),
+                fresh.map(shape)
+            );
+        }
+    }
+}

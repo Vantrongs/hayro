@@ -2,7 +2,7 @@ use crate::object::dict::keys::{ROOT, TYPE};
 use crate::object::name::decoded_bytes;
 use crate::object::{MAX_OBJECT_NESTING_DEPTH, Name, Object};
 use crate::reader::{Ends, Reader, ReaderExt, skip_white_spaces_and_comments_in};
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 const MAX_FAILED_CACHE: usize = 4 * MAX_OBJECT_NESTING_DEPTH;
@@ -12,6 +12,8 @@ const MAX_BATCH_STEPS: usize = 8 * MAX_OBJECT_NESTING_DEPTH;
 #[derive(Default)]
 pub(super) struct Containers {
     failed: BTreeSet<usize>,
+    tails: BTreeMap<(usize, bool), Option<Container>>,
+    furthest: usize,
     last_ok: Option<(usize, Container)>,
     frames: Vec<Frame>,
 }
@@ -24,10 +26,28 @@ pub(super) struct Container {
     height: u16,
 }
 
+impl Container {
+    const EMPTY: Self = Self {
+        end: 0,
+        has_root: false,
+        has_type: false,
+        height: 1,
+    };
+
+    fn append(&mut self, tail: Self) {
+        self.end = tail.end;
+        self.has_root |= tail.has_root;
+        self.has_type |= tail.has_type;
+        self.height = self.height.max(tail.height);
+    }
+}
+
 struct Frame {
     start: usize,
     dict: bool,
     value: Container,
+    after_join: bool,
+    prefixes: Vec<(usize, Container)>,
 }
 
 impl Frame {
@@ -42,12 +62,9 @@ impl Frame {
         Some(Self {
             start,
             dict,
-            value: Container {
-                end: 0,
-                has_root: false,
-                has_type: false,
-                height: 1,
-            },
+            value: Container::EMPTY,
+            after_join: false,
+            prefixes: Vec::new(),
         })
     }
 
@@ -77,6 +94,13 @@ impl Containers {
     }
 
     pub(super) fn evict_before(&mut self, pos: usize) {
+        while self
+            .tails
+            .first_key_value()
+            .is_some_and(|(&(at, _), _)| at < pos)
+        {
+            self.tails.pop_first();
+        }
         while self.failed.first().is_some_and(|&offset| offset < pos) {
             self.failed.pop_first();
         }
@@ -97,6 +121,7 @@ impl Containers {
         let mut doomed_prefix = 0;
         let mut batch_steps = 0;
         let mut batch_truncated = false;
+        let mut syntax_error = false;
         while let Some(frame) = self.frames.last_mut() {
             if doomed_prefix > 0 {
                 if doomed_prefix >= MAX_OBJECT_NESTING_DEPTH || batch_steps == MAX_BATCH_STEPS {
@@ -111,15 +136,48 @@ impl Containers {
                 }
                 batch_steps += 1;
             }
-            skip_white_spaces_and_comments_in(&mut r, ends);
+            let after_comment = skip_trivia(&mut r, ends);
+            let join = core::mem::take(&mut frame.after_join) || after_comment;
+            let mut hit = false;
+            // Separate probes can meet after a literal string, a comment, or a shared child.
+            if join && r.offset() <= self.furthest && doomed_prefix == 0 {
+                let key = (r.offset(), frame.dict);
+                match self.tails.get(&key) {
+                    Some(Some(tail)) => {
+                        frame.value.append(*tail);
+                        r.jump(tail.end);
+                        hit = true;
+                    }
+                    Some(None) => {
+                        syntax_error = true;
+                        doomed_prefix = self.frames.len();
+                        break;
+                    }
+                    None => frame.prefixes.push((
+                        key.0,
+                        core::mem::replace(&mut frame.value, Container::EMPTY),
+                    )),
+                }
+            }
             let closer: &[u8] = if frame.dict { b">>" } else { b"]" };
-            if r.forward_tag(closer).is_some() {
-                let mut closed = self.frames.pop().unwrap().value;
+            if hit || r.forward_tag(closer).is_some() {
+                let frame = self.frames.pop().unwrap();
+                let shared = hit || !frame.prefixes.is_empty();
+                let mut closed = frame.value;
                 closed.end = r.offset();
+                for (at, mut prefix) in frame.prefixes.into_iter().rev() {
+                    if !batch_truncated {
+                        self.tails.insert((at, frame.dict), Some(closed));
+                    }
+                    prefix.append(closed);
+                    closed = prefix;
+                }
                 let Some(parent) = self.frames.last_mut() else {
+                    self.furthest = self.furthest.max(r.offset());
                     self.last_ok = Some((start, closed));
                     return Some(closed);
                 };
+                parent.after_join |= shared;
                 parent.value.height = parent.value.height.max(closed.height + 1);
                 if usize::from(parent.value.height) > MAX_OBJECT_NESTING_DEPTH {
                     doomed_prefix = self.frames.len();
@@ -129,10 +187,10 @@ impl Containers {
             }
 
             let has_key = frame.dict && frame.read_dict_key(&mut r);
-            if has_key {
-                skip_white_spaces_and_comments_in(&mut r, ends);
-            }
-            if let Some(open) = Frame::open(&mut r) {
+            let shared_value = has_key && skip_trivia(&mut r, ends);
+            frame.after_join = shared_value || r.peek_byte() == Some(b'(');
+            if let Some(mut open) = Frame::open(&mut r) {
+                open.after_join = shared_value;
                 if self.failed.contains(&open.start) {
                     doomed_prefix = self.frames.len();
                     break;
@@ -149,9 +207,18 @@ impl Containers {
             };
             if scalar.is_none() {
                 if !batch_truncated {
+                    syntax_error = true;
                     doomed_prefix = self.frames.len();
                 }
                 break;
+            }
+        }
+        self.furthest = self.furthest.max(r.offset());
+        if syntax_error {
+            for frame in &self.frames {
+                for &(at, _) in &frame.prefixes {
+                    self.tails.insert((at, frame.dict), None);
+                }
             }
         }
         // Only the outer prefix is known to fail when the batch budget runs out.
@@ -167,6 +234,15 @@ impl Containers {
         self.frames.clear();
         None
     }
+}
+
+fn skip_trivia(r: &mut Reader<'_>, ends: &impl Ends) -> bool {
+    r.skip_white_spaces();
+    if r.peek_byte() != Some(b'%') {
+        return false;
+    }
+    skip_white_spaces_and_comments_in(r, ends);
+    true
 }
 
 #[cfg(test)]

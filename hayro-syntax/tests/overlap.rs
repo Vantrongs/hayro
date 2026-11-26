@@ -290,6 +290,22 @@ fn linear(family: &str, cost: impl Fn(u32) -> (usize, usize)) {
     );
 }
 
+#[test]
+fn repair_shares_container_tails_after_strings_and_comments() {
+    for start in ["[ ( ", "[ x% "] {
+        linear(start, |n| {
+            let headers = r"5 0 obj [ \( ".repeat(n as usize);
+            let tail = "/x ".repeat(n as usize);
+            let body = format!("4 0 obj\n{start}{headers})\n{tail}]\nendobj");
+            let file = table_file(&one_page(100, "1"), body.as_bytes(), &[(4, 0)], true);
+            let started = thread_cpu_time();
+            let (unit, used) = measure(|| unit(file));
+            assert_eq!(unit, (Some(1.0), None));
+            ((thread_cpu_time() - started).as_nanos() as usize, used.peak)
+        });
+    }
+}
+
 // Entries that lead into the string of the object before, all sharing one tail: each
 // body is lexed in its slot, where no string ends, so each but the innermost is lost,
 // and is read once, as is the tail; the pages keep their geometry.
