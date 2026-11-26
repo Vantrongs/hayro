@@ -7,20 +7,55 @@ use hayro_syntax::object::{Array, Dict, MaybeRef, Name, Number, ObjRef, Object, 
 use hayro_syntax::xref::XRef;
 use smallvec::SmallVec;
 use std::any::{Any, TypeId};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 pub(crate) type Numbers = SmallVec<[f64; 8]>;
 
-pub(crate) fn real(n: Number) -> f64 {
-    f64::from(n.as_f32())
+thread_local! {
+    static UNREADABLE_NUMBER: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn reading<T>(f: impl FnOnce() -> T) -> (T, bool) {
+    let before = UNREADABLE_NUMBER.replace(false);
+    let value = f();
+    (value, UNREADABLE_NUMBER.replace(before))
+}
+
+pub(crate) fn read<T>(f: impl FnOnce() -> T) -> Result<T, Unsupported> {
+    match reading(f) {
+        (_, true) => Err(Unsupported::Number),
+        (value, false) => Ok(value),
+    }
+}
+
+pub(crate) fn unreadable_number() {
+    UNREADABLE_NUMBER.set(true);
+}
+
+fn real(n: Number) -> f64 {
+    n.viewer_f32().map_or_else(
+        || {
+            unreadable_number();
+            0.0
+        },
+        f64::from,
+    )
+}
+
+pub(crate) fn operand_real(n: Number) -> f64 {
+    let value = real(n);
+    if !n.is_integer() && n.as_f64() as f32 != value as f32 {
+        unreadable_number();
+    }
+    value
 }
 
 fn int(n: Number) -> i32 {
     if n.is_integer() {
         n.as_i64() as i32
     } else {
-        let rounded = (n.as_f32() + 0.5).floor();
+        let rounded = (real(n) as f32 + 0.5).floor();
         if (-2_147_483_648.0..2_147_483_648.0).contains(&rounded) {
             rounded as i32
         } else {

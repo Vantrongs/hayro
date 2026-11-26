@@ -11,12 +11,12 @@ use crate::util::PointExt;
 use hayro_syntax::bit_reader::{BitReader, bit_mask};
 use hayro_syntax::object::Array;
 use hayro_syntax::object::Dict;
-use hayro_syntax::object::Object;
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::{
     BACKGROUND, BITS_PER_COMPONENT, BITS_PER_COORDINATE, BITS_PER_FLAG, COLORSPACE, COORDS, DECODE,
     DOMAIN, EXTEND, FUNCTION, SHADING_TYPE, VERTICES_PER_ROW,
 };
+use hayro_syntax::object::{Number, Object};
 use kurbo::{Affine, BezPath, Point, Shape};
 use smallvec::{SmallVec, smallvec};
 use std::sync::Arc;
@@ -179,6 +179,9 @@ impl ShadingFunction {
     }
 }
 
+mod radial;
+pub use radial::RadialCircles;
+
 /// A type of shading.
 #[derive(Debug)]
 pub enum ShadingType {
@@ -201,13 +204,15 @@ pub enum ShadingType {
         function: ShadingFunction,
         /// The extends in the left/right direction of the shading.
         extend: [bool; 2],
-        /// Whether the shading is axial or radial.
-        axial: bool,
+        /// Local circle geometry for radial shadings.
+        circles: Option<RadialCircles>,
     },
     /// A triangle-mesh shading.
     TriangleMesh {
         /// The triangles making up the shading.
         triangles: Vec<Triangle>,
+        /// The decode range for the parameter when the mesh has a function.
+        domain: [f32; 2],
         /// An optional function used for calculating the sampled color values.
         function: Option<ShadingFunction>,
     },
@@ -215,10 +220,12 @@ pub enum ShadingType {
     PatchMesh {
         /// The patches that make up the shading.
         patches: Vec<Patch>,
+        /// The decode range for the parameter when the mesh has a function.
+        domain: [f32; 2],
         /// An optional function used for calculating the sampled color values.
         function: Option<ShadingFunction>,
     },
-    /// A dummy shading that should just be drawn transparent.
+    /// A shading with no painted geometry.
     Dummy,
 }
 
@@ -234,6 +241,7 @@ pub struct Shading {
     pub clip_path: Option<BezPath>,
     /// The background color of the shading.
     pub background: Option<SmallVec<[f32; 4]>>,
+    pub(crate) unit_components: bool,
     pub(crate) mesh_bounds: Option<kurbo::Rect>,
 }
 
@@ -258,6 +266,15 @@ impl Shading {
         let color_space = ColorSpace::new(dict.get(COLORSPACE)?, cache)?;
 
         let mut mesh_bounds = None;
+        let mut unit_components = false;
+        let mut mesh_decode = || {
+            let decode = dict
+                .get::<Array<'_>>(DECODE)?
+                .iter::<f32>()
+                .collect::<Vec<_>>();
+            unit_components = decode.get(4..)?.iter().all(|v| (0.0..=1.0).contains(v));
+            Some(decode)
+        };
         let shading_type = match shading_num {
             1 => {
                 let domain = dict.get::<[f32; 4]>(DOMAIN).unwrap_or([0.0, 1.0, 0.0, 1.0]);
@@ -274,17 +291,20 @@ impl Shading {
                 let domain = dict.get::<[f32; 2]>(DOMAIN).unwrap_or([0.0, 1.0]);
                 let function = read_function(dict, &color_space)?;
                 let extend = dict.get::<[bool; 2]>(EXTEND).unwrap_or([false, false]);
-                let (coords, invalid) = if shading_num == 2 {
+                let (coords, circles, invalid) = if shading_num == 2 {
                     let read = dict.get::<[f64; 4]>(COORDS)?;
                     let invalid = read[0] == read[2] && read[1] == read[3];
-                    ([read[0], read[1], read[2], read[3], 0.0, 0.0], invalid)
+                    (
+                        [read[0], read[1], read[2], read[3], 0.0, 0.0],
+                        None,
+                        invalid,
+                    )
                 } else {
-                    let read = dict.get::<[f64; 6]>(COORDS)?;
-                    let invalid = read[0] == read[3] && read[1] == read[4] && read[2] == read[5];
-                    (read, invalid)
+                    let read = dict.get::<[Number; 6]>(COORDS)?;
+                    let circles = RadialCircles::new(read);
+                    let invalid = circles.p1 == Point::ZERO && circles.dr == 0.0;
+                    (read.map(|n| n.as_f64()), Some(circles), invalid)
                 };
-
-                let axial = shading_num == 2;
 
                 if invalid {
                     ShadingType::Dummy
@@ -294,7 +314,7 @@ impl Shading {
                         function,
                         extend,
                         coords,
-                        axial,
+                        circles,
                     }
                 }
             }
@@ -305,10 +325,7 @@ impl Shading {
                 let bp_comp = dict.get::<u8>(BITS_PER_COMPONENT)?;
                 let bpf = dict.get::<u8>(BITS_PER_FLAG)?;
                 let function = read_function(dict, &color_space);
-                let decode = dict
-                    .get::<Array<'_>>(DECODE)?
-                    .iter::<f32>()
-                    .collect::<Vec<_>>();
+                let decode = mesh_decode()?;
 
                 let (triangles, bounds) = read_free_form_triangles(
                     stream_data.as_ref(),
@@ -322,6 +339,7 @@ impl Shading {
 
                 ShadingType::TriangleMesh {
                     triangles,
+                    domain: decode.get(4..6)?.try_into().ok()?,
                     function,
                 }
             }
@@ -331,10 +349,7 @@ impl Shading {
                 let bp_coord = dict.get::<u8>(BITS_PER_COORDINATE)?;
                 let bp_comp = dict.get::<u8>(BITS_PER_COMPONENT)?;
                 let function = read_function(dict, &color_space);
-                let decode = dict
-                    .get::<Array<'_>>(DECODE)?
-                    .iter::<f32>()
-                    .collect::<Vec<_>>();
+                let decode = mesh_decode()?;
                 let vertices_per_row = dict.get::<u32>(VERTICES_PER_ROW)?;
 
                 let (triangles, bounds) = read_lattice_triangles(
@@ -349,20 +364,18 @@ impl Shading {
 
                 ShadingType::TriangleMesh {
                     triangles,
+                    domain: decode.get(4..6)?.try_into().ok()?,
                     function,
                 }
             }
-            6 => {
+            6 | 7 => {
                 let stream = stream?;
                 let stream_data = stream.decoded_data().ok()?;
                 let bp_coord = dict.get::<u8>(BITS_PER_COORDINATE)?;
                 let bp_comp = dict.get::<u8>(BITS_PER_COMPONENT)?;
                 let bpf = dict.get::<u8>(BITS_PER_FLAG)?;
                 let function = read_function(dict, &color_space);
-                let decode = dict
-                    .get::<Array<'_>>(DECODE)?
-                    .iter::<f32>()
-                    .collect::<Vec<_>>();
+                let decode = mesh_decode()?;
 
                 let (patches, bounds) = read_patch_mesh(
                     stream_data.as_ref(),
@@ -371,36 +384,19 @@ impl Shading {
                     bp_comp,
                     function.is_some(),
                     &decode,
-                    PatchKind::Coons,
+                    if shading_num == 6 {
+                        PatchKind::Coons
+                    } else {
+                        PatchKind::TensorProduct
+                    },
                 )?;
                 mesh_bounds = bounds;
 
-                ShadingType::PatchMesh { patches, function }
-            }
-            7 => {
-                let stream = stream?;
-                let stream_data = stream.decoded_data().ok()?;
-                let bp_coord = dict.get::<u8>(BITS_PER_COORDINATE)?;
-                let bp_comp = dict.get::<u8>(BITS_PER_COMPONENT)?;
-                let bpf = dict.get::<u8>(BITS_PER_FLAG)?;
-                let function = read_function(dict, &color_space);
-                let decode = dict
-                    .get::<Array<'_>>(DECODE)?
-                    .iter::<f32>()
-                    .collect::<Vec<_>>();
-
-                let (patches, bounds) = read_patch_mesh(
-                    stream_data.as_ref(),
-                    bpf,
-                    bp_coord,
-                    bp_comp,
-                    function.is_some(),
-                    &decode,
-                    PatchKind::TensorProduct,
-                )?;
-                mesh_bounds = bounds;
-
-                ShadingType::PatchMesh { patches, function }
+                ShadingType::PatchMesh {
+                    patches,
+                    function,
+                    domain: decode.get(4..6)?.try_into().ok()?,
+                }
             }
             _ => return None,
         };
@@ -417,6 +413,7 @@ impl Shading {
             clip_path: bbox.map(|r| r.to_path(0.1)),
             background,
             mesh_bounds,
+            unit_components,
         })
     }
 }

@@ -1866,3 +1866,62 @@ fn resources_pages_share_are_read_once() {
         );
     }
 }
+
+fn relabel(file: &mut [u8], from: u8, to: u8) {
+    let header = [from, b' ', b'0', b' ', b'o', b'b', b'j'];
+    let at = file
+        .windows(header.len())
+        .position(|s| s == header)
+        .unwrap();
+    file[at] = to;
+}
+
+#[test]
+fn mislabelled_object() {
+    let mut file = pdf(&[
+        CATALOG,
+        &pages_node("1", "3 0 R"),
+        "<< /Type /Page /MediaBox [0 0 300 200] /Rotate 4 0 R >>",
+        "90",
+    ]);
+    relabel(&mut file, b'4', b'1');
+    assert_eq!(
+        shown("mislabelled-object", file),
+        ["3 [0 0 300 200] = 90 -"]
+    );
+}
+
+#[test]
+fn mislabelled_node_kids() {
+    let mut file = pdf(&[
+        CATALOG,
+        "<< /Type /Pages /Count 2 /Kids 3 0 R >>",
+        "[5 0 R 4 0 R]",
+        "<< /Type /Page >>",
+        "<< /Type /Page >>",
+    ]);
+    relabel(&mut file, b'2', b'1');
+    relabel(&mut file, b'3', b'1');
+    assert_eq!(listed("mislabelled-node-kids", file), ["5", "4"]);
+}
+
+#[test]
+fn late_repair_box() {
+    let mut file = pdf(&[
+        CATALOG,
+        &pages_node("2", "4 0 R 5 0 R"),
+        "<< /Type /Pages /MediaBox [0 0 100 100] >>",
+        "<< /Type /Page /Parent 3 0 R >>",
+        "<< /Type /Page /Parent 3 0 R /UserUnit 6 0 R >>",
+        "null",
+        "<< /Type /Pages /MediaBox [0 0 200 200] >>",
+    ]);
+    relabel(&mut file, b'7', b'3');
+    let xref = file.windows(7).position(|s| s == b"7 1\n000").unwrap() + 4;
+    let five = file.windows(7).position(|s| s == b"5 0 obj").unwrap();
+    file[xref..xref + 10].copy_from_slice(format!("{five:010}").as_bytes());
+    assert_eq!(
+        shown("late-repair-box", file),
+        ["4 [0 0 200 200] = 0 -", "5 [0 0 200 200] = 0 -"]
+    );
+}

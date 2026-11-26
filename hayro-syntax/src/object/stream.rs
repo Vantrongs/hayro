@@ -22,6 +22,7 @@ use crate::trivia::is_white_space_character;
 use crate::util::find_needle;
 use crate::xref::XRef;
 use alloc::borrow::Cow;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
 use core::sync::atomic::AtomicBool;
@@ -202,6 +203,15 @@ impl<'a> FilterEntries<'a> {
     }
 }
 
+pub(super) struct CapturedFilters<'a> {
+    external: bool,
+    xref_stream: bool,
+    #[cfg(feature = "images")]
+    expand_fax: bool,
+    filters: SmallVec<[Filter; 2]>,
+    params: Box<[Dict<'a>]>,
+}
+
 struct FiltersAndParams<'a> {
     filters: SmallVec<[Filter; 2]>,
     params: SmallVec<[Dict<'a>; 2]>,
@@ -223,6 +233,8 @@ impl PartialEq for Stream<'_> {
 /// Additional parameters for decoding images.
 #[derive(Clone, PartialEq, Default)]
 pub struct ImageDecodeParams {
+    /// Keep the source sample precision for color-key masking.
+    pub has_color_key: bool,
     /// Whether the color space of the image is an indexed color space.
     pub is_indexed: bool,
     /// The bits per component of the image, if that information is available.
@@ -305,13 +317,27 @@ impl<'a> Stream<'a> {
         Some((Self::new(data, dict), end))
     }
 
-    fn filters_and_params(&self) -> FiltersAndParams<'a> {
-        let (filters, params) = self
-            .filter_entries()
-            .applied()
-            .map(|(f, e)| (f, e.params()))
-            .unzip();
+    fn filters_and_params(&self, keep: impl Fn(Filter) -> bool) -> FiltersAndParams<'a> {
+        let (filters, params) = if let Some(d) = self.dict.decoding() {
+            d.filters
+                .iter()
+                .copied()
+                .zip(d.params.iter())
+                .filter(|(f, _)| keep(*f))
+                .map(|(f, p)| (f, p.clone()))
+                .unzip()
+        } else {
+            self.filter_entries()
+                .applied()
+                .filter(|(f, _)| keep(*f))
+                .map(|(f, e)| (f, e.params()))
+                .unzip()
+        };
         FiltersAndParams { filters, params }
+    }
+
+    fn data_filters(&self) -> FiltersAndParams<'a> {
+        self.filters_and_params(|filter| filter != Filter::Crypt)
     }
 
     /// Filters paired with their original parameters.
@@ -326,7 +352,7 @@ impl<'a> Stream<'a> {
         params: &ImageDecodeParams,
         cancel: Option<CancelArc<AtomicBool>>,
     ) -> Option<FilterResult<'static>> {
-        let mut prefix = self.filters_and_params();
+        let mut prefix = self.data_filters();
         if prefix.filters.pop() != Some(Filter::CcittFaxDecode) {
             return None;
         }
@@ -356,7 +382,7 @@ impl<'a> Stream<'a> {
         params: &ImageDecodeParams,
         cancel: Option<CancelArc<AtomicBool>>,
     ) -> Option<JpegRows<'a>> {
-        let mut prefix = self.filters_and_params();
+        let mut prefix = self.data_filters();
         if prefix.filters.pop() != Some(Filter::DctDecode) {
             return None;
         }
@@ -370,7 +396,7 @@ impl<'a> Stream<'a> {
         &self,
         cancel: Option<CancelArc<AtomicBool>>,
     ) -> Result<DecodedReader<'a>, DecodeFailure> {
-        self.forward(&self.filters_and_params(), cancel, false)
+        self.forward(&self.data_filters(), cancel, false)
     }
 
     fn forward(
@@ -380,10 +406,7 @@ impl<'a> Stream<'a> {
         strict: bool,
     ) -> Result<DecodedReader<'a>, DecodeFailure> {
         let mut reader = DecodedReader::new(self.decrypted_reader()?, cancel, strict);
-        for (i, (filter, params)) in filters.filters.iter().zip(&filters.params).enumerate() {
-            if i == 0 && *filter == Filter::Crypt {
-                continue;
-            }
+        for (filter, params) in filters.filters.iter().zip(&filters.params) {
             reader
                 .add(*filter, params, None)
                 .ok_or(DecodeFailure::StreamDecode)?;
@@ -393,7 +416,7 @@ impl<'a> Stream<'a> {
 
     /// Decodes all data filters, discarding tentative output on failure.
     pub fn decoded_strict(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
-        let filters = self.filters_and_params();
+        let filters = self.data_filters();
         if filters.filters.is_empty()
             && !self.has_external_file()
             && !self.dict.ctx().xref().needs_decryption(self.dict.ctx())
@@ -418,10 +441,7 @@ impl<'a> Stream<'a> {
         drop(reader);
         let mut input;
         let mut chain = DecodedReader::new(self.decrypted_reader()?, cancel.clone(), strict);
-        for (i, (&filter, params)) in filters.filters.iter().zip(&filters.params).enumerate() {
-            if i == 0 && filter == Filter::Crypt {
-                continue;
-            }
+        for (&filter, params) in filters.filters.iter().zip(&filters.params) {
             let mode = if filter == Filter::FlateDecode && chain.ambiguous_flate_header()? {
                 let bytes = chain.collect_strict(None)?;
                 drop(chain);
@@ -455,9 +475,27 @@ impl<'a> Stream<'a> {
 
     /// Whether a file specification supplies the stream's data.
     pub fn has_external_file(&self) -> bool {
+        if let Some(captured) = self.dict.decoding() {
+            return captured.external;
+        }
         matches!(
             self.dict.get::<Object<'_>>(F),
             Some(Object::String(_) | Object::Dict(_))
+        )
+    }
+
+    fn is_xref_stream(&self) -> bool {
+        self.dict.decoding().map_or_else(
+            || self.dict.get::<Name<'_>>(TYPE).as_deref() == Some(XREF),
+            |capture| capture.xref_stream,
+        )
+    }
+
+    #[cfg(feature = "images")]
+    fn expand_fax(&self) -> bool {
+        self.dict.decoding().map_or_else(
+            || crate::filter::ccitt::can_expand(&self.dict),
+            |capture| capture.expand_fax,
         )
     }
 
@@ -469,13 +507,17 @@ impl<'a> Stream<'a> {
         let ctx = self.dict.ctx();
         let encrypted = self.dict.obj_id().is_some()
             && ctx.xref().needs_decryption(ctx)
-            && self.dict.get::<Name<'_>>(TYPE).as_deref() != Some(XREF);
+            && !self.is_xref_stream();
         let decryptor = if encrypted {
             ctx.xref().decryptor()
         } else {
             &Decryptor::None
         };
-        let filter = encrypted.then(|| self.crypt_filter()).flatten();
+        let filter = if encrypted {
+            self.crypt_filter()?
+        } else {
+            None
+        };
         let target = filter.as_ref().map_or(DecryptionTarget::Stream, |name| {
             DecryptionTarget::Named(name)
         });
@@ -495,10 +537,8 @@ impl<'a> Stream<'a> {
         }
         let ctx = self.dict.ctx();
 
-        if ctx.xref().needs_decryption(ctx)
-            && self.dict.get::<Name<'_>>(TYPE).as_deref() != Some(XREF)
-        {
-            let crypt_filter = self.crypt_filter();
+        if ctx.xref().needs_decryption(ctx) && !self.is_xref_stream() {
+            let crypt_filter = self.crypt_filter()?;
             let target = match &crypt_filter {
                 Some(name) => DecryptionTarget::Named(name),
                 None => DecryptionTarget::Stream,
@@ -531,7 +571,11 @@ impl<'a> Stream<'a> {
 
     /// Return the filters that are applied to the stream.
     pub fn filters(&self) -> SmallVec<[Filter; 2]> {
-        self.filters_and_params().filters
+        if let Some(d) = self.dict.decoding() {
+            d.filters.clone()
+        } else {
+            self.filter_entries().applied().map(|(f, _)| f).collect()
+        }
     }
 
     /// Return the decoded data of the stream.
@@ -550,18 +594,9 @@ impl<'a> Stream<'a> {
         if self.has_external_file() {
             return Err(DecodeFailure::StreamDecode);
         }
-        let chain = self.filters_and_params();
-        let mut filters = chain
-            .filters
-            .iter()
-            .zip(&chain.params)
-            .enumerate()
-            .filter_map(|(i, (filter, params))| {
-                (i != 0 || *filter != Filter::Crypt).then_some((filter, params))
-            });
-        match (filters.next(), filters.next()) {
-            (None, _) => self.try_raw_data(),
-            (Some((Filter::FlateDecode, _)), None) => {
+        match self.data_filters().filters.as_slice() {
+            [] => self.try_raw_data(),
+            [Filter::FlateDecode] => {
                 for key in [DP, DECODE_PARMS] {
                     if self.dict.get_ref(key).is_some()
                         || self
@@ -604,7 +639,7 @@ impl<'a> Stream<'a> {
             return Err(DecodeFailure::StreamDecode);
         }
 
-        let mut filters_and_params = self.filters_and_params();
+        let mut filters_and_params = self.data_filters();
         let first_image = filters_and_params.filters.iter().position(Filter::is_image);
         let image_params = match target {
             DecodeTarget::Image(params, _luma) => match first_image {
@@ -635,7 +670,8 @@ impl<'a> Stream<'a> {
                     #[cfg(feature = "images")]
                     if _luma
                         && filter == Filter::CcittFaxDecode
-                        && crate::filter::ccitt::can_expand(&self.dict, params)
+                        && !params.is_indexed
+                        && self.expand_fax()
                     {
                         return crate::filter::ccitt::Fax::new(&options, params.height, None)
                             .decode(&stored, crate::filter::ccitt::FaxRows::Luma8)
@@ -653,16 +689,11 @@ impl<'a> Stream<'a> {
 
         let mut current: Option<FilterResult<'a>> = None;
 
-        for (i, (filter, params)) in filters_and_params
+        for (filter, params) in filters_and_params
             .filters
             .iter()
-            .zip(filters_and_params.params.iter())
-            .enumerate()
+            .zip(&filters_and_params.params)
         {
-            if i == 0 && *filter == Filter::Crypt {
-                continue;
-            }
-
             let new = filter.apply(
                 current.as_ref().map(|c| c.data.as_ref()).unwrap_or(&data),
                 params,
@@ -678,23 +709,27 @@ impl<'a> Stream<'a> {
         }))
     }
 
-    fn crypt_filter(&self) -> Option<Name<'a>> {
-        let FiltersAndParams {
-            filters, params, ..
-        } = self.filters_and_params();
-
-        (filters.first() == Some(&Filter::Crypt)).then(|| {
-            params
-                .first()
-                .and_then(|params| params.get::<Name<'a>>(NAME))
-                .unwrap_or(Name::new_unescaped(IDENTITY))
-        })
+    fn crypt_filter(&self) -> Result<Option<Name<'a>>, DecodeFailure> {
+        let chain = self.filters_and_params(|_| true);
+        let mut selected = None;
+        for (i, (&filter, params)) in chain.filters.iter().zip(&chain.params).enumerate() {
+            if filter == Filter::Crypt {
+                let name = params
+                    .get::<Name<'_>>(NAME)
+                    .unwrap_or_else(|| Name::new_unescaped(IDENTITY));
+                if i != 0 && name.as_ref() != IDENTITY {
+                    return Err(DecodeFailure::Decryption);
+                }
+                selected.get_or_insert(name);
+            }
+        }
+        Ok(selected)
     }
 
     /// Owns the data needed to reopen this stream.
     pub fn to_owned_stream(&self) -> OwnedStream {
         let ctx = self.dict.ctx();
-        OwnedStream(match self.dict.obj_id().and_then(|_| ctx.lookup_id()) {
+        let owner = match self.dict.obj_id().and_then(|_| ctx.lookup_id()) {
             Some(id) => OwnedInner::Indirect {
                 xref: ctx.xref().clone(),
                 id,
@@ -704,15 +739,76 @@ impl<'a> Stream<'a> {
                 dict: Arc::from(self.dict.data()),
                 data: Arc::from(self.data),
             },
-        })
+        };
+        OwnedStream(Arc::new(CapturedStream::new(owner, |owner| {
+            let mut stream = owner.get()?;
+            stream.capture_decoding(true);
+            Some(stream)
+        })))
+    }
+
+    fn capture_decoding(&mut self, globals: bool) {
+        use crate::object::dict::keys::*;
+        let mut chain = self.filters_and_params(|_| true);
+        for (&filter, params) in chain.filters.iter().zip(&mut chain.params) {
+            let keys: &[&[u8]] = match filter {
+                Filter::FlateDecode => &[PREDICTOR, COLORS, COLUMNS, BITS_PER_COMPONENT],
+                Filter::LzwDecode => {
+                    &[EARLY_CHANGE, PREDICTOR, COLORS, COLUMNS, BITS_PER_COMPONENT]
+                }
+                Filter::Crypt => &[NAME],
+                Filter::DctDecode => &[COLOR_TRANSFORM],
+                Filter::CcittFaxDecode => &[
+                    K,
+                    COLUMNS,
+                    ROWS,
+                    END_OF_BLOCK,
+                    END_OF_LINE,
+                    ENCODED_BYTE_ALIGN,
+                    BLACK_IS_1,
+                ],
+                Filter::Jbig2Decode if globals => &[JBIG2_GLOBALS],
+                _ => &[],
+            };
+            params.capture_parameters(keys, |dict, key| match key {
+                JBIG2_GLOBALS => {
+                    let mut stream = dict.get::<Stream<'_>>(key)?;
+                    // Globals are decoded as a data stream; image filters cannot run there.
+                    stream.capture_decoding(false);
+                    Some(Object::Stream(stream))
+                }
+                NAME => dict.get::<Name<'_>>(key).map(Object::Name),
+                END_OF_BLOCK | END_OF_LINE | ENCODED_BYTE_ALIGN | BLACK_IS_1 => {
+                    dict.get::<bool>(key).map(Object::Boolean)
+                }
+                _ => dict.get::<super::Number>(key).map(Object::Number),
+            });
+        }
+        self.dict.set_decoding(CapturedFilters {
+            external: self.has_external_file(),
+            xref_stream: self.dict.ctx().xref().needs_decryption(self.dict.ctx())
+                && self.is_xref_stream(),
+            #[cfg(feature = "images")]
+            expand_fax: chain.filters.contains(&Filter::CcittFaxDecode) && self.expand_fax(),
+            filters: chain.filters,
+            params: chain.params.into_vec().into_boxed_slice(),
+        });
     }
 }
 
+type MaybeStream<'a> = Option<Stream<'a>>;
+self_cell::self_cell!(
+    struct CapturedStream {
+        owner: OwnedInner,
+        #[covariant]
+        dependent: MaybeStream,
+    }
+);
+
 /// A stream that owns what it needs to read it again (see [`Stream::to_owned_stream`]).
 #[derive(Clone)]
-pub struct OwnedStream(OwnedInner);
+pub struct OwnedStream(Arc<CapturedStream>);
 
-#[derive(Clone)]
 enum OwnedInner {
     Indirect {
         xref: XRef,
@@ -728,7 +824,21 @@ enum OwnedInner {
 impl OwnedStream {
     /// The stream; `None` if it can no longer be read.
     pub fn get(&self) -> Option<Stream<'_>> {
-        match &self.0 {
+        self.0.borrow_dependent().clone()
+    }
+
+    /// Bytes copied to retain the stream and dictionary.
+    pub fn copied_bytes(&self) -> usize {
+        match self.0.borrow_owner() {
+            OwnedInner::Indirect { .. } => 0,
+            OwnedInner::Inline { data, dict, .. } => data.len() + dict.len(),
+        }
+    }
+}
+
+impl OwnedInner {
+    fn get(&self) -> Option<Stream<'_>> {
+        match self {
             OwnedInner::Indirect { xref, id } => xref.get::<Stream<'_>>(*id),
             OwnedInner::Inline { xref, dict, data } => {
                 let dict = Reader::new(dict)
@@ -814,8 +924,10 @@ pub struct ImageData {
     pub alpha: Option<Vec<u8>>,
     /// The color space of the image.
     pub color_space: Option<ImageColorSpace>,
-    /// The bits per component of the image.
+    /// The number of bits used to store each sample.
     pub bits_per_component: u8,
+    /// Native bit depths where components of different precisions share that storage.
+    pub component_depths: Vec<u8>,
     /// The width of the image.
     pub width: u32,
     /// The height of the image.
@@ -870,7 +982,9 @@ impl NextEndstream {
         {
             let tail = r.tail()?;
             self.searched_from = Some(start);
-            self.marker = find_needle(tail, b"endstream").map(|offset| {
+            let found = find_needle(tail, b"endstream");
+            crate::work::bodies(found.map_or(tail.len(), |at| at + 9));
+            self.marker = found.map(|offset| {
                 let whitespace = trim_trailing_ascii_whitespace(&tail[..offset]);
                 (start + whitespace, start + offset)
             });
@@ -922,6 +1036,65 @@ mod tests {
     use crate::object::Stream;
     use crate::reader::Reader;
     use crate::reader::{ReaderContext, ReaderExt};
+
+    #[test]
+    fn repeated_identity_filters_preserve_samples_and_data_filters() {
+        let params = "<< /Name /Identity >>";
+        for (filters, parms, bytes) in [
+            ("/Crypt /Crypt", format!("{params} null"), "A"),
+            (
+                "/Crypt /ASCIIHexDecode /Crypt",
+                format!("null null {params}"),
+                "41>",
+            ),
+        ] {
+            let source = format!(
+                "<< /Filter [{filters}] /DecodeParms [{parms}] /Length {} >> stream\n{bytes}\nendstream",
+                bytes.len()
+            );
+            let stream = Reader::new(source.as_bytes())
+                .read_indirect::<Stream<'_>>(&ReaderContext::dummy())
+                .unwrap();
+            assert_eq!(stream.decoded().unwrap().as_ref(), b"A");
+            assert_eq!(stream.decoded_data().unwrap().as_ref(), b"A");
+            assert_eq!(stream.decoded_strict().unwrap().as_ref(), b"A");
+            assert_eq!(stream.filters().len(), filters.split_whitespace().count());
+        }
+    }
+
+    #[test]
+    fn named_crypt_filter_must_be_first() {
+        for (filters, parms, selected) in [
+            (
+                "/ASCIIHexDecode /Crypt",
+                "null << /Name /Identity >>",
+                Some(b"Identity".as_slice()),
+            ),
+            (
+                "/Crypt /Crypt",
+                "<< /Name /Cipher >> null",
+                Some(b"Cipher".as_slice()),
+            ),
+            ("/ASCIIHexDecode /Crypt", "null << /Name /Cipher >>", None),
+            ("/Crypt /Crypt", "null << /Name /Cipher >>", None),
+        ] {
+            let source = format!(
+                "<< /Filter [{filters}] /DecodeParms [{parms}] /Length 0 >> stream\n\nendstream"
+            );
+            let stream = Reader::new(source.as_bytes())
+                .read_indirect::<Stream<'_>>(&ReaderContext::dummy())
+                .unwrap();
+            match selected {
+                Some(expected) => {
+                    assert_eq!(stream.crypt_filter().unwrap().as_deref(), Some(expected))
+                }
+                None => assert!(matches!(
+                    stream.crypt_filter(),
+                    Err(super::DecodeFailure::Decryption)
+                )),
+            }
+        }
+    }
 
     #[test]
     fn field_values_refuse_corrupt_flate() {

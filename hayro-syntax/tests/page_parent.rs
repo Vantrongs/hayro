@@ -732,7 +732,7 @@ fn repaired_tree_with_missing_kid_recovers_page() {
 }
 
 #[test]
-fn invalid_body_triggers_page_recovery() {
+fn invalid_body_leaves_the_checked_table_intact() {
     for invalid in [
         "garbage",
         "trueish",
@@ -744,8 +744,8 @@ fn invalid_body_triggers_page_recovery() {
     ] {
         let body = format!("{invalid}\nendobj\n3 0 obj\n<< /Contents [] /Rotate 90 >>");
         let pdf = document(&[CATALOG, "<< >>", &body]);
-        assert_eq!(pdf.pages().len(), 1, "{invalid}");
-        assert_eq!(pdf.pages()[0].rotation(), Rotation::Horizontal);
+        assert!(pdf.pages().is_empty(), "{invalid}");
+        assert!(!pdf.xref().is_repaired());
     }
 }
 
@@ -844,12 +844,11 @@ fn shadowed_media_box_does_not_repair_the_xref() {
     assert_eq!(pdf.pages()[0].render_dimensions(), (10.0, 20.0));
     let sentinel = ObjectIdentifier::new(5, 0);
     assert_eq!(pdf.xref().get::<i32>(sentinel), None);
+    let damaged = ObjectIdentifier::new(4, 0);
     assert_eq!(
         pdf.xref()
-            .get::<Rect>(ObjectIdentifier::new(4, 0))
-            .unwrap()
-            .width(),
-        32.0
+            .watch(|| pdf.xref().get::<Rect>(damaged).is_none()),
+        (true, Some(damaged))
     );
-    assert_eq!(pdf.xref().get::<i32>(sentinel), Some(42));
+    assert_eq!(pdf.xref().get::<i32>(sentinel), None);
 }

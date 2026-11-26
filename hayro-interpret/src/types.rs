@@ -30,6 +30,11 @@ pub struct StencilImage<'a, 'b> {
 }
 
 impl<'a, 'b> StencilImage<'a, 'b> {
+    /// The paint applied through the stencil.
+    pub fn paint(&self) -> &Paint<'a> {
+        &self.paint
+    }
+
     /// Owns the source for region requests.
     pub fn asset(&self) -> crate::ImageAsset {
         self.image_xobject.asset(self.pixels_key())

@@ -32,6 +32,17 @@ fn object_3(pdf: &Pdf) -> Stream<'_> {
 }
 
 #[test]
+fn predictor_parameters_use_the_written_integer_at_the_filter_position() {
+    let pdf = stream_file(
+        "/Filter [null /Crypt /FlateDecode] /DP [null null << /Predictor 12 /Colors 4294967297 /Columns 3 >>]",
+        &stored_zlib(&[1, 10, 2, 3], 8),
+    );
+    let stream = object_3(&pdf);
+    assert_eq!(stream.decoded_strict().unwrap().as_ref(), &[10, 12, 15]);
+    assert_eq!(stream.decoded_data().unwrap().as_ref(), &[10, 12, 15]);
+}
+
+#[test]
 fn the_reader_reads_what_strict_decoding_returns() {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     for case in 0..3000 {
@@ -328,4 +339,32 @@ fn short_baseline_jpeg_stops_before_a_whole_frame_allocation() {
     let (result, used) = allocations::measure(|| stream.decoded_image(&params));
     assert!(matches!(result, Err(DecodeFailure::ImageDecode)));
     assert!(used.largest < 200 * 200, "{used:?}");
+}
+
+#[cfg(all(any(debug_assertions, feature = "work-counters"), feature = "std"))]
+#[test]
+fn captured_stream_replays_after_document_drop_without_reading_an_indirect_body() {
+    use hayro_syntax::work::BODIES_READ;
+    let pdf = Pdf::new(file(
+        &[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec(),
+            stream("/Filter 4 0 R /DecodeParms 5 0 R", b"4142>"),
+            b"/ASCIIHexDecode".to_vec(),
+            b"<< >>".to_vec(),
+        ],
+        "",
+    ))
+    .unwrap();
+    let captured = object_3(&pdf).to_owned_stream();
+    drop(pdf);
+    assert_eq!(captured.copied_bytes(), 0);
+    BODIES_READ.set(0);
+    for _ in 0..2 {
+        assert_eq!(
+            captured.get().unwrap().decoded_data().unwrap().as_ref(),
+            b"AB"
+        );
+    }
+    assert_eq!(BODIES_READ.get(), 0);
 }

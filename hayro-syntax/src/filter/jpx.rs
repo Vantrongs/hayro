@@ -35,11 +35,6 @@ pub(crate) fn decode(data: &[u8], params: &ImageDecodeParams) -> Option<FilterRe
 
     let width = image.width();
     let height = image.height();
-    let bpc = if params.is_indexed {
-        image.original_bit_depth()
-    } else {
-        8
-    };
     let cs = match image.color_space() {
         ColorSpace::Gray => ImageColorSpace::Gray,
         ColorSpace::RGB => ImageColorSpace::Rgb,
@@ -57,31 +52,53 @@ pub(crate) fn decode(data: &[u8], params: &ImageDecodeParams) -> Option<FilterRe
     };
     let has_alpha = image.has_alpha();
     let mut decoder_context = hayro_jpeg2000::DecoderContext::default();
-    let bitmap = image.decode(&mut decoder_context).ok()?.data_u8().ok()?;
-
-    let (mut data, mut alpha) = if !has_alpha {
-        (bitmap, None)
-    } else {
-        let total_channels = cs.num_components() + 1;
-        let mut color_channels = Vec::with_capacity(
-            (bitmap.len() / total_channels as usize) * cs.num_components() as usize,
-        );
-        let mut alpha_channel = Vec::with_capacity(bitmap.len() / total_channels as usize);
-
-        for sample in bitmap.chunks_exact(total_channels as usize) {
-            let (alpha, color) = sample.split_last()?;
-            alpha_channel.push(*alpha);
-            color_channels.extend_from_slice(color);
-        }
-
-        (color_channels, Some(alpha_channel))
-    };
-
-    // The decoder always outputs 8 bits.
-    if bpc != 8 {
-        data = scale(&data, bpc, cs.num_components(), width, height)?;
-        alpha = alpha.and_then(|alpha| scale(&alpha, bpc, cs.num_components(), width, height));
+    let decoded = image.decode(&mut decoder_context).ok()?;
+    let (color, alpha) = decoded
+        .components()
+        .split_at_checked(usize::from(cs.num_components()))?;
+    if color.is_empty() || alpha.len() != usize::from(has_alpha) {
+        return None;
     }
+    let bpc = if params.is_indexed {
+        color[0].bit_depth()
+    } else if params.has_color_key {
+        color.iter().map(|c| c.bit_depth()).max()?
+    } else {
+        8
+    };
+    let mixed =
+        params.has_color_key && !params.is_indexed && color.iter().any(|c| c.bit_depth() != bpc);
+    let component_depths = if mixed {
+        color.iter().map(|c| c.bit_depth()).collect()
+    } else {
+        Vec::new()
+    };
+    let (data, alpha) = if bpc != 8 || mixed {
+        let data = pack(color, bpc, mixed, width, height)?;
+        let alpha = if has_alpha {
+            Some(pack(alpha, 8, false, width, height)?)
+        } else {
+            None
+        };
+        (data, alpha)
+    } else {
+        let bitmap = decoded.data_u8().ok()?;
+        if !has_alpha {
+            (bitmap, None)
+        } else {
+            let total_channels = usize::from(cs.num_components()) + 1;
+            let mut color_channels =
+                Vec::with_capacity((bitmap.len() / total_channels) * cs.num_components() as usize);
+            let mut alpha_channel = Vec::with_capacity(bitmap.len() / total_channels);
+
+            for sample in bitmap.chunks_exact(total_channels) {
+                let (alpha, color) = sample.split_last()?;
+                alpha_channel.push(*alpha);
+                color_channels.extend_from_slice(color);
+            }
+            (color_channels, Some(alpha_channel))
+        }
+    };
 
     Some(FilterResult {
         data: Cow::Owned(data),
@@ -89,45 +106,49 @@ pub(crate) fn decode(data: &[u8], params: &ImageDecodeParams) -> Option<FilterRe
             alpha,
             color_space: Some(cs),
             bits_per_component: bpc,
+            component_depths,
             width,
             height,
         }),
     })
 }
 
-fn scale(
-    data: &[u8],
-    bit_per_component: u8,
-    num_components: u8,
+fn pack(
+    components: &[hayro_jpeg2000::ComponentData],
+    bpc: u8,
+    native: bool,
     width: u32,
     height: u32,
 ) -> Option<Vec<u8>> {
-    if bit_per_component == 0 || bit_per_component > 32 {
+    let max = |bits: u8| 1_u64.checked_shl(u32::from(bits))?.checked_sub(1);
+    let out_max = max(bpc)?;
+    let width = width as usize;
+    let pixels = width.checked_mul(height as usize)?;
+    if width == 0 || components.is_empty() || components.iter().any(|c| c.samples().len() != pixels)
+    {
         return None;
     }
-
-    let div_factor = ((1 << 8) - 1) as f32;
-    let mul_factor = ((1_u32 << bit_per_component) - 1) as f32;
-
-    let bits_per_row = (width as usize)
-        .checked_mul(num_components as usize)?
-        .checked_mul(bit_per_component as usize)?;
-    let input_len = bits_per_row.div_ceil(8).checked_mul(height as usize)?;
-    let mut input = vec![0; input_len];
-    let mut writer = BitWriter::new(&mut input, bit_per_component)?;
-    let components_per_row = (num_components as usize).checked_mul(width as usize)?;
-
-    for bytes in data.chunks_exact(components_per_row) {
-        for byte in bytes {
-            let scaled = ((*byte as f32 / div_factor) * mul_factor + 0.5) as u32;
-            writer.write(scaled)?;
+    let row_bits = width
+        .checked_mul(components.len())?
+        .checked_mul(usize::from(bpc))?;
+    let mut data = vec![0; row_bits.div_ceil(8).checked_mul(height as usize)?];
+    let mut writer = BitWriter::new(&mut data, bpc)?;
+    let planes = components
+        .iter()
+        .map(|c| {
+            let source_max = max(c.bit_depth())?;
+            let limit = if native { source_max } else { out_max };
+            Some((c.samples(), limit as f64 / source_max as f64, limit as u32))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    for row in (0..pixels).step_by(width) {
+        for i in row..row + width {
+            for &(samples, scale, limit) in &planes {
+                let value = (f64::from(samples[i]) * scale + 0.5) as u32;
+                writer.write(value.min(limit))?;
+            }
         }
-
         writer.align();
     }
-
-    let final_pos = writer.cur_pos();
-    input.truncate(final_pos);
-
-    Some(input)
+    Some(data)
 }

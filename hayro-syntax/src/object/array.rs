@@ -203,6 +203,7 @@ impl<'a> Readable<'a> for Array<'a> {
             r.read_bytes(len)?
         } else {
             let bytes = r.skip::<Array<'_>>(ctx.in_content_stream())?;
+            crate::work::lexed(bytes.len());
             if let Some(c) = cache {
                 c.arrays.get().insert(at, bytes.len());
             }

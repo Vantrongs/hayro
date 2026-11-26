@@ -168,6 +168,7 @@ impl<'a> JpegRows<'a> {
 
         ImageData {
             alpha: None,
+            component_depths: Vec::new(),
             color_space: match self.colorspace {
                 ColorSpace::RGB | ColorSpace::YCbCr => Some(ImageColorSpace::Rgb),
                 ColorSpace::Luma => Some(ImageColorSpace::Gray),

@@ -13,10 +13,62 @@ static POWERS_OF_10: [f64; 23] = [
 ];
 
 const MAX_EXACT_MANTISSA: u64 = 1 << 53;
+const SIMPLE_DIGITS: usize = 18;
+
+const MAX_PLACES: i64 = 37;
+const SIGNIFICANT: u32 = 9;
+const LONG: usize = 10;
+const MAX_POWER: usize = MAX_PLACES as usize + SIGNIFICANT as usize - 1;
+
+// The viewer divides by a power rounded to 32 significant bits, with ties to even.
+const POWERS_OF_TEN_32: [(u64, i32); MAX_POWER + 1] = {
+    let mut table = [(0, 0); MAX_POWER + 1];
+    let mut k = 0;
+    while k <= MAX_POWER {
+        // Ten to the `k` is five to the `k` times two to the `k`.
+        let five = 5_u128.pow(k as u32);
+        let bits = 128 - five.leading_zeros();
+        let (mut m, mut shift) = (five, k as i32);
+        if bits > 32 {
+            let drop = bits - 32;
+            m = five >> drop;
+            let rest = five & ((1 << drop) - 1);
+            let half = 1 << (drop - 1);
+            if rest > half || (rest == half && m & 1 == 1) {
+                m += 1;
+            }
+            shift += drop as i32;
+            if m == 1 << 32 {
+                m >>= 1;
+                shift += 1;
+            }
+        }
+        let spare = m.leading_zeros() - 96;
+        table[k] = ((m << spare) as u64, shift - spare as i32);
+        k += 1;
+    }
+    table
+};
 
 /// A number.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Number(pub(crate) InternalNumber);
+
+impl Default for Number {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
+impl PartialEq for Number {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.0, other.0) {
+            (InternalNumber::Integer(a), InternalNumber::Integer(b)) => a == b,
+            (InternalNumber::Integer(_), _) | (_, InternalNumber::Integer(_)) => false,
+            _ => self.as_f64() == other.as_f64(),
+        }
+    }
+}
 
 impl Number {
     /// The number zero.
@@ -29,10 +81,33 @@ impl Number {
         matches!(self.0, InternalNumber::Integer(_))
     }
 
+    /// The sign, unsigned mantissa and decimal places when the exact decimal is retained.
+    pub fn as_decimal(self) -> Option<(bool, u64, u32)> {
+        match self.0 {
+            InternalNumber::Integer(i) => Some((i < 0, i.unsigned_abs(), 0)),
+            InternalNumber::Decimal {
+                negative,
+                digits,
+                scale,
+                ..
+            } => Some((negative, digits, u32::from(scale))),
+            InternalNumber::Real { .. } => None,
+        }
+    }
+
     /// Returns the number as a f64.
     pub fn as_f64(&self) -> f64 {
         match self.0 {
-            InternalNumber::Real(r) => r,
+            InternalNumber::Real { value, .. } => value,
+            InternalNumber::Decimal {
+                digits,
+                scale,
+                negative,
+                ..
+            } => {
+                let value = digits as f64 / POWERS_OF_10[usize::from(scale)];
+                if negative { -value } else { value }
+            }
             InternalNumber::Integer(i) => i as f64,
         }
     }
@@ -40,22 +115,58 @@ impl Number {
     /// Returns the number as a f32.
     pub fn as_f32(&self) -> f32 {
         match self.0 {
-            InternalNumber::Real(r) => r as f32,
             InternalNumber::Integer(i) => i as f32,
+            _ => self.as_f64() as f32,
         }
     }
 
     /// Returns the number as an i64.
     pub fn as_i64(&self) -> i64 {
         match self.0 {
-            InternalNumber::Real(r) => r as i64,
             InternalNumber::Integer(i) => i,
+            _ => self.as_f64() as i64,
+        }
+    }
+
+    /// The 32-bit viewer reading of the original decimal spelling, when established.
+    pub fn viewer_f32(&self) -> Option<f32> {
+        match self.0 {
+            InternalNumber::Integer(i) => Some(i as f32),
+            InternalNumber::Real { viewer, .. } => (!viewer.is_nan()).then_some(viewer),
+            InternalNumber::Decimal {
+                digits,
+                scale,
+                negative,
+                long: false,
+            } => nine_digits_of_decimal(digits, u32::from(scale), negative),
+            InternalNumber::Decimal {
+                digits,
+                scale,
+                negative,
+                long: true,
+            } => {
+                let power = 10_u64.pow(u32::from(scale));
+                let mut fraction = digits % power;
+                let mut places = [0; SIMPLE_DIGITS];
+                for place in places[..usize::from(scale)].iter_mut().rev() {
+                    *place = (fraction % 10) as u8;
+                    fraction /= 10;
+                }
+                Some(long_reading(
+                    (digits / power) as u32,
+                    places[..usize::from(scale)].iter().copied(),
+                    negative,
+                ))
+            }
         }
     }
 
     /// Create a new `Number` from an f32 number.
     pub const fn from_f32(num: f32) -> Self {
-        Self(InternalNumber::Real(num as f64))
+        Self(InternalNumber::Real {
+            value: num as f64,
+            viewer: num,
+        })
     }
 
     /// Create a new `Number` from an i32 number.
@@ -67,8 +178,8 @@ impl Number {
 impl Display for Number {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         match self.0 {
-            InternalNumber::Real(value) => write!(f, "{value:?}"),
             InternalNumber::Integer(value) => write!(f, "{value}"),
+            _ => write!(f, "{:?}", self.as_f64()),
         }
     }
 }
@@ -81,11 +192,29 @@ impl Skippable for Number {
 
 impl Readable<'_> for Number {
     #[inline]
-    fn read(r: &mut Reader<'_>, _: &ReaderContext<'_>) -> Option<Self> {
+    fn read(r: &mut Reader<'_>, ctx: &ReaderContext<'_>) -> Option<Self> {
         let start = r.offset();
         Self::read_simple(r).or_else(|| {
+            let long = r.offset() - start > SIMPLE_DIGITS;
             r.jump(start);
-            Self::read_fallback(r, false)
+            if !long {
+                return Self::read_fallback(r, false);
+            }
+            use crate::sync::MutexExt;
+            let tail = r.tail()?;
+            let cache = ctx.xref().storage().filter(|_| ctx.stored(tail));
+            let key = (tail.as_ptr() as usize, tail.len());
+            if let Some((len, value)) = cache.and_then(|c| c.numbers.get().get(&key).copied()) {
+                r.skip_bytes(len)?;
+                return Some(value);
+            }
+            let value = Self::read_fallback(r, false)?;
+            if let Some(cache) = cache
+                && r.offset() - start > SIMPLE_DIGITS
+            {
+                cache.numbers.get().insert(key, (r.offset() - start, value));
+            }
+            Some(value)
         })
     }
 }
@@ -105,6 +234,7 @@ impl Number {
 
     #[inline(always)]
     pub(crate) fn read_simple(r: &mut Reader<'_>) -> Option<Self> {
+        let start = r.offset();
         let negative = match r.peek_byte() {
             Some(b'-') => {
                 r.forward();
@@ -125,6 +255,9 @@ impl Number {
                 .map(|b| b.wrapping_sub(b'0'))
                 .filter(|d| *d < 10)
             {
+                if r.offset() - start > SIMPLE_DIGITS {
+                    break;
+                }
                 mantissa = mantissa.wrapping_mul(10).wrapping_add(d as u64);
                 r.forward();
             }
@@ -132,6 +265,7 @@ impl Number {
         };
 
         let mut digits = read_digits(r);
+        let whole_len = r.offset() - start;
         let mut decimal_shift = None;
         if r.peek_byte() == Some(b'.') {
             r.forward();
@@ -140,15 +274,21 @@ impl Number {
             digits += fraction_digits;
         }
 
-        if digits == 0 || digits > 18 || r.peek_byte().is_some_and(is_regular_character) {
+        if digits == 0 || digits > SIMPLE_DIGITS || r.peek_byte().is_some_and(is_regular_character)
+        {
             return None;
         }
 
-        Self::from_parts(negative, mantissa, decimal_shift)
+        Self::from_parts(negative, mantissa, decimal_shift, whole_len >= LONG)
     }
 
     #[inline(always)]
-    fn from_parts(negative: bool, mantissa: u64, decimal_shift: Option<u32>) -> Option<Self> {
+    fn from_parts(
+        negative: bool,
+        mantissa: u64,
+        decimal_shift: Option<u32>,
+        long: bool,
+    ) -> Option<Self> {
         match decimal_shift {
             None => {
                 let value = mantissa as i64;
@@ -159,16 +299,16 @@ impl Number {
                 })))
             }
             Some(shift) => {
-                if mantissa > MAX_EXACT_MANTISSA {
+                if mantissa > MAX_EXACT_MANTISSA || shift > SIMPLE_DIGITS as u32 {
                     return None;
                 }
 
-                let value = mantissa as f64 / POWERS_OF_10.get(shift as usize)?;
-                Some(Self(InternalNumber::Real(if negative {
-                    -value
-                } else {
-                    value
-                })))
+                Some(Self(InternalNumber::Decimal {
+                    digits: mantissa,
+                    scale: shift as u8,
+                    negative,
+                    long,
+                }))
             }
         }
     }
@@ -190,7 +330,7 @@ fn read_inner(r: &mut Reader<'_>, allow_operator_after_dot: bool) -> Option<Numb
     };
 
     let mut mantissa: u64 = 0;
-    let mut has_dot = false;
+    let mut point = None;
     let mut decimal_shift: u32 = 0;
     let mut has_digits = false;
     let mut overflowed = false;
@@ -211,13 +351,13 @@ fn read_inner(r: &mut Reader<'_>, allow_operator_after_dot: bool) -> Option<Numb
                     }
                 }
                 has_digits = true;
-                if has_dot {
-                    decimal_shift += 1;
+                if point.is_some() {
+                    decimal_shift = decimal_shift.saturating_add(1);
                 }
             }
-            Some(b'.') if !has_dot => {
+            Some(b'.') if point.is_none() => {
+                point = Some(r.offset());
                 r.forward();
-                has_dot = true;
             }
             // Some weird PDFs have trailing minus in the fraction of number.
             Some(b'-') if has_digits => {
@@ -231,8 +371,8 @@ fn read_inner(r: &mut Reader<'_>, allow_operator_after_dot: bool) -> Option<Numb
     }
 
     if !has_digits {
-        if (has_dot && allow_operator_after_dot)
-            || ((has_dot || has_sign) && !r.peek_byte().is_some_and(is_regular_character))
+        if (point.is_some() && allow_operator_after_dot)
+            || ((point.is_some() || has_sign) && !r.peek_byte().is_some_and(is_regular_character))
         {
             // Treat numbers like just `-`, `+` or `-.` as zero.
             return Some(Number(InternalNumber::Integer(0)));
@@ -245,12 +385,16 @@ fn read_inner(r: &mut Reader<'_>, allow_operator_after_dot: bool) -> Option<Numb
         return None;
     }
 
-    let integer_overflow = !has_dot && mantissa > i64::MAX as u64;
+    let integer_overflow = point.is_none() && mantissa > i64::MAX as u64;
 
     if !overflowed
         && !integer_overflow
-        && let Some(number) =
-            Number::from_parts(negative, mantissa, has_dot.then_some(decimal_shift))
+        && let Some(number) = Number::from_parts(
+            negative,
+            mantissa,
+            point.map(|_| decimal_shift),
+            point.is_some_and(|at| at - start_offset >= LONG),
+        )
     {
         return Some(number);
     }
@@ -258,19 +402,135 @@ fn read_inner(r: &mut Reader<'_>, allow_operator_after_dot: bool) -> Option<Numb
     let end_offset = number_end.unwrap_or_else(|| r.offset());
     let number = core::str::from_utf8(r.range(start_offset..end_offset)?).ok()?;
 
-    if !has_dot && let Ok(value) = number.parse::<i64>() {
+    if point.is_none()
+        && let Ok(value) = number.parse::<i64>()
+    {
         return Some(Number(InternalNumber::Integer(value)));
     }
 
     let value = number.parse::<f64>().ok()?;
-    Some(Number(InternalNumber::Real(value)))
+    let viewer = point.map_or(f32::NAN, |point| {
+        let whole = &r.data[start_offset + usize::from(has_sign)..point];
+        let fraction = &r.data[point + 1..end_offset];
+        if point - start_offset >= LONG {
+            let low = whole.iter().fold(0_u32, |n, d| {
+                n.wrapping_mul(10).wrapping_add(u32::from(d - b'0'))
+            });
+            long_reading(low, fraction.iter().map(|d| d - b'0'), negative)
+        } else {
+            nine_digits_of_written(whole, fraction, negative).unwrap_or(f32::NAN)
+        }
+    });
+    Some(Number(InternalNumber::Real { value, viewer }))
+}
+
+fn nine_digits_of_decimal(digits: u64, scale: u32, negative: bool) -> Option<f32> {
+    if digits == 0 {
+        return Some(signed_zero(negative));
+    }
+    let count = digits.ilog10() + 1;
+    if i64::from(scale) - i64::from(count) + 1 > MAX_PLACES {
+        return None;
+    }
+    let (m, power) = if count > SIGNIFICANT {
+        let dropped = count - SIGNIFICANT;
+        (
+            digits / 10_u64.pow(dropped),
+            i64::from(dropped) - i64::from(scale),
+        )
+    } else {
+        (digits, -i64::from(scale))
+    };
+    Some(nine_digits(m, power, negative))
+}
+
+fn nine_digits_of_written(whole: &[u8], fraction: &[u8], negative: bool) -> Option<f32> {
+    let before = whole.len() as i64;
+    let mut significant = whole
+        .iter()
+        .chain(fraction)
+        .map(|d| d - b'0')
+        .enumerate()
+        .skip_while(|&(_, d)| d == 0);
+    let Some((first, d)) = significant.next() else {
+        return Some(signed_zero(negative));
+    };
+    // The places after the point the first significant digit stands at.
+    if first as i64 + 1 - before > MAX_PLACES {
+        return None;
+    }
+    let mut m = u64::from(d);
+    let mut last = first;
+    for (at, d) in significant.take(SIGNIFICANT as usize - 1) {
+        m = m * 10 + u64::from(d);
+        last = at;
+    }
+    Some(nine_digits(m, before - 1 - last as i64, negative))
+}
+
+fn nine_digits(mut m: u64, mut power: i64, negative: bool) -> f32 {
+    if m == 0 {
+        return signed_zero(negative);
+    }
+    while m.is_multiple_of(10) {
+        m /= 10;
+        power += 1;
+    }
+    let reading = if power >= 0 {
+        // At most nine characters before the point: below 10^9, exact in 64 bits.
+        (m * 10_u64.pow(power as u32)) as f32
+    } else {
+        let (p, shift) = POWERS_OF_TEN_32[power.unsigned_abs() as usize];
+        divided(m, p, shift)
+    };
+    if negative { -reading } else { reading }
+}
+
+// Two guard bits beyond a float keep the division from rounding twice.
+const WIDEN: i32 = 58;
+
+fn divided(m: u64, p: u64, shift: i32) -> f32 {
+    let numerator = u128::from(m) << WIDEN;
+    let quotient = numerator / u128::from(p);
+    let inexact = !numerator.is_multiple_of(u128::from(p));
+    // A remainder held in the lowest bit, below where rounding to 24 bits looks,
+    // rounds the widened quotient as it rounds the exact one.
+    let quotient = quotient as u64 | u64::from(inexact);
+    let scale = f64::from_bits(((1023 - WIDEN - shift) as u64) << 52);
+    // Rounded once from the integer; scaling by a power of two is exact.
+    ((quotient as f32) as f64 * scale) as f32
+}
+
+// For a long integer part, the viewer wraps it to 32 bits and accumulates the fraction in f32.
+fn long_reading(low: u32, fraction: impl Iterator<Item = u8>, negative: bool) -> f32 {
+    let mut numerator = 0.0_f32;
+    let mut power = 1.0_f32;
+    for digit in fraction {
+        numerator = numerator * 10.0 + f32::from(digit);
+        power *= 10.0;
+    }
+    let reading = low as f32 + numerator / power;
+    if negative { -reading } else { reading }
+}
+
+fn signed_zero(negative: bool) -> f32 {
+    if negative { -0.0 } else { 0.0 }
 }
 
 object!(Number, Number);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum InternalNumber {
-    Real(f64),
+    Real {
+        value: f64,
+        viewer: f32,
+    },
+    Decimal {
+        digits: u64,
+        scale: u8,
+        long: bool,
+        negative: bool,
+    },
     Integer(i64),
 }
 
@@ -330,10 +590,9 @@ impl Skippable for f32 {
     }
 }
 
-impl Readable<'_> for f32 {
-    fn read(r: &mut Reader<'_>, _: &ReaderContext<'_>) -> Option<Self> {
-        r.read_without_context::<Number>()
-            .map(|n| n.as_f64() as Self)
+impl<'a> Readable<'a> for f32 {
+    fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
+        r.read::<Number>(ctx).map(|n| n.as_f64() as Self)
     }
 }
 
@@ -356,9 +615,9 @@ impl Skippable for f64 {
     }
 }
 
-impl Readable<'_> for f64 {
-    fn read(r: &mut Reader<'_>, _: &ReaderContext<'_>) -> Option<Self> {
-        r.read_without_context::<Number>().map(|n| n.as_f64())
+impl<'a> Readable<'a> for f64 {
+    fn read(r: &mut Reader<'a>, ctx: &ReaderContext<'a>) -> Option<Self> {
+        r.read::<Number>(ctx).map(|n| n.as_f64())
     }
 }
 
@@ -388,6 +647,30 @@ mod tests {
     use crate::object::Number;
     use crate::reader::Reader;
     use crate::reader::ReaderExt;
+
+    #[test]
+    fn viewer_numbers_keep_the_written_fraction() {
+        for (spelling, expected) in [
+            ("4294967297.4999999", Some(1.4999999)),
+            ("600.000030517579125", Some(f32::from_bits(0x4416_0000))),
+            ("0.000000152703727", Some(f32::from_bits(0x3423_F6E1))),
+            ("4503599627370497.25", Some(1.25)),
+            ("-9007199254740993.75", Some(-1.75)),
+            ("9223372036854775808.0", Some(0.0)),
+            ("9223372036854775808", None),
+            ("1000000000000000000000000000000000000000.0", Some(0.0)),
+            ("0.00000000000000000000000000000000000001", None),
+            (
+                "0000000001.9999999999999999999999999999999999999999999",
+                None,
+            ),
+        ] {
+            let n = Reader::new(spelling.as_bytes())
+                .read_without_context::<Number>()
+                .unwrap();
+            assert_eq!(n.viewer_f32(), expected, "{spelling}");
+        }
+    }
 
     #[test]
     fn display() {

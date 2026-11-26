@@ -65,22 +65,18 @@ impl<'a> FormXObject<'a> {
         context: &mut Context<'a>,
         device: &mut impl Device<'a>,
     ) {
-        if !context.ocg_state.is_visible() {
-            return;
+        if context.ocg_state.is_visible() && context.ocg_state.shows(context.xref, &self.dict) {
+            self.draw_content(resources, context, device);
         }
+    }
 
-        if !context.begin_nested_interpretation() {
-            return;
-        }
-
-        let has_oc = context
-            .ocg_state
-            .begin_named(context.xref, &self.dict, b"OC");
-        if !context.ocg_state.is_visible() {
-            if has_oc {
-                context.ocg_state.end_marked_content();
-            }
-            context.end_nested_interpretation();
+    pub(crate) fn draw_content(
+        &self,
+        resources: &Resources<'a>,
+        context: &mut Context<'a>,
+        device: &mut impl Device<'a>,
+    ) {
+        if !context.ocg_state.is_visible() || !context.begin_nested_interpretation() {
             return;
         }
 
@@ -131,10 +127,6 @@ impl<'a> FormXObject<'a> {
 
         context.pop_root_transform();
         context.restore_state(device);
-
-        if has_oc {
-            context.ocg_state.end_marked_content();
-        }
 
         context.end_nested_interpretation();
     }

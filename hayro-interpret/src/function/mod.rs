@@ -466,7 +466,8 @@ impl std::hash::Hash for TransferFunction {
 }
 
 impl TransferFunction {
-    pub(crate) fn setup_cost(&self) -> Cost {
+    /// Work required to build the transfer table.
+    pub fn setup_cost(&self) -> Cost {
         if self.0.samples.get().is_some() {
             Cost::ZERO
         } else {

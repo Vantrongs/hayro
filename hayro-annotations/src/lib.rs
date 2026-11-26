@@ -89,6 +89,8 @@ pub enum Unsupported {
     Bidi(char),
     /// The geometry exceeds the supported range or precision.
     Coordinates,
+    /// The appearance depends on a number without an established viewer reading.
+    Number,
     /// The rich text uses unsupported structure or styling.
     RichText,
     /// The line ending has ambiguous geometry.
@@ -286,16 +288,19 @@ struct Known<'a> {
 type Kept<K, V> = hash::Map<K, Observed<V>>;
 
 #[derive(Clone, Copy)]
-struct Observed<T>(T, hayro_syntax::lost::Lost);
+struct Observed<T>(T, hayro_syntax::lost::Lost, bool);
 
 impl<T> Observed<T> {
     fn read(xref: &XRef, make: impl FnOnce() -> T) -> Self {
-        let (value, lost) = xref.apart(make);
-        Self(value, lost)
+        let ((value, invalid_number), lost) = xref.apart(|| entries::reading(make));
+        Self(value, lost, invalid_number)
     }
 
     fn replay(self, xref: &XRef) -> T {
         xref.note(self.1);
+        if self.2 {
+            entries::unreadable_number();
+        }
         self.0
     }
 }
@@ -426,17 +431,25 @@ impl<'a> Appearances<'a> {
             });
             Some(Rc::new(Plan::Fixed { annotation, placed }))
         };
-        if !selected(&annot, selection) || !annot.shown_in(&mut self.visibility.borrow_mut()) {
+        let unselected = match entries::read(|| selected(&annot, selection)) {
+            Ok(true) => None,
+            Ok(false) => return None,
+            Err(why) => Some(why),
+        };
+        if !annot.shown_in(&mut self.visibility.borrow_mut()) {
             return None;
         }
-        match self.prepare(&annot) {
-            Prepared::Nothing | Prepared::Placed(Look::Nothing, _) => None,
-            Prepared::Placed(look, placed) => fixed(look, placed),
-            Prepared::Generate(refused) => Some(Rc::new(Plan::Generate {
+        match entries::read(|| self.prepare(&annot)) {
+            Err(why) => fixed(Look::Unsupported(why), None),
+            Ok(Prepared::Nothing | Prepared::Placed(Look::Nothing, _)) => None,
+            Ok(Prepared::Placed(look, placed)) => {
+                fixed(unselected.map_or(look, Look::Unsupported), placed)
+            }
+            Ok(Prepared::Generate(refused)) => Some(Rc::new(Plan::Generate {
                 id: listed.id,
                 annot,
                 subtype,
-                refused,
+                refused: unselected.or(refused),
                 again: Cell::new(false),
             })),
         }
@@ -659,15 +672,25 @@ impl<'a> Appearances<'a> {
             return Ok(None);
         };
         let mut out = Out::new(visible, unit);
-        let Some(whole) = whole(&subtype, annot) else {
-            return Ok(None);
+        let (whole, refused) = match entries::read(|| whole(&subtype, annot)) {
+            Err(why) => (Part::Anywhere, Some(why)),
+            Ok(None) => return Ok(None),
+            Ok(Some(whole)) => (whole, refused),
         };
         if !out.shows(&whole) {
             return Ok(None);
         }
         let drew = match refused {
             Some(why) => out.refuse(why, whole).map(|()| None),
-            None => self.generated_anyway(annot, &subtype, visible, &mut out),
+            None => {
+                let (drew, invalid) =
+                    entries::reading(|| self.generated_anyway(annot, &subtype, visible, &mut out));
+                if invalid {
+                    drew.and_then(|_| out.refuse(Unsupported::Number, whole).map(|()| None))
+                } else {
+                    drew
+                }
+            }
         };
         // A number that could not be written fails the appearance, whatever the
         // generator made of it: `None` from a generator means nothing to draw.
@@ -685,7 +708,7 @@ impl<'a> Appearances<'a> {
         let opacity = if *subtype == *b"Widget" {
             1.0
         } else {
-            opacity(annot)
+            entries::read(|| opacity(annot))?
         };
         Ok(Some(Appearance {
             marks: content,

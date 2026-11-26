@@ -1,6 +1,9 @@
 use crate::Renderer;
 use hayro_interpret::Paint;
-use hayro_interpret::encode::{EncodedShadingPattern, EncodedShadingType, texture_dimensions};
+use hayro_interpret::encode::{
+    Cost, EncodedShadingPattern, EncodedShadingType, Exhausted, Meter, Unmetered,
+    texture_dimensions,
+};
 use hayro_interpret::gradient::{PreparedShading, SvgGradient, SvgGradientKind, SvgGradientStop};
 use hayro_interpret::pattern::{Pattern, ShadingPattern};
 use hayro_interpret::util::x_y_advances;
@@ -73,67 +76,163 @@ impl Renderer<'_> {
 }
 
 impl Renderer<'_> {
-    fn shading_paint(&mut self, pattern: ShadingPattern, mut bbox: Rect) -> (PaintType, Affine) {
-        let mut encoded = pattern.encode();
-        if let EncodedShadingType::RadialAxial(g) = &mut encoded.shading_type {
-            g.cover_placement(bbox, encoded.base_transform);
+    fn shading_paint(&mut self, pattern: ShadingPattern, bbox: Rect) -> (PaintType, Affine) {
+        match self
+            .gradient_cache
+            .select(&pattern, bbox, &mut Unmetered)
+            .expect("unmetered")
+        {
+            ShadingPaint::Native(paint, transform) => (paint, transform),
+            ShadingPaint::Sampled(encoded, area) => texture_paint(&encoded.prepare_for(area), area),
         }
-        if let EncodedShadingType::RadialAxial(g) = &encoded.shading_type {
-            if let Some(native) = g
-                .as_svg_gradient(&encoded, STOP_TOLERANCE)
+    }
+}
+
+/// A Vello paint and its device transform, or the shading to sample.
+pub enum ShadingPaint {
+    /// A native gradient or a folded axial strip.
+    Native(PaintType, Affine),
+    /// The encoded shading and its compact texture bounds.
+    Sampled(EncodedShadingPattern, Rect),
+}
+
+/// Parameter tables and axial strips shared between placements in a document.
+#[derive(Default)]
+pub struct ShadingPaintCache {
+    gradients: rustc_hash::FxHashMap<u128, CachedGradient>,
+    bytes: usize,
+}
+
+impl ShadingPaintCache {
+    /// Bytes reserved for cached entries, parameter tables, stops, and pixmaps.
+    pub fn retained_bytes(&self) -> usize {
+        self.bytes + self.gradients.capacity() * size_of::<(u128, CachedGradient)>()
+    }
+
+    /// Choose a paint for device-space bounds, charging temporary holds until return.
+    ///
+    /// Account for [`Self::retained_bytes`] between calls, including after a refusal.
+    pub fn select(
+        &mut self,
+        pattern: &ShadingPattern,
+        bbox: Rect,
+        meter: &mut dyn Meter,
+    ) -> Result<ShadingPaint, Exhausted> {
+        let mark = meter.scratch_mark();
+        let result = self.select_inner(pattern, bbox, meter);
+        meter.release_scratch(mark);
+        result
+    }
+
+    fn select_inner(
+        &mut self,
+        pattern: &ShadingPattern,
+        bbox: Rect,
+        meter: &mut dyn Meter,
+    ) -> Result<ShadingPaint, Exhausted> {
+        let mut encoded = pattern.encode_metered(meter)?;
+        let EncodedShadingType::RadialAxial(original) = &encoded.shading_type else {
+            return Ok(ShadingPaint::Sampled(encoded, bbox));
+        };
+        let mut g = original.clone();
+        // Coverage sampling includes the entire pixel footprint at the placement edge.
+        let footprint = bbox.inflate(0.5, 0.5);
+        g.cover_placement(footprint, encoded.base_transform);
+        if g.is_extended()
+            && let Some(native) = g
+                .as_svg_gradient_metered(&encoded, STOP_TOLERANCE, meter)?
                 .and_then(SvgGradient::with_raster_geometry)
                 .filter(|g| raster_precision(g, bbox))
-                .and_then(|gradient| resolved_gradient(gradient, g.clamps_child_domain()))
-            {
-                return native_paint(native);
-            }
-            let texture_bbox = g.texture_bounds(bbox, &encoded);
-            let compact = texture_bbox != bbox;
-            bbox = texture_bbox;
-            let matrix = pattern.matrix;
-            let cache = self
-                .gradient_cache
-                .entry(PreparedShading::cache_key(&pattern))
-                .or_default();
-            cache.pixels += bbox.area();
-            if cache.pixels >= PreparedShading::MIN_SAMPLES as f64 {
-                encoded = cache
-                    .shading
-                    .get_or_init(|| PreparedShading::new(pattern))
-                    .encode(matrix);
-                if let EncodedShadingType::RadialAxial(g) = &mut encoded.shading_type {
-                    g.cover_placement(bbox, encoded.base_transform);
-                }
-                if let EncodedShadingType::RadialAxial(g) = &encoded.shading_type
-                    && !compact
-                {
-                    if g.is_extended()
-                        && cache.pixels >= (STRIP_WIDTH * STRIP_ROWS) as f64
-                        && let Some(transform) = strip_transform(encoded.base_transform, bbox)
-                        && let Some(strip) = cache
-                            .strip
-                            .get_or_init(|| g.axial_strip(&encoded).map(strip_pixmap))
-                    {
-                        let image = Image {
-                            image: ImageSource::Pixmap(strip.clone()),
-                            sampler: ImageSampler {
-                                quality: ImageQuality::Low,
-                                y_extend: peniko::Extend::Reflect,
-                                ..Default::default()
-                            },
-                        };
-                        return (PaintType::Image(image), transform);
-                    }
-                    if let Some(native) = g
-                        .as_raster_gradient(&encoded)
-                        .filter(|g| raster_precision(g, bbox))
-                    {
-                        return native_paint(native);
-                    }
-                }
+        {
+            reserve_paint(native.stops.len(), meter)?;
+            if let Some(native) = resolved_gradient(native, g.clamps_child_domain()) {
+                let (paint, transform) = native_paint(native);
+                return Ok(ShadingPaint::Native(paint, transform));
             }
         }
-        texture_paint(&encoded.prepare_for(bbox), bbox)
+        let area = g.texture_bounds(bbox, &encoded);
+        let key = PreparedShading::cache_key(pattern);
+        if self.gradients.len() == self.gradients.capacity() && !self.gradients.contains_key(&key) {
+            let slots = self
+                .gradients
+                .len()
+                .saturating_add(1)
+                .next_power_of_two()
+                .saturating_mul(2)
+                .max(4);
+            if !meter.hold(slots.saturating_mul(size_of::<(u128, CachedGradient)>() + 1)) {
+                return Err(Exhausted);
+            }
+        }
+        let cache = self.gradients.entry(key).or_default();
+        cache.pixels += area.area();
+        if cache.pixels < PreparedShading::MIN_SAMPLES as f64 {
+            return Ok(ShadingPaint::Sampled(encoded, area));
+        }
+        if cache.shading.is_none() {
+            let prepared = PreparedShading::new_metered(pattern.clone(), meter)?;
+            self.bytes += prepared.retained_bytes();
+            cache.shading = Some(prepared);
+        }
+        let prepared = cache.shading.as_ref().unwrap();
+        encoded = prepared.encode_metered(pattern.matrix, meter)?;
+        let EncodedShadingType::RadialAxial(original) = &encoded.shading_type else {
+            unreachable!()
+        };
+        if area == bbox {
+            let mut g = original.clone();
+            g.cover_placement(footprint, encoded.base_transform);
+            if g.is_extended()
+                && cache.pixels >= PreparedShading::STRIP_SAMPLES as f64
+                && let Some(transform) = strip_transform(encoded.base_transform, area)
+            {
+                if cache.strip.is_none() {
+                    let strip = match g.axial_strip_metered(&encoded, meter)? {
+                        Some(colors) => {
+                            let pixels = (STRIP_WIDTH + 2) * STRIP_ROWS;
+                            if !meter.work(Cost::of(pixels)) || !meter.hold(pixels * 4) {
+                                return Err(Exhausted);
+                            }
+                            self.bytes += pixels * 4;
+                            Some(strip_pixmap(colors))
+                        }
+                        None => None,
+                    };
+                    cache.strip = Some(strip);
+                }
+                if let Some(Some(strip)) = &cache.strip {
+                    let image = Image {
+                        image: ImageSource::Pixmap(strip.clone()),
+                        sampler: ImageSampler {
+                            quality: ImageQuality::Low,
+                            y_extend: peniko::Extend::Reflect,
+                            ..Default::default()
+                        },
+                    };
+                    return Ok(ShadingPaint::Native(PaintType::Image(image), transform));
+                }
+            }
+            let before = prepared.retained_bytes();
+            let gradient = g.as_raster_gradient_metered(&encoded, meter);
+            self.bytes += prepared.retained_bytes() - before;
+            if let Some(native) = gradient?.filter(|g| raster_precision(g, area)) {
+                reserve_paint(native.stops.len(), meter)?;
+                let (paint, transform) = native_paint(native);
+                return Ok(ShadingPaint::Native(paint, transform));
+            }
+        }
+        Ok(ShadingPaint::Sampled(encoded, area))
+    }
+}
+
+fn reserve_paint(stops: usize, meter: &mut dyn Meter) -> Result<(), Exhausted> {
+    let count = stops + 1;
+    if meter.work(Cost::of(count).times(8 + u64::from(count.ilog2())))
+        && meter.hold(count * (size_of::<ColorStop>() + 2 * size_of::<SvgGradientStop>()))
+    {
+        Ok(())
+    } else {
+        Err(Exhausted)
     }
 }
 
@@ -290,13 +389,11 @@ fn texture_paint(encoded: &EncodedShadingPattern, bbox: Rect) -> (PaintType, Aff
     (PaintType::Image(image), transform)
 }
 
-pub(super) type GradientCache = rustc_hash::FxHashMap<u128, CachedGradient>;
-
 #[derive(Default)]
-pub(super) struct CachedGradient {
+struct CachedGradient {
     pixels: f64,
-    shading: std::cell::OnceCell<PreparedShading>,
-    strip: std::cell::OnceCell<Option<Arc<Pixmap>>>,
+    shading: Option<PreparedShading>,
+    strip: Option<Option<Arc<Pixmap>>>,
 }
 
 const STRIP_WIDTH: usize = PreparedShading::STRIP_SAMPLES / STRIP_ROWS;

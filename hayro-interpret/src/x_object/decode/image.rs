@@ -1,11 +1,9 @@
 use super::mask::{DecodedMask, decode_mask};
-use super::{DecodeContext, decode_context, decode_u8_samples, fix_image_length, unpack_samples};
-use crate::color::{ColorComponents, ToLuma, ToRgb};
+use super::{DecodeContext, decode_context, decode_u8_samples, fix_image_length, for_each_sample};
+use crate::color::{ToLuma, ToRgb};
 use crate::interpret::state::ActiveTransferFunction;
-use crate::x_object::image::ImageXObject;
+use crate::x_object::image::samples::{Samples, Source};
 use crate::{ImageData, LumaData, RgbData};
-use hayro_syntax::object::dict::keys::*;
-use hayro_syntax::object::{Dict, Stream};
 use smallvec::SmallVec;
 
 pub(crate) struct DecodedImage {
@@ -79,14 +77,14 @@ impl DecodedImage {
     }
 }
 pub(crate) fn decode_image(
-    obj: &ImageXObject<'_>,
+    obj: &Samples<impl Source>,
     target_dimension: Option<(u32, u32)>,
 ) -> Option<DecodedImage> {
     ImageDecoder::new(obj, target_dimension)?.decode()
 }
 
 pub(crate) fn convert_band(
-    obj: &ImageXObject<'_>,
+    obj: &Samples<impl Source>,
     data: Vec<u8>,
     metadata: Option<hayro_syntax::object::stream::ImageData>,
     width: u32,
@@ -113,7 +111,7 @@ pub(crate) fn convert_band(
         ctx,
         target_dimension: None,
     };
-    let alpha = decoder.decode_color_key_mask(obj.stream.dict().get::<Stream<'_>>(SMASK).is_some());
+    let alpha = decoder.decode_color_key_mask();
     let (data, c) = match decoder.decode_image()? {
         ImageData::Luma(d) => (d.data, 1),
         ImageData::Rgb(d) => (d.data, 3),
@@ -127,40 +125,14 @@ pub(crate) fn convert_band(
     }
 }
 
-struct SoftMask<'a> {
-    repaired: bool,
-    stream: Option<Stream<'a>>,
-}
-
-impl<'a> SoftMask<'a> {
-    fn read(dict: &Dict<'a>) -> Self {
-        let was_repaired = dict.xref().is_repaired();
-        let mut mask = Self {
-            repaired: was_repaired,
-            stream: dict.get(SMASK),
-        };
-        mask.current(dict);
-        mask
-    }
-
-    fn current(&mut self, dict: &Dict<'a>) -> &mut Option<Stream<'a>> {
-        if !self.repaired && dict.xref().is_repaired() {
-            self.stream = None;
-            self.repaired = true;
-            self.stream = dict.get(SMASK);
-        }
-        &mut self.stream
-    }
-}
-
-struct ImageDecoder<'a, 'b> {
-    obj: &'a ImageXObject<'b>,
-    ctx: DecodeContext<'b>,
+struct ImageDecoder<'a, S> {
+    obj: &'a Samples<S>,
+    ctx: DecodeContext<'a>,
     target_dimension: Option<(u32, u32)>,
 }
 
-impl<'a, 'b> ImageDecoder<'a, 'b> {
-    fn new(obj: &'a ImageXObject<'b>, target_dimension: Option<(u32, u32)>) -> Option<Self> {
+impl<'a, S: Source> ImageDecoder<'a, S> {
+    fn new(obj: &'a Samples<S>, target_dimension: Option<(u32, u32)>) -> Option<Self> {
         let ctx = decode_context(obj, target_dimension)?;
 
         Some(Self {
@@ -172,10 +144,9 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
 
     fn decode(mut self) -> Option<DecodedImage> {
         let tail = super::Tail::of(&self.ctx, self.obj)?;
-        let mut soft_mask = SoftMask::read(self.obj.stream.dict());
-        let key = self.decode_color_key_mask(soft_mask.stream.is_some());
+        let key = self.decode_color_key_mask();
         let mut image = self.decode_image()?;
-        let alpha = self.decode_alpha(&mut image, key, &mut soft_mask);
+        let alpha = self.decode_alpha(&mut image, key);
 
         Some(DecodedImage { image, alpha, tail })
     }
@@ -312,22 +283,10 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
         &mut self,
         image: &mut ImageData,
         key: Option<LumaData>,
-        soft_mask: &mut SoftMask<'b>,
     ) -> Option<DecodedMask> {
-        let dict = self.obj.stream.dict();
-        let (matte, embedded) = loop {
-            let matte = soft_mask
-                .current(dict)
-                .as_ref()
-                .and_then(|s| self.resolve_matte(s))
-                .filter(|(alpha, _)| {
-                    alpha.tail.width == self.ctx.width && alpha.tail.declared == self.ctx.declared
-                });
-            let embedded = matte.is_none() && dict.get::<u8>(SMASK_IN_DATA) == Some(1);
-            if soft_mask.repaired == dict.xref().is_repaired() {
-                break (matte, embedded);
-            }
-        };
+        let matte = self.resolve_matte().filter(|(alpha, _)| {
+            alpha.tail.width == self.ctx.width && alpha.tail.declared == self.ctx.declared
+        });
         if let Some((mut alpha, matte_rgb)) = matte {
             alpha.tail.declared = self.ctx.height;
             alpha.luma.height = alpha.luma.height.min(self.ctx.height);
@@ -346,7 +305,7 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
         }
 
         // Drop an invalid alpha channel so the image itself still renders (PDFJS-19611).
-        if embedded {
+        if self.obj.in_data == 1 {
             let mut data = self
                 .ctx
                 .decoded
@@ -363,21 +322,18 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
                 scale_factors: self.ctx.scale_factors,
             }))
             // `SMask` takes precedence over `Mask`.
-        } else if let Some(s_mask) = soft_mask
-            .current(dict)
-            .take()
-            .or_else(|| dict.get::<Stream<'_>>(MASK))
-        {
-            let obj = ImageXObject::new_mask(&s_mask, &self.obj.warning_sink, &self.obj.cache)?;
-
-            decode_mask(&obj, self.target_dimension)
+        } else if self.obj.has_mask_stream {
+            decode_mask(self.obj.mask.as_deref()?, self.target_dimension)
         } else {
             key.map(DecodedMask::dense)
         }
     }
 
-    fn resolve_matte(&self, s_mask: &Stream<'_>) -> Option<(DecodedMask, [u8; 3])> {
-        let matte = s_mask.dict().get::<ColorComponents>(MATTE)?;
+    fn resolve_matte(&self) -> Option<(DecodedMask, [u8; 3])> {
+        if !self.obj.has_soft_mask {
+            return None;
+        }
+        let matte = self.obj.matte.as_ref()?;
 
         if matte.len() != self.ctx.color_space.num_components() as usize {
             return None;
@@ -385,42 +341,36 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
 
         // Matte is applied in RGB rather than the image's color space.
         let mut matte_rgb = [0_u8; 3];
-        self.ctx.color_space.convert_values(&matte, &mut matte_rgb);
+        self.ctx.color_space.convert_values(matte, &mut matte_rgb);
 
-        let mask_obj = ImageXObject::new_mask(s_mask, &self.obj.warning_sink, &self.obj.cache)?;
-        let alpha = decode_mask(&mask_obj, self.target_dimension)?;
+        let alpha = decode_mask(self.obj.mask.as_deref()?, self.target_dimension)?;
 
         Some((alpha, matte_rgb))
     }
 
-    fn decode_color_key_mask(&self, has_soft_mask: bool) -> Option<LumaData> {
-        let color_key_mask = super::color_key(
-            self.obj,
-            self.ctx.color_space.num_components(),
-            has_soft_mask,
-        )?;
+    fn decode_color_key_mask(&self) -> Option<LumaData> {
+        let color_key_mask = self.obj.color_key(self.ctx.color_space.num_components())?;
         let num_components = self.ctx.color_space.num_components() as usize;
-        let components = unpack_samples(
+        let ranges = color_key_mask.as_chunks::<2>().0;
+        let mut data = Vec::with_capacity(self.ctx.width as usize * self.ctx.height as usize);
+        let mut outside = false;
+        for_each_sample(
             &self.ctx.decoded.data,
             self.ctx.width,
             self.ctx.height,
             num_components,
             self.ctx.bits_per_component,
-        )?;
-        let mut data = Vec::with_capacity(self.ctx.width as usize * self.ctx.height as usize);
-
-        for pixel in components.chunks_exact(num_components) {
-            let mut value = 0;
-
-            for (component, min_max) in pixel.iter().zip(color_key_mask.as_chunks::<2>().0) {
-                if *component > min_max[1] || *component < min_max[0] {
-                    value = 255;
+            |sample, index| {
+                let component = index % num_components;
+                let [min, max] = ranges[component];
+                outside |= sample < min || sample > max;
+                if component + 1 == num_components {
+                    data.push(if outside { 255 } else { 0 });
+                    outside = false;
                 }
-            }
-
-            data.push(value);
-        }
-
+                Some(())
+            },
+        )?;
         let mut height = self.ctx.height;
         fix_image_length(&mut data, self.ctx.width, &mut height, 0, 1)?;
 

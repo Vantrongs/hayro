@@ -1,10 +1,11 @@
 mod bands;
 use super::area::Area;
+use super::image::samples::Samples;
 use super::image::{ImageKind, ImageXObject};
-use crate::cache::Cache;
-use crate::color::ColorSpace;
+use crate::ImageData;
 use crate::interpret::state::ActiveTransferFunction;
-use crate::{ImageData, WarningSinkFn};
+#[cfg(test)]
+use crate::{WarningSinkFn, cache::Cache};
 use bands::Bands;
 use hayro_syntax::object::stream::OwnedStream;
 use kurbo::Affine;
@@ -16,36 +17,18 @@ use std::sync::Mutex;
 pub struct ImageAsset(Arc<AssetData>);
 
 struct AssetData {
-    stream: OwnedStream,
+    samples: Samples<OwnedStream>,
     bands: Mutex<Option<Bands>>,
     token: Arc<std::sync::atomic::AtomicBool>,
-    width: u32,
-    height: u32,
-    color_space: Option<ColorSpace>,
-    interpolate: bool,
-    transfer_function: Option<ActiveTransferFunction>,
-    cache: Cache,
-    warning_sink: WarningSinkFn,
-    kind: ImageKind,
     key: Option<u128>,
 }
 
 impl ImageXObject<'_> {
     pub(crate) fn asset(&self, key: Option<u128>) -> ImageAsset {
         ImageAsset(Arc::new(AssetData {
-            stream: self.stream.to_owned_stream(),
+            samples: Samples::read(self, &hayro_syntax::object::Stream::to_owned_stream),
             bands: Mutex::default(),
             token: Arc::default(),
-            width: self.width,
-            height: self.height,
-            color_space: self.color_space.clone(),
-            interpolate: self.interpolate,
-            transfer_function: self.transfer_function.clone(),
-            // The colour space is resolved; decoding uses a cache only to read masks
-            // (always `DeviceGray`), so the page's cache is not kept alive.
-            cache: Cache::new(),
-            warning_sink: self.warning_sink.clone(),
-            kind: self.kind,
             key,
         }))
     }
@@ -55,12 +38,12 @@ impl ImageAsset {
     /// The width of the image's pixel grid, as its dictionary declares it: the image's
     /// transform maps `0..width` × `0..height` onto the unit square.
     pub fn width(&self) -> u32 {
-        self.0.width
+        self.0.samples.width
     }
 
     /// The height of the image's pixel grid, as its dictionary declares it.
     pub fn height(&self) -> u32 {
-        self.0.height
+        self.0.samples.height
     }
 
     /// Identifies what the asset decodes to, as
@@ -71,24 +54,20 @@ impl ImageAsset {
         self.0.key
     }
 
+    /// Bytes copied when capturing the stream.
+    pub fn copied_bytes(&self) -> usize {
+        self.0.samples.stream.copied_bytes()
+            + self
+                .0
+                .samples
+                .mask
+                .as_ref()
+                .map_or(0, |m| m.stream.copied_bytes())
+    }
+
     /// Bytes retained in decoder checkpoints.
     pub fn checkpoint_bytes(&self) -> Result<usize, RequestError> {
         Ok(0)
-    }
-
-    fn xobject(&self) -> Option<ImageXObject<'_>> {
-        let a = &*self.0;
-        Some(ImageXObject {
-            width: a.width,
-            height: a.height,
-            color_space: a.color_space.clone(),
-            cache: a.cache.clone(),
-            interpolate: a.interpolate,
-            kind: a.kind,
-            stream: a.stream.get()?,
-            transfer_function: a.transfer_function.clone(),
-            warning_sink: a.warning_sink.clone(),
-        })
     }
 
     /// A cancellation flag shared by this asset's decoders.
@@ -98,10 +77,10 @@ impl ImageAsset {
 
     /// Opens the image for requests, optionally hinting the desired size.
     pub fn open(&self, hint: Option<(u32, u32)>) -> Option<ImageSource<'_>> {
-        let obj = self.xobject()?;
+        let obj = &self.0.samples;
         let mut bands = self.0.bands.lock().ok()?;
         if bands.is_none() {
-            *bands = Bands::new(self, &obj);
+            *bands = Bands::new(self);
         }
         if let Some(bands) = bands.as_ref() {
             return Some(ImageSource {
@@ -116,7 +95,7 @@ impl ImageAsset {
         }
         let stencil = obj.kind == ImageKind::StencilMask;
         let decoded = if stencil {
-            let d = obj.decoded_mask(hint)?;
+            let d = super::decode::decode_mask(obj, hint)?;
             Decoded::new(
                 ImageData::Luma(d.luma),
                 None,
@@ -125,7 +104,7 @@ impl ImageAsset {
                 d.tail.texel,
             )
         } else {
-            let d = obj.decoded_image(hint)?;
+            let d = super::decode::decode_image(obj, hint)?;
             Decoded::new(
                 d.image,
                 d.alpha,
@@ -337,7 +316,7 @@ impl ImageSource<'_> {
         if let Some(decoded) = &self.decoded {
             rows_decoded = decoded.run(request.plane, &mut area, request.cancel)?;
         } else {
-            let obj = self.asset.xobject().ok_or(RequestError::Failed)?;
+            let obj = &self.asset.0.samples;
             let rows = area.rows();
             let columns = area.columns();
             let c = plane.format.channels();
@@ -353,11 +332,11 @@ impl ImageSource<'_> {
                     .lock()
                     .map_err(|_| RequestError::Failed)?;
                 if lock.is_none() {
-                    *lock = Bands::new(self.asset, &obj);
+                    *lock = Bands::new(self.asset);
                 }
                 let bands = lock.as_mut().ok_or(RequestError::Failed)?;
                 let end = y.saturating_add(bands.band_rows() as u32).min(rows.end);
-                let band = match bands.read_band(request.plane, &columns, y, end, &obj) {
+                let band = match bands.read_band(request.plane, &columns, y, end, obj) {
                     Ok(result) => result,
                     Err(error) => {
                         *lock = None;
@@ -588,3 +567,59 @@ impl Decoded {
 
 #[cfg(test)]
 mod short_rows;
+
+#[cfg(all(test, debug_assertions))]
+#[test]
+fn recorded_mask_and_filter_operands_need_no_object_reads_on_the_drawing_thread() {
+    use crate::fixtures::{file, stream};
+    use hayro_syntax::Pdf;
+    use hayro_syntax::object::{ObjectIdentifier, Stream};
+    use hayro_syntax::work::BODIES_READ;
+
+    for (mask, expected) in [("/Mask 4 0 R", 0), ("/SMask 5 0 R", 127)] {
+        let objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec(),
+            stream(
+                &format!("/Width 1 /Height 1 /CS /G /BPC 8 /Decode 6 0 R {mask}"),
+                &[128],
+            ),
+            b"[7 0 R 7 0 R]".to_vec(),
+            stream(
+                "/Width 1 /Height 1 /BPC 8 /Decode 6 0 R /Filter /LZWDecode /DP << /EarlyChange 8 0 R >>",
+                &[0x80, 0x1f, 0xe0, 0x20],
+            ),
+            b"[0 1]".to_vec(),
+            b"128".to_vec(),
+            b"1".to_vec(),
+        ];
+        let pdf = Pdf::new(file(&objects, "")).unwrap();
+        let stream: Stream<'_> = pdf.xref().get(ObjectIdentifier::new(3, 0)).unwrap();
+        let obj = ImageXObject::new(
+            &stream,
+            |_| None,
+            &(Arc::new(|_| {}) as WarningSinkFn),
+            &Cache::new(),
+            None,
+        )
+        .unwrap();
+        let asset = obj.asset(None);
+        drop(pdf);
+        std::thread::spawn(move || {
+            BODIES_READ.set(0);
+            let mut source = asset.open(None).unwrap();
+            let out = source
+                .request(&ImageRequest {
+                    plane: Plane::Image,
+                    grid: (1, 1),
+                    window: [0, 0, 1, 1],
+                    cancel: None,
+                })
+                .unwrap();
+            assert_eq!(out.data.last(), Some(&expected));
+            assert_eq!(BODIES_READ.get(), 0);
+        })
+        .join()
+        .unwrap();
+    }
+}

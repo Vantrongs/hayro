@@ -1,35 +1,80 @@
 use crate::filter::png::{self, RowFilter};
-use crate::object::Dict;
-use crate::object::dict::keys::{BITS_PER_COMPONENT, COLORS, COLUMNS, PREDICTOR};
+use crate::object::dict::keys::{BITS_PER_COMPONENT, COLORS, COLUMNS, EARLY_CHANGE, PREDICTOR};
+use crate::object::{Dict, Number};
 use alloc::vec::Vec;
 
+pub(super) struct Rows {
+    pub(super) tiff: bool,
+    pub(super) colors: usize,
+    pub(super) bpc: usize,
+    pub(super) columns: usize,
+    pub(super) width: usize,
+}
+
+fn integer(params: &Dict<'_>, key: &[u8], default: i32) -> Option<i32> {
+    let Some(number) = params.get::<Number>(key) else {
+        return Some(default);
+    };
+    if number.is_integer() {
+        return Some(number.as_i64() as i32);
+    }
+    let rounded = number.viewer_f32()? + 0.5;
+    Some(if rounded >= 2_147_483_648.0 {
+        i32::MIN
+    } else {
+        rounded as i32
+    })
+}
+
+pub(super) fn early_change(params: &Dict<'_>) -> bool {
+    integer(params, EARLY_CHANGE, 1) != Some(0)
+}
+
+impl Rows {
+    pub(super) fn read(params: &Dict<'_>) -> Result<Option<Self>, ()> {
+        let method = integer(params, PREDICTOR, 1).ok_or(())?;
+        if !matches!(method, 2 | 10..=15) {
+            return Ok(None);
+        }
+        let positive = |key, default| {
+            integer(params, key, default)
+                .map(|value| if value < 1 { default } else { value } as usize)
+                .ok_or(())
+        };
+        let colors = positive(COLORS, 1)?;
+        let bpc = positive(BITS_PER_COMPONENT, 8)?;
+        let columns = positive(COLUMNS, 1)?;
+        if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
+            return Err(());
+        }
+        let width = colors
+            .checked_mul(bpc)
+            .and_then(|bits| bits.checked_mul(columns))
+            .ok_or(())?
+            .div_ceil(8);
+        Ok(Some(Self {
+            tiff: method == 2,
+            colors,
+            bpc,
+            columns,
+            width,
+        }))
+    }
+
+    pub(super) fn bytes_per_pixel(&self) -> usize {
+        (self.colors * self.bpc).div_ceil(8)
+    }
+}
+
 pub(crate) fn apply(data: Vec<u8>, params: &Dict<'_>) -> Option<Vec<u8>> {
-    let predictor = params.get::<u32>(PREDICTOR).unwrap_or(1);
-
-    if predictor == 1 {
+    let Some(rows) = Rows::read(params).ok()? else {
         return Some(data);
-    }
-
-    let colors = params.get::<usize>(COLORS).unwrap_or(1);
-    let bits_per_component = params.get::<usize>(BITS_PER_COMPONENT).unwrap_or(8);
-    let columns = params.get::<usize>(COLUMNS).unwrap_or(1);
-
-    if !matches!(bits_per_component, 1 | 2 | 4 | 8 | 16) {
-        return None;
-    }
-
-    let bits_per_pixel = colors.checked_mul(bits_per_component)?;
-    let row_len = columns.checked_mul(bits_per_pixel)?.div_ceil(8);
-
-    if row_len == 0 {
-        return None;
-    }
-
-    match predictor {
-        2 => Some(tiff(data, colors, bits_per_component, columns, row_len)),
-        10..=15 => Some(png(data, bits_per_pixel.div_ceil(8), row_len)),
-        _ => None,
-    }
+    };
+    Some(if rows.tiff {
+        tiff(data, rows.colors, rows.bpc, rows.columns, rows.width)
+    } else {
+        png(data, rows.bytes_per_pixel(), rows.width)
+    })
 }
 
 fn tiff(

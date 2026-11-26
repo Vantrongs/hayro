@@ -15,9 +15,8 @@ pub(crate) fn decode(
     Fax::new(params, image_params.height, None).decode(data, FaxRows::Packed)
 }
 
-pub(crate) fn can_expand(dict: &Dict<'_>, params: &ImageDecodeParams) -> bool {
-    !params.is_indexed
-        && !dict.contains_key(MASK)
+pub(crate) fn can_expand(dict: &Dict<'_>) -> bool {
+    !dict.contains_key(MASK)
         && dict
             .get::<Array<'_>>(D)
             .or_else(|| dict.get::<Array<'_>>(DECODE))
@@ -111,6 +110,7 @@ impl Fax {
             data: Cow::Owned(decoder.output),
             image_data: Some(ImageData {
                 alpha: None,
+                component_depths: Vec::new(),
                 color_space: Some(ImageColorSpace::Gray),
                 bits_per_component: if luma { 8 } else { 1 },
                 width: columns,

@@ -613,7 +613,7 @@ pub(crate) mod cached {
             let xref_reference: &'static XRef = unsafe { core::mem::transmute(xref.deref()) };
 
             let ctx = ReaderContext::new(xref_reference, false);
-            let pages = xref.retry_after_repair(|_| Pages::new(&ctx, xref_reference))?;
+            let pages = Pages::new(&ctx, xref_reference)?;
 
             Some(Self { pages, _xref: xref })
         }

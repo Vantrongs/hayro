@@ -49,6 +49,7 @@ mod x_object;
 
 pub mod color;
 pub mod encode;
+pub mod flatten;
 pub mod font;
 mod geometry;
 pub mod gradient;

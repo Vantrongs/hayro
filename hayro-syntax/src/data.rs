@@ -55,12 +55,13 @@ impl From<Vec<u8>> for PdfData {
 pub(crate) struct Data {
     pub(crate) watched: crate::lost::Watched,
     pub(crate) dictionaries: Mutex<Map<usize, (usize, crate::object::dict::Index)>>,
+    pub(crate) numbers: Mutex<Map<(usize, usize), (usize, crate::object::Number)>>,
     pub(crate) arrays: Mutex<Map<usize, usize>>,
     pub(crate) rectangles: Mutex<Map<usize, [crate::object::MaybeRef<f32>; 4]>>,
     data: PdfData,
     // 32 segments are more than enough as we can't have more objects than this.
     object_streams: SegmentList<ObjectStream, 32>,
-    map: Mutex<Map<(ObjectIdentifier, bool), (usize, crate::lost::Lost)>>,
+    map: Mutex<Map<ObjectIdentifier, (usize, crate::lost::Lost)>>,
 }
 
 impl Debug for Data {
@@ -74,6 +75,7 @@ impl Data {
         Self {
             data,
             dictionaries: Mutex::default(),
+            numbers: Mutex::default(),
             arrays: Mutex::default(),
             rectangles: Mutex::default(),
             watched: crate::lost::Watched::default(),
@@ -89,11 +91,9 @@ impl Data {
     pub(crate) fn object_stream(
         &self,
         id: ObjectIdentifier,
-        repaired: bool,
         ctx: &ReaderContext<'_>,
     ) -> Option<&ObjectStream> {
-        let key = (id, repaired);
-        if let Some(&(idx, lost)) = self.map.get().get(&key) {
+        if let Some(&(idx, lost)) = self.map.get().get(&id) {
             ctx.xref().note(lost);
             return self.object_streams.get(idx);
         }
@@ -101,20 +101,14 @@ impl Data {
         // Decoding may resolve other objects, so do it without holding the cache lock.
         let (object_stream, lost) = ctx.xref().apart(|| {
             let crate::xref::Carrier(stream, cut) = ctx.xref().get_with(id, ctx)?;
-            if !repaired && ctx.xref().is_repaired() {
-                return None;
-            }
             let mut object_stream = ObjectStream::new(&stream)?;
             object_stream.next_byte = cut;
             Some(object_stream)
         });
-        if !repaired && ctx.xref().is_repaired() {
-            return None;
-        }
         let object_stream = object_stream?;
         let mut locked = self.map.get();
         let next = locked.len();
-        let (idx, lost) = *locked.entry(key).or_insert_with(|| {
+        let (idx, lost) = *locked.entry(id).or_insert_with(|| {
             self.object_streams.get_or_init(next, || object_stream);
             (next, lost)
         });

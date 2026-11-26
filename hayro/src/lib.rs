@@ -69,6 +69,7 @@ mod glyph_cache;
 mod image;
 mod mask;
 mod paint;
+pub use paint::{ShadingPaint, ShadingPaintCache};
 mod path;
 mod tiling;
 
@@ -106,7 +107,7 @@ pub(crate) struct Renderer<'a> {
     global: &'a GlobalState,
     pub(crate) ctx: &'a mut RenderContext,
     pub(crate) inside_pattern: bool,
-    gradient_cache: paint::GradientCache,
+    gradient_cache: ShadingPaintCache,
     pub(crate) soft_masks: hayro_interpret::SoftMasks<Mask>,
     pub(crate) in_type3_glyph: bool,
 }
@@ -117,7 +118,7 @@ impl<'r> Renderer<'r> {
             global,
             ctx,
             inside_pattern: false,
-            gradient_cache: FxHashMap::default(),
+            gradient_cache: ShadingPaintCache::default(),
             soft_masks: hayro_interpret::SoftMasks::default(),
             in_type3_glyph: false,
         }
@@ -504,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_direct_and_repaired_annotations_after_invalid_entries() {
+    fn renders_direct_annotations_after_unreadable_entries() {
         let data = Arc::new(CountingPdf::default());
         let pdf = Pdf::new(data.clone()).unwrap();
         let annots = pdf.pages()[0].raw().get::<Array<'_>>(b"Annots").unwrap();
@@ -526,7 +527,7 @@ mod tests {
         let pixel = |x| pages[0].sample(x, 15).to_u8_array();
 
         assert_eq!(pixel(15), [255; 4], "page self-reference");
-        assert_eq!(pixel(45), [0, 0, 255, 255], "repaired annotation");
+        assert_eq!(pixel(45), [255; 4], "unreadable annotation");
         assert_eq!(pixel(75), [0, 0, 255, 255], "direct annotation");
     }
 }

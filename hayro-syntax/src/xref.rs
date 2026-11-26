@@ -21,7 +21,7 @@ use crate::object::{Object, ObjectLike};
 use crate::pdf::PdfVersion;
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, skip_white_spaces_and_comments_in};
-use crate::sync::{Arc, RwLock, RwLockExt};
+use crate::sync::Arc;
 use crate::trivia::is_regular_character;
 use crate::trivia::is_white_space_character;
 use crate::util::findr_needle;
@@ -51,6 +51,8 @@ pub(crate) fn root_xref(data: PdfData, password: &[u8]) -> Result<XRef, XRefErro
     let xref_pos = find_last_xref_pos(data.as_ref()).ok_or(XRefError::Unknown)?;
     let trailer =
         populate_xref_impl(data.as_ref(), xref_pos, &mut xref_map).ok_or(XRefError::Unknown)?;
+
+    xref_map.retain(|_, entry| *entry != EntryType::Normal(0));
 
     XRef::new(
         data.clone(),
@@ -106,6 +108,18 @@ fn fallback_xref_map_inner<'a>(
     listed: Option<&XrefMap>,
 ) -> (XrefMap, Option<XRefInput<'a>>) {
     let mut xref_map = Map::default();
+    let mut claims: Vec<_> = listed
+        .into_iter()
+        .flatten()
+        .filter_map(|(&id, entry)| match entry {
+            EntryType::Normal(at) => Some((*at, id)),
+            _ => None,
+        })
+        .collect();
+    claims.sort_unstable_by_key(|claim| claim.0);
+    let mut claims = claims.chunk_by(|a, b| a.0 == b.0).peekable();
+    let mut aliases = Vec::new();
+    let mut found = Vec::new();
     let mut preferred = Vec::new();
     let mut trailer_dicts = vec![];
     let mut root_ref = None;
@@ -126,7 +140,36 @@ fn fallback_xref_map_inner<'a>(
                 r = header;
                 let mut cloned = r.clone();
                 skip_white_spaces_and_comments_in(&mut cloned, ends);
+                let body_start = cloned.offset();
                 if containers.skip_object(ends, &mut cloned).is_some() {
+                    while claims.next_if(|group| group[0].0 < cur_pos).is_some() {}
+                    let first_alias = aliases.len();
+                    let mut named = false;
+                    while let Some(group) = claims.next_if(|group| group[0].0 < body_start) {
+                        let at = group[0].0;
+                        let end = claims.peek().map_or(data.as_ref().len(), |next| {
+                            next[0].0.min(data.as_ref().len())
+                        });
+                        let valid = if at == cur_pos {
+                            end >= r.offset()
+                        } else {
+                            let mut slot = Reader::new(&data.as_ref()[at..end]);
+                            ObjectIdentifier::read_in(&mut slot, &crate::reader::Unknown).is_some()
+                        };
+                        if valid {
+                            for &(_, id) in group {
+                                named |= id == obj_id;
+                                if id != obj_id {
+                                    aliases.push((id, cur_pos));
+                                }
+                            }
+                        } else if at == cur_pos {
+                            broken.extend(group.iter().map(|&(_, id)| (id, at)));
+                        }
+                    }
+                    if listed.is_some() {
+                        found.push((obj_id, cur_pos, !named && aliases.len() != first_alias));
+                    }
                     xref_map.insert(obj_id, EntryType::Normal(cur_pos));
                     last_obj_num = Some(obj_id);
                     dummy_ctx.set_obj_number(obj_id);
@@ -141,7 +184,10 @@ fn fallback_xref_map_inner<'a>(
                 && let Some(probe) = containers.resolve(ends, r.clone())
             {
                 r.jump(probe.end);
-                if probe.has_root || probe.has_type {
+                let mut payload = r.clone();
+                let has_stream =
+                    object::stream::forward_stream_opener(&mut payload, ends).is_some();
+                if probe.has_root || probe.has_type || has_stream {
                     let mut dict_reader = Reader::new(&data.as_ref()[cur_pos..probe.end]);
                     if let Some(dict) = dict_reader.read_with_context::<Dict<'_>>(&dummy_ctx) {
                         if dict
@@ -171,15 +217,15 @@ fn fallback_xref_map_inner<'a>(
                                 let id = ObjectIdentifier::new(obj_num, 0);
                                 let entry =
                                     EntryType::ObjStream(last_obj_num.obj_number, idx as u32);
-                                if listed.is_some_and(|map| {
-                                    map.get(&id) == Some(&entry)
-                                        && map.get(&last_obj_num) == xref_map.get(&last_obj_num)
+                                if let Some(&location) = xref_map.get(&last_obj_num) && listed.is_some_and(|map| {
+                                    matches!(map.get(&id), Some(EntryType::ObjStream(num, _)) if *num == last_obj_num.obj_number)
+                                        && map.get(&last_obj_num) == Some(&location)
                                 }) {
                                     preferred.push((
                                         id,
                                         entry,
                                         last_obj_num,
-                                        xref_map[&last_obj_num],
+                                        location,
                                     ));
                                 }
                                 if xref_map
@@ -192,8 +238,7 @@ fn fallback_xref_map_inner<'a>(
                         }
 
                         // An exact declared length owns its payload, including bytes that look like headers.
-                        let mut payload = r.clone();
-                        if object::stream::forward_stream_opener(&mut payload, ends).is_some()
+                        if has_stream
                             && let Some(length) = dict.get::<usize>(object::dict::keys::LENGTH)
                             && payload.skip_bytes(length).is_some()
                         {
@@ -226,6 +271,28 @@ fn fallback_xref_map_inner<'a>(
         if xref_map.get(&carrier) == Some(&location) {
             xref_map.insert(id, entry);
         }
+    }
+    aliases.retain(|(id, _)| !xref_map.contains_key(id));
+    if !aliases.is_empty() {
+        let taken: crate::hash::Set<_> = aliases.iter().map(|&(_, at)| at).collect();
+        let mut moved = crate::hash::Set::default();
+        for &(id, at, exclusive) in &found {
+            if exclusive && taken.contains(&at) && xref_map.get(&id) == Some(&EntryType::Normal(at))
+            {
+                moved.insert(id);
+                xref_map.remove(&id);
+            }
+        }
+        for (id, at, exclusive) in found {
+            if moved.contains(&id) && !(exclusive && taken.contains(&at)) {
+                xref_map.insert(id, EntryType::Normal(at));
+            }
+        }
+        xref_map.extend(
+            aliases
+                .into_iter()
+                .map(|(id, at)| (id, EntryType::Normal(at))),
+        );
     }
     let trailer_dict = find_rebuild_trailer(data, &dummy_ctx, &xref_map, trailer_dicts);
 
@@ -348,7 +415,7 @@ fn find_rebuild_trailer<'a>(
 
 const DUMMY_XREF: XRef = XRef(Inner::Dummy);
 
-/// An xref table.
+/// The cross-reference table, checked or rebuilt on open and immutable thereafter.
 #[derive(Debug, Clone)]
 pub struct XRef(Inner);
 
@@ -386,17 +453,23 @@ impl XRef {
         password: &[u8],
         broken: Broken,
     ) -> Result<Self, XRefError> {
+        let original = MapRepr::new(xref_map, repaired, broken);
+        let (map, trailer) = if !repaired && !original.valid(data.as_ref()) {
+            original.rebuild(&data, password)
+        } else {
+            (original, None)
+        };
+        let input = trailer.unwrap_or(input);
         // The trailer can only be resolved once the xref exists.
         let trailer_data = TrailerData::dummy();
 
         let mut xref = Self(Inner::Some(Arc::new(SomeRepr {
-            data: Arc::new(Data::new(data)),
-            map: Arc::new(RwLock::new(MapRepr::new(xref_map, repaired, broken))),
+            data: Arc::new(Data::new(data.clone())),
+            map: Arc::new(map),
             decryptor: Arc::new(Decryptor::None),
             has_ocgs: false,
             metadata: Arc::new(Metadata::default()),
             trailer_data,
-            password: password.to_vec(),
         })));
 
         // Read the trailer twice so the catalog can be in an encrypted object stream.
@@ -490,7 +563,7 @@ impl XRef {
     pub(crate) fn len(&self) -> usize {
         match &self.0 {
             Inner::Dummy => 0,
-            Inner::Some(r) => r.map.get().xref_map.len(),
+            Inner::Some(r) => r.map.xref_map.len(),
         }
     }
 
@@ -530,8 +603,8 @@ impl XRef {
         let Inner::Some(r) = &self.0 else {
             unreachable!()
         };
-        let locked = r.map.get();
-        let mut elements = locked
+        let map = &r.map;
+        let mut elements = map
             .xref_map
             .iter()
             .map(|(id, e)| {
@@ -539,7 +612,7 @@ impl XRef {
                     EntryType::Normal(o) => (*o, 0),
                     EntryType::ObjStream(id, index) => {
                         if let Some(EntryType::Normal(offset)) =
-                            locked.xref_map.get(&ObjectIdentifier::new(*id, 0))
+                            map.xref_map.get(&ObjectIdentifier::new(*id, 0))
                         {
                             (*offset, *index)
                         } else {
@@ -552,7 +625,7 @@ impl XRef {
             })
             .collect::<Vec<_>>();
 
-        elements.extend(locked.broken.iter().map(|(id, at)| (*id, (*at, 0))));
+        elements.extend(map.broken.iter().map(|(id, at)| (*id, (*at, 0))));
         elements.sort_unstable_by_key(|(id, location)| (*location, *id));
         elements.into_iter().map(|(id, _)| id)
     }
@@ -593,7 +666,7 @@ impl XRef {
     /// Location a listed reference leads to.
     pub fn content_key(&self, id: ObjectIdentifier) -> Option<ContentKey<'_>> {
         let Inner::Some(r) = &self.0 else { return None };
-        let (entry, repaired, next) = r.map.get().location(id, self)?;
+        let (entry, next) = r.map.location(id, self)?;
         let mut ctx = ReaderContext::new(self, false);
         let data = match entry {
             EntryType::Normal(at) => {
@@ -604,31 +677,20 @@ impl XRef {
                     return None;
                 };
                 let physical = Reader::new(bytes).read_without_context::<ObjectIdentifier>();
-                if physical != Some(id) && !repaired {
-                    self.repair();
-                    return self.content_key(id);
-                }
                 ctx.set_obj_number(physical.unwrap_or(id));
                 bytes
             }
             EntryType::ObjStream(n, i) => {
                 let carrier = ObjectIdentifier::new(n, 0);
                 if carrier == id {
-                    if !repaired {
-                        self.repair();
-                        return self.content_key(id);
-                    }
                     self.note(Some(id));
                     return None;
                 }
-                let (stream, lost) = self.apart(|| r.data.object_stream(carrier, repaired, &ctx));
-                if !repaired && stream.and_then(|s| s.obj_number(i)) != Some(id.obj_number) {
-                    self.repair();
-                    return self.content_key(id);
-                }
-                let Some((stream, at)) =
-                    stream.and_then(|s| Some((s, s.offsets.get(i as usize)?.1?)))
-                else {
+                let (stream, lost) = self.apart(|| r.data.object_stream(carrier, &ctx));
+                let Some((stream, at)) = stream.and_then(|s| {
+                    let index = s.member_index(id.obj_number, i)?;
+                    Some((s, s.offsets[index as usize].1?))
+                }) else {
                     self.note(Some(id));
                     return None;
                 };
@@ -642,58 +704,7 @@ impl XRef {
 
     /// Whether the cross-reference map has been rebuilt.
     pub fn is_repaired(&self) -> bool {
-        matches!(&self.0, Inner::Some(r) if r.map.get().repaired)
-    }
-
-    pub(crate) fn retry_after_repair<T>(&self, read: impl Fn(bool) -> T) -> T {
-        loop {
-            let started_repaired = self.is_repaired();
-            let result = read(started_repaired);
-            if started_repaired || !self.is_repaired() {
-                return result;
-            }
-        }
-    }
-
-    pub(crate) fn repair(&self) {
-        let Inner::Some(r) = &self.0 else {
-            unreachable!();
-        };
-
-        let mut locked = r.map.put();
-        if locked.repaired {
-            return;
-        }
-
-        let mut broken = Broken::default();
-        let (xref_map, _) = scan_table(
-            r.data.get(),
-            &r.password,
-            &mut broken,
-            Some(&locked.xref_map),
-        );
-        let mut rebuilt = xref_map;
-        let file = r.data.get().as_ref();
-        for (&id, &entry) in &locked.xref_map {
-            if let EntryType::ObjStream(_, _) = entry {
-                rebuilt.entry(id).or_insert(entry);
-            } else if let EntryType::Normal(at) = entry {
-                let end = locked.next_offset(at).unwrap_or(file.len()).min(file.len());
-                let mut header = Reader::new_with(&file[..end], at);
-                if let Some(physical) =
-                    ObjectIdentifier::read_in(&mut header, &crate::reader::Unknown)
-                {
-                    if broken.contains_key(&physical) && !rebuilt.contains_key(&id) {
-                        broken.insert(id, at);
-                    } else {
-                        rebuilt.entry(id).or_insert(entry);
-                    }
-                } else if file.get(at..=end).is_some_and(cut_header) {
-                    broken.entry(id).or_insert(at);
-                }
-            }
-        }
-        *locked = MapRepr::new(rebuilt, true, broken);
+        matches!(&self.0, Inner::Some(r) if r.map.repaired)
     }
 
     #[inline]
@@ -757,9 +768,11 @@ impl XRef {
             return None;
         }
 
-        // The flag must describe the map this entry came from.
-        let (entry, was_repaired, next) = repr.map.get().location(id, self)?;
-        let caller_ctx = ctx;
+        let (entry, next) = repr.map.location(id, self)?;
+        let missing = || {
+            self.note(Some(id));
+            None
+        };
         let mut ctx = ctx.clone();
         ctx.set_lookup_id(id);
         ctx.set_obj_number(id);
@@ -772,17 +785,8 @@ impl XRef {
                 ctx.set_in_object_stream(false);
                 let mut r = Reader::new_with(&file[..end], offset);
                 if let Some(physical) = r.read_without_context::<ObjectIdentifier>() {
-                    if physical != id && !was_repaired {
-                        return self.repair_and_get(id, caller_ctx, false);
-                    }
-                    if ctx.parent_chain_contains(&physical) {
-                        return None;
-                    }
                     ctx.set_obj_number(physical);
                     ctx.parent_chain_push(id);
-                    if physical != id {
-                        ctx.parent_chain_push(physical);
-                    }
                     r.skip_white_spaces_and_comments();
                     ctx.mark_storage(r.tail()?);
                     ctx.set_cut(file.get(end).copied());
@@ -794,77 +798,40 @@ impl XRef {
                     } else {
                         lost
                     };
-                    if value.is_none() && !was_repaired {
-                        if lost == Some(id) {
-                            self.repair();
-                        }
-                        if repr
-                            .map
-                            .get()
-                            .location(id, self)
-                            .is_some_and(|(new, _, bound)| (new, bound) != (entry, next))
-                        {
-                            return self.get_with(id, caller_ctx);
-                        }
-                    }
                     self.note(lost);
                     return value;
                 }
-                self.repair_and_get(id, caller_ctx, was_repaired)
+                missing()
             }
             EntryType::ObjStream(obj_stram_gen_num, index) => {
                 let obj_stream_id = ObjectIdentifier::new(obj_stram_gen_num, 0);
 
                 if obj_stream_id == id {
-                    return self.repair_and_get(id, caller_ctx, was_repaired);
+                    return missing();
                 }
 
                 if !matches!(
-                    repr.map.get().xref_map.get(&obj_stream_id),
+                    repr.map.xref_map.get(&obj_stream_id),
                     Some(EntryType::Normal(_))
                 ) {
-                    return self.repair_and_get(id, caller_ctx, was_repaired);
+                    return missing();
                 }
 
                 ctx.parent_chain_push(id);
 
                 let (object_stream, lost) =
-                    self.apart(|| repr.data.object_stream(obj_stream_id, was_repaired, &ctx));
-                if !was_repaired && repr.map.get().repaired {
-                    return self.get_with(id, caller_ctx);
-                }
+                    self.apart(|| repr.data.object_stream(obj_stream_id, &ctx));
                 let Some(object_stream) = object_stream else {
-                    return self.repair_and_get(id, caller_ctx, was_repaired);
+                    return missing();
                 };
 
-                if object_stream.obj_number(index) == Some(id.obj_number)
-                    || was_repaired && object_stream.obj_number(index).is_some()
-                {
+                if let Some(index) = object_stream.member_index(id.obj_number, index) {
                     self.note(lost);
                     return object_stream.member(index, &ctx, true);
                 }
 
-                self.repair_and_get(id, caller_ctx, was_repaired)
+                missing()
             }
-        }
-    }
-
-    fn repair_and_get<'a, T>(
-        &'a self,
-        id: ObjectIdentifier,
-        ctx: &ReaderContext<'a>,
-        was_repaired: bool,
-    ) -> Option<T>
-    where
-        T: Readable<'a>,
-    {
-        if was_repaired {
-            self.note(Some(id));
-            None
-        } else {
-            self.repair();
-
-            self.get_with::<T>(id, ctx)
         }
     }
 }
@@ -927,17 +894,63 @@ struct MapRepr {
 }
 
 impl MapRepr {
-    fn location(
-        &self,
-        id: ObjectIdentifier,
-        xref: &XRef,
-    ) -> Option<(EntryType, bool, Option<usize>)> {
+    fn valid(&self, file: &[u8]) -> bool {
+        self.xref_map.iter().all(|(&id, &entry)| match entry {
+            EntryType::Normal(at) => {
+                let end = self.next_offset(at).unwrap_or(file.len()).min(file.len());
+                file.get(at..end).is_some_and(|slot| {
+                    let mut header = Reader::new(slot);
+                    ObjectIdentifier::read_in(&mut header, &crate::reader::Unknown) == Some(id)
+                })
+            }
+            EntryType::ObjStream(num, _) => matches!(
+                self.xref_map.get(&ObjectIdentifier::new(num, 0)),
+                Some(EntryType::Normal(_))
+            ),
+        })
+    }
+
+    fn rebuild<'a>(&self, data: &'a PdfData, password: &[u8]) -> (Self, Option<XRefInput<'a>>) {
+        let mut broken = Broken::default();
+        let (mut rebuilt, trailer) = scan_table(data, password, &mut broken, Some(&self.xref_map));
+        let file = data.as_ref();
+        let mut headers = Map::default();
+        for (&id, &entry) in &self.xref_map {
+            if rebuilt.contains_key(&id) {
+                continue;
+            }
+            if let EntryType::ObjStream(_, _) = entry {
+                rebuilt.entry(id).or_insert(entry);
+            } else if let EntryType::Normal(at) = entry {
+                let (physical, cut) = *headers.entry(at).or_insert_with(|| {
+                    let end = self.next_offset(at).unwrap_or(file.len()).min(file.len());
+                    let mut header = Reader::new_with(&file[..end], at);
+                    (
+                        ObjectIdentifier::read_in(&mut header, &crate::reader::Unknown),
+                        file.get(at..=end).is_some_and(cut_header),
+                    )
+                });
+                if let Some(physical) = physical {
+                    if broken.contains_key(&physical) {
+                        broken.insert(id, at);
+                    } else {
+                        rebuilt.entry(id).or_insert(entry);
+                    }
+                } else if cut {
+                    broken.entry(id).or_insert(at);
+                }
+            }
+        }
+        (Self::new(rebuilt, true, broken), trailer)
+    }
+
+    fn location(&self, id: ObjectIdentifier, xref: &XRef) -> Option<(EntryType, Option<usize>)> {
         let entry = self.entry(id, xref)?;
         let end = match entry {
             EntryType::Normal(at) => self.next_offset(at),
             EntryType::ObjStream(_, _) => None,
         };
-        Some((entry, self.repaired, end))
+        Some((entry, end))
     }
 
     fn entry(&self, id: ObjectIdentifier, xref: &XRef) -> Option<EntryType> {
@@ -994,11 +1007,10 @@ impl TrailerData {
 #[derive(Debug, Clone)]
 struct SomeRepr {
     data: Arc<Data>,
-    map: Arc<RwLock<MapRepr>>,
+    map: Arc<MapRepr>,
     metadata: Arc<Metadata>,
     decryptor: Arc<Decryptor>,
     has_ocgs: bool,
-    password: Vec<u8>,
     trailer_data: TrailerData,
 }
 
@@ -1159,6 +1171,7 @@ fn populate_from_xref_table(reader: &mut Reader<'_>, insert_map: &mut XrefMap) -
         for obj_number in start..end {
             max_obj = max(max_obj, obj_number);
             let bytes = reader.read_bytes(XREF_ENTRY_LEN)?;
+            crate::work::told(bytes.len());
             let entry = XRefEntry::read(bytes)?;
 
             // Entries beyond `Size` are not ignored.
@@ -1216,6 +1229,7 @@ fn populate_from_xref_stream(stream: &Stream<'_>, insert_map: &mut XrefMap) -> O
 }
 
 fn xref_stream_num(data: &[u8]) -> Option<u32> {
+    crate::work::told(data.len());
     Some(match data.len() {
         0 => return None,
         1 => u8::from_be(data[0]) as u32,
@@ -1348,18 +1362,21 @@ fn has_usable_object_stream_header(dict: &Dict<'_>) -> bool {
 
 pub(crate) struct ObjectStream {
     pub(crate) next_byte: Option<u8>,
-    data: Vec<u8>,
+    data: Box<[u8]>,
     offsets: Vec<(u32, Option<usize>)>,
+    by_number: crate::sync::OnceLock<Map<u32, u32>>,
 }
 
 impl ObjectStream {
     pub(crate) fn new(stream: &Stream<'_>) -> Option<Self> {
-        let data = stream.decoded_data().ok()?.into_owned();
+        let data = stream.decoded_data().ok()?.into_owned().into_boxed_slice();
+        crate::work::bodies(data.len());
         let offsets = Self::read_offsets(stream, &data).unwrap_or_default();
 
         Some(Self {
             data,
             offsets,
+            by_number: Default::default(),
             next_byte: None,
         })
     }
@@ -1378,6 +1395,7 @@ impl ObjectStream {
             let obj_num = r.read_without_context::<u32>()?;
             r.skip_white_spaces_and_comments();
             let relative_offset = r.read_without_context::<usize>()?;
+            crate::work::entries(1);
             let offset = first_offset.saturating_add(relative_offset);
 
             // Offsets must strictly increase, or members could overlap.
@@ -1393,6 +1411,22 @@ impl ObjectStream {
         }
 
         Some(offsets)
+    }
+
+    fn member_index(&self, number: u32, listed: u32) -> Option<u32> {
+        if self.obj_number(listed) == Some(number) {
+            return Some(listed);
+        }
+        self.by_number
+            .get_or_init(|| {
+                self.offsets
+                    .iter()
+                    .zip(0u32..)
+                    .map(|(&(n, _), i)| (n, i))
+                    .collect()
+            })
+            .get(&number)
+            .copied()
     }
 
     fn obj_number(&self, index: u32) -> Option<u32> {
@@ -1474,41 +1508,45 @@ fn read_bounded<'a, T: Readable<'a>>(
     id: ObjectIdentifier,
     indirect: bool,
 ) -> Option<T> {
-    let start = r.offset();
-    let object = if indirect {
-        r.read_indirect::<T>(ctx)
-    } else {
-        r.read::<T>(ctx)
-    };
-    let split = next_byte.is_some_and(is_regular_character)
-        && r.data.last().copied().is_some_and(is_regular_character);
-    let cut = |pos: usize| pos == end && split;
-    if let Some(o) = object {
-        if !cut(r.offset()) {
-            return Some(o);
-        }
-    } else {
-        r.jump(start);
-        if !T::HANDLES_TYPE_MISMATCH && Object::skip_indirect_value(r).is_some() && !cut(r.offset())
-        {
-            let mut suffix = r.clone();
-            suffix.skip_white_spaces_and_comments();
-            if !indirect
-                || suffix
-                    .forward_tag(b"stream")
-                    .and_then(|_| suffix.read_eol())
-                    .is_none()
-            {
-                return None;
+    crate::work::body(|| {
+        let start = r.offset();
+        let object = if indirect {
+            r.read_indirect::<T>(ctx)
+        } else {
+            r.read::<T>(ctx)
+        };
+        let split = next_byte.is_some_and(is_regular_character)
+            && r.data.last().copied().is_some_and(is_regular_character);
+        let cut = |pos: usize| pos == end && split;
+        if let Some(o) = object {
+            if !cut(r.offset()) {
+                return Some(o);
             }
+        } else {
             r.jump(start);
-            if r.read_indirect::<Object<'_>>(ctx).is_some() {
-                return None;
+            if !T::HANDLES_TYPE_MISMATCH
+                && Object::skip_indirect_value(r).is_some()
+                && !cut(r.offset())
+            {
+                let mut suffix = r.clone();
+                suffix.skip_white_spaces_and_comments();
+                if !indirect
+                    || suffix
+                        .forward_tag(b"stream")
+                        .and_then(|_| suffix.read_eol())
+                        .is_none()
+                {
+                    return None;
+                }
+                r.jump(start);
+                if r.read_indirect::<Object<'_>>(ctx).is_some() {
+                    return None;
+                }
             }
         }
-    }
-    ctx.xref().note(Some(id));
-    None
+        ctx.xref().note(Some(id));
+        None
+    })
 }
 
 fn parse_metadata(info_dict: &Dict<'_>) -> Metadata {

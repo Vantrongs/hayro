@@ -10,6 +10,7 @@ use crate::reader::{
 };
 use crate::sync::{Arc, MutexExt, OnceLock};
 pub(crate) type Index = Arc<OnceLock<Vec<(Name<'static>, Range<usize>)>>>;
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
@@ -109,7 +110,19 @@ impl<'a> Dict<'a> {
     where
         T: ObjectLike<'a>,
     {
-        self.get_raw::<T>(key.as_ref())?.resolve(self.ctx())
+        let key = key.as_ref();
+        match self.get_raw::<T>(key)? {
+            MaybeRef::NotRef(value) => Some(value),
+            MaybeRef::Ref(reference) => {
+                if let Inner::Some(r) = &self.0
+                    && let Some(Captured::Parameters(entries)) = r.captured.as_deref()
+                    && let Some((_, value)) = entries.iter().find(|(k, _)| *k == key)
+                {
+                    return value.clone()?.cast();
+                }
+                self.ctx().xref().get_with(reference.into(), self.ctx())
+            }
+        }
     }
 
     /// Get the object reference linked to a key.
@@ -172,6 +185,40 @@ impl<'a> Dict<'a> {
         Reader::new(&repr.data[found?])
             .read::<MaybeRef<T>>(&repr.ctx)?
             .resolve(&repr.ctx)
+    }
+
+    pub(super) fn decoding(&self) -> Option<&super::stream::CapturedFilters<'a>> {
+        if let Inner::Some(r) = &self.0
+            && let Some(Captured::Stream(filters)) = r.captured.as_deref()
+        {
+            return Some(filters);
+        }
+        None
+    }
+
+    pub(super) fn set_decoding(&mut self, filters: super::stream::CapturedFilters<'a>) {
+        if let Inner::Some(repr) = &mut self.0 {
+            Arc::make_mut(repr).captured = Some(Arc::new(Captured::Stream(filters)));
+        }
+    }
+
+    pub(super) fn capture_parameters(
+        &mut self,
+        keys: &[&'static [u8]],
+        read: impl Fn(&Self, &[u8]) -> Option<Object<'a>>,
+    ) {
+        let entries: Vec<_> = keys
+            .iter()
+            .copied()
+            .filter(|key| self.get_ref(key).is_some())
+            .map(|key| (key, read(self, key)))
+            .collect();
+        if !entries.is_empty()
+            && let Inner::Some(repr) = &mut self.0
+        {
+            Arc::make_mut(repr).captured =
+                Some(Arc::new(Captured::Parameters(entries.into_boxed_slice())));
+        }
     }
 
     pub(crate) fn ctx(&self) -> &ReaderContext<'a> {
@@ -313,6 +360,7 @@ fn read_inner<'a>(
     let at = tail.as_ptr() as usize;
     if let Some((len, index)) = cache.and_then(|c| c.dictionaries.get().get(&at).cloned()) {
         return Some(Dict(Inner::Some(Arc::new(Repr {
+            captured: None,
             data: r.read_bytes(len)?,
             offsets: index,
             start: start_tag,
@@ -337,6 +385,7 @@ fn read_inner<'a>(
         Index::default()
     };
     Some(Dict(Inner::Some(Arc::new(Repr {
+        captured: None,
         data,
         offsets: index,
         start: start_tag,
@@ -404,6 +453,7 @@ where
             } else {
                 r.skip_with_depth::<MaybeRef<Object<'_>>>(ctx.in_content_stream(), depth)?;
             }
+            crate::work::lexed(r.offset() - start_offset - offset);
             on_entry(name, offset..r.offset() - start_offset)?;
         }
     }
@@ -411,8 +461,14 @@ where
 
 object!(Dict<'a>, Dict);
 
+enum Captured<'a> {
+    Stream(super::stream::CapturedFilters<'a>),
+    Parameters(Box<[(&'static [u8], Option<Object<'a>>)]>),
+}
+
 #[derive(Clone)]
 struct Repr<'a> {
+    captured: Option<Arc<Captured<'a>>>,
     data: &'a [u8],
     offsets: Index,
     start: Option<&'static [u8]>,

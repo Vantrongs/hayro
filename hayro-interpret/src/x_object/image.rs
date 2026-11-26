@@ -1,3 +1,4 @@
+pub(crate) mod samples;
 use super::decode::{DecodedImage, DecodedMask, decode_image, decode_mask};
 use crate::WarningSinkFn;
 use crate::cache::Cache;
@@ -204,7 +205,10 @@ impl<'a> ImageXObject<'a> {
             return None;
         }
 
-        decode_mask(self, target_dimension)
+        decode_mask(
+            &samples::Samples::read(self, &Clone::clone),
+            target_dimension,
+        )
     }
 
     pub(crate) fn decoded_image(
@@ -215,7 +219,10 @@ impl<'a> ImageXObject<'a> {
             return None;
         }
 
-        decode_image(self, target_dimension)
+        decode_image(
+            &samples::Samples::read(self, &Clone::clone),
+            target_dimension,
+        )
     }
 
     pub(crate) fn width(&self) -> u32 {

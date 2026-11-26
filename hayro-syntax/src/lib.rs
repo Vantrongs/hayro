@@ -92,6 +92,7 @@ pub mod metadata;
 pub mod object;
 pub mod page;
 pub mod transform;
+pub mod work;
 pub mod xref;
 
 // Public only for hayro-interpret.

@@ -47,6 +47,7 @@ pub(crate) fn decode(
         data: Cow::Owned(decoded),
         image_data: Some(ImageData {
             alpha: None,
+            component_depths: Vec::new(),
             color_space: Some(ImageColorSpace::Gray),
             bits_per_component: bpc,
             width: bitmap.width(),

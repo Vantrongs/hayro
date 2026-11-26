@@ -77,7 +77,8 @@ impl Filter {
         #[cfg_attr(not(feature = "images"), allow(unused))] image_params: &ImageDecodeParams,
         recover_ascii_hex: bool,
     ) -> Result<FilterResult<'static>, DecodeFailure> {
-        match self {
+        crate::work::told(data.len());
+        let result = match self {
             Self::AsciiHexDecode => ascii_hex::decode_into(data, recover_ascii_hex)
                 .map(FilterResult::from_data)
                 .ok_or(DecodeFailure::StreamDecode),
@@ -112,7 +113,11 @@ impl Filter {
                 Err(DecodeFailure::ImageDecode)
             }
             _ => Err(DecodeFailure::StreamDecode),
+        };
+        if let Ok(decoded) = &result {
+            crate::work::told(decoded.data.len());
         }
+        result
     }
 }
 

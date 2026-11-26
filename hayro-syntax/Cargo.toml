@@ -10,6 +10,7 @@ license = { workspace = true }
 readme = "README.md"
 
 [features]
+work-counters = []
 default = ["std", "images"]
 std = ["hayro-ccitt?/std", "hayro-jbig2?/std", "hayro-jpeg2000?/std", "dep:foldhash", "zune-jpeg?/std"]
 images = ["dep:zune-jpeg", "dep:hayro-ccitt", "dep:hayro-jbig2", "dep:hayro-jpeg2000"]
@@ -24,6 +25,7 @@ unsafe = [
 ]
 
 [dependencies]
+self_cell = "1.3"
 foldhash = { version = "0.2", optional = true }
 smallvec = { workspace = true }
 miniz_oxide = { workspace = true }

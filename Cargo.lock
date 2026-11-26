@@ -742,6 +742,7 @@ dependencies = [
  "md5",
  "memchr",
  "miniz_oxide",
+ "self_cell",
  "sha2",
  "smallvec",
  "windows-sys 0.61.2",

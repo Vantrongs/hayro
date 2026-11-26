@@ -161,7 +161,8 @@ fn draw_placed<'a>(
     context.save_state();
     context.pre_concat_affine(placement);
     context.push_root_transform();
-    form.draw(resources, context, device);
+    // The annotation controls visibility of its appearance.
+    form.draw_content(resources, context, device);
     context.pop_root_transform();
     context.restore_state(device);
 }
@@ -235,7 +236,7 @@ pub fn interpret<'a>(
     let floor = context.ocg_state.open();
     let num_states = context.num_states();
     let mut font_dict_cache = FxHashMap::<Name<'a>, Dict<'a>>::default();
-    let mut last_form: Option<(Name<'_>, bool, Option<FormXObject<'a>>)> = None;
+    let mut last_form: Option<(Name<'_>, Option<FormXObject<'a>>)> = None;
 
     context.save_state();
 
@@ -615,11 +616,8 @@ pub fn interpret<'a>(
             TypedInstruction::ShapeGlyph(_) => {}
             TypedInstruction::XObject(x) => {
                 let xref = resources.x_objects.xref();
-                let repaired = xref.is_repaired();
-                let repeated = last_form
-                    .as_ref()
-                    .filter(|(name, revision, _)| name == x.0 && *revision == repaired);
-                if let Some((_, _, Some(form))) = repeated {
+                let repeated = last_form.as_ref().filter(|(name, _)| name == x.0);
+                if let Some((_, Some(form))) = repeated {
                     form.draw(resources, context, device);
                     continue;
                 }
@@ -642,7 +640,7 @@ pub fn interpret<'a>(
                     if let XObject::FormXObject(form) = object
                         && lost.is_none()
                     {
-                        last_form = Some((x.0.clone(), xref.is_repaired(), reused.then_some(form)));
+                        last_form = Some((x.0.clone(), reused.then_some(form)));
                     }
                 }
             }

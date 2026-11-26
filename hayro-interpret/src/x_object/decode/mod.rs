@@ -8,10 +8,9 @@ pub(crate) use mask::{DecodedMask, decode_mask};
 use crate::InterpreterWarning;
 use crate::color::ColorSpace;
 use crate::function::interpolate;
-use crate::x_object::image::{ImageKind, ImageXObject};
+use crate::x_object::image::ImageKind;
+use crate::x_object::image::samples::{Samples, Source};
 use hayro_syntax::bit_reader::BitReader;
-use hayro_syntax::object::Array;
-use hayro_syntax::object::dict::keys::*;
 use hayro_syntax::object::stream::{FilterResult, ImageColorSpace, ImageDecodeParams};
 use smallvec::SmallVec;
 use std::iter;
@@ -29,30 +28,27 @@ struct DecodeContext<'a> {
 }
 
 fn decode_context<'a>(
-    obj: &ImageXObject<'a>,
+    obj: &'a Samples<impl Source>,
     target_dimension: Option<(u32, u32)>,
 ) -> Option<DecodeContext<'a>> {
-    let dict = obj.stream.dict();
-    let dict_bpc = dict
-        .get::<u8>(BPC)
-        .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT));
     let color_space = obj.color_space.as_ref();
     let is_indexed = color_space.is_some_and(ColorSpace::is_indexed);
 
     let decode_params = ImageDecodeParams {
+        has_color_key: obj.key.is_some(),
         is_indexed,
-        bpc: dict_bpc,
+        bpc: obj.bpc,
         num_components: color_space.map(ColorSpace::num_components),
         target_dimension,
-        width: obj.width(),
-        height: obj.height(),
+        width: obj.width,
+        height: obj.height,
     };
 
     let gray = color_space.is_none_or(|cs| cs.is_device_gray_or_rgb() && cs.num_components() == 1);
     let decoded = if gray {
-        obj.stream.decoded_luma_image(&decode_params)
+        obj.stream.open_stream()?.decoded_luma_image(&decode_params)
     } else {
-        obj.stream.decoded_image(&decode_params)
+        obj.stream.open_stream()?.decoded_image(&decode_params)
     }
     .map_err(|_| (obj.warning_sink)(InterpreterWarning::ImageDecodeFailure))
     .ok()?;
@@ -70,7 +66,7 @@ fn decode_context<'a>(
         stride,
         ctx.height,
         ctx.bits_per_component,
-        || short_rows_transparent(obj, ctx.color_space.num_components()),
+        || obj.transparent_tail(ctx.color_space.num_components()),
     );
     ctx.height = u32::try_from(available.div_ceil(stride)).ok()?;
     match &mut ctx.decoded.data {
@@ -108,44 +104,6 @@ pub(crate) fn fit_rows(
     }
 }
 
-pub(crate) fn short_rows_transparent(obj: &ImageXObject<'_>, components: u8) -> bool {
-    if obj.kind != ImageKind::Image {
-        return false;
-    }
-    let dict = obj.stream.dict();
-    if let Some(mask) = dict
-        .get::<hayro_syntax::object::Stream<'_>>(SMASK)
-        .or_else(|| dict.get::<hayro_syntax::object::Stream<'_>>(MASK))
-    {
-        return mask.dict().get::<Array<'_>>(MATTE).is_some();
-    }
-    color_key(
-        obj,
-        components,
-        dict.get::<hayro_syntax::object::Stream<'_>>(SMASK)
-            .is_some(),
-    )
-    .is_some()
-}
-
-fn color_key(
-    obj: &ImageXObject<'_>,
-    components: u8,
-    has_soft_mask: bool,
-) -> Option<SmallVec<[u16; 8]>> {
-    let dict = obj.stream.dict();
-    if has_soft_mask {
-        return None;
-    }
-    let components = usize::from(components);
-    let key: SmallVec<_> = dict
-        .get::<Array<'_>>(MASK)?
-        .iter::<u16>()
-        .take(2 * components)
-        .collect();
-    (components > 0 && key.len() == 2 * components).then_some(key)
-}
-
 pub(super) struct Tail {
     pub(super) width: u32,
     pub(super) declared: u32,
@@ -153,10 +111,10 @@ pub(super) struct Tail {
 }
 
 impl Tail {
-    fn of(ctx: &DecodeContext<'_>, obj: &ImageXObject<'_>) -> Option<Self> {
+    fn of(ctx: &DecodeContext<'_>, obj: &Samples<impl Source>) -> Option<Self> {
         let texel =
             if (ctx.height < ctx.declared || ctx.width < ctx.logical_width)
-                && !short_rows_transparent(obj, ctx.color_space.num_components())
+                && !obj.transparent_tail(ctx.color_space.num_components())
             {
                 let info = ctx.decoded.image_data.as_ref().map(|d| {
                     hayro_syntax::object::stream::ImageData {
@@ -165,6 +123,7 @@ impl Tail {
                         color_space: d.color_space,
                         bits_per_component: d.bits_per_component,
                         alpha: None,
+                        component_depths: d.component_depths.clone(),
                     }
                 });
                 let bytes = (usize::from(ctx.bits_per_component)
@@ -246,13 +205,9 @@ impl Tail {
 }
 
 fn sample_context<'a>(
-    obj: &ImageXObject<'a>,
+    obj: &'a Samples<impl Source>,
     decoded: FilterResult<'a>,
 ) -> Option<DecodeContext<'a>> {
-    let dict = obj.stream.dict();
-    let dict_bpc = dict
-        .get::<u8>(BPC)
-        .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT));
     let color_space = obj.color_space.clone();
     let (mut scale_x, mut scale_y) = (1.0, 1.0);
 
@@ -260,12 +215,12 @@ fn sample_context<'a>(
         .image_data
         .as_ref()
         .map(|d| {
-            scale_x = obj.width() as f32 / d.width as f32;
-            scale_y = obj.height() as f32 / d.height as f32;
+            scale_x = obj.width as f32 / d.width as f32;
+            scale_y = obj.height as f32 / d.height as f32;
 
             (d.width, d.height)
         })
-        .unwrap_or((obj.width(), obj.height()));
+        .unwrap_or((obj.width, obj.height));
 
     let color_space = color_space
         .or_else(|| {
@@ -294,14 +249,20 @@ fn sample_context<'a>(
         .image_data
         .as_ref()
         .map(|i| i.bits_per_component)
-        .or(dict_bpc)
+        .or(obj.bpc)
         .unwrap_or(fallback_bpc);
 
-    let decode_arr = dict
-        .get::<Array<'_>>(D)
-        .or_else(|| dict.get::<Array<'_>>(DECODE))
-        .map(|a| a.iter::<(f32, f32)>().collect::<SmallVec<_>>())
-        .unwrap_or(color_space.default_decode_arr(bits_per_component as f32));
+    let mut decode_arr = obj
+        .decode
+        .clone()
+        .unwrap_or_else(|| color_space.default_decode_arr(bits_per_component as f32));
+
+    if let Some(info) = &decoded.image_data {
+        let max = |bits| 2.0_f32.powi(i32::from(bits)) - 1.0;
+        for ((lo, hi), &bits) in decode_arr.iter_mut().zip(&info.component_depths) {
+            *hi = *lo + (*hi - *lo) * (max(bits_per_component) / max(bits));
+        }
+    }
 
     Some(DecodeContext {
         decoded,
@@ -396,7 +357,7 @@ fn decode_u8_samples(
                 )
             })
         }
-        1..16 => {
+        1..16 | 17..=32 => {
             let mut buf = Vec::with_capacity(capacity);
             for_each_sample(
                 data,
@@ -584,4 +545,64 @@ fn for_each_sample(
     }
 
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DecodedImage;
+    use crate::fixtures::{file, stream};
+    use crate::x_object::ImageXObject;
+    use crate::{WarningSinkFn, cache::Cache};
+    use hayro_syntax::Pdf;
+    use hayro_syntax::object::{ObjectIdentifier, Stream};
+    use std::sync::Arc;
+
+    fn keyed_jpx(entries: &str, data: &[u8]) -> DecodedImage {
+        let objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec(),
+            stream(&format!("/Filter /JPXDecode {entries}"), data),
+        ];
+        let pdf = Pdf::new(file(&objects, "")).unwrap();
+        let image = pdf
+            .xref()
+            .get::<Stream<'_>>(ObjectIdentifier::new(3, 0))
+            .unwrap();
+        let sink: WarningSinkFn = Arc::new(|_| {});
+        let obj = ImageXObject::new(&image, |_| None, &sink, &Cache::new(), None).unwrap();
+        obj.decoded_image(None).unwrap()
+    }
+
+    #[test]
+    fn jpx_mask_compares_irreversible_samples_before_quantization() {
+        let decoded = keyed_jpx(
+            "/Width 128 /Height 96 /ColorSpace /DeviceGray /Mask [256 65535]",
+            include_bytes!(
+                "../../../../hayro-jpeg2000/tests/streams/quantization_irreversible_16bit.j2k"
+            ),
+        );
+        let mask = decoded.alpha.unwrap().luma.data;
+        // OpenJPEG decodes these source samples as 48251, 305 and 73.
+        assert_eq!([mask[0], mask[7], mask[82]], [0, 0, 255]);
+    }
+
+    #[test]
+    fn jpx_mask_uses_each_components_native_range() {
+        // Empty code blocks reconstruct to the midpoint of each unsigned component.
+        for (green_depth, green) in [(16, 32768), (17, 65536)] {
+            let mut data = *include_bytes!("../../../tests/fixtures/jpx-mixed-precision.j2k");
+            data[45] = green_depth - 1;
+            for (key, alpha) in [(green, 0), (green + 1, 255)] {
+                let entries = format!(
+                    "/Width 1 /Height 1 /ColorSpace /DeviceRGB /Mask [128 128 {key} {key} 8 8]"
+                );
+                let decoded = keyed_jpx(&entries, &data);
+                assert_eq!(decoded.alpha.unwrap().luma.data, [alpha]);
+                let crate::ImageData::Rgb(image) = decoded.image else {
+                    panic!("expected RGB")
+                };
+                assert_eq!(image.data, [128, 128, 136]);
+            }
+        }
+    }
 }

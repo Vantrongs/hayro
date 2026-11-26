@@ -1,143 +1,175 @@
-use crate::canvas::{Canvas, bounds};
+use crate::canvas::{Canvas, RowShade, bounds};
 use crate::color::ColorComponents;
-use crate::encode::{Cost, EncodedShadingPattern, Exhausted, Meter, take};
+use crate::encode::{
+    Cost, EncodedMeshShading, EncodedShadingPattern, Exhausted, Meter, SamplePixel, take,
+};
 use crate::function::MAX_COMPONENTS;
 use crate::gradient::{ColorLut, function_lut_metered};
 use crate::shading::{Patch, ShadingFunction, ShadingType, Triangle};
 use kurbo::{Affine, Point, Rect};
 
-const MESH_SEGMENT: f64 = 8.0;
+const MESH_SEGMENT: f64 = 8.;
 const MAX_DEPTH: u32 = 10;
 const PATCH_FLATNESS: f64 = 0.125;
-const MAX_PIECES: f64 = (1 << 20) as f64;
+const COMPONENT_FLATNESS: f64 = 0.25;
+const MAX_COMPONENT_DEPTH: u32 = 20;
+const COMPONENT_TOLERANCE: f64 = 1. / 32768.;
 
-struct Target<'a> {
-    canvas: &'a mut Canvas,
+struct Target<'a, 'b, P> {
+    canvas: &'a mut Canvas<'b, P>,
     meter: &'a mut dyn Meter,
-    vertex_cost: Cost,
     pixel_centers: bool,
+    vertex_cost: Cost,
 }
 
-pub(crate) fn draw_mesh(
-    canvas: &mut Canvas,
-    shading_type: &ShadingType,
+pub(crate) fn draw_mesh<'a, P: SamplePixel>(
+    canvas: &mut Canvas<'a, P>,
+    mesh: &'a EncodedMeshShading,
     transform: Affine,
-    pattern: &EncodedShadingPattern,
-    pixel_centers: bool,
+    pattern: &'a EncodedShadingPattern,
     meter: &mut dyn Meter,
 ) -> Result<(), Exhausted> {
-    let mut target = Target {
-        canvas,
-        meter,
-        pixel_centers,
-        vertex_cost: Cost::of(usize::from(pattern.color_space.num_components()) + 4)
-            + pattern.color_space.prepared().sample,
-    };
-    match shading_type {
+    let n = usize::from(pattern.color_space.num_components());
+    let linear = mesh.unit_components
+        && pattern.color_space.is_device_gray_or_rgb()
+        && pattern.transfer_function.is_none();
+    let (pieces, function, domain) = match mesh.shading_type.as_ref() {
         ShadingType::TriangleMesh {
             triangles,
             function,
+            domain,
         } => {
-            take(target.meter, Cost::of(triangles.len()).times(6))?;
-            if !target.meter.hold(
-                triangles
-                    .len()
-                    .saturating_mul(size_of::<CanvasTriangle<'_>>()),
-            ) {
-                return Err(Exhausted);
-            }
-            let triangles = triangles
-                .iter()
-                .map(|triangle| CanvasTriangle::new(triangle, transform))
-                .collect::<Vec<_>>();
-
-            if let Some(function) = function {
-                let corner_colors = triangles.iter().flat_map(|t| t.colors);
-                let colors = Parameter::new(function, corner_colors, pattern, target.meter)?;
-                draw_triangles(&mut target, &triangles, 0, &colors)?;
-                target.canvas.finish_parameter_mesh(colors.lut);
-            } else {
-                let colors = Direct { pattern };
-                let depth = if colors.is_linear() {
-                    0
-                } else {
-                    let pieces = triangles.iter().map(|t| (t.extent(), t.bounds()));
-                    mesh_depth(target.canvas.bounds(), pieces, target.meter)?
-                };
-
-                draw_triangles(&mut target, &triangles, depth, &colors)?;
-            }
+            take(meter, Cost::of(triangles.len()).times(6))?;
+            (Pieces::Triangles(triangles), function, domain)
         }
-        ShadingType::PatchMesh { patches, function } => {
-            take(target.meter, Cost::of(patches.len()).times(32))?;
-            if !target
-                .meter
-                .hold(patches.len().saturating_mul(size_of::<CanvasPatch<'_>>()))
-            {
-                return Err(Exhausted);
-            }
-            let patches = patches
-                .iter()
-                .map(|patch| CanvasPatch::new(patch, transform))
-                .collect::<Vec<_>>();
-            let pieces = patches.iter().map(|p| (p.extent(), p.bounds()));
-            let depth = mesh_depth(target.canvas.bounds(), pieces, target.meter)?;
-
-            let direct = Direct { pattern };
-            let depths = group_depths(
-                &patches,
-                target.canvas.bounds(),
-                depth,
-                direct.is_linear() && function.is_none(),
-                target.meter,
+        ShadingType::PatchMesh {
+            patches,
+            function,
+            domain,
+        } => {
+            take(meter, Cost::of(patches.len()).times(64 + 8 * n as u64))?;
+            let ranges = if function.is_some() {
+                smallvec::smallvec![(domain[0], domain[1])]
+            } else {
+                pattern.color_space.component_ranges()
+            };
+            let depths = mesh_depths(
+                patches,
+                transform,
+                canvas.bounds(),
+                &ranges,
+                linear && function.is_none(),
+                meter,
             )?;
-            if let Some(function) = function {
-                let corner_colors = patches.iter().flat_map(|p| p.colors.as_flattened());
-                let colors = Parameter::new(function, corner_colors, pattern, target.meter)?;
-                draw_patches(&mut target, &patches, &depths, &colors)?;
-                target.canvas.finish_parameter_mesh(colors.lut);
-            } else {
-                draw_patches(&mut target, &patches, &depths, &Direct { pattern })?;
-            }
+            (Pieces::Patches(patches, depths), function, domain)
         }
-        _ => {}
+        _ => return Ok(()),
+    };
+    let mut target = Target {
+        pixel_centers: canvas.width > 0,
+        canvas,
+        meter,
+        vertex_cost: Cost::of(n + 4),
+    };
+    if let Some(function) = function {
+        let parameter = Parameter::new::<P>(function, *domain, pattern, target.meter)?;
+        pieces.draw(&mut target, transform, &parameter)?;
+        target
+            .canvas
+            .set_row_shade(RowShade::Parameter(parameter.lut));
+    } else if linear {
+        target.vertex_cost = target.vertex_cost + pattern.color_space.prepared().sample;
+        pieces.draw(&mut target, transform, &DirectLinear { pattern })?;
+    } else {
+        let colors = DirectComponents {
+            pattern,
+            num_components: n,
+        };
+        target.canvas.set_row_shade(RowShade::Direct {
+            pattern,
+            num_components: n,
+        });
+        match n {
+            1 => pieces.draw::<1, _>(&mut target, transform, &colors)?,
+            2 => pieces.draw::<2, _>(&mut target, transform, &colors)?,
+            3 => pieces.draw::<3, _>(&mut target, transform, &colors)?,
+            4 => pieces.draw::<4, _>(&mut target, transform, &colors)?,
+            _ => pieces.draw::<MAX_COMPONENTS, _>(&mut target, transform, &colors)?,
+        }
+    }
+    if let Pieces::Patches(_, PatchDepths::Many(depths)) = pieces {
+        let bytes = depths.capacity();
+        drop(depths);
+        target.meter.release_bytes(bytes);
     }
     Ok(())
 }
+enum Pieces<'a> {
+    Triangles(&'a [Triangle]),
+    Patches(&'a [Patch], PatchDepths),
+}
 
-fn mesh_depth(
-    canvas: Rect,
-    pieces: impl ExactSizeIterator<Item = (f64, Rect)>,
-    meter: &mut dyn Meter,
-) -> Result<u32, Exhausted> {
-    take(meter, Cost::of(pieces.len()))?;
-    let mut max_extent: f64 = 0.0;
-    let mut visible_area = 0.0;
-
-    for (extent, bounds) in pieces {
-        if !bounds.overlaps(canvas) {
-            continue;
+impl Pieces<'_> {
+    fn draw<const N: usize, P: SamplePixel>(
+        &self,
+        target: &mut Target<'_, '_, P>,
+        transform: Affine,
+        colors: &impl MeshColors<N>,
+    ) -> Result<(), Exhausted> {
+        match self {
+            Self::Triangles(triangles) => {
+                for triangle in *triangles {
+                    take(target.meter, Cost::new(1))?;
+                    let points = triangle.vertices.each_ref().map(|v| transform * v.point);
+                    if target.canvas.is_visible(&points) {
+                        take(target.meter, target.vertex_cost.times(3))?;
+                        let values = triangle
+                            .vertices
+                            .each_ref()
+                            .map(|v| colors.values(&v.colors));
+                        target.canvas.fill_triangle(
+                            points,
+                            values,
+                            &|v| P::evaluated(Some(colors.shade(v))),
+                            colors.cost(),
+                            target.meter,
+                        )?;
+                    }
+                }
+            }
+            Self::Patches(patches, depth) => {
+                for (i, p) in distinct_patches(patches).enumerate() {
+                    let patch = CanvasPatch::new(p, transform);
+                    if !patch.bounds().overlaps(target.canvas.bounds()) {
+                        continue;
+                    }
+                    draw_patch(target, &patch, depth.at(i), colors)?;
+                }
+            }
         }
-
-        let area = bounds.area();
-        max_extent = max_extent.max(extent);
-        visible_area += if area > 0.0 {
-            bounds.intersect(canvas).area() / area
-        } else {
-            1.0
-        };
+        Ok(())
     }
+}
 
-    let mut depth = (max_extent / MESH_SEGMENT)
-        .log2()
-        .ceil()
-        .clamp(0.0, MAX_DEPTH as f64) as u32;
+// Consecutive identical patches replace exactly the same samples on every canvas.
+fn distinct_patches(patches: &[Patch]) -> impl Iterator<Item = &Patch> {
+    patches
+        .chunk_by(|a, b| a.control_points == b.control_points && a.colors == b.colors)
+        .map(|run| &run[0])
+}
 
-    while depth > 0 && visible_area * 4.0_f64.powi(depth as i32) > MAX_PIECES {
-        depth -= 1;
+enum PatchDepths {
+    Single(u8),
+    Many(Vec<u8>),
+}
+
+impl PatchDepths {
+    fn at(&self, i: usize) -> u32 {
+        u32::from(match self {
+            Self::Single(d) => *d,
+            Self::Many(depths) => depths[i],
+        })
     }
-
-    Ok(depth)
 }
 
 type EdgeKey = [[u64; 2]; 4];
@@ -160,154 +192,201 @@ fn root(parent: &mut [usize], mut i: usize, meter: &mut dyn Meter) -> Result<usi
     Ok(i)
 }
 
-fn group_depths(
-    patches: &[CanvasPatch<'_>],
+fn mesh_depths(
+    patches: &[Patch],
+    transform: Affine,
     canvas: Rect,
-    fine: u32,
-    linear: bool,
+    ranges: &[(f32, f32)],
+    linear_color: bool,
     meter: &mut dyn Meter,
-) -> Result<Vec<u32>, Exhausted> {
-    let n = patches.len();
-    take(meter, Cost::of(n).times(if linear { 512 } else { 32 }))?;
-    if !meter.hold(n.saturating_mul(size_of::<u32>())) {
+) -> Result<PatchDepths, Exhausted> {
+    let linear = transform.with_translation(kurbo::Vec2::ZERO);
+    let visible = |p| CanvasPatch::new(p, transform).bounds().overlaps(canvas);
+    let depth = |p| {
+        let patch = CanvasPatch::new(p, linear);
+        if linear_color {
+            let fine = (patch.extent() / MESH_SEGMENT)
+                .max(1.)
+                .log2()
+                .ceil()
+                .min(f64::from(MAX_DEPTH)) as u32;
+            patch.linear_depth(fine) as u8
+        } else {
+            patch.component_depth(ranges) as u8
+        }
+    };
+    let n = distinct_patches(patches).count();
+    if n <= 1 {
+        return Ok(PatchDepths::Single(
+            patches.first().filter(|p| visible(p)).map_or(0, depth),
+        ));
+    }
+    take(meter, Cost::of(n).times(4 * 8 + 16))?;
+    if !meter.hold(n) {
         return Err(Exhausted);
     }
-    let mut depths = patches
-        .iter()
-        .map(|p| {
-            if !p.bounds().overlaps(canvas) {
-                0
-            } else if linear {
-                p.depth(fine)
-            } else {
-                fine
-            }
-        })
-        .collect::<Vec<_>>();
-    if !linear || n < 2 || depths.iter().all(|d| *d == depths[0]) {
-        return Ok(depths);
+    let mut depths = vec![u8::MAX; n];
+    let bytes = n.checked_mul(size_of::<usize>()).ok_or(Exhausted)?;
+    if !meter.hold(bytes) {
+        return Err(Exhausted);
     }
-    crate::encode::scratch(meter, |meter| {
-        let count = n.checked_mul(4).ok_or(Exhausted)?;
-        let bytes = count
-            .checked_mul(size_of::<(EdgeKey, usize)>())
-            .and_then(|v| v.checked_add(n.checked_mul(size_of::<usize>())?))
-            .ok_or(Exhausted)?;
-        if !meter.hold(bytes) {
-            return Err(Exhausted);
+    let mut parent: Vec<_> = (0..n).collect();
+    crate::encode::scratch(meter, |meter| join_edges(patches, &mut parent, meter))?;
+    for (i, patch) in distinct_patches(patches).enumerate() {
+        parent[i] = root(&mut parent, i, meter)?;
+        if visible(patch) {
+            depths[parent[i]] = 0;
         }
-        take(meter, crate::function::sorting(Cost::of(count)).times(8))?;
-        let mut edges = Vec::with_capacity(count);
-        let mut parent = (0..n).collect::<Vec<_>>();
-        for (i, p) in patches.iter().enumerate() {
-            let net = &p.points;
-            for key in [net[0], net[3], net.map(|c| c[0]), net.map(|c| c[3])]
-                .into_iter()
-                .filter_map(edge_key)
-            {
-                edges.push((key, i));
-            }
+    }
+    for (i, patch) in distinct_patches(patches).enumerate() {
+        let component = &mut depths[parent[i]];
+        if *component != u8::MAX {
+            *component = (*component).max(depth(patch));
         }
-        edges.sort_unstable();
-        for pair in edges.windows(2) {
-            if pair[0].0 == pair[1].0 {
-                let a = root(&mut parent, pair[0].1, meter)?;
-                let b = root(&mut parent, pair[1].1, meter)?;
+    }
+    for (i, &component) in parent.iter().enumerate() {
+        depths[i] = depths[component];
+    }
+    drop(parent);
+    meter.release_bytes(bytes);
+    Ok(PatchDepths::Many(depths))
+}
+
+fn join_edges(
+    patches: &[Patch],
+    parent: &mut [usize],
+    meter: &mut dyn Meter,
+) -> Result<(), Exhausted> {
+    let mut edges = rustc_hash::FxHashMap::default();
+    let mut held = 0;
+    for (i, patch) in distinct_patches(patches).enumerate() {
+        let p = &patch.control_points;
+        for key in [p[0], p[3], p.map(|col| col[0]), p.map(|col| col[3])]
+            .into_iter()
+            .filter_map(edge_key)
+        {
+            if let Some(&other) = edges.get(&key) {
+                let a = root(parent, i, meter)?;
+                let b = root(parent, other, meter)?;
                 parent[a] = b;
-                depths[b] = depths[b].max(depths[a]);
+            } else {
+                if edges.len() == edges.capacity() {
+                    take(meter, Cost::of(edges.len()).times(8))?;
+                    // Rehashing holds both tables, including control bytes and a trailing SIMD group.
+                    let buckets = edges
+                        .capacity()
+                        .checked_next_power_of_two()
+                        .and_then(|v| v.checked_mul(2))
+                        .ok_or(Exhausted)?
+                        .max(4);
+                    let bytes = buckets
+                        .checked_mul(size_of::<(EdgeKey, usize)>() + 1)
+                        .and_then(|v| v.checked_add(32))
+                        .ok_or(Exhausted)?;
+                    if !meter.hold(bytes) {
+                        return Err(Exhausted);
+                    }
+                    edges.try_reserve(1).map_err(|_| Exhausted)?;
+                    meter.release_bytes(held);
+                    held = bytes;
+                }
+                edges.insert(key, i);
             }
         }
-        for i in 0..n {
-            let group = root(&mut parent, i, meter)?;
-            depths[i] = depths[group];
-        }
-        Ok(())
-    })?;
-    Ok(depths)
+    }
+    Ok(())
 }
 
 trait MeshColors<const N: usize> {
-    const CACHE_COLUMNS: bool = false;
-    fn values(&self, components: &[f32]) -> [f32; N];
-    fn invariant_column(&self, _: &[f32], _: &[f32], _: &[f32]) -> Option<[f32; N]> {
-        None
+    fn cost(&self) -> Cost {
+        Cost::ZERO
     }
+    fn values(&self, components: &[f32]) -> [f32; N];
     fn shade(&self, values: &[f32; N]) -> [f32; 4];
 }
 
 struct Parameter {
-    lut: ColorLut,
+    lut: Option<ColorLut>,
     t0: f32,
-    scale: f32,
+    scale: f64,
 }
 
 impl Parameter {
-    fn new<'a>(
+    fn new<P: SamplePixel>(
         function: &ShadingFunction,
-        colors: impl Iterator<Item = &'a ColorComponents>,
+        [t0, t1]: [f32; 2],
         pattern: &EncodedShadingPattern,
         meter: &mut dyn Meter,
     ) -> Result<Self, Exhausted> {
-        let (t0, t1) = colors
-            .filter_map(|c| c.first().copied())
-            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), t| {
-                (lo.min(t), hi.max(t))
+        if P::CLASSIFIED {
+            return Ok(Self {
+                lut: None,
+                t0: 0.,
+                scale: 1.,
             });
-        let (t0, t1) = if t0 <= t1 { (t0, t1) } else { (0.0, 0.0) };
-
+        }
         Ok(Self {
-            lut: function_lut_metered(function, [t0, t1], pattern, meter)?,
+            lut: Some(function_lut_metered(function, [t0, t1], pattern, meter)?),
             t0,
-            scale: if t1 > t0 { 1.0 / (t1 - t0) } else { 0.0 },
+            scale: if t1 != t0 {
+                1.0 / (f64::from(t1) - f64::from(t0))
+            } else {
+                0.0
+            },
         })
     }
 }
 
 impl MeshColors<1> for Parameter {
     fn values(&self, components: &[f32]) -> [f32; 1] {
-        [(components.first().copied().unwrap_or(0.0) - self.t0) * self.scale]
+        [
+            ((f64::from(components.first().copied().unwrap_or(0.0)) - f64::from(self.t0))
+                * self.scale) as f32,
+        ]
     }
 
     fn shade(&self, values: &[f32; 1]) -> [f32; 4] {
-        self.lut.get(values[0])
+        self.lut
+            .as_ref()
+            .map_or([values[0], 0., 0., 0.], |lut| lut.get(values[0]))
     }
 }
 
-struct Direct<'a> {
+struct DirectComponents<'a> {
+    pattern: &'a EncodedShadingPattern,
+    num_components: usize,
+}
+
+impl<const N: usize> MeshColors<N> for DirectComponents<'_> {
+    fn cost(&self) -> Cost {
+        self.pattern.color_space.prepared().sample
+            + Cost::new(3 * u64::from(self.pattern.transfer_function.is_some()))
+    }
+    fn values(&self, components: &[f32]) -> [f32; N] {
+        let mut out = [0.; N];
+        let used = components.len().min(self.num_components);
+        out[..used].copy_from_slice(&components[..used]);
+        if used < self.num_components {
+            out[used..self.num_components]
+                .copy_from_slice(&self.pattern.color_space.initial_color()[used..]);
+        }
+        out
+    }
+
+    fn shade(&self, values: &[f32; N]) -> [f32; 4] {
+        self.pattern.convert(&values[..self.num_components])
+    }
+}
+
+struct DirectLinear<'a> {
     pattern: &'a EncodedShadingPattern,
 }
 
-impl Direct<'_> {
-    fn is_linear(&self) -> bool {
-        self.pattern.color_space.is_device_gray_or_rgb() && self.pattern.transfer_function.is_none()
-    }
-}
-
-impl MeshColors<4> for Direct<'_> {
-    const CACHE_COLUMNS: bool = true;
+impl MeshColors<4> for DirectLinear<'_> {
     fn values(&self, components: &[f32]) -> [f32; 4] {
         self.pattern.convert(components)
     }
 
-    fn invariant_column(&self, values: &[f32], a: &[f32], b: &[f32]) -> Option<[f32; 4]> {
-        let mut low = [0.; MAX_COMPONENTS];
-        let mut high = low;
-        for (i, &v) in values.iter().enumerate() {
-            if !v.is_finite() || !a[i].is_finite() || !b[i].is_finite() {
-                return None;
-            }
-            // Enclose both rounded four-term bilinear sums around the same exact column value.
-            let error = 16. * f32::EPSILON * a[i].abs().max(b[i].abs()) + f32::MIN_POSITIVE;
-            low[i] = v - error;
-            high[i] = v + error;
-            if !low[i].is_finite() || !high[i].is_finite() {
-                return None;
-            }
-        }
-        let space = &self.pattern.color_space;
-        (space.encode_values(&low[..values.len()]) == space.encode_values(&high[..values.len()]))
-            .then(|| self.values(values))
-    }
     fn shade(&self, values: &[f32; 4]) -> [f32; 4] {
         *values
     }
@@ -326,92 +405,24 @@ fn mix<'a, const K: usize>(
         .min(MAX_COMPONENTS);
 
     for (i, out) in out[..len].iter_mut().enumerate() {
-        *out = colors
-            .iter()
-            .zip(weights)
-            .map(|(color, weight)| color[i] * weight)
-            .sum();
+        let values = colors.map(|color| color[i]);
+        let first = values[0];
+        *out = if values.iter().all(|&v| v == first) {
+            first
+        } else {
+            let min = values.into_iter().fold(first, f32::min);
+            let max = values.into_iter().fold(first, f32::max);
+            values
+                .into_iter()
+                .zip(weights)
+                .map(|(v, w)| v * w)
+                .sum::<f32>()
+                .max(min)
+                .min(max)
+        };
     }
 
     &out[..len]
-}
-
-struct CanvasTriangle<'a> {
-    points: [Point; 3],
-    colors: [&'a ColorComponents; 3],
-}
-
-impl<'a> CanvasTriangle<'a> {
-    fn new(triangle: &'a Triangle, transform: Affine) -> Self {
-        Self {
-            points: triangle.vertices.each_ref().map(|v| transform * v.point),
-            colors: triangle.vertices.each_ref().map(|v| &v.colors),
-        }
-    }
-
-    fn extent(&self) -> f64 {
-        let [a, b, c] = self.points;
-        (a - b).hypot().max((b - c).hypot()).max((c - a).hypot())
-    }
-
-    fn bounds(&self) -> Rect {
-        bounds(&self.points)
-    }
-}
-
-fn draw_triangles<const N: usize>(
-    target: &mut Target<'_>,
-    triangles: &[CanvasTriangle<'_>],
-    depth: u32,
-    colors: &impl MeshColors<N>,
-) -> Result<(), Exhausted> {
-    const CORNERS: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-
-    for triangle in triangles {
-        draw_triangle_piece(target, triangle, triangle.points, CORNERS, depth, colors)?;
-    }
-    Ok(())
-}
-
-fn draw_triangle_piece<const N: usize>(
-    target: &mut Target<'_>,
-    triangle: &CanvasTriangle<'_>,
-    points: [Point; 3],
-    weights: [[f32; 3]; 3],
-    depth: u32,
-    colors: &impl MeshColors<N>,
-) -> Result<(), Exhausted> {
-    take(target.meter, Cost::new(1))?;
-    if !target.canvas.is_visible(&points) {
-        return Ok(());
-    }
-
-    if depth == 0 {
-        let mut buffer = [0.0; MAX_COMPONENTS];
-        take(target.meter, target.vertex_cost.times(3))?;
-        let values = weights.map(|w| colors.values(mix(triangle.colors, w, &mut buffer)));
-        target
-            .canvas
-            .fill_triangle(points, values, &|v| colors.shade(v), target.meter)?;
-
-        return Ok(());
-    }
-
-    let [p0, p1, p2] = points;
-    let [w0, w1, w2] = weights;
-    let (m01, m12, m20) = (p0.midpoint(p1), p1.midpoint(p2), p2.midpoint(p0));
-    let mid = |a: [f32; 3], b: [f32; 3]| [0, 1, 2].map(|i| 0.5 * (a[i] + b[i]));
-    let (n01, n12, n20) = (mid(w0, w1), mid(w1, w2), mid(w2, w0));
-
-    for (points, weights) in [
-        ([p0, m01, m20], [w0, n01, n20]),
-        ([m01, p1, m12], [n01, w1, n12]),
-        ([m20, m12, p2], [n20, n12, w2]),
-        ([m01, m12, m20], [n01, n12, n20]),
-    ] {
-        draw_triangle_piece(target, triangle, points, weights, depth - 1, colors)?;
-    }
-    Ok(())
 }
 
 struct CanvasPatch<'a> {
@@ -437,7 +448,7 @@ impl<'a> CanvasPatch<'a> {
         columns.into_iter().chain(rows).fold(0.0, f64::max)
     }
 
-    fn depth(&self, fine: u32) -> u32 {
+    fn linear_depth(&self, fine: u32) -> u32 {
         let curved = |[a, b, c, d]: [Point; 4]| {
             let axis = d - a;
 
@@ -457,21 +468,7 @@ impl<'a> CanvasPatch<'a> {
         {
             return fine;
         }
-        let second_difference = |[a, b, c, d]: [Point; 4]| {
-            let middle = c - b;
-            (middle - (b - a)).hypot().max(((d - c) - middle).hypot())
-        };
-        let rows = (0..4).map(|j| self.points.map(|column| column[j]));
-        let u = rows.map(second_difference).fold(0., f64::max);
-        let v = self
-            .points
-            .map(second_difference)
-            .into_iter()
-            .fold(0., f64::max);
         let [left, _, _, right] = self.points;
-        let corner = ((right[3] - left[3]) - (right[0] - left[0])).hypot();
-        let pure = 0.75 * (u + v);
-        let geometry = pure + 0.25 * corner;
         // Each parametric tangent is a convex combination of control-net differences.
         let orientation = (right[0] - left[0]).cross(left[3] - left[0]).signum();
         for pair in net.windows(2) {
@@ -516,8 +513,59 @@ impl<'a> CanvasPatch<'a> {
                     .abs()
             })
             .fold(0., f64::max);
-        let color_ratio = twist * 512.;
-        if geometry <= PATCH_FLATNESS && color_ratio <= 1. {
+        self.subdivision_depth(twist * 512., PATCH_FLATNESS, fine)
+    }
+
+    fn component_depth(&self, ranges: &[(f32, f32)]) -> u32 {
+        let [[c00, c01], [c10, c11]] = self.colors;
+        let mut twist: f64 = 0.;
+        let mut relative_twist: f64 = 0.;
+        for (i, &(lo, hi)) in ranges.iter().enumerate() {
+            let (Some(&v00), Some(&v10), Some(&v01), Some(&v11)) =
+                (c00.get(i), c10.get(i), c01.get(i), c11.get(i))
+            else {
+                continue;
+            };
+            let delta = (f64::from(v00) - f64::from(v10) - f64::from(v01) + f64::from(v11)).abs();
+            let span = (f64::from(hi) - f64::from(lo)).abs();
+            if span > 0. {
+                twist = twist.max(delta / span);
+            }
+            let min = v00.min(v10).min(v01).min(v11);
+            let max = v00.max(v10).max(v01).max(v11);
+            let patch_span = f64::from(max) - f64::from(min);
+            if patch_span > 0. {
+                relative_twist = relative_twist.max(delta / patch_span);
+            }
+        }
+        let contour_ratio = if relative_twist > 0. {
+            let b = self.bounds();
+            let extent = b.width().hypot(b.height());
+            (0.25 * extent * relative_twist) / COMPONENT_FLATNESS
+        } else {
+            0.
+        };
+        let color_ratio = (0.25 * twist / COMPONENT_TOLERANCE).max(contour_ratio);
+        self.subdivision_depth(color_ratio, COMPONENT_FLATNESS, MAX_COMPONENT_DEPTH)
+    }
+
+    fn subdivision_depth(&self, color_ratio: f64, flatness: f64, max_depth: u32) -> u32 {
+        let second_difference = |[a, b, c, d]: [Point; 4]| {
+            let middle = c - b;
+            (middle - (b - a)).hypot().max(((d - c) - middle).hypot())
+        };
+        let rows = (0..4).map(|j| self.points.map(|column| column[j]));
+        let u = rows.map(second_difference).fold(0., f64::max);
+        let v = self
+            .points
+            .map(second_difference)
+            .into_iter()
+            .fold(0., f64::max);
+        let [left, _, _, right] = self.points;
+        let corner = ((right[3] - left[3]) - (right[0] - left[0])).hypot();
+        let pure = 0.75 * (u + v);
+        let geometry = pure + 0.25 * corner;
+        if geometry <= flatness && color_ratio <= 1. {
             return 0;
         }
         // A child rectangle's corner twist integrates the mixed derivative over its area.
@@ -528,8 +576,10 @@ impl<'a> CanvasPatch<'a> {
                     .max(((pair[1][j + 1] - pair[1][j]) - (pair[0][j + 1] - pair[0][j])).hypot());
             }
         }
-        let ratio = ((pure + 2.25 * mixed) / PATCH_FLATNESS).max(color_ratio);
-        (0.5 * ratio.max(1.).log2()).ceil().min(f64::from(fine)) as u32
+        let ratio = ((pure + 2.25 * mixed) / flatness).max(color_ratio);
+        (0.5 * ratio.max(1.).log2())
+            .ceil()
+            .min(f64::from(max_depth)) as u32
     }
 
     fn bounds(&self) -> Rect {
@@ -544,55 +594,23 @@ impl<'a> CanvasPatch<'a> {
     }
 }
 
-type Column<const N: usize> = (usize, Option<[f32; N]>);
-
-fn draw_patches<const N: usize, C: MeshColors<N>>(
-    target: &mut Target<'_>,
-    patches: &[CanvasPatch<'_>],
-    depths: &[u32],
-    colors: &C,
+fn draw_patch<P: SamplePixel, const N: usize>(
+    target: &mut Target<'_, '_, P>,
+    patch: &CanvasPatch<'_>,
+    depth: u32,
+    colors: &impl MeshColors<N>,
 ) -> Result<(), Exhausted> {
-    for (patch, &depth) in patches.iter().zip(depths) {
-        let mut line = Vec::new();
-        let [[c00, c01], [c10, c11]] = patch.colors;
-        let components = c00
-            .len()
-            .min(c01.len())
-            .min(c10.len())
-            .min(c11.len())
-            .min(MAX_COMPONENTS);
-        let cache = target.pixel_centers
-            && target.canvas.height > 1
-            && C::CACHE_COLUMNS
-            && depth > 1
-            && c00[..components] == c01[..components]
-            && c10[..components] == c11[..components];
-        draw_patch_rows(
-            target,
-            patch,
-            patch.points,
-            [0., 1.],
-            depth,
-            depth,
-            colors,
-            cache.then_some(&mut line),
-        )?;
-        target
-            .meter
-            .release_bytes(line.capacity() * size_of::<Column<N>>());
-    }
-    Ok(())
+    draw_patch_rows(target, patch, patch.points, [0., 1.], depth, depth, colors)
 }
 
-fn draw_patch_rows<const N: usize>(
-    target: &mut Target<'_>,
+fn draw_patch_rows<P: SamplePixel, const N: usize>(
+    target: &mut Target<'_, '_, P>,
     patch: &CanvasPatch<'_>,
     points: [[Point; 4]; 4],
     [v0, v1]: [f32; 2],
     remaining: u32,
     depth: u32,
     colors: &impl MeshColors<N>,
-    mut line: Option<&mut Vec<Column<N>>>,
 ) -> Result<(), Exhausted> {
     take(target.meter, Cost::new(1))?;
     if !target.canvas.is_visible(points.as_flattened()) {
@@ -601,67 +619,15 @@ fn draw_patch_rows<const N: usize>(
     if remaining > 0 {
         let (lo, hi) = split_rows(points);
         let mid = (v0 + v1) * 0.5;
-        draw_patch_rows(
-            target,
-            patch,
-            lo,
-            [v0, mid],
-            remaining - 1,
-            depth,
-            colors,
-            line.as_deref_mut(),
-        )?;
-        return draw_patch_rows(
-            target,
-            patch,
-            hi,
-            [mid, v1],
-            remaining - 1,
-            depth,
-            colors,
-            line,
-        );
+        draw_patch_rows(target, patch, lo, [v0, mid], remaining - 1, depth, colors)?;
+        return draw_patch_rows(target, patch, hi, [mid, v1], remaining - 1, depth, colors);
     }
     let segments = 1_usize << depth;
     let mut previous = None;
     let mut buffer = [0.; MAX_COMPONENTS];
     let vertex_cost = target.vertex_cost;
-    let slots = (segments + 1).min(
-        target
-            .canvas
-            .width
-            .saturating_add(target.canvas.height)
-            .saturating_add(1),
-    );
     let mut column = |i: usize, meter: &mut dyn Meter| -> Result<[[f32; N]; 2], Exhausted> {
         let u = i as f32 / segments as f32;
-        if line.as_ref().is_some_and(|cache| cache.is_empty()) {
-            if meter.hold(slots * size_of::<Column<N>>()) {
-                take(meter, Cost::of(slots))?;
-                let cache = line.as_deref_mut().unwrap();
-                cache.reserve_exact(slots);
-                cache.resize(slots, (usize::MAX, None));
-            } else {
-                line = None;
-            }
-        }
-        if let Some(cache) = &mut line {
-            let slot = &mut cache[i % slots];
-            if slot.0 != i {
-                take(meter, vertex_cost.times(2))?;
-                *slot = (
-                    i,
-                    colors.invariant_column(
-                        patch.components(u, 0., &mut buffer),
-                        &patch.colors[0][0],
-                        &patch.colors[1][0],
-                    ),
-                );
-            }
-            if let Some(value) = slot.1 {
-                return Ok([value; 2]);
-            }
-        }
         take(meter, vertex_cost.times(2))?;
         Ok([v0, v1].map(|v| colors.values(patch.components(u, v, &mut buffer))))
     };
@@ -679,27 +645,37 @@ fn draw_patch_rows<const N: usize>(
             let right = column(i + 1, target.meter)?;
             let [c10, c11] = right;
             previous = Some((i + 1, right));
-            let shade = |v: &[f32; N]| colors.shade(v);
+            let shade = |v: &[f32; N]| P::evaluated(Some(colors.shade(v)));
             target.canvas.fill_triangle(
                 [p[0], p[1], q[0]],
                 [c00, c10, c01],
                 &shade,
+                colors.cost(),
                 target.meter,
             )?;
-            target
-                .canvas
-                .fill_triangle([p[1], q[1], q[0]], [c10, c11, c01], &shade, target.meter)
+            target.canvas.fill_triangle(
+                [p[1], q[1], q[0]],
+                [c10, c11, c01],
+                &shade,
+                colors.cost(),
+                target.meter,
+            )
         },
     )
 }
 
-fn draw_patch_strip(
-    target: &mut Target<'_>,
+fn draw_patch_strip<P: SamplePixel>(
+    target: &mut Target<'_, '_, P>,
     top: [Point; 4],
     bottom: [Point; 4],
     start: usize,
     width: usize,
-    leaf: &mut impl FnMut(&mut Target<'_>, usize, [Point; 2], [Point; 2]) -> Result<(), Exhausted>,
+    leaf: &mut impl FnMut(
+        &mut Target<'_, '_, P>,
+        usize,
+        [Point; 2],
+        [Point; 2],
+    ) -> Result<(), Exhausted>,
 ) -> Result<(), Exhausted> {
     take(target.meter, Cost::new(1))?;
     let area = if width == 1 {
@@ -781,12 +757,12 @@ mod tests {
                     vertex_cost: Cost::new(1),
                     pixel_centers: true,
                 };
-                draw_patches(&mut target, std::slice::from_ref(&patch), &[depth], &Gray).unwrap();
+                draw_patch(&mut target, &patch, depth, &Gray).unwrap();
                 canvas.pixels
             };
             let fine = draw(4);
             assert!(fine.iter().any(|p| p[3] == 1.));
-            assert_eq!(draw(patch.depth(4)), fine);
+            assert_eq!(draw(patch.linear_depth(4)), fine);
         }
     }
 
@@ -805,29 +781,40 @@ mod tests {
         let flat = [[0., 0.], [0., 0.]].map(|row| row.map(|v| smallvec::smallvec![v]));
         let varied = [[0., 1.], [1., 0.]].map(|row| row.map(|v| smallvec::smallvec![v]));
         let patches = [
-            CanvasPatch {
-                points: grid(0.5, false),
-                colors: &flat,
+            Patch {
+                control_points: grid(0.5, false),
+                colors: flat.clone(),
             },
-            CanvasPatch {
-                points: grid(12.5, true),
-                colors: &varied,
+            Patch {
+                control_points: grid(12.5, true),
+                colors: varied,
             },
-            CanvasPatch {
-                points: grid(28., false),
-                colors: &flat,
+            Patch {
+                control_points: grid(28., false),
+                colors: flat.clone(),
             },
         ];
         let mut canvas = Canvas::new(40, 12, [0.; 4]);
-        let depths = group_depths(&patches, canvas.bounds(), 3, true, &mut Unmetered).unwrap();
-        assert_eq!(depths, [3, 3, 0]);
+        let zoom = Affine::scale(4.);
+        let depths = mesh_depths(
+            &patches,
+            zoom,
+            zoom.transform_rect_bbox(canvas.bounds()),
+            &[(0., 1.)],
+            true,
+            &mut Unmetered,
+        )
+        .unwrap();
+        assert_eq!([depths.at(0), depths.at(1), depths.at(2)], [3, 3, 0]);
         let mut target = Target {
             canvas: &mut canvas,
             meter: &mut Unmetered,
             vertex_cost: Cost::new(1),
             pixel_centers: true,
         };
-        draw_patches(&mut target, &patches, &depths, &Gray).unwrap();
+        Pieces::Patches(&patches, depths)
+            .draw(&mut target, Affine::IDENTITY, &Gray)
+            .unwrap();
         for row in canvas.pixels.as_chunks::<40>().0 {
             assert!(row[..24].iter().all(|p| p[3] == 1.));
             assert!(row[24..28].iter().all(|p| p[3] == 0.));
@@ -848,7 +835,7 @@ mod tests {
                 points,
                 colors: &clipped,
             }
-            .depth(2),
+            .linear_depth(2),
             2
         );
         let unequal = [
@@ -860,7 +847,7 @@ mod tests {
                 points,
                 colors: &unequal,
             }
-            .depth(2),
+            .linear_depth(2),
             0
         );
     }

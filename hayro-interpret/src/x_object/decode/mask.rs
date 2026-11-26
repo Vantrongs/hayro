@@ -1,7 +1,8 @@
 use super::{DecodeContext, decode_context, fix_image_length, unpack_samples};
 use crate::LumaData;
 use crate::function::interpolate;
-use crate::x_object::image::{ImageKind, ImageXObject};
+use crate::x_object::image::ImageKind;
+use crate::x_object::image::samples::{Samples, Source};
 use std::sync::LazyLock;
 
 static BILEVEL_MASK_LUT: LazyLock<Box<[u64; 256]>> = LazyLock::new(|| {
@@ -55,7 +56,7 @@ impl DecodedMask {
 }
 
 pub(crate) fn decode_mask(
-    obj: &ImageXObject<'_>,
+    obj: &Samples<impl Source>,
     target_dimension: Option<(u32, u32)>,
 ) -> Option<DecodedMask> {
     let ctx = decode_context(obj, target_dimension)?;

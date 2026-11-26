@@ -1,5 +1,5 @@
 //! SVG-like gradient approximations of encoded shadings.
-use crate::encode::{Cost, Exhausted, Meter, push_metered, take};
+use crate::encode::{Cost, Exhausted, Meter, Unmetered, push_metered, reserve_metered, take};
 
 mod ramp;
 
@@ -136,11 +136,39 @@ impl EncodedRadialAxialShading {
         pattern: &EncodedShadingPattern,
         tolerance: f32,
     ) -> Option<SvgGradient> {
+        self.as_svg_gradient_metered(pattern, tolerance, &mut Unmetered)
+            .expect("unmetered")
+    }
+
+    /// Derive native stops, charging their storage and color evaluations before use.
+    pub fn as_svg_gradient_metered(
+        &self,
+        pattern: &EncodedShadingPattern,
+        tolerance: f32,
+        meter: &mut dyn Meter,
+    ) -> Result<Option<SvgGradient>, Exhausted> {
+        let conversion = pattern.color_space.prepared();
+        conversion.hold(meter)?;
+        take(meter, pattern.setup_cost() + conversion.sample)?;
+        let mut setup = Setup::new(meter);
+        let result = self.svg_gradient(pattern, tolerance, &mut setup);
+        setup.result(result)
+    }
+
+    fn svg_gradient(
+        &self,
+        pattern: &EncodedShadingPattern,
+        tolerance: f32,
+        setup: &mut Setup<'_>,
+    ) -> Option<SvgGradient> {
         let background = pattern.background_color.components();
         let background = (background[3] > 0.0).then(|| pattern.finish(background));
         let range = self.padded_range(background.is_some())?;
 
-        let stops = self.native_stops(pattern, tolerance)?;
+        let mut stops = self.native_stops(pattern, tolerance, setup)?;
+        let padding = 2 * (usize::from(range[0] < 0.) + usize::from(range[1] > 1.));
+        setup.reserve(&mut stops, padding)?;
+        setup.work(Cost::of(stops.len() + padding))?;
 
         Some(SvgGradient {
             kind: self.gradient_kind(range),
@@ -153,6 +181,7 @@ impl EncodedRadialAxialShading {
         &self,
         pattern: &EncodedShadingPattern,
         tolerance: f32,
+        setup: &mut Setup<'_>,
     ) -> Option<Vec<SvgGradientStop>> {
         if !tolerance.is_finite() || tolerance < 0.0 {
             return None;
@@ -164,6 +193,12 @@ impl EncodedRadialAxialShading {
         }
 
         let mut stops: Vec<SvgGradientStop> = Vec::new();
+        let point = pattern.point_cost();
+        let limit = crate::function::MAX_LINEAR_PIECES;
+        setup.work(Cost::of(limit) + self.function.bounds_cost())?;
+        if matches!(&self.function, ShadingFunction::Multiple(fs) if fs.len() > 1) {
+            setup.hold(2 * limit * size_of::<([f64; 2], f32, f32)>())?;
+        }
         self.function.linear_pieces(
             self.domain.map(f64::from),
             direct_color.then_some(tolerance),
@@ -171,6 +206,7 @@ impl EncodedRadialAxialShading {
                 if start >= end {
                     return None;
                 }
+                setup.work(point.times(2))?;
                 let (ca, cb) = (pattern.convert(a), pattern.convert(b));
                 if !direct_color {
                     let expected = |t| lerp_color(ca, cb, (t - start) / (end - start));
@@ -179,7 +215,8 @@ impl EncodedRadialAxialShading {
                         color,
                         codes: pattern.color_space.encode_values(values),
                     };
-                    let mid = |t| {
+                    let mut mid = |t| {
+                        setup.work(point)?;
                         let [lo, hi] = self.domain.map(f64::from);
                         let mut out = [0.0; crate::function::MAX_COMPONENTS];
                         let out = &mut out[..self.function.num_outputs()];
@@ -190,12 +227,13 @@ impl EncodedRadialAxialShading {
                     check_color_interval(
                         &sample(start, ca, a),
                         &sample(end, cb, b),
-                        &mid,
+                        &mut mid,
                         &expected,
                         tolerance,
                     )?;
                 }
                 if stops.last().is_none_or(|last| last.color != ca) {
+                    setup.reserve(&mut stops, 1)?;
                     stops.push(SvgGradientStop {
                         offset: start,
                         color: ca,
@@ -214,6 +252,7 @@ impl EncodedRadialAxialShading {
                         stops.pop();
                     }
                 }
+                setup.reserve(&mut stops, 1)?;
                 stops.push(SvgGradientStop {
                     offset: end,
                     color: cb,
@@ -229,8 +268,13 @@ impl EncodedRadialAxialShading {
     fn padded_range(&self, has_background: bool) -> Option<[f64; 2]> {
         let mut padding = self.extend.map(|extend| if extend { 0.0 } else { PADDING });
 
-        if let RadialAxialParams::Radial { p1, r } = self.params {
-            let growth = r.y - r.x;
+        if let RadialAxialParams::Radial(circles) = self.params {
+            let crate::shading::RadialCircles {
+                p1,
+                r,
+                dr: growth,
+                a,
+            } = circles;
             let distance = p1.to_vec2().hypot();
             let nested = growth.abs() - distance > RADIAL_EPSILON;
 
@@ -238,7 +282,7 @@ impl EncodedRadialAxialShading {
             if r.x < 0.0
                 || r.y < 0.0
                 || r.x.max(r.y) > f64::from(f32::MAX)
-                || distance > growth.abs()
+                || a >= 0.0
                 || !nested && (has_background || !self.extend[1])
             {
                 return None;
@@ -259,12 +303,51 @@ impl EncodedRadialAxialShading {
                 start: Point::new(t0, 0.0),
                 end: Point::new(t1, 0.0),
             },
-            RadialAxialParams::Radial { p1, r } => SvgGradientKind::Radial {
-                start_center: (p1.to_vec2() * t0).to_point(),
-                start_radius: (r.x + (r.y - r.x) * t0) as f32,
-                end_center: (p1.to_vec2() * t1).to_point(),
-                end_radius: (r.x + (r.y - r.x) * t1) as f32,
-            },
+            RadialAxialParams::Radial(crate::shading::RadialCircles { p1, r, dr, .. }) => {
+                SvgGradientKind::Radial {
+                    start_center: (p1.to_vec2() * t0).to_point(),
+                    start_radius: (r.x + dr * t0) as f32,
+                    end_center: (p1.to_vec2() * t1).to_point(),
+                    end_radius: (r.x + dr * t1) as f32,
+                }
+            }
+        }
+    }
+}
+
+// Gradient construction uses None for unsupported shapes; keep budget refusals distinct.
+struct Setup<'m> {
+    meter: &'m mut dyn Meter,
+    exhausted: bool,
+}
+
+impl<'m> Setup<'m> {
+    fn new(meter: &'m mut dyn Meter) -> Self {
+        Self {
+            meter,
+            exhausted: false,
+        }
+    }
+    fn work(&mut self, steps: Cost) -> Option<()> {
+        let ok = self.meter.work(steps);
+        self.exhausted |= !ok;
+        ok.then_some(())
+    }
+    fn hold(&mut self, bytes: usize) -> Option<()> {
+        let ok = self.meter.hold(bytes);
+        self.exhausted |= !ok;
+        ok.then_some(())
+    }
+    fn reserve<T>(&mut self, values: &mut Vec<T>, extra: usize) -> Option<()> {
+        let result = reserve_metered(values, extra, self.meter);
+        self.exhausted |= result.is_err();
+        result.ok()
+    }
+    fn result<T>(self, value: Option<T>) -> Result<Option<T>, Exhausted> {
+        if self.exhausted {
+            Err(Exhausted)
+        } else {
+            Ok(value)
         }
     }
 }
@@ -278,7 +361,7 @@ struct ColorSample {
 fn check_color_interval(
     a: &ColorSample,
     b: &ColorSample,
-    sample: &impl Fn(f32) -> Option<ColorSample>,
+    sample: &mut impl FnMut(f32) -> Option<ColorSample>,
     expected: &impl Fn(f32) -> [f32; 4],
     tolerance: f32,
 ) -> Option<()> {
@@ -594,7 +677,9 @@ mod tests {
         };
         let a = sample(0.5, 127);
         let b = sample(a.t.next_up(), 128);
-        assert!(check_color_interval(&a, &b, &|_| unreachable!(), &|_| a.color, 0.01).is_none());
+        assert!(
+            check_color_interval(&a, &b, &mut |_| unreachable!(), &|_| a.color, 0.01).is_none()
+        );
     }
 
     fn stops(dict: &[u8]) -> Option<Vec<SvgGradientStop>> {

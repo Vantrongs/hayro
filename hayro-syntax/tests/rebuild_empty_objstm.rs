@@ -122,7 +122,7 @@ fn rebuild_skips_decoding_unusable_objstm_headers() {
 }
 
 #[test]
-fn rebuild_still_recovers_usable_objstm_and_normal_lookup_still_repairs() {
+fn opening_repair_recovers_usable_object_streams_and_later_reads_report_lost_entries() {
     let _guard = TEST_LOCK.lock().unwrap();
     // 1. Rebuild recovers compressed object 6 = 42 from valid /N 1 /First 4 stream.
     let rebuild_bytes = b"%PDF-1.5\n\
@@ -134,8 +134,7 @@ fn rebuild_still_recovers_usable_objstm_and_normal_lookup_still_repairs() {
     let pdf = Pdf::new(rebuild_bytes.to_vec()).unwrap();
     assert_eq!(pdf.xref().get::<u32>(ObjectIdentifier::new(6, 0)), Some(42));
 
-    // 2. Normal xref pointing object 6 at a decodable /N 0 stream still triggers repair
-    //    and recovers standalone object 6 = 99.
+    // A valid xref that lists an absent compressed member stays authoritative.
     let mut pdf_bytes = b"%PDF-1.5\n".to_vec();
     let mut offsets = [0_usize; 7];
     let mut push_obj = |id: usize, body: &[u8]| {
@@ -181,6 +180,9 @@ fn rebuild_still_recovers_usable_objstm_and_normal_lookup_still_repairs() {
     );
 
     let pdf = Pdf::new(pdf_bytes).unwrap();
-    // Original xref has no entry for object 7's replacement; entry 6 triggers lazy repair.
-    assert_eq!(pdf.xref().get::<u32>(ObjectIdentifier::new(6, 0)), Some(99));
+    let id = ObjectIdentifier::new(6, 0);
+    let (value, lost) = pdf.xref().watch(|| pdf.xref().get::<u32>(id));
+    assert_eq!(value, None);
+    assert!(lost.is_some());
+    assert!(!pdf.xref().is_repaired());
 }

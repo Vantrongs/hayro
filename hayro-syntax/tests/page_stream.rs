@@ -49,7 +49,7 @@ fn document(ignored: &str, wrong_stream_offset: bool) -> Vec<u8> {
     if wrong_stream_offset {
         offsets[3] = offsets[4];
     }
-    // Only a repaired xref can find object 7. Entry 8 points at its header.
+    // Entry 8 owns this body even though its header names object 7.
     let unindexed = pdf.len();
     pdf.push_str("7 0 obj\n1\nendobj\n");
     let length = pdf.len();
@@ -107,7 +107,8 @@ fn ignored_content_dictionary_skips_keys_and_indirect_length() {
 fn wrong_stream_offset_repairs_xref() {
     let pdf = Pdf::new(document("<ab>", true)).unwrap();
     assert_eq!(pdf.pages()[0].page_stream().unwrap(), b"q Q ");
-    assert_eq!(pdf.xref().get::<u32>(ObjectIdentifier::new(7, 0)), Some(1));
+    assert!(pdf.xref().is_repaired());
+    assert_eq!(pdf.xref().get::<u32>(ObjectIdentifier::new(8, 0)), Some(1));
 }
 
 #[test]

@@ -108,15 +108,11 @@ pub(crate) mod lzw {
     use crate::bit_reader::BitReader;
     use crate::filter::predictor;
     use crate::object::Dict;
-    use crate::object::dict::keys::EARLY_CHANGE;
     use alloc::vec;
     use alloc::vec::Vec;
 
     pub(crate) fn decode(data: &[u8], params: &Dict<'_>) -> Option<Vec<u8>> {
-        let early_change = params
-            .get::<u8>(EARLY_CHANGE)
-            .map(|e| e != 0)
-            .unwrap_or(true);
+        let early_change = predictor::early_change(params);
         let decoded = decode_impl(data, early_change)?;
 
         predictor::apply(decoded, params)

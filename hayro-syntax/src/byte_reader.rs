@@ -105,7 +105,9 @@ impl<'a> Reader<'a> {
     /// Peeks a single byte.
     #[inline]
     pub fn peek_byte(&self) -> Option<u8> {
-        self.data.get(self.offset).copied()
+        let byte = self.data.get(self.offset).copied();
+        crate::work::examined(usize::from(byte.is_some()));
+        byte
     }
 
     /// Eat the next byte if it satisfies the condition.

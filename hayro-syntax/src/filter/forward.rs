@@ -3,7 +3,6 @@ use super::lzw_flate::lzw::Table;
 use super::png::{RowFilter, unfilter_row};
 use super::{Filter, predictor};
 use crate::object::Dict;
-use crate::object::dict::keys::*;
 use crate::object::stream::{DecodeFailure, DecryptedReader};
 use crate::sync::CancelArc;
 use crate::trivia::is_white_space_character;
@@ -78,11 +77,7 @@ enum Codec {
 }
 
 struct Predict {
-    method: u32,
-    colors: usize,
-    bpc: usize,
-    columns: usize,
-    width: usize,
+    layout: predictor::Rows,
     previous: Vec<u8>,
     row: Vec<u8>,
     filter: Option<u8>,
@@ -128,7 +123,7 @@ impl<'a> DecodedReader<'a> {
                 repeat: 0,
             },
             Filter::LzwDecode => Codec::Lzw {
-                table: Table::new(params.get::<u8>(EARLY_CHANGE) != Some(0)),
+                table: Table::new(predictor::early_change(params)),
                 bits: 0,
                 len: 0,
                 previous: None,
@@ -149,30 +144,15 @@ impl<'a> DecodedReader<'a> {
             _ => return None,
         };
         self.push(codec);
-        if matches!(filter, Filter::FlateDecode | Filter::LzwDecode) {
-            let method = params.get::<u32>(PREDICTOR).unwrap_or(1);
-            if method != 1 {
-                let colors = params.get::<usize>(COLORS).unwrap_or(1);
-                let bpc = params.get::<usize>(BITS_PER_COMPONENT).unwrap_or(8);
-                let columns = params.get::<usize>(COLUMNS).unwrap_or(1);
-                let width = colors.checked_mul(bpc)?.checked_mul(columns)?.div_ceil(8);
-                if width == 0
-                    || !matches!(bpc, 1 | 2 | 4 | 8 | 16)
-                    || !matches!(method, 2 | 10..=15)
-                {
-                    return None;
-                }
-                self.push(Codec::Predict(Predict {
-                    method,
-                    colors,
-                    bpc,
-                    columns,
-                    width,
-                    previous: Vec::new(),
-                    row: Vec::new(),
-                    filter: None,
-                }));
-            }
+        if matches!(filter, Filter::FlateDecode | Filter::LzwDecode)
+            && let Some(layout) = predictor::Rows::read(params).ok()?
+        {
+            self.push(Codec::Predict(Predict {
+                layout,
+                previous: Vec::new(),
+                row: Vec::new(),
+                filter: None,
+            }));
         }
         Some(())
     }
@@ -191,7 +171,9 @@ impl<'a> DecodedReader<'a> {
         }
         if self.layers.is_empty() {
             self.poll()?;
-            return Ok(self.stored.read(out));
+            let n = self.stored.read(out);
+            crate::work::told(n);
+            return Ok(n);
         }
         self.pull(self.layers.len(), out)
     }
@@ -343,6 +325,7 @@ impl<'a> DecodedReader<'a> {
             if i == 0 {
                 pending.bytes.resize(BLOCK, 0);
                 let n = self.stored.read(&mut pending.bytes);
+                crate::work::told(n);
                 pending.bytes.truncate(n);
                 pending.pos = 0;
                 pending.end = n == 0;
@@ -366,6 +349,7 @@ impl<'a> DecodedReader<'a> {
                 self.failed = Some(i - 1);
                 return Err(DecodeFailure::StreamDecode);
             };
+            crate::work::told(n + layer.out.bytes.len());
             input.pos += n;
             if matches!(layer.codec, Codec::Flate { .. }) {
                 self.inflated = self.inflated.saturating_add(layer.out.bytes.len() as u64);
@@ -640,37 +624,52 @@ impl Inflater {
 impl Predict {
     fn step(&mut self, data: &[u8], eof: bool, out: &mut Vec<u8>) -> Option<(usize, bool)> {
         let mut n = 0;
-        if self.method != 2 && self.filter.is_none() && !data.is_empty() {
+        if !self.layout.tiff && self.filter.is_none() && !data.is_empty() {
             self.filter = Some(data[0]);
             n = 1;
         }
-        let take = (self.width - self.row.len()).min(data.len() - n);
+        let take = (self.layout.width - self.row.len()).min(data.len() - n);
         self.row.extend_from_slice(&data[n..n + take]);
         n += take;
         let end = eof && n == data.len();
-        if self.row.len() == self.width || end && !self.row.is_empty() {
-            if self.method == 2 {
-                if self.bpc == 16 && self.row.len() % 2 == 1 {
+        if self.row.len() == self.layout.width || end && !self.row.is_empty() {
+            if self.layout.tiff {
+                if self.layout.bpc == 16 && self.row.len() % 2 == 1 {
                     let missing = self.previous.get(self.row.len()).copied().unwrap_or(0);
                     self.row.push(missing);
-                    predictor::tiff_row(&mut self.row, self.colors, self.bpc, self.columns);
+                    predictor::tiff_row(
+                        &mut self.row,
+                        self.layout.colors,
+                        self.layout.bpc,
+                        self.layout.columns,
+                    );
                     self.row.pop();
-                } else if self.bpc == 16 {
+                } else if self.layout.bpc == 16 {
                     self.previous.clone_from(&self.row);
-                    predictor::tiff_row(&mut self.row, self.colors, self.bpc, self.columns);
+                    predictor::tiff_row(
+                        &mut self.row,
+                        self.layout.colors,
+                        self.layout.bpc,
+                        self.layout.columns,
+                    );
                 } else {
-                    predictor::tiff_row(&mut self.row, self.colors, self.bpc, self.columns);
+                    predictor::tiff_row(
+                        &mut self.row,
+                        self.layout.colors,
+                        self.layout.bpc,
+                        self.layout.columns,
+                    );
                 }
             } else if let Some(filter) = self.filter.take().and_then(RowFilter::from_u8) {
                 unfilter_row(
                     filter,
-                    (self.colors * self.bpc).div_ceil(8),
+                    self.layout.bytes_per_pixel(),
                     &self.previous,
                     &mut self.row,
                 );
             }
             out.extend_from_slice(&self.row);
-            if self.method != 2 {
+            if !self.layout.tiff {
                 core::mem::swap(&mut self.row, &mut self.previous);
             }
             self.row.clear();

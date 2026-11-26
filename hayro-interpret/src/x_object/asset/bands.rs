@@ -1,8 +1,7 @@
 use super::*;
-use crate::color::{ColorComponents, ToLuma};
+use crate::color::ToLuma;
 use crate::x_object::decode::{convert_band, premultiply, unblend_matte};
 use hayro_syntax::Filter;
-use hayro_syntax::object::dict::keys::*;
 use hayro_syntax::object::stream::{
     DecodedReader, ImageData as Metadata, ImageDecodeParams, JpegRows,
 };
@@ -55,65 +54,48 @@ pub(super) struct Band {
 }
 
 impl Bands {
-    pub(super) fn new(asset: &ImageAsset, obj: &ImageXObject<'_>) -> Option<Self> {
-        Self::from_stream(asset.0.stream.clone(), obj, asset.cancel_token())
+    pub(super) fn new(asset: &ImageAsset) -> Option<Self> {
+        Self::from_stream(&asset.0.samples, asset.cancel_token())
     }
 
-    fn from_stream(
-        owner: OwnedStream,
-        obj: &ImageXObject<'_>,
-        token: Arc<AtomicBool>,
-    ) -> Option<Self> {
-        let dict = obj.stream.dict();
-        if dict.get::<u8>(SMASK_IN_DATA).unwrap_or(0) != 0 {
+    fn from_stream(obj: &Samples<OwnedStream>, token: Arc<AtomicBool>) -> Option<Self> {
+        if obj.in_data != 0 {
             return None;
         }
-        let external = if obj.kind == ImageKind::Image {
-            dict.get::<hayro_syntax::object::Stream<'_>>(SMASK)
-                .or_else(|| dict.get::<hayro_syntax::object::Stream<'_>>(MASK))
+        let mask = if obj.has_mask_stream {
+            Some(Box::new(Self::from_stream(
+                obj.mask.as_deref()?,
+                token.clone(),
+            )?))
         } else {
             None
         };
-        let mask = match external.as_ref() {
-            Some(stream) => {
-                let obj = ImageXObject::new_mask(stream, &obj.warning_sink, &obj.cache)?;
-                Some(Box::new(Self::from_stream(
-                    stream.to_owned_stream(),
-                    &obj,
-                    token.clone(),
-                )?))
-            }
-            None => None,
-        };
         let cs = obj.color_space.as_ref()?;
-        let keyed = super::super::decode::short_rows_transparent(obj, cs.num_components());
+        let keyed = obj.transparent_tail(cs.num_components());
         let channels = usize::from(cs.num_components());
-        let bpc = dict
-            .get::<u8>(BPC)
-            .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT))
-            .unwrap_or(if obj.kind == ImageKind::StencilMask {
-                1
-            } else {
-                8
-            });
+        let bpc = obj.bpc.unwrap_or(if obj.kind == ImageKind::StencilMask {
+            1
+        } else {
+            8
+        });
         let params = ImageDecodeParams {
             is_indexed: cs.is_indexed(),
             num_components: Some(cs.num_components()),
-            width: obj.width(),
-            height: obj.height(),
+            width: obj.width,
+            height: obj.height,
             ..Default::default()
         };
         let mut metadata = None;
-        let reader = StreamRows::try_new(owner, |owned| {
+        let reader = StreamRows::try_new(obj.stream.clone(), |owned| {
             let stream = owned.get().ok_or(())?;
-            let filters = stream.filters();
-            if filters.is_empty() || filters.as_slice() == [Filter::Crypt] {
+            let last_filter = stream.filters().into_iter().rfind(|&f| f != Filter::Crypt);
+            if last_filter.is_none() {
                 let mut reader = stream.decrypted_reader().map_err(|_| ())?;
                 if reader.can_seek() {
                     return Ok(Producer::Direct(reader.skip(usize::MAX) as u64));
                 }
             }
-            if filters.last() == Some(&Filter::CcittFaxDecode) {
+            if last_filter == Some(Filter::CcittFaxDecode) {
                 let fax = stream.fax_image(&params, Some(token.clone())).ok_or(())?;
                 let info = fax.image_data.ok_or(())?;
                 if params.width != info.width || params.height != info.height || channels != 1 {
@@ -122,7 +104,7 @@ impl Bands {
                 metadata = Some(info);
                 return Ok(Producer::Packed(fax.data.into_owned()));
             }
-            if filters.last() == Some(&Filter::DctDecode) {
+            if last_filter == Some(Filter::DctDecode) {
                 let jpeg = stream.jpeg_rows(&params, Some(token.clone())).ok_or(())?;
                 let info = jpeg.metadata();
                 if info.width != params.width
@@ -156,13 +138,13 @@ impl Bands {
             .as_ref()
             .is_none_or(|tf| matches!(tf, ActiveTransferFunction::Single(_)))
             && cs.to_luma(&mut []).is_some();
-        let matte = dict
-            .get::<hayro_syntax::object::Stream<'_>>(SMASK)
-            .and_then(|stream| stream.dict().get::<ColorComponents>(MATTE))
-            .filter(|values| values.len() == channels)
+        let matte = obj
+            .matte
+            .as_ref()
+            .filter(|values| obj.has_soft_mask && values.len() == channels)
             .map(|values| {
                 let mut rgb = [0; 3];
-                cs.convert_values(&values, &mut rgb);
+                cs.convert_values(values, &mut rgb);
                 rgb
             });
         let mut layout = ImageLayout {
@@ -171,7 +153,7 @@ impl Bands {
                 height: params.height,
                 to_image: (1., 1.),
                 interpolate: obj.interpolate,
-                format: match (obj.kind, gray, keyed && external.is_none()) {
+                format: match (obj.kind, gray, keyed && mask.is_none()) {
                     (ImageKind::Image, true, true) => PixelFormat::LumaAlpha,
                     (ImageKind::Image, false, true) => PixelFormat::RgbAlpha,
                     (ImageKind::Image, true, false) => PixelFormat::Luma,
@@ -295,7 +277,7 @@ impl Bands {
         columns: &std::ops::Range<u32>,
         first: u32,
         end: u32,
-        obj: &ImageXObject<'_>,
+        obj: &Samples<OwnedStream>,
     ) -> Result<Vec<u8>, RequestError> {
         let stored = self.stored_bytes();
         let start = u64::from(first).saturating_mul(self.stride as u64);
@@ -321,6 +303,8 @@ impl Bands {
                 let mut direct = if matches!(r, Producer::Direct(_)) {
                     Some(
                         obj.stream
+                            .get()
+                            .ok_or(RequestError::Failed)?
                             .decrypted_reader()
                             .map_err(|_| RequestError::Failed)?,
                     )
@@ -406,7 +390,7 @@ impl Bands {
         columns: &std::ops::Range<u32>,
         first: u32,
         end: u32,
-        obj: &ImageXObject<'_>,
+        obj: &Samples<OwnedStream>,
     ) -> Result<Band, RequestError> {
         let combined = self.mask.is_some() && self.layout.mask.is_none();
         let (ready, mut rows, mut bytes) = if plane == Plane::Image {
@@ -449,28 +433,17 @@ impl Bands {
         columns: &std::ops::Range<u32>,
         first: u32,
         end: u32,
-        obj: &ImageXObject<'_>,
+        obj: &Samples<OwnedStream>,
     ) -> Result<Vec<u8>, RequestError> {
         if self.mask.is_none() || plane == Plane::Image && self.layout.mask.is_some() {
             return self.samples(columns, first, end, obj);
         }
-        let stream = obj
-            .stream
-            .dict()
-            .get::<hayro_syntax::object::Stream<'_>>(SMASK)
-            .or_else(|| {
-                obj.stream
-                    .dict()
-                    .get::<hayro_syntax::object::Stream<'_>>(MASK)
-            })
-            .ok_or(RequestError::Failed)?;
-        let mask_obj = ImageXObject::new_mask(&stream, &obj.warning_sink, &obj.cache)
-            .ok_or(RequestError::Failed)?;
+        let mask_obj = obj.mask.as_deref().ok_or(RequestError::Failed)?;
         let mask = self.mask.as_mut().unwrap();
         if plane == Plane::Mask {
-            return mask.samples(columns, first, end, &mask_obj);
+            return mask.samples(columns, first, end, mask_obj);
         }
-        let mut alpha = mask.samples(columns, first, end, &mask_obj)?;
+        let mut alpha = mask.samples(columns, first, end, mask_obj)?;
         let mut color = self.samples(columns, first, end, obj)?;
         if self.keyed {
             // Matte rows without stored colour have zero coverage even with an opaque mask.

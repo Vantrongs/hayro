@@ -14,7 +14,7 @@
 //! compare.
 
 use super::Unsupported;
-use super::entries::real;
+use super::entries::operand_real;
 use super::out::{Color, Out, Part, Refused, Rounding, corners};
 use crate::hash;
 use crate::marks::Mark;
@@ -2038,7 +2038,7 @@ pub(super) fn default_appearance(da: &[u8]) -> (Family, Option<f32>, Option<Colo
         {
             match operand {
                 // Only the first four are ever taken.
-                Object::Number(n) if numbers.len() < 4 => numbers.push(real(n)),
+                Object::Number(n) if numbers.len() < 4 => numbers.push(operand_real(n)),
                 Object::Name(n) => name = Some(n),
                 _ => {}
             }
