@@ -1,4 +1,5 @@
 //! SVG-like gradient approximations of encoded shadings.
+use crate::encode::{Cost, Exhausted, Meter, push_metered, take};
 
 mod ramp;
 
@@ -160,10 +161,16 @@ impl EncodedRadialAxialShading {
 
         if let RadialAxialParams::Radial { p1, r } = self.params {
             let growth = r.y - r.x;
-            let nested = growth.abs() - p1.to_vec2().hypot() > RADIAL_EPSILON;
+            let distance = p1.to_vec2().hypot();
+            let nested = growth.abs() - distance > RADIAL_EPSILON;
 
             // Unless nested, circles past the end outrank earlier ones and some points need the background.
-            if r.x < 0.0 || r.y < 0.0 || !nested && (has_background || !self.extend[1]) {
+            if r.x < 0.0
+                || r.y < 0.0
+                || r.x.max(r.y) > f64::from(f32::MAX)
+                || distance > growth.abs()
+                || !nested && (has_background || !self.extend[1])
+            {
                 return None;
             }
 
@@ -227,16 +234,45 @@ fn check_color_interval(
     check_color_interval(&m, b, sample, expected, tolerance)
 }
 
-pub(crate) fn function_lut(
+pub(crate) fn function_lut_metered(
     function: &ShadingFunction,
     range: [f32; 2],
     pattern: &EncodedShadingPattern,
-) -> ColorLut {
-    ColorLut::new(&approximate_gradient_stops(
+    meter: &mut dyn Meter,
+) -> Result<ColorLut, Exhausted> {
+    let stops = metered_stops(function, range, pattern, LUT_TOLERANCE, meter)?;
+    ColorLut::new(&stops, meter)
+}
+
+fn metered_stops(
+    function: &ShadingFunction,
+    range: [f32; 2],
+    pattern: &EncodedShadingPattern,
+    tolerance: f32,
+    meter: &mut dyn Meter,
+) -> Result<Vec<SvgGradientStop>, Exhausted> {
+    let bounds = function.bounds_cost();
+    take(meter, bounds)?;
+    if !meter.hold(
+        usize::try_from(
+            (function.bounds_count() + Cost::new(2))
+                .times(4 * size_of::<f32>() as u64)
+                .steps(),
+        )
+        .unwrap_or(usize::MAX),
+    ) {
+        return Err(Exhausted);
+    }
+    approximate_gradient_stops(
+        &mut Stops {
+            meter,
+            sample_cost: pattern.point_cost(),
+            stops: Vec::new(),
+        },
         |t| sample_function(function, range, pattern, t),
         &normalized_stitching_bounds(function, range),
-        LUT_TOLERANCE,
-    ))
+        tolerance,
+    )
 }
 
 fn sample_function(
@@ -274,15 +310,20 @@ pub(crate) struct ColorLut {
 }
 
 impl ColorLut {
-    fn new(stops: &[SvgGradientStop]) -> Self {
+    fn new(stops: &[SvgGradientStop], meter: &mut dyn Meter) -> Result<Self, Exhausted> {
+        take(meter, Cost::of(stops.len()).times(2))?;
         let min_gap = stops
             .windows(2)
             .map(|w| w[1].offset - w[0].offset)
             .filter(|gap| *gap > 0.0)
             .fold(1.0, f32::min);
         let size = ((1.0 / min_gap).ceil() as usize)
-            .next_power_of_two()
-            .clamp(MIN_LUT_SIZE, MAX_LUT_SIZE);
+            .clamp(MIN_LUT_SIZE, MAX_LUT_SIZE)
+            .next_power_of_two();
+        take(meter, Cost::of(size))?;
+        if !meter.hold(size * size_of::<[f32; 4]>()) {
+            return Err(Exhausted);
+        }
 
         let mut segment = 0;
         let colors = (0..size)
@@ -305,7 +346,7 @@ impl ColorLut {
             })
             .collect();
 
-        Self { colors }
+        Ok(Self { colors })
     }
 
     #[inline]
@@ -351,32 +392,54 @@ fn pad_stops(
     Some(stops)
 }
 
+struct Stops<'m> {
+    meter: &'m mut dyn Meter,
+    /// The steps a sample takes.
+    sample_cost: Cost,
+    stops: Vec<SvgGradientStop>,
+}
+
+impl Stops<'_> {
+    /// Pays for `samples` samples.
+    fn pay(&mut self, samples: u64) -> Result<(), Exhausted> {
+        take(self.meter, self.sample_cost.times(samples))
+    }
+
+    fn push(&mut self, offset: f32, color: [f32; 4]) -> Result<(), Exhausted> {
+        push_metered(
+            &mut self.stops,
+            SvgGradientStop { offset, color },
+            self.meter,
+        )
+    }
+}
+
+/// The stops approximating, within `tolerance`, the colors `sample` finds between
+/// each two `breakpoints`, each sample and the stops held paid for first.
 fn approximate_gradient_stops(
+    stops: &mut Stops<'_>,
     mut sample: impl FnMut(f32) -> [f32; 4],
     breakpoints: &[f32],
     tolerance: f32,
-) -> Vec<SvgGradientStop> {
+) -> Result<Vec<SvgGradientStop>, Exhausted> {
     let mut interval_bounds = Vec::with_capacity(breakpoints.len() + 2);
     interval_bounds.push(0.0);
     interval_bounds.extend(breakpoints.iter().copied());
     interval_bounds.push(1.0);
 
-    let mut stops = Vec::new();
     for interval in interval_bounds.windows(2) {
         let start_offset = interval[0];
         let end_offset = interval[1];
 
+        stops.pay(2)?;
         let start_color = sample(start_offset);
-        stops.push(SvgGradientStop {
-            offset: start_offset,
-            color: start_color,
-        });
+        stops.push(start_offset, start_color)?;
 
         let end_color = sample(end_offset);
 
         approximate_gradient_interval(
+            stops,
             &mut sample,
-            &mut stops,
             GradientSample {
                 offset: start_offset,
                 color: start_color,
@@ -387,10 +450,10 @@ fn approximate_gradient_stops(
             },
             tolerance.max(0.0),
             0,
-        );
+        )?;
     }
 
-    stops
+    Ok(std::mem::take(&mut stops.stops))
 }
 
 #[derive(Clone, Copy)]
@@ -400,18 +463,19 @@ struct GradientSample {
 }
 
 fn approximate_gradient_interval(
+    stops: &mut Stops<'_>,
     sample: &mut impl FnMut(f32) -> [f32; 4],
-    stops: &mut Vec<SvgGradientStop>,
     start: GradientSample,
     end: GradientSample,
     tolerance: f32,
     depth: u8,
-) {
+) -> Result<(), Exhausted> {
     let offset_delta = end.offset - start.offset;
     let quarter_offset = start.offset + offset_delta * 0.25;
     let mid_offset = start.offset + offset_delta * 0.5;
     let three_quarter_offset = start.offset + offset_delta * 0.75;
 
+    stops.pay(3)?;
     let quarter_color = sample(quarter_offset);
     let mid_color = sample(mid_offset);
     let three_quarter_color = sample(three_quarter_offset);
@@ -424,12 +488,7 @@ fn approximate_gradient_interval(
         ) <= tolerance
         || depth == MAX_GRADIENT_SUBDIVISION_DEPTH
     {
-        stops.push(SvgGradientStop {
-            offset: end.offset,
-            color: end.color,
-        });
-
-        return;
+        return stops.push(end.offset, end.color);
     }
 
     let mid = GradientSample {
@@ -437,8 +496,8 @@ fn approximate_gradient_interval(
         color: mid_color,
     };
 
-    approximate_gradient_interval(sample, stops, start, mid, tolerance, depth + 1);
-    approximate_gradient_interval(sample, stops, mid, end, tolerance, depth + 1);
+    approximate_gradient_interval(stops, sample, start, mid, tolerance, depth + 1)?;
+    approximate_gradient_interval(stops, sample, mid, end, tolerance, depth + 1)
 }
 
 #[cfg(test)]

@@ -8,11 +8,11 @@ const MAX_CACHED_COLORS: usize = 1 << 18;
 
 #[derive(Debug, Clone)]
 pub(crate) struct DeviceN {
-    alternate_space: ColorSpace,
+    pub(super) alternate_space: ColorSpace,
     pub(super) num_components: u8,
-    tint_transform: Function,
+    pub(super) tint_transform: Function,
     is_none: bool,
-    lookup: U8Lookup<[u8; 3]>,
+    pub(super) lookup: U8Lookup<[u8; 3]>,
 }
 
 impl DeviceN {

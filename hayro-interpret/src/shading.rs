@@ -5,8 +5,9 @@
 use crate::CacheKey;
 use crate::cache::Cache;
 use crate::color::{ColorComponents, ColorSpace};
+use crate::encode::Cost;
 use crate::function::Function;
-use crate::util::{Float32Ext, PointExt, RectExt};
+use crate::util::{PointExt, RectExt};
 use hayro_syntax::bit_reader::{BitReader, bit_mask};
 use hayro_syntax::object::Array;
 use hayro_syntax::object::Dict;
@@ -31,6 +32,34 @@ pub enum ShadingFunction {
 }
 
 impl ShadingFunction {
+    /// The most steps one [`eval`](Self::eval) takes ([`Function::cost`]).
+    pub fn cost(&self) -> Cost {
+        match self {
+            Self::Single(function) => function.cost(),
+            // And a step each to put its output.
+            Self::Multiple(functions) => functions
+                .iter()
+                .map(|function| function.cost() + Cost::new(1))
+                .sum(),
+        }
+    }
+
+    /// The most steps [`stitching_bounds`](Self::stitching_bounds) takes.
+    pub(crate) fn bounds_cost(&self) -> Cost {
+        crate::function::sorting(self.bounds_count())
+            + match self {
+                Self::Single(function) => function.bounds_cost(),
+                Self::Multiple(functions) => functions.iter().map(Function::bounds_cost).sum(),
+            }
+    }
+
+    pub(crate) fn bounds_count(&self) -> Cost {
+        match self {
+            Self::Single(f) => f.bounds_count(),
+            Self::Multiple(fs) => fs.iter().map(Function::bounds_count).sum(),
+        }
+    }
+
     /// The number of output values of the shading function.
     pub fn num_outputs(&self) -> usize {
         match self {
@@ -166,7 +195,7 @@ pub enum ShadingType {
     /// A radial-axial shading.
     RadialAxial {
         /// `x0 y0 x1 y1` for axial shadings, `x0 y0 r0 x1 y1 r1` for radial ones.
-        coords: [f32; 6],
+        coords: [f64; 6],
         /// The domain of the shading.
         domain: [f32; 2],
         /// The function forming the basis of the shading.
@@ -250,15 +279,12 @@ impl Shading {
                 let function = read_function(dict, &color_space)?;
                 let extend = dict.get::<[bool; 2]>(EXTEND).unwrap_or([false, false]);
                 let (coords, invalid) = if shading_num == 2 {
-                    let read = dict.get::<[f32; 4]>(COORDS)?;
-                    let invalid = (read[0] - read[2]).is_nearly_zero()
-                        && (read[1] - read[3]).is_nearly_zero();
+                    let read = dict.get::<[f64; 4]>(COORDS)?;
+                    let invalid = read[0] == read[2] && read[1] == read[3];
                     ([read[0], read[1], read[2], read[3], 0.0, 0.0], invalid)
                 } else {
-                    let read = dict.get::<[f32; 6]>(COORDS)?;
-                    let invalid = (read[0] - read[3]).is_nearly_zero()
-                        && (read[1] - read[4]).is_nearly_zero()
-                        && (read[2] - read[5]).is_nearly_zero();
+                    let read = dict.get::<[f64; 6]>(COORDS)?;
+                    let invalid = read[0] == read[3] && read[1] == read[4] && read[2] == read[5];
                     (read, invalid)
                 };
 

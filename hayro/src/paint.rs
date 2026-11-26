@@ -121,11 +121,11 @@ impl Renderer<'_> {
                 }
             }
         }
-        texture_paint(&encoded, bbox)
+        texture_paint(&encoded.prepare_for(bbox), bbox)
     }
 }
 
-fn native_paint(native: SvgGradient) -> (PaintType, Affine) {
+fn native_paint(mut native: SvgGradient) -> (PaintType, Affine) {
     let mut gradient = match native.kind {
         SvgGradientKind::Linear { start, end } => Gradient::new_linear(start, end),
         SvgGradientKind::Radial {
@@ -133,7 +133,23 @@ fn native_paint(native: SvgGradient) -> (PaintType, Affine) {
             start_radius,
             end_center,
             end_radius,
-        } => Gradient::new_two_point_radial(start_center, start_radius, end_center, end_radius),
+        } => {
+                                    // Vello tests degeneracy in gradient coordinates before applying the transform.
+                                    const DEGENERATE_THRESHOLD: f32 = 1.0e-6;
+                                    let radius = start_radius.max(end_radius);
+                                    let unit = if radius > 0.0 && radius <= DEGENERATE_THRESHOLD {
+                                        f64::from(radius)
+                                    } else {
+                                        1.0
+                                    };
+                                    native.transform *= Affine::scale(unit);
+                                    Gradient::new_two_point_radial(
+                                        (start_center.to_vec2() / unit).to_point(),
+                                        (f64::from(start_radius) / unit) as f32,
+                                        (end_center.to_vec2() / unit).to_point(),
+                                        (f64::from(end_radius) / unit) as f32,
+                                    )
+}
     }
     .with_extend(peniko::Extend::Pad);
     gradient

@@ -5,10 +5,10 @@ use hayro_syntax::object::{Array, Name, Object};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Separation {
-    alternate_space: ColorSpace,
-    tint_transform: Function,
+    pub(super) alternate_space: ColorSpace,
+    pub(super) tint_transform: Function,
     is_none_separation: bool,
-    lookup: U8Lookup<[u8; 3]>,
+    pub(super) lookup: U8Lookup<[u8; 3]>,
 }
 
 impl Separation {

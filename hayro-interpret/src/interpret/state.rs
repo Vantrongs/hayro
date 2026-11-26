@@ -1,6 +1,7 @@
 use crate::color::{AlphaColor, ColorComponents, ColorSpace};
 use crate::context::Context;
 use crate::convert::{convert_line_cap, convert_line_join};
+use crate::encode::Cost;
 use crate::font::{Font, UNITS_PER_EM};
 use crate::function::TransferFunction;
 use crate::interpret::text::TextRenderingMode;
@@ -37,6 +38,18 @@ impl CacheKey for ActiveTransferFunction {
 }
 
 impl ActiveTransferFunction {
+    /// The steps building the tables the functions map by takes, until they are
+    /// built.
+    pub fn setup_cost(&self) -> Cost {
+        match self {
+            Self::Single(f) => f.setup_cost(),
+            Self::Four(functions) => functions[..3]
+                .iter()
+                .map(TransferFunction::setup_cost)
+                .sum(),
+        }
+    }
+
     /// Apply the transfer function to the RGB channels of a color.
     pub fn apply(&self, color: &AlphaColor) -> AlphaColor {
         let mut rgba = color.components();

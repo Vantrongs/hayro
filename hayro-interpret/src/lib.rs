@@ -35,6 +35,9 @@ mod canvas;
 mod context;
 mod convert;
 mod device;
+#[cfg(test)]
+#[path = "../tests/common/fixtures.rs"]
+mod fixtures;
 mod function;
 mod function_shading;
 mod interpret;
@@ -54,6 +57,8 @@ pub mod util;
 pub use cache::CacheKey;
 pub use context::*;
 pub use device::*;
+#[cfg(feature = "count-operators")]
+pub use function::operators_run;
 pub use function::{Function, TransferFunction};
 pub use hayro_cmap;
 pub use hayro_syntax;

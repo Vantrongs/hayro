@@ -7,8 +7,8 @@ use std::borrow::Cow;
 pub(crate) struct Indexed {
     values: Vec<Vec<u8>>,
     hival: u8,
-    base: Box<ColorSpace>,
-    lookup: U8Lookup<[u8; 3]>,
+    pub(super) base: Box<ColorSpace>,
+    pub(super) lookup: U8Lookup<[u8; 3]>,
     luma_lookup: U8Lookup<u8>,
 }
 

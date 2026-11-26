@@ -24,6 +24,7 @@ use self::lab::Lab;
 use self::pattern::Pattern;
 use self::separation::Separation;
 use crate::cache::Cache;
+use crate::{encode::Cost, function::Function};
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
 use hayro_syntax::object::Object;
@@ -265,9 +266,64 @@ impl ColorSpaceType {
 #[derive(Debug, Clone)]
 pub struct ColorSpace(Arc<ColorSpaceType>);
 
+pub(crate) struct PreparedConversion {
+    pub(crate) sample: Cost,
+    pub(crate) setup: Cost,
+}
+
+impl PreparedConversion {
+    fn table(self, lookup: &U8Lookup<[u8; 3]>) -> Self {
+        Self {
+            sample: Cost::new(1),
+            setup: if lookup.0.get().is_some() {
+                Cost::ZERO
+            } else {
+                self.setup + (self.sample + Cost::new(1)).times(256)
+            },
+        }
+    }
+}
 impl ColorSpace {
     pub(crate) fn identity(&self) -> *const ColorSpaceType {
         Arc::as_ptr(&self.0)
+    }
+    pub(crate) fn prepare_tables(&self) {
+        if self.prepared().setup != Cost::ZERO {
+            // An empty conversion initializes the same shared lookup tables as a sampled pixel.
+            let _ = self.convert(&[], &mut []);
+        }
+    }
+    pub(crate) fn prepared(&self) -> PreparedConversion {
+        let tint = |alternate: &Self, function: &Function| {
+            let mut conversion = alternate.prepared();
+            conversion.sample = conversion.sample
+                + function.cost()
+                + Cost::of(function.num_outputs() + function.num_inputs());
+            conversion
+        };
+        match self.0.as_ref() {
+            ColorSpaceType::Separation(s) => {
+                tint(&s.alternate_space, &s.tint_transform).table(&s.lookup)
+            }
+            ColorSpaceType::DeviceN(s) => {
+                let p = tint(&s.alternate_space, &s.tint_transform);
+                if s.num_components == 1 {
+                    p.table(&s.lookup)
+                } else {
+                    p
+                }
+            }
+            ColorSpaceType::Indexed(s) => {
+                let mut base = s.base.prepared();
+                base.sample = base.sample + Cost::new(u64::from(s.base.num_components()));
+                base.table(&s.lookup)
+            }
+            ColorSpaceType::Pattern(s) => s.color_space().prepared(),
+            _ => PreparedConversion {
+                sample: Cost::new(1 + u64::from(self.num_components())),
+                setup: Cost::ZERO,
+            },
+        }
     }
 
     pub(crate) fn new(object: Object<'_>, cache: &Cache) -> Option<Self> {

@@ -1,3 +1,4 @@
+use crate::encode::Cost;
 use hayro_postscript::{Procedure, Scanner, Token};
 use hayro_syntax::object::Stream;
 
@@ -10,6 +11,15 @@ pub(crate) struct Type4 {
 }
 
 impl Type4 {
+    pub(super) fn cost(&self) -> Cost {
+        self.code
+            .iter()
+            .map(|op| match op {
+                PostScriptOp::Copy | PostScriptOp::Roll => Cost::of(MAX_STACK_DEPTH + 1),
+                _ => Cost::new(1),
+            })
+            .sum()
+    }
     pub(crate) fn new(stream: &Stream<'_>) -> Option<Self> {
         Some(Self {
             code: parse_procedure(&stream.decoded_data().ok()?)?,
@@ -121,6 +131,8 @@ fn execute(code: &[PostScriptOp], stack: &mut Stack) -> Option<()> {
     let mut pc = 0;
 
     while let Some(&op) = code.get(pc) {
+        #[cfg(any(test, feature = "count-operators"))]
+        RUN.set(RUN.get() + 1);
         pc += 1;
 
         match op {
@@ -186,6 +198,8 @@ fn execute(code: &[PostScriptOp], stack: &mut Stack) -> Option<()> {
             Op::Copy => {
                 let n = pop!() as u32 as usize;
                 let start = len.checked_sub(n)?;
+                #[cfg(any(test, feature = "count-operators"))]
+                RUN.set(RUN.get() + n as u64);
 
                 for i in start..start + n {
                     push!(values[i], bools[i]);
@@ -212,6 +226,8 @@ fn execute(code: &[PostScriptOp], stack: &mut Stack) -> Option<()> {
                 let j = pop!() as i32;
                 let n = pop!() as u32 as usize;
                 let start = len.checked_sub(n)?;
+                #[cfg(any(test, feature = "count-operators"))]
+                RUN.set(RUN.get() + n as u64);
 
                 if n > 0 {
                     let shift = j.unsigned_abs() as usize % n;
@@ -378,6 +394,22 @@ impl PostScriptOp {
 
         Some(op)
     }
+}
+
+#[cfg(any(test, feature = "count-operators"))]
+thread_local! {
+    /// The operators this thread's type 4 functions ran, and the values `copy`
+    /// and `roll` moved.
+    pub(crate) static RUN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The operators this thread's type 4 functions have run, and the values `copy`
+/// and `roll` moved, each a step of [`Function::cost`](crate::Function::cost):
+/// a count that does not vary from run to run, for a caller's tests to bound
+/// the work functions did.
+#[cfg(feature = "count-operators")]
+pub fn operators_run() -> u64 {
+    RUN.get()
 }
 
 #[cfg(test)]
@@ -759,6 +791,9 @@ mod tests {
         let procedure = parse_procedure(b"{  }").unwrap();
 
         let type4 = Function(Arc::new(Repr {
+            cost: crate::encode::Cost::new(6),
+            bounds_cost: crate::encode::Cost::ZERO,
+            bounds_count: crate::encode::Cost::ZERO,
             domain: vec![
                 Interval {
                     min: -5.0,

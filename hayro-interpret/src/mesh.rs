@@ -1,8 +1,8 @@
 use crate::canvas::{Canvas, bounds};
 use crate::color::ColorComponents;
-use crate::encode::EncodedShadingPattern;
+use crate::encode::{Cost, EncodedShadingPattern, Exhausted, Meter, take};
 use crate::function::MAX_COMPONENTS;
-use crate::gradient::{ColorLut, function_lut};
+use crate::gradient::{ColorLut, function_lut_metered};
 use crate::shading::{Patch, ShadingFunction, ShadingType, Triangle};
 use kurbo::{Affine, Point, Rect};
 
@@ -10,17 +10,38 @@ const MESH_SEGMENT: f64 = 8.0;
 const MAX_DEPTH: u32 = 10;
 const MAX_PIECES: f64 = (1 << 20) as f64;
 
+struct Target<'a> {
+    canvas: &'a mut Canvas,
+    meter: &'a mut dyn Meter,
+    vertex_cost: Cost,
+}
+
 pub(crate) fn draw_mesh(
     canvas: &mut Canvas,
     shading_type: &ShadingType,
     transform: Affine,
     pattern: &EncodedShadingPattern,
-) {
+    meter: &mut dyn Meter,
+) -> Result<(), Exhausted> {
+    let mut target = Target {
+        canvas,
+        meter,
+        vertex_cost: Cost::of(usize::from(pattern.color_space.num_components()) + 4)
+            + pattern.color_space.prepared().sample,
+    };
     match shading_type {
         ShadingType::TriangleMesh {
             triangles,
             function,
         } => {
+            take(target.meter, Cost::of(triangles.len()).times(6))?;
+            if !target.meter.hold(
+                triangles
+                    .len()
+                    .saturating_mul(size_of::<CanvasTriangle<'_>>()),
+            ) {
+                return Err(Exhausted);
+            }
             let triangles = triangles
                 .iter()
                 .map(|triangle| CanvasTriangle::new(triangle, transform))
@@ -28,41 +49,56 @@ pub(crate) fn draw_mesh(
 
             if let Some(function) = function {
                 let corner_colors = triangles.iter().flat_map(|t| t.colors);
-                let colors = Parameter::new(function, corner_colors, pattern);
-                draw_triangles(canvas, &triangles, 0, &colors);
+                let colors = Parameter::new(function, corner_colors, pattern, target.meter)?;
+                draw_triangles(&mut target, &triangles, 0, &colors)?;
+                target.canvas.finish_parameter_mesh(colors.lut);
             } else {
                 let colors = Direct { pattern };
                 let depth = if colors.is_linear() {
                     0
                 } else {
                     let pieces = triangles.iter().map(|t| (t.extent(), t.bounds()));
-                    mesh_depth(canvas.bounds(), pieces)
+                    mesh_depth(target.canvas.bounds(), pieces, target.meter)?
                 };
 
-                draw_triangles(canvas, &triangles, depth, &colors);
+                draw_triangles(&mut target, &triangles, depth, &colors)?;
             }
         }
         ShadingType::PatchMesh { patches, function } => {
+            take(target.meter, Cost::of(patches.len()).times(32))?;
+            if !target
+                .meter
+                .hold(patches.len().saturating_mul(size_of::<CanvasPatch<'_>>()))
+            {
+                return Err(Exhausted);
+            }
             let patches = patches
                 .iter()
                 .map(|patch| CanvasPatch::new(patch, transform))
                 .collect::<Vec<_>>();
             let pieces = patches.iter().map(|p| (p.extent(), p.bounds()));
-            let depth = mesh_depth(canvas.bounds(), pieces);
+            let depth = mesh_depth(target.canvas.bounds(), pieces, target.meter)?;
 
             if let Some(function) = function {
                 let corner_colors = patches.iter().flat_map(|p| p.colors.as_flattened());
-                let colors = Parameter::new(function, corner_colors, pattern);
-                draw_patches(canvas, &patches, depth, &colors);
+                let colors = Parameter::new(function, corner_colors, pattern, target.meter)?;
+                draw_patches(&mut target, &patches, depth, &colors)?;
+                target.canvas.finish_parameter_mesh(colors.lut);
             } else {
-                draw_patches(canvas, &patches, depth, &Direct { pattern });
+                draw_patches(&mut target, &patches, depth, &Direct { pattern })?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
-fn mesh_depth(canvas: Rect, pieces: impl Iterator<Item = (f64, Rect)>) -> u32 {
+fn mesh_depth(
+    canvas: Rect,
+    pieces: impl ExactSizeIterator<Item = (f64, Rect)>,
+    meter: &mut dyn Meter,
+) -> Result<u32, Exhausted> {
+    take(meter, Cost::of(pieces.len()))?;
     let mut max_extent: f64 = 0.0;
     let mut visible_area = 0.0;
 
@@ -89,7 +125,7 @@ fn mesh_depth(canvas: Rect, pieces: impl Iterator<Item = (f64, Rect)>) -> u32 {
         depth -= 1;
     }
 
-    depth
+    Ok(depth)
 }
 
 trait MeshColors<const N: usize> {
@@ -108,7 +144,8 @@ impl Parameter {
         function: &ShadingFunction,
         colors: impl Iterator<Item = &'a ColorComponents>,
         pattern: &EncodedShadingPattern,
-    ) -> Self {
+        meter: &mut dyn Meter,
+    ) -> Result<Self, Exhausted> {
         let (t0, t1) = colors
             .filter_map(|c| c.first().copied())
             .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), t| {
@@ -116,11 +153,11 @@ impl Parameter {
             });
         let (t0, t1) = if t0 <= t1 { (t0, t1) } else { (0.0, 0.0) };
 
-        Self {
-            lut: function_lut(function, [t0, t1], pattern),
+        Ok(Self {
+            lut: function_lut_metered(function, [t0, t1], pattern, meter)?,
             t0,
             scale: if t1 > t0 { 1.0 / (t1 - t0) } else { 0.0 },
-        }
+        })
     }
 }
 
@@ -201,36 +238,41 @@ impl<'a> CanvasTriangle<'a> {
 }
 
 fn draw_triangles<const N: usize>(
-    canvas: &mut Canvas,
+    target: &mut Target<'_>,
     triangles: &[CanvasTriangle<'_>],
     depth: u32,
     colors: &impl MeshColors<N>,
-) {
+) -> Result<(), Exhausted> {
     const CORNERS: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
     for triangle in triangles {
-        draw_triangle_piece(canvas, triangle, triangle.points, CORNERS, depth, colors);
+        draw_triangle_piece(target, triangle, triangle.points, CORNERS, depth, colors)?;
     }
+    Ok(())
 }
 
 fn draw_triangle_piece<const N: usize>(
-    canvas: &mut Canvas,
+    target: &mut Target<'_>,
     triangle: &CanvasTriangle<'_>,
     points: [Point; 3],
     weights: [[f32; 3]; 3],
     depth: u32,
     colors: &impl MeshColors<N>,
-) {
-    if !canvas.is_visible(&points) {
-        return;
+) -> Result<(), Exhausted> {
+    take(target.meter, Cost::new(1))?;
+    if !target.canvas.is_visible(&points) {
+        return Ok(());
     }
 
     if depth == 0 {
         let mut buffer = [0.0; MAX_COMPONENTS];
+        take(target.meter, target.vertex_cost.times(3))?;
         let values = weights.map(|w| colors.values(mix(triangle.colors, w, &mut buffer)));
-        canvas.fill_triangle(points, values, &|v| colors.shade(v));
+        target
+            .canvas
+            .fill_triangle(points, values, &|v| colors.shade(v), target.meter)?;
 
-        return;
+        return Ok(());
     }
 
     let [p0, p1, p2] = points;
@@ -245,8 +287,9 @@ fn draw_triangle_piece<const N: usize>(
         ([m20, m12, p2], [n20, n12, w2]),
         ([m01, m12, m20], [n01, n12, n20]),
     ] {
-        draw_triangle_piece(canvas, triangle, points, weights, depth - 1, colors);
+        draw_triangle_piece(target, triangle, points, weights, depth - 1, colors)?;
     }
+    Ok(())
 }
 
 struct CanvasPatch<'a> {
@@ -285,27 +328,29 @@ impl<'a> CanvasPatch<'a> {
 }
 
 fn draw_patches<const N: usize>(
-    canvas: &mut Canvas,
+    target: &mut Target<'_>,
     patches: &[CanvasPatch<'_>],
     depth: u32,
     colors: &impl MeshColors<N>,
-) {
+) -> Result<(), Exhausted> {
     for patch in patches {
         let ranges = [[0.0, 1.0]; 2];
-        draw_patch_piece(canvas, patch, patch.points, ranges, [depth; 2], colors);
+        draw_patch_piece(target, patch, patch.points, ranges, [depth; 2], colors)?;
     }
+    Ok(())
 }
 
 fn draw_patch_piece<const N: usize>(
-    canvas: &mut Canvas,
+    target: &mut Target<'_>,
     patch: &CanvasPatch<'_>,
     points: [[Point; 4]; 4],
     [u_range, v_range]: [[f32; 2]; 2],
     [u_depth, v_depth]: [u32; 2],
     colors: &impl MeshColors<N>,
-) {
-    if !canvas.is_visible(points.as_flattened()) {
-        return;
+) -> Result<(), Exhausted> {
+    take(target.meter, Cost::new(1))?;
+    if !target.canvas.is_visible(points.as_flattened()) {
+        return Ok(());
     }
 
     let halves = |[a, b]: [f32; 2]| [[a, 0.5 * (a + b)], [0.5 * (a + b), b]];
@@ -316,13 +361,13 @@ fn draw_patch_piece<const N: usize>(
         for (points, v_range) in [low, high].into_iter().zip(halves(v_range)) {
             let ranges = [u_range, v_range];
             draw_patch_piece(
-                canvas,
+                target,
                 patch,
                 points,
                 ranges,
                 [u_depth, v_depth - 1],
                 colors,
-            );
+            )?;
         }
     } else if u_depth > 0 {
         let (low, high) = split_columns(points);
@@ -330,17 +375,18 @@ fn draw_patch_piece<const N: usize>(
         for (points, u_range) in [low, high].into_iter().zip(halves(u_range)) {
             let ranges = [u_range, v_range];
             draw_patch_piece(
-                canvas,
+                target,
                 patch,
                 points,
                 ranges,
                 [u_depth - 1, v_depth],
                 colors,
-            );
+            )?;
         }
     } else {
         let ([u0, u1], [v0, v1]) = (u_range, v_range);
         let mut buffer = [0.0; MAX_COMPONENTS];
+        take(target.meter, target.vertex_cost.times(4))?;
         let mut values = |u, v| colors.values(patch.components(u, v, &mut buffer));
         let (c00, c10, c01, c11) = (
             values(u0, v0),
@@ -351,9 +397,14 @@ fn draw_patch_piece<const N: usize>(
         let (p00, p10, p01, p11) = (points[0][0], points[3][0], points[0][3], points[3][3]);
         let shade = |v: &[f32; N]| colors.shade(v);
 
-        canvas.fill_triangle([p00, p10, p01], [c00, c10, c01], &shade);
-        canvas.fill_triangle([p10, p11, p01], [c10, c11, c01], &shade);
+        target
+            .canvas
+            .fill_triangle([p00, p10, p01], [c00, c10, c01], &shade, target.meter)?;
+        target
+            .canvas
+            .fill_triangle([p10, p11, p01], [c10, c11, c01], &shade, target.meter)?;
     }
+    Ok(())
 }
 
 fn split_rows(points: [[Point; 4]; 4]) -> ([[Point; 4]; 4], [[Point; 4]; 4]) {

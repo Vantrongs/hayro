@@ -1,5 +1,8 @@
 //! Encoding shading patterns for easy sampling.
 
+#[cfg(test)]
+#[path = "encode/tests.rs"]
+mod metering_tests;
 use crate::canvas::Canvas;
 use crate::color::{AlphaColor, ColorSpace};
 use crate::function::MAX_COMPONENTS;
@@ -10,6 +13,145 @@ use crate::pattern::ShadingPattern;
 use crate::shading::{ShadingFunction, ShadingType};
 use kurbo::{Affine, Point, Rect, Vec2};
 use std::sync::Arc;
+
+/// Steps of work: an operator of a function run, a value read, computed or
+/// written, a pixel visited. Its arithmetic saturates, so a cost made of others
+/// is never less than any of them: work too large to count is never given.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Cost(u64);
+
+impl Cost {
+    /// No work.
+    pub const ZERO: Self = Self(0);
+
+    /// `steps` steps.
+    pub const fn new(steps: u64) -> Self {
+        Self(steps)
+    }
+
+    /// A step for each of `n` things.
+    pub fn of(n: usize) -> Self {
+        Self(u64::try_from(n).unwrap_or(u64::MAX))
+    }
+
+    /// The steps, `u64::MAX` for any number of them that does not fit.
+    pub const fn steps(self) -> u64 {
+        self.0
+    }
+
+    /// The cost of doing this `n` times.
+    #[must_use]
+    pub const fn times(self, n: u64) -> Self {
+        Self(self.0.saturating_mul(n))
+    }
+}
+
+impl std::ops::Add for Cost {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self(self.0.saturating_add(other.0))
+    }
+}
+
+impl std::iter::Sum for Cost {
+    fn sum<I: Iterator<Item = Self>>(costs: I) -> Self {
+        costs.fold(Self::ZERO, |sum, cost| sum + cost)
+    }
+}
+
+/// What a caller lets sampling a shading take, asked before the work is done: the
+/// steps of work ([`Cost`]) and the bytes held while it runs. A sampling it
+/// refuses stops unfinished, with [`Exhausted`], having done no more than it was
+/// given.
+pub trait Meter {
+    /// Marks the start of temporary holds within a sampling call.
+    fn scratch_mark(&self) -> usize {
+        0
+    }
+    /// Releases temporary holds after the marked scope.
+    fn release_scratch(&mut self, _mark: usize) {}
+
+    /// Releases bytes for storage dropped within the current scope.
+    fn release_bytes(&mut self, _bytes: usize) {}
+
+    /// Takes `steps`: `false`, and the work stops, when fewer are left.
+    fn work(&mut self, steps: Cost) -> bool;
+
+    /// Takes `bytes` held until the call that takes them returns: `false`, and the
+    /// work stops, when they do not fit.
+    fn hold(&mut self, bytes: usize) -> bool;
+}
+
+pub(crate) fn push_metered<T>(
+    vec: &mut Vec<T>,
+    value: T,
+    meter: &mut dyn Meter,
+) -> Result<(), Exhausted> {
+    reserve_metered(vec, 1, meter)?;
+    vec.push(value);
+    Ok(())
+}
+
+pub(crate) fn capacity_after<T>(vec: &Vec<T>, additional: usize) -> usize {
+    let required = vec.len().saturating_add(additional);
+    if required <= vec.capacity() {
+        vec.capacity()
+    } else {
+        required.max(vec.capacity().saturating_mul(2)).max(4)
+    }
+}
+
+pub(crate) fn reserve_metered<T>(
+    vec: &mut Vec<T>,
+    additional: usize,
+    meter: &mut dyn Meter,
+) -> Result<(), Exhausted> {
+    let capacity = capacity_after(vec, additional);
+    if capacity > vec.capacity() {
+        let old = vec.capacity();
+        let bytes = capacity.checked_mul(size_of::<T>()).ok_or(Exhausted)?;
+        if !meter.hold(bytes) {
+            return Err(Exhausted);
+        }
+        vec.try_reserve_exact(capacity - vec.len())
+            .map_err(|_| Exhausted)?;
+        meter.release_bytes(old * size_of::<T>());
+    }
+    Ok(())
+}
+
+pub(crate) fn scratch<T>(
+    meter: &mut dyn Meter,
+    run: impl FnOnce(&mut dyn Meter) -> Result<T, Exhausted>,
+) -> Result<T, Exhausted> {
+    let mark = meter.scratch_mark();
+    let result = run(meter);
+    meter.release_scratch(mark);
+    result
+}
+
+/// A meter that gives any work and memory asked.
+pub struct Unmetered;
+
+impl Meter for Unmetered {
+    fn work(&mut self, _: Cost) -> bool {
+        true
+    }
+
+    fn hold(&mut self, _: usize) -> bool {
+        true
+    }
+}
+
+/// Work its [`Meter`] refused to give more to, stopped unfinished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Exhausted;
+
+/// Takes `steps` of `meter`, or stops with [`Exhausted`].
+pub(crate) fn take(meter: &mut dyn Meter, steps: Cost) -> Result<(), Exhausted> {
+    meter.work(steps).then_some(()).ok_or(Exhausted)
+}
 
 /// A shading pattern that was encoded so it can be sampled.
 #[derive(Clone, Debug)]
@@ -87,6 +229,37 @@ pub fn texture_dimensions(bbox: Rect, scale: f32) -> (u32, u32) {
 }
 
 impl EncodedShadingPattern {
+    /// Work to evaluate and convert one sample.
+    pub fn point_cost(&self) -> Cost {
+        self.sample_cost(self.color_space.prepared().sample)
+    }
+    fn sample_cost(&self, conversion: Cost) -> Cost {
+        let function = match &self.shading_type {
+            EncodedShadingType::FunctionBased(s) => Some(&s.function),
+            EncodedShadingType::RadialAxial(s) => Some(&s.function),
+            EncodedShadingType::Mesh(s) => match &*s.shading_type {
+                ShadingType::TriangleMesh { function, .. }
+                | ShadingType::PatchMesh { function, .. } => function.as_ref(),
+                _ => None,
+            },
+            EncodedShadingType::Dummy(_) => None,
+        };
+        Cost::new(8)
+            + function.map_or(Cost::ZERO, ShadingFunction::cost)
+            + conversion
+            + Cost::new(3 * u64::from(self.transfer_function.is_some()))
+    }
+    /// The steps building the tables sampling looks colors up in takes, until they
+    /// are built: the color space's and the transfer function's.
+    pub fn setup_cost(&self) -> Cost {
+        self.color_space.prepared().setup + self.transfer_cost()
+    }
+    fn transfer_cost(&self) -> Cost {
+        self.transfer_function
+            .as_ref()
+            .map_or(Cost::ZERO, ActiveTransferFunction::setup_cost)
+    }
+
     pub(crate) fn finish(&self, mut color: [f32; 4]) -> [f32; 4] {
         color[3] *= self.opacity;
 
@@ -129,22 +302,7 @@ impl EncodedShadingPattern {
         let grid_transform =
             Affine::translate((bbox.x0, bbox.y0)) * Affine::scale(1.0 / scale as f64);
         if let EncodedShadingType::RadialAxial(shading) = &self.shading_type {
-            let sampling_transform = match shading.params {
-                RadialAxialParams::Axial {
-                    start,
-                    axis,
-                    sampling_transform,
-                    expected_base_transform,
-                } => {
-                    if self.base_transform == expected_base_transform {
-                        sampling_transform
-                    } else {
-                        Affine::new([axis.x, axis.y, -axis.y, axis.x, start.x, start.y])
-                            * self.base_transform
-                    }
-                }
-                RadialAxialParams::Radial { .. } => self.base_transform,
-            };
+            let sampling_transform = self.sampling_transform();
             shading.sample(width, height, sampling_transform * grid_transform, self, f);
             return (width, height, grid_transform);
         }
@@ -166,7 +324,14 @@ impl EncodedShadingPattern {
                 );
             }
             EncodedShadingType::Mesh(shading) => {
-                draw_mesh(&mut canvas, &shading.shading_type, transform, self);
+                draw_mesh(
+                    &mut canvas,
+                    &shading.shading_type,
+                    transform,
+                    self,
+                    &mut Unmetered,
+                )
+                .expect("unmetered");
             }
             EncodedShadingType::Dummy(_) => {}
             EncodedShadingType::RadialAxial(_) => unreachable!(),
@@ -177,6 +342,145 @@ impl EncodedShadingPattern {
         (width, height, grid_transform)
     }
 
+    /// Sample each row of the pixel grid after reserving its work and scratch space.
+    pub fn sample_texture_metered(
+        &self,
+        bbox: Rect,
+        scale: f32,
+        meter: &mut dyn Meter,
+        mut f: impl FnMut(&[[f32; 4]]),
+    ) -> Result<(u32, u32, Affine), Exhausted> {
+        scratch(meter, |meter| {
+            let (width, height) = texture_dimensions(bbox, scale);
+            let grid =
+                Affine::translate((bbox.x0, bbox.y0)) * Affine::scale(1.0 / f64::from(scale));
+            let count = u64::from(width) * u64::from(height);
+            let buffer = u64::from(width);
+            if !meter.hold(
+                usize::try_from(buffer)
+                    .ok()
+                    .and_then(|n| n.checked_mul(size_of::<[f32; 4]>()))
+                    .filter(|&n| n <= isize::MAX as usize)
+                    .ok_or(Exhausted)?,
+            ) {
+                return Err(Exhausted);
+            }
+            let bg = self.admit_batch(count, meter)?;
+            if let EncodedShadingType::Mesh(s) = &self.shading_type {
+                take(meter, Cost::new(count))?;
+                let mut canvas = Canvas::for_rows(width, height, bg);
+                draw_mesh(
+                    &mut canvas,
+                    &s.shading_type,
+                    grid.inverse() * self.base_transform.inverse(),
+                    self,
+                    meter,
+                )?;
+                canvas.emit_rows(bg, meter, f)?;
+            } else {
+                let sample = self.point_sampler(bg);
+                let transform = self.sampling_transform() * grid;
+                let mut row = vec![bg; width as usize];
+                for y in 0..height {
+                    for (x, pixel) in row.iter_mut().enumerate() {
+                        *pixel = sample(transform * Point::new(x as f64 + 0.5, f64::from(y) + 0.5));
+                    }
+                    f(&row);
+                }
+            }
+            Ok((width, height, grid))
+        })
+    }
+
+    /// Sample the requested positions in order. A refused request publishes no samples.
+    pub fn sample_points_metered(
+        &self,
+        points: &[Point],
+        meter: &mut dyn Meter,
+        mut f: impl FnMut([f32; 4]),
+    ) -> Result<(), Exhausted> {
+        scratch(meter, |meter| {
+            if points.is_empty() {
+                return Ok(());
+            }
+            let bg = self.admit_batch(points.len() as u64, meter)?;
+            if let EncodedShadingType::Mesh(s) = &self.shading_type {
+                let mut canvas = Canvas::for_points(points, bg, meter)?;
+                draw_mesh(
+                    &mut canvas,
+                    &s.shading_type,
+                    self.base_transform.inverse(),
+                    self,
+                    meter,
+                )?;
+                canvas.pixels.into_iter().for_each(f);
+            } else {
+                let sample = self.point_sampler(bg);
+                let transform = self.sampling_transform();
+                for point in points {
+                    f(sample(transform * *point));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn sampling_transform(&self) -> Affine {
+        let EncodedShadingType::RadialAxial(shading) = &self.shading_type else {
+            return self.base_transform;
+        };
+        match shading.params {
+            RadialAxialParams::Axial {
+                start,
+                axis,
+                sampling_transform,
+                expected_base_transform,
+            } => {
+                if self.base_transform == expected_base_transform {
+                    sampling_transform
+                } else {
+                    Affine::new([axis.x, axis.y, -axis.y, axis.x, start.x, start.y])
+                        * self.base_transform
+                }
+            }
+            RadialAxialParams::Radial { .. } => self.base_transform,
+        }
+    }
+    fn admit_batch(&self, count: u64, meter: &mut dyn Meter) -> Result<[f32; 4], Exhausted> {
+        let conversion = self.color_space.prepared();
+        let work = if matches!(self.shading_type, EncodedShadingType::Mesh(_)) {
+            Cost::ZERO
+        } else {
+            self.sample_cost(conversion.sample).times(count)
+        };
+        take(meter, conversion.setup + self.transfer_cost() + work)?;
+        Ok(self.finish(self.background_color.components()))
+    }
+
+    /// Prepare reusable color tables for a nonempty placement.
+    pub fn prepare_for(self, bbox: Rect) -> Self {
+        if bbox.area() > 0.0 {
+            self.color_space.prepare_tables();
+            if let Some(tf) = &self.transfer_function {
+                tf.apply(&AlphaColor::TRANSPARENT);
+            }
+        }
+        self
+    }
+
+    fn point_sampler(&self, bg: [f32; 4]) -> impl Fn(Point) -> [f32; 4] + '_ {
+        move |p| match &self.shading_type {
+            EncodedShadingType::RadialAxial(s) => s.position(p).map_or(bg, |t| {
+                let [lo, hi] = s.domain.map(f64::from);
+                self.eval_1d(&s.function, lo + (hi - lo) * t)
+            }),
+            EncodedShadingType::FunctionBased(s) if s.domain.contains(p) => self
+                .eval_color(&s.function, |out| {
+                    s.function.eval(&[p.x as f32, p.y as f32], out)
+                }),
+            _ => bg,
+        }
+    }
     /// Rasterize the shading into a straight RGBA8 texture covering `bbox`.
     pub fn render_texture(&self, bbox: Rect, scale: f32) -> ShadingTexture {
         let (width, height) = texture_dimensions(bbox, scale);
@@ -206,6 +510,23 @@ impl EncodedShadingPattern {
 }
 
 impl ShadingPattern {
+    /// [`encode`](Self::encode), taking first of `meter` the steps building the
+    /// tables its background color is looked up in, until they are built, and
+    /// converting it.
+    pub fn encode_metered(
+        &self,
+        meter: &mut dyn Meter,
+    ) -> Result<EncodedShadingPattern, Exhausted> {
+        let color_space = &self.shading.color_space;
+        if self.shading.background.is_some() {
+            take(meter, {
+                let p = color_space.prepared();
+                p.setup + p.sample
+            })?;
+        }
+        Ok(self.encode())
+    }
+
     /// Encode the shading pattern.
     pub fn encode(&self) -> EncodedShadingPattern {
         let base_transform;
@@ -273,7 +594,7 @@ impl ShadingPattern {
 }
 
 fn encode_axial_shading(
-    coords: [f32; 6],
+    coords: [f64; 6],
     domain: [f32; 2],
     function: &ShadingFunction,
     extend: [bool; 2],
@@ -282,7 +603,6 @@ fn encode_axial_shading(
 ) -> (EncodedShadingType, Affine) {
     let initial_transform;
 
-    let coords = coords.map(f64::from);
     let params = if is_axial {
         let [x_0, y_0, x_1, y_1, _, _] = coords;
 
@@ -606,7 +926,7 @@ trailer << /Root 1 0 R >>
 
     #[test]
     fn radial_precision() {
-        let sample = |coords: [f32; 6], pos: Point, extend: [bool; 2]| {
+        let sample = |coords: [f64; 6], pos: Point, extend: [bool; 2]| {
             let [x0, y0, r0, x1, y1, r1] = coords;
             let [start, end] = extend;
             let data = format!(
@@ -655,7 +975,7 @@ trailer << /Root 1 0 R >>
                 [0.0, 0.0, 2.5, 64.1, 0.0, 2.5],
                 0.5,
                 2.5,
-                Some((0.5 / f64::from(64.1_f32)) as f32),
+                Some((0.5 / 64.1) as f32),
             ),
             ([0.0, 0.0, 2.5, 64.1, 0.0, 2.5], 0.5, 2.501, None),
             ([0.0, 0.0, 1.0, 1.0, 0.0, 2.0], -1.0, 0.0, Some(1.0)),
@@ -681,11 +1001,11 @@ trailer << /Root 1 0 R >>
             let l = 134217728.0;
             for (y, expected) in [(0.5, Some(0.5)), (-0.5, extend[0].then_some(0.0))] {
                 assert_eq!(
-                    sample([0.0, 0.0, l, l, 1.0, 0.0], Point::new(l.into(), y), extend),
+                    sample([0.0, 0.0, l, l, 1.0, 0.0], Point::new(l, y), extend),
                     expected
                 );
                 assert_eq!(
-                    sample([0.0, 0.0, l, 1.0, l, 0.0], Point::new(y, l.into()), extend),
+                    sample([0.0, 0.0, l, 1.0, l, 0.0], Point::new(y, l), extend),
                     expected
                 );
             }

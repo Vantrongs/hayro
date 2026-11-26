@@ -1,3 +1,4 @@
+use crate::encode::Cost;
 use crate::function::{Function, Interval, read_intervals};
 use hayro_syntax::object::Array;
 use hayro_syntax::object::Dict;
@@ -13,6 +14,24 @@ pub(crate) struct Type3 {
 }
 
 impl Type3 {
+    pub(super) fn cost(&self) -> Cost {
+        Cost::new(2 + u64::from(self.bounds.len().ilog2()))
+            + self
+                .functions
+                .iter()
+                .map(Function::cost)
+                .max()
+                .unwrap_or_default()
+    }
+    pub(super) fn bounds_cost(&self) -> (Cost, Cost) {
+        let count = Cost::of(self.bounds.len() - 2)
+            + self.functions.iter().map(Function::bounds_count).sum();
+        let cost = Cost::of(self.functions.len())
+            + self.functions.iter().map(Function::bounds_cost).sum()
+            + count
+            + super::sorting(count);
+        (cost, count)
+    }
     pub(crate) fn new(dict: &Dict<'_>, domain: Interval, depth: u8) -> Option<Self> {
         let functions = dict
             .get::<Array<'_>>(FUNCTIONS)?

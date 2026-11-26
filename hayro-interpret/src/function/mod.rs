@@ -4,6 +4,7 @@ mod type3;
 mod type4;
 
 use crate::CacheKey;
+use crate::encode::Cost;
 use crate::function::type0::Type0;
 use crate::function::type2::Type2;
 use crate::function::type3::Type3;
@@ -66,6 +67,9 @@ enum FunctionType {
 
 #[derive(Debug)]
 struct Repr {
+    cost: Cost,
+    bounds_cost: Cost,
+    bounds_count: Cost,
     domain: Vec<Interval>,
     range: Option<Vec<Interval>>,
     num_outputs: usize,
@@ -79,6 +83,22 @@ pub struct Function(Arc<Repr>);
 type PieceEmitter<'a> = dyn FnMut([f32; 2], &[f32], &[f32], &mut usize) -> Option<()> + 'a;
 
 impl Function {
+    /// The most steps one [`eval`](Self::eval) takes: an operator run, or a value
+    /// read, computed or written, whatever the input. Known before evaluating, so a
+    /// caller can bound the work of evaluating many times.
+    pub fn cost(&self) -> Cost {
+        self.0.cost
+    }
+
+    /// The most steps [`stitching_bounds`](Self::stitching_bounds) takes.
+    pub(crate) fn bounds_cost(&self) -> Cost {
+        self.0.bounds_cost
+    }
+
+    pub(crate) fn bounds_count(&self) -> Cost {
+        self.0.bounds_count
+    }
+
     /// Create a new function.
     pub fn new(obj: &Object<'_>) -> Option<Self> {
         Self::new_nested(obj, 0)
@@ -132,7 +152,21 @@ impl Function {
             return None;
         }
 
+        let cost = Cost::of(domain.len() + num_outputs)
+            + match &function_type {
+                FunctionType::Type0(f) => f.cost(),
+                FunctionType::Type2(_) => Cost::of(num_outputs + 1),
+                FunctionType::Type3(f) => f.cost(),
+                FunctionType::Type4(f) => f.cost(),
+            };
+        let (bounds_cost, bounds_count) = match &function_type {
+            FunctionType::Type3(f) => f.bounds_cost(),
+            _ => (Cost::ZERO, Cost::ZERO),
+        };
         Some(Self(Arc::new(Repr {
+            cost,
+            bounds_cost,
+            bounds_count,
             domain,
             range,
             num_outputs,
@@ -372,6 +406,13 @@ impl std::hash::Hash for TransferFunction {
 }
 
 impl TransferFunction {
+    pub(crate) fn setup_cost(&self) -> Cost {
+        if self.0.samples.get().is_some() {
+            Cost::ZERO
+        } else {
+            (self.0.function.cost() + Cost::new(1)).times(256)
+        }
+    }
     pub(crate) fn new(obj: &Object<'_>) -> Option<Self> {
         Some(Self(Arc::new(TransferFunctionRepr {
             function: Function::new(obj)?,
@@ -425,6 +466,20 @@ impl Function {
 
         Some(output)
     }
+}
+
+/// The steps sorting the values gathering them took `gathered` steps for.
+pub(crate) fn sorting(gathered: Cost) -> Cost {
+    let n = gathered.steps();
+    gathered.times(u64::from(u64::BITS - n.leading_zeros()).max(1))
+}
+
+#[cfg(feature = "count-operators")]
+pub use type4::operators_run;
+
+#[cfg(test)]
+pub(crate) fn test_operator_count() -> u64 {
+    type4::RUN.get()
 }
 
 #[cfg(test)]

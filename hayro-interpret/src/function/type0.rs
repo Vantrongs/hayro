@@ -1,3 +1,4 @@
+use crate::encode::Cost;
 use crate::function::{Interval, MAX_COMPONENTS, read_intervals};
 use hayro_syntax::bit_reader::BitReader;
 use hayro_syntax::object::Array;
@@ -37,6 +38,11 @@ impl SampledInput {
 }
 
 impl Type0 {
+    pub(super) fn cost(&self) -> Cost {
+        let axes = self.inputs.iter().filter(|x| x.size > 1).count();
+        Cost::of(self.inputs.len() + self.decode.len())
+            + Cost::of(axes + self.decode.len()).times(1 << axes)
+    }
     pub(crate) fn new(
         stream: &Stream<'_>,
         domain: &[Interval],
