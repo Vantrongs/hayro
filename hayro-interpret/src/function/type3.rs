@@ -8,6 +8,7 @@ use hayro_syntax::object::dict::keys::{BOUNDS, ENCODE, FUNCTIONS};
 #[derive(Debug)]
 pub(crate) struct Type3 {
     strictly_increasing: bool,
+    pub(super) clamps_child_domain: bool,
     functions: Vec<Function>,
     bounds: Vec<f32>,
     encode: Vec<Interval>,
@@ -63,6 +64,13 @@ impl Type3 {
         bounds.push(domain.max);
 
         Some(Self {
+            clamps_child_domain: functions.iter().zip(&encode).any(|(f, e)| {
+                let domain = f.0.domain[0];
+                f.clamps_child_domain()
+                    || [e.min, e.max]
+                        .iter()
+                        .any(|&x| x < domain.min || x > domain.max)
+            }),
             strictly_increasing: bounds.windows(2).all(|p| p[0] < p[1]),
             functions,
             bounds,
@@ -206,6 +214,56 @@ impl Type3 {
 mod tests {
     use super::*;
     use hayro_syntax::object::FromBytes;
+
+    #[test]
+    fn clamped_child_pieces_follow_traversal_and_spend_one_budget() {
+        for encoding in ["-1 3", "3 -1", "-2 -1", "3 2"] {
+            let dict = format!("<< /FunctionType 3 /Domain [0 1] /Functions [
+                << /FunctionType 2 /Domain [0 1] /Range [.25 .75] /N 1 >>] /Bounds [] /Encode [{encoding}] >>");
+            let function = Function::new(&Object::from_bytes(dict.as_bytes()).unwrap()).unwrap();
+            let count = if matches!(encoding, "-1 3" | "3 -1") {
+                5
+            } else {
+                1
+            };
+            for domain in [[0., 1.], [1., 0.]] {
+                let mut budget = count;
+                let mut previous = 0.;
+                function
+                    .linear_pieces(
+                        domain,
+                        [0., 1.],
+                        &mut budget,
+                        Some(0.01),
+                        &mut |[s, e], a, b| {
+                            assert_eq!(s, previous);
+                            assert!(s < e);
+                            previous = e;
+                            for (t, expected) in [(s, a[0]), (e, b[0])] {
+                                let x = domain[0] + f64::from(t) * (domain[1] - domain[0]);
+                                let mut actual = [0.];
+                                function.eval_1d_f64(x, &mut actual)?;
+                                assert_eq!(actual, [expected]);
+                            }
+                            Some(())
+                        },
+                    )
+                    .unwrap();
+                assert_eq!((previous, budget), (1., 0));
+                assert!(
+                    function
+                        .linear_pieces(
+                            domain,
+                            [0., 1.],
+                            &mut (count - 1),
+                            Some(0.01),
+                            &mut |_, _, _| Some(())
+                        )
+                        .is_none()
+                );
+            }
+        }
+    }
 
     #[test]
     fn reversed_stitch_clamps_channels_with_a_shared_budget() {

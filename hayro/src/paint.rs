@@ -75,11 +75,14 @@ impl Renderer<'_> {
 impl Renderer<'_> {
     fn shading_paint(&mut self, pattern: ShadingPattern, mut bbox: Rect) -> (PaintType, Affine) {
         let mut encoded = pattern.encode();
+        if let EncodedShadingType::RadialAxial(g) = &mut encoded.shading_type {
+            g.cover_placement(bbox, encoded.base_transform);
+        }
         if let EncodedShadingType::RadialAxial(g) = &encoded.shading_type {
             if let Some(native) = g
                 .as_svg_gradient(&encoded, STOP_TOLERANCE)
                 .and_then(SvgGradient::with_raster_geometry)
-                .filter(|g| lut_resolves(&g.stops, NATIVE_GRADIENT_TOLERANCE))
+                .and_then(|gradient| resolved_gradient(gradient, g.clamps_child_domain()))
             {
                 return native_paint(native);
             }
@@ -97,10 +100,14 @@ impl Renderer<'_> {
                     .shading
                     .get_or_init(|| PreparedShading::new(pattern))
                     .encode(matrix);
+                if let EncodedShadingType::RadialAxial(g) = &mut encoded.shading_type {
+                    g.cover_placement(bbox, encoded.base_transform);
+                }
                 if let EncodedShadingType::RadialAxial(g) = &encoded.shading_type
                     && !compact
                 {
-                    if cache.pixels >= (STRIP_WIDTH * STRIP_ROWS) as f64
+                    if g.is_extended()
+                        && cache.pixels >= (STRIP_WIDTH * STRIP_ROWS) as f64
                         && let Some(transform) = strip_transform(encoded.base_transform, bbox)
                         && let Some(strip) = cache
                             .strip
@@ -267,6 +274,23 @@ fn strip_transform(transform: Affine, bbox: Rect) -> Option<Affine> {
         && bounds.x0.abs().max(bounds.x1.abs()) * (STRIP_ROWS as f64) < (1 << 22) as f64
         && bounds.y0.abs().max(bounds.y1.abs()) < (1 << 22) as f64)
         .then_some(inverse)
+}
+
+fn resolved_gradient(mut gradient: SvgGradient, clamped_child: bool) -> Option<SvgGradient> {
+    if lut_resolves(&gradient.stops, NATIVE_GRADIENT_TOLERANCE) {
+        return Some(gradient);
+    }
+    if !clamped_child {
+        return None;
+    }
+    let i = gradient
+        .stops
+        .windows(2)
+        .position(|p| p[0].color == p[1].color && p[1].offset - p[0].offset > 1. / 2047.)?;
+    let mut pin = gradient.stops[i].clone();
+    pin.offset += 1. / 2047.;
+    gradient.stops.insert(i + 1, pin);
+    lut_resolves(&gradient.stops, NATIVE_GRADIENT_TOLERANCE).then_some(gradient)
 }
 
 fn lut_resolves(stops: &[SvgGradientStop], tolerance: f32) -> bool {

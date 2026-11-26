@@ -204,3 +204,25 @@ fn tint_work_is_reserved_for_the_table_or_for_each_sample() {
         assert_eq!(pattern.setup_cost(), Cost::ZERO);
     }
 }
+
+#[test]
+fn axial_extension_depends_on_reachable_pixel_centers() {
+    for (kind, coords, bbox, expected) in [
+        (2, "0 0 10 0", Rect::new(0., 0., 10., 2.), [true, true]),
+        (2, "0 0 10 0", Rect::new(-1., 0., 10., 2.), [false, true]),
+        (2, "0 0 10 0", Rect::new(0., 0., 11., 2.), [true, false]),
+        (
+            3,
+            "0 0 0 0 0 10",
+            Rect::new(0., 0., 10., 2.),
+            [false, false],
+        ),
+    ] {
+        let mut p=pattern(format!("<< /ShadingType {kind} /Coords [{coords}] /ColorSpace /DeviceGray /Function 6 0 R >>").into_bytes(),b"<< /FunctionType 2 /Domain [0 1] /N 1 >>".to_vec());
+        let EncodedShadingType::RadialAxial(g) = &mut p.shading_type else {
+            panic!("expected gradient")
+        };
+        g.cover_placement(bbox, p.base_transform);
+        assert_eq!(g.extend, expected);
+    }
+}

@@ -1,4 +1,4 @@
-use super::{SvgGradient, SvgGradientStop, sample_function};
+use super::{SvgGradient, SvgGradientStop};
 use crate::CacheKey;
 use crate::color::color_error;
 use crate::encode::{
@@ -323,7 +323,11 @@ impl EncodedRadialAxialShading {
             .raster_geometry(pattern.base_transform.inverse())?;
         let stops = ramp
             .native
-            .get_or_init(|| self.raster_stops(pattern, ramp))
+            .get_or_init(|| {
+                [1024, 2048, 4096]
+                    .into_iter()
+                    .find_map(|size| Self::raster_stops(ramp, size))
+            })
             .as_ref()?;
         Some(SvgGradient {
             kind,
@@ -332,32 +336,27 @@ impl EncodedRadialAxialShading {
         })
     }
 
-    fn raster_stops(
-        &self,
-        pattern: &EncodedShadingPattern,
-        ramp: &ParameterRamp,
-    ) -> Option<Vec<SvgGradientStop>> {
-        // A pair of adjacent stops pins Vello's table to SIZE entries even after pruning flat runs.
-        const SIZE: usize = 1024;
+    fn raster_stops(ramp: &ParameterRamp, size: usize) -> Option<Vec<SvgGradientStop>> {
+        // Preserve adjacent stops so Vello selects this power-of-two table size.
         let mut stops: Vec<SvgGradientStop> = Vec::new();
-        for i in 0..SIZE {
-            let offset = i as f32 / (SIZE - 1) as f32;
-            let first = (i * PARAMETER_CELLS / (SIZE - 1))
+        for i in 0..size {
+            let offset = i as f32 / (size - 1) as f32;
+            let first = (i * PARAMETER_CELLS / (size - 1))
                 .saturating_sub(1)
                 .min(PARAMETER_CELLS - 1);
-            let last = ((i + 1) * PARAMETER_CELLS / (SIZE - 1)).min(PARAMETER_CELLS - 1);
-            let color = if i == SIZE - 1 {
-                pattern.eval_1d(&self.function, f64::from(self.domain[1]))
-            } else {
-                sample_function(&self.function, self.domain, pattern, offset)
-            };
-            if color[3] != 1.
-                || !ramp.cells[first..=last].iter().all(|&id| {
-                    ramp.ranges[usize::from(id)].is_some_and(|(lo, hi)| {
-                        color_error(color, lo).max(color_error(color, hi))
-                            <= 1. / 255. + f32::EPSILON
-                    })
-                })
+            let last = ((i + 1) * PARAMETER_CELLS / (size - 1)).min(PARAMETER_CELLS - 1);
+            let mut low = [1.0_f32; 4];
+            let mut high = [0.0_f32; 4];
+            for &id in &ramp.cells[first..=last] {
+                let (lo, hi) = ramp.ranges[usize::from(id)]?;
+                for c in 0..4 {
+                    low[c] = low[c].min(lo[c]);
+                    high[c] = high[c].max(hi[c]);
+                }
+            }
+            let color = std::array::from_fn(|c| ((low[c] + high[c]) * 127.5).round() / 255.);
+            if low[3] != 1.
+                || color_error(color, low).max(color_error(color, high)) > 1. / 255. + f32::EPSILON
             {
                 return None;
             }
@@ -380,6 +379,28 @@ mod tests {
     use crate::cache::Cache;
     use crate::shading::Shading;
     use hayro_syntax::object::{Dict, FromBytes};
+
+    #[test]
+    fn native_bins_choose_the_smallest_table_covering_a_three_level_step() {
+        let mut cells = vec![0; PARAMETER_CELLS];
+        cells[12..].fill(1);
+        cells[24..].fill(2);
+        let gray = |b| [b, b, b, 1.];
+        let ranges = [0., 2. / 255., 3. / 255.]
+            .map(gray)
+            .map(|v| Some((v, v)))
+            .to_vec();
+        let ramp = ParameterRamp {
+            cells,
+            ranges,
+            can_promote: true,
+            native: OnceLock::new(),
+        };
+        assert!(EncodedRadialAxialShading::raster_stops(&ramp, 1024).is_none());
+        let stops = EncodedRadialAxialShading::raster_stops(&ramp, 2048).unwrap();
+        assert_eq!(stops[0].color, gray(1. / 255.));
+        assert_eq!(stops[1].offset, 1. / 2047.);
+    }
 
     #[test]
     fn direct_color_ramps_reuse_only_constant_cells() {

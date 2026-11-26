@@ -264,6 +264,10 @@ impl Function {
         Some(())
     }
 
+    pub(crate) fn clamps_child_domain(&self) -> bool {
+        matches!(&self.0.function_type, FunctionType::Type3(f) if f.clamps_child_domain)
+    }
+
     pub(crate) fn calculator_interval(&self, domain: [f64; 2]) -> Option<bool> {
         let FunctionType::Type4(f) = &self.0.function_type else {
             return None;
@@ -300,14 +304,52 @@ impl Function {
         emit: &mut PieceEmitter<'_>,
     ) -> Option<()> {
         let repr = &self.0;
+        let [bounds] = repr.domain.as_slice() else {
+            return None;
+        };
         if *budget == 0
-            || domain.iter().any(|&x| {
-                !x.is_finite()
-                    || x < f64::from(repr.domain[0].min)
-                    || x > f64::from(repr.domain[0].max)
-            })
+            || !domain.iter().all(|x| x.is_finite())
+            || bounds.min > bounds.max
+            || !bounds.min.is_finite()
+            || !bounds.max.is_finite()
         {
             return None;
+        }
+        let clipped = domain.map(|x| x.clamp(f64::from(bounds.min), f64::from(bounds.max)));
+        if clipped != domain {
+            let offset = |x| {
+                offsets[0] + (x - domain[0]) / (domain[1] - domain[0]) * (offsets[1] - offsets[0])
+            };
+            let constant = |x, ts: [f64; 2], budget: &mut usize, emit: &mut PieceEmitter<'_>| {
+                let mut values = [0.; MAX_COMPONENTS];
+                let values = &mut values[..self.num_outputs()];
+                self.eval_1d_f64(x, values)?;
+                *budget = budget.checked_sub(1)?;
+                emit(ts.map(|t| t as f32), values, values, budget)
+            };
+            if clipped[0] == clipped[1] {
+                return constant(clipped[0], offsets, budget, emit);
+            }
+            let ts = [
+                if clipped[0] == domain[0] {
+                    offsets[0]
+                } else {
+                    offset(clipped[0])
+                },
+                if clipped[1] == domain[1] {
+                    offsets[1]
+                } else {
+                    offset(clipped[1])
+                },
+            ];
+            if clipped[0] != domain[0] {
+                constant(clipped[0], [offsets[0], ts[0]], budget, emit)?;
+            }
+            self.ranged_pieces(clipped, ts, budget, tolerance, emit)?;
+            if clipped[1] != domain[1] {
+                constant(clipped[1], [ts[1], offsets[1]], budget, emit)?;
+            }
+            return Some(());
         }
         let mut clamp = |ts, a: &[f32], b: &[f32], remaining: &mut usize| {
             self.emit_clamped(ts, a, b, remaining, emit)
