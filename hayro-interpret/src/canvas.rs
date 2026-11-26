@@ -170,17 +170,21 @@ impl Canvas {
             return Ok(());
         }
 
-        let mut dx = [0.0; N];
-        let mut dy = [0.0; N];
+        let slopes = || {
+            let mut dx = [0.0; N];
+            let mut dy = [0.0; N];
 
-        for c in 0..N {
-            let d1 = (values[1][c] - values[0][c]) as f64;
-            let d2 = (values[2][c] - values[0][c]) as f64;
-            dx[c] = ((d1 * e2.y - d2 * e1.y) / det) as f32;
-            dy[c] = ((d2 * e1.x - d1 * e2.x) / det) as f32;
-        }
+            for c in 0..N {
+                let d1 = (values[1][c] - values[0][c]) as f64;
+                let d2 = (values[2][c] - values[0][c]) as f64;
+                dx[c] = ((d1 * e2.y - d2 * e1.y) / det) as f32;
+                dy[c] = ((d2 * e1.x - d1 * e2.x) / det) as f32;
+            }
 
+            (dx, dy)
+        };
         if let Layout::Points(sparse) = &self.layout {
+            let (dx, dy) = slopes();
             let area = bounds(&points);
             let (lo, hi) = if sparse.by_x {
                 (area.x0, area.x1)
@@ -214,6 +218,7 @@ impl Canvas {
             return Ok(());
         }
 
+        let dense = matches!(self.layout, Layout::Dense);
         let mut sorted = points;
         sorted.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
         let [top, middle, bottom] = sorted;
@@ -222,6 +227,10 @@ impl Canvas {
         let end_row = pixel_index(bottom.y, self.height);
 
         take(meter, Cost::of(end_row - first_row))?;
+        if first_row == end_row {
+            return Ok(());
+        }
+        let (dx, dy) = slopes();
         for y in first_row..end_row {
             let center_y = y as f64 + 0.5;
             let long = edge_x(top, bottom, center_y);
@@ -247,22 +256,24 @@ impl Canvas {
             }
 
             take(meter, Cost::of(end - start).times((N + 1) as u64))?;
-            self.prepare_span(shade, meter)?;
-            if let Layout::Rows { spans, .. } = &mut self.layout {
-                crate::encode::reserve_metered(spans, 1, meter)?;
-                let mut initial = [0.0; 4];
-                initial[..N].copy_from_slice(&value);
-                let mut step = [0.0; 4];
-                step[..N].copy_from_slice(&dx);
-                spans.push(Span {
-                    order: spans.len(),
-                    y,
-                    start,
-                    end,
-                    value: initial,
-                    dx: step,
-                });
-                continue;
+            if !dense {
+                self.prepare_span(shade, meter)?;
+                if let Layout::Rows { spans, .. } = &mut self.layout {
+                    crate::encode::reserve_metered(spans, 1, meter)?;
+                    let mut initial = [0.0; 4];
+                    initial[..N].copy_from_slice(&value);
+                    let mut step = [0.0; 4];
+                    step[..N].copy_from_slice(&dx);
+                    spans.push(Span {
+                        order: spans.len(),
+                        y,
+                        start,
+                        end,
+                        value: initial,
+                        dx: step,
+                    });
+                    continue;
+                }
             }
             for pixel in &mut self.pixels[y * self.width + start..y * self.width + end] {
                 *pixel = shade(&value);
