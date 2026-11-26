@@ -441,6 +441,20 @@ impl XRef {
         }
     }
 
+    pub(crate) fn is_repaired(&self) -> bool {
+        matches!(&self.0, Inner::Some(r) if r.map.get().repaired)
+    }
+
+    pub(crate) fn retry_after_repair<T>(&self, read: impl Fn(bool) -> T) -> T {
+        loop {
+            let started_repaired = self.is_repaired();
+            let result = read(started_repaired);
+            if started_repaired || !self.is_repaired() {
+                return result;
+            }
+        }
+    }
+
     pub(crate) fn repair(&self) {
         let Inner::Some(r) = &self.0 else {
             unreachable!();
@@ -552,10 +566,18 @@ impl XRef {
 
                 ctx.parent_chain_push(id);
 
-                let object_stream = repr.data.object_stream(obj_stream_id, &ctx)?;
+                let object_stream = repr.data.object_stream(obj_stream_id, was_repaired, &ctx);
+                if !was_repaired && repr.map.get().repaired {
+                    return self.get_with(id, caller_ctx);
+                }
+                let object_stream = object_stream?;
 
                 if object_stream.obj_number(index) == Some(id.obj_number) {
-                    return object_stream.get(index, &ctx);
+                    let member = object_stream.get(index, &ctx);
+                    if !was_repaired && repr.map.get().repaired {
+                        return self.get_with(id, caller_ctx);
+                    }
+                    return member;
                 }
 
                 self.repair_and_get(id, caller_ctx, was_repaired)

@@ -9,7 +9,7 @@ use crate::object::Stream;
 use crate::object::array::ArrayIter;
 use crate::object::dict::keys::*;
 use crate::object::{MaybeRef, Object};
-use crate::reader::ReaderContext;
+use crate::reader::{Reader, ReaderContext, ReaderExt};
 use crate::sync::{FxHashSet, OnceLock};
 use crate::transform::Transform;
 use crate::util::FloatExt;
@@ -48,12 +48,12 @@ impl<'a> Pages<'a> {
         pages_dict: &Dict<'a>,
         ctx: &ReaderContext<'a>,
         xref: &'a XRef,
-    ) -> Option<Self> {
+    ) -> Option<(Self, bool)> {
         let mut pages = vec![];
         let pages_ctx = PagesContext::new();
-        resolve_pages(pages_dict, &mut pages, pages_ctx, ctx)?;
+        let saw_kid = resolve_pages(pages_dict, &mut pages, pages_ctx, ctx)?;
 
-        Some(Self { pages, xref })
+        Some((Self { pages, xref }, saw_kid))
     }
 
     pub(crate) fn new_brute_force(ctx: &ReaderContext<'a>, xref: &'a XRef) -> Option<Self> {
@@ -91,6 +91,7 @@ impl<'a> Deref for Pages<'a> {
 struct PageTreeFrame<'a> {
     kids: ArrayIter<'a>,
     ctx: PagesContext<'a>,
+    has_kids: bool,
 }
 
 impl<'a> PageTreeFrame<'a> {
@@ -102,8 +103,12 @@ impl<'a> PageTreeFrame<'a> {
             ctx.resources = resources;
         }
 
+        let kids = dict.get::<Array<'a>>(KIDS)?;
+        let mut r = Reader::new(kids.data());
+        r.skip_white_spaces_and_comments();
         Some(Self {
-            kids: dict.get::<Array<'a>>(KIDS)?.raw_iter(),
+            has_kids: !r.at_end(),
+            kids: kids.raw_iter(),
             ctx,
         })
     }
@@ -114,7 +119,7 @@ fn resolve_pages<'a>(
     entries: &mut Vec<Page<'a>>,
     ctx: PagesContext<'a>,
     reader_ctx: &ReaderContext<'a>,
-) -> Option<()> {
+) -> Option<bool> {
     let mut visited = FxHashSet::default();
 
     if let Some(id) = pages_dict.obj_id() {
@@ -123,6 +128,7 @@ fn resolve_pages<'a>(
 
     let mut stack = vec![PageTreeFrame::new(pages_dict, ctx)?];
 
+    let mut saw_kid = stack[0].has_kids;
     while let Some(frame) = stack.last_mut() {
         let Some(kid) = frame.kids.next() else {
             stack.pop();
@@ -150,6 +156,7 @@ fn resolve_pages<'a>(
         match dict.get::<Name<'_>>(TYPE).as_deref() {
             Some(PAGES) => {
                 if let Some(child) = PageTreeFrame::new(&dict, frame.ctx.clone()) {
+                    saw_kid |= child.has_kids;
                     stack.push(child);
                 }
             }
@@ -162,11 +169,11 @@ fn resolve_pages<'a>(
         }
     }
 
-    Some(())
+    Some(saw_kid)
 }
 
 /// The rotation of the page.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Rotation {
     /// No rotation.
     None,
@@ -508,10 +515,27 @@ pub(crate) mod cached {
             let xref_reference: &'static XRef = unsafe { core::mem::transmute(xref.deref()) };
 
             let ctx = ReaderContext::new(xref_reference, false);
-            let pages = xref_reference
-                .get_with(xref.trailer_data().pages_ref, &ctx)
-                .and_then(|p| Pages::new(&p, &ctx, xref_reference))
-                .or_else(|| Pages::new_brute_force(&ctx, xref_reference))?;
+            let pages = xref.retry_after_repair(|repaired| {
+                let pages_ref = xref_reference
+                    .get_with::<crate::object::Object<'_>>(xref.root_id(), &ctx)
+                    .and_then(|object| match object {
+                        crate::object::Object::Dict(dict) => Some(dict),
+                        _ => None,
+                    })
+                    .and_then(|catalog| catalog.get_ref(crate::object::dict::keys::PAGES))
+                    .map(Into::into)
+                    .unwrap_or(xref.trailer_data().pages_ref);
+                let tree = xref_reference
+                    .get_with(pages_ref, &ctx)
+                    .and_then(|p| Pages::new(&p, &ctx, xref_reference));
+                match tree {
+                    Some((pages, true)) if repaired && pages.is_empty() => {
+                        Pages::new_brute_force(&ctx, xref_reference).or(Some(pages))
+                    }
+                    Some((pages, _)) => Some(pages),
+                    None => Pages::new_brute_force(&ctx, xref_reference),
+                }
+            })?;
 
             Some(Self { pages, _xref: xref })
         }
