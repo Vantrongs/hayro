@@ -57,7 +57,19 @@ impl Renderer<'_> {
 
     pub(super) fn stroke_bounds(&self, bounds: Rect) -> Rect {
         let stroke = self.ctx.stroke();
-        let extent = stroke.width / 2.0 * stroke.miter_limit.max(SQRT_2);
+        let factor = match stroke.join {
+            kurbo::Join::Miter => stroke.miter_limit.max(SQRT_2),
+            kurbo::Join::Bevel | kurbo::Join::Round => {
+                if matches!(stroke.start_cap, kurbo::Cap::Square)
+                    || matches!(stroke.end_cap, kurbo::Cap::Square)
+                {
+                    SQRT_2
+                } else {
+                    1.0
+                }
+            }
+        };
+        let extent = stroke.width / 2.0 * factor;
         bounds.inflate(extent, extent)
     }
 

@@ -202,7 +202,8 @@ fn raster_precision(gradient: &SvgGradient, bbox: Rect) -> bool {
                 let span = 1. - focal_x;
                 let fr1 = r1 / span.abs();
                 let denom = fr1 * fr1 - 1.;
-                if !denom.is_finite() || denom <= 0. || fr1 / denom >= LIMIT {
+                if !denom.is_finite() || denom <= 0. || (focal_x.abs() + 1.) * fr1 / denom >= LIMIT
+                {
                     return false;
                 }
                 let sign = span.signum();
@@ -524,6 +525,17 @@ mod tests {
             ..focal
         };
         assert!(!raster_precision(&zoomed_focal, bbox));
+        let near_tangent = SvgGradient {
+            kind: SvgGradientKind::Radial {
+                start_center: kurbo::Point::ORIGIN,
+                start_radius: 128.03,
+                end_center: kurbo::Point::new(1., 0.),
+                end_radius: 129.031,
+            },
+            transform: Affine::translate((128.03, 0.)) * Affine::scale(64.),
+            stops: Vec::new(),
+        };
+        assert!(!raster_precision(&near_tangent, bbox));
 
         let concentric = SvgGradient {
             kind: SvgGradientKind::Radial {

@@ -329,6 +329,9 @@ impl Function {
             emit(ts.map(|t| t as f32), values, values, budget)
         };
         if clipped[0] == clipped[1] {
+            if clipped[0].to_bits() != clipped[1].to_bits() {
+                return None;
+            }
             return constant(clipped[0], offsets, budget, emit);
         }
         if clipped != domain {
@@ -576,6 +579,23 @@ mod tests {
             .unwrap();
 
         Function::new(&object)
+    }
+
+    #[test]
+    fn clipped_signed_zeros_require_direct_evaluation() {
+        use hayro_syntax::object::FromBytes;
+        let obj = Object::from_bytes(
+            b"<< /FunctionType 4 /Domain [-0.0 0] /Range [0 1] /Length 14 >>\nstream\n{ 1 exch div }\nendstream",
+        )
+        .unwrap();
+        let f = Function::new(&obj).unwrap();
+        let mut budget = usize::MAX;
+        assert!(
+            f.linear_pieces([-1., 1.], [0., 1.], &mut budget, None, &mut |_, _, _| Some(
+                ()
+            ))
+            .is_none()
+        );
     }
 
     #[test]
