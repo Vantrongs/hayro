@@ -6,6 +6,7 @@ use crate::filter::Filter;
 #[cfg(feature = "images")]
 pub use crate::filter::dct::JpegRows;
 pub use crate::filter::forward::DecodedReader;
+use crate::filter::forward::FlateMode;
 use crate::object::Name;
 use crate::object::dict::InlineImageDict;
 use crate::object::dict::keys::{DECODE_PARMS, DP, F, FILTER, IDENTITY, LENGTH, NAME, TYPE, XREF};
@@ -404,29 +405,41 @@ impl<'a> Stream<'a> {
             result => return result.map(Cow::Owned),
         }
         drop(reader);
-        // After a failed streaming pass, keep the input of just the stage being retried.
-        let mut data = self.try_raw_data()?;
+        let mut input;
+        let mut chain = DecodedReader::new(self.decrypted_reader()?, cancel.clone(), strict);
         for (i, (&filter, params)) in filters.filters.iter().zip(&filters.params).enumerate() {
             if i == 0 && filter == Filter::Crypt {
                 continue;
             }
-            let mut mode = None;
-            data = Cow::Owned(loop {
-                let mut stage =
-                    DecodedReader::new(DecryptedReader::plain(&data), cancel.clone(), strict);
-                stage
-                    .add(filter, params, mode)
-                    .ok_or(DecodeFailure::StreamDecode)?;
-                match stage.collect_strict() {
-                    Ok(result) => break result,
-                    Err(DecodeFailure::StreamDecode) if stage.retry().is_some() => {
-                        mode = stage.retry();
+            let mode = if filter == Filter::FlateDecode && chain.ambiguous_flate_header()? {
+                let bytes = chain.collect_strict()?;
+                drop(chain);
+                input = bytes;
+                let mut mode = FlateMode::Wrapped;
+                loop {
+                    let mut probe =
+                        DecodedReader::new(DecryptedReader::plain(&input), cancel.clone(), strict);
+                    probe
+                        .add(filter, params, Some(mode))
+                        .ok_or(DecodeFailure::StreamDecode)?;
+                    match probe.drain_strict(|_| {}) {
+                        Ok(()) => break,
+                        Err(DecodeFailure::StreamDecode) => {
+                            mode = probe.retry().ok_or(DecodeFailure::StreamDecode)?;
+                        }
+                        Err(err) => return Err(err),
                     }
-                    Err(error) => return Err(error),
                 }
-            });
+                chain = DecodedReader::new(DecryptedReader::plain(&input), cancel.clone(), strict);
+                Some(mode)
+            } else {
+                Some(FlateMode::Detect)
+            };
+            chain
+                .add(filter, params, mode)
+                .ok_or(DecodeFailure::StreamDecode)?;
         }
-        Ok(data)
+        chain.collect_strict().map(Cow::Owned)
     }
 
     /// Whether a file specification supplies the stream's data.

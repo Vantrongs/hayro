@@ -927,3 +927,30 @@ fn invalid_intermediate_slot_preserves_the_next_read_boundary() {
         (None, Some(id(5)))
     );
 }
+
+#[test]
+fn repaired_stream_boundary_is_used_on_the_first_read() {
+    let payload = b"sample data";
+    let mut extra = b"3 0 obj\n".to_vec();
+    extra.extend(common::stream("/Subtype /Image", payload));
+    extra.extend(b"\nendobj");
+    let inside = extra
+        .windows(payload.len())
+        .position(|p| p == payload)
+        .unwrap()
+        + 2;
+    let pdf = Pdf::new(table_file(
+        &pages(0).0,
+        &extra,
+        &[(3, 0), (4, inside)],
+        false,
+    ))
+    .unwrap();
+    for _ in 0..2 {
+        let stream = pdf
+            .xref()
+            .get::<hayro_syntax::object::Stream<'_>>(id(3))
+            .unwrap();
+        assert_eq!(stream.raw_data().as_ref(), payload);
+    }
+}

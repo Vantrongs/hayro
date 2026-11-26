@@ -11,7 +11,7 @@ use chains::{Rng, ascii_hex, damaged, data, layer, zlib};
 use fixtures::{file, noise, stored_zlib, stream};
 use hayro_syntax::{
     Pdf,
-    object::stream::{DecodeFailure, ImageDecodeParams},
+    object::stream::DecodeFailure,
     object::{ObjectIdentifier, Stream},
 };
 
@@ -129,6 +129,7 @@ fn deep_expanding_chains_read_what_strict_decoding_returns() {
     }
 }
 
+#[cfg(feature = "images")]
 #[test]
 fn flate_before_fax_emits_only_completed_packed_rows() {
     let data = zlib(&[0x35, 0x14], 6);
@@ -137,7 +138,7 @@ fn flate_before_fax_emits_only_completed_packed_rows() {
         &data,
     );
     let result = object_3(&pdf)
-        .decoded_image(&ImageDecodeParams::default())
+        .decoded_image(&hayro_syntax::object::stream::ImageDecodeParams::default())
         .unwrap();
     assert_eq!(&*result.data, &[0]);
     let mut cursor = object_3(&pdf).decoded_reader(None).unwrap();
@@ -179,6 +180,12 @@ fn malformed_huffman_tables_are_rejected() {
 fn strict_filters_require_complete_packets() {
     for (filter, data, expected) in [
         ("/Fl", vec![], None),
+        ("/A85", b"z~".to_vec(), None),
+        (
+            "/A85",
+            [vec![32; 8190], b"z~>".to_vec()].concat(),
+            Some(&[0; 4][..]),
+        ),
         ("/Fl", zlib(b"", 6), Some(&b""[..])),
         ("/RL", vec![2, b'a'], None),
         ("/RL", vec![2, b'a', b'b', b'c', 128], Some(&b"abc"[..])),
@@ -225,4 +232,24 @@ fn flate_recovery_work_grows_with_the_number_of_stages() {
         large.1 < 8 * small.1,
         "stage decoding time: {small:?}, {large:?}"
     );
+}
+
+#[test]
+fn flate_recovery_streams_expanded_whitespace_to_the_next_filter() {
+    let mut bytes = vec![b' '; 2 << 20];
+    bytes.extend(b"41>");
+    let mut encoded = zlib(&bytes, 6);
+    *encoded.last_mut().unwrap() ^= 1;
+    let pdf = stream_file("/Filter [/Fl /AHx]", &encoded);
+    let stream = object_3(&pdf);
+    let (result, used) = allocations::measure(|| stream.decoded_strict().unwrap());
+    assert_eq!(result.as_ref(), b"A");
+    assert!(used.peak < bytes.len() / 2, "{used:?}");
+}
+
+#[test]
+fn raw_stored_block_with_a_zlib_header_recovers_after_a_prefix_filter() {
+    let encoded = b"780100FEFF41010000FFFF>";
+    let pdf = stream_file("/Filter [/AHx /Fl]", encoded);
+    assert_eq!(object_3(&pdf).decoded_strict().unwrap().as_ref(), b"A");
 }

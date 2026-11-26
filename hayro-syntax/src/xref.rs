@@ -798,9 +798,8 @@ impl XRef {
                         if repr
                             .map
                             .get()
-                            .xref_map
-                            .get(&id)
-                            .is_some_and(|new| *new != entry)
+                            .location(id, self)
+                            .is_some_and(|(new, _, bound)| (new, bound) != (entry, next))
                         {
                             return self.get_with(id, caller_ctx);
                         }

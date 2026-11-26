@@ -71,7 +71,7 @@ The supported features include:
   If you need to do that, there are other crates in the Rust ecosystem that are suitable for this.
 */
 
-#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(not(any(feature = "std", test)), no_std)]
 #![deny(missing_docs)]
 
 extern crate alloc;

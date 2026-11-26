@@ -56,6 +56,7 @@ enum Codec {
     Base85 {
         value: u32,
         digits: u8,
+        pending_eod: bool,
     },
     Run {
         literal: usize,
@@ -120,6 +121,7 @@ impl<'a> DecodedReader<'a> {
             Filter::Ascii85Decode => Codec::Base85 {
                 value: 0,
                 digits: 0,
+                pending_eod: false,
             },
             Filter::RunLengthDecode => Codec::Run {
                 literal: 0,
@@ -219,6 +221,14 @@ impl<'a> DecodedReader<'a> {
 
     pub(crate) fn collect_strict(&mut self) -> Result<Vec<u8>, DecodeFailure> {
         let mut output = Vec::new();
+        self.drain_strict(|bytes| output.extend_from_slice(bytes))?;
+        Ok(output)
+    }
+
+    pub(crate) fn drain_strict(
+        &mut self,
+        mut consume: impl FnMut(&[u8]),
+    ) -> Result<(), DecodeFailure> {
         let mut buffer = [0; BLOCK];
         let mut level = self.layers.len();
         loop {
@@ -235,7 +245,7 @@ impl<'a> DecodedReader<'a> {
                     break;
                 }
                 if level == self.layers.len() {
-                    output.extend_from_slice(&buffer[..n]);
+                    consume(&buffer[..n]);
                 }
             }
             if level == 0 {
@@ -246,7 +256,7 @@ impl<'a> DecodedReader<'a> {
         if self.failed.is_some() {
             Err(DecodeFailure::StreamDecode)
         } else {
-            Ok(output)
+            Ok(())
         }
     }
 
@@ -263,6 +273,31 @@ impl<'a> DecodedReader<'a> {
             } => Some(FlateMode::Detect),
             _ => None,
         }
+    }
+
+    pub(crate) fn ambiguous_flate_header(&mut self) -> Result<bool, DecodeFailure> {
+        let mut prefix = [0; 5];
+        let mut count = 0;
+        while count < prefix.len() {
+            let n = self.pull(self.layers.len(), &mut prefix[count..])?;
+            if n == 0 {
+                break;
+            }
+            count += n;
+        }
+        let pending = self
+            .layers
+            .last_mut()
+            .map_or(&mut self.source, |layer| &mut layer.out);
+        pending
+            .bytes
+            .splice(..pending.pos, prefix[..count].iter().copied());
+        pending.pos = 0;
+        // A zlib header can also start raw DEFLATE only as a stored block with complementary lengths.
+        Ok(count == 5
+            && zlib_header(&prefix[..2])
+            && prefix[1] == !prefix[3]
+            && prefix[2] == !prefix[4])
     }
 
     fn poll(&self) -> Result<(), DecodeFailure> {
@@ -368,7 +403,7 @@ impl Codec {
                 if header.len() < 2 && !eof {
                     return Some((n, false));
                 }
-                let raw = !matches!(header.as_slice(),[a,b] if a&15==8 && a>>4<=7 && u16::from_be_bytes([*a,*b]).is_multiple_of(31));
+                let raw = !zlib_header(header);
                 *started = true;
                 if raw && !header.is_empty() {
                     let (used, done) = state.step(header, false, strict, out)?;
@@ -385,6 +420,7 @@ impl Codec {
             return p.step(data, eof, out);
         }
         let mut n = 0;
+        let mut terminated = false;
         while n < data.len() && out.len() < BLOCK {
             let b = data[n];
             n += 1;
@@ -406,11 +442,27 @@ impl Codec {
                         *high = Some(digit);
                     }
                 }
-                Self::Base85 { value, digits } => {
+                Self::Base85 {
+                    value,
+                    digits,
+                    pending_eod,
+                } => {
+                    if *pending_eod {
+                        if b != b'>' {
+                            return None;
+                        }
+                        terminated = true;
+                        break;
+                    }
                     if is_white_space_character(b) {
                         continue;
                     }
                     if b == b'~' {
+                        if strict {
+                            *pending_eod = true;
+                            continue;
+                        }
+                        terminated = true;
                         break;
                     }
                     if b == b'z' && *digits == 0 {
@@ -484,8 +536,7 @@ impl Codec {
                 _ => unreachable!(),
             }
         }
-        let ended = eof && n == data.len()
-            || matches!(self, Self::Base85 { .. }) && n != 0 && data[n - 1] == b'~';
+        let ended = terminated || eof && n == data.len();
         if ended {
             match self {
                 Self::Hex(high) => {
@@ -493,10 +544,11 @@ impl Codec {
                         out.push(v << 4);
                     }
                 }
+                Self::Base85 { .. } if strict && !terminated => return None,
                 Self::Base85 { digits: 1, .. } | Self::Run { .. } if strict => {
                     return None;
                 }
-                Self::Base85 { value, digits } if *digits > 1 => {
+                Self::Base85 { value, digits, .. } if *digits > 1 => {
                     for _ in *digits..5 {
                         *value = if strict {
                             value.checked_mul(85)?.checked_add(84)?
@@ -511,6 +563,10 @@ impl Codec {
         }
         Some((n, ended))
     }
+}
+
+fn zlib_header(bytes: &[u8]) -> bool {
+    matches!(bytes, [a, b] if a & 15 == 8 && a >> 4 <= 7 && u16::from_be_bytes([*a, *b]).is_multiple_of(31))
 }
 
 struct Inflater {
