@@ -28,11 +28,7 @@ impl<'a> FormXObject<'a> {
         let decoded = stream.decoded_data().ok()?;
         let resources = dict.get(RESOURCES).map(Resources::new);
 
-        let matrix = Affine::new(
-            dict.get::<[f64; 6]>(MATRIX)
-                .unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
-        );
-        let bbox = dict.get::<[f32; 4]>(BBOX)?;
+        let (bbox, matrix) = crate::geometry::box_and_matrix(dict)?;
         let group = dict.get::<Dict<'_>>(GROUP);
         let flag = |key| {
             group

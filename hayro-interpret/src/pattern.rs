@@ -6,16 +6,14 @@ use crate::device::Device;
 use crate::font::GlyphRun;
 use crate::interpret::state::{ActiveTransferFunction, PaintState, State};
 use crate::shading::Shading;
-use crate::util::{Float32Ext, RectExt, hash128};
+use crate::util::{Float32Ext, hash128};
 use crate::x_object::soft_mask::SoftMask;
 use crate::{BlendMode, CacheKey, ClipPath, DrawMode, DrawProps, Image, ImageDrawProps};
 use crate::{FillRule, InterpreterSettings, Paint, interpret};
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Stream;
-use hayro_syntax::object::dict::keys::{
-    BBOX, MATRIX, PAINT_TYPE, RESOURCES, SHADING, X_STEP, Y_STEP,
-};
+use hayro_syntax::object::dict::keys::{PAINT_TYPE, RESOURCES, SHADING, X_STEP, Y_STEP};
 use hayro_syntax::object::{Object, dict_or_stream};
 use hayro_syntax::page::Resources;
 use hayro_syntax::xref::XRef;
@@ -115,10 +113,7 @@ impl ShadingPattern {
 
             Shading::new(dict, stream, cache)
         })?;
-        let matrix = dict
-            .get::<[f64; 6]>(MATRIX)
-            .map(Affine::new)
-            .unwrap_or_default();
+        let matrix = crate::geometry::matrix(dict);
 
         Some(Self {
             shading: Arc::new(shading),
@@ -179,7 +174,7 @@ impl<'a> TilingPattern<'a> {
         let cache_key = stream.cache_key();
         let dict = stream.dict();
 
-        let bbox = dict.get::<hayro_syntax::object::Rect>(BBOX)?.to_kurbo();
+        let bbox = crate::geometry::bbox(dict)?;
         let x_step = dict.get::<f32>(X_STEP)?;
         let y_step = dict.get::<f32>(Y_STEP)?;
 
@@ -188,10 +183,7 @@ impl<'a> TilingPattern<'a> {
         }
 
         let is_color = dict.get::<u8>(PAINT_TYPE)? == 1;
-        let matrix = dict
-            .get::<[f64; 6]>(MATRIX)
-            .map(Affine::new)
-            .unwrap_or_default();
+        let matrix = crate::geometry::matrix(dict);
 
         let stencil_color = (!is_color).then(|| {
             let cs = paint

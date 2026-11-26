@@ -7,16 +7,15 @@ use crate::cache::Cache;
 use crate::color::{ColorComponents, ColorSpace};
 use crate::encode::Cost;
 use crate::function::Function;
-use crate::util::{PointExt, RectExt};
+use crate::util::{Float32Ext, PointExt, RectExt};
 use hayro_syntax::bit_reader::{BitReader, bit_mask};
 use hayro_syntax::object::Array;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Object;
-use hayro_syntax::object::Rect;
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::{
-    BACKGROUND, BBOX, BITS_PER_COMPONENT, BITS_PER_COORDINATE, BITS_PER_FLAG, COLORSPACE, COORDS,
-    DECODE, DOMAIN, EXTEND, FUNCTION, MATRIX, SHADING_TYPE, VERTICES_PER_ROW,
+    BACKGROUND, BITS_PER_COMPONENT, BITS_PER_COORDINATE, BITS_PER_FLAG, COLORSPACE, COORDS, DECODE,
+    DOMAIN, EXTEND, FUNCTION, SHADING_TYPE, VERTICES_PER_ROW,
 };
 use kurbo::{Affine, BezPath, Point, Shape};
 use smallvec::{SmallVec, smallvec};
@@ -262,10 +261,7 @@ impl Shading {
         let shading_type = match shading_num {
             1 => {
                 let domain = dict.get::<[f32; 4]>(DOMAIN).unwrap_or([0.0, 1.0, 0.0, 1.0]);
-                let matrix = dict
-                    .get::<[f64; 6]>(MATRIX)
-                    .map(Affine::new)
-                    .unwrap_or_default();
+                let matrix = crate::geometry::matrix(dict);
                 let function = read_function(dict, &color_space)?;
 
                 ShadingType::FunctionBased {
@@ -409,7 +405,7 @@ impl Shading {
             _ => return None,
         };
 
-        let bbox = dict.get::<Rect>(BBOX).map(|r| r.to_kurbo());
+        let bbox = crate::geometry::bbox(dict);
         let background = dict
             .get::<Array<'_>>(BACKGROUND)
             .map(|a| a.iter::<f32>().collect::<SmallVec<_>>());
