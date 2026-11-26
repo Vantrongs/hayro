@@ -11,7 +11,7 @@ repository.workspace = true
 hayro-font = { workspace = true }
 hayro-interpret = { workspace = true }
 hayro-syntax = { workspace = true, features = ["std"] }
-html5ever = "0.39"
+html5ever = "0.40"
 html5gum = "0.9"
 kurbo = { workspace = true }
 smallvec = { workspace = true }
