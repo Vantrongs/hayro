@@ -453,6 +453,7 @@ impl EncodedShadingPattern {
         } else {
             self.sample_cost(conversion.sample).times(count)
         };
+        conversion.hold(meter)?;
         take(meter, conversion.setup + self.transfer_cost() + work)?;
         Ok(self.finish(self.background_color.components()))
     }
@@ -519,10 +520,9 @@ impl ShadingPattern {
     ) -> Result<EncodedShadingPattern, Exhausted> {
         let color_space = &self.shading.color_space;
         if self.shading.background.is_some() {
-            take(meter, {
-                let p = color_space.prepared();
-                p.setup + p.sample
-            })?;
+            let p = color_space.prepared();
+            p.hold(meter)?;
+            take(meter, p.setup + p.sample)?;
         }
         Ok(self.encode())
     }

@@ -50,7 +50,7 @@ impl Renderer<'_> {
 
                 match *p {
                     Pattern::Shading(s) => {
-                        clip_path = s.shading.clip_path.clone();
+                        clip_path = s.clip_path();
                         let (paint, transform) = self.shading_paint(s, bbox.expand());
                         paint_transform = path_transform.inverse() * transform;
                         paint

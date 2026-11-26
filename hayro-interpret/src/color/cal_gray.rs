@@ -7,7 +7,7 @@ pub(crate) struct CalGray {
     white_point: [f32; 3],
     black_point: [f32; 3],
     gamma: f32,
-    lookup: U8Lookup<u8>,
+    pub(super) lookup: U8Lookup<u8>,
 }
 
 // See <https://github.com/mozilla/pdf.js/blob/06f44916c8936b92f464d337fe3a0a6b2b78d5b4/src/core/colorspace.js#L752>

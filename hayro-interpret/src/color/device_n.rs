@@ -62,7 +62,7 @@ impl DeviceN {
         };
         let mut evaluated = Vec::with_capacity(input.len() / num_components * num_encoded);
 
-        if num_components > 8 {
+        if num_components == 1 || num_components > 8 || input.len() == num_components {
             for pixel in input.chunks_exact(num_components) {
                 evaluated.extend(evaluate_pixel(pixel));
             }
@@ -112,8 +112,10 @@ impl DeviceN {
     }
 
     fn u8_lookup(&self) -> Option<&[[u8; 3]; 256]> {
-        self.lookup
-            .get_or_init(|input, output| self.convert_inner(input, output))
+        self.lookup.get_or_init(|input, output| {
+            self.alternate_space
+                .convert_table(&self.evaluate(input), output)
+        })
     }
 }
 

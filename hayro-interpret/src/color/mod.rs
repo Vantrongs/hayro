@@ -269,12 +269,31 @@ pub struct ColorSpace(Arc<ColorSpaceType>);
 pub(crate) struct PreparedConversion {
     pub(crate) sample: Cost,
     pub(crate) setup: Cost,
+    pub(crate) bytes: usize,
+    sample_bytes: usize,
 }
 
 impl PreparedConversion {
-    fn table(self, lookup: &U8Lookup<[u8; 3]>) -> Self {
+    pub(crate) fn hold(
+        &self,
+        meter: &mut dyn crate::encode::Meter,
+    ) -> Result<(), crate::encode::Exhausted> {
+        if meter.hold(self.bytes + self.sample_bytes) {
+            Ok(())
+        } else {
+            Err(crate::encode::Exhausted)
+        }
+    }
+
+    fn table(self, lookup: &U8Lookup<[u8; 3]>, components: usize) -> Self {
         Self {
             sample: Cost::new(1),
+            sample_bytes: 0,
+            bytes: if lookup.0.get().is_some() {
+                0
+            } else {
+                self.bytes + size_of::<[[u8; 3]; 256]>() + 256 * components + self.sample_bytes
+            },
             setup: if lookup.0.get().is_some() {
                 Cost::ZERO
             } else {
@@ -286,6 +305,22 @@ impl PreparedConversion {
 impl ColorSpace {
     pub(crate) fn identity(&self) -> *const ColorSpaceType {
         Arc::as_ptr(&self.0)
+    }
+    /// Table construction holds only one multi-ink sample's conversion scratch.
+    fn convert_table(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
+        match self.0.as_ref() {
+            ColorSpaceType::DeviceN(s) if s.num_components > 1 => {
+                for (pixel, rgb) in input
+                    .chunks_exact(usize::from(s.num_components))
+                    .zip(output.as_chunks_mut::<3>().0)
+                {
+                    s.convert(pixel, rgb)?;
+                }
+                Some(())
+            }
+            ColorSpaceType::Pattern(s) => s.color_space().convert_table(input, output),
+            _ => self.convert(input, output),
+        }
     }
     pub(crate) fn prepare_tables(&self) {
         if self.prepared().setup != Cost::ZERO {
@@ -302,26 +337,39 @@ impl ColorSpace {
             conversion
         };
         match self.0.as_ref() {
-            ColorSpaceType::Separation(s) => {
-                tint(&s.alternate_space, &s.tint_transform).table(&s.lookup)
-            }
+            ColorSpaceType::CalGray(s) if s.lookup.0.get().is_none() => PreparedConversion {
+                sample: Cost::new(2),
+                setup: Cost::new(256),
+                bytes: size_of::<[u8; 256]>(),
+                sample_bytes: 0,
+            },
+            ColorSpaceType::Separation(s) => tint(&s.alternate_space, &s.tint_transform)
+                .table(&s.lookup, usize::from(s.alternate_space.num_components())),
             ColorSpaceType::DeviceN(s) => {
-                let p = tint(&s.alternate_space, &s.tint_transform);
+                let mut p = tint(&s.alternate_space, &s.tint_transform);
                 if s.num_components == 1 {
-                    p.table(&s.lookup)
+                    p.table(&s.lookup, usize::from(s.alternate_space.num_components()))
                 } else {
+                    let channels = usize::from(s.num_components);
+                    p.sample_bytes += usize::from(s.alternate_space.num_components());
+                    if channels > 4 {
+                        p.sample_bytes += channels.next_power_of_two()
+                            * (size_of::<(f32, f32)>() + 2 * size_of::<f32>() + 1);
+                    }
                     p
                 }
             }
             ColorSpaceType::Indexed(s) => {
                 let mut base = s.base.prepared();
                 base.sample = base.sample + Cost::new(u64::from(s.base.num_components()));
-                base.table(&s.lookup)
+                base.table(&s.lookup, usize::from(s.base.num_components()))
             }
             ColorSpaceType::Pattern(s) => s.color_space().prepared(),
             _ => PreparedConversion {
                 sample: Cost::new(1 + u64::from(self.num_components())),
                 setup: Cost::ZERO,
+                bytes: 0,
+                sample_bytes: 0,
             },
         }
     }

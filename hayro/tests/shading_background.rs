@@ -25,7 +25,7 @@ fn page(content: &str) -> Vec<u8> {
     fixtures::one_page(
         100,
         "/Contents 4 0 R /Resources << /Shading << /M 5 0 R /A 6 0 R >> \
-         /Pattern << /P 7 0 R >> >>",
+         /Pattern << /P 7 0 R /Q 8 0 R >> >>",
         vec![
             fixtures::stream("", content.as_bytes()),
             fixtures::stream(
@@ -35,10 +35,11 @@ fn page(content: &str) -> Vec<u8> {
                 mesh.as_bytes(),
             ),
             b"<< /ShadingType 2 /ColorSpace /DeviceRGB /Background [0 1 0] \
-              /Coords [40 0 60 0] /Function << /FunctionType 2 /Domain [0 1] \
+              /BBox [40 45 60 55] /Coords [40 0 60 0] /Function << /FunctionType 2 /Domain [0 1] \
               /C0 [1 0 0] /C1 [1 0 0] /N 1 >> >>"
                 .to_vec(),
             b"<< /PatternType 2 /Shading 5 0 R >>".to_vec(),
+            b"<< /PatternType 2 /Matrix [1 0 0 1 20 10] /Shading 6 0 R >>".to_vec(),
         ],
     )
 }
@@ -89,4 +90,15 @@ fn a_shading_patterns_background_fills_its_shape() {
         pixels(fill, &[(50, 45), (10, 10), (90, 90)]),
         [RED, GREEN, GREEN]
     );
+}
+
+#[test]
+fn transformed_shading_boxes() {
+    let probes = [(70, 60), (50, 50), (70, 35)];
+    for content in [
+        "/Pattern cs /Q scn 0 0 100 100 re f",
+        "1 0 0 1 20 10 cm /A sh",
+    ] {
+        assert_eq!(pixels(content, &probes), [RED, WHITE_RGB, WHITE_RGB]);
+    }
 }

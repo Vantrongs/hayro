@@ -32,7 +32,8 @@ impl Separation {
     fn convert_inner(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
         let mut values = [0.0; MAX_COMPONENTS];
         let values = &mut values[..self.tint_transform.num_outputs()];
-        let mut evaluated = Vec::with_capacity(input.len() * values.len());
+        let mut evaluated =
+            Vec::with_capacity(input.len() * usize::from(self.alternate_space.num_components()));
 
         for n in input {
             if self.tint_transform.eval(&[u8_to_f32(*n)], values).is_some() {
@@ -45,7 +46,7 @@ impl Separation {
             }
         }
 
-        self.alternate_space.convert(&evaluated, output)
+        self.alternate_space.convert_table(&evaluated, output)
     }
 
     fn u8_lookup(&self) -> Option<&[[u8; 3]; 256]> {

@@ -70,7 +70,7 @@ impl Indexed {
             output.copy_from_slice(&self.values[idx]);
         }
 
-        self.base.convert(&indexed, output)
+        self.base.convert_table(&indexed, output)
     }
 
     fn u8_lookup(&self) -> Option<&[[u8; 3]; 256]> {

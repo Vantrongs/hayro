@@ -140,6 +140,13 @@ fn tint_work_is_reserved_for_the_table_or_for_each_sample() {
     let points = [Point::new(0.25, 0.0), Point::new(0.75, 0.0)];
     for (space, function, inputs, code, table) in [
         (
+            "[/Separation /Spot /DeviceGray 6 0 R]",
+            "/C0 [0] /C1 [1]",
+            "[0 1]",
+            "{ dup mul }",
+            true,
+        ),
+        (
             "[/Indexed [/Separation /Spot /DeviceGray 6 0 R] 1 <00ff>]",
             "/C0 [0] /C1 [1]",
             "[0 1]",
@@ -168,6 +175,15 @@ fn tint_work_is_reserved_for_the_table_or_for_each_sample() {
         let cost = pattern.setup_cost() + pattern.point_cost().times(points.len() as u64);
         assert_eq!(pattern.setup_cost() != Cost::ZERO, table);
         let before = crate::function::test_operator_count();
+        let mut empty = Allow {
+            steps: u64::MAX,
+            bytes: 0,
+        };
+        assert_eq!(
+            pattern.sample_points_metered(&points, &mut empty, |_| panic!("unexpected sample")),
+            Err(Exhausted)
+        );
+        assert_eq!(before, crate::function::test_operator_count());
         let mut meter = Allow {
             steps: cost.steps() - 1,
             bytes: usize::MAX,
