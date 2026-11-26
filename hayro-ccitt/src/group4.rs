@@ -1,5 +1,5 @@
 use crate::bit_reader::BitReader;
-use crate::context::{Color, DecoderContext, decode_2d_line};
+use crate::context::{DecoderContext, decode_2d_line};
 use crate::{DecodeError, Decoder, Result};
 
 pub(crate) fn decode(
@@ -37,13 +37,8 @@ pub(crate) fn decode(
                 return Err(e);
             }
 
-            if ctx.pixels_decoded > 0 {
-                ctx.color = Color::White;
-                ctx.push_pixels(ctx.line_width - ctx.pixels_decoded)?;
-                ctx.next_line(decoder);
-            }
-
-            if e == DecodeError::UnexpectedEof {
+            ctx.finish_partial_row(decoder)?;
+            if reader.at_end() || e == DecodeError::UnexpectedEof {
                 break;
             }
 

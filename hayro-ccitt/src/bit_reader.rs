@@ -8,6 +8,7 @@ pub(crate) struct BitReader<'a> {
     // Next bit in the MSB; at least 32 valid bits, zero past the end of the data.
     buffer: u64,
     limit: usize,
+    overrun: bool,
 }
 
 impl<'a> BitReader<'a> {
@@ -18,6 +19,7 @@ impl<'a> BitReader<'a> {
             bit_offset: 0,
             buffer: 0,
             limit: 0,
+            overrun: false,
         };
         reader.refill();
         reader
@@ -48,6 +50,17 @@ impl<'a> BitReader<'a> {
         self.buffer <<= num_bits;
 
         Ok(())
+    }
+
+    #[inline(always)]
+    pub(crate) fn consume_code(&mut self, bits: usize) -> bool {
+        let cut = self.consume(bits).is_err();
+        self.overrun |= cut;
+        cut
+    }
+
+    pub(crate) fn overrun(&self) -> bool {
+        self.overrun
     }
 
     #[inline(always)]

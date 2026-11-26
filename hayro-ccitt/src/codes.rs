@@ -24,7 +24,7 @@ impl BitReader<'_> {
         let bits = self.peek_u32();
 
         if bits >> 31 == 1 {
-            self.consume(1)?;
+            self.consume_code(1);
             return Ok(Mode::Vertical(0));
         }
 
@@ -47,7 +47,7 @@ impl BitReader<'_> {
             }
         };
 
-        self.consume(len)?;
+        self.consume_code(len);
 
         Ok(mode)
     }
@@ -94,11 +94,18 @@ impl BitReader<'_> {
 
         loop {
             let entry = lookup[(self.peek_u32() >> (32 - LOOKUP_BITS)) as usize];
-            self.consume((entry >> 12) as usize)?;
+            let cut = self.consume_code((entry >> 12) as usize);
 
             let len = entry & 0xFFF;
 
             if len == LOOKUP_INVALID {
+                if cut {
+                    return if total > 0 {
+                        Ok(total)
+                    } else {
+                        Err(DecodeError::UnexpectedEof)
+                    };
+                }
                 return Err(DecodeError::InvalidCode);
             }
 

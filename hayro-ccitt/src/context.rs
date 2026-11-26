@@ -71,6 +71,35 @@ impl<'a> DecoderContext<'a> {
         self.update_b();
     }
 
+    pub(crate) fn salvage(
+        &mut self,
+        reader: &BitReader<'_>,
+        error: DecodeError,
+        decoder: &mut impl Decoder,
+    ) -> Result<()> {
+        if self.settings.strict || !reader.at_end() {
+            return Err(error);
+        }
+        self.finish_partial_row(decoder)
+    }
+
+    pub(crate) fn finish_partial_row(&mut self, decoder: &mut impl Decoder) -> Result<()> {
+        if self.pixels_decoded != 0 {
+            self.color = Color::White;
+            self.push_pixels(self.line_width - self.pixels_decoded)?;
+            self.next_line(decoder);
+        }
+        Ok(())
+    }
+
+    fn check_complete(&self, reader: &BitReader<'_>) -> Result<()> {
+        if self.settings.strict && reader.overrun() {
+            Err(DecodeError::UnexpectedEof)
+        } else {
+            Ok(())
+        }
+    }
+
     #[inline(always)]
     fn a0(&self) -> Option<u32> {
         if self.pixels_decoded == 0 {
@@ -131,7 +160,7 @@ pub(crate) fn decode_1d_line(
         ctx.color = ctx.color.opposite();
     }
 
-    Ok(())
+    ctx.check_complete(reader)
 }
 
 #[inline(always)]
@@ -176,7 +205,7 @@ pub(crate) fn decode_2d_line(
         }
     }
 
-    Ok(())
+    ctx.check_complete(reader)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

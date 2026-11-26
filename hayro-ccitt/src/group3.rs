@@ -23,7 +23,10 @@ pub(crate) fn decode_1d(
         let line_start = reader.clone();
 
         if let Err(e) = decode_1d_line(ctx, reader) {
-            recover(ctx, reader, line_start, e)?;
+            match ctx.salvage(reader, e, decoder) {
+                Ok(()) => break,
+                Err(error) => recover(ctx, reader, line_start, error)?,
+            }
         }
 
         ctx.next_line(decoder);
@@ -65,7 +68,10 @@ pub(crate) fn decode_2d(
         });
 
         if let Err(e) = result {
-            recover(ctx, reader, line_start, e)?;
+            match ctx.salvage(reader, e, decoder) {
+                Ok(()) => break,
+                Err(error) => recover(ctx, reader, line_start, error)?,
+            }
         }
 
         ctx.next_line(decoder);

@@ -10,6 +10,7 @@ mod g4;
 mod modes;
 mod recovery;
 mod settings;
+mod trailing;
 
 use hayro_ccitt::{DecodeSettings, Decoder, EncodingMode, decode};
 use std::path::PathBuf;
@@ -62,6 +63,19 @@ impl Decoder for Collector {
     }
 }
 
+fn settings_for(columns: u32, rows: u32) -> DecodeSettings {
+    DecodeSettings {
+        columns,
+        rows,
+        end_of_block: false,
+        end_of_line: false,
+        rows_are_byte_aligned: false,
+        encoding: G4,
+        strict: false,
+        cancel: None,
+    }
+}
+
 fn check(stream: &str, reference: &str, configure: impl FnOnce(&mut DecodeSettings)) {
     check_consumed(stream, reference, None, configure);
 }
@@ -77,16 +91,7 @@ fn check_consumed(
         std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
     let reference = load_reference(reference);
 
-    let mut settings = DecodeSettings {
-        columns: reference[0].len() as u32,
-        rows: reference.len() as u32,
-        end_of_block: false,
-        end_of_line: false,
-        rows_are_byte_aligned: false,
-        encoding: G4,
-        strict: false,
-        cancel: None,
-    };
+    let mut settings = settings_for(reference[0].len() as u32, reference.len() as u32);
     configure(&mut settings);
 
     let mut collector = Collector::new(settings.columns);
@@ -146,4 +151,25 @@ fn check_malformed(
     configure(&mut settings);
 
     let _ = decode(&data, &mut Collector::new(columns), &settings);
+}
+
+#[derive(Default)]
+pub(crate) struct Bits {
+    pub(crate) out: Vec<u8>,
+    len: usize,
+}
+
+impl Bits {
+    pub(crate) fn put(&mut self, code: &str) -> &mut Self {
+        for bit in code.bytes() {
+            if self.len.is_multiple_of(8) {
+                self.out.push(0);
+            }
+            if bit == b'1' {
+                *self.out.last_mut().unwrap() |= 0x80 >> (self.len % 8);
+            }
+            self.len += 1;
+        }
+        self
+    }
 }
