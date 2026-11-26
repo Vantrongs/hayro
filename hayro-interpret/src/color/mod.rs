@@ -271,6 +271,10 @@ impl ColorSpaceType {
 pub struct ColorSpace(Arc<ColorSpaceType>);
 
 impl ColorSpace {
+    pub(crate) fn identity(&self) -> *const ColorSpaceType {
+        Arc::as_ptr(&self.0)
+    }
+
     pub(crate) fn new(object: Object<'_>, cache: &Cache) -> Option<Self> {
         Self::new_nested(object, cache, 0)
     }

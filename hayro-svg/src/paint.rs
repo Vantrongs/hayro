@@ -2,7 +2,7 @@ use crate::clip::CachedClipPath;
 use crate::{Id, hash128};
 use crate::{SvgRenderer, convert_transform};
 use hayro_interpret::encode::EncodedShadingType;
-use hayro_interpret::gradient::{SvgGradient, SvgGradientKind};
+use hayro_interpret::gradient::{PreparedShading, SvgGradient, SvgGradientKind};
 use hayro_interpret::pattern::{Pattern, ShadingPattern, TilingPattern};
 use hayro_interpret::{CacheKey, FillRule, Paint, StrokeProps};
 use image::{DynamicImage, ImageBuffer};
@@ -347,8 +347,21 @@ impl<'a> SvgRenderer<'a> {
         self.xml.start_element("defs");
         self.xml.write_attribute("id", "shading");
 
+        let mut prepared = std::collections::HashMap::new();
         for (id, shading) in shadings.iter() {
-            let encoded = shading.pattern.encode();
+            let pattern = &shading.pattern;
+            let encoded = if matches!(
+                pattern.shading.shading_type.as_ref(),
+                hayro_interpret::shading::ShadingType::RadialAxial { .. }
+            ) && shading.bbox.area() >= PreparedShading::MIN_SAMPLES as f64
+            {
+                prepared
+                    .entry(PreparedShading::cache_key(pattern))
+                    .or_insert_with(|| PreparedShading::new(pattern.clone()))
+                    .encode(pattern.matrix)
+            } else {
+                pattern.encode()
+            };
             let texture = encoded.render_texture(shading.bbox, 1.0);
             let image = DynamicImage::ImageRgba8(
                 ImageBuffer::from_raw(texture.width, texture.height, texture.data).unwrap(),

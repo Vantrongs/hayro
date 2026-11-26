@@ -103,6 +103,7 @@ pub(crate) struct Renderer<'a> {
     global: &'a GlobalState,
     pub(crate) ctx: &'a mut RenderContext,
     pub(crate) inside_pattern: bool,
+    gradient_cache: paint::GradientCache,
     pub(crate) soft_mask_cache: FxHashMap<u128, Mask>,
     pub(crate) in_type3_glyph: bool,
 }
@@ -113,6 +114,7 @@ impl<'r> Renderer<'r> {
             global,
             ctx,
             inside_pattern: false,
+            gradient_cache: FxHashMap::default(),
             soft_mask_cache: FxHashMap::default(),
             in_type3_glyph: false,
         }

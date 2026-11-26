@@ -1,5 +1,10 @@
 //! SVG-like gradient approximations of encoded shadings.
 
+mod ramp;
+
+pub(crate) use ramp::ParameterRamp;
+pub use ramp::PreparedShading;
+
 use crate::color::{color_error, lerp_color};
 use crate::encode::{EncodedRadialAxialShading, EncodedShadingPattern, RadialAxialParams};
 use crate::shading::ShadingFunction;
@@ -45,6 +50,7 @@ pub enum SvgGradientKind {
 }
 
 /// A color stop for an SVG-like gradient.
+#[derive(Clone, Debug)]
 pub struct SvgGradientStop {
     /// Normalized offset.
     pub offset: f32,
@@ -460,6 +466,7 @@ mod tests {
             color_space: ColorSpace::device_gray(),
             background_color: AlphaColor::TRANSPARENT,
             shading_type: EncodedShadingType::RadialAxial(EncodedRadialAxialShading {
+                ramp: None,
                 params: RadialAxialParams::Axial {
                     sampling_transform: Affine::IDENTITY,
                     expected_base_transform: Affine::IDENTITY,

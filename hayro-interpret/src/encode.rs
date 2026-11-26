@@ -48,6 +48,7 @@ pub struct EncodedFunctionBasedShading {
 #[derive(Clone, Debug)]
 pub struct EncodedRadialAxialShading {
     pub(crate) function: ShadingFunction,
+    pub(crate) ramp: Option<Arc<crate::gradient::ParameterRamp>>,
     pub(crate) params: RadialAxialParams,
     pub(crate) domain: [f32; 2],
     pub(crate) extend: [bool; 2],
@@ -127,8 +128,31 @@ impl EncodedShadingPattern {
         let (width, height) = texture_dimensions(bbox, scale);
         let grid_transform =
             Affine::translate((bbox.x0, bbox.y0)) * Affine::scale(1.0 / scale as f64);
-        let background = self.finish(self.background_color.components());
-        let mut canvas = Canvas::new(width, height, background);
+        if let EncodedShadingType::RadialAxial(shading) = &self.shading_type {
+            let sampling_transform = match shading.params {
+                RadialAxialParams::Axial {
+                    start,
+                    axis,
+                    sampling_transform,
+                    expected_base_transform,
+                } => {
+                    if self.base_transform == expected_base_transform {
+                        sampling_transform
+                    } else {
+                        Affine::new([axis.x, axis.y, -axis.y, axis.x, start.x, start.y])
+                            * self.base_transform
+                    }
+                }
+                RadialAxialParams::Radial { .. } => self.base_transform,
+            };
+            shading.sample(width, height, sampling_transform * grid_transform, self, f);
+            return (width, height, grid_transform);
+        }
+        let mut canvas = Canvas::new(
+            width,
+            height,
+            self.finish(self.background_color.components()),
+        );
         let transform = grid_transform.inverse() * self.base_transform.inverse();
 
         match &self.shading_type {
@@ -141,29 +165,11 @@ impl EncodedShadingPattern {
                     self,
                 );
             }
-            EncodedShadingType::RadialAxial(shading) => {
-                let sampling_transform = match shading.params {
-                    RadialAxialParams::Axial {
-                        start,
-                        axis,
-                        sampling_transform,
-                        expected_base_transform,
-                    } => {
-                        if self.base_transform == expected_base_transform {
-                            sampling_transform
-                        } else {
-                            Affine::new([axis.x, axis.y, -axis.y, axis.x, start.x, start.y])
-                                * self.base_transform
-                        }
-                    }
-                    RadialAxialParams::Radial { .. } => self.base_transform,
-                };
-                shading.draw(&mut canvas, sampling_transform * grid_transform, self);
-            }
             EncodedShadingType::Mesh(shading) => {
                 draw_mesh(&mut canvas, &shading.shading_type, transform, self);
             }
             EncodedShadingType::Dummy(_) => {}
+            EncodedShadingType::RadialAxial(_) => unreachable!(),
         }
 
         canvas.pixels.into_iter().for_each(f);
@@ -306,6 +312,7 @@ fn encode_axial_shading(
     (
         EncodedShadingType::RadialAxial(EncodedRadialAxialShading {
             function: function.clone(),
+            ramp: None,
             params,
             domain,
             extend,
@@ -343,45 +350,81 @@ pub(crate) enum RadialAxialParams {
 }
 
 impl EncodedRadialAxialShading {
-    fn draw(&self, canvas: &mut Canvas, transform: Affine, pattern: &EncodedShadingPattern) {
+    /// Return a single device row or column when the axial parameter is invariant on that axis.
+    pub fn texture_bounds(&self, bbox: Rect, pattern: &EncodedShadingPattern) -> Rect {
+        let RadialAxialParams::Axial {
+            sampling_transform,
+            expected_base_transform,
+            ..
+        } = self.params
+        else {
+            return bbox;
+        };
+        if pattern.base_transform != expected_base_transform {
+            return bbox;
+        }
+        if self.invariant_y(sampling_transform) {
+            Rect::new(bbox.x0, bbox.y0, bbox.x1, bbox.y0 + 1.)
+        } else if self.invariant_x(sampling_transform) {
+            Rect::new(bbox.x0, bbox.y0, bbox.x0 + 1., bbox.y1)
+        } else {
+            bbox
+        }
+    }
+
+    fn sample(
+        &self,
+        width: u32,
+        height: u32,
+        transform: Affine,
+        pattern: &EncodedShadingPattern,
+        mut emit: impl FnMut([f32; 4]),
+    ) {
+        let background = pattern.finish(pattern.background_color.components());
         let [start, end] = self.domain.map(f64::from);
         let (mut start_color, mut end_color) = (None, None);
-        let mut sample = |x: usize, y: usize| {
+        let mut sample = |x: u32, y: u32| {
             let point = transform * Point::new(x as f64 + 0.5, y as f64 + 0.5);
-            self.position(point).map(|t| match t {
-                0.0 => *start_color.get_or_insert_with(|| pattern.eval_1d(&self.function, start)),
-                1.0 => *end_color.get_or_insert_with(|| pattern.eval_1d(&self.function, end)),
-                _ => pattern.eval_1d(&self.function, start + (end - start) * t),
-            })
+            self.position(point)
+                .map(|t| match t {
+                    0.0 => {
+                        *start_color.get_or_insert_with(|| pattern.eval_1d(&self.function, start))
+                    }
+                    1.0 => *end_color.get_or_insert_with(|| pattern.eval_1d(&self.function, end)),
+                    _ => self
+                        .ramp
+                        .as_ref()
+                        .and_then(|r| r.get(t))
+                        .unwrap_or_else(|| {
+                            pattern.eval_1d(&self.function, start + (end - start) * t)
+                        }),
+                })
+                .unwrap_or(background)
         };
-        let mut draw_row = |y, row: &mut [[f32; 4]]| {
-            for (x, pixel) in row.iter_mut().enumerate() {
-                if let Some(color) = sample(x, y) {
-                    *pixel = color;
-                }
+        if height > 1 && self.invariant_y(transform) {
+            let row = (0..width).map(|x| sample(x, 0)).collect::<Vec<_>>();
+            for _ in 0..height {
+                row.iter().copied().for_each(&mut emit);
             }
-        };
-        let mut rows = canvas.pixels.chunks_exact_mut(canvas.width);
-        if matches!(self.params, RadialAxialParams::Axial { axis, .. } if axis.y == 0.0 && transform.as_coeffs()[2] == 0.0)
-        {
-            if let Some(first) = rows.next() {
-                draw_row(0, first);
-                for row in rows {
-                    row.copy_from_slice(first);
-                }
-            }
-        } else if matches!(self.params, RadialAxialParams::Axial { axis, .. } if axis.x == 0.0 && transform.as_coeffs()[1] == 0.0)
-        {
-            for (y, row) in rows.enumerate() {
-                if let Some(color) = sample(0, y) {
-                    row.fill(color);
-                }
+        } else if self.invariant_x(transform) {
+            for y in 0..height {
+                std::iter::repeat_n(sample(0, y), width as usize).for_each(&mut emit);
             }
         } else {
-            for (y, row) in rows.enumerate() {
-                draw_row(y, row);
+            for y in 0..height {
+                for x in 0..width {
+                    emit(sample(x, y));
+                }
             }
         }
+    }
+
+    pub(crate) fn invariant_y(&self, transform: Affine) -> bool {
+        matches!(self.params,RadialAxialParams::Axial{axis,..} if axis.y==0. && transform.as_coeffs()[2]==0.)
+    }
+
+    pub(crate) fn invariant_x(&self, transform: Affine) -> bool {
+        matches!(self.params,RadialAxialParams::Axial{axis,..} if axis.x==0. && transform.as_coeffs()[1]==0.)
     }
 
     fn position(&self, pos: Point) -> Option<f64> {
