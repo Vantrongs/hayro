@@ -32,7 +32,7 @@ fn decode_context<'a>(
     obj: &ImageXObject<'a>,
     target_dimension: Option<(u32, u32)>,
 ) -> Option<DecodeContext<'a>> {
-    let dict_bpc = obj.dict_bpc;
+    let dict_bpc = obj.dict_bpc();
     let color_space = obj.color_space.as_ref();
     let is_indexed = color_space.is_some_and(ColorSpace::is_indexed);
 
@@ -238,7 +238,7 @@ fn sample_context<'a>(
     decoded: FilterResult<'a>,
     ranges: Option<Array<'a>>,
 ) -> Option<DecodeContext<'a>> {
-    let dict_bpc = obj.dict_bpc;
+    let dict_bpc = obj.dict_bpc();
     let color_space = obj.color_space.clone();
     let (mut scale_x, mut scale_y) = (1.0, 1.0);
 
@@ -568,4 +568,86 @@ fn for_each_sample(
     }
 
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::Cache;
+    use hayro_syntax::Pdf;
+    use hayro_syntax::object::{ObjectIdentifier, Stream};
+    use std::sync::Arc;
+
+    fn repaired_image_pdf(extra_dict: &str, hex_data: &str, obj3_body: &str) -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len();
+        let stream = format!(
+            "1 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /Filter 2 0 R {extra_dict} /Length {} >>\nstream\n{hex_data}\nendstream\nendobj\n",
+            hex_data.len()
+        );
+        pdf.extend_from_slice(stream.as_bytes());
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n/ASCIIHexDecode\nendobj\n");
+        pdf.extend_from_slice(format!("3 0 obj\n{obj3_body}\nendobj\n").as_bytes());
+        let off4 = pdf.len();
+        pdf.extend_from_slice(b"4 0 obj\n<< /Type /Catalog /Pages 5 0 R >>\nendobj\n");
+        let off5 = pdf.len();
+        pdf.extend_from_slice(b"5 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+        let xref_off = pdf.len();
+        // Mark object 3 free and corrupt object 2's offset so resolving /Filter triggers XRef::repair.
+        let xref = format!(
+            "xref\n0 6\n0000000000 65535 f \n{off1:010} 00000 n \n{:010} 00000 n \n0000000000 65535 f \n{off4:010} 00000 n \n{off5:010} 00000 n \ntrailer\n<< /Size 6 /Root 4 0 R >>\nstartxref\n{xref_off}\n%%EOF\n",
+            off2 + 3,
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf
+    }
+
+    fn first_pixel_luma(decoded: DecodedImage) -> u8 {
+        match decoded.image {
+            crate::ImageData::Luma(l) => l.data[0],
+            crate::ImageData::Rgb(r) => {
+                assert_eq!(r.data[0], r.data[1]);
+                assert_eq!(r.data[1], r.data[2]);
+                r.data[0]
+            }
+        }
+    }
+
+    #[test]
+    fn image_decode_refreshes_decode_and_bpc_after_xref_repair() {
+        let sink: crate::WarningSinkFn = Arc::new(|_| {});
+
+        // Case 1: repair triggered by /Filter recovers /Decode [1 0], inverting 0x00 to white.
+        let pdf = Pdf::new(repaired_image_pdf(
+            "/BitsPerComponent 8 /Decode 3 0 R",
+            "00>",
+            "[1 0]",
+        ))
+        .unwrap();
+        let stream = pdf
+            .xref()
+            .get::<Stream<'_>>(ObjectIdentifier::new(1, 0))
+            .unwrap();
+        let obj = ImageXObject::new(&stream, |_| None, &sink, &Cache::default(), None).unwrap();
+        assert!(!pdf.xref().is_repaired());
+        let decoded = decode_image(&obj, None).unwrap();
+        assert!(pdf.xref().is_repaired());
+        assert_eq!(first_pixel_luma(decoded), 255);
+
+        // Case 2: repair triggered by /Filter recovers /BitsPerComponent 1, so 0x80 decodes as white.
+        let pdf = Pdf::new(repaired_image_pdf("/BitsPerComponent 3 0 R", "80>", "1")).unwrap();
+        let stream = pdf
+            .xref()
+            .get::<Stream<'_>>(ObjectIdentifier::new(1, 0))
+            .unwrap();
+        let obj = ImageXObject::new(&stream, |_| None, &sink, &Cache::default(), None).unwrap();
+        assert!(!pdf.xref().is_repaired());
+        assert_eq!(obj.dict_bpc(), None);
+        let decoded = decode_image(&obj, None).unwrap();
+        assert!(pdf.xref().is_repaired());
+        assert_eq!(obj.dict_bpc(), Some(1));
+        assert_eq!(first_pixel_luma(decoded), 255);
+    }
 }

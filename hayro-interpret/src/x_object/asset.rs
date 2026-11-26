@@ -27,6 +27,7 @@ struct AssetData {
     cache: Cache,
     warning_sink: WarningSinkFn,
     dict_bpc: Option<u8>,
+    bpc_repaired: bool,
     kind: ImageKind,
     key: Option<u128>,
 }
@@ -47,6 +48,7 @@ impl ImageXObject<'_> {
             cache: Cache::new(),
             warning_sink: self.warning_sink.clone(),
             dict_bpc: self.dict_bpc,
+            bpc_repaired: self.bpc_repaired,
             kind: self.kind,
             key,
         }))
@@ -87,6 +89,7 @@ impl ImageAsset {
             cache: a.cache.clone(),
             interpolate: a.interpolate,
             dict_bpc: a.dict_bpc,
+            bpc_repaired: a.bpc_repaired,
             kind: a.kind,
             stream: a.stream.get()?,
             transfer_function: a.transfer_function.clone(),

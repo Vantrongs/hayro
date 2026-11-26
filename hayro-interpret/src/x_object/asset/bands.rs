@@ -88,13 +88,6 @@ impl Bands {
         let cs = obj.color_space.as_ref()?;
         let keyed = super::super::decode::short_rows_transparent(obj, cs.num_components());
         let channels = usize::from(cs.num_components());
-        let bpc = obj
-            .dict_bpc
-            .unwrap_or(if obj.kind == ImageKind::StencilMask {
-                1
-            } else {
-                8
-            });
         let params = ImageDecodeParams {
             is_indexed: cs.is_indexed(),
             num_components: Some(cs.num_components()),
@@ -139,6 +132,13 @@ impl Bands {
             }
         })
         .ok()?;
+        let bpc = obj
+            .dict_bpc()
+            .unwrap_or(if obj.kind == ImageKind::StencilMask {
+                1
+            } else {
+                8
+            });
         let bits = metadata.as_ref().map_or(bpc, |i| i.bits_per_component);
         if !matches!(bits, 1..=16) {
             return None;

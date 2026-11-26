@@ -249,10 +249,14 @@ impl ImageDecodeParams {
     }
 }
 
-enum DecodeTarget<'a> {
+enum DecodeTarget<'a, 'b> {
     Data,
     PageContent,
-    Image(&'a ImageDecodeParams, Option<&'a Option<Array<'a>>>),
+    Image {
+        params: &'b ImageDecodeParams,
+        allow_luma: bool,
+        ranges: Option<&'b mut Option<Array<'a>>>,
+    },
 }
 
 impl<'a> Stream<'a> {
@@ -328,6 +332,9 @@ impl<'a> Stream<'a> {
         params: &ImageDecodeParams,
         cancel: Option<CancelArc<AtomicBool>>,
     ) -> Option<FilterResult<'static>> {
+        if self.has_external_file() {
+            return None;
+        }
         let mut prefix = self.filters_and_params();
         if prefix.filters.pop() != Some(Filter::CcittFaxDecode) {
             return None;
@@ -345,7 +352,7 @@ impl<'a> Stream<'a> {
         cancel: Option<CancelArc<AtomicBool>>,
     ) -> Option<Cow<'a, [u8]>> {
         if prefix.filters.is_empty() {
-            self.try_raw_data().ok()
+            self.try_embedded_raw_data().ok()
         } else {
             self.collect_filters(prefix, false, cancel, None).ok()
         }
@@ -358,6 +365,9 @@ impl<'a> Stream<'a> {
         params: &ImageDecodeParams,
         cancel: Option<CancelArc<AtomicBool>>,
     ) -> Option<JpegRows<'a>> {
+        if self.has_external_file() {
+            return None;
+        }
         let mut prefix = self.filters_and_params();
         if prefix.filters.pop() != Some(Filter::DctDecode) {
             return None;
@@ -372,6 +382,9 @@ impl<'a> Stream<'a> {
         &self,
         cancel: Option<CancelArc<AtomicBool>>,
     ) -> Result<DecodedReader<'a>, DecodeFailure> {
+        if self.has_external_file() {
+            return Err(DecodeFailure::StreamDecode);
+        }
         self.forward(&self.filters_and_params(), cancel, false)
     }
 
@@ -381,7 +394,7 @@ impl<'a> Stream<'a> {
         cancel: Option<CancelArc<AtomicBool>>,
         strict: bool,
     ) -> Result<DecodedReader<'a>, DecodeFailure> {
-        let mut reader = DecodedReader::new(self.decrypted_reader()?, cancel, strict);
+        let mut reader = DecodedReader::new(self.decrypted_embedded_reader()?, cancel, strict);
         for (i, (filter, params)) in filters.filters.iter().zip(&filters.params).enumerate() {
             if i == 0 && *filter == Filter::Crypt {
                 continue;
@@ -395,11 +408,11 @@ impl<'a> Stream<'a> {
 
     /// Decodes all data filters, discarding tentative output on failure.
     pub fn decoded_strict(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
+        if self.has_external_file() {
+            return Err(DecodeFailure::StreamDecode);
+        }
         let filters = self.filters_and_params();
-        if filters.filters.is_empty()
-            && !self.has_external_file()
-            && !self.dict.ctx().xref().needs_decryption(self.dict.ctx())
-        {
+        if filters.filters.is_empty() && !self.dict.ctx().xref().needs_decryption(self.dict.ctx()) {
             return Ok(Cow::Borrowed(self.data));
         }
         self.collect_filters(&filters, true, None, None)
@@ -419,7 +432,8 @@ impl<'a> Stream<'a> {
         }
         drop(reader);
         let mut input;
-        let mut chain = DecodedReader::new(self.decrypted_reader()?, cancel.clone(), strict);
+        let mut chain =
+            DecodedReader::new(self.decrypted_embedded_reader()?, cancel.clone(), strict);
         for (i, (&filter, params)) in filters.filters.iter().zip(&filters.params).enumerate() {
             if i == 0 && filter == Filter::Crypt {
                 continue;
@@ -463,11 +477,20 @@ impl<'a> Stream<'a> {
         )
     }
 
+    /// Whether the underlying cross-reference table has been repaired.
+    pub fn xref_is_repaired(&self) -> bool {
+        self.dict.ctx().xref().is_repaired()
+    }
+
     /// Opens the stored bytes for incremental decryption.
     pub fn decrypted_reader(&self) -> Result<DecryptedReader<'a>, DecodeFailure> {
         if self.has_external_file() {
             return Err(DecodeFailure::StreamDecode);
         }
+        self.decrypted_embedded_reader()
+    }
+
+    fn decrypted_embedded_reader(&self) -> Result<DecryptedReader<'a>, DecodeFailure> {
         let ctx = self.dict.ctx();
         let encrypted = self.dict.obj_id().is_some()
             && ctx.xref().needs_decryption(ctx)
@@ -495,6 +518,10 @@ impl<'a> Stream<'a> {
         if self.has_external_file() {
             return Err(DecodeFailure::StreamDecode);
         }
+        self.try_embedded_raw_data()
+    }
+
+    fn try_embedded_raw_data(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
         let ctx = self.dict.ctx();
 
         if ctx.xref().needs_decryption(ctx)
@@ -585,7 +612,11 @@ impl<'a> Stream<'a> {
         &self,
         image_params: &ImageDecodeParams,
     ) -> Result<FilterResult<'a>, DecodeFailure> {
-        self.decode(DecodeTarget::Image(image_params, None))
+        self.decode(DecodeTarget::Image {
+            params: image_params,
+            allow_luma: false,
+            ranges: None,
+        })
     }
 
     /// Decodes a gray image, allowing terminal fax samples to be expanded to eight bits.
@@ -594,8 +625,11 @@ impl<'a> Stream<'a> {
         &self,
         params: &ImageDecodeParams,
     ) -> Result<FilterResult<'a>, DecodeFailure> {
-        self.decoded_image_samples(params, true)
-            .map(|(image, _)| image)
+        self.decode(DecodeTarget::Image {
+            params,
+            allow_luma: true,
+            ranges: None,
+        })
     }
 
     /// Decodes image samples and returns the array describing their component ranges.
@@ -605,8 +639,12 @@ impl<'a> Stream<'a> {
         params: &ImageDecodeParams,
         allow_luma: bool,
     ) -> Result<(FilterResult<'a>, Option<Array<'a>>), DecodeFailure> {
-        let ranges = self.image_decode_array();
-        let image = self.decode(DecodeTarget::Image(params, allow_luma.then_some(&ranges)))?;
+        let mut ranges = None;
+        let image = self.decode(DecodeTarget::Image {
+            params,
+            allow_luma,
+            ranges: Some(&mut ranges),
+        })?;
         Ok((image, ranges))
     }
 
@@ -621,14 +659,24 @@ impl<'a> Stream<'a> {
         self.decode(DecodeTarget::PageContent).map(|r| r.data)
     }
 
-    fn decode(&self, target: DecodeTarget<'_>) -> Result<FilterResult<'a>, DecodeFailure> {
+    fn decode(&self, target: DecodeTarget<'a, '_>) -> Result<FilterResult<'a>, DecodeFailure> {
+        if self.has_external_file() {
+            return Err(DecodeFailure::StreamDecode);
+        }
+
         let mut filters_and_params = self.filters_and_params();
         let first_image = filters_and_params.filters.iter().position(Filter::is_image);
+        let mut ranges_out = None;
+        let is_page_content = matches!(target, DecodeTarget::PageContent);
         let image_params = match target {
-            DecodeTarget::Image(params, _luma) => match first_image {
+            DecodeTarget::Image {
+                params,
+                allow_luma: _luma,
+                ranges,
+            } => match first_image {
                 None => {
                     let data = if filters_and_params.filters.is_empty() {
-                        self.try_raw_data()?
+                        self.try_embedded_raw_data()?
                     } else {
                         self.collect_filters(
                             &filters_and_params,
@@ -637,6 +685,9 @@ impl<'a> Stream<'a> {
                             params.sample_bytes(),
                         )?
                     };
+                    if let Some(out) = ranges {
+                        *out = self.image_decode_array();
+                    }
                     return Ok(FilterResult {
                         data,
                         image_data: None,
@@ -646,34 +697,44 @@ impl<'a> Stream<'a> {
                     let filter = filters_and_params.filters.pop().unwrap();
                     let options = filters_and_params.params.pop().unwrap();
                     let stored = if filters_and_params.filters.is_empty() {
-                        self.try_raw_data()?
+                        self.try_embedded_raw_data()?
                     } else {
                         self.collect_filters(&filters_and_params, false, None, None)?
                     };
+                    let need_ranges = ranges.is_some()
+                        || (cfg!(feature = "images") && _luma && filter == Filter::CcittFaxDecode);
+                    let decode_ranges = need_ranges.then(|| self.image_decode_array()).flatten();
                     #[cfg(feature = "images")]
-                    if let Some(ranges) = _luma
+                    let result = if _luma
                         && filter == Filter::CcittFaxDecode
-                        && crate::filter::ccitt::can_expand(&self.dict, params, ranges.as_ref())
-                    {
-                        return crate::filter::ccitt::Fax::new(&options, params.height, None)
+                        && crate::filter::ccitt::can_expand(
+                            &self.dict,
+                            params,
+                            decode_ranges.as_ref(),
+                        ) {
+                        crate::filter::ccitt::Fax::new(&options, params.height, None)
                             .decode(&stored, crate::filter::ccitt::FaxRows::Luma8)
-                            .ok_or(DecodeFailure::ImageDecode);
+                            .ok_or(DecodeFailure::ImageDecode)
+                    } else {
+                        filter.apply(&stored, &options, params, false)
+                    };
+                    #[cfg(not(feature = "images"))]
+                    let result = filter.apply(&stored, &options, params, false);
+                    if let Some(out) = ranges {
+                        *out = decode_ranges;
                     }
-                    return filter.apply(&stored, &options, params, false);
+                    return result;
                 }
-                _ => params,
+                _ => {
+                    ranges_out = ranges;
+                    params
+                }
             },
-            _ if first_image.is_some() => {
-                return Err(if self.has_external_file() {
-                    DecodeFailure::StreamDecode
-                } else {
-                    DecodeFailure::ImageDecode
-                });
-            }
+            _ if first_image.is_some() => return Err(DecodeFailure::ImageDecode),
             _ => &ImageDecodeParams::default(),
         };
 
-        let data = self.try_raw_data()?;
+        let data = self.try_embedded_raw_data()?;
 
         let mut current: Option<FilterResult<'a>> = None;
 
@@ -691,9 +752,13 @@ impl<'a> Stream<'a> {
                 current.as_ref().map(|c| c.data.as_ref()).unwrap_or(&data),
                 params,
                 image_params,
-                matches!(target, DecodeTarget::PageContent),
+                is_page_content,
             )?;
             current = Some(new);
+        }
+
+        if let Some(out) = ranges_out {
+            *out = self.image_decode_array();
         }
 
         Ok(current.unwrap_or(FilterResult {
@@ -1079,5 +1144,51 @@ mod tests {
         let stream = Stream::new(b"41>", dict);
 
         assert_eq!(stream.decoded().unwrap().as_ref(), b"A");
+    }
+
+    #[test]
+    fn external_file_rejects_before_resolving_filter_or_decode() {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len();
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Length 3 /F (data.bin) /Filter 2 0 R /Decode 3 0 R >>\nstream\nabc\nendstream\nendobj\n",
+        );
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n/ASCIIHexDecode\nendobj\n");
+        let off3 = pdf.len();
+        pdf.extend_from_slice(b"3 0 obj\n[1 0]\nendobj\n");
+        let off4 = pdf.len();
+        pdf.extend_from_slice(b"4 0 obj\n<< /Type /Catalog /Pages 5 0 R >>\nendobj\n");
+        let off5 = pdf.len();
+        pdf.extend_from_slice(b"5 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+        let xref_off = pdf.len();
+        let xref = alloc::format!(
+            "xref\n0 6\n0000000000 65535 f \n{off1:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n{off4:010} 00000 n \n{off5:010} 00000 n \ntrailer\n<< /Size 6 /Root 4 0 R >>\nstartxref\n{xref_off}\n%%EOF\n",
+            off2 + 3,
+            off3 + 3,
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+
+        let pdf = crate::Pdf::new(pdf).unwrap();
+        assert!(!pdf.xref().is_repaired());
+        let stream = pdf
+            .xref()
+            .get::<Stream<'_>>(crate::object::ObjectIdentifier::new(1, 0))
+            .unwrap();
+        assert!(matches!(
+            stream.decoded_data(),
+            Err(super::DecodeFailure::StreamDecode)
+        ));
+        assert!(matches!(
+            stream.decoded_page_content(),
+            Err(super::DecodeFailure::StreamDecode)
+        ));
+        #[cfg(feature = "images")]
+        assert!(matches!(
+            stream.decoded_image_samples(&super::ImageDecodeParams::default(), true),
+            Err(super::DecodeFailure::StreamDecode)
+        ));
+        assert!(!pdf.xref().is_repaired());
     }
 }
