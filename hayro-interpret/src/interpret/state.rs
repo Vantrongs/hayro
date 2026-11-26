@@ -13,7 +13,7 @@ use hayro_syntax::content::ops::{LineCap, LineJoin};
 use hayro_syntax::object::dict::keys::{FONT, SMASK, TR, TR2};
 use hayro_syntax::object::{Array, Dict, Name, Number, Object};
 use hayro_syntax::page::Resources;
-use kurbo::{Affine, BezPath, Vec2};
+use kurbo::{Affine, Vec2};
 use smallvec::smallvec;
 use std::ops::Deref;
 
@@ -138,8 +138,6 @@ pub(crate) struct TextState<'a> {
 
     pub(crate) text_matrix: Affine,
     pub(crate) text_line_matrix: Affine,
-
-    pub(crate) clip_paths: BezPath,
 }
 
 impl<'a> TextState<'a> {
@@ -235,7 +233,6 @@ impl Default for TextState<'_> {
             text_matrix: Affine::IDENTITY,
             text_line_matrix: Affine::IDENTITY,
             rise: 0.0,
-            clip_paths: BezPath::default(),
         }
     }
 }

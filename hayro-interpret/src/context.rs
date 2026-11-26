@@ -59,6 +59,7 @@ pub struct Context<'a> {
     pub(crate) settings: InterpreterSettings,
     pub(crate) interpreter_cache: InterpreterCache<'a>,
     pub(crate) xref: &'a XRef,
+    pub(crate) text_clip: Option<BezPath>,
     pub(crate) ocg_state: OcgState,
     nesting_depth: u32,
     pub(crate) shape_paints: Option<(Paint<'a>, Paint<'a>)>,
@@ -76,7 +77,11 @@ impl<'a> Context<'a> {
     ) -> Self {
         let state = State::new(initial_transform);
 
-        Self::new_with(initial_transform, bbox, cache, xref, settings, state, 0)
+        let mut context = Self::new_with(initial_transform, bbox, cache, xref, settings, state, 0);
+        context.ocg_state.viewing = xref.get::<Dict<'_>>(xref.root_id()).map(|catalog| {
+            std::rc::Rc::new(crate::ocg::ViewingState::from_catalog(xref, &catalog))
+        });
+        context
     }
 
     pub(crate) fn new_with(
@@ -88,13 +93,6 @@ impl<'a> Context<'a> {
         state: State<'a>,
         nesting_depth: u32,
     ) -> Self {
-        let ocg_state = {
-            let root_ref = xref.root_id();
-            xref.get::<Dict<'_>>(root_ref)
-                .map(|catalog| OcgState::from_catalog(&catalog))
-                .unwrap_or_default()
-        };
-
         Self {
             stack: StateStack::new(state),
             settings,
@@ -106,7 +104,8 @@ impl<'a> Context<'a> {
             bbox: vec![bbox],
             path: BezPath::new(),
             interpreter_cache: cache.clone(),
-            ocg_state,
+            text_clip: None,
+            ocg_state: OcgState::default(),
             nesting_depth,
             shape_paints: None,
             glyph_scratch: Vec::new(),

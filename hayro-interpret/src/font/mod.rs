@@ -88,6 +88,7 @@ impl<'run, 'a> GlyphRun<'run, 'a> {
 /// A type3 glyph.
 #[derive(Clone)]
 pub struct Type3Glyph<'a> {
+    pub(crate) viewing: Option<std::rc::Rc<crate::ocg::ViewingState>>,
     pub(crate) glyph: hayro_font::Type3Glyph<'a>,
     pub(crate) state: State<'a>,
     pub(crate) stroke_paint: Paint<'a>,
@@ -162,6 +163,7 @@ pub(crate) fn get_glyph<'a>(
             let nesting_depth = ctx.nesting_depth() + 1;
 
             Glyph::Type3(Box::new(Type3Glyph {
+                viewing: ctx.ocg_state.viewing.clone(),
                 stroke_paint: ctx.get_paint(true),
                 glyph,
                 state: ctx.snapshot(),

@@ -63,6 +63,7 @@ pub(crate) fn render_glyph<'a>(
         glyph.nesting_depth,
     );
 
+    context.ocg_state.viewing.clone_from(&glyph.viewing);
     let resources = program
         .dict()
         .get(RESOURCES)

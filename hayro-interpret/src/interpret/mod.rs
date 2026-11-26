@@ -184,6 +184,8 @@ pub fn interpret<'a>(
     context: &mut Context<'a>,
     device: &mut impl Device<'a>,
 ) {
+    let outer_text_clip = context.text_clip.take();
+    let floor = context.ocg_state.open();
     let num_states = context.num_states();
     let mut font_dict_cache = FxHashMap::<Name<'a>, Dict<'a>>::default();
 
@@ -430,18 +432,15 @@ pub fn interpret<'a>(
                     .and_then(|name| resources.properties.get::<Dict<'_>>(name))
                     .or_else(|| dict_or_stream(bdc.1).map(|(props, _)| props.clone()));
 
-                let oc = bdc.1.clone().into_name().and_then(|name| {
-                    let r = resources.properties.get_ref(name.as_ref())?;
-                    let d = resources
-                        .properties
-                        .get::<Dict<'_>>(name)
-                        .unwrap_or_default();
-                    Some((d, r))
-                });
-
-                if let Some((dict, oc_ref)) = oc {
-                    context.ocg_state.begin_ocg(&dict, oc_ref.into());
-                } else {
+                let begun = bdc.0.as_ref() == b"OC"
+                    && bdc.1.clone().into_name().is_some_and(|name| {
+                        context.ocg_state.begin_named(
+                            context.xref,
+                            &resources.properties,
+                            name.as_ref(),
+                        )
+                    });
+                if !begun && properties.is_some() {
                     context.ocg_state.begin_marked_content();
                 }
 
@@ -474,15 +473,11 @@ pub fn interpret<'a>(
                 context.text_state_mut().text_matrix = m;
             }
             TypedInstruction::EndText(_) => {
-                let has_outline = context.text_state().clip_paths.segments().next().is_some();
-
-                if has_outline {
-                    let clip_path = context.ctm() * context.text_state().clip_paths.clone();
-
+                if let Some(clip_path) = context.text_clip.take()
+                    && context.text_state().render_mode.clips()
+                {
                     context.push_clip_path(clip_path, FillRule::NonZero, device);
                 }
-
-                context.text_state_mut().clip_paths.truncate(0);
             }
             TypedInstruction::TextFont(t) => {
                 let name = t.0;
@@ -654,6 +649,8 @@ pub fn interpret<'a>(
         }
     }
 
+    context.text_clip = outer_text_clip;
+    context.ocg_state.close(floor);
     // A pending path, including `W`/`W*`, can't continue past its content stream.
     context.path_mut().truncate(0);
     *(context.clip_mut()) = None;

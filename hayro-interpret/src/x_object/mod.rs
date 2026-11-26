@@ -60,15 +60,5 @@ impl<'a> XObject<'a> {
 }
 
 fn xobject_oc(dict: &Dict<'_>, context: &mut Context<'_>) -> bool {
-    let Some(oc_dict) = dict.get::<Dict<'_>>(OC) else {
-        return false;
-    };
-
-    if let Some(oc_ref) = dict.get_ref(OC) {
-        context.ocg_state.begin_ocg(&oc_dict, oc_ref.into());
-    } else {
-        context.ocg_state.begin_ocmd(&oc_dict);
-    }
-
-    true
+    context.ocg_state.begin_named(context.xref, dict, OC)
 }
