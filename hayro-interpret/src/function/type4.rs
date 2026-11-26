@@ -29,19 +29,28 @@ impl Type4 {
     pub(crate) fn evaluator(&self) -> impl FnMut(&[f32], &mut [f32]) -> Option<()> + '_ {
         let mut stack = Stack::new();
 
-        move |input, output| {
-            let len = input.len();
-            stack.values.get_mut(..len)?.copy_from_slice(input);
-            stack.bools[..len].fill(false);
-            stack.len = len;
+        move |input, output| self.eval(input, output, &mut stack)
+    }
 
-            execute(&self.code, &mut stack)?;
-
-            let values = &stack.values[..stack.len];
-            output.copy_from_slice(values.get(values.len().checked_sub(output.len())?..)?);
-
-            Some(())
+    pub(crate) fn eval_one(&self, x: f32, output: &mut [f32]) -> Option<()> {
+        thread_local! {
+            static STACK: std::cell::RefCell<Stack> = const { std::cell::RefCell::new(Stack::new()) };
         }
+        STACK.with_borrow_mut(|stack| self.eval(&[x], output, stack))
+    }
+
+    fn eval(&self, input: &[f32], output: &mut [f32], stack: &mut Stack) -> Option<()> {
+        let len = input.len();
+        stack.values.get_mut(..len)?.copy_from_slice(input);
+        stack.bools[..len].fill(false);
+        stack.len = len;
+
+        execute(&self.code, stack)?;
+
+        let values = &stack.values[..stack.len];
+        output.copy_from_slice(values.get(values.len().checked_sub(output.len())?..)?);
+
+        Some(())
     }
 }
 
@@ -52,7 +61,7 @@ struct Stack {
 }
 
 impl Stack {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             values: [0.0; MAX_STACK_DEPTH],
             bools: [false; MAX_STACK_DEPTH],
@@ -427,6 +436,18 @@ mod tests {
         program.push_str(&" if }".repeat(depth - 1));
 
         program.into_bytes()
+    }
+
+    #[test]
+    fn single_samples_reset_stack_depth_and_operand_types() {
+        let calc = |program: &[u8]| Type4 {
+            code: parse_procedure(program).unwrap(),
+        };
+        let mut out = [0.0];
+        calc(b"{ pop true true }").eval_one(0., &mut out).unwrap();
+        assert!(calc(b"{ exch }").eval_one(0., &mut out).is_none());
+        calc(b"{ not }").eval_one(2., &mut out).unwrap();
+        assert_eq!(out, [-3.]);
     }
 
     #[test]

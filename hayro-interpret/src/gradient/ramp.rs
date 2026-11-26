@@ -44,12 +44,7 @@ impl PreparedShading {
     pub fn new(pattern: ShadingPattern) -> Self {
         let encoded = pattern.encode();
         let ramp = match &encoded.shading_type {
-            EncodedShadingType::RadialAxial(g)
-                if !(encoded.color_space.is_device_gray_or_rgb()
-                    && encoded.transfer_function.is_none()) =>
-            {
-                ParameterRamp::new(g, &encoded).map(Arc::new)
-            }
+            EncodedShadingType::RadialAxial(g) => ParameterRamp::new(g, &encoded).map(Arc::new),
             _ => None,
         };
         Self { pattern, ramp }
@@ -75,7 +70,7 @@ const STRIP_COLOR_ERROR: f32 = 2.0 / 255.0 + f32::EPSILON;
 pub(crate) struct ParameterRamp {
     cells: Vec<u16>,
     ranges: Vec<Option<ColorBounds>>,
-    bounded: bool,
+    can_promote: bool,
     native: OnceLock<Option<Vec<SvgGradientStop>>>,
 }
 
@@ -91,7 +86,8 @@ impl ParameterRamp {
         };
         let mut cells = Vec::with_capacity(PARAMETER_CELLS);
         let mut ranges = Vec::new();
-        let mut bounded = true;
+        let mut can_promote =
+            !pattern.color_space.is_device_gray_or_rgb() || pattern.transfer_function.is_some();
         let mut budget = PARAMETER_CELLS * 8;
         let mut pending: SmallVec<[(usize, usize); 16]> = smallvec::smallvec![(0, PARAMETER_CELLS)];
         while let Some((start, end)) = pending.pop() {
@@ -104,7 +100,7 @@ impl ParameterRamp {
                 pending.push((start, mid));
                 continue;
             }
-            bounded &= interval.is_some();
+            can_promote &= interval.is_some();
             if ranges.last() != Some(&interval) {
                 ranges.push(interval);
             }
@@ -117,7 +113,7 @@ impl ParameterRamp {
             .then_some(Self {
                 cells,
                 ranges,
-                bounded,
+                can_promote,
                 native: OnceLock::new(),
             })
     }
@@ -206,7 +202,7 @@ impl EncodedRadialAxialShading {
         let ramp = self.ramp.as_ref()?;
         if !matches!(self.params, RadialAxialParams::Axial { .. })
             || self.extend != [true; 2]
-            || !ramp.bounded
+            || !ramp.can_promote
         {
             return None;
         }
@@ -288,7 +284,7 @@ impl EncodedRadialAxialShading {
     /// Return a gradient whose native table entries reproduce the converted colors within one level.
     pub fn as_raster_gradient(&self, pattern: &EncodedShadingPattern) -> Option<SvgGradient> {
         let ramp = self.ramp.as_ref()?;
-        if self.extend != [true; 2] || !ramp.bounded {
+        if self.extend != [true; 2] || !ramp.can_promote {
             return None;
         }
         let (kind, transform) = self
@@ -353,6 +349,33 @@ mod tests {
     use crate::cache::Cache;
     use crate::shading::Shading;
     use hayro_syntax::object::{Dict, FromBytes};
+
+    #[test]
+    fn direct_color_ramps_reuse_only_constant_cells() {
+        for (space, start, end) in [("DeviceGray", "0", "1"), ("DeviceRGB", "0 1 0", "1 0 0")] {
+            let source = format!(
+                "<< /ShadingType 2 /Coords [0 0 1 1] /Extend [true true]
+                /ColorSpace /{space} /Function << /FunctionType 2 /Domain [0 1]
+                /N 1 /C0 [{start}] /C1 [{end}] >> >>"
+            );
+            let dict = Dict::from_bytes(source.as_bytes()).unwrap();
+            let pattern = ShadingPattern {
+                shading: Arc::new(Shading::new(&dict, None, &Cache::default()).unwrap()),
+                matrix: Affine::IDENTITY,
+                opacity: 1.,
+                transfer_function: None,
+            };
+            let encoded = PreparedShading::new(pattern).encode(Affine::IDENTITY);
+            let EncodedShadingType::RadialAxial(g) = &encoded.shading_type else {
+                unreachable!()
+            };
+            let ramp = g.ramp.as_ref().unwrap();
+            assert_eq!(ramp.get(0.25), Some(encoded.eval_1d(&g.function, 0.25)));
+            assert!(ramp.get(0.5 - f64::EPSILON).is_none());
+            assert!(g.axial_strip(&encoded).is_none());
+            assert!(g.as_raster_gradient(&encoded).is_none());
+        }
+    }
 
     #[test]
     fn unresolved_subtexel_spot_color_uses_exact_parameter_evaluation() {

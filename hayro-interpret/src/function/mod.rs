@@ -36,7 +36,7 @@ impl Interval {
     }
 
     fn map_f64(self, x: f64, to: Self) -> f64 {
-        if self.min == self.max {
+        if self.min == self.max || to.min == to.max {
             return f64::from(to.min);
         }
 
@@ -224,7 +224,7 @@ impl Function {
             FunctionType::Type0(f) => f.eval_1d(x, output),
             FunctionType::Type2(f) => f.eval(x, output),
             FunctionType::Type3(f) => f.eval(x, output)?,
-            FunctionType::Type4(f) => f.evaluator()(&[x as f32], output)?,
+            FunctionType::Type4(f) => f.eval_one(x as f32, output)?,
         }
         self.clamp_output(output);
         Some(())

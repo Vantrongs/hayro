@@ -740,11 +740,13 @@ impl EncodedRadialAxialShading {
     }
 
     pub(crate) fn invariant_y(&self, transform: Affine) -> bool {
-        matches!(self.params,RadialAxialParams::Axial{axis,..} if axis.y==0. && transform.as_coeffs()[2]==0.)
+        let [_, _, c, d, ..] = transform.as_coeffs();
+        matches!(self.params, RadialAxialParams::Axial { axis, .. } if (axis.x == 0. || c == 0.) && (axis.y == 0. || d == 0.))
     }
 
     pub(crate) fn invariant_x(&self, transform: Affine) -> bool {
-        matches!(self.params,RadialAxialParams::Axial{axis,..} if axis.x==0. && transform.as_coeffs()[1]==0.)
+        let [a, b, ..] = transform.as_coeffs();
+        matches!(self.params, RadialAxialParams::Axial { axis, .. } if (axis.x == 0. || a == 0.) && (axis.y == 0. || b == 0.))
     }
 
     fn position(&self, pos: Point) -> Option<f64> {
@@ -1037,6 +1039,40 @@ mod tests {
     use crate::cache::Cache;
     use crate::shading::Shading;
     use hayro_syntax::object::{Dict, FromBytes};
+
+    #[test]
+    fn quarter_turn_axial_texture() {
+        let bbox = Rect::new(0., 0., 4., 5.);
+        for (coords, expected, horizontal) in [
+            ("0 0 8 0", Rect::new(0., 0., 1., 5.), true),
+            ("0 0 0 -8", Rect::new(0., 0., 4., 1.), false),
+        ] {
+            let source = format!(
+                "<< /ShadingType 2 /Coords [{coords}] /ColorSpace /DeviceGray
+                /Function << /FunctionType 2 /Domain [0 1] /N 1 >> >>"
+            );
+            let dict = Dict::from_bytes(source.as_bytes()).unwrap();
+            let pattern = ShadingPattern {
+                shading: Arc::new(Shading::new(&dict, None, &Cache::default()).unwrap()),
+                matrix: Affine::new([0., 1., -1., 0., 0., 0.]),
+                opacity: 1.,
+                transfer_function: None,
+            }
+            .encode();
+            let EncodedShadingType::RadialAxial(g) = &pattern.shading_type else {
+                unreachable!()
+            };
+            assert_eq!(g.texture_bounds(bbox, &pattern), expected);
+            let mut pixels = Vec::new();
+            pattern.sample_texture(bbox, 1., |c| pixels.push(c));
+            for y in 0..5 {
+                for x in 0..4 {
+                    let t = (if horizontal { y } else { x } as f64 + 0.5) / 8.;
+                    assert_eq!(pixels[y * 4 + x], pattern.eval_1d(&g.function, t));
+                }
+            }
+        }
+    }
 
     #[test]
     fn axial_base_transform_normalizes_endpoints() {
