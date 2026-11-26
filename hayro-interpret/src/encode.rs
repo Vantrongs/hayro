@@ -329,6 +329,7 @@ impl EncodedShadingPattern {
                     &shading.shading_type,
                     transform,
                     self,
+                    true,
                     &mut Unmetered,
                 )
                 .expect("unmetered");
@@ -374,6 +375,7 @@ impl EncodedShadingPattern {
                     &s.shading_type,
                     grid.inverse() * self.base_transform.inverse(),
                     self,
+                    true,
                     meter,
                 )?;
                 canvas.emit_rows(bg, meter, f)?;
@@ -411,6 +413,7 @@ impl EncodedShadingPattern {
                     &s.shading_type,
                     self.base_transform.inverse(),
                     self,
+                    false,
                     meter,
                 )?;
                 canvas.pixels.into_iter().for_each(f);
