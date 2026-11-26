@@ -27,11 +27,11 @@ pub(crate) fn decode(
     image_params: &ImageDecodeParams,
 ) -> Option<FilterResult<'static>> {
     let mut rows = JpegRows::new(Cow::Borrowed(data), params, image_params, None)?;
-    if !rows.streaming {
+    let frame_bytes = rows.stride.checked_mul(rows.decoder.dimensions()?.1)?;
+    if !rows.streaming || data.len() >= frame_bytes.div_ceil(16) {
         return rows.decode_whole();
     }
     let mut output = alloc::vec![0; rows.stride.checked_mul(16)?];
-    let frame_bytes = rows.stride.checked_mul(rows.decoder.dimensions()?.1)?;
     let mut hint = Some(frame_bytes);
     let mut samples = Vec::new();
     loop {
@@ -41,7 +41,7 @@ pub(crate) fn decode(
                 samples.extend_from_slice(&output[..n * rows.stride]);
                 super::reserve_observed(&mut samples, &mut hint);
             }
-            None if samples.len().max(data.len()) < frame_bytes.div_ceil(16) => {
+            None if samples.len() < frame_bytes.div_ceil(16) => {
                 return (!samples.is_empty()).then(|| rows.result(samples));
             }
             None => {
