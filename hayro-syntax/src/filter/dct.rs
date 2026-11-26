@@ -9,7 +9,7 @@ use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::colorspace::ColorSpace::CMYK;
 use zune_jpeg::zune_core::options::DecoderOptions;
 
-use alloc::sync::Arc;
+use crate::sync::CancelArc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use zune_jpeg::{JpegDecoder, ScanlineReadStatus, ScanlineStatus};
 
@@ -52,7 +52,7 @@ impl<'a> JpegRows<'a> {
         data: Cow<'a, [u8]>,
         params: &Dict<'_>,
         image_params: &ImageDecodeParams,
-        cancel: Option<Arc<AtomicBool>>,
+        cancel: Option<CancelArc<AtomicBool>>,
     ) -> Option<Self> {
         if image_params.width > u16::MAX as u32 || image_params.height > u16::MAX as u32 {
             return None;

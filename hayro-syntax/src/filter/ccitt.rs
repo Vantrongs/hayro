@@ -24,7 +24,7 @@ impl Fax {
     pub(crate) fn new(
         params: &Dict<'_>,
         height: u32,
-        cancel: Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>,
+        cancel: Option<crate::sync::CancelArc<core::sync::atomic::AtomicBool>>,
     ) -> Self {
         let k = params.get::<i32>(K).unwrap_or(0);
 

@@ -1003,3 +1003,26 @@ fn strings_of_an_encrypted_file_are_copied_decrypted() {
     let item = listed.iter::<hayro_syntax::object::String<'_>>().next();
     assert_eq!(item.unwrap().as_bytes(), b"a\r\n)b\xff");
 }
+
+#[test]
+fn a_self_carried_resource_reports_its_object_number() {
+    let source = Pdf::new(fixtures::stream_table(
+        &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources 5 0 R >>"
+                    .to_vec(),
+            ),
+        ],
+        &[(5, 5, 0)],
+        false,
+    ))
+    .unwrap();
+    for query in page_queries(0, [200.0, 200.0]) {
+        assert!(
+            matches!(run(&source, &[query]), Err(ExtractionError::UnreadablePage(0, id)) if id == ObjRef::new(5, 0))
+        );
+    }
+}

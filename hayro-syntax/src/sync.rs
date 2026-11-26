@@ -1,6 +1,5 @@
-// Keep in sync with the implementation in `page`.
 #[cfg(feature = "std")]
-pub(crate) use std::sync::Arc;
+pub(crate) use alloc::sync::Arc;
 
 #[cfg(not(feature = "std"))]
 pub(crate) use alloc::rc::Rc as Arc;
@@ -85,3 +84,8 @@ impl<T> RwLockExt<T> for RwLock<T> {
         self.borrow_mut()
     }
 }
+
+#[cfg(not(target_has_atomic = "ptr"))]
+pub(crate) use alloc::rc::Rc as CancelArc;
+#[cfg(target_has_atomic = "ptr")]
+pub(crate) use alloc::sync::Arc as CancelArc;

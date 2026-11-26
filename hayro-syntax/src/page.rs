@@ -591,12 +591,7 @@ pub(crate) mod cached {
     use crate::xref::XRef;
     use core::ops::Deref;
 
-    // Keep in sync with the `sync` module.
-    #[cfg(feature = "std")]
-    pub(crate) use std::sync::Arc;
-
-    #[cfg(not(feature = "std"))]
-    pub(crate) use alloc::rc::Rc as Arc;
+    use crate::sync::Arc;
 
     pub(crate) struct CachedPages {
         pages: Pages<'static>,

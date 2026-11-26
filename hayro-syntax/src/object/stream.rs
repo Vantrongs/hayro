@@ -16,11 +16,11 @@ use crate::reader::Reader;
 use crate::reader::{
     Ends, Readable, ReaderContext, ReaderExt, Skippable, Unknown, skip_white_spaces_and_comments_in,
 };
+use crate::sync::{Arc, CancelArc};
 use crate::trivia::is_white_space_character;
 use crate::util::find_needle;
 use crate::xref::XRef;
 use alloc::borrow::Cow;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
 use core::sync::atomic::AtomicBool;
@@ -313,7 +313,7 @@ impl<'a> Stream<'a> {
     pub fn fax_image(
         &self,
         params: &ImageDecodeParams,
-        cancel: Option<Arc<AtomicBool>>,
+        cancel: Option<CancelArc<AtomicBool>>,
     ) -> Option<FilterResult<'static>> {
         let mut prefix = self.filters_and_params();
         if prefix.filters.pop() != Some(Filter::CcittFaxDecode) {
@@ -329,7 +329,7 @@ impl<'a> Stream<'a> {
     fn image_input(
         &self,
         prefix: &FiltersAndParams<'_>,
-        cancel: Option<Arc<AtomicBool>>,
+        cancel: Option<CancelArc<AtomicBool>>,
     ) -> Option<Cow<'a, [u8]>> {
         if prefix.filters.is_empty() {
             self.try_raw_data().ok()
@@ -343,7 +343,7 @@ impl<'a> Stream<'a> {
     pub fn jpeg_rows(
         &self,
         params: &ImageDecodeParams,
-        cancel: Option<Arc<AtomicBool>>,
+        cancel: Option<CancelArc<AtomicBool>>,
     ) -> Option<JpegRows<'a>> {
         let mut prefix = self.filters_and_params();
         if prefix.filters.pop() != Some(Filter::DctDecode) {
@@ -357,32 +357,24 @@ impl<'a> Stream<'a> {
     /// Opens a forward reader of the stream's data filters.
     pub fn decoded_reader(
         &self,
-        cancel: Option<Arc<AtomicBool>>,
+        cancel: Option<CancelArc<AtomicBool>>,
     ) -> Result<DecodedReader<'a>, DecodeFailure> {
-        self.forward(&self.filters_and_params(), cancel, &[], false)
+        self.forward(&self.filters_and_params(), cancel, false)
     }
 
     fn forward(
         &self,
         filters: &FiltersAndParams<'_>,
-        cancel: Option<Arc<AtomicBool>>,
-        raw: &[(usize, crate::filter::forward::FlateMode)],
+        cancel: Option<CancelArc<AtomicBool>>,
         strict: bool,
     ) -> Result<DecodedReader<'a>, DecodeFailure> {
-        if matches!(
-            self.dict.get::<Object<'_>>(F),
-            Some(Object::String(_) | Object::Dict(_))
-        ) {
-            return Err(DecodeFailure::StreamDecode);
-        }
-
         let mut reader = DecodedReader::new(self.decrypted_reader()?, cancel, strict);
         for (i, (filter, params)) in filters.filters.iter().zip(&filters.params).enumerate() {
             if i == 0 && *filter == Filter::Crypt {
                 continue;
             }
             reader
-                .add(*filter, params, raw)
+                .add(*filter, params, None)
                 .ok_or(DecodeFailure::StreamDecode)?;
         }
         Ok(reader)
@@ -392,10 +384,7 @@ impl<'a> Stream<'a> {
     pub fn decoded_strict(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
         let filters = self.filters_and_params();
         if filters.filters.is_empty()
-            && !matches!(
-                self.dict.get::<Object<'_>>(F),
-                Some(Object::String(_) | Object::Dict(_))
-            )
+            && !self.has_external_file()
             && !self.dict.ctx().xref().needs_decryption(self.dict.ctx())
         {
             return Ok(Cow::Borrowed(self.data));
@@ -407,24 +396,52 @@ impl<'a> Stream<'a> {
         &self,
         filters: &FiltersAndParams<'_>,
         strict: bool,
-        cancel: Option<Arc<AtomicBool>>,
+        cancel: Option<CancelArc<AtomicBool>>,
     ) -> Result<Cow<'a, [u8]>, DecodeFailure> {
-        let mut raw = Vec::new();
-        loop {
-            let mut reader = self.forward(filters, cancel.clone(), &raw, strict)?;
-            match reader.collect_strict() {
-                Err(_) if reader.retry().is_some() => {
-                    let (index, mode) = reader.retry().unwrap();
-                    raw.retain(|&(i, _)| i < index);
-                    raw.push((index, mode));
-                }
-                result => return result.map(Cow::Owned),
-            }
+        let mut reader = self.forward(filters, cancel.clone(), strict)?;
+        match reader.collect_strict() {
+            Err(DecodeFailure::StreamDecode) if reader.retry().is_some() => {}
+            result => return result.map(Cow::Owned),
         }
+        drop(reader);
+        // After a failed streaming pass, keep the input of just the stage being retried.
+        let mut data = self.try_raw_data()?;
+        for (i, (&filter, params)) in filters.filters.iter().zip(&filters.params).enumerate() {
+            if i == 0 && filter == Filter::Crypt {
+                continue;
+            }
+            let mut mode = None;
+            data = Cow::Owned(loop {
+                let mut stage =
+                    DecodedReader::new(DecryptedReader::plain(&data), cancel.clone(), strict);
+                stage
+                    .add(filter, params, mode)
+                    .ok_or(DecodeFailure::StreamDecode)?;
+                match stage.collect_strict() {
+                    Ok(result) => break result,
+                    Err(DecodeFailure::StreamDecode) if stage.retry().is_some() => {
+                        mode = stage.retry();
+                    }
+                    Err(error) => return Err(error),
+                }
+            });
+        }
+        Ok(data)
+    }
+
+    /// Whether a file specification supplies the stream's data.
+    pub fn has_external_file(&self) -> bool {
+        matches!(
+            self.dict.get::<Object<'_>>(F),
+            Some(Object::String(_) | Object::Dict(_))
+        )
     }
 
     /// Opens the stored bytes for incremental decryption.
     pub fn decrypted_reader(&self) -> Result<DecryptedReader<'a>, DecodeFailure> {
+        if self.has_external_file() {
+            return Err(DecodeFailure::StreamDecode);
+        }
         let ctx = self.dict.ctx();
         let encrypted = self.dict.obj_id().is_some()
             && ctx.xref().needs_decryption(ctx)
@@ -449,10 +466,7 @@ impl<'a> Stream<'a> {
 
     /// Decrypted stream bytes or a decryption error.
     pub fn try_raw_data(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
-        if matches!(
-            self.dict.get::<Object<'_>>(F),
-            Some(Object::String(_) | Object::Dict(_))
-        ) {
+        if self.has_external_file() {
             return Err(DecodeFailure::StreamDecode);
         }
         let ctx = self.dict.ctx();
@@ -509,10 +523,7 @@ impl<'a> Stream<'a> {
 
     /// Read a text field value that is unfiltered or Flate-compressed, rejecting corrupt data.
     pub fn decoded_field_value(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
-        if matches!(
-            self.dict.get::<Object<'_>>(F),
-            Some(Object::String(_) | Object::Dict(_))
-        ) {
+        if self.has_external_file() {
             return Err(DecodeFailure::StreamDecode);
         }
         let chain = self.filters_and_params();
@@ -556,10 +567,7 @@ impl<'a> Stream<'a> {
     }
 
     fn decode(&self, target: DecodeTarget<'_>) -> Result<FilterResult<'a>, DecodeFailure> {
-        if matches!(
-            self.dict.get::<Object<'_>>(F),
-            Some(Object::String(_) | Object::Dict(_))
-        ) {
+        if self.has_external_file() {
             return Err(DecodeFailure::StreamDecode);
         }
 
@@ -639,7 +647,7 @@ impl<'a> Stream<'a> {
     /// Owns the data needed to reopen this stream.
     pub fn to_owned_stream(&self) -> OwnedStream {
         let ctx = self.dict.ctx();
-        OwnedStream(match self.dict.obj_id() {
+        OwnedStream(match self.dict.obj_id().and_then(|_| ctx.lookup_id()) {
             Some(id) => OwnedInner::Indirect {
                 xref: ctx.xref().clone(),
                 id,

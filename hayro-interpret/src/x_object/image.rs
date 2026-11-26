@@ -232,7 +232,7 @@ impl<'a> ImageXObject<'a> {
 
     pub(crate) fn pixels_key(&self) -> Option<u128> {
         let dict = self.stream.dict();
-        let id = dict.obj_id()?;
+        dict.obj_id()?;
         if dict
             .get::<Name<'_>>(CS)
             .or_else(|| dict.get::<Name<'_>>(COLORSPACE))
@@ -246,7 +246,7 @@ impl<'a> ImageXObject<'a> {
             return None;
         }
         Some(crate::util::hash128(&(
-            id,
+            dict.content_key(),
             self.kind,
             &self.transfer_function,
         )))

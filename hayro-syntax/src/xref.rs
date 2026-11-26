@@ -614,6 +614,11 @@ impl XRef {
             EntryType::ObjStream(n, i) => {
                 let carrier = ObjectIdentifier::new(n, 0);
                 if carrier == id {
+                    if !repaired {
+                        self.repair();
+                        return self.content_key(id);
+                    }
+                    self.note(Some(id));
                     return None;
                 }
                 let (stream, lost) = self.apart(|| r.data.object_stream(carrier, repaired, &ctx));
@@ -755,6 +760,7 @@ impl XRef {
         let (entry, was_repaired, next) = repr.map.get().location(id, self)?;
         let caller_ctx = ctx;
         let mut ctx = ctx.clone();
+        ctx.set_lookup_id(id);
         ctx.set_obj_number(id);
         ctx.set_in_content_stream(false);
 
@@ -808,7 +814,7 @@ impl XRef {
                 let obj_stream_id = ObjectIdentifier::new(obj_stram_gen_num, 0);
 
                 if obj_stream_id == id {
-                    return None;
+                    return self.repair_and_get(id, caller_ctx, was_repaired);
                 }
 
                 if !matches!(
@@ -1412,8 +1418,9 @@ impl ObjectStream {
         };
         let end = self
             .offsets
-            .get(index as usize + 1)
-            .and_then(|e| e.1)
+            .get(index as usize + 1..)?
+            .iter()
+            .find_map(|e| e.1)
             .unwrap_or(self.data.len());
         let mut r = Reader::new_with(&self.data[..end], offset);
         let mut ctx = ctx.clone();

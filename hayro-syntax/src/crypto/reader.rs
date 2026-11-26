@@ -32,6 +32,15 @@ impl Cipher {
 }
 
 impl<'a> DecryptedReader<'a> {
+    pub(crate) fn plain(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            cipher: Cipher::Plain,
+            pos: 0,
+            end: data.len(),
+        }
+    }
+
     pub(crate) fn new(
         data: &'a [u8],
         decryptor: &Decryptor,

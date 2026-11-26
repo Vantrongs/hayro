@@ -166,6 +166,7 @@ struct ReaderContextData<'a> {
     in_content_stream: bool,
     in_object_stream: bool,
     obj_number: Option<ObjectIdentifier>,
+    lookup_id: Option<ObjectIdentifier>,
     storage: core::ops::Range<usize>,
     cut: Option<u8>,
     parent_chain: SmallVec<[ObjectIdentifier; 8]>,
@@ -187,6 +188,7 @@ impl<'a> ReaderContext<'a> {
             xref,
             in_content_stream,
             obj_number: None,
+            lookup_id: None,
             in_object_stream: false,
             storage: 0..0,
             cut: None,
@@ -277,6 +279,19 @@ impl<'a> ReaderContext<'a> {
     }
 
     #[inline]
+    pub(crate) fn lookup_id(&self) -> Option<ObjectIdentifier> {
+        match &self.0 {
+            ReaderContextInner::Shared(inner) => inner.lookup_id.or(inner.obj_number),
+            ReaderContextInner::Dummy { .. } => None,
+        }
+    }
+
+    pub(crate) fn set_lookup_id(&mut self, id: ObjectIdentifier) {
+        if let ReaderContextInner::Shared(inner) = &mut self.0 {
+            Arc::make_mut(inner).lookup_id = Some(id);
+        }
+    }
+
     pub(crate) fn set_obj_number(&mut self, id: ObjectIdentifier) {
         match &mut self.0 {
             ReaderContextInner::Shared(inner) => Arc::make_mut(inner).obj_number = Some(id),

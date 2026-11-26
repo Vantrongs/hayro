@@ -1,6 +1,10 @@
 //! Invariants of transactional decoding and its filter stages.
+#[path = "common/allocations.rs"]
+mod allocations;
 #[path = "forward/chains.rs"]
 mod chains;
+#[path = "common/cpu_time.rs"]
+mod cpu_time;
 #[path = "forward/fixtures.rs"]
 mod fixtures;
 use chains::{Rng, ascii_hex, damaged, data, layer, zlib};
@@ -30,7 +34,6 @@ fn object_3(pdf: &Pdf) -> Stream<'_> {
 #[test]
 fn the_reader_reads_what_strict_decoding_returns() {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-    let mut successes = 0;
     for case in 0..3000 {
         let mut encoded = data(&mut rng);
         let mut stages = Vec::new();
@@ -64,9 +67,7 @@ fn the_reader_reads_what_strict_decoding_returns() {
             actual.as_ref().map(|v| v.len()),
             expected.as_ref().map(Vec::len)
         );
-        successes += usize::from(actual.is_some());
     }
-    println!("{successes} accepted, {} rejected", 3000 - successes);
 }
 
 #[test]
@@ -172,4 +173,56 @@ fn malformed_huffman_tables_are_rejected() {
         );
         assert!(output.is_empty());
     }
+}
+
+#[test]
+fn strict_filters_require_complete_packets() {
+    for (filter, data, expected) in [
+        ("/Fl", vec![], None),
+        ("/Fl", zlib(b"", 6), Some(&b""[..])),
+        ("/RL", vec![2, b'a'], None),
+        ("/RL", vec![2, b'a', b'b', b'c', 128], Some(&b"abc"[..])),
+    ] {
+        let pdf = stream_file(&format!("/Filter {filter}"), &data);
+        assert_eq!(object_3(&pdf).decoded_strict().ok().as_deref(), expected);
+    }
+}
+
+#[test]
+fn flate_recovery_work_grows_with_the_number_of_stages() {
+    let input = noise(16_384, 73);
+    let cost = |count| {
+        let mut encoded = input.clone();
+        for _ in 0..count {
+            encoded = stored_zlib(&encoded, 65535);
+            *encoded.last_mut().unwrap() ^= 1;
+        }
+        let pdf = stream_file(
+            &format!("/Filter [{}]", vec!["/Fl"; count].join(" ")),
+            &encoded,
+        );
+        let stream = object_3(&pdf);
+        let mut times = [std::time::Duration::ZERO; 5];
+        let mut allocated = 0;
+        for time in &mut times {
+            let start = cpu_time::thread_cpu_time();
+            let (decoded, work) = allocations::measure(|| stream.decoded_strict().unwrap());
+            *time = cpu_time::thread_cpu_time() - start;
+            assert_eq!(decoded.as_ref(), input);
+            allocated = work.allocated;
+        }
+        times.sort();
+        (allocated, times[2])
+    };
+    // Each pass through a stage allocates an inflater and its output.
+    let small = cost(4);
+    let large = cost(16);
+    assert!(
+        large.0 < 6 * small.0,
+        "stage allocations: {small:?}, {large:?}"
+    );
+    assert!(
+        large.1 < 8 * small.1,
+        "stage decoding time: {small:?}, {large:?}"
+    );
 }

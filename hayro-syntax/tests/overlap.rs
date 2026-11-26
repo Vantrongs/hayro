@@ -6,6 +6,7 @@ use hayro_syntax::object::{Array, Dict, Name, Number, ObjectIdentifier, Rect};
 
 mod common;
 use common::allocations::measure;
+use common::stream_table;
 
 const CATALOG: &[u8] = b"<< /Type /Catalog /Pages 2 0 R >>";
 
@@ -45,49 +46,6 @@ fn table_file(
     out.extend(
         format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{start}\n%%EOF\n").bytes(),
     );
-    out
-}
-
-/// A file of `objects`, each at its number, with a cross-reference stream that puts
-/// each of `compressed`, (number, stream, index), in an object stream; where
-/// `broken`, `startxref` leads to no table, which rebuilds it.
-fn stream_table(
-    objects: &[(u32, Vec<u8>)],
-    compressed: &[(u32, u32, u32)],
-    broken: bool,
-) -> Vec<u8> {
-    let mut out = b"%PDF-1.7\n".to_vec();
-    let mut entries = std::collections::BTreeMap::new();
-    for (number, body) in objects {
-        entries.insert(*number, (1_u8, out.len() as u32, 0_u16));
-        out.extend(format!("{number} 0 obj\n").bytes());
-        out.extend(body);
-        out.extend(b"\nendobj\n");
-    }
-    for &(number, stream, index) in compressed {
-        entries.insert(number, (2, stream, index as u16));
-    }
-    let table = entries.keys().max().unwrap() + 1;
-    let at = out.len();
-    entries.insert(table, (1, at as u32, 0));
-    let mut rows = vec![];
-    for number in 0..=table {
-        let (kind, field, index) = entries.get(&number).copied().unwrap_or((0, 0, 0));
-        rows.push(kind);
-        rows.extend(field.to_be_bytes());
-        rows.extend(index.to_be_bytes());
-    }
-    out.extend(
-        format!(
-            "{table} 0 obj\n<< /Type /XRef /Size {} /W [1 4 2] /Root 1 0 R /Length {} >>\nstream\n",
-            table + 1,
-            rows.len()
-        )
-        .bytes(),
-    );
-    out.extend(rows);
-    let start = if broken { 9 } else { at };
-    out.extend(format!("\nendstream\nendobj\nstartxref\n{start}\n%%EOF\n").bytes());
     out
 }
 
@@ -893,4 +851,79 @@ fn watches_and_memo_report_the_requested_alias_in_its_document() {
     let (value, replay) = xref.watch(|| *memo.get(xref, 1, || panic!("recomputed")));
     assert_eq!(value, None);
     assert_eq!(replay, first);
+}
+
+#[test]
+fn reopening_an_aliased_image_keeps_the_addressed_revision() {
+    use hayro_syntax::object::Stream;
+    let image = |pixel| {
+        common::stream(
+            "/Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray",
+            &[pixel],
+        )
+    };
+    let mut revisions = Vec::new();
+    let mut offsets = Vec::new();
+    for pixel in [17, 42] {
+        offsets.push(revisions.len());
+        revisions.extend(b"4 0 obj\n");
+        revisions.extend(image(pixel));
+        revisions.extend(b"\nendobj\n");
+    }
+    let pdf = Pdf::new(table_file(
+        &one_page(10, "1"),
+        &revisions,
+        &[(4, offsets[1]), (5, offsets[0])],
+        false,
+    ))
+    .unwrap();
+    for (number, expected) in [(5, 17), (4, 42)] {
+        let stream = pdf.xref().get::<Stream<'_>>(id(number)).unwrap();
+        let owned = stream.to_owned_stream();
+        for s in [stream, owned.get().unwrap()] {
+            assert_eq!(s.obj_id(), id(4));
+            assert_eq!(
+                &*s.decoded_image(&hayro_syntax::object::stream::ImageDecodeParams::default())
+                    .unwrap()
+                    .data,
+                &[expected]
+            );
+        }
+    }
+}
+
+#[test]
+fn self_carried_object_reports_the_listed_number() {
+    let pdf = Pdf::new(stream_table(&one_page(10, "5 0 R"), &[(5, 5, 0)], false)).unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            pdf.xref().watch(|| pdf.xref().content_key(id(5)).is_some()),
+            (false, Some(id(5)))
+        );
+        assert_eq!(
+            pdf.xref().watch(|| pdf.xref().get::<f32>(id(5))),
+            (None, Some(id(5)))
+        );
+    }
+}
+
+#[test]
+fn invalid_intermediate_slot_preserves_the_next_read_boundary() {
+    let mut objects = one_page(10, "5 0 R");
+    let header = "5 0 6 999 7 1 ";
+    objects.push((
+        4,
+        common::stream(
+            &format!("/Type /ObjStm /N 3 /First {}", header.len()),
+            format!("{header}12").as_bytes(),
+        ),
+    ));
+    assert_eq!(
+        unit(stream_table(
+            &objects,
+            &[(5, 4, 0), (6, 4, 1), (7, 4, 2)],
+            false
+        )),
+        (None, Some(id(5)))
+    );
 }

@@ -130,3 +130,46 @@ pub(crate) fn cut_row_content_stream() -> Vec<u8> {
         &stored_zlib(&rows, 64),
     )
 }
+
+/// A file of `objects`, each at its number, with a cross-reference stream that puts
+/// each of `compressed`, (number, stream, index), in an object stream; where
+/// `broken`, `startxref` leads to no table, which rebuilds it.
+pub(crate) fn stream_table(
+    objects: &[(u32, Vec<u8>)],
+    compressed: &[(u32, u32, u32)],
+    broken: bool,
+) -> Vec<u8> {
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut entries = std::collections::BTreeMap::new();
+    for (number, body) in objects {
+        entries.insert(*number, (1_u8, out.len() as u32, 0_u16));
+        out.extend(format!("{number} 0 obj\n").bytes());
+        out.extend(body);
+        out.extend(b"\nendobj\n");
+    }
+    for &(number, stream, index) in compressed {
+        entries.insert(number, (2, stream, index as u16));
+    }
+    let table = entries.keys().max().unwrap() + 1;
+    let at = out.len();
+    entries.insert(table, (1, at as u32, 0));
+    let mut rows = vec![];
+    for number in 0..=table {
+        let (kind, field, index) = entries.get(&number).copied().unwrap_or((0, 0, 0));
+        rows.push(kind);
+        rows.extend(field.to_be_bytes());
+        rows.extend(index.to_be_bytes());
+    }
+    out.extend(
+        format!(
+            "{table} 0 obj\n<< /Type /XRef /Size {} /W [1 4 2] /Root 1 0 R /Length {} >>\nstream\n",
+            table + 1,
+            rows.len()
+        )
+        .bytes(),
+    );
+    out.extend(rows);
+    let start = if broken { 9 } else { at };
+    out.extend(format!("\nendstream\nendobj\nstartxref\n{start}\n%%EOF\n").bytes());
+    out
+}

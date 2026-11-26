@@ -548,9 +548,7 @@ fn entries_leading_to_one_image_copy_it_once() {
                 "refers {refers}, {n} entries: {work} ns and {written} bytes written \
                  for {size} bytes"
             );
-            eprintln!(
-                "refers {refers}, {n} entries: {work} ns, {written} bytes written for {size}"
-            );
+
             (work, written)
         });
         assert!(
@@ -653,7 +651,7 @@ fn a_page_listed_many_times_is_copied_once() {
             written <= 4 * size,
             "{n} pages: {work} ns and {written} bytes written for {size} bytes"
         );
-        eprintln!("{n} pages: {work} ns, {written} bytes written for {size}");
+
         (work, written)
     });
     assert!(

@@ -5,10 +5,11 @@ use super::{Filter, predictor};
 use crate::object::Dict;
 use crate::object::dict::keys::*;
 use crate::object::stream::{DecodeFailure, DecryptedReader};
+use crate::sync::CancelArc;
 use crate::trivia::is_white_space_character;
 #[cfg(not(feature = "unsafe"))]
 use alloc::boxed::Box;
-use alloc::{sync::Arc, vec::Vec};
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(feature = "unsafe"))]
 use miniz_oxide::{
@@ -23,7 +24,7 @@ pub struct DecodedReader<'a> {
     stored: DecryptedReader<'a>,
     layers: Vec<Layer>,
     source: Pending,
-    cancel: Option<Arc<AtomicBool>>,
+    cancel: Option<CancelArc<AtomicBool>>,
     failed: Option<usize>,
     strict: bool,
     inflated: u64,
@@ -89,7 +90,7 @@ struct Predict {
 impl<'a> DecodedReader<'a> {
     pub(crate) fn new(
         stored: DecryptedReader<'a>,
-        cancel: Option<Arc<AtomicBool>>,
+        cancel: Option<CancelArc<AtomicBool>>,
         strict: bool,
     ) -> Self {
         Self {
@@ -107,7 +108,7 @@ impl<'a> DecodedReader<'a> {
         &mut self,
         filter: Filter,
         params: &Dict<'_>,
-        raw_modes: &[(usize, FlateMode)],
+        mode: Option<FlateMode>,
     ) -> Option<()> {
         let codec = match filter {
             #[cfg(feature = "images")]
@@ -131,17 +132,11 @@ impl<'a> DecodedReader<'a> {
                 previous: None,
             },
             Filter::FlateDecode => {
-                let mode = raw_modes
-                    .iter()
-                    .find(|(i, _)| *i == self.layers.len())
-                    .map_or(
-                        if self.strict {
-                            FlateMode::Wrapped
-                        } else {
-                            FlateMode::Detect
-                        },
-                        |e| e.1,
-                    );
+                let mode = mode.unwrap_or(if self.strict {
+                    FlateMode::Wrapped
+                } else {
+                    FlateMode::Detect
+                });
                 Codec::Flate {
                     state: None,
                     mode,
@@ -225,11 +220,15 @@ impl<'a> DecodedReader<'a> {
     pub(crate) fn collect_strict(&mut self) -> Result<Vec<u8>, DecodeFailure> {
         let mut output = Vec::new();
         let mut buffer = [0; BLOCK];
-        for level in (0..=self.layers.len()).rev() {
+        let mut level = self.layers.len();
+        loop {
             loop {
                 let n = match self.pull(level, &mut buffer) {
                     Ok(n) => n,
-                    Err(DecodeFailure::StreamDecode) => break,
+                    Err(DecodeFailure::StreamDecode) => {
+                        level = self.failed.unwrap() + 1;
+                        break;
+                    }
                     Err(e) => return Err(e),
                 };
                 if n == 0 {
@@ -239,6 +238,10 @@ impl<'a> DecodedReader<'a> {
                     output.extend_from_slice(&buffer[..n]);
                 }
             }
+            if level == 0 {
+                break;
+            }
+            level -= 1;
         }
         if self.failed.is_some() {
             Err(DecodeFailure::StreamDecode)
@@ -247,17 +250,17 @@ impl<'a> DecodedReader<'a> {
         }
     }
 
-    pub(crate) fn retry(&self) -> Option<(usize, FlateMode)> {
+    pub(crate) fn retry(&self) -> Option<FlateMode> {
         let i = self.failed?;
         match self.layers[i].codec {
             Codec::Flate {
                 mode: FlateMode::Wrapped,
                 ..
-            } => Some((i, FlateMode::Raw)),
+            } => Some(FlateMode::Raw),
             Codec::Flate {
                 mode: FlateMode::Raw,
                 ..
-            } => Some((i, FlateMode::Detect)),
+            } => Some(FlateMode::Detect),
             _ => None,
         }
     }
@@ -356,7 +359,7 @@ impl Codec {
         } = self
         {
             if state.is_none() && data.is_empty() && eof {
-                return Some((0, true));
+                return (!strict).then_some((0, true));
             }
             let state = state.get_or_insert_with(|| Inflater::new(*mode == FlateMode::Wrapped));
             if !*started {
@@ -490,7 +493,7 @@ impl Codec {
                         out.push(v << 4);
                     }
                 }
-                Self::Base85 { digits: 1, .. } | Self::Run { literal: 0, .. } if strict => {
+                Self::Base85 { digits: 1, .. } | Self::Run { .. } if strict => {
                     return None;
                 }
                 Self::Base85 { value, digits } if *digits > 1 => {

@@ -111,7 +111,18 @@ fn a_content_of_many_filters_is_copied_on_a_small_stack() {
         let entries = format!("/Filter [{}]", [filter].repeat(100_000).join(" "));
         std::thread::Builder::new()
             .stack_size(512 << 10)
-            .spawn(move || copied(page(&entries, b""), b""))
+            .spawn(move || {
+                let bytes = page(&entries, b"");
+                if filter == "/Fl" {
+                    assert!(
+                        Pdf::new(bytes).unwrap().pages()[0]
+                            .try_page_stream()
+                            .is_err()
+                    );
+                } else {
+                    copied(bytes, b"");
+                }
+            })
             .unwrap()
             .join()
             .unwrap();
