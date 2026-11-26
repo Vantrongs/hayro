@@ -6,7 +6,7 @@ use hayro_interpret::gradient::{PreparedShading, SvgGradient, SvgGradientKind};
 use hayro_interpret::pattern::{Pattern, ShadingPattern, TilingPattern};
 use hayro_interpret::{CacheKey, FillRule, Paint, StrokeProps};
 use image::{DynamicImage, ImageBuffer};
-use kurbo::{Affine, Rect};
+use kurbo::{Affine, Join, Rect};
 
 #[derive(Clone)]
 pub(crate) struct CachedTilingPattern<'a> {
@@ -118,9 +118,14 @@ impl<'a> SvgRenderer<'a> {
 
                         let mut basic_bbox = path_bbox();
 
-                        if let Some(stroke_width) = stroke_props.map(|s| s.line_width) {
-                            basic_bbox =
-                                basic_bbox.inflate(stroke_width as f64, stroke_width as f64);
+                        if let Some(stroke) = stroke_props {
+                            let width = f64::from(stroke.line_width);
+                            let pad = if stroke.line_join == Join::Miter {
+                                width * (0.5 * f64::from(stroke.miter_limit)).max(1.0)
+                            } else {
+                                width
+                            };
+                            basic_bbox = basic_bbox.inflate(pad, pad);
                         }
 
                         let bbox = path_transform.transform_rect_bbox(basic_bbox);

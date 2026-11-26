@@ -85,7 +85,7 @@ impl<'a> SvgRenderer<'a> {
                         self.write_stroke_properties(s);
                         self.write_paint(
                             &props.paint,
-                            || outline.bounding_box(),
+                            || glyph_transform.transform_rect_bbox(outline.bounding_box()),
                             paint_transform,
                             Some(s),
                         );
@@ -94,7 +94,7 @@ impl<'a> SvgRenderer<'a> {
                         self.write_stroke_properties(s);
                         self.write_fill_and_stroke_paint(
                             &props.paint,
-                            || outline.bounding_box(),
+                            || glyph_transform.transform_rect_bbox(outline.bounding_box()),
                             paint_transform,
                             s,
                         );

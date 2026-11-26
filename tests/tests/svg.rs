@@ -32,6 +32,8 @@ pub(crate) fn tests() -> Vec<Test> {
             Test::unit("svg::gradient_sample_budget", sample_budget),
             Test::unit("svg::gradient_affine_domain", affine_domain),
             Test::unit("svg::gradient_transfer_pair", transfer_pair),
+            Test::unit("svg::gradient_miter_crop", miter_crop),
+            Test::unit("svg::gradient_glyph_crop", glyph_crop),
             Test::unit("svg::gradient_offpage", offpage),
             Test::unit("svg::collapsed_band", collapsed_band),
             Test::unit("svg::close_stops", close_stops),
@@ -54,7 +56,7 @@ fn scaled_gradient(bytes: &[u8], scale: u32) -> (String, resvg::tiny_skia::Pixma
     let svg = hayro_svg::convert(
         &pdf.pages()[0],
         &Default::default(),
-        &Default::default(),
+        &interpreter_settings(),
         &Default::default(),
     );
     let tree = resvg::usvg::Tree::from_str(&svg, &Default::default()).unwrap();
@@ -209,6 +211,20 @@ fn stitched_band() {
     );
     assert_eq!(image.pixel(1, 8).unwrap().red(), 0);
     assert_eq!(image.pixel(8, 8).unwrap().alpha(), 0);
+}
+
+fn miter_crop() {
+    let (_, image) = scaled_gradient(
+        include_bytes!("../../hayro/tests/gradients/miter_crop.pdf"),
+        4,
+    );
+    assert!(image.pixel(26 * 4, 10 * 4).unwrap().alpha() > 0);
+    assert_eq!(image.pixel(23 * 4, 10 * 4).unwrap().alpha(), 0);
+}
+
+fn glyph_crop() {
+    let (_, image) = gradient(include_bytes!("../../hayro/tests/gradients/glyph_crop.pdf"));
+    assert!((32..56).any(|x| (0..32).any(|y| image.pixel(x, y).unwrap().alpha() > 0)));
 }
 
 fn offpage() {

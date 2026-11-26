@@ -381,24 +381,41 @@ mod tests {
     }
 
     #[test]
-    fn nonconcentric_nearly_equal_radial_declines_native_promotion() {
-        let dict = Dict::from_bytes(
-            b"<< /ShadingType 3 /Coords [0 .4 1 1 .4 1.0002] /Extend [true true]
-            /ColorSpace [/Separation /Ink /DeviceRGB << /FunctionType 2 /Domain [0 1] /N 1 /C0 [0 0 0] /C1 [0 0 0] >>]
-            /Function << /FunctionType 2 /Domain [0 1] /N 1 /C0 [0] /C1 [1] >> >>",
-        )
-        .unwrap();
-        let pattern = ShadingPattern {
-            shading: Arc::new(Shading::new(&dict, None, &Cache::default()).unwrap()),
-            matrix: Affine::IDENTITY,
-            opacity: 1.,
-            transfer_function: None,
-        };
-        let encoded = PreparedShading::new(pattern).encode(Affine::IDENTITY);
-        let EncodedShadingType::RadialAxial(g) = &encoded.shading_type else {
-            unreachable!()
-        };
-        assert!(g.as_raster_gradient(&encoded).is_none());
+    fn radial_native_promotion_uses_normalized_circles() {
+        for (coords, native) in [
+            ("0 0 100 0 0 500", true),
+            ("0 0 0 1 0 2", true),
+            ("0 0 2 1 0 0", true),
+            ("0 0 0.0001 1 0 2", false),
+            ("0 0 2 1 0 0.0001", false),
+            ("0 0 0 1 0 100000000000000000000", false),
+            ("0 .4 1 1 .4 1.0002", false),
+        ] {
+            let source = format!(
+                "<< /ShadingType 3 /Coords [{coords}] /Extend [true true]
+                /ColorSpace [/DeviceN [/Ink] /DeviceGray << /FunctionType 2 /Domain [0 1] /N 1 >>]
+                /Function << /FunctionType 2 /Domain [0 1] /C0 [.25] /C1 [.25] /N 1 >> >>"
+            );
+            let dict = Dict::from_bytes(source.as_bytes()).unwrap();
+            let pattern = ShadingPattern {
+                shading: Arc::new(Shading::new(&dict, None, &Cache::default()).unwrap()),
+                matrix: Affine::IDENTITY,
+                opacity: 1.,
+                transfer_function: None,
+            };
+            let encoded = PreparedShading::new(pattern).encode(Affine::IDENTITY);
+            let EncodedShadingType::RadialAxial(g) = &encoded.shading_type else {
+                unreachable!()
+            };
+            assert_eq!(g.as_raster_gradient(&encoded).is_some(), native, "{coords}");
+            assert_eq!(
+                g.as_svg_gradient(&encoded, 0.01)
+                    .and_then(SvgGradient::with_raster_geometry)
+                    .is_some(),
+                native,
+                "{coords}"
+            );
+        }
     }
 
     #[test]

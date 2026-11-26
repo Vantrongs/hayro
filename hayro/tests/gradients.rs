@@ -210,3 +210,29 @@ fn wide_separation_strip_tracks_the_parameter() {
         }
     }
 }
+
+#[test]
+fn nested_focal_covers_the_left_edge() {
+    let image = crop(
+        include_bytes!("gradients/nested_focal.pdf"),
+        1,
+        1,
+        Affine::IDENTITY,
+    );
+    assert_eq!(image.sample(0, 0).a, 255);
+}
+
+#[test]
+fn concentric_annulus_matches_calculator() {
+    let image = crop(
+        include_bytes!("gradients/concentric_annulus.pdf"),
+        600,
+        2,
+        Affine::IDENTITY,
+    );
+    for x in 0..600 {
+        let reference = image.sample(x, 0);
+        assert_eq!(reference.a, 255);
+        assert_eq!(image.sample(x, 1), reference, "x={x}");
+    }
+}
