@@ -72,7 +72,7 @@ impl<'a> Device<'a> for TextCollector {
     }
 }
 
-fn page_text(file: &[u8]) -> String {
+pub(crate) fn page_text(file: &[u8]) -> String {
     let pdf = Pdf::new(file.to_vec()).unwrap();
     let cache = InterpreterCache::new();
     let mut context = Context::new(

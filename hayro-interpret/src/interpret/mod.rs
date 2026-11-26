@@ -123,7 +123,14 @@ fn interpret_annotation<'a>(
 ) {
     let flags = annot.get::<u32>(F).unwrap_or(0);
 
-    if flags & (ANNOTATION_HIDDEN | ANNOTATION_NO_VIEW) != 0 {
+    if flags & (ANNOTATION_HIDDEN | ANNOTATION_NO_VIEW) != 0
+        || context.ocg_state.is_configured()
+            && annot.get::<Dict<'_>>(OC).is_some_and(|oc| {
+                !context
+                    .ocg_state
+                    .oc_is_active(&oc, annot.get_ref(OC).map(Into::into))
+            })
+    {
         return;
     }
 
@@ -185,6 +192,7 @@ pub fn interpret<'a>(
     device: &mut impl Device<'a>,
 ) {
     let num_states = context.num_states();
+    let marked_depth = context.ocg_state.depth();
     let mut font_dict_cache = FxHashMap::<Name<'a>, Dict<'a>>::default();
 
     context.save_state();
@@ -423,34 +431,24 @@ pub fn interpret<'a>(
                 });
             }
             TypedInstruction::BeginMarkedContentWithProperties(bdc) => {
-                let properties = bdc
-                    .1
-                    .clone()
-                    .into_name()
-                    .and_then(|name| resources.properties.get::<Dict<'_>>(name))
-                    .or_else(|| dict_or_stream(bdc.1).map(|(props, _)| props.clone()));
+                let (properties, oc) = if let Object::Name(name) = bdc.1 {
+                    let props = resources.properties.get::<Dict<'_>>(name);
+                    let oc = props
+                        .as_ref()
+                        .filter(|_| bdc.0.as_ref() == OC)
+                        .map(|dict| (dict.clone(), resources.properties.get_ref(name)));
+                    (props, oc)
+                } else {
+                    let props = dict_or_stream(bdc.1).map(|(props, _)| props.clone());
+                    let oc = props
+                        .as_ref()
+                        .filter(|_| bdc.0.as_ref() == OC)
+                        .and_then(|props| Some((props.get::<Dict<'_>>(OC)?, props.get_ref(OC))));
+                    (props, oc)
+                };
 
-                let oc = bdc
-                    .1
-                    .clone()
-                    .into_name()
-                    .and_then(|name| {
-                        let r = resources.properties.get_ref(name.as_ref())?;
-                        let d = resources
-                            .properties
-                            .get::<Dict<'_>>(name)
-                            .unwrap_or_default();
-                        Some((d, r))
-                    })
-                    .or_else(|| {
-                        let (props, _) = dict_or_stream(bdc.1)?;
-                        let r = props.get_ref(OC)?;
-                        let d = props.get::<Dict<'_>>(OC).unwrap_or_default();
-                        Some((d, r))
-                    });
-
-                if let Some((dict, oc_ref)) = oc {
-                    context.ocg_state.begin_ocg(&dict, oc_ref.into());
+                if let Some((dict, id)) = oc {
+                    context.ocg_state.begin_ocg(&dict, id.map(Into::into));
                 } else {
                     context.ocg_state.begin_marked_content();
                 }
@@ -459,8 +457,10 @@ pub fn interpret<'a>(
             }
             TypedInstruction::MarkedContentPointWithProperties(_) => {}
             TypedInstruction::EndMarkedContent(_) => {
-                context.ocg_state.end_marked_content();
-                device.end_marked_content();
+                if context.ocg_state.depth() > marked_depth {
+                    context.ocg_state.end_marked_content();
+                    device.end_marked_content();
+                }
             }
             TypedInstruction::MarkedContentPoint(_) => {}
             TypedInstruction::BeginMarkedContent(bmc) => {
@@ -667,6 +667,11 @@ pub fn interpret<'a>(
     // A pending path, including `W`/`W*`, can't continue past its content stream.
     context.path_mut().truncate(0);
     *(context.clip_mut()) = None;
+
+    while context.ocg_state.depth() > marked_depth {
+        context.ocg_state.end_marked_content();
+        device.end_marked_content();
+    }
 
     while context.num_states() > num_states {
         context.restore_state(device);

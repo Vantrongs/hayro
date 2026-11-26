@@ -113,7 +113,11 @@ fn collect(args: &Args) -> (Vec<Test>, usize) {
         .chain(write::tests())
         .chain(load::tests())
         .chain(text::tests())
-        .chain([Test::unit("visibility", visibility)])
+        .chain([
+            Test::unit("visibility", visibility),
+            Test::unit("annotation_oc", annotation_oc),
+            Test::unit("form_oc_unmatched_emc", form_oc_unmatched_emc),
+        ])
         .filter(|test| args.matches(&test.name))
         .collect();
     tests.sort_by(|a, b| a.name.cmp(&b.name));
@@ -340,6 +344,98 @@ fn visibility() {
                 DecryptionError::UnsupportedAlgorithm => {}
             },
             LoadPdfError::Invalid => {}
+        }
+    }
+}
+
+fn form_oc_unmatched_emc() {
+    use pdf_writer::{Finish, Name, Pdf, Rect, Ref, TextStr};
+
+    let mut pdf = Pdf::new();
+    let [catalog, pages, page, contents, form, group] = [1, 2, 3, 4, 5, 6].map(Ref::new);
+    let bbox = Rect::new(0.0, 0.0, 10.0, 10.0);
+    let mut root = pdf.catalog(catalog);
+    root.pages(pages);
+    let mut properties = root.insert(Name(b"OCProperties")).dict();
+    properties.insert(Name(b"OCGs")).array().item(group);
+    properties.insert(Name(b"D")).dict();
+    properties.finish();
+    root.finish();
+    pdf.indirect(group)
+        .dict()
+        .pair(Name(b"Type"), Name(b"OCG"))
+        .pair(Name(b"Name"), TextStr("Visible"));
+    pdf.pages(pages).kids([page]).count(1);
+    pdf.page(page)
+        .parent(pages)
+        .media_box(bbox)
+        .contents(contents)
+        .resources()
+        .x_objects()
+        .pair(Name(b"Fm"), form);
+    pdf.stream(contents, b"/Span BMC /Fm Do /After BMC EMC EMC");
+    pdf.form_xobject(form, b"EMC /Inside BMC EMC")
+        .bbox(bbox)
+        .pair(Name(b"OC"), group);
+
+    assert_eq!(
+        text::page_text(&pdf.finish()),
+        "<Span><Inside></><After></></>"
+    );
+}
+
+fn annotation_oc() {
+    let bytes = include_bytes!("../../hayro-interpret/tests/data/annotation_oc.pdf");
+    let cases = [
+        ("unclosed hidden BDC", false),
+        ("following annotation", true),
+        ("off group", false),
+        ("on group", true),
+        ("AnyOn with off and invalid members", false),
+        ("AllOff with off group", true),
+        ("nested expression", true),
+        ("expression overrides policy", false),
+        ("Design group", true),
+        ("AnyOff ignores Design group", false),
+        ("And ignores Design group", true),
+        ("reused membership dictionary", true),
+        ("Not with indirect expression", false),
+        ("direct membership dictionary in Properties", false),
+        ("AllOff with on group", false),
+    ];
+    check_annotation_oc(bytes.to_vec(), &cases);
+
+    let mut unconfigured = bytes.to_vec();
+    let key = b"/OCProperties";
+    let pos = bytes.windows(key.len()).position(|s| s == key).unwrap();
+    unconfigured[pos + 1] = b'X';
+    check_annotation_oc(unconfigured, &cases.map(|(name, _)| (name, true)));
+}
+
+fn check_annotation_oc(bytes: Vec<u8>, cases: &[(&str, bool)]) {
+    let pdf = Pdf::new(bytes).unwrap();
+    let raster = render_pdf(
+        &pdf,
+        "annotation_oc",
+        InterpreterSettings::default(),
+        &RenderSettings::default(),
+        None,
+    );
+    let svg = render_svg(
+        &pdf,
+        "annotation_oc",
+        InterpreterSettings::default(),
+        svg_render_settings(),
+        None,
+    );
+    for (renderer, page) in [("raster", &raster[0]), ("SVG", &svg[0])] {
+        for (index, &(name, visible)) in cases.iter().enumerate() {
+            let x = index as u32 * 10 + 5;
+            assert_eq!(
+                page.get_pixel(x, 5).0,
+                if visible { [255, 0, 0, 255] } else { [255; 4] },
+                "{renderer}: {name} at x={x}"
+            );
         }
     }
 }

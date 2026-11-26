@@ -59,7 +59,7 @@ pub struct Context<'a> {
     pub(crate) settings: InterpreterSettings,
     pub(crate) interpreter_cache: InterpreterCache<'a>,
     pub(crate) xref: &'a XRef,
-    pub(crate) ocg_state: OcgState,
+    pub(crate) ocg_state: OcgState<'a>,
     nesting_depth: u32,
     pub(crate) glyph_scratch: Vec<PositionedGlyph<'a>>,
 }
@@ -90,7 +90,7 @@ impl<'a> Context<'a> {
         let ocg_state = {
             let root_ref = xref.root_id();
             xref.get::<Dict<'_>>(root_ref)
-                .map(|catalog| OcgState::from_catalog(&catalog))
+                .map(|catalog| OcgState::from_catalog(&catalog, xref))
                 .unwrap_or_default()
         };
 
