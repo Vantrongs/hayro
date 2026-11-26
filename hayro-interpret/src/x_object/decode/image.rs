@@ -77,22 +77,6 @@ impl DecodedImage {
             }
         }
     }
-
-    pub(crate) fn into_whole(mut self) -> Option<(ImageData, Option<LumaData>)> {
-        match &mut self.image {
-            ImageData::Rgb(d) => self
-                .tail
-                .complete(&mut d.data, &mut d.width, &mut d.height)?,
-            ImageData::Luma(d) => self
-                .tail
-                .complete(&mut d.data, &mut d.width, &mut d.height)?,
-        }
-        let alpha = match self.alpha {
-            Some(mask) => Some(mask.into_whole()?),
-            None => None,
-        };
-        Some((self.image, alpha))
-    }
 }
 pub(crate) fn decode_image(
     obj: &ImageXObject<'_>,

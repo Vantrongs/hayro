@@ -71,6 +71,9 @@ impl ActiveTransferFunction {
     }
 
     pub(crate) fn apply_to(&self, values: &mut [u8]) {
+        if values.is_empty() {
+            return;
+        }
         match self {
             Self::Single(function) => function.apply_to(values),
             Self::Four(functions) => {

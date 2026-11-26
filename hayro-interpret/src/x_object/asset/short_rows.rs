@@ -71,12 +71,15 @@ fn short_images_convert_stored_zero() {
         let pdf = pdf(&[(dict, data)]);
         let obj = image(&pdf);
         assert_eq!(request(&obj, Plane::Image).data, expected);
-        let (ImageData::Luma(whole), None) = obj.decoded_image(None).unwrap().into_whole().unwrap()
-        else {
+        let decoded = obj.decoded_image(None).unwrap();
+        let ImageData::Luma(stored) = decoded.image else {
             panic!()
         };
-        assert_eq!(whole.data, expected);
-        assert_eq!(whole.height, 3);
+        assert_eq!(
+            stored.data,
+            expected[..(stored.width * stored.height) as usize]
+        );
+        assert_eq!(decoded.tail.texel.as_deref(), Some(&[255][..]));
     }
 }
 
@@ -88,8 +91,8 @@ fn short_color_key_uses_source_precision_and_drops_the_incomplete_row() {
         request(&obj, Plane::Image).data,
         [0, 0, 1, 255, 0, 0, 0, 0, 0, 0, 0, 0]
     );
-    let (ImageData::Luma(whole), Some(alpha)) =
-        obj.decoded_image(None).unwrap().into_whole().unwrap()
+    let decoded = obj.decoded_image(None).unwrap();
+    let (ImageData::Luma(whole), Some(alpha)) = (decoded.image, decoded.alpha.map(|a| a.luma))
     else {
         panic!()
     };
@@ -105,8 +108,8 @@ fn matte_does_not_paint_rows_missing_from_the_image() {
     ]);
     let obj = image(&pdf);
     let region = request(&obj, Plane::Image);
-    let (ImageData::Luma(whole), Some(alpha)) =
-        obj.decoded_image(None).unwrap().into_whole().unwrap()
+    let decoded = obj.decoded_image(None).unwrap();
+    let (ImageData::Luma(whole), Some(alpha)) = (decoded.image, decoded.alpha.map(|a| a.luma))
     else {
         panic!()
     };
@@ -214,4 +217,56 @@ fn sparse_region_means_match_padded_pixels() {
             );
         }
     }
+}
+
+#[test]
+fn four_transfer_functions_convert_an_empty_images_tail() {
+    use crate::function::TransferFunction;
+    use hayro_syntax::object::Object;
+    let doc = pdf(&[(
+        "/BPC 8 /TR << /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>",
+        &[],
+    )]);
+    let mut obj = image(&doc);
+    let function =
+        TransferFunction::new(&obj.stream.dict().get::<Object<'_>>(b"TR").unwrap()).unwrap();
+    obj.transfer_function = Some(ActiveTransferFunction::Four(std::array::from_fn(|_| {
+        function.clone()
+    })));
+    let decoded = obj.decoded_image(None).unwrap();
+    assert_eq!(decoded.image.height(), 0);
+    assert_eq!(decoded.tail.texel.as_deref(), Some(&[255, 255, 255][..]));
+}
+
+#[test]
+fn whole_image_scales_an_independent_mask_over_the_color_tail() {
+    let doc = pdf(&[
+        (
+            "/Width 1 /Height 4 /BPC 8 /CS /Unresolved /SMask 4 0 R",
+            &[20, 30],
+        ),
+        ("/Width 1 /Height 2 /BPC 8", &[255, 255]),
+    ]);
+    let obj = image(&doc);
+    let asset = obj.asset(None);
+    let mut source = asset.open(None).unwrap();
+    assert!(!source.is_streamed());
+    let mask = source
+        .request(&ImageRequest {
+            plane: Plane::Mask,
+            grid: (1, 2),
+            window: [0, 0, 1, 2],
+            cancel: None,
+        })
+        .unwrap();
+    assert_eq!(mask.data, [255, 255]);
+    assert_eq!(mask.to_image, Affine::scale_non_uniform(1., 2.));
+    let mut bands = 0;
+    obj.decoded_image(None).unwrap().bands(|_, _, alpha| {
+        let (luma, transform) = alpha.unwrap();
+        assert_eq!(transform, mask.to_image);
+        assert_eq!(luma.data, mask.data);
+        bands += 1;
+    });
+    assert_eq!(bands, 2);
 }

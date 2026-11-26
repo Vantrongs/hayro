@@ -442,9 +442,14 @@ impl Decoded {
         height: u32,
         fill: Option<Vec<u8>>,
     ) -> Self {
-        let h = image.height();
+        let effective_height = if fill.is_some() {
+            height
+        } else {
+            image.height()
+        };
         let same_grid = alpha.as_ref().is_some_and(|a| {
-            (a.tail.width == width && (a.tail.declared == h || a.tail.declared == height))
+            a.tail.width == width
+                && a.tail.declared == effective_height
                 && a.luma.interpolate == image.interpolate()
         });
         Self {
