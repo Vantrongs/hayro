@@ -77,6 +77,10 @@ impl<'a> DecryptedReader<'a> {
         })
     }
 
+    pub(crate) fn plain_data(&self) -> Option<&'a [u8]> {
+        matches!(self.cipher, Cipher::Plain).then_some(self.data)
+    }
+
     /// Whether skipping can address the target block directly.
     pub fn can_seek(&self) -> bool {
         !matches!(self.cipher, Cipher::Rc4(_))

@@ -2,7 +2,7 @@ use super::*;
 use hayro_syntax::Pdf;
 use hayro_syntax::object::{ObjectIdentifier, Stream};
 
-fn pdf(images: &[(&str, &[u8])]) -> Pdf {
+pub(super) fn pdf(images: &[(&str, &[u8])]) -> Pdf {
     let mut file=b"%PDF-1.7\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [] /Count 0 >> endobj\n".to_vec();
     for (i, (dict, data)) in images.iter().enumerate() {
         let height = if dict.contains("/Height ") {
@@ -23,7 +23,7 @@ fn pdf(images: &[(&str, &[u8])]) -> Pdf {
     Pdf::new(file).unwrap()
 }
 
-fn image(pdf: &Pdf) -> ImageXObject<'_> {
+pub(super) fn image(pdf: &Pdf) -> ImageXObject<'_> {
     let stream = pdf
         .xref()
         .get::<Stream<'_>>(ObjectIdentifier::new(3, 0))

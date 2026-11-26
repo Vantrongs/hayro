@@ -67,7 +67,17 @@ impl ImageAsset {
 
     /// Bytes retained in decoder checkpoints.
     pub fn checkpoint_bytes(&self) -> Result<usize, RequestError> {
-        Ok(0)
+        let bands = self.0.bands.lock().map_err(|_| RequestError::Failed)?;
+        Ok(bands.as_ref().map_or(0, Bands::retained_bytes))
+    }
+
+    /// Releases stored image bands and their decoder.
+    pub fn evict_cache(&self) {
+        *self
+            .0
+            .bands
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
     }
 
     /// A cancellation flag shared by this asset's decoders.
@@ -335,7 +345,9 @@ impl ImageSource<'_> {
                     *lock = Bands::new(self.asset);
                 }
                 let bands = lock.as_mut().ok_or(RequestError::Failed)?;
-                let end = y.saturating_add(bands.band_rows() as u32).min(rows.end);
+                let end = y
+                    .saturating_add(bands.request_rows(request.plane) as u32)
+                    .min(rows.end);
                 let band = match bands.read_band(request.plane, &columns, y, end, obj) {
                     Ok(result) => result,
                     Err(error) => {

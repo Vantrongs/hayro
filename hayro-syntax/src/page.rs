@@ -345,10 +345,9 @@ impl<'a> Page<'a> {
             };
             let emit = |id, object, spaced, out: &mut dyn FnMut(&[u8])| match object {
                 Object::Stream(stream) => {
-                    let data = stream
-                        .decoded_strict()
+                    stream
+                        .drain_strict(out)
                         .map_err(|e| ContentError::Decode(id, e))?;
-                    out(&data);
                     if spaced {
                         out(b" ");
                     }

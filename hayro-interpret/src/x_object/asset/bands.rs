@@ -11,6 +11,64 @@ use tempfile::{SpooledTempFile, spooled_tempfile};
 
 const BAND_BYTES: usize = 128 * 1024;
 
+enum Spool {
+    File(SpooledTempFile),
+    Window { base: u64, data: Vec<u8> },
+}
+
+impl Spool {
+    fn append(&mut self, offset: u64, start: u64, end: u64, chunk: &[u8]) {
+        if let Self::File(file) = self {
+            if file
+                .seek(SeekFrom::Start(offset))
+                .and_then(|_| file.write_all(chunk))
+                .is_ok()
+            {
+                return;
+            }
+            *self = Self::Window {
+                base: offset,
+                data: Vec::new(),
+            };
+        }
+        if let Self::Window { base, data } = self {
+            let discard = start.saturating_sub(*base).min(data.len() as u64) as usize;
+            data.drain(..discard);
+            *base += discard as u64;
+            let skip = start.saturating_sub(offset).min(chunk.len() as u64) as usize;
+            *base += skip as u64;
+            let needed = data.len() + chunk.len() - skip;
+            if needed > data.capacity() {
+                let capacity = data
+                    .capacity()
+                    .saturating_mul(2)
+                    .min((end - *base) as usize);
+                data.reserve_exact(capacity.max(needed) - data.len());
+            }
+            data.extend_from_slice(&chunk[skip..]);
+        }
+    }
+
+    fn read(&mut self, offset: u64, target: &mut [u8]) -> Result<(), RequestError> {
+        match self {
+            Self::File(file) => file
+                .seek(SeekFrom::Start(offset))
+                .and_then(|_| file.read_exact(target))
+                .map_err(|_| RequestError::Failed),
+            Self::Window { base, data } => {
+                let at = usize::try_from(offset.checked_sub(*base).ok_or(RequestError::Failed)?)
+                    .map_err(|_| RequestError::Failed)?;
+                target.copy_from_slice(
+                    data.get(at..)
+                        .and_then(|s| s.get(..target.len()))
+                        .ok_or(RequestError::Failed)?,
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
 enum Producer<'a> {
     Direct(u64),
     Finished,
@@ -32,7 +90,7 @@ pub(super) struct Bands {
     scratch: Vec<u8>,
 
     token: Arc<AtomicBool>,
-    file: SpooledTempFile,
+    spool: Spool,
     bytes: u64,
     eof: bool,
     stride: usize,
@@ -78,6 +136,96 @@ impl Bands {
         } else {
             8
         });
+        let (reader, metadata) = Self::producer(obj, &token)?;
+        let bits = metadata.as_ref().map_or(bpc, |i| i.bits_per_component);
+        if !matches!(bits, 1..=16) {
+            return None;
+        }
+        let stride = (obj.width as usize)
+            .checked_mul(channels)?
+            .checked_mul(usize::from(bits))?
+            .div_ceil(8);
+        if stride == 0 {
+            return None;
+        }
+        let gray = obj
+            .transfer_function
+            .as_ref()
+            .is_none_or(|tf| matches!(tf, ActiveTransferFunction::Single(_)))
+            && cs.to_luma(&mut []).is_some();
+        let matte = obj
+            .matte
+            .as_ref()
+            .filter(|values| obj.has_soft_mask && values.len() == channels)
+            .map(|values| {
+                let mut rgb = [0; 3];
+                cs.convert_values(values, &mut rgb);
+                rgb
+            });
+        let mut layout = ImageLayout {
+            image: PlaneLayout {
+                width: obj.width,
+                height: obj.height,
+                to_image: (1., 1.),
+                interpolate: obj.interpolate,
+                format: match (obj.kind, gray, keyed && mask.is_none()) {
+                    (ImageKind::Image, true, true) => PixelFormat::LumaAlpha,
+                    (ImageKind::Image, false, true) => PixelFormat::RgbAlpha,
+                    (ImageKind::Image, true, false) => PixelFormat::Luma,
+                    (ImageKind::Image, false, false) => PixelFormat::Rgb,
+                    _ => PixelFormat::Alpha,
+                },
+            },
+            mask: None,
+        };
+        let sample_format = layout.image.format;
+        if let Some(m) = &mask {
+            let plane = m.layout.image;
+            if plane.width == obj.width
+                && plane.height == obj.height
+                && plane.interpolate == obj.interpolate
+            {
+                layout.image.format = sample_format.with_alpha();
+            } else {
+                if matte.is_some() {
+                    return None;
+                }
+                layout.mask = Some(PlaneLayout {
+                    to_image: (
+                        f64::from(obj.width) / f64::from(plane.width),
+                        f64::from(obj.height) / f64::from(plane.height),
+                    ),
+                    format: PixelFormat::Alpha,
+                    ..plane
+                });
+            }
+        }
+        Some(Self {
+            mask,
+            matte,
+            sample_format,
+            reader,
+            token,
+            scratch: Vec::new(),
+
+            spool: Spool::File(spooled_tempfile(BAND_BYTES)),
+            bytes: 0,
+            eof: false,
+            stride,
+            pixel_bits: channels * usize::from(bits),
+            metadata,
+            bits,
+            keyed,
+            layout,
+        })
+    }
+
+    fn producer(
+        obj: &Samples<OwnedStream>,
+        token: &Arc<AtomicBool>,
+    ) -> Option<(StreamRows, Option<Metadata>)> {
+        let cs = obj.color_space.as_ref()?;
+        let channels = usize::from(cs.num_components());
         let params = ImageDecodeParams {
             is_indexed: cs.is_indexed(),
             num_components: Some(cs.num_components()),
@@ -122,97 +270,50 @@ impl Bands {
             }
         })
         .ok()?;
-        let bits = metadata.as_ref().map_or(bpc, |i| i.bits_per_component);
-        if !matches!(bits, 1..=16) {
-            return None;
-        }
-        let stride = (params.width as usize)
-            .checked_mul(channels)?
-            .checked_mul(usize::from(bits))?
-            .div_ceil(8);
-        if stride == 0 {
-            return None;
-        }
-        let gray = obj
-            .transfer_function
-            .as_ref()
-            .is_none_or(|tf| matches!(tf, ActiveTransferFunction::Single(_)))
-            && cs.to_luma(&mut []).is_some();
-        let matte = obj
-            .matte
-            .as_ref()
-            .filter(|values| obj.has_soft_mask && values.len() == channels)
-            .map(|values| {
-                let mut rgb = [0; 3];
-                cs.convert_values(values, &mut rgb);
-                rgb
-            });
-        let mut layout = ImageLayout {
-            image: PlaneLayout {
-                width: params.width,
-                height: params.height,
-                to_image: (1., 1.),
-                interpolate: obj.interpolate,
-                format: match (obj.kind, gray, keyed && mask.is_none()) {
-                    (ImageKind::Image, true, true) => PixelFormat::LumaAlpha,
-                    (ImageKind::Image, false, true) => PixelFormat::RgbAlpha,
-                    (ImageKind::Image, true, false) => PixelFormat::Luma,
-                    (ImageKind::Image, false, false) => PixelFormat::Rgb,
-                    _ => PixelFormat::Alpha,
-                },
-            },
-            mask: None,
-        };
-        let sample_format = layout.image.format;
-        if let Some(m) = &mask {
-            let plane = m.layout.image;
-            if plane.width == params.width
-                && plane.height == params.height
-                && plane.interpolate == obj.interpolate
-            {
-                layout.image.format = sample_format.with_alpha();
-            } else {
-                if matte.is_some() {
-                    return None;
-                }
-                layout.mask = Some(PlaneLayout {
-                    to_image: (
-                        f64::from(params.width) / f64::from(plane.width),
-                        f64::from(params.height) / f64::from(plane.height),
-                    ),
-                    format: PixelFormat::Alpha,
-                    ..plane
-                });
-            }
-        }
-        Some(Self {
-            mask,
-            matte,
-            sample_format,
-            reader,
-            token,
-            scratch: Vec::new(),
-
-            file: spooled_tempfile(BAND_BYTES),
-            bytes: 0,
-            eof: false,
-            stride,
-            pixel_bits: channels * usize::from(bits),
-            metadata,
-            bits,
-            keyed,
-            layout,
-        })
+        Some((reader, metadata))
     }
 
-    fn advance(&mut self, end: u32) -> Result<(bool, u32, u64), RequestError> {
+    pub(super) fn retained_bytes(&self) -> usize {
+        let storage = match &self.spool {
+            Spool::File(_) => usize::try_from(self.bytes).unwrap_or(usize::MAX),
+            Spool::Window { data, .. } => data.capacity(),
+        };
+        let packed = self.reader.with_dependent(|_, r| match r {
+            Producer::Packed(bytes) => bytes.capacity(),
+            _ => 0,
+        });
+        storage
+            .saturating_add(self.scratch.capacity())
+            .saturating_add(packed)
+            .saturating_add(self.mask.as_ref().map_or(0, |m| m.retained_bytes()))
+    }
+
+    fn advance(
+        &mut self,
+        first: u32,
+        end: u32,
+        obj: &Samples<OwnedStream>,
+    ) -> Result<(bool, u32, u64), RequestError> {
         use std::sync::atomic::Ordering;
         if self.token.load(Ordering::Relaxed) {
             return Err(RequestError::Cancelled);
         }
 
         let end_bytes = u64::from(end).saturating_mul(self.stride as u64);
-        let count = self.band_rows();
+        let start = u64::from(first) * self.stride as u64;
+        if let Spool::Window { base, data } = &mut self.spool
+            && start < *base
+        {
+            self.reader = Self::producer(obj, &self.token)
+                .ok_or(RequestError::Failed)?
+                .0;
+            self.bytes = 0;
+            self.eof = false;
+            *base = 0;
+            data.clear();
+        }
+        let read_size = (self.stride * self.band_rows())
+            .min(usize::try_from(end_bytes.saturating_sub(self.bytes)).unwrap_or(usize::MAX));
         let direct = self
             .reader
             .with_dependent(|_, r| matches!(r, Producer::Direct(_) | Producer::Packed(_)));
@@ -221,12 +322,11 @@ impl Bands {
         if !direct && self.bytes < end_bytes && !self.eof {
             let result = self.reader.with_dependent_mut(|_, r| match r {
                 Producer::Jpeg(jpeg) => {
-                    self.scratch.resize(self.stride * count, 0);
+                    self.scratch.resize(read_size, 0);
                     jpeg.read(&mut self.scratch).map(|n| n * self.stride)
                 }
                 Producer::Filter(filter) => {
-                    self.scratch
-                        .resize((self.stride * count).min(BAND_BYTES), 0);
+                    self.scratch.resize(read_size.min(BAND_BYTES), 0);
                     let before = filter.inflated_bytes();
                     let result = filter.read(&mut self.scratch).ok();
                     inflated = filter.inflated_bytes() - before;
@@ -244,18 +344,14 @@ impl Bands {
             if n == 0 {
                 self.eof = true;
             } else {
-                if self
-                    .file
-                    .seek(SeekFrom::Start(self.bytes))
-                    .and_then(|_| self.file.write_all(&self.scratch[..n]))
-                    .is_err()
-                {
-                    return Err(RequestError::Failed);
-                }
+                self.spool
+                    .append(self.bytes, start, end_bytes, &self.scratch[..n]);
                 let previous = self.bytes;
                 self.bytes += n as u64;
                 advanced = (self.bytes / self.stride as u64 - previous / self.stride as u64) as u32;
-                if self.bytes < end_bytes {
+                if self.bytes < end_bytes
+                    || matches!(&self.spool, Spool::Window { base, .. } if start < *base)
+                {
                     return Ok((false, advanced, inflated));
                 }
             }
@@ -326,10 +422,7 @@ impl Bands {
                     } else if let Producer::Packed(data) = r {
                         target.copy_from_slice(&data[offset as usize..offset as usize + n]);
                     } else {
-                        self.file
-                            .seek(SeekFrom::Start(offset))
-                            .and_then(|_| self.file.read_exact(target))
-                            .map_err(|_| RequestError::Failed)?;
+                        self.spool.read(offset, target)?;
                     }
                     Ok(())
                 };
@@ -394,7 +487,7 @@ impl Bands {
     ) -> Result<Band, RequestError> {
         let combined = self.mask.is_some() && self.layout.mask.is_none();
         let (ready, mut rows, mut bytes) = if plane == Plane::Image {
-            self.advance(end)?
+            self.advance(first, end, obj)?
         } else {
             (true, 0, 0)
         };
@@ -406,7 +499,8 @@ impl Bands {
         let mut ready = ready;
         if ready && (plane == Plane::Mask || combined) {
             let mask = self.mask.as_mut().ok_or(RequestError::Failed)?;
-            let (done, m, n) = mask.advance(end)?;
+            let (done, m, n) =
+                mask.advance(first, end, obj.mask.as_deref().ok_or(RequestError::Failed)?)?;
             ready = done;
             rows += m;
             bytes += n;
@@ -488,7 +582,89 @@ impl Bands {
         }
     }
 
-    pub(super) fn band_rows(&self) -> usize {
+    pub(super) fn request_rows(&self, plane: Plane) -> usize {
+        match (&self.mask, plane) {
+            (Some(mask), Plane::Mask) => mask.band_rows(),
+            (Some(mask), Plane::Image) if self.layout.mask.is_none() => {
+                self.band_rows().min(mask.band_rows())
+            }
+            _ => self.band_rows(),
+        }
+    }
+
+    fn band_rows(&self) -> usize {
         (BAND_BYTES / self.stride).clamp(1, 64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::x_object::asset::short_rows::{image, pdf};
+
+    #[test]
+    fn failed_spill_preserves_decoder_errors() {
+        let mut encoded = vec![b'0'; 3 * BAND_BYTES];
+        encoded.push(b'G');
+        let doc = pdf(&[("/BPC 8 /Width 2048 /Height 192 /Filter /AHx", &encoded)]);
+        let asset = image(&doc).asset(None);
+        let mut source = asset.open(None).unwrap();
+        let bad_dir = tempfile::NamedTempFile::new().unwrap();
+        asset.0.bands.lock().unwrap().as_mut().unwrap().spool =
+            Spool::File(SpooledTempFile::new_in(0, bad_dir.path()));
+        let result = source.request(&ImageRequest {
+            plane: Plane::Image,
+            grid: (2048, 192),
+            window: [0, 0, 2048, 192],
+            cancel: None,
+        });
+        assert!(matches!(result, Err(RequestError::Failed)));
+    }
+
+    #[test]
+    fn forward_and_backward_bands_survive_failed_spill() {
+        let width = 2048;
+        let height = 192;
+        let mut encoded = Vec::new();
+        for row in 0..height {
+            for _ in 0..width / 128 {
+                encoded.extend_from_slice(&[129, row as u8]);
+            }
+        }
+        encoded.push(128);
+        let doc = pdf(&[("/BPC 8 /Width 2048 /Height 192 /Filter /RL", &encoded)]);
+        let asset = image(&doc).asset(None);
+        let bad_dir = tempfile::NamedTempFile::new().unwrap();
+        for fail in [false, true] {
+            let mut source = asset.open(None).unwrap();
+            if fail {
+                asset.0.bands.lock().unwrap().as_mut().unwrap().spool =
+                    Spool::File(SpooledTempFile::new_in(BAND_BYTES, bad_dir.path()));
+            }
+            for (first, end) in [(0, 43), (43, 104), (128, 192), (100, 149), (0, 64)] {
+                let result = source
+                    .request(&ImageRequest {
+                        plane: Plane::Image,
+                        grid: (width, height),
+                        window: [0, first, width, end],
+                        cancel: None,
+                    })
+                    .unwrap();
+                assert_eq!(result.data.len(), ((end - first) * width) as usize);
+                for (row, data) in result.data.chunks_exact(width as usize).enumerate() {
+                    assert!(data.iter().all(|&v| v == first as u8 + row as u8));
+                }
+                assert!(asset.checkpoint_bytes().unwrap() > 0);
+            }
+            if fail {
+                let bands = asset.0.bands.lock().unwrap();
+                let Spool::Window { data, .. } = &bands.as_ref().unwrap().spool else {
+                    panic!("expected window after spill failure");
+                };
+                assert!(data.capacity() <= BAND_BYTES);
+            }
+            asset.evict_cache();
+            assert_eq!(asset.checkpoint_bytes().unwrap(), 0);
+        }
     }
 }

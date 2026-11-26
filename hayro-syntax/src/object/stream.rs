@@ -426,6 +426,54 @@ impl<'a> Stream<'a> {
         self.collect_filters(&filters, true, None, None)
     }
 
+    /// Streams decoded data, returning the first decoding error.
+    pub fn drain_strict(&self, out: &mut dyn FnMut(&[u8])) -> Result<(), DecodeFailure> {
+        let filters = self.data_filters();
+        let source = self.decrypted_reader()?;
+        if filters.filters.is_empty()
+            && let Some(data) = source.plain_data()
+        {
+            out(data);
+            return Ok(());
+        }
+
+        let mut reader = DecodedReader::new(source, None, true);
+        let mut modes = Vec::new();
+        for (&filter, params) in filters.filters.iter().zip(&filters.params) {
+            let mut mode = FlateMode::Detect;
+            if filter == Filter::FlateDecode && reader.ambiguous_flate_header()? {
+                mode = FlateMode::Wrapped;
+                loop {
+                    reader
+                        .add(filter, params, Some(mode))
+                        .ok_or(DecodeFailure::StreamDecode)?;
+                    let result = reader.drain_strict(|_| {});
+                    let retry = reader.retry();
+                    reader = DecodedReader::new(self.decrypted_reader()?, None, true);
+                    for ((&prior, params), &mode) in
+                        filters.filters.iter().zip(&filters.params).zip(&modes)
+                    {
+                        reader
+                            .add(prior, params, Some(mode))
+                            .ok_or(DecodeFailure::StreamDecode)?;
+                    }
+                    match result {
+                        Ok(()) => break,
+                        Err(DecodeFailure::StreamDecode) => {
+                            mode = retry.ok_or(DecodeFailure::StreamDecode)?
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            modes.push(mode);
+            reader
+                .add(filter, params, Some(mode))
+                .ok_or(DecodeFailure::StreamDecode)?;
+        }
+        reader.drain_strict(out)
+    }
+
     fn collect_filters(
         &self,
         filters: &FiltersAndParams<'_>,

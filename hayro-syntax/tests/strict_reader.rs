@@ -67,7 +67,14 @@ fn the_reader_reads_what_strict_decoding_returns() {
                 .join(" ")
         );
         let pdf = stream_file(&dict, &encoded);
-        let actual = object_3(&pdf).decoded_strict().ok();
+        let object = object_3(&pdf);
+        let actual = object.decoded_strict().ok();
+        let mut streamed = Vec::new();
+        let result = object.drain_strict(&mut |bytes| streamed.extend_from_slice(bytes));
+        assert!(
+            result.ok().map(|()| streamed.as_slice()) == actual.as_deref(),
+            "streamed case {case}, {dict}"
+        );
         let expected = stages.iter().try_fold(encoded, |input, (name, params)| {
             let pdf = stream_file(&format!("/Filter {name} /DecodeParms {params}"), &input);
             object_3(&pdf).decoded_strict().ok().map(|v| v.into_owned())
@@ -158,6 +165,68 @@ fn flate_before_fax_emits_only_completed_packed_rows() {
     assert_eq!(row, [0]);
     assert_eq!(cursor.read(&mut row).unwrap(), 0);
     assert_eq!(result.image_data.unwrap().bits_per_component, 1);
+}
+
+#[test]
+fn plain_stream_emits_its_borrowed_bytes() {
+    let doc = stream_file("", b"q Q");
+    let stream = object_3(&doc);
+    let data = stream.try_raw_data().unwrap();
+    let mut calls = 0;
+    stream
+        .drain_strict(&mut |chunk| {
+            assert!(core::ptr::eq(chunk, data.as_ref()));
+            calls += 1;
+        })
+        .unwrap();
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn streaming_probes_ambiguous_flate_before_emitting() {
+    let expected = noise(100_000, 31);
+    let mut raw = fixtures::stored_deflate(&expected, 0x9c);
+    raw[0] = 0x78;
+    for (filters, data) in [("/Fl", raw.clone()), ("[/Fl /Fl]", zlib(&raw, 6))] {
+        let pdf = stream_file(&format!("/Filter {filters}"), &data);
+        let mut output = Vec::new();
+        object_3(&pdf)
+            .drain_strict(&mut |bytes| output.extend_from_slice(bytes))
+            .unwrap();
+        assert_eq!(output, expected);
+    }
+}
+
+#[test]
+fn large_page_content_drains_with_bounded_memory() {
+    let content = b"q Q ".repeat(2 * 1024 * 1024);
+    let encoded = zlib(&content, 6);
+    let doc = Pdf::new(file(
+        &[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>".to_vec(),
+            stream("/Filter /Fl", &encoded),
+        ],
+        "",
+    ))
+    .unwrap();
+    let page = &doc.pages()[0];
+    let mut pos = 0;
+    let ((), used) = allocations::measure(|| {
+        page.try_page_stream_to(&mut |chunk| {
+            assert_eq!(chunk, &content[pos..pos + chunk.len()]);
+            pos += chunk.len();
+        })
+        .unwrap();
+    });
+    assert_eq!(pos, content.len());
+    eprintln!(
+        "{} compressed bytes, {pos} decoded bytes, {} peak heap bytes",
+        encoded.len(),
+        used.peak
+    );
+    assert!(used.peak < 512 * 1024);
 }
 
 #[test]
