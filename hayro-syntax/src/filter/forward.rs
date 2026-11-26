@@ -67,7 +67,7 @@ enum Codec {
         previous: Option<usize>,
     },
     Flate {
-        state: Inflater,
+        state: Option<Inflater>,
         mode: FlateMode,
         header: Vec<u8>,
         started: bool,
@@ -143,7 +143,7 @@ impl<'a> DecodedReader<'a> {
                         |e| e.1,
                     );
                 Codec::Flate {
-                    state: Inflater::new(mode == FlateMode::Wrapped),
+                    state: None,
                     mode,
                     header: Vec::new(),
                     started: mode != FlateMode::Detect,
@@ -352,9 +352,13 @@ impl Codec {
             state,
             started,
             header,
-            ..
+            mode,
         } = self
         {
+            if state.is_none() && data.is_empty() && eof {
+                return Some((0, true));
+            }
+            let state = state.get_or_insert_with(|| Inflater::new(*mode == FlateMode::Wrapped));
             if !*started {
                 let n = (2 - header.len()).min(data.len());
                 header.extend_from_slice(&data[..n]);
