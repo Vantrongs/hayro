@@ -507,6 +507,42 @@ impl<'a> Stream<'a> {
         self.decode(DecodeTarget::Data).map(|r| r.data)
     }
 
+    /// Read a text field value that is unfiltered or Flate-compressed, rejecting corrupt data.
+    pub fn decoded_field_value(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
+        if matches!(
+            self.dict.get::<Object<'_>>(F),
+            Some(Object::String(_) | Object::Dict(_))
+        ) {
+            return Err(DecodeFailure::StreamDecode);
+        }
+        let chain = self.filters_and_params();
+        let mut filters = chain
+            .filters
+            .iter()
+            .zip(&chain.params)
+            .enumerate()
+            .filter_map(|(i, (filter, params))| {
+                (i != 0 || *filter != Filter::Crypt).then_some((filter, params))
+            });
+        match (filters.next(), filters.next()) {
+            (None, _) => self.try_raw_data(),
+            (Some((Filter::FlateDecode, _)), None) => {
+                for key in [DP, DECODE_PARMS] {
+                    if self.dict.get_ref(key).is_some()
+                        || self
+                            .dict
+                            .get::<Array<'_>>(key)
+                            .is_some_and(|a| a.raw_iter().any(|v| v.as_obj_ref().is_some()))
+                    {
+                        return Err(DecodeFailure::StreamDecode);
+                    }
+                }
+                self.decoded_strict()
+            }
+            _ => Err(DecodeFailure::StreamDecode),
+        }
+    }
+
     /// Return the decoded data of the stream, with image metadata if available.
     pub fn decoded_image(
         &self,
@@ -832,6 +868,17 @@ mod tests {
     use crate::object::Stream;
     use crate::reader::Reader;
     use crate::reader::{ReaderContext, ReaderExt};
+
+    #[test]
+    fn field_values_refuse_corrupt_flate() {
+        let mut reader =
+            Reader::new(b"<< /Filter /FlateDecode /Length 1 >> stream\n\xff\nendstream");
+        let stream = reader
+            .read_indirect::<Stream<'_>>(&ReaderContext::dummy())
+            .unwrap();
+        assert!(stream.decoded_data().is_ok());
+        assert!(stream.decoded_field_value().is_err());
+    }
 
     #[test]
     fn display() {

@@ -56,25 +56,40 @@ impl<'a> Array<'a> {
 
     /// Iterates over the entries that can be read as dictionaries.
     pub fn dictionaries(&self) -> impl Iterator<Item = Dict<'a>> + '_ {
+        self.dictionary_entries()
+            .filter_map(|(_, entry)| match entry {
+                MaybeRef::Ref(r) => self.ctx.xref().get_with(r.into(), &self.ctx),
+                MaybeRef::NotRef(d) => Some(d),
+            })
+    }
+
+    /// Positions and unresolved dictionary candidates, skipping malformed entries and cyclic references.
+    pub fn dictionary_entries(
+        &self,
+    ) -> impl Iterator<Item = (usize, MaybeRef<Dict<'a>>)> + use<'a> {
         let mut reader = Reader::new(self.data);
+        let ctx = self.ctx.clone();
+        let mut index = 0;
         core::iter::from_fn(move || {
             loop {
+                let i = index;
+                index += 1;
                 reader.skip_white_spaces_and_comments();
-                if !self.ctx.in_content_stream()
-                    && let Some(id) = reader.read_with_context::<ObjRef>(&self.ctx)
+                if !ctx.in_content_stream()
+                    && let Some(id) = reader.read_with_context::<ObjRef>(&ctx)
                 {
-                    if let Some(dict) = self.ctx.xref().get_with(id.into(), &self.ctx) {
-                        return Some(dict);
+                    if !ctx.parent_chain_contains(&id.into()) {
+                        return Some((i, MaybeRef::Ref(id)));
                     }
                     continue;
                 }
                 if reader.peek_bytes(2) == Some(b"<<")
-                    && let Some(dict) = reader.read_with_context::<Dict<'_>>(&self.ctx)
+                    && let Some(dict) = reader.read_with_context::<Dict<'_>>(&ctx)
                 {
-                    return Some(dict);
+                    return Some((i, MaybeRef::NotRef(dict)));
                 }
 
-                let skipped = if self.ctx.in_content_stream() {
+                let skipped = if ctx.in_content_stream() {
                     reader.skip::<Object<'_>>(true)?
                 } else {
                     reader.skip::<MaybeRef<Object<'_>>>(false)?

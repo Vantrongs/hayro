@@ -24,6 +24,7 @@ use smallvec::smallvec;
 use std::sync::Arc;
 
 pub(crate) mod path;
+pub use path::paint_path;
 pub(crate) mod stack;
 pub(crate) mod state;
 pub(crate) mod text;
@@ -67,6 +68,18 @@ impl Default for InterpreterSettings {
     }
 }
 
+/// Which annotations to include.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AnnotationSelection {
+    /// Visible on screen.
+    #[default]
+    View,
+    /// Visible when printing.
+    Print,
+    /// Preserve visible non-link annotations when flattening.
+    Flatten,
+}
+
 bitflags! {
     /// The parts of a page that should be rendered.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,20 +109,61 @@ pub fn interpret_page<'a>(
     context: &mut Context<'a>,
     device: &mut impl Device<'a>,
 ) {
-    let resources = page.resources();
-    let render_content = context.settings.render_content;
-
-    if render_content.contains(RenderContent::PAGE) {
-        interpret(page.typed_operations(), resources, context, device);
-    }
-
-    if render_content.contains(RenderContent::ANNOTATIONS)
-        && let Some(annot_arr) = page.raw().get::<Array<'_>>(ANNOTS)
-    {
-        for annot in annot_arr.dictionaries() {
-            interpret_annotation(&annot, resources, context, device);
+    interpret_page_with_annotations(page, context, device, |context, device| {
+        if let Some(annots) = page.raw().get::<Array<'_>>(ANNOTS) {
+            for annot in annots.dictionaries() {
+                interpret_annotation(&annot, page.resources(), context, device);
+            }
         }
+    });
+}
+
+/// Interpret page content and delegate annotation drawing to the caller.
+pub fn interpret_page_with_annotations<'a, D: Device<'a>>(
+    page: &Page<'a>,
+    context: &mut Context<'a>,
+    device: &mut D,
+    annotations: impl FnOnce(&mut Context<'a>, &mut D),
+) {
+    let content = context.settings.render_content;
+    if content.contains(RenderContent::PAGE) {
+        interpret(page.typed_operations(), page.resources(), context, device);
     }
+    if content.contains(RenderContent::ANNOTATIONS) && page.raw().contains_key(ANNOTS) {
+        annotations(context, device);
+    }
+}
+
+/// Draw a placed annotation form into the current page context.
+pub fn draw_appearance_stream<'a>(
+    stream: &Stream<'a>,
+    bbox: [f32; 4],
+    matrix: Affine,
+    placement: Affine,
+    resources: &Resources<'a>,
+    context: &mut Context<'a>,
+    device: &mut impl Device<'a>,
+) {
+    if let Some(form) = FormXObject::with_geometry(stream, bbox, matrix) {
+        draw_placed(&form, placement, resources, context, device);
+    } else {
+        (context.settings.warning_sink)(InterpreterWarning::UnresolvedAnnotationAppearance);
+    }
+}
+
+fn draw_placed<'a>(
+    form: &FormXObject<'a>,
+    placement: Affine,
+    resources: &Resources<'a>,
+    context: &mut Context<'a>,
+    device: &mut impl Device<'a>,
+) {
+    context.save_state();
+    context.pre_concat_affine(placement);
+    context.push_root_transform();
+    form.draw(resources, context, device);
+    context.pop_root_transform();
+    context.restore_state(device);
 }
 
 fn interpret_annotation<'a>(
@@ -151,13 +205,7 @@ fn interpret_annotation<'a>(
             annot_rect.y0 - sy * transformed_rect.y0,
         ]);
 
-        context.save_state();
-        context.pre_concat_affine(affine);
-        context.push_root_transform();
-
-        apx.draw(resources, context, device);
-        context.pop_root_transform();
-        context.restore_state(device);
+        draw_placed(&apx, affine, resources, context, device);
     } else if annot.get::<Dict<'_>>(AP).is_some() {
         (context.settings.warning_sink)(InterpreterWarning::UnresolvedAnnotationAppearance);
     }

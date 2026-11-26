@@ -1,4 +1,3 @@
-use super::xobject_oc;
 use crate::context::Context;
 use crate::device::Device;
 use crate::{ClipPath, FillRule, interpret};
@@ -23,12 +22,20 @@ pub(crate) struct FormXObject<'a> {
 
 impl<'a> FormXObject<'a> {
     pub(crate) fn new(stream: &Stream<'a>) -> Option<Self> {
+        let (bbox, matrix) = crate::geometry::box_and_matrix(stream.dict())?;
+        Self::with_geometry(stream, bbox, matrix)
+    }
+
+    pub(crate) fn with_geometry(
+        stream: &Stream<'a>,
+        bbox: [f32; 4],
+        matrix: Affine,
+    ) -> Option<Self> {
         let dict = stream.dict();
 
         let decoded = stream.decoded_data().ok()?;
         let resources = dict.get(RESOURCES).map(Resources::new);
 
-        let (bbox, matrix) = crate::geometry::box_and_matrix(dict)?;
         let group = dict.get::<Dict<'_>>(GROUP);
         let flag = |key| {
             group
@@ -63,7 +70,7 @@ impl<'a> FormXObject<'a> {
             return;
         }
 
-        let has_oc = xobject_oc(&self.dict, context);
+        let has_oc = context.ocg_state.begin_named(context.xref, &self.dict, b"OC");
         if !context.ocg_state.is_visible() {
             if has_oc {
                 context.ocg_state.end_marked_content();

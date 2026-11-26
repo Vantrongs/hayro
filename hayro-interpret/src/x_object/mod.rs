@@ -14,7 +14,6 @@ use crate::color::ColorSpace;
 use crate::context::Context;
 use crate::device::Device;
 use crate::interpret::state::ActiveTransferFunction;
-use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::*;
@@ -59,8 +58,4 @@ impl<'a> XObject<'a> {
             Self::ImageXObject(image) => image.draw(context, device),
         }
     }
-}
-
-fn xobject_oc(dict: &Dict<'_>, context: &mut Context<'_>) -> bool {
-    context.ocg_state.begin_named(context.xref, dict, OC)
 }

@@ -43,6 +43,7 @@ mod function_shading;
 mod interpret;
 mod mesh;
 mod ocg;
+pub use ocg::OcgState;
 mod types;
 mod x_object;
 

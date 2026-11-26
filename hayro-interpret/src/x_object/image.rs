@@ -1,5 +1,4 @@
 use super::decode::{DecodedImage, DecodedMask, decode_image, decode_mask};
-use super::xobject_oc;
 use crate::WarningSinkFn;
 use crate::cache::Cache;
 use crate::color::ColorSpace;
@@ -130,7 +129,7 @@ impl<'a> ImageXObject<'a> {
             return;
         }
 
-        let has_oc = xobject_oc(self.stream.dict(), context);
+        let has_oc = context.ocg_state.begin_named(context.xref, self.stream.dict(), b"OC");
         if !context.ocg_state.is_visible() {
             if has_oc {
                 context.ocg_state.end_marked_content();

@@ -640,6 +640,33 @@ pub struct Color {
 }
 
 impl Color {
+    /// A device gray color with the supplied opacity.
+    pub fn gray(components: [f32; 1], opacity: f32) -> Self {
+        Self::new(
+            ColorSpace::device_gray(),
+            components.as_slice().into(),
+            opacity,
+        )
+    }
+
+    /// A device RGB color with the supplied opacity.
+    pub fn rgb(components: [f32; 3], opacity: f32) -> Self {
+        Self::new(
+            ColorSpace::device_rgb(),
+            components.as_slice().into(),
+            opacity,
+        )
+    }
+
+    /// A device CMYK color with the supplied opacity.
+    pub fn cmyk(components: [f32; 4], opacity: f32) -> Self {
+        Self::new(
+            ColorSpace::device_cmyk(),
+            components.as_slice().into(),
+            opacity,
+        )
+    }
+
     pub(crate) fn new(color_space: ColorSpace, components: ColorComponents, opacity: f32) -> Self {
         Self {
             color_space,
