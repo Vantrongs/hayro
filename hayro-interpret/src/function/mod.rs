@@ -264,6 +264,16 @@ impl Function {
         Some(())
     }
 
+    pub(crate) fn calculator_interval(&self, domain: [f64; 2]) -> Option<bool> {
+        let FunctionType::Type4(f) = &self.0.function_type else {
+            return None;
+        };
+        let [bounds] = self.0.domain.as_slice() else {
+            return None;
+        };
+        f.monotone_interval(domain.map(|x| bounds.clamp(x as f32)))
+    }
+
     pub(crate) fn linear_pieces(
         &self,
         domain: [f64; 2],

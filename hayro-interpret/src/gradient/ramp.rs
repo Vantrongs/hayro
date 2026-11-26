@@ -88,6 +88,11 @@ impl ParameterRamp {
         let mut ranges = Vec::new();
         let mut can_promote =
             !pattern.color_space.is_device_gray_or_rgb() || pattern.transfer_function.is_some();
+        let calculator = |f: &Function| f.calculator_interval([lo, hi]).is_some();
+        can_promote &= !match &g.function {
+            ShadingFunction::Single(f) => calculator(f),
+            ShadingFunction::Multiple(fs) => fs.iter().any(calculator),
+        };
         let mut budget = PARAMETER_CELLS * 8;
         let mut pending: SmallVec<[(usize, usize); 16]> = smallvec::smallvec![(0, PARAMETER_CELLS)];
         while let Some((start, end)) = pending.pop() {
@@ -137,6 +142,25 @@ fn color_bounds(
     let n = function.num_outputs();
     let (min, max) = (min.get_mut(..n)?, max.get_mut(..n)?);
     let mut collect = |f: &Function, first: usize| {
+        if let Some(monotone) = f.calculator_interval(domain) {
+            if !monotone {
+                return Some(false);
+            }
+            let end = first + f.num_outputs();
+            let a = min.get_mut(first..end)?;
+            let b = max.get_mut(first..end)?;
+            f.eval_1d_f64(domain[0], a)?;
+            f.eval_1d_f64(domain[1], b)?;
+            for (lo, hi) in a.iter_mut().zip(b) {
+                if !lo.is_finite() || !hi.is_finite() {
+                    return None;
+                }
+                if *lo > *hi {
+                    std::mem::swap(lo, hi);
+                }
+            }
+            return Some(true);
+        }
         f.linear_pieces(
             domain,
             [0., 1.],
@@ -150,15 +174,22 @@ fn color_bounds(
                 Some(())
             },
         )
+        .map(|()| true)
     };
     match function {
-        ShadingFunction::Single(f) => collect(f, 0)?,
+        ShadingFunction::Single(f) => {
+            if !collect(f, 0)? {
+                return Some(None);
+            }
+        }
         ShadingFunction::Multiple(fs) => {
             for (k, f) in fs.iter().enumerate() {
                 if f.num_outputs() != 1 {
                     return None;
                 }
-                collect(f, k)?;
+                if !collect(f, k)? {
+                    return Some(None);
+                }
             }
         }
     }

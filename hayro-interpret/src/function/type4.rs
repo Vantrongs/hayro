@@ -8,6 +8,7 @@ const MAX_STACK_DEPTH: usize = 100;
 #[derive(Debug)]
 pub(crate) struct Type4 {
     code: Vec<PostScriptOp>,
+    pieces: Option<CalculatorPieces>,
 }
 
 impl Type4 {
@@ -21,9 +22,22 @@ impl Type4 {
             .sum()
     }
     pub(crate) fn new(stream: &Stream<'_>) -> Option<Self> {
-        Some(Self {
-            code: parse_procedure(&stream.decoded_data().ok()?)?,
-        })
+        Some(Self::from_code(parse_procedure(
+            &stream.decoded_data().ok()?,
+        )?))
+    }
+
+    fn from_code(code: Vec<PostScriptOp>) -> Self {
+        let pieces = CalculatorPieces::parse(&code);
+        Self { code, pieces }
+    }
+
+    pub(super) fn monotone_interval(&self, [a, b]: [f32; 2]) -> Option<bool> {
+        let thresholds = &self.pieces.as_ref()?.thresholds;
+        let start = a.min(b);
+        let end = a.max(b);
+        let first = thresholds.partition_point(|&t| t < start);
+        Some(thresholds.get(first).is_none_or(|t| *t >= end))
     }
 
     pub(crate) fn evaluator(&self) -> impl FnMut(&[f32], &mut [f32]) -> Option<()> + '_ {
@@ -33,6 +47,22 @@ impl Type4 {
     }
 
     pub(crate) fn eval_one(&self, x: f32, output: &mut [f32]) -> Option<()> {
+        if let Some(pieces) = &self.pieces {
+            let index = pieces.thresholds.partition_point(|&t| t < x);
+            let channels = &pieces.channels[index * pieces.width..(index + 1) * pieces.width];
+            let start = channels.len().checked_sub(output.len())?;
+            for (out, channel) in output.iter_mut().zip(&channels[start..]) {
+                *out = match *channel {
+                    Channel::Constant(c) => c,
+                    Channel::Affine {
+                        anchor,
+                        slope,
+                        base,
+                    } => (x - anchor) * slope + base,
+                };
+            }
+            return Some(());
+        }
         thread_local! {
             static STACK: std::cell::RefCell<Stack> = const { std::cell::RefCell::new(Stack::new()) };
         }
@@ -51,6 +81,84 @@ impl Type4 {
         output.copy_from_slice(values.get(values.len().checked_sub(output.len())?..)?);
 
         Some(())
+    }
+}
+
+#[derive(Debug)]
+struct CalculatorPieces {
+    thresholds: Vec<f32>,
+    channels: Vec<Channel>,
+    width: usize,
+}
+
+#[derive(Debug)]
+enum Channel {
+    Constant(f32),
+    Affine { anchor: f32, slope: f32, base: f32 },
+}
+
+impl CalculatorPieces {
+    fn parse(mut ops: &[PostScriptOp]) -> Option<Self> {
+        use PostScriptOp::*;
+        let mut channels = Vec::new();
+        while let [Number(n), Exch, tail @ ..] = ops {
+            if !n.is_finite() || channels.len() == super::MAX_COMPONENTS {
+                return None;
+            }
+            channels.push(Channel::Constant(*n));
+            ops = tail;
+        }
+        let width = channels.len();
+        if width == 0 {
+            return None;
+        }
+        let mut thresholds = Vec::new();
+        while let [Dup, Number(t), Gt, SkipUnless(len), tail @ ..] = ops {
+            if !t.is_finite() || thresholds.last().is_some_and(|prev| prev >= t) {
+                return None;
+            }
+            let (mut body, rest) = tail.split_at_checked(*len as usize)?;
+            for _ in 0..width {
+                body = body.strip_prefix(&[Exch, Pop])?;
+            }
+            for _ in 0..width {
+                body = match body {
+                    [Number(c), Exch, rest @ ..] if c.is_finite() => {
+                        channels.push(Channel::Constant(*c));
+                        rest
+                    }
+                    [
+                        Dup,
+                        Number(anchor),
+                        Sub,
+                        Number(slope),
+                        Mul,
+                        Number(base),
+                        Add,
+                        Exch,
+                        rest @ ..,
+                    ] if anchor == t && slope.is_finite() && base.is_finite() => {
+                        channels.push(Channel::Affine {
+                            anchor: *anchor,
+                            slope: *slope,
+                            base: *base,
+                        });
+                        rest
+                    }
+                    _ => return None,
+                };
+            }
+            if !body.is_empty() {
+                return None;
+            }
+            thresholds.push(*t);
+            ops = rest;
+        }
+        (ops == [Pop] && !thresholds.is_empty()).then_some(Self {
+            thresholds,
+            channels,
+            width,
+        })
     }
 }
 
@@ -439,10 +547,28 @@ mod tests {
     }
 
     #[test]
+    fn strict_thresholds_match_interpreted_neighbors() {
+        let calc = Type4::from_code(
+            parse_procedure(
+                b"{ .9 exch dup .5 gt { exch pop dup .5 sub -3 mul .25 add exch } if pop }",
+            )
+            .unwrap(),
+        );
+        let t = 0.5_f32;
+        assert_eq!(calc.monotone_interval([t.next_down(), t]), Some(true));
+        assert_eq!(calc.monotone_interval([t.next_up(), t]), Some(false));
+        for x in [t.next_down(), t, t.next_up(), 1.] {
+            let mut actual = [0.];
+            let mut expected = [0.];
+            calc.eval_one(x, &mut actual).unwrap();
+            calc.evaluator()(&[x], &mut expected).unwrap();
+            assert_eq!(actual[0].to_bits(), expected[0].to_bits());
+        }
+    }
+
+    #[test]
     fn single_samples_reset_stack_depth_and_operand_types() {
-        let calc = |program: &[u8]| Type4 {
-            code: parse_procedure(program).unwrap(),
-        };
+        let calc = |program: &[u8]| Type4::from_code(parse_procedure(program).unwrap());
         let mut out = [0.0];
         calc(b"{ pop true true }").eval_one(0., &mut out).unwrap();
         assert!(calc(b"{ exch }").eval_one(0., &mut out).is_none());
@@ -824,7 +950,7 @@ mod tests {
             ],
             range: None,
             num_outputs: 3,
-            function_type: FunctionType::Type4(Type4 { code: procedure }),
+            function_type: FunctionType::Type4(Type4::from_code(procedure)),
         }));
 
         let res = type4.eval_one(&[-10.0, -2.0, 6.0]).unwrap();
