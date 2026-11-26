@@ -137,14 +137,84 @@ impl Renderer<'_> {
 
 fn raster_precision(gradient: &SvgGradient, bbox: Rect) -> bool {
     let inverse = gradient.transform.inverse();
-    let [a, b, c, d, e, f] = inverse.as_coeffs();
+    if !inverse.is_finite() {
+        return false;
+    }
     let x = bbox.x0.abs().max(bbox.x1.abs()) + 8.;
     let y = bbox.y0.abs().max(bbox.y1.abs()) + 4.;
-    // Bound the operands before cancellation to retain a fraction of a 4096-entry bin.
-    let bound = |a: f64, c: f64, e: f64| a.abs() * x + c.abs() * y + e.abs() < 512.;
-    inverse.is_finite()
-        && bound(a, c, e)
-        && (matches!(gradient.kind, SvgGradientKind::Linear { .. }) || bound(b, d, f))
+    let extent = |a: f64, c: f64, e: f64| a.abs() * x + c.abs() * y + e.abs();
+    // Bound the operands before cancellation in Vello's f32 sampler.
+    const LIMIT: f64 = 512.;
+    let line_to_unit = |p0: kurbo::Point, p1: kurbo::Point| {
+        let d = p1 - p0;
+        let len2 = d.hypot2();
+        if !len2.is_finite() || len2 == 0. {
+            return None;
+        }
+        let ux = d.x / len2;
+        let uy = d.y / len2;
+        Some(Affine::new([ux, -uy, uy, ux, 0., 0.]) * Affine::translate((-p0.x, -p0.y)))
+    };
+    match gradient.kind {
+        SvgGradientKind::Linear { start, end } => {
+            let Some(unit) = line_to_unit(start, end) else {
+                return false;
+            };
+            let eff = unit * inverse;
+            let [a, _, c, _, e, _] = eff.as_coeffs();
+            eff.is_finite() && extent(a, c, e) < LIMIT
+        }
+        SvgGradientKind::Radial {
+            start_center,
+            start_radius,
+            end_center,
+            end_radius,
+        } => {
+            let d = (end_center - start_center).hypot();
+            if d == 0. {
+                let max_r = f64::from(start_radius.max(end_radius));
+                let dr = f64::from(end_radius - start_radius).abs();
+                if max_r == 0. || dr == 0. {
+                    return false;
+                }
+                let eff = Affine::scale(1. / max_r)
+                    * Affine::translate((-end_center.x, -end_center.y))
+                    * inverse;
+                let [a, b, c, d, e, f] = eff.as_coeffs();
+                let scale = max_r / dr;
+                let bias = f64::from(start_radius) / dr;
+                eff.is_finite()
+                    && extent(a, c, e) * scale + bias < LIMIT
+                    && extent(b, d, f) * scale + bias < LIMIT
+            } else {
+                let Some(unit) = line_to_unit(start_center, end_center) else {
+                    return false;
+                };
+                let mut eff = unit * inverse;
+                let mut r0 = f64::from(start_radius) / d;
+                let mut r1 = f64::from(end_radius) / d;
+                let mut focal_x = r0 / (r0 - r1);
+                if (focal_x - 1.).abs() < 1e-6 {
+                    eff = Affine::scale_non_uniform(-1., 1.) * Affine::translate((-1., 0.)) * eff;
+                    std::mem::swap(&mut r0, &mut r1);
+                    focal_x = 0.;
+                }
+                let span = 1. - focal_x;
+                let fr1 = r1 / span.abs();
+                let denom = fr1 * fr1 - 1.;
+                if !denom.is_finite() || denom <= 0. {
+                    return false;
+                }
+                let sign = span.signum();
+                eff = Affine::scale_non_uniform(sign * fr1 / denom, sign / denom.sqrt())
+                    * Affine::translate((-focal_x, 0.))
+                    * eff;
+                let [a, b, c, d, e, f] = eff.as_coeffs();
+                let bias = focal_x.abs();
+                eff.is_finite() && extent(a, c, e) + bias < LIMIT && extent(b, d, f) + bias < LIMIT
+            }
+        }
+    }
 }
 
 fn native_paint(mut native: SvgGradient) -> (PaintType, Affine) {
@@ -432,5 +502,33 @@ mod tests {
             color: [gray, gray, gray, 1.0],
         });
         assert!(!lut_resolves(&stops, 0.01));
+    }
+
+    #[test]
+    fn raster_precision_rejects_ill_conditioned_radial_gradients() {
+        let bbox = Rect::new(0., 0., 16., 16.);
+        let focal = SvgGradient {
+            kind: SvgGradientKind::Radial {
+                start_center: kurbo::Point::ORIGIN,
+                start_radius: 100.,
+                end_center: kurbo::Point::new(1., 0.),
+                end_radius: 101.00025,
+            },
+            transform: Affine::IDENTITY,
+            stops: Vec::new(),
+        };
+        assert!(!raster_precision(&focal, bbox));
+
+        let concentric = SvgGradient {
+            kind: SvgGradientKind::Radial {
+                start_center: kurbo::Point::ORIGIN,
+                start_radius: 100.,
+                end_center: kurbo::Point::ORIGIN,
+                end_radius: 100.05,
+            },
+            transform: Affine::IDENTITY,
+            stops: Vec::new(),
+        };
+        assert!(!raster_precision(&concentric, bbox));
     }
 }

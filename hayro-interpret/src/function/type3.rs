@@ -128,16 +128,18 @@ impl Type3 {
             let mut left = [0.0; super::MAX_COMPONENTS];
             let mut right = left;
             let n = self.num_outputs();
-            self.functions[end - 1].eval_piece(
-                f64::from(self.encode[end - 1].max),
-                &mut left[..n],
-                budget,
-            )?;
-            self.functions[end].eval_piece(
-                f64::from(self.encode[end].min),
-                &mut right[..n],
-                budget,
-            )?;
+            let left_x = Interval {
+                min: self.bounds[end - 1],
+                max: self.bounds[end],
+            }
+            .map_f64(high, self.encode[end - 1]);
+            let right_x = Interval {
+                min: self.bounds[end],
+                max: self.bounds[end + 1],
+            }
+            .map_f64(high, self.encode[end]);
+            self.functions[end - 1].eval_piece(left_x, &mut left[..n], budget)?;
+            self.functions[end].eval_piece(right_x, &mut right[..n], budget)?;
             if left != right {
                 return None;
             }
@@ -393,6 +395,35 @@ mod tests {
         assert_eq!(
             function.eval_one(&[7.0]).unwrap().as_slice(),
             &[0.7, 0.7, 0.7]
+        );
+    }
+
+    #[test]
+    fn stitch_endpoint_uses_mapped_child_input_for_infinite_encode() {
+        let data = b"<<
+          /FunctionType 3
+          /Domain [0 1]
+          /Functions [
+            << /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [0] /N 1 >>
+            << /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >>
+          ]
+          /Bounds [0.5]
+          /Encode [0 1 0 10000000000000000000000000000000000000000.0]
+        >>";
+        let function = Function::new(&Object::from_bytes(data).unwrap()).unwrap();
+        // At 0.5, the right child's infinite encode end yields NaN -> clamped to 1.0 (output 1.0 != 0.0).
+        assert_eq!(function.eval_one(&[0.5]).unwrap().as_slice(), &[1.0]);
+        let mut budget = 64;
+        assert!(
+            function
+                .linear_pieces(
+                    [0.0, 0.5],
+                    [0.0, 1.0],
+                    &mut budget,
+                    Some(0.01),
+                    &mut |_, _, _| { Some(()) }
+                )
+                .is_none()
         );
     }
 }

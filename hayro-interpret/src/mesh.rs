@@ -489,10 +489,20 @@ impl<'a> CanvasPatch<'a> {
         }
 
         let [[c00, c01], [c10, c11]] = self.colors;
-        // Retain the fine grid when intermediate vertex quantization introduces extra color steps.
+        let components = c00
+            .len()
+            .min(c01.len())
+            .min(c10.len())
+            .min(c11.len())
+            .min(MAX_COMPONENTS);
+        // Retain the fine grid when clamping or intermediate vertex quantization changes steps.
         let divisions = f64::from(1_u32 << fine);
-        for k in 0..c00.len() {
-            let [a, b, c, d] = [c00, c01, c10, c11].map(|v| f64::from(v[k]) * 255.);
+        for k in 0..components {
+            let corners = [c00[k], c01[k], c10[k], c11[k]];
+            if corners.iter().any(|v| !(0.0..=1.0).contains(v)) {
+                return fine;
+            }
+            let [a, b, c, d] = corners.map(|v| f64::from(v) * 255.);
             if [b - a, c - a, d - c, d - b]
                 .iter()
                 .any(|v| (v / divisions).fract() != 0.)
@@ -500,13 +510,10 @@ impl<'a> CanvasPatch<'a> {
                 return fine;
             }
         }
-        let twist = c00
-            .iter()
-            .zip(c01)
-            .zip(c10)
-            .zip(c11)
-            .map(|(((&a, &b), &c), &d)| {
-                (f64::from(a) - f64::from(b) - f64::from(c) + f64::from(d)).abs()
+        let twist = (0..components)
+            .map(|k| {
+                (f64::from(c00[k]) - f64::from(c01[k]) - f64::from(c10[k]) + f64::from(c11[k]))
+                    .abs()
             })
             .fold(0., f64::max);
         let color_ratio = twist * 512.;
@@ -547,8 +554,19 @@ fn draw_patches<const N: usize, C: MeshColors<N>>(
 ) -> Result<(), Exhausted> {
     for (patch, &depth) in patches.iter().zip(depths) {
         let mut line = Vec::new();
-        let cache =
-            C::CACHE_COLUMNS && depth > 0 && patch.colors.iter().all(|pair| pair[0] == pair[1]);
+        let [[c00, c01], [c10, c11]] = patch.colors;
+        let components = c00
+            .len()
+            .min(c01.len())
+            .min(c10.len())
+            .min(c11.len())
+            .min(MAX_COMPONENTS);
+        let cache = target.pixel_centers
+            && target.canvas.height > 1
+            && C::CACHE_COLUMNS
+            && depth > 1
+            && c00[..components] == c01[..components]
+            && c10[..components] == c11[..components];
         draw_patch_rows(
             target,
             patch,
@@ -617,18 +635,20 @@ fn draw_patch_rows<const N: usize>(
     );
     let mut column = |i: usize, meter: &mut dyn Meter| -> Result<[[f32; N]; 2], Exhausted> {
         let u = i as f32 / segments as f32;
-        if let Some(line) = &mut line {
-            if line.is_empty() {
+        if line.as_ref().is_some_and(|cache| cache.is_empty()) {
+            if meter.hold(slots * size_of::<Column<N>>()) {
                 take(meter, Cost::of(slots))?;
-                if !meter.hold(slots * size_of::<Column<N>>()) {
-                    return Err(Exhausted);
-                }
-                line.reserve_exact(slots);
-                line.resize(slots, (usize::MAX, None));
+                let cache = line.as_deref_mut().unwrap();
+                cache.reserve_exact(slots);
+                cache.resize(slots, (usize::MAX, None));
+            } else {
+                line = None;
             }
-            let slot = &mut line[i % slots];
+        }
+        if let Some(cache) = &mut line {
+            let slot = &mut cache[i % slots];
             if slot.0 != i {
-                take(meter, vertex_cost.times(4))?;
+                take(meter, vertex_cost.times(2))?;
                 *slot = (
                     i,
                     colors.invariant_column(
@@ -812,5 +832,36 @@ mod tests {
             assert!(row[..24].iter().all(|p| p[3] == 1.));
             assert!(row[24..28].iter().all(|p| p[3] == 0.));
         }
+    }
+
+    #[test]
+    fn out_of_range_and_unequal_patch_colors_retain_fine_depth() {
+        let points = std::array::from_fn(|i| {
+            std::array::from_fn(|j| Point::new(i as f64 * 8., j as f64 * 8.))
+        });
+        let clipped = [
+            [smallvec::smallvec![0.], smallvec::smallvec![0.]],
+            [smallvec::smallvec![4.], smallvec::smallvec![4.]],
+        ];
+        assert_eq!(
+            CanvasPatch {
+                points,
+                colors: &clipped,
+            }
+            .depth(2),
+            2
+        );
+        let unequal = [
+            [smallvec::smallvec![0., 0.], smallvec::smallvec![0.]],
+            [smallvec::smallvec![0.], smallvec::smallvec![0.]],
+        ];
+        assert_eq!(
+            CanvasPatch {
+                points,
+                colors: &unequal,
+            }
+            .depth(2),
+            0
+        );
     }
 }
