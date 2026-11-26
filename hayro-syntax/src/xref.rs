@@ -640,7 +640,8 @@ impl XRef {
         Some(ContentKey::new(data, &ctx))
     }
 
-    pub(crate) fn is_repaired(&self) -> bool {
+    /// Whether the cross-reference map has been rebuilt.
+    pub fn is_repaired(&self) -> bool {
         matches!(&self.0, Inner::Some(r) if r.map.get().repaired)
     }
 

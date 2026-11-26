@@ -235,6 +235,7 @@ pub fn interpret<'a>(
     let floor = context.ocg_state.open();
     let num_states = context.num_states();
     let mut font_dict_cache = FxHashMap::<Name<'a>, Dict<'a>>::default();
+    let mut last_form: Option<(Name<'_>, bool, Option<FormXObject<'a>>)> = None;
 
     context.save_state();
 
@@ -613,22 +614,40 @@ pub fn interpret<'a>(
             }
             TypedInstruction::ShapeGlyph(_) => {}
             TypedInstruction::XObject(x) => {
-                let cache = context.interpreter_cache.object_cache.clone();
-                let warning_sink = context.settings.warning_sink.clone();
-                let transfer_function = context.compositing().transfer_function.clone();
-                if let Some(x_object) = resources.get_x_object(x.0).and_then(|s| {
+                let xref = resources.x_objects.xref();
+                let repaired = xref.is_repaired();
+                let repeated = last_form
+                    .as_ref()
+                    .filter(|(name, revision, _)| name == x.0 && *revision == repaired);
+                if let Some((_, _, Some(form))) = repeated {
+                    form.draw(resources, context, device);
+                    continue;
+                }
+
+                // Retain a decoded form only once this content stream has reused it.
+                let reused = repeated.is_some();
+                last_form = None;
+                let (object, lost) = xref.watch(|| {
+                    let stream = resources.get_x_object(x.0)?;
                     XObject::new(
-                        &s,
+                        &stream,
                         |name| context.get_color_space(resources, name),
-                        &warning_sink,
-                        &cache,
-                        transfer_function.clone(),
+                        &context.settings.warning_sink,
+                        &context.interpreter_cache.object_cache,
+                        context.compositing().transfer_function.clone(),
                     )
-                }) {
-                    x_object.draw(resources, context, device);
+                });
+                if let Some(object) = object {
+                    object.draw(resources, context, device);
+                    if let XObject::FormXObject(form) = object
+                        && lost.is_none()
+                    {
+                        last_form = Some((x.0.clone(), xref.is_repaired(), reused.then_some(form)));
+                    }
                 }
             }
             TypedInstruction::InlineImage(i) => {
+                last_form = None;
                 let warning_sink = context.settings.warning_sink.clone();
                 let transfer_function = context.compositing().transfer_function.clone();
                 let cache = context.interpreter_cache.object_cache.clone();

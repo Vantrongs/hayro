@@ -352,7 +352,7 @@ impl<'a> Context<'a> {
     }
 
     pub(crate) fn get_color_space(
-        &mut self,
+        &self,
         resources: &Resources<'_>,
         name: &Name<'_>,
     ) -> Option<ColorSpace> {

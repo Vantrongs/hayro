@@ -39,6 +39,11 @@ impl PartialEq for Dict<'_> {
 }
 
 impl<'a> Dict<'a> {
+    /// The cross-reference table used to resolve this dictionary's entries.
+    pub fn xref(&self) -> &'a crate::xref::XRef {
+        self.ctx().xref()
+    }
+
     /// Reads this object independently of the reference chain that reached it.
     pub fn as_root(&self) -> Self {
         self.rooted(false)
