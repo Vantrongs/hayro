@@ -204,3 +204,28 @@ fn tiny_extended_radial_matches_a_unit_circle_at_device_scale() {
         assert_eq!(tiny.sample(x, 49), reference);
     }
 }
+
+#[test]
+fn subpixel_axial_gradient_keeps_the_pixel_center_parameter() {
+    let image = gradient(
+        "0.0000000009313225746154785 0 0 1 1.5 0 cm /S sh",
+        "/ShadingType 2 /Coords [-0.875 0 0.125 0] /Extend [true true]",
+        b"<< /FunctionType 3 /Domain [0 1] /Functions [<< /FunctionType 2 /Domain [0 1] /N 1 >>] /Bounds [] /Encode [-3 1] >>".to_vec(),
+        1.,
+    );
+    assert_eq!(image.sample(1, 50).r, 128);
+}
+
+#[test]
+fn nonextended_axial_stroke_leaves_the_miter_tip_unpainted() {
+    let image = raster(fixtures::one_page(
+        100,
+        "/Contents 4 0 R /Resources << /Pattern << /P 5 0 R >> >>",
+        vec![
+            fixtures::stream("", b"1 0 0 rg 0 0 100 100 re f /Pattern CS /P SCN 10 w 10 M 75 40.62 m 40 50 l 75 59.38 l S"),
+            b"<< /Type /Pattern /PatternType 2 /Shading << /ShadingType 2 /ColorSpace /DeviceGray /Coords [29 0 95 0] /Function << /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [0] /N 1 >> >> >>".to_vec(),
+        ],
+    ), 1.);
+    assert_eq!(image.sample(25, 50).to_u8_array(), [255, 0, 0, 255]);
+    assert_eq!(image.sample(32, 50).to_u8_array(), [0, 0, 0, 255]);
+}

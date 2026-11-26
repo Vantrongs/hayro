@@ -55,6 +55,12 @@ impl Renderer<'_> {
         self.ctx.set_stroke(stroke);
     }
 
+    pub(super) fn stroke_bounds(&self, bounds: Rect) -> Rect {
+        let stroke = self.ctx.stroke();
+        let extent = stroke.width / 2.0 * stroke.miter_limit.max(SQRT_2);
+        bounds.inflate(extent, extent)
+    }
+
     pub(super) fn stroke_path(
         &mut self,
         path: &BezPath,
@@ -65,9 +71,7 @@ impl Renderer<'_> {
         self.apply_draw_props(&props);
         self.set_stroke_properties(stroke_props, is_text);
 
-        let stroke = self.ctx.stroke();
-        let extent = stroke.width / 2.0 * stroke.miter_limit.max(SQRT_2);
-        let bbox = path.control_box().inflate(extent, extent);
+        let bbox = self.stroke_bounds(path.control_box());
         if self.misses_target(props.transform.transform_rect_bbox(bbox)) {
             return;
         }

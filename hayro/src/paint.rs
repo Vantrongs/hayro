@@ -3,7 +3,6 @@ use hayro_interpret::Paint;
 use hayro_interpret::encode::{EncodedShadingPattern, EncodedShadingType, texture_dimensions};
 use hayro_interpret::gradient::{PreparedShading, SvgGradient, SvgGradientKind, SvgGradientStop};
 use hayro_interpret::pattern::{Pattern, ShadingPattern};
-use hayro_interpret::util::x_y_advances;
 use kurbo::{Affine, BezPath, Rect};
 use std::sync::Arc;
 use vello_cpu::color::{AlphaColor, DynamicColor, Srgb};
@@ -32,13 +31,12 @@ impl Renderer<'_> {
             Paint::Pattern(p) => {
                 let path_transform = *self.ctx.transform();
                 let bbox = {
-                    let mut bbox = path_transform.transform_rect_bbox(path_bbox());
-
-                    if is_stroke {
-                        let (a1, a2) = x_y_advances(&path_transform);
-                        let factor = a1.length().max(a2.length()) * self.ctx.stroke().width;
-                        bbox = bbox.inflate(factor, factor);
-                    }
+                    let bounds = path_bbox();
+                    let bbox = path_transform.transform_rect_bbox(if is_stroke {
+                        self.stroke_bounds(bounds)
+                    } else {
+                        bounds
+                    });
 
                     bbox.intersect(Rect::new(
                         0.0,
@@ -82,6 +80,7 @@ impl Renderer<'_> {
             if let Some(native) = g
                 .as_svg_gradient(&encoded, STOP_TOLERANCE)
                 .and_then(SvgGradient::with_raster_geometry)
+                .filter(|g| raster_precision(g, bbox))
                 .and_then(|gradient| resolved_gradient(gradient, g.clamps_child_domain()))
             {
                 return native_paint(native);
@@ -123,7 +122,10 @@ impl Renderer<'_> {
                         };
                         return (PaintType::Image(image), transform);
                     }
-                    if let Some(native) = g.as_raster_gradient(&encoded) {
+                    if let Some(native) = g
+                        .as_raster_gradient(&encoded)
+                        .filter(|g| raster_precision(g, bbox))
+                    {
                         return native_paint(native);
                     }
                 }
@@ -131,6 +133,18 @@ impl Renderer<'_> {
         }
         texture_paint(&encoded.prepare_for(bbox), bbox)
     }
+}
+
+fn raster_precision(gradient: &SvgGradient, bbox: Rect) -> bool {
+    let inverse = gradient.transform.inverse();
+    let [a, b, c, d, e, f] = inverse.as_coeffs();
+    let x = bbox.x0.abs().max(bbox.x1.abs()) + 8.;
+    let y = bbox.y0.abs().max(bbox.y1.abs()) + 4.;
+    // Bound the operands before cancellation to retain a fraction of a 4096-entry bin.
+    let bound = |a: f64, c: f64, e: f64| a.abs() * x + c.abs() * y + e.abs() < 512.;
+    inverse.is_finite()
+        && bound(a, c, e)
+        && (matches!(gradient.kind, SvgGradientKind::Linear { .. }) || bound(b, d, f))
 }
 
 fn native_paint(mut native: SvgGradient) -> (PaintType, Affine) {

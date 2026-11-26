@@ -355,7 +355,8 @@ impl EncodedRadialAxialShading {
                 }
             }
             let color = std::array::from_fn(|c| ((low[c] + high[c]) * 127.5).round() / 255.);
-            if low[3] != 1.
+            if (size == 1024 && (0..4).any(|c| high[c] - low[c] > 1. / 255. + f32::EPSILON))
+                || low[3] != 1.
                 || color_error(color, low).max(color_error(color, high)) > 1. / 255. + f32::EPSILON
             {
                 return None;
@@ -381,25 +382,28 @@ mod tests {
     use hayro_syntax::object::{Dict, FromBytes};
 
     #[test]
-    fn native_bins_choose_the_smallest_table_covering_a_three_level_step() {
-        let mut cells = vec![0; PARAMETER_CELLS];
-        cells[12..].fill(1);
-        cells[24..].fill(2);
-        let gray = |b| [b, b, b, 1.];
-        let ranges = [0., 2. / 255., 3. / 255.]
-            .map(gray)
-            .map(|v| Some((v, v)))
-            .to_vec();
-        let ramp = ParameterRamp {
-            cells,
-            ranges,
-            can_promote: true,
-            native: OnceLock::new(),
-        };
-        assert!(EncodedRadialAxialShading::raster_stops(&ramp, 1024).is_none());
-        let stops = EncodedRadialAxialShading::raster_stops(&ramp, 2048).unwrap();
-        assert_eq!(stops[0].color, gray(1. / 255.));
-        assert_eq!(stops[1].offset, 1. / 2047.);
+    fn native_bins_refine_two_and_three_level_steps() {
+        for peak in [2., 3.] {
+            let mut cells = vec![0; PARAMETER_CELLS];
+            cells[12..].fill(1);
+            cells[24..].fill(2);
+
+            let gray = |b| [b, b, b, 1.];
+            let ranges = [0., 2. / 255., peak / 255.]
+                .map(gray)
+                .map(|v| Some((v, v)))
+                .to_vec();
+            let ramp = ParameterRamp {
+                cells,
+                ranges,
+                can_promote: true,
+                native: OnceLock::new(),
+            };
+            assert!(EncodedRadialAxialShading::raster_stops(&ramp, 1024).is_none());
+            let stops = EncodedRadialAxialShading::raster_stops(&ramp, 2048).unwrap();
+            assert_eq!(stops[0].color, gray(1. / 255.));
+            assert_eq!(stops[1].offset, 1. / 2047.);
+        }
     }
 
     #[test]

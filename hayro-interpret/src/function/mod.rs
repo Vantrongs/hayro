@@ -295,6 +295,12 @@ impl Function {
         })
     }
 
+    fn eval_piece(&self, x: f64, values: &mut [f32], budget: &mut usize) -> Option<()> {
+        let cost = usize::try_from(self.cost().steps()).ok()?.max(1);
+        *budget = budget.checked_sub(cost)?;
+        self.eval_1d_f64(x, values)
+    }
+
     fn ranged_pieces(
         &self,
         domain: [f64; 2],
@@ -316,20 +322,19 @@ impl Function {
             return None;
         }
         let clipped = domain.map(|x| x.clamp(f64::from(bounds.min), f64::from(bounds.max)));
+        let constant = |x, ts: [f64; 2], budget: &mut usize, emit: &mut PieceEmitter<'_>| {
+            let mut values = [0.; MAX_COMPONENTS];
+            let values = &mut values[..self.num_outputs()];
+            self.eval_piece(x, values, budget)?;
+            emit(ts.map(|t| t as f32), values, values, budget)
+        };
+        if clipped[0] == clipped[1] {
+            return constant(clipped[0], offsets, budget, emit);
+        }
         if clipped != domain {
             let offset = |x| {
                 offsets[0] + (x - domain[0]) / (domain[1] - domain[0]) * (offsets[1] - offsets[0])
             };
-            let constant = |x, ts: [f64; 2], budget: &mut usize, emit: &mut PieceEmitter<'_>| {
-                let mut values = [0.; MAX_COMPONENTS];
-                let values = &mut values[..self.num_outputs()];
-                self.eval_1d_f64(x, values)?;
-                *budget = budget.checked_sub(1)?;
-                emit(ts.map(|t| t as f32), values, values, budget)
-            };
-            if clipped[0] == clipped[1] {
-                return constant(clipped[0], offsets, budget, emit);
-            }
             let ts = [
                 if clipped[0] == domain[0] {
                     offsets[0]

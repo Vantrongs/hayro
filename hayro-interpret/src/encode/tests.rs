@@ -33,7 +33,7 @@ impl Meter for Allow {
     }
 }
 
-fn pattern(shading: Vec<u8>, function: Vec<u8>) -> EncodedShadingPattern {
+fn parsed_pattern(shading: Vec<u8>, function: Vec<u8>) -> ShadingPattern {
     let pdf = Pdf::new(crate::fixtures::one_page(
         100,
         "",
@@ -48,7 +48,11 @@ fn pattern(shading: Vec<u8>, function: Vec<u8>) -> EncodedShadingPattern {
         .xref()
         .get::<Dict<'_>>(ObjectIdentifier::new(4, 0))
         .unwrap();
-    ShadingPattern::new(&dict, &Cache::new()).unwrap().encode()
+    ShadingPattern::new(&dict, &Cache::new()).unwrap()
+}
+
+fn pattern(shading: Vec<u8>, function: Vec<u8>) -> EncodedShadingPattern {
+    parsed_pattern(shading, function).encode()
 }
 
 #[test]
@@ -225,4 +229,120 @@ fn axial_extension_depends_on_reachable_pixel_centers() {
         g.cover_placement(bbox, p.base_transform);
         assert_eq!(g.extend, expected);
     }
+}
+
+fn tensor_patch(
+    space: &str,
+    color_decode: &str,
+    colors: [u8; 4],
+    offscreen: usize,
+) -> EncodedShadingPattern {
+    let points = [
+        [0, 0],
+        [0, 1],
+        [0, 2],
+        [0, 3],
+        [1, 3],
+        [2, 3],
+        [3, 3],
+        [3, 2],
+        [3, 1],
+        [3, 0],
+        [2, 0],
+        [1, 0],
+        [1, 1],
+        [1, 2],
+        [2, 2],
+        [2, 1],
+    ];
+    let mut data = Vec::new();
+    for i in 0..=offscreen {
+        data.push(0);
+        for [x, y] in points {
+            data.extend([x * 42 + if i > 0 { 129 } else { 0 }, y * 42]);
+        }
+        data.extend(colors);
+    }
+    pattern(
+        crate::fixtures::stream(
+            &format!(
+                "/ShadingType 7 /ColorSpace {space} /BitsPerCoordinate 8 /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 16575 0 16575 {color_decode}]"
+            ),
+            &data,
+        ),
+        b"null".to_vec(),
+    )
+}
+
+#[test]
+fn tiny_crop_of_a_large_patch_fits_its_scratch_budget() {
+    for (space, bytes) in [
+        ("/DeviceGray", 4096),
+        ("[/CalGray << /WhitePoint [1 1 1] >>]", 4096),
+        (
+            "/DeviceGray /Function << /FunctionType 2 /Domain [0 1] /N 1 >>",
+            8192,
+        ),
+    ] {
+        let patch = tensor_patch(space, "0 1", [0, 0, 255, 255], 6);
+        let mut meter = Allow {
+            steps: 1_000_000,
+            bytes,
+        };
+        let mut result = Vec::new();
+        patch
+            .sample_texture_metered(
+                Rect::new(4000., 4000., 4001., 4001.),
+                1.,
+                &mut meter,
+                |row| result.extend_from_slice(row),
+            )
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0][3], 1.);
+        assert_eq!(meter.bytes, bytes);
+    }
+}
+
+#[test]
+fn overflowing_mesh_decode_preserves_interior_white() {
+    let patch = tensor_patch(
+        "/DeviceGray",
+        "0 999999999999999999999999999999999999999999999",
+        [255; 4],
+        0,
+    );
+    let mut result = Vec::new();
+    patch
+        .sample_texture_metered(
+            Rect::new(4000., 4000., 4001., 4001.),
+            1.,
+            &mut Unmetered,
+            |row| result.extend_from_slice(row),
+        )
+        .unwrap();
+    assert_eq!(result, [[1.; 4]]);
+}
+
+#[test]
+fn subdividing_a_varying_channel_bounds_clamped_calculator_work() {
+    let pattern = parsed_pattern(
+        b"<< /ShadingType 2 /Coords [0 0 1 0] /ColorSpace /DeviceRGB /Function [
+        << /FunctionType 3 /Domain [0 1] /Functions [6 0 R] /Bounds [] /Encode [2 3] >>
+        << /FunctionType 2 /Domain [0 1] /N 1 >>
+        << /FunctionType 2 /Domain [0 1] /N 1 >>] >>"
+            .to_vec(),
+        crate::fixtures::stream(
+            "/FunctionType 4 /Domain [0 1] /Range [0 1]",
+            format!("{{ {} }}", "dup mul ".repeat(256)).as_bytes(),
+        ),
+    );
+    let before = crate::function::test_operator_count();
+    let prepared = crate::gradient::PreparedShading::new(pattern).encode(Affine::IDENTITY);
+    let EncodedShadingType::RadialAxial(g) = prepared.shading_type else {
+        unreachable!()
+    };
+    assert!(g.ramp.is_none());
+    let executed = crate::function::test_operator_count() - before;
+    assert!((512..=262144).contains(&executed));
 }

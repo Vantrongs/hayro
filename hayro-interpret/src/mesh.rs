@@ -168,7 +168,7 @@ fn group_depths(
     meter: &mut dyn Meter,
 ) -> Result<Vec<u32>, Exhausted> {
     let n = patches.len();
-    take(meter, Cost::of(n).times(128))?;
+    take(meter, Cost::of(n).times(if linear { 512 } else { 32 }))?;
     if !meter.hold(n.saturating_mul(size_of::<u32>())) {
         return Err(Exhausted);
     }
@@ -184,7 +184,7 @@ fn group_depths(
             }
         })
         .collect::<Vec<_>>();
-    if n < 2 || depths.iter().all(|d| *d == depths[0]) {
+    if !linear || n < 2 || depths.iter().all(|d| *d == depths[0]) {
         return Ok(depths);
     }
     crate::encode::scratch(meter, |meter| {
@@ -227,6 +227,7 @@ fn group_depths(
 }
 
 trait MeshColors<const N: usize> {
+    const CACHE_COLUMNS: bool = false;
     fn values(&self, components: &[f32]) -> [f32; N];
     fn invariant_column(&self, _: &[f32], _: &[f32], _: &[f32]) -> Option<[f32; N]> {
         None
@@ -283,6 +284,7 @@ impl Direct<'_> {
 }
 
 impl MeshColors<4> for Direct<'_> {
+    const CACHE_COLUMNS: bool = true;
     fn values(&self, components: &[f32]) -> [f32; 4] {
         self.pattern.convert(components)
     }
@@ -291,10 +293,16 @@ impl MeshColors<4> for Direct<'_> {
         let mut low = [0.; MAX_COMPONENTS];
         let mut high = low;
         for (i, &v) in values.iter().enumerate() {
+            if !v.is_finite() || !a[i].is_finite() || !b[i].is_finite() {
+                return None;
+            }
             // Enclose both rounded four-term bilinear sums around the same exact column value.
             let error = 16. * f32::EPSILON * a[i].abs().max(b[i].abs()) + f32::MIN_POSITIVE;
             low[i] = v - error;
             high[i] = v + error;
+            if !low[i].is_finite() || !high[i].is_finite() {
+                return None;
+            }
         }
         let space = &self.pattern.color_space;
         (space.encode_values(&low[..values.len()]) == space.encode_values(&high[..values.len()]))
@@ -432,12 +440,12 @@ impl<'a> CanvasPatch<'a> {
     fn depth(&self, fine: u32) -> u32 {
         let curved = |[a, b, c, d]: [Point; 4]| {
             let axis = d - a;
-            let tolerance = f64::EPSILON * 16. * axis.hypot2();
+
             if axis.hypot2() == 0. {
                 return a != b || a != c;
             }
-            (b - a).cross(axis).abs() > tolerance
-                || (c - a).cross(axis).abs() > tolerance
+            (b - a).cross(axis) != 0.
+                || (c - a).cross(axis) != 0.
                 || (b - a).dot(axis) < 0.
                 || (c - b).dot(axis) < 0.
                 || (d - c).dot(axis) < 0.
@@ -464,6 +472,21 @@ impl<'a> CanvasPatch<'a> {
         let corner = ((right[3] - left[3]) - (right[0] - left[0])).hypot();
         let pure = 0.75 * (u + v);
         let geometry = pure + 0.25 * corner;
+        // Each parametric tangent is a convex combination of control-net differences.
+        let orientation = (right[0] - left[0]).cross(left[3] - left[0]).signum();
+        for pair in net.windows(2) {
+            for (a, b) in pair[0].iter().zip(&pair[1]) {
+                let du = *b - *a;
+                for column in net {
+                    if !column
+                        .windows(2)
+                        .all(|v| du.cross(v[1] - v[0]) * orientation > 0.)
+                    {
+                        return fine;
+                    }
+                }
+            }
+        }
 
         let [[c00, c01], [c10, c11]] = self.colors;
         // Retain the fine grid when intermediate vertex quantization introduces extra color steps.
@@ -514,38 +537,18 @@ impl<'a> CanvasPatch<'a> {
     }
 }
 
-fn draw_patches<const N: usize>(
+type Column<const N: usize> = (usize, Option<[f32; N]>);
+
+fn draw_patches<const N: usize, C: MeshColors<N>>(
     target: &mut Target<'_>,
     patches: &[CanvasPatch<'_>],
     depths: &[u32],
-    colors: &impl MeshColors<N>,
+    colors: &C,
 ) -> Result<(), Exhausted> {
     for (patch, &depth) in patches.iter().zip(depths) {
-        let samples = 1_usize << depth;
         let mut line = Vec::new();
-        if depth > 0
-            && patch.colors.iter().all(|pair| pair[0] == pair[1])
-            && patch.bounds().overlaps(target.canvas.bounds())
-        {
-            let bytes = (samples + 1) * size_of::<Option<[f32; N]>>();
-            if !target.meter.hold(bytes) {
-                return Err(Exhausted);
-            }
-            take(
-                target.meter,
-                target.vertex_cost.times(4 * (samples + 1) as u64),
-            )?;
-            line.reserve_exact(samples + 1);
-            let mut buffer = [0.; MAX_COMPONENTS];
-            for i in 0..=samples {
-                let values = patch.components(i as f32 / samples as f32, 0., &mut buffer);
-                line.push(colors.invariant_column(
-                    values,
-                    &patch.colors[0][0],
-                    &patch.colors[1][0],
-                ));
-            }
-        }
+        let cache =
+            C::CACHE_COLUMNS && depth > 0 && patch.colors.iter().all(|pair| pair[0] == pair[1]);
         draw_patch_rows(
             target,
             patch,
@@ -554,11 +557,11 @@ fn draw_patches<const N: usize>(
             depth,
             depth,
             colors,
-            &line,
+            cache.then_some(&mut line),
         )?;
         target
             .meter
-            .release_bytes(line.capacity() * size_of::<Option<[f32; N]>>());
+            .release_bytes(line.capacity() * size_of::<Column<N>>());
     }
     Ok(())
 }
@@ -571,7 +574,7 @@ fn draw_patch_rows<const N: usize>(
     remaining: u32,
     depth: u32,
     colors: &impl MeshColors<N>,
-    line: &[Option<[f32; N]>],
+    mut line: Option<&mut Vec<Column<N>>>,
 ) -> Result<(), Exhausted> {
     take(target.meter, Cost::new(1))?;
     if !target.canvas.is_visible(points.as_flattened()) {
@@ -588,7 +591,7 @@ fn draw_patch_rows<const N: usize>(
             remaining - 1,
             depth,
             colors,
-            line,
+            line.as_deref_mut(),
         )?;
         return draw_patch_rows(
             target,
@@ -605,12 +608,41 @@ fn draw_patch_rows<const N: usize>(
     let mut previous = None;
     let mut buffer = [0.; MAX_COMPONENTS];
     let vertex_cost = target.vertex_cost;
+    let slots = (segments + 1).min(
+        target
+            .canvas
+            .width
+            .saturating_add(target.canvas.height)
+            .saturating_add(1),
+    );
     let mut column = |i: usize, meter: &mut dyn Meter| -> Result<[[f32; N]; 2], Exhausted> {
-        if let Some(Some(value)) = line.get(i) {
-            return Ok([*value; 2]);
+        let u = i as f32 / segments as f32;
+        if let Some(line) = &mut line {
+            if line.is_empty() {
+                take(meter, Cost::of(slots))?;
+                if !meter.hold(slots * size_of::<Column<N>>()) {
+                    return Err(Exhausted);
+                }
+                line.reserve_exact(slots);
+                line.resize(slots, (usize::MAX, None));
+            }
+            let slot = &mut line[i % slots];
+            if slot.0 != i {
+                take(meter, vertex_cost.times(4))?;
+                *slot = (
+                    i,
+                    colors.invariant_column(
+                        patch.components(u, 0., &mut buffer),
+                        &patch.colors[0][0],
+                        &patch.colors[1][0],
+                    ),
+                );
+            }
+            if let Some(value) = slot.1 {
+                return Ok([value; 2]);
+            }
         }
         take(meter, vertex_cost.times(2))?;
-        let u = i as f32 / segments as f32;
         Ok([v0, v1].map(|v| colors.values(patch.components(u, v, &mut buffer))))
     };
     draw_patch_strip(
@@ -699,6 +731,42 @@ mod tests {
         }
         fn shade(&self, v: &[f32; 1]) -> [f32; 4] {
             [v[0], v[0], v[0], 1.]
+        }
+    }
+
+    #[test]
+    fn folded_patch_coverage_matches_fine_subdivision() {
+        let colors = [[0., 0.], [0., 0.]].map(|row| row.map(|v| smallvec::smallvec![v]));
+        for degenerate in [false, true] {
+            let points = std::array::from_fn(|i| {
+                std::array::from_fn(|j| {
+                    let interior = (1..3).contains(&i) && (1..3).contains(&j);
+                    let y = if degenerate {
+                        if interior { 0.52 } else { 0.5 }
+                    } else {
+                        (60 + j) as f64 / 128. + if interior { 1. / 16. } else { 0. }
+                    };
+                    Point::new(8. * i as f64, y)
+                })
+            });
+            let patch = CanvasPatch {
+                points,
+                colors: &colors,
+            };
+            let draw = |depth| {
+                let mut canvas = Canvas::new(24, 1, [0.; 4]);
+                let mut target = Target {
+                    canvas: &mut canvas,
+                    meter: &mut Unmetered,
+                    vertex_cost: Cost::new(1),
+                    pixel_centers: true,
+                };
+                draw_patches(&mut target, std::slice::from_ref(&patch), &[depth], &Gray).unwrap();
+                canvas.pixels
+            };
+            let fine = draw(4);
+            assert!(fine.iter().any(|p| p[3] == 1.));
+            assert_eq!(draw(patch.depth(4)), fine);
         }
     }
 

@@ -114,13 +114,6 @@ impl Type3 {
         if !self.strictly_increasing {
             return None;
         }
-        if first == last {
-            let mut color = [0.0; super::MAX_COMPONENTS];
-            let color = &mut color[..self.num_outputs()];
-            self.eval(first, color)?;
-            *budget -= 1;
-            return emit(offsets.map(|v| v as f32), color, color, budget);
-        }
         let low = first.min(last);
         let high = first.max(last);
         let begin = self.find_interval(low);
@@ -135,8 +128,16 @@ impl Type3 {
             let mut left = [0.0; super::MAX_COMPONENTS];
             let mut right = left;
             let n = self.num_outputs();
-            self.functions[end - 1].eval(&[self.encode[end - 1].max], &mut left[..n])?;
-            self.eval(high, &mut right[..n])?;
+            self.functions[end - 1].eval_piece(
+                f64::from(self.encode[end - 1].max),
+                &mut left[..n],
+                budget,
+            )?;
+            self.functions[end].eval_piece(
+                f64::from(self.encode[end].min),
+                &mut right[..n],
+                budget,
+            )?;
             if left != right {
                 return None;
             }
@@ -221,10 +222,14 @@ mod tests {
             let dict = format!("<< /FunctionType 3 /Domain [0 1] /Functions [
                 << /FunctionType 2 /Domain [0 1] /Range [.25 .75] /N 1 >>] /Bounds [] /Encode [{encoding}] >>");
             let function = Function::new(&Object::from_bytes(dict.as_bytes()).unwrap()).unwrap();
+            let crate::function::FunctionType::Type3(stitch) = &function.0.function_type else {
+                unreachable!()
+            };
+            let constant_cost = stitch.functions[0].cost().steps() as usize;
             let count = if matches!(encoding, "-1 3" | "3 -1") {
-                5
+                3 + 2 * constant_cost
             } else {
-                1
+                constant_cost
             };
             for domain in [[0., 1.], [1., 0.]] {
                 let mut budget = count;

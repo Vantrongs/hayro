@@ -49,6 +49,8 @@ impl Type4 {
     pub(crate) fn eval_one(&self, x: f32, output: &mut [f32]) -> Option<()> {
         if let Some(pieces) = &self.pieces {
             let index = pieces.thresholds.partition_point(|&t| t < x);
+            #[cfg(any(test, feature = "count-operators"))]
+            RUN.set(RUN.get() + pieces.executed[index]);
             let channels = &pieces.channels[index * pieces.width..(index + 1) * pieces.width];
             let start = channels.len().checked_sub(output.len())?;
             for (out, channel) in output.iter_mut().zip(&channels[start..]) {
@@ -89,6 +91,8 @@ struct CalculatorPieces {
     thresholds: Vec<f32>,
     channels: Vec<Channel>,
     width: usize,
+    #[cfg(any(test, feature = "count-operators"))]
+    executed: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -113,6 +117,8 @@ impl CalculatorPieces {
             return None;
         }
         let mut thresholds = Vec::new();
+        #[cfg(any(test, feature = "count-operators"))]
+        let mut executed = vec![2 * width as u64 + 1];
         while let [Dup, Number(t), Gt, SkipUnless(len), tail @ ..] = ops {
             if !t.is_finite() || thresholds.last().is_some_and(|prev| prev >= t) {
                 return None;
@@ -151,10 +157,18 @@ impl CalculatorPieces {
             if !body.is_empty() {
                 return None;
             }
+            #[cfg(any(test, feature = "count-operators"))]
+            executed.push(executed.last()? + u64::from(*len));
             thresholds.push(*t);
             ops = rest;
         }
+        #[cfg(any(test, feature = "count-operators"))]
+        for count in &mut executed {
+            *count += 4 * thresholds.len() as u64;
+        }
         (ops == [Pop] && !thresholds.is_empty()).then_some(Self {
+            #[cfg(any(test, feature = "count-operators"))]
+            executed,
             thresholds,
             channels,
             width,
@@ -550,18 +564,24 @@ mod tests {
     fn strict_thresholds_match_interpreted_neighbors() {
         let calc = Type4::from_code(
             parse_procedure(
-                b"{ .9 exch dup .5 gt { exch pop dup .5 sub -3 mul .25 add exch } if pop }",
+                b"{ .9 exch dup .5 gt { exch pop dup .5 sub -3 mul .25 add exch } if dup .75 gt { exch pop 1 exch } if pop }",
             )
             .unwrap(),
         );
         let t = 0.5_f32;
         assert_eq!(calc.monotone_interval([t.next_down(), t]), Some(true));
         assert_eq!(calc.monotone_interval([t.next_up(), t]), Some(false));
-        for x in [t.next_down(), t, t.next_up(), 1.] {
+        for x in [t, 0.75]
+            .into_iter()
+            .flat_map(|t| [t.next_down(), t, t.next_up()])
+        {
             let mut actual = [0.];
             let mut expected = [0.];
+            let before = super::RUN.get();
             calc.eval_one(x, &mut actual).unwrap();
+            let after = super::RUN.get();
             calc.evaluator()(&[x], &mut expected).unwrap();
+            assert_eq!(after - before, super::RUN.get() - after);
             assert_eq!(actual[0].to_bits(), expected[0].to_bits());
         }
     }
@@ -931,6 +951,33 @@ mod tests {
             "1 2 3 4 5 6 7 5 2 roll",
             &[1.0, 2.0, 6.0, 7.0, 3.0, 4.0, 5.0],
         );
+    }
+
+    #[test]
+    fn clamped_calculator_charges_each_piece_before_running() {
+        let code = Type4::from_code(parse_procedure(b"{ dup mul dup mul dup mul }").unwrap());
+        let cost = code.cost();
+        let f = Function(Arc::new(Repr {
+            cost,
+            bounds_cost: crate::encode::Cost::ZERO,
+            bounds_count: crate::encode::Cost::ZERO,
+            domain: vec![Interval { min: 0., max: 1. }],
+            range: None,
+            num_outputs: 1,
+            function_type: FunctionType::Type4(code),
+        }));
+        let mut budget = cost.steps() as usize * 3 + 1;
+        let before = super::RUN.get();
+        for i in 0..8 {
+            assert_eq!(
+                f.linear_pieces([2., 3.], [0., 1.], &mut budget, None, &mut |_, _, _| Some(
+                    ()
+                ))
+                .is_some(),
+                i < 3
+            );
+        }
+        assert_eq!(super::RUN.get() - before, 3 * cost.steps());
     }
 
     #[test]
