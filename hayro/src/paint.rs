@@ -202,7 +202,7 @@ fn raster_precision(gradient: &SvgGradient, bbox: Rect) -> bool {
                 let span = 1. - focal_x;
                 let fr1 = r1 / span.abs();
                 let denom = fr1 * fr1 - 1.;
-                if !denom.is_finite() || denom <= 0. {
+                if !denom.is_finite() || denom <= 0. || fr1 / denom >= LIMIT {
                     return false;
                 }
                 let sign = span.signum();
@@ -518,6 +518,12 @@ mod tests {
             stops: Vec::new(),
         };
         assert!(!raster_precision(&focal, bbox));
+        // Even zoomed into the left rim where eff extents shrink, f32 focal coefficients lose precision.
+        let zoomed_focal = SvgGradient {
+            transform: Affine::translate((100., 0.)) * Affine::scale(64.),
+            ..focal
+        };
+        assert!(!raster_precision(&zoomed_focal, bbox));
 
         let concentric = SvgGradient {
             kind: SvgGradientKind::Radial {
