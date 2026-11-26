@@ -4,6 +4,7 @@ use crate::function::{Function, MAX_COMPONENTS};
 use hayro_syntax::object::{Array, Name, Object};
 use rustc_hash::FxHashMap;
 
+const BATCH_PIXELS: usize = 4096;
 const MAX_CACHED_COLORS: usize = 1 << 18;
 
 #[derive(Debug, Clone)]
@@ -41,14 +42,15 @@ impl DeviceN {
         })
     }
 
-    fn evaluate(&self, input: &[u8]) -> Vec<u8> {
+    fn evaluator(&self) -> impl FnMut(&[u8], &mut Vec<u8>) + '_ {
         let num_components = self.num_components as usize;
         let num_encoded = self.alternate_space.num_components() as usize;
         let mut components = [0.0; MAX_COMPONENTS];
-        let components = &mut components[..num_components];
         let mut values = [0.0; MAX_COMPONENTS];
-        let values = &mut values[..self.tint_transform.num_outputs()];
-        let mut evaluate_pixel = |pixel: &[u8]| {
+        let num_outputs = self.tint_transform.num_outputs();
+        let mut evaluate_pixel = move |pixel: &[u8]| {
+            let components = &mut components[..num_components];
+            let values = &mut values[..num_outputs];
             for (component, value) in components.iter_mut().zip(pixel) {
                 *component = u8_to_f32(*value);
             }
@@ -60,61 +62,77 @@ impl DeviceN {
                     .encode_values(&self.alternate_space.initial_color())
             }
         };
-        let mut evaluated = Vec::with_capacity(input.len() / num_components * num_encoded);
-
-        if num_components == 1 || num_components > 8 || input.len() == num_components {
-            for pixel in input.chunks_exact(num_components) {
-                evaluated.extend(evaluate_pixel(pixel));
-            }
-
-            return evaluated;
-        }
-
         let mut cached = Vec::new();
         let mut offsets = FxHashMap::default();
         let mut previous = None;
 
-        for pixel in input.chunks_exact(num_components) {
-            let key = pixel
-                .iter()
-                .fold(0_u64, |key, value| (key << 8) | u64::from(*value));
-
-            let offset = match previous {
-                Some((previous_key, offset)) if previous_key == key => Some(offset),
-                _ => match offsets.get(&key) {
-                    Some(&offset) => Some(offset),
-                    None if offsets.len() < MAX_CACHED_COLORS => {
-                        let offset = cached.len();
-                        cached.extend(evaluate_pixel(pixel));
-                        offsets.insert(key, offset);
-
-                        Some(offset)
-                    }
-                    None => None,
-                },
-            };
-
-            match offset {
-                Some(offset) => {
-                    evaluated.extend_from_slice(&cached[offset..offset + num_encoded]);
-                    previous = Some((key, offset));
+        move |input, evaluated| {
+            evaluated.clear();
+            evaluated.reserve_exact(input.len() / num_components * num_encoded);
+            if num_components == 1 || num_components > 8 || input.len() == num_components {
+                for pixel in input.chunks_exact(num_components) {
+                    evaluated.extend(evaluate_pixel(pixel));
                 }
-                None => evaluated.extend(evaluate_pixel(pixel)),
+
+                return;
+            }
+
+            for pixel in input.chunks_exact(num_components) {
+                let key = pixel
+                    .iter()
+                    .fold(0_u64, |key, value| (key << 8) | u64::from(*value));
+
+                let offset = match previous {
+                    Some((previous_key, offset)) if previous_key == key => Some(offset),
+                    _ => match offsets.get(&key) {
+                        Some(&offset) => Some(offset),
+                        None if offsets.len() < MAX_CACHED_COLORS => {
+                            let offset = cached.len();
+                            cached.extend(evaluate_pixel(pixel));
+                            offsets.insert(key, offset);
+
+                            Some(offset)
+                        }
+                        None => None,
+                    },
+                };
+
+                match offset {
+                    Some(offset) => {
+                        evaluated.extend_from_slice(&cached[offset..offset + num_encoded]);
+                        previous = Some((key, offset));
+                    }
+                    None => evaluated.extend(evaluate_pixel(pixel)),
+                }
             }
         }
-
-        evaluated
     }
 
     fn convert_inner(&self, input: &[u8], output: &mut [u8]) -> Option<()> {
-        let evaluated = self.evaluate(input);
-        self.alternate_space.convert(&evaluated, output)
+        let n = usize::from(self.num_components);
+        if !output.len().is_multiple_of(3) || input.len() / n != output.len() / 3 {
+            return None;
+        }
+        let mut evaluate = self.evaluator();
+        let mut buf = Vec::new();
+        if input.is_empty() {
+            return self.alternate_space.convert(&[], output);
+        }
+        for (src, dst) in input
+            .chunks(BATCH_PIXELS * n)
+            .zip(output.chunks_mut(BATCH_PIXELS * 3))
+        {
+            evaluate(src, &mut buf);
+            self.alternate_space.convert(&buf, dst)?;
+        }
+        Some(())
     }
 
     fn u8_lookup(&self) -> Option<&[[u8; 3]; 256]> {
         self.lookup.get_or_init(|input, output| {
-            self.alternate_space
-                .convert_table(&self.evaluate(input), output)
+            let mut buf = Vec::new();
+            self.evaluator()(input, &mut buf);
+            self.alternate_space.convert_table(&buf, output)
         })
     }
 }
@@ -138,11 +156,61 @@ impl ToRgb for DeviceN {
             return None;
         }
 
-        let evaluated = self.evaluate(input);
-        self.alternate_space.convert(&evaluated, input)
+        let mut evaluate = self.evaluator();
+        if !input.len().is_multiple_of(3) {
+            return None;
+        }
+        let mut buf = Vec::new();
+        if input.is_empty() {
+            return self.alternate_space.convert(&buf, input);
+        }
+        for chunk in input.chunks_mut(BATCH_PIXELS * 3) {
+            evaluate(chunk, &mut buf);
+            self.alternate_space.convert(&buf, chunk)?;
+        }
+        Some(())
     }
 
     fn is_none(&self) -> bool {
         self.is_none
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hayro_syntax::{Pdf, object::ObjectIdentifier};
+
+    #[test]
+    fn multi_batch_tints_match_whole_image() {
+        let pdf = Pdf::new(crate::fixtures::one_page(
+            1,
+            "",
+            vec![
+                b"[/DeviceN [/A /B /C] /DeviceRGB 5 0 R]".to_vec(),
+                crate::fixtures::stream(
+                    "/FunctionType 4 /Domain [0 1 0 1 0 1] /Range [0 1 0 1 0 1]",
+                    b"{ exch }",
+                ),
+            ],
+        ))
+        .unwrap();
+        let array = pdf.xref().get(ObjectIdentifier::new(4, 0)).unwrap();
+        let space = DeviceN::new(&array, &Cache::new(), 0).unwrap();
+        let mut input: Vec<_> = (0..(BATCH_PIXELS * 2 + 17) * 3)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut evaluated = Vec::new();
+        space.evaluator()(&input, &mut evaluated);
+        let mut expected = vec![0; input.len()];
+        space
+            .alternate_space
+            .convert(&evaluated, &mut expected)
+            .unwrap();
+        let mut output = vec![0; input.len()];
+        space.convert(&input, &mut output).unwrap();
+        assert_eq!(output, expected);
+        space.convert_in_place(&mut input).unwrap();
+        assert_eq!(input, expected);
     }
 }
