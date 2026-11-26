@@ -18,6 +18,7 @@ use crate::object::Dict;
 use crate::object::Name;
 use crate::object::dict::keys::*;
 use crate::object::stream::{DecodeFailure, FilterResult, ImageDecodeParams};
+use alloc::vec::Vec;
 use core::ops::Deref;
 
 /// A data filter.
@@ -112,5 +113,35 @@ impl Filter {
             }
             _ => Err(DecodeFailure::StreamDecode),
         }
+    }
+}
+
+fn reserve_observed(output: &mut Vec<u8>, hint: &mut Option<usize>) {
+    if let Some(size) = *hint
+        && output.len() >= size.div_ceil(16)
+    {
+        *hint = None;
+        if size > output.capacity() {
+            // An estimate must never prevent a shorter actual result from succeeding.
+            let _ = output.try_reserve_exact(size - output.len());
+        }
+    }
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    #[test]
+    fn reserve_only_after_observing_output() {
+        let mut output = alloc::vec![0; 63];
+        let mut hint = Some(1024);
+        super::reserve_observed(&mut output, &mut hint);
+        assert_eq!(output.capacity(), 63);
+        output.push(0);
+        super::reserve_observed(&mut output, &mut hint);
+        assert_eq!(output.capacity(), 1024);
+        assert_eq!(hint, None);
+        output.resize(1025, 0);
+        super::reserve_observed(&mut output, &mut Some(1024));
+        assert_eq!(output.len(), 1025);
     }
 }

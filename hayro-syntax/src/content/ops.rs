@@ -271,7 +271,7 @@ f
     fn display_ops() {
         let mut iter = TypedIter::new(
             b"h 2 w 1 0 0 RG 0 0 10 20 re 10 20 m 30 20 60 40 90 80 c \
-              0.1 0.2 SC 0.0 scn 1.0 /Spot SCN (Hello) Tj <00FF> Tj foo",
+              0.1 0.2 SC 0.0 scn 1.0 /Spot SCN (Hello) Tj <00FF> Tj f#6Fo S #53",
         );
 
         assert_eq!(format!("{}", iter.next().unwrap()), "ClosePath");
@@ -298,6 +298,8 @@ f
         assert_eq!(format!("{}", iter.next().unwrap()), "ShowText(\"Hello\")");
         assert_eq!(format!("{}", iter.next().unwrap()), "ShowText([0, 255])");
         assert_eq!(format!("{}", iter.next().unwrap()), "Fallback(foo)");
+        let plain = format!("{}", iter.next().unwrap());
+        assert_eq!(plain, format!("{}", iter.next().unwrap()));
         assert!(iter.next().is_none());
     }
 

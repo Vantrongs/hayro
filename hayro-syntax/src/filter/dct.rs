@@ -31,13 +31,22 @@ pub(crate) fn decode(
         return rows.decode_whole();
     }
     let mut output = alloc::vec![0; rows.stride.checked_mul(16)?];
+    let frame_bytes = rows.stride.checked_mul(rows.decoder.dimensions()?.1)?;
+    let mut hint = Some(frame_bytes);
     let mut samples = Vec::new();
     loop {
         match rows.read(&mut output) {
             Some(0) => break,
-            Some(n) => samples.extend_from_slice(&output[..n * rows.stride]),
+            Some(n) => {
+                samples.extend_from_slice(&output[..n * rows.stride]);
+                super::reserve_observed(&mut samples, &mut hint);
+            }
+            None if samples.len().max(data.len()) < frame_bytes.div_ceil(16) => {
+                return (!samples.is_empty()).then(|| rows.result(samples));
+            }
             None => {
                 drop(samples);
+                drop(rows);
                 let whole = JpegRows::new(Cow::Borrowed(data), params, image_params, None)?;
                 return whole.decode_whole();
             }

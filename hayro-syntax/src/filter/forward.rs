@@ -219,9 +219,15 @@ impl<'a> DecodedReader<'a> {
         Ok(moved)
     }
 
-    pub(crate) fn collect_strict(&mut self) -> Result<Vec<u8>, DecodeFailure> {
+    pub(crate) fn collect_strict(
+        &mut self,
+        mut hint: Option<usize>,
+    ) -> Result<Vec<u8>, DecodeFailure> {
         let mut output = Vec::new();
-        self.drain_strict(|bytes| output.extend_from_slice(bytes))?;
+        self.drain_strict(|bytes| {
+            output.extend_from_slice(bytes);
+            super::reserve_observed(&mut output, &mut hint);
+        })?;
         Ok(output)
     }
 
@@ -381,7 +387,10 @@ impl Codec {
         if let Self::Fax(fax, stored) = self {
             stored.extend_from_slice(data);
             if eof {
-                *out = fax.decode(stored)?.data.into_owned();
+                *out = fax
+                    .decode(stored, crate::filter::ccitt::FaxRows::Packed)?
+                    .data
+                    .into_owned();
                 *stored = Vec::new();
             }
             return Some((data.len(), eof));

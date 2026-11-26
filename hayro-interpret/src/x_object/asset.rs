@@ -479,27 +479,23 @@ impl Decoded {
                 interpolate: self.image.interpolate(),
                 format,
             },
-            mask: self
-                .alpha
-                .as_ref()
-                .filter(|_| !self.same_grid)
-                .map(|a| {
-                    let color_h = if self.fill.is_some() {
-                        h
-                    } else {
-                        self.image.height()
-                    };
-                    PlaneLayout {
-                        width: a.tail.width,
-                        height: a.tail.declared,
-                        to_image: (
-                            sx as f64 * w as f64 / a.tail.width as f64,
-                            sy as f64 * color_h as f64 / a.tail.declared as f64,
-                        ),
-                        interpolate: a.luma.interpolate,
-                        format: PixelFormat::Alpha,
-                    }
-                }),
+            mask: self.alpha.as_ref().filter(|_| !self.same_grid).map(|a| {
+                let color_h = if self.fill.is_some() {
+                    h
+                } else {
+                    self.image.height()
+                };
+                PlaneLayout {
+                    width: a.tail.width,
+                    height: a.tail.declared,
+                    to_image: (
+                        sx as f64 * w as f64 / a.tail.width as f64,
+                        sy as f64 * color_h as f64 / a.tail.declared as f64,
+                    ),
+                    interpolate: a.luma.interpolate,
+                    format: PixelFormat::Alpha,
+                }
+            }),
         }
     }
 

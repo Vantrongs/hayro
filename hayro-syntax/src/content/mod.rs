@@ -6,12 +6,13 @@ pub mod ops;
 use crate::content::ops::TypedInstruction;
 use crate::object;
 use crate::object::dict::InlineImageDict;
-use crate::object::name::{Name, skip_name_like};
+use crate::object::name::{Name, decoded_bytes, skip_name_like};
 use crate::object::{Array, Number, Object, Stream};
 use crate::reader::Reader;
 use crate::reader::{Readable, ReaderContext, ReaderExt, Skippable};
 use crate::trivia::{is_regular_character, is_white_space_character};
 use crate::util::find_needle;
+use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
 use core::ops::Deref;
@@ -23,19 +24,19 @@ const INLINE_COLOR_COMPONENTS: usize = 4;
 
 impl Debug for Operator<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.0.as_str())
+        Display::fmt(self, f)
     }
 }
 
 impl Display for Operator<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.0.as_str())
+        f.write_str(core::str::from_utf8(self).unwrap_or("{non-ascii key}"))
     }
 }
 
 /// A content stream operator.
 #[derive(Clone, PartialEq)]
-pub struct Operator<'a>(Name<'a>);
+pub struct Operator<'a>(Cow<'a, [u8]>);
 
 impl Deref for Operator<'_> {
     type Target = [u8];
@@ -66,9 +67,9 @@ impl<'a> Readable<'a> for Operator<'a> {
         }
 
         let name = if escaped {
-            Name::new_escaped(data)?
+            Cow::Owned(decoded_bytes(data).collect())
         } else {
-            Name::new_unescaped(data)
+            Cow::Borrowed(data)
         };
 
         Some(Self(name))

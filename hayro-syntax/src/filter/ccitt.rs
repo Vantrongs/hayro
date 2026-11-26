@@ -1,8 +1,8 @@
-use crate::object::Dict;
 use crate::object::dict::keys::{
-    BLACK_IS_1, COLUMNS, ENCODED_BYTE_ALIGN, END_OF_BLOCK, END_OF_LINE, K, ROWS,
+    BLACK_IS_1, COLUMNS, D, DECODE, ENCODED_BYTE_ALIGN, END_OF_BLOCK, END_OF_LINE, K, MASK, ROWS,
 };
 use crate::object::stream::{FilterResult, ImageColorSpace, ImageData, ImageDecodeParams};
+use crate::object::{Array, Dict};
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use hayro_ccitt::{DecodeSettings, Decoder, EncodingMode};
@@ -12,7 +12,19 @@ pub(crate) fn decode(
     params: &Dict<'_>,
     image_params: &ImageDecodeParams,
 ) -> Option<FilterResult<'static>> {
-    Fax::new(params, image_params.height, None).decode(data)
+    Fax::new(params, image_params.height, None).decode(data, FaxRows::Packed)
+}
+
+pub(crate) fn can_expand(dict: &Dict<'_>, params: &ImageDecodeParams) -> bool {
+    !params.is_indexed
+        && !dict.contains_key(MASK)
+        && dict
+            .get::<Array<'_>>(D)
+            .or_else(|| dict.get::<Array<'_>>(DECODE))
+            .is_none_or(|array| {
+                let mut pairs = array.iter::<(f32, f32)>();
+                matches!(pairs.next(), Some((0.0, 1.0) | (1.0, 0.0))) && pairs.next().is_none()
+            })
 }
 
 pub(crate) struct Fax {
@@ -65,56 +77,21 @@ impl Fax {
         Self { settings, white }
     }
 
-    pub(crate) fn decode(&self, data: &[u8]) -> Option<FilterResult<'static>> {
+    pub(crate) fn decode(&self, data: &[u8], format: FaxRows) -> Option<FilterResult<'static>> {
         let (columns, rows, white) = (self.settings.columns, self.settings.rows, self.white);
-        struct BitPackDecoder {
-            output: Vec<u8>,
-            columns: u32,
-            stride: usize,
-            white: u8,
-            last_byte_mask: u8,
-            decoded_rows: u32,
-        }
-
-        impl Decoder for BitPackDecoder {
-            fn push_row(&mut self, changes: &[u32]) {
-                let start = self.output.len();
-                let end = start + self.stride;
-
-                self.output.resize(end, self.white);
-
-                let row = &mut self.output[start..end];
-
-                // Rows are prefilled with white, so flipping a span makes it black.
-                for (start, end) in black_spans(changes, self.columns) {
-                    let (first, last) = (start / 8, (end - 1) / 8);
-                    let first_mask = 0xFF_u8 >> (start % 8);
-                    let last_mask = 0xFF_u8 << (7 - (end - 1) % 8);
-
-                    if first == last {
-                        row[first] ^= first_mask & last_mask;
-                    } else {
-                        row[first] ^= first_mask;
-                        fill_short(&mut row[first + 1..last], !self.white);
-                        row[last] ^= last_mask;
-                    }
-                }
-
-                if let Some(last) = row.last_mut() {
-                    *last &= self.last_byte_mask;
-                }
-
-                self.decoded_rows += 1;
-            }
-        }
-
-        let stride = (columns as usize).div_ceil(8);
-        let mut decoder = BitPackDecoder {
-            output: Vec::new(),
+        let luma = matches!(format, FaxRows::Luma8);
+        let stride = if luma {
+            columns as usize
+        } else {
+            (columns as usize).div_ceil(8)
+        };
+        let mut decoder = RowDecoder {
+            format,
             columns,
-            stride,
             white,
-            last_byte_mask: 0xFF_u8 << ((8 - columns % 8) % 8),
+            stride,
+            output: Vec::new(),
+            hint: stride.checked_mul(rows as usize),
             decoded_rows: 0,
         };
         let result = hayro_ccitt::decode(data, &mut decoder, &self.settings);
@@ -135,7 +112,7 @@ impl Fax {
             image_data: Some(ImageData {
                 alpha: None,
                 color_space: Some(ImageColorSpace::Gray),
-                bits_per_component: 1,
+                bits_per_component: if luma { 8 } else { 1 },
                 width: columns,
                 height: if rows == 0 {
                     decoder.decoded_rows
@@ -144,6 +121,56 @@ impl Fax {
                 },
             }),
         })
+    }
+}
+
+pub(crate) enum FaxRows {
+    Packed,
+    Luma8,
+}
+
+struct RowDecoder {
+    format: FaxRows,
+    columns: u32,
+    white: u8,
+    stride: usize,
+    output: Vec<u8>,
+    hint: Option<usize>,
+    decoded_rows: u32,
+}
+
+impl Decoder for RowDecoder {
+    fn push_row(&mut self, changes: &[u32]) {
+        let offset = self.output.len();
+        self.output.resize(offset + self.stride, self.white);
+        let row = &mut self.output[offset..];
+        let spans = black_spans(changes, self.columns);
+        match self.format {
+            FaxRows::Luma8 => {
+                for (start, end) in spans {
+                    fill_short(&mut row[start..end], !self.white);
+                }
+            }
+            FaxRows::Packed => {
+                for (start, end) in spans {
+                    let (first, last) = (start / 8, (end - 1) / 8);
+                    let first_mask = 0xFF_u8 >> (start % 8);
+                    let last_mask = 0xFF_u8 << (7 - (end - 1) % 8);
+                    if first == last {
+                        row[first] ^= first_mask & last_mask;
+                    } else {
+                        row[first] ^= first_mask;
+                        fill_short(&mut row[first + 1..last], !self.white);
+                        row[last] ^= last_mask;
+                    }
+                }
+                if let Some(last) = row.last_mut() {
+                    *last &= 0xFF_u8 << ((8 - self.columns % 8) % 8);
+                }
+            }
+        }
+        self.decoded_rows += 1;
+        super::reserve_observed(&mut self.output, &mut self.hint);
     }
 }
 

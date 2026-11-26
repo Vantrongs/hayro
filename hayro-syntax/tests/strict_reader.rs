@@ -253,3 +253,79 @@ fn raw_stored_block_with_a_zlib_header_recovers_after_a_prefix_filter() {
     let pdf = stream_file("/Filter [/AHx /Fl]", encoded);
     assert_eq!(object_3(&pdf).decoded_strict().unwrap().as_ref(), b"A");
 }
+
+#[test]
+fn short_flate_image_allocates_for_the_decoded_row() {
+    let pdf = stream_file("/Filter /FlateDecode", &stored_zlib(&[19; 512], 512));
+    let stream = object_3(&pdf);
+    let params = hayro_syntax::object::stream::ImageDecodeParams {
+        width: 512,
+        height: 1_000_000,
+        num_components: Some(1),
+        bpc: Some(8),
+        ..Default::default()
+    };
+    let (result, used) = allocations::measure(|| stream.decoded_image(&params).unwrap());
+    assert_eq!(&*result.data, &[19; 512]);
+    assert!(used.peak < 1024 * 1024, "{used:?}");
+}
+
+#[cfg(feature = "images")]
+#[test]
+fn short_fax_allocates_for_the_decoded_row_in_both_formats() {
+    let pdf = stream_file(
+        "/Filter /CCITTFaxDecode /DecodeParms << /Columns 8 >>",
+        &[0x35, 0x14],
+    );
+    let stream = object_3(&pdf);
+    let params = hayro_syntax::object::stream::ImageDecodeParams {
+        width: 8,
+        height: 1_000_000,
+        ..Default::default()
+    };
+    for luma in [false, true] {
+        let (result, used) = allocations::measure(|| {
+            if luma {
+                stream.decoded_luma_image(&params)
+            } else {
+                stream.decoded_image(&params)
+            }
+            .unwrap()
+        });
+        let info = result.image_data.unwrap();
+        assert_eq!(info.bits_per_component, if luma { 8 } else { 1 });
+        assert_eq!(info.height, params.height);
+        assert_eq!(result.data.len(), if luma { 8 } else { 1 });
+        assert!(used.peak < 1024 * 1024, "{used:?}");
+    }
+}
+
+#[cfg(feature = "images")]
+#[test]
+fn short_baseline_jpeg_stops_before_a_whole_frame_allocation() {
+    let pdf =
+        Pdf::new(include_bytes!("../../tests/pdfs/custom/image_luma8_jpg.pdf").to_vec()).unwrap();
+    let stream: Stream<'_> = pdf.xref().get(ObjectIdentifier::new(4, 0)).unwrap();
+    let hex = stream_file("/Filter /ASCIIHexDecode", &stream.raw_data());
+    let hex_stream = object_3(&hex);
+    let data = hex_stream.decoded_data().unwrap();
+    let pdf = stream_file(
+        "/Filter /DCTDecode",
+        &data[..data
+            .windows(2)
+            .position(|marker| marker == [0xff, 0xda])
+            .unwrap()
+            + 10],
+    );
+    let params = hayro_syntax::object::stream::ImageDecodeParams {
+        width: 200,
+        height: 200,
+        num_components: Some(1),
+        bpc: Some(8),
+        ..Default::default()
+    };
+    let stream = object_3(&pdf);
+    let (result, used) = allocations::measure(|| stream.decoded_image(&params));
+    assert!(matches!(result, Err(DecodeFailure::ImageDecode)));
+    assert!(used.largest < 200 * 200, "{used:?}");
+}

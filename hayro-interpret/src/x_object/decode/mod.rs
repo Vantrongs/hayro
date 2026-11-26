@@ -48,11 +48,16 @@ fn decode_context<'a>(
         height: obj.height(),
     };
 
-    let decoded = obj
-        .stream
-        .decoded_image(&decode_params)
-        .map_err(|_| (obj.warning_sink)(InterpreterWarning::ImageDecodeFailure))
-        .ok()?;
+    let gray = color_space
+        .as_ref()
+        .is_none_or(|cs| cs.is_device_gray_or_rgb() && cs.num_components() == 1);
+    let decoded = if gray {
+        obj.stream.decoded_luma_image(&decode_params)
+    } else {
+        obj.stream.decoded_image(&decode_params)
+    }
+    .map_err(|_| (obj.warning_sink)(InterpreterWarning::ImageDecodeFailure))
+    .ok()?;
 
     let mut ctx = sample_context(obj, decoded)?;
     let stride = (ctx.width as usize)

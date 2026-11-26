@@ -237,10 +237,20 @@ pub struct ImageDecodeParams {
     pub height: u32,
 }
 
+impl ImageDecodeParams {
+    fn sample_bytes(&self) -> Option<usize> {
+        (self.width as usize)
+            .checked_mul(usize::from(self.num_components?))?
+            .checked_mul(usize::from(self.bpc?))?
+            .div_ceil(8)
+            .checked_mul(self.height as usize)
+    }
+}
+
 enum DecodeTarget<'a> {
     Data,
     PageContent,
-    Image(&'a ImageDecodeParams),
+    Image(&'a ImageDecodeParams, bool),
 }
 
 impl<'a> Stream<'a> {
@@ -323,7 +333,7 @@ impl<'a> Stream<'a> {
         let fax =
             crate::filter::ccitt::Fax::new(&prefix.params.pop()?, params.height, cancel.clone());
         let data = self.image_input(&prefix, cancel)?;
-        fax.decode(&data)
+        fax.decode(&data, crate::filter::ccitt::FaxRows::Packed)
     }
 
     #[cfg(feature = "images")]
@@ -335,7 +345,7 @@ impl<'a> Stream<'a> {
         if prefix.filters.is_empty() {
             self.try_raw_data().ok()
         } else {
-            self.collect_filters(prefix, false, cancel).ok()
+            self.collect_filters(prefix, false, cancel, None).ok()
         }
     }
 
@@ -390,7 +400,7 @@ impl<'a> Stream<'a> {
         {
             return Ok(Cow::Borrowed(self.data));
         }
-        self.collect_filters(&filters, true, None)
+        self.collect_filters(&filters, true, None, None)
     }
 
     fn collect_filters(
@@ -398,9 +408,10 @@ impl<'a> Stream<'a> {
         filters: &FiltersAndParams<'_>,
         strict: bool,
         cancel: Option<CancelArc<AtomicBool>>,
+        hint: Option<usize>,
     ) -> Result<Cow<'a, [u8]>, DecodeFailure> {
         let mut reader = self.forward(filters, cancel.clone(), strict)?;
-        match reader.collect_strict() {
+        match reader.collect_strict(hint) {
             Err(DecodeFailure::StreamDecode) if reader.retry().is_some() => {}
             result => return result.map(Cow::Owned),
         }
@@ -412,7 +423,7 @@ impl<'a> Stream<'a> {
                 continue;
             }
             let mode = if filter == Filter::FlateDecode && chain.ambiguous_flate_header()? {
-                let bytes = chain.collect_strict()?;
+                let bytes = chain.collect_strict(None)?;
                 drop(chain);
                 input = bytes;
                 let mut mode = FlateMode::Wrapped;
@@ -439,7 +450,7 @@ impl<'a> Stream<'a> {
                 .add(filter, params, mode)
                 .ok_or(DecodeFailure::StreamDecode)?;
         }
-        chain.collect_strict().map(Cow::Owned)
+        chain.collect_strict(hint).map(Cow::Owned)
     }
 
     /// Whether a file specification supplies the stream's data.
@@ -572,7 +583,16 @@ impl<'a> Stream<'a> {
         &self,
         image_params: &ImageDecodeParams,
     ) -> Result<FilterResult<'a>, DecodeFailure> {
-        self.decode(DecodeTarget::Image(image_params))
+        self.decode(DecodeTarget::Image(image_params, false))
+    }
+
+    /// Decodes a gray image, allowing terminal fax samples to be expanded to eight bits.
+    #[cfg(feature = "images")]
+    pub fn decoded_luma_image(
+        &self,
+        params: &ImageDecodeParams,
+    ) -> Result<FilterResult<'a>, DecodeFailure> {
+        self.decode(DecodeTarget::Image(params, true))
     }
 
     pub(crate) fn decoded_page_content(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
@@ -587,12 +607,17 @@ impl<'a> Stream<'a> {
         let mut filters_and_params = self.filters_and_params();
         let first_image = filters_and_params.filters.iter().position(Filter::is_image);
         let image_params = match target {
-            DecodeTarget::Image(params) => match first_image {
+            DecodeTarget::Image(params, _luma) => match first_image {
                 None => {
                     let data = if filters_and_params.filters.is_empty() {
                         self.try_raw_data()?
                     } else {
-                        self.collect_filters(&filters_and_params, false, None)?
+                        self.collect_filters(
+                            &filters_and_params,
+                            false,
+                            None,
+                            params.sample_bytes(),
+                        )?
                     };
                     return Ok(FilterResult {
                         data,
@@ -605,8 +630,17 @@ impl<'a> Stream<'a> {
                     let stored = if filters_and_params.filters.is_empty() {
                         self.try_raw_data()?
                     } else {
-                        self.collect_filters(&filters_and_params, false, None)?
+                        self.collect_filters(&filters_and_params, false, None, None)?
                     };
+                    #[cfg(feature = "images")]
+                    if _luma
+                        && filter == Filter::CcittFaxDecode
+                        && crate::filter::ccitt::can_expand(&self.dict, params)
+                    {
+                        return crate::filter::ccitt::Fax::new(&options, params.height, None)
+                            .decode(&stored, crate::filter::ccitt::FaxRows::Luma8)
+                            .ok_or(DecodeFailure::ImageDecode);
+                    }
                     return filter.apply(&stored, &options, params, false);
                 }
                 _ => params,

@@ -270,3 +270,75 @@ fn whole_image_scales_an_independent_mask_over_the_color_tail() {
     });
     assert_eq!(bands, 2);
 }
+
+#[test]
+fn short_fax_preserves_mask_polarity_decode_and_tail() {
+    for black_is_one in [false, true] {
+        for invert in [false, true] {
+            let decode = if invert { "[1 0]" } else { "[0 1]" };
+            let dict = format!(
+                "/Width 8 /Filter /CCITTFaxDecode /DecodeParms << /Columns 8 /BlackIs1 {black_is_one} >> /Decode {decode}"
+            );
+            let doc = pdf(&[(&dict, &[0x35, 0x14])]);
+            let mut obj = image(&doc);
+            let sample = u8::from(black_is_one ^ invert) * 255;
+            let tail = u8::from(invert) * 255;
+            let decoded = obj.decoded_image(None).unwrap();
+            let ImageData::Luma(stored) = decoded.image else {
+                panic!()
+            };
+            assert_eq!(stored.data, [sample; 8]);
+            assert_eq!(stored.height, 1);
+            assert_eq!(decoded.tail.declared, 3);
+            assert_eq!(decoded.tail.texel.as_deref(), Some(&[tail][..]));
+            for kind in [ImageKind::Mask, ImageKind::StencilMask] {
+                obj.kind = kind;
+                let mask = obj.decoded_mask(None).unwrap();
+                let xor = if kind == ImageKind::StencilMask {
+                    255
+                } else {
+                    0
+                };
+                assert_eq!(mask.luma.data, [sample ^ xor; 8]);
+                assert_eq!(mask.tail.texel.as_deref(), Some(&[tail ^ xor][..]));
+            }
+        }
+    }
+}
+
+#[test]
+fn fax_color_keys_and_palette_indices_use_one_bit_samples() {
+    let fax = "/Width 8 /Height 1 /BPC 1 /Filter /CCITTFaxDecode /DecodeParms << /Columns 8 /BlackIs1 true >>";
+    for suffix in ["/Mask [1 1]", "/CS [/Indexed /DeviceGray 1 <1030>]"] {
+        let doc = pdf(&[(&format!("{fax} {suffix}"), &[0x35, 0x14])]);
+        let obj = image(&doc);
+        let result = obj.decoded_image(None).unwrap();
+        if suffix.starts_with("/Mask") {
+            assert_eq!(result.alpha.unwrap().luma.data, [0; 8]);
+        } else {
+            let ImageData::Luma(stored) = result.image else {
+                panic!()
+            };
+            assert_eq!(stored.data, [0x30; 8]);
+        }
+    }
+}
+
+#[test]
+fn fax_transfer_function_maps_pixels_and_tail() {
+    use crate::function::TransferFunction;
+    use hayro_syntax::object::Object;
+    let doc = pdf(&[(
+        "/Width 8 /Filter /CCITTFaxDecode /DecodeParms << /Columns 8 /BlackIs1 true >> /TR << /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>",
+        &[0x35, 0x14],
+    )]);
+    let mut obj = image(&doc);
+    let tr = TransferFunction::new(&obj.stream.dict().get::<Object<'_>>(b"TR").unwrap()).unwrap();
+    obj.transfer_function = Some(ActiveTransferFunction::Single(tr));
+    let result = obj.decoded_image(None).unwrap();
+    let ImageData::Luma(stored) = result.image else {
+        panic!()
+    };
+    assert_eq!(stored.data, [0; 8]);
+    assert_eq!(result.tail.texel.as_deref(), Some(&[255][..]));
+}
