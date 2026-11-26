@@ -33,7 +33,10 @@ impl<'a> FormXObject<'a> {
     ) -> Option<Self> {
         let dict = stream.dict();
 
-        let decoded = stream.decoded_data().ok()?;
+        let mut decoded = stream.decoded_data().ok()?;
+        if let Cow::Owned(bytes) = &mut decoded {
+            bytes.shrink_to_fit();
+        }
         let resources = dict.get(RESOURCES).map(Resources::new);
 
         let group = dict.get::<Dict<'_>>(GROUP);

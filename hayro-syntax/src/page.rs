@@ -17,6 +17,7 @@ use crate::transform::Transform;
 use crate::util::FloatExt;
 
 use crate::xref::{ContentKey, XRef};
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Deref;
@@ -209,7 +210,7 @@ pub struct Page<'a> {
     media_box: Rect,
     crop_box: Rect,
     rotation: Rotation,
-    page_streams: OnceLock<(Option<Vec<u8>>, Lost)>,
+    page_streams: OnceLock<(Option<Box<[u8]>>, Lost)>,
     resources: Resources<'a>,
     unreadable: Lost,
     ctx: ReaderContext<'a>,
@@ -278,9 +279,10 @@ impl<'a> Page<'a> {
 
     /// Return the cached decoded content of the page.
     pub fn page_stream(&self) -> Option<&[u8]> {
-        let (data, lost) = self
-            .page_streams
-            .get_or_init(|| self.xref().watch(|| self.read_page_stream()));
+        let (data, lost) = self.page_streams.get_or_init(|| {
+            self.xref()
+                .watch(|| self.read_page_stream().map(Vec::into_boxed_slice))
+        });
         self.xref().note(*lost);
         data.as_deref()
     }
