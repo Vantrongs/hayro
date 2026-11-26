@@ -34,7 +34,6 @@ This crate has two default features:
 use fearless_simd::Level;
 use glyph_cache::GlyphCache;
 use hayro_interpret::Device;
-use hayro_interpret::FillRule;
 use hayro_interpret::InterpreterCache;
 use hayro_interpret::InterpreterSettings;
 use hayro_interpret::font::{GlyphRun, HintingCache};
@@ -43,7 +42,8 @@ use hayro_interpret::hayro_syntax::page::Page;
 use hayro_interpret::util::{RectExt, TransformExt};
 use hayro_interpret::{BlendMode, Context, DrawMode, DrawProps, ImageDrawProps, SoftMask};
 use hayro_interpret::{ClipPath, interpret_page};
-use kurbo::{Affine, BezPath, Rect};
+use hayro_interpret::{FillRule, Knockout};
+use kurbo::{Affine, BezPath, Rect, Shape};
 use pic_scale::Scaler;
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
@@ -104,7 +104,7 @@ pub(crate) struct Renderer<'a> {
     pub(crate) ctx: &'a mut RenderContext,
     pub(crate) inside_pattern: bool,
     gradient_cache: paint::GradientCache,
-    pub(crate) soft_mask_cache: FxHashMap<u128, Mask>,
+    pub(crate) soft_masks: hayro_interpret::SoftMasks<Mask>,
     pub(crate) in_type3_glyph: bool,
 }
 
@@ -115,7 +115,7 @@ impl<'r> Renderer<'r> {
             ctx,
             inside_pattern: false,
             gradient_cache: FxHashMap::default(),
-            soft_mask_cache: FxHashMap::default(),
+            soft_masks: hayro_interpret::SoftMasks::default(),
             in_type3_glyph: false,
         }
     }
@@ -135,8 +135,12 @@ impl<'r> Renderer<'r> {
     fn apply_draw_props(&mut self, props: &DrawProps<'_>) {
         self.ctx.set_transform(props.transform);
         self.apply_soft_mask(props.soft_mask.as_ref());
-        self.ctx
-            .set_blend_mode(convert_blend_mode(props.blend_mode));
+        let mut blend_mode = convert_blend_mode(props.blend_mode);
+        if props.knockout == Knockout::Replace {
+            // `Copy` mixes the destination and the source by the coverage alone.
+            blend_mode.compose = Compose::Copy;
+        }
+        self.ctx.set_blend_mode(blend_mode);
     }
 
     fn apply_image_props(&mut self, props: &ImageDrawProps<'_>) {
@@ -180,10 +184,16 @@ impl<'a, 'r> Device<'a> for Renderer<'r> {
     }
 
     fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        if props.knockout == Knockout::ClearThenOver {
+            self.clear_under(path, props.transform, draw_mode);
+        }
         Self::draw_path(self, path, props, draw_mode);
     }
 
     fn draw_rect(&mut self, rect: &Rect, props: DrawProps<'a>, draw_mode: &DrawMode) {
+        if props.knockout == Knockout::ClearThenOver {
+            self.clear_under(&rect.to_path(0.1), props.transform, draw_mode);
+        }
         Self::draw_rect(self, rect, props, draw_mode);
     }
 

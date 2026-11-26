@@ -27,6 +27,14 @@ impl PartialEq for Array<'_> {
 }
 
 impl<'a> Array<'a> {
+    /// Reads this object independently of the reference chain that reached it.
+    pub fn as_root(&self) -> Self {
+        Self {
+            data: self.data,
+            ctx: self.ctx.rooted(false),
+        }
+    }
+
     /// Returns an iterator over the objects of the array.
     pub fn raw_iter(&self) -> ArrayIter<'a> {
         ArrayIter::new(self.data, &self.ctx)

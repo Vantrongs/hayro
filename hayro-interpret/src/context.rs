@@ -1,4 +1,4 @@
-use crate::cache::{Cache, CacheKey};
+use crate::cache::Cache;
 use crate::color::{Color, ColorSpace};
 use crate::convert::convert_transform;
 use crate::font::{FontCache, PositionedGlyph, StandardFont};
@@ -51,11 +51,13 @@ impl<'a> InterpreterCache<'a> {
 pub struct Context<'a> {
     stack: StateStack<'a>,
     path: BezPath,
+    pub(crate) text_clip: Option<BezPath>,
     sub_path_start: Point,
     last_point: Point,
     clip: Option<FillRule>,
     root_transforms: Vec<Affine>,
     bbox: Vec<Rect>,
+    pub(crate) bbox_read: std::cell::Cell<bool>,
     pub(crate) settings: InterpreterSettings,
     pub(crate) interpreter_cache: InterpreterCache<'a>,
     pub(crate) xref: &'a XRef,
@@ -102,7 +104,9 @@ impl<'a> Context<'a> {
             sub_path_start: Point::default(),
             clip: None,
             bbox: vec![bbox],
+            bbox_read: std::cell::Cell::new(false),
             path: BezPath::new(),
+            text_clip: None,
             interpreter_cache: cache.clone(),
             text_clip: None,
             ocg_state: OcgState::default(),
@@ -117,6 +121,11 @@ impl<'a> Context<'a> {
     }
 
     pub(crate) fn bbox(&self) -> Rect {
+        self.bbox_read.set(true);
+        self.current_bbox()
+    }
+
+    fn current_bbox(&self) -> Rect {
         self.bbox
             .last()
             .copied()
@@ -124,7 +133,7 @@ impl<'a> Context<'a> {
     }
 
     fn push_bbox(&mut self, bbox: Rect) {
-        let new = self.bbox().intersect(bbox);
+        let new = self.current_bbox().intersect(bbox);
         self.bbox.push(new);
     }
 
@@ -205,6 +214,7 @@ impl<'a> Context<'a> {
 
     pub(crate) fn draw_props(&self, is_stroke: bool) -> DrawProps<'a> {
         DrawProps {
+            knockout: crate::Knockout::None,
             transform: self.ctm(),
             paint: self.get_paint(is_stroke),
             soft_mask: self.compositing().soft_mask.clone(),
@@ -349,11 +359,7 @@ impl<'a> Context<'a> {
         name: &Name<'_>,
     ) -> Option<ColorSpace> {
         let cs_object = resources.get_color_space(name)?;
-        self.interpreter_cache
-            .object_cache
-            .get_or_insert_with(cs_object.cache_key(), || {
-                ColorSpace::new(cs_object.clone(), &self.interpreter_cache.object_cache)
-            })
+        ColorSpace::new(cs_object, &self.interpreter_cache.object_cache)
     }
 
     pub(crate) fn num_states(&self) -> usize {

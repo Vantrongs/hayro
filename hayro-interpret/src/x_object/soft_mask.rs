@@ -13,6 +13,7 @@ use hayro_syntax::object::{Dict, Object};
 use hayro_syntax::page::Resources;
 use hayro_syntax::xref::XRef;
 use kurbo::Affine;
+use rustc_hash::FxHashMap;
 use smallvec::smallvec;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
@@ -29,8 +30,8 @@ pub enum MaskType {
 }
 
 struct Repr<'a> {
-    dict_key: u128,
-    parent_resources_key: Option<u128>,
+    key: u128,
+    key_in_box: u128,
     group: FormXObject<'a>,
     mask_type: MaskType,
     parent_resources: Resources<'a>,
@@ -46,11 +47,7 @@ struct Repr<'a> {
 
 impl Hash for Repr<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.dict_key.hash(state);
-        self.parent_resources_key.hash(state);
-        self.root_transform.cache_key().hash(state);
-        self.bbox.cache_key().hash(state);
-        self.nesting_depth.hash(state);
+        self.key_in_box.hash(state);
     }
 }
 
@@ -60,7 +57,7 @@ pub struct SoftMask<'a>(Rc<Repr<'a>>);
 
 impl Debug for SoftMask<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SoftMask({:032x})", self.0.dict_key)
+        write!(f, "SoftMask({:032x})", self.0.key_in_box)
     }
 }
 
@@ -74,7 +71,66 @@ impl Eq for SoftMask<'_> {}
 
 impl CacheKey for SoftMask<'_> {
     fn cache_key(&self) -> u128 {
-        hash128(self)
+        self.0.key_in_box
+    }
+}
+
+/// Identifies the placements that can reuse an interpreted soft mask.
+#[must_use = "a drawing is kept for the uses it serves through `SoftMasks::insert`"]
+#[derive(Clone, Copy, Debug)]
+pub struct Interpreted {
+    key: u128,
+    /// Where the drawing read the box, the mask's key with the box.
+    in_box: Option<u128>,
+}
+
+/// Caches soft masks by bounding box only when their drawing reads it.
+pub struct SoftMasks<T> {
+    drawn: FxHashMap<u128, Drawings<T>>,
+}
+
+enum Drawings<T> {
+    InAnyBox(T),
+    ByBox(FxHashMap<u128, T>),
+}
+
+impl<T> Default for SoftMasks<T> {
+    fn default() -> Self {
+        Self {
+            drawn: FxHashMap::default(),
+        }
+    }
+}
+
+impl<T> SoftMasks<T> {
+    /// The drawing kept that serves `mask`, if any.
+    pub fn get(&self, mask: &SoftMask<'_>) -> Option<&T> {
+        match self.drawn.get(&mask.0.key)? {
+            Drawings::InAnyBox(drawn) => Some(drawn),
+            Drawings::ByBox(by_box) => by_box.get(&mask.0.key_in_box),
+        }
+    }
+
+    /// Keeps `drawn`, what was drawn by the interpretation that returned
+    /// `interpreted`, for the uses it serves.
+    pub fn insert(&mut self, interpreted: Interpreted, drawn: T) {
+        let Some(in_box) = interpreted.in_box else {
+            self.drawn
+                .insert(interpreted.key, Drawings::InAnyBox(drawn));
+            return;
+        };
+        let drawings = self
+            .drawn
+            .entry(interpreted.key)
+            .or_insert_with(|| Drawings::ByBox(FxHashMap::default()));
+        match drawings {
+            Drawings::ByBox(by_box) => {
+                by_box.insert(in_box, drawn);
+            }
+            Drawings::InAnyBox(_) => {
+                *drawings = Drawings::ByBox([(in_box, drawn)].into_iter().collect());
+            }
+        }
     }
 }
 
@@ -115,14 +171,21 @@ impl<'a> SoftMask<'a> {
             .is_none()
             .then(|| parent_resources.cache_key());
 
-        Some(Self(Rc::new(Repr {
-            dict_key: dict.cache_key(),
+        let bbox = context.bbox();
+        let key = hash128(&(
+            dict.cache_key(),
+            nesting_depth,
             parent_resources_key,
+            context.ctm().cache_key(),
+        ));
+        Some(Self(Rc::new(Repr {
+            key,
+            key_in_box: hash128(&(key, bbox.cache_key())),
             group,
             mask_type,
             root_transform: context.ctm(),
             transfer_function,
-            bbox: context.bbox(),
+            bbox,
             interpreter_cache: context.interpreter_cache.clone(),
             settings: context.settings.clone(),
             xref: context.xref,
@@ -133,7 +196,7 @@ impl<'a> SoftMask<'a> {
     }
 
     /// Interpret the contents of the mask into the given device.
-    pub fn interpret(&self, device: &mut impl Device<'a>) {
+    pub fn interpret(&self, device: &mut impl Device<'a>) -> Interpreted {
         let state = State::new(self.0.root_transform);
         let mut ctx = Context::new_with(
             self.0.root_transform,
@@ -147,6 +210,10 @@ impl<'a> SoftMask<'a> {
         self.0
             .group
             .draw(&self.0.parent_resources, &mut ctx, device);
+        Interpreted {
+            key: self.0.key,
+            in_box: ctx.bbox_read.get().then_some(self.0.key_in_box),
+        }
     }
 
     /// Return the underlying mask type.

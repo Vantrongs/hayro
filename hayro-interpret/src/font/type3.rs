@@ -87,7 +87,14 @@ struct Type3ShapeGlyphDevice<'b, T>(&'b mut T);
 // Only filling, stroking of paths and stencil masks are allowed.
 impl<'a, T: Device<'a>> Device<'a> for Type3ShapeGlyphDevice<'_, T> {
     fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode) {
-        self.0.draw_path(path, props, draw_mode);
+        self.0.draw_path(
+            path,
+            DrawProps {
+                knockout: crate::Knockout::None,
+                ..props
+            },
+            draw_mode,
+        );
     }
 
     fn push_clip_path(&mut self, clip_path: &ClipPath) {

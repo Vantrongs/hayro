@@ -196,6 +196,17 @@ impl<'a> ReaderContext<'a> {
         })
     }
 
+    pub(crate) fn rooted(&self, keep_body: bool) -> Self {
+        let mut result = self.clone();
+        if let ReaderContextInner::Shared(inner) = &mut result.0
+            && inner.parent_chain.len() > usize::from(keep_body)
+        {
+            let body = keep_body.then(|| *inner.parent_chain.last().unwrap());
+            Arc::make_mut(inner).parent_chain = body.into_iter().collect();
+        }
+        result
+    }
+
     pub(crate) fn dummy_ref() -> &'static Self {
         &Self(ReaderContextInner::Dummy {
             in_content_stream: true,

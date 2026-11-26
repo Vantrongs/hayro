@@ -246,7 +246,7 @@ impl<'a> FontCache<'a> {
             programs: self.program_loader(font_resolver),
             cmap_resolver,
         };
-        let font = Font::new(dict, &loader);
+        let font = Font::new(&dict.as_root(), &loader);
         self.0.fonts.borrow_mut().insert(key, font.clone());
 
         font
@@ -590,7 +590,10 @@ impl ProgramLoader<'_> {
         let key = hash128(&("font program", stream.cache_key()));
 
         self.get_or_insert_with(key, || {
-            FontProgram::new(Arc::new(stream.decoded_data().ok()?.into_owned()), 0)
+            FontProgram::new(
+                Arc::new(stream.as_root().decoded_data().ok()?.into_owned()),
+                0,
+            )
         })
     }
 

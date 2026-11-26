@@ -54,8 +54,6 @@ impl<'a> Pattern<'a> {
         match self {
             Self::Shading(p) => {
                 p.matrix = transform * p.matrix;
-                let transformed_clip_path = p.shading.clip_path.clone().map(|r| p.matrix * r);
-                Arc::make_mut(&mut p.shading).clip_path = transformed_clip_path;
             }
             Self::Tiling(p) => p.matrix = transform * p.matrix,
         }
@@ -107,6 +105,10 @@ pub struct ShadingPattern {
 }
 
 impl ShadingPattern {
+    /// The shading bounding box in paint coordinates.
+    pub fn clip_path(&self) -> Option<BezPath> {
+        self.shading.clip_path.as_ref().map(|p| self.matrix * p)
+    }
     pub(crate) fn new(dict: &Dict<'_>, cache: &crate::cache::Cache) -> Option<Self> {
         let shading = dict.get::<Object<'_>>(SHADING).and_then(|o| {
             let (dict, stream) = dict_or_stream(&o)?;
@@ -255,8 +257,9 @@ impl<'a> TilingPattern<'a> {
     }
 }
 
-impl CacheKey for TilingPattern<'_> {
-    fn cache_key(&self) -> u128 {
+impl TilingPattern<'_> {
+    /// Identifies the painted cell independently of placement opacity.
+    pub fn paint_key(&self) -> u128 {
         let color = self
             .stencil_color
             .as_ref()
@@ -264,10 +267,15 @@ impl CacheKey for TilingPattern<'_> {
         hash128(&(
             self.cache_key,
             self.matrix.cache_key(),
-            self.opacity.to_bits(),
             color,
             self.nesting_depth,
         ))
+    }
+}
+
+impl CacheKey for TilingPattern<'_> {
+    fn cache_key(&self) -> u128 {
+        hash128(&(self.paint_key(), self.opacity.to_bits()))
     }
 }
 
@@ -289,6 +297,7 @@ impl<'a, 'b, T: Device<'a>> StencilPatternDevice<'a, 'b, T> {
 impl<'a, T: Device<'a>> Device<'a> for StencilPatternDevice<'a, '_, T> {
     fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, draw_mode: &DrawMode) {
         let props = DrawProps {
+            knockout: crate::Knockout::None,
             paint: self.paint.clone(),
             ..props
         };

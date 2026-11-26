@@ -78,6 +78,16 @@ impl Display for Object<'_> {
 }
 
 impl<'a> Object<'a> {
+    /// Reads this object independently of the reference chain that reached it.
+    pub fn as_root(&self) -> Self {
+        match self {
+            Self::Dict(d) => Self::Dict(d.as_root()),
+            Self::Array(a) => Self::Array(a.as_root()),
+            Self::Stream(s) => Self::Stream(s.as_root()),
+            x => x.clone(),
+        }
+    }
+
     pub(crate) fn cast<T>(self) -> Option<T>
     where
         T: ObjectLike<'a>,

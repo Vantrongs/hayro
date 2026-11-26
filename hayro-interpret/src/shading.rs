@@ -211,9 +211,12 @@ pub struct Shading {
 
 impl Shading {
     pub(crate) fn new(dict: &Dict<'_>, stream: Option<&Stream<'_>>, cache: &Cache) -> Option<Self> {
-        let cache_key = stream.map_or_else(|| dict.cache_key(), |s| s.cache_key());
-
-        cache.get_or_insert_with(cache_key, || Self::parse(dict, stream, cache, cache_key))
+        let object =
+            stream.map_or_else(|| Object::Dict(dict.clone()), |s| Object::Stream(s.clone()));
+        cache.rooted(&object, |o, cache| {
+            let (dict, stream) = hayro_syntax::object::dict_or_stream(&o)?;
+            Self::parse(dict, stream, cache, o.cache_key())
+        })
     }
 
     fn parse(

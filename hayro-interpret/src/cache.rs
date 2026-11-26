@@ -17,16 +17,67 @@ impl Default for Cache {
     }
 }
 
+pub(crate) trait Root: CacheKey {
+    /// The object read as where a resolution starts ([`Dict::as_root`]).
+    fn as_root(&self) -> Self;
+}
+
+impl Root for Object<'_> {
+    fn as_root(&self) -> Self {
+        Object::as_root(self)
+    }
+}
+
+impl Root for Stream<'_> {
+    fn as_root(&self) -> Self {
+        Stream::as_root(self)
+    }
+}
+
+pub(crate) struct Building<'a>(&'a Cache);
+impl Building<'_> {
+    pub(crate) fn of_bytes<W: core::hash::Hash + Copy, T: Clone + Send + Sync + 'static>(
+        &self,
+        bytes: &[u8],
+        with: W,
+        build: fn(&[u8], W) -> Option<T>,
+    ) -> Option<T> {
+        self.0
+            .get_or_insert_with(hash128(&(bytes, with)), || build(bytes, with))
+    }
+}
 impl Cache {
+    pub(crate) fn rooted<O: Root, T: Clone + Send + Sync + 'static>(
+        &self,
+        object: &O,
+        build: fn(O, &Self) -> Option<T>,
+    ) -> Option<T> {
+        self.get_or_insert_with(object.cache_key(), || build(object.as_root(), self))
+    }
+    pub(crate) fn rooted_with<
+        O: Root,
+        W: core::hash::Hash + Copy,
+        T: Clone + Send + Sync + 'static,
+    >(
+        &self,
+        object: &O,
+        with: W,
+        build: fn(O, W, &Building<'_>) -> Option<T>,
+    ) -> Option<T> {
+        self.get_or_insert_with(hash128(&(object.cache_key(), with)), || {
+            build(object.as_root(), with, &Building(self))
+        })
+    }
     pub(crate) fn new() -> Self {
         Self(Arc::new(Mutex::new(FxHashMap::default())))
     }
 
-    pub(crate) fn get_or_insert_with<T: Clone + Send + Sync + 'static>(
+    fn get_or_insert_with<T: Clone + Send + Sync + 'static>(
         &self,
         id: u128,
         f: impl FnOnce() -> Option<T>,
     ) -> Option<T> {
+        let id = hash128(&(std::any::TypeId::of::<T>(), id));
         let mut locked = self.0.lock().unwrap();
 
         // `get_or_insert_with` would deadlock if the closure accesses the cache.

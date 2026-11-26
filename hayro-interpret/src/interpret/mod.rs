@@ -474,7 +474,7 @@ pub fn interpret<'a>(
             }
             TypedInstruction::EndText(_) => {
                 if let Some(clip_path) = context.text_clip.take()
-                    && context.text_state().render_mode.clips()
+                    && clip_path.segments().next().is_some()
                 {
                     context.push_clip_path(clip_path, FillRule::NonZero, device);
                 }
@@ -655,6 +655,7 @@ pub fn interpret<'a>(
     context.path_mut().truncate(0);
     *(context.clip_mut()) = None;
 
+    context.text_clip = outer_text_clip;
     while context.num_states() > num_states {
         context.restore_state(device);
     }

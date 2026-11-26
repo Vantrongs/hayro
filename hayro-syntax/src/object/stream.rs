@@ -60,6 +60,14 @@ enum DecodeTarget<'a> {
 }
 
 impl<'a> Stream<'a> {
+    /// Reads this object independently of the reference chain that reached it.
+    pub fn as_root(&self) -> Self {
+        Self {
+            dict: self.dict.rooted(true),
+            data: self.data,
+        }
+    }
+
     pub(crate) fn new(data: &'a [u8], dict: Dict<'a>) -> Self {
         Self { dict, data }
     }

@@ -177,7 +177,7 @@ impl<'a> SvgRenderer<'a> {
                                 }
                             };
 
-                        let clip_path = s.shading.clip_path.clone().map(|path| {
+                        let clip_path = s.clip_path().map(|path| {
                             self.clip_paths.insert(CachedClipPath::Path {
                                 path,
                                 fill_rule: FillRule::NonZero,
@@ -199,7 +199,7 @@ impl<'a> SvgRenderer<'a> {
                     }
                     Pattern::Tiling(t) => {
                         let inverse_transform = path_transform.inverse();
-                        let cache_key = (t.cache_key(), inverse_transform).cache_key();
+                        let cache_key = (t.paint_key(), inverse_transform).cache_key();
 
                         if !self.tiling_patterns.contains(cache_key) {
                             self.with_dummy(|r| {

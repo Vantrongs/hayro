@@ -23,7 +23,7 @@ use self::indexed::Indexed;
 use self::lab::Lab;
 use self::pattern::Pattern;
 use self::separation::Separation;
-use crate::cache::{Cache, CacheKey};
+use crate::cache::Cache;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
 use hayro_syntax::object::Object;
@@ -180,34 +180,29 @@ impl ColorSpaceType {
                     let dict = icc_stream.dict();
                     let num_components = dict.get::<usize>(N)?;
 
-                    return cache.get_or_insert_with(icc_stream.cache_key(), || {
-                        if let Some(decoded) = icc_stream.decoded_data().ok().as_ref() {
-                            ICCProfile::new(decoded, num_components)
-                                .map(|icc| {
-                                    // TODO: For SVG and PNG we can assume that the output color space is
-                                    // sRGB. If we ever implement PDF-to-PDF, we probably want to
-                                    // let the user pass the native color type and don't make this optimization
-                                    // if it's not sRGB.
-                                    if icc.is_srgb() {
-                                        Self::DeviceRgb(DeviceRgb)
-                                    } else {
-                                        Self::ICCBased(icc)
-                                    }
-                                })
-                                .or_else(|| {
-                                    dict.get::<Object<'_>>(ALTERNATE)
-                                        .and_then(|o| Self::new(o, cache, depth + 1))
-                                })
-                                .or_else(|| match dict.get::<u8>(N) {
-                                    Some(1) => Some(Self::DeviceGray(DeviceGray)),
-                                    Some(3) => Some(Self::DeviceRgb(DeviceRgb)),
-                                    Some(4) => Some(Self::DeviceCmyk(DeviceCmyk)),
-                                    _ => None,
-                                })
-                        } else {
-                            None
-                        }
-                    });
+                    let parsed =
+                        cache.rooted_with(&icc_stream, num_components, |stream, n, building| {
+                            let bytes = stream.decoded_data().ok()?;
+                            Some(building.of_bytes(&bytes, n, ICCProfile::new))
+                        })?;
+                    return parsed
+                        .map(|icc| {
+                            if icc.is_srgb() {
+                                Self::DeviceRgb(DeviceRgb)
+                            } else {
+                                Self::ICCBased(icc)
+                            }
+                        })
+                        .or_else(|| {
+                            dict.get::<Object<'_>>(ALTERNATE)
+                                .and_then(|o| Self::new(o, cache, depth + 1))
+                        })
+                        .or_else(|| match num_components {
+                            1 => Some(Self::DeviceGray(DeviceGray)),
+                            3 => Some(Self::DeviceRgb(DeviceRgb)),
+                            4 => Some(Self::DeviceCmyk(DeviceCmyk)),
+                            _ => None,
+                        });
                 }
                 CALCMYK => return Some(Self::DeviceCmyk(DeviceCmyk)),
                 CALGRAY => {
@@ -276,7 +271,10 @@ impl ColorSpace {
     }
 
     pub(crate) fn new(object: Object<'_>, cache: &Cache) -> Option<Self> {
-        Self::new_nested(object, cache, 0)
+        match object {
+            Object::Name(name) => Self::new_from_name(&name),
+            object => cache.rooted(&object, |o, cache| Self::new_nested(o, cache, 0)),
+        }
     }
 
     pub(super) fn new_nested(object: Object<'_>, cache: &Cache, depth: u8) -> Option<Self> {

@@ -1,0 +1,31 @@
+//! Writes small PDF files and interprets their first page.
+
+// Each test crate uses a different part of this module.
+#![allow(dead_code, unused_imports)]
+
+use hayro_interpret::hayro_syntax::Pdf;
+use hayro_interpret::{Context, Device, InterpreterCache, InterpreterSettings, interpret_page};
+use kurbo::{Affine, Rect};
+
+mod fixtures;
+pub(crate) use fixtures::{file, one_page, stream};
+
+/// Interprets the first page of `pdf` into `device` in PDF user space (y up), so
+/// coordinates read like the numbers in the file.
+pub(crate) fn interpret_first_page<'a>(
+    pdf: &'a Pdf,
+    settings: InterpreterSettings,
+    device: &mut impl Device<'a>,
+) {
+    let page = &pdf.pages()[0];
+    let (w, h) = page.render_dimensions();
+    let cache = InterpreterCache::new();
+    let mut ctx = Context::new(
+        Affine::IDENTITY,
+        Rect::new(0.0, 0.0, f64::from(w), f64::from(h)),
+        &cache,
+        page.xref(),
+        settings,
+    );
+    interpret_page(page, &mut ctx, device);
+}

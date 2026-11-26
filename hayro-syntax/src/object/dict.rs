@@ -37,6 +37,18 @@ impl PartialEq for Dict<'_> {
 }
 
 impl<'a> Dict<'a> {
+    /// Reads this object independently of the reference chain that reached it.
+    pub fn as_root(&self) -> Self {
+        self.rooted(false)
+    }
+
+    pub(super) fn rooted(&self, keep_body: bool) -> Self {
+        let mut result = self.clone();
+        if let Inner::Some(repr) = &mut result.0 {
+            Arc::make_mut(repr).ctx = repr.ctx.rooted(keep_body);
+        }
+        result
+    }
     /// Create a new empty dictionary.
     pub fn empty() -> Self {
         Self(Inner::Empty)
@@ -334,6 +346,7 @@ where
 
 object!(Dict<'a>, Dict);
 
+#[derive(Clone)]
 struct Repr<'a> {
     data: &'a [u8],
     offsets: Vec<(Name<'a>, usize)>,
