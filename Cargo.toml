@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "hayro-interpret",
+    "hayro-annotations",
     "hayro",
     "benches",
     "hayro-syntax",

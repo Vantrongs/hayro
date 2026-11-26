@@ -1,0 +1,15 @@
+[package]
+name = "hayro-annotations"
+version = "0.1.0"
+description = "PDF annotation appearance synthesis"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+html5ever = "0.39"
+html5gum = "0.9"
+
+[lints]
+workspace = true
