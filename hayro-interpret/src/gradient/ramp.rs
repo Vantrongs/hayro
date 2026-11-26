@@ -291,26 +291,16 @@ impl EncodedRadialAxialShading {
         if self.extend != [true; 2] || !ramp.bounded {
             return None;
         }
-        let range = self.padded_range(pattern.background_color.components()[3] > 0.)?;
-        let kind = self.gradient_kind(range);
-        if let super::SvgGradientKind::Radial {
-            start_center,
-            start_radius,
-            end_center,
-            end_radius,
-        } = kind
-            && start_center != end_center
-            && (end_radius - start_radius).abs() < 1.0 / 4096.0
-        {
-            return None;
-        }
+        let (kind, transform) = self
+            .gradient_kind([0., 1.])
+            .raster_geometry(pattern.base_transform.inverse())?;
         let stops = ramp
             .native
             .get_or_init(|| self.raster_stops(pattern, ramp))
             .as_ref()?;
         Some(SvgGradient {
             kind,
-            transform: pattern.base_transform.inverse(),
+            transform,
             stops: stops.clone(),
         })
     }

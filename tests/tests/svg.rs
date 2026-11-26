@@ -34,6 +34,7 @@ pub(crate) fn tests() -> Vec<Test> {
             Test::unit("svg::gradient_transfer_pair", transfer_pair),
             Test::unit("svg::gradient_offpage", offpage),
             Test::unit("svg::collapsed_band", collapsed_band),
+            Test::unit("svg::close_stops", close_stops),
             Test::unit("svg::stitched_band", stitched_band),
             Test::unit("svg::narrow_exponential", narrow_exponential),
             Test::unit("svg::gradient_background_order", background_order),
@@ -307,5 +308,36 @@ fn sampled_peak() {
                 "x={x}: {channel} vs {expected}"
             );
         }
+    }
+}
+
+fn close_stops() {
+    for (pdf, band) in [
+        (
+            include_bytes!("../../hayro/tests/gradients/close_red.pdf").as_slice(),
+            [255, 0, 0],
+        ),
+        (
+            include_bytes!("../../hayro/tests/gradients/close_white.pdf").as_slice(),
+            [255, 255, 255],
+        ),
+    ] {
+        let (svg, image) = gradient(pdf);
+        for x in 0..10 {
+            let p = image.pixel(x, 0).unwrap();
+            let expected = if (2..7).contains(&x) { band } else { [0; 3] };
+            assert_eq!([p.red(), p.green(), p.blue()], expected, "x={x}");
+            assert_eq!(p.alpha(), 255);
+        }
+        assert!(svg.contains("<image"));
+    }
+    for pdf in [
+        include_bytes!("../../hayro/tests/gradients/close_padding.pdf").as_slice(),
+        include_bytes!("../../hayro/tests/gradients/close_end_padding.pdf").as_slice(),
+    ] {
+        let (svg, image) = gradient(pdf);
+        assert_eq!(image.pixel(3, 4).unwrap().alpha(), 0);
+        assert_eq!(image.pixel(6, 4).unwrap().alpha(), 255);
+        assert!(svg.contains("<image"));
     }
 }

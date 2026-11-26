@@ -78,6 +78,7 @@ impl Renderer<'_> {
         if let EncodedShadingType::RadialAxial(g) = &encoded.shading_type {
             if let Some(native) = g
                 .as_svg_gradient(&encoded, STOP_TOLERANCE)
+                .and_then(SvgGradient::with_raster_geometry)
                 .filter(|g| lut_resolves(&g.stops, NATIVE_GRADIENT_TOLERANCE))
             {
                 return native_paint(native);
@@ -240,10 +241,15 @@ fn strip_transform(transform: Affine, bbox: Rect) -> Option<Affine> {
     let fine = (STRIP_WIDTH * STRIP_ROWS) as f64;
     let period = (2 * STRIP_ROWS) as f64;
     // At pixel centers the transverse term is a whole mirror period, keeping the two axes independent.
+    // A horizontal skew of at least one texel selects Vello's f64-stepping NNImagePainter.
     let (dx, dy) = if x.abs() > y.abs() {
-        (0., period)
+        if (x * fine).abs() >= 1. {
+            (0., period)
+        } else {
+            (period.copysign(x), -period.copysign(y))
+        }
     } else {
-        (period, 0.)
+        (period.copysign(x), 0.)
     };
     let width = STRIP_WIDTH as f64;
     let texture = Affine::new([
@@ -252,12 +258,14 @@ fn strip_transform(transform: Affine, bbox: Rect) -> Option<Affine> {
         y * width,
         y * fine + dy,
         1. + offset * width,
-        offset * fine - period * 0.5,
+        offset * fine - (dx + dy) * 0.5,
     ]);
     let bounds = texture.transform_rect_bbox(bbox.inflate(8., 4.));
     // Keep subtexel addressing within the integer precision of Vello's f32 sampler.
     let inverse = texture.inverse();
-    (inverse.is_finite() && bounds.y0.abs().max(bounds.y1.abs()) < (1 << 22) as f64)
+    (inverse.is_finite()
+        && bounds.x0.abs().max(bounds.x1.abs()) * (STRIP_ROWS as f64) < (1 << 22) as f64
+        && bounds.y0.abs().max(bounds.y1.abs()) < (1 << 22) as f64)
         .then_some(inverse)
 }
 

@@ -50,6 +50,51 @@ pub enum SvgGradientKind {
     },
 }
 
+impl SvgGradient {
+    /// Normalize geometry supported by the native raster gradient sampler.
+    pub fn with_raster_geometry(self) -> Option<Self> {
+        let (kind, transform) = self.kind.raster_geometry(self.transform)?;
+        Some(Self {
+            kind,
+            transform,
+            stops: self.stops,
+        })
+    }
+}
+
+impl SvgGradientKind {
+    fn raster_geometry(self, transform: Affine) -> Option<(Self, Affine)> {
+        match self {
+            Self::Linear { .. } => Some((self, transform)),
+            Self::Radial {
+                start_center,
+                start_radius,
+                end_center,
+                end_radius,
+            } if start_center == end_center && (start_radius == 0. || end_radius == 0.) => {
+                let radius = start_radius.max(end_radius);
+                if !radius.is_finite() || radius <= 0. {
+                    return None;
+                }
+                // Unit radii keep Vello's degeneracy check independent of the PDF coordinate scale.
+                let kind = Self::Radial {
+                    start_center: Point::ORIGIN,
+                    start_radius: start_radius / radius,
+                    end_center: Point::ORIGIN,
+                    end_radius: end_radius / radius,
+                };
+                Some((
+                    kind,
+                    transform
+                        * Affine::translate(start_center.to_vec2())
+                        * Affine::scale(f64::from(radius)),
+                ))
+            }
+            Self::Radial { .. } => None,
+        }
+    }
+}
+
 /// A color stop for an SVG-like gradient.
 #[derive(Clone, Debug)]
 pub struct SvgGradientStop {
@@ -179,7 +224,8 @@ impl EncodedRadialAxialShading {
             padding[1] = padding[1].min(r.y / (-growth).max(0.0));
         }
 
-        Some([-padding[0], 1.0 + padding[1]])
+        let end = 1.0 + padding[1];
+        (padding[1] == 0. || end > 1.).then_some([-padding[0], end])
     }
 
     fn gradient_kind(&self, [t0, t1]: [f64; 2]) -> SvgGradientKind {
@@ -361,34 +407,40 @@ fn pad_stops(
     [t0, t1]: [f64; 2],
     background: Option<[f32; 4]>,
 ) -> Option<Vec<SvgGradientStop>> {
-    let (t0, t1) = (t0 as f32, t1 as f32);
     let padding = |offset| SvgGradientStop {
         offset,
-        color: background.unwrap_or([0.0; 4]),
+        color: background.unwrap_or([0.; 4]),
     };
-
-    let padded = |offset: f32| (offset - t0) / (t1 - t0);
-    // SVG parsers such as usvg collapse distinct stops within 4 f32 ULPs.
-    let collapses = |a: f32, b: f32| a >= b || b.to_bits().saturating_sub(a.to_bits()) <= 4;
-    if stops
-        .windows(2)
-        .any(|s| s[0].offset < s[1].offset && collapses(padded(s[0].offset), padded(s[1].offset)))
-    {
-        return None;
+    if t0 < 0. {
+        stops.splice(0..0, [padding(0.), padding(0.)]);
     }
-    for stop in &mut stops {
-        stop.offset = padded(stop.offset);
-    }
-    if t0 < 0.0 {
-        let edge = stops[0].offset;
-        stops.splice(0..0, [padding(0.0), padding(edge)]);
+    if t1 > 1. {
+        stops.extend([padding(1.), padding(1.)]);
     }
 
-    if t1 > 1.0 {
-        let edge = stops[stops.len() - 1].offset;
-        stops.extend([padding(edge), padding(1.0)]);
+    let end = stops.len() - 1;
+    let mut previous = None;
+    for (i, stop) in stops.iter_mut().enumerate() {
+        let position = match i {
+            0 => t0,
+            i if i == end => t1,
+            _ => f64::from(stop.offset),
+        };
+        let offset = ((position - t0) / (t1 - t0)) as f32;
+        if let Some((last, left)) = previous
+            && position != last
+        {
+            // usvg merges within four ULPs and moves duplicates left by EPSILON (right at zero).
+            let rightmost = if left == 0. { f32::EPSILON } else { left };
+            if offset.to_bits().saturating_sub(left.to_bits()) <= 4
+                || offset - f32::EPSILON <= rightmost
+            {
+                return None;
+            }
+        }
+        stop.offset = offset;
+        previous = Some((position, offset));
     }
-
     Some(stops)
 }
 

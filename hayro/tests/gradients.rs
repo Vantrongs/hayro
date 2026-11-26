@@ -1,9 +1,10 @@
 //! Check axial and radial shading colors at device pixel centers.
 use hayro::hayro_interpret::InterpreterSettings;
 use hayro::hayro_syntax::Pdf;
-use hayro::vello_cpu::Pixmap;
 use hayro::vello_cpu::color::palette::css::WHITE;
+use hayro::vello_cpu::{Pixmap, RenderContext, Resources};
 use hayro::{PixmapSettings, RenderCache, RenderSettings, render};
+use kurbo::Affine;
 
 fn raster(data: &[u8], scale: f32) -> Pixmap {
     let pdf = Pdf::new(data.to_vec()).unwrap();
@@ -144,6 +145,68 @@ fn narrow_reversed_encode_matches_affine() {
         let image = raster(pdf, 1.0);
         for x in 0..64 {
             assert_eq!(image.sample(x, 0), image.sample(x, 1), "x={x}");
+        }
+    }
+}
+
+fn crop(data: &[u8], width: u16, height: u16, transform: Affine) -> Pixmap {
+    let pdf = Pdf::new(data.to_vec()).unwrap();
+    let mut ctx = RenderContext::new(width, height);
+    hayro::render_into(
+        &pdf.pages()[0],
+        &RenderCache::new(),
+        &InterpreterSettings::default(),
+        &RenderSettings::default(),
+        &mut ctx,
+        transform,
+    );
+    ctx.flush();
+    let mut image = Pixmap::new(width, height);
+    ctx.render(&mut image, &mut Resources::default());
+    image
+}
+
+#[test]
+fn nearly_tangent_circles_cover_the_left_of_the_focus() {
+    for (size, shift) in [(400, 0_u16), (160, 120)] {
+        let transform =
+            Affine::translate((-f64::from(shift), -f64::from(shift))) * Affine::scale(2.);
+        let image = crop(
+            include_bytes!("gradients/radial_tangent.pdf"),
+            size,
+            size,
+            transform,
+        );
+        let pixel = image.sample(199 - shift, 199 - shift);
+        assert!(pixel.r.abs_diff(26) <= 1 && pixel.a == 255, "{pixel:?}");
+    }
+}
+
+#[test]
+fn radial_strip_boundary_preserves_coverage() {
+    let image = crop(
+        include_bytes!("gradients/radial_strip_boundary.pdf"),
+        400,
+        400,
+        Affine::IDENTITY,
+    );
+    let pixel = image.sample(0, 1);
+    assert!(pixel.r.abs_diff(26) <= 1 && pixel.a == 255, "{pixel:?}");
+}
+
+#[test]
+fn wide_separation_strip_tracks_the_parameter() {
+    let pdf = include_bytes!("gradients/wide_strip.pdf");
+    let image = crop(pdf, 60000, 16, Affine::IDENTITY);
+    for y in 0..16 {
+        let row = crop(pdf, 60000, 1, Affine::translate((0., -f64::from(y))));
+        for x in 0..60000 {
+            let expected = row.sample(x, 0);
+            let pixel = image.sample(x, y);
+            assert!(
+                pixel.r.abs_diff(expected.r) <= 2 && pixel.a == expected.a,
+                "({x},{y}): {pixel:?}, expected {expected:?}"
+            );
         }
     }
 }
