@@ -32,34 +32,27 @@ fn decode_context<'a>(
     obj: &ImageXObject<'a>,
     target_dimension: Option<(u32, u32)>,
 ) -> Option<DecodeContext<'a>> {
-    let dict = obj.stream.dict();
-    let dict_bpc = dict
-        .get::<u8>(BPC)
-        .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT));
-    let color_space = obj.color_space.clone();
-    let is_indexed = obj.color_space.as_ref().is_some_and(|cs| cs.is_indexed());
+    let dict_bpc = obj.dict_bpc;
+    let color_space = obj.color_space.as_ref();
+    let is_indexed = color_space.is_some_and(ColorSpace::is_indexed);
 
     let decode_params = ImageDecodeParams {
         is_indexed,
         bpc: dict_bpc,
-        num_components: color_space.as_ref().map(|c| c.num_components()),
+        num_components: color_space.map(ColorSpace::num_components),
         target_dimension,
         width: obj.width(),
         height: obj.height(),
     };
 
-    let gray = color_space
-        .as_ref()
-        .is_none_or(|cs| cs.is_device_gray_or_rgb() && cs.num_components() == 1);
-    let decoded = if gray {
-        obj.stream.decoded_luma_image(&decode_params)
-    } else {
-        obj.stream.decoded_image(&decode_params)
-    }
-    .map_err(|_| (obj.warning_sink)(InterpreterWarning::ImageDecodeFailure))
-    .ok()?;
+    let gray = color_space.is_none_or(|cs| cs.is_device_gray_or_rgb() && cs.num_components() == 1);
+    let (decoded, ranges) = obj
+        .stream
+        .decoded_image_samples(&decode_params, gray)
+        .map_err(|_| (obj.warning_sink)(InterpreterWarning::ImageDecodeFailure))
+        .ok()?;
 
-    let mut ctx = sample_context(obj, decoded)?;
+    let mut ctx = sample_context(obj, decoded, ranges)?;
     let stride = (ctx.width as usize)
         .checked_mul(usize::from(ctx.color_space.num_components()))?
         .checked_mul(usize::from(ctx.bits_per_component))?
@@ -67,13 +60,12 @@ fn decode_context<'a>(
     if stride == 0 {
         return None;
     }
-    let transparent = short_rows_transparent(obj, ctx.color_space.num_components());
     let available = fit_rows(
         ctx.decoded.data.len(),
         stride,
         ctx.height,
         ctx.bits_per_component,
-        transparent,
+        || short_rows_transparent(obj, ctx.color_space.num_components()),
     );
     ctx.height = u32::try_from(available.div_ceil(stride)).ok()?;
     match &mut ctx.decoded.data {
@@ -101,10 +93,10 @@ pub(crate) fn fit_rows(
     stride: usize,
     rows: u32,
     bits: u8,
-    transparent: bool,
+    transparent: impl FnOnce() -> bool,
 ) -> usize {
     let n = bytes.min(stride.saturating_mul(rows as usize));
-    if transparent || bits != 8 {
+    if bits != 8 || (!n.is_multiple_of(stride) && transparent()) {
         n / stride * stride
     } else {
         n
@@ -244,11 +236,9 @@ impl Tail {
 fn sample_context<'a>(
     obj: &ImageXObject<'a>,
     decoded: FilterResult<'a>,
+    ranges: Option<Array<'a>>,
 ) -> Option<DecodeContext<'a>> {
-    let dict = obj.stream.dict();
-    let dict_bpc = dict
-        .get::<u8>(BPC)
-        .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT));
+    let dict_bpc = obj.dict_bpc;
     let color_space = obj.color_space.clone();
     let (mut scale_x, mut scale_y) = (1.0, 1.0);
 
@@ -293,11 +283,9 @@ fn sample_context<'a>(
         .or(dict_bpc)
         .unwrap_or(fallback_bpc);
 
-    let decode_arr = dict
-        .get::<Array<'_>>(D)
-        .or_else(|| dict.get::<Array<'_>>(DECODE))
+    let decode_arr = ranges
         .map(|a| a.iter::<(f32, f32)>().collect::<SmallVec<_>>())
-        .unwrap_or(color_space.default_decode_arr(bits_per_component as f32));
+        .unwrap_or_else(|| color_space.default_decode_arr(bits_per_component as f32));
 
     Some(DecodeContext {
         decoded,

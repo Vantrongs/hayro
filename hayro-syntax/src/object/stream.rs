@@ -9,7 +9,9 @@ pub use crate::filter::forward::DecodedReader;
 use crate::filter::forward::FlateMode;
 use crate::object::Name;
 use crate::object::dict::InlineImageDict;
-use crate::object::dict::keys::{DECODE_PARMS, DP, F, FILTER, IDENTITY, LENGTH, NAME, TYPE, XREF};
+use crate::object::dict::keys::{
+    D, DECODE, DECODE_PARMS, DP, F, FILTER, IDENTITY, LENGTH, NAME, TYPE, XREF,
+};
 use crate::object::{Array, ObjectIdentifier};
 use crate::object::{Dict, Written};
 use crate::object::{Object, ObjectLike, ObjectRefLike};
@@ -250,7 +252,7 @@ impl ImageDecodeParams {
 enum DecodeTarget<'a> {
     Data,
     PageContent,
-    Image(&'a ImageDecodeParams, bool),
+    Image(&'a ImageDecodeParams, Option<&'a Option<Array<'a>>>),
 }
 
 impl<'a> Stream<'a> {
@@ -583,7 +585,7 @@ impl<'a> Stream<'a> {
         &self,
         image_params: &ImageDecodeParams,
     ) -> Result<FilterResult<'a>, DecodeFailure> {
-        self.decode(DecodeTarget::Image(image_params, false))
+        self.decode(DecodeTarget::Image(image_params, None))
     }
 
     /// Decodes a gray image, allowing terminal fax samples to be expanded to eight bits.
@@ -592,7 +594,27 @@ impl<'a> Stream<'a> {
         &self,
         params: &ImageDecodeParams,
     ) -> Result<FilterResult<'a>, DecodeFailure> {
-        self.decode(DecodeTarget::Image(params, true))
+        self.decoded_image_samples(params, true)
+            .map(|(image, _)| image)
+    }
+
+    /// Decodes image samples and returns the array describing their component ranges.
+    #[cfg(feature = "images")]
+    pub fn decoded_image_samples(
+        &self,
+        params: &ImageDecodeParams,
+        allow_luma: bool,
+    ) -> Result<(FilterResult<'a>, Option<Array<'a>>), DecodeFailure> {
+        let ranges = self.image_decode_array();
+        let image = self.decode(DecodeTarget::Image(params, allow_luma.then_some(&ranges)))?;
+        Ok((image, ranges))
+    }
+
+    /// Returns the image's explicit component decode ranges.
+    pub fn image_decode_array(&self) -> Option<Array<'a>> {
+        self.dict
+            .get::<Array<'_>>(D)
+            .or_else(|| self.dict.get(DECODE))
     }
 
     pub(crate) fn decoded_page_content(&self) -> Result<Cow<'a, [u8]>, DecodeFailure> {
@@ -600,10 +622,6 @@ impl<'a> Stream<'a> {
     }
 
     fn decode(&self, target: DecodeTarget<'_>) -> Result<FilterResult<'a>, DecodeFailure> {
-        if self.has_external_file() {
-            return Err(DecodeFailure::StreamDecode);
-        }
-
         let mut filters_and_params = self.filters_and_params();
         let first_image = filters_and_params.filters.iter().position(Filter::is_image);
         let image_params = match target {
@@ -633,9 +651,9 @@ impl<'a> Stream<'a> {
                         self.collect_filters(&filters_and_params, false, None, None)?
                     };
                     #[cfg(feature = "images")]
-                    if _luma
+                    if let Some(ranges) = _luma
                         && filter == Filter::CcittFaxDecode
-                        && crate::filter::ccitt::can_expand(&self.dict, params)
+                        && crate::filter::ccitt::can_expand(&self.dict, params, ranges.as_ref())
                     {
                         return crate::filter::ccitt::Fax::new(&options, params.height, None)
                             .decode(&stored, crate::filter::ccitt::FaxRows::Luma8)
@@ -645,7 +663,13 @@ impl<'a> Stream<'a> {
                 }
                 _ => params,
             },
-            _ if first_image.is_some() => return Err(DecodeFailure::ImageDecode),
+            _ if first_image.is_some() => {
+                return Err(if self.has_external_file() {
+                    DecodeFailure::StreamDecode
+                } else {
+                    DecodeFailure::ImageDecode
+                });
+            }
             _ => &ImageDecodeParams::default(),
         };
 

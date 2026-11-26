@@ -88,9 +88,8 @@ impl Bands {
         let cs = obj.color_space.as_ref()?;
         let keyed = super::super::decode::short_rows_transparent(obj, cs.num_components());
         let channels = usize::from(cs.num_components());
-        let bpc = dict
-            .get::<u8>(BPC)
-            .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT))
+        let bpc = obj
+            .dict_bpc
             .unwrap_or(if obj.kind == ImageKind::StencilMask {
                 1
             } else {
@@ -300,13 +299,10 @@ impl Bands {
         let stored = self.stored_bytes();
         let start = u64::from(first).saturating_mul(self.stride as u64);
         let available = usize::try_from(stored.saturating_sub(start)).unwrap_or(usize::MAX);
-        let held = super::super::decode::fit_rows(
-            available,
-            self.stride,
-            end - first,
-            self.bits,
-            self.keyed,
-        );
+        let held =
+            super::super::decode::fit_rows(available, self.stride, end - first, self.bits, || {
+                self.keyed
+            });
         let rows = if self.keyed {
             held / self.stride
         } else {

@@ -12,6 +12,7 @@ use kurbo::Affine;
 
 #[derive(Clone)]
 pub(crate) struct ImageXObject<'a> {
+    pub(super) dict_bpc: Option<u8>,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) color_space: Option<ColorSpace>,
@@ -112,6 +113,9 @@ impl<'a> ImageXObject<'a> {
         }
 
         Some(Self {
+            dict_bpc: dict
+                .get::<u8>(BPC)
+                .or_else(|| dict.get::<u8>(BITS_PER_COMPONENT)),
             width,
             cache: cache.clone(),
             height,

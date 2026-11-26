@@ -98,6 +98,7 @@ pub(crate) fn convert_band(
             data: std::borrow::Cow::Owned(data),
             image_data: metadata,
         },
+        obj.stream.image_decode_array(),
     )?;
     ctx.width = width;
     ctx.height = rows;
