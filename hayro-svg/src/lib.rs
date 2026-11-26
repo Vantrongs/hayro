@@ -350,30 +350,25 @@ impl<'a> Device<'a> for SvgRenderer<'a> {
 
     fn draw_image(&mut self, image: Image<'a, '_>, props: ImageDrawProps<'a>) {
         self.with_group(props.soft_mask.clone(), props.blend_mode, |r| {
-            let mut transform = props.transform;
+            let transform = props.transform;
             match image {
-                Image::Stencil(s) => {
-                    s.with_stencil(
-                        |s, paint| {
-                            transform *= Affine::scale_non_uniform(
-                                s.scale_factors.0 as f64,
-                                s.scale_factors.1 as f64,
-                            );
-                            Self::draw_stencil_image(r, s, transform, paint);
-                        },
-                        None,
-                    );
-                }
-                Image::Raster(raster) => {
-                    raster.with_rgba(
-                        |image, alpha| {
-                            let (sx, sy) = image.scale_factors();
-                            transform *= Affine::scale_non_uniform(sx as f64, sy as f64);
-                            Self::draw_rgba_image(r, image, transform, alpha);
-                        },
-                        None,
-                    );
-                }
+                Image::Stencil(s) => s.with_stencil_bands(
+                    |stencil, paint, band| {
+                        Self::draw_stencil_image(r, stencil, transform * band, paint);
+                    },
+                    None,
+                ),
+                Image::Raster(raster) => raster.with_rgba_bands(
+                    |image, band, alpha| {
+                        Self::draw_rgba_image(
+                            r,
+                            image,
+                            transform * band,
+                            alpha.map(|(mask, t)| (mask, transform * t)),
+                        );
+                    },
+                    None,
+                ),
             }
         });
     }

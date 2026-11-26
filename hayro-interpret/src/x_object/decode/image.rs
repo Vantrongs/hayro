@@ -1,4 +1,4 @@
-use super::mask::decode_mask;
+use super::mask::{DecodedMask, decode_mask};
 use super::{DecodeContext, decode_context, decode_u8_samples, fix_image_length, unpack_samples};
 use crate::color::{ColorComponents, ToLuma, ToRgb};
 use crate::interpret::state::ActiveTransferFunction;
@@ -10,17 +10,88 @@ use smallvec::SmallVec;
 
 pub(crate) struct DecodedImage {
     pub(crate) image: ImageData,
-    pub(crate) alpha: Option<LumaData>,
+    pub(crate) alpha: Option<DecodedMask>,
     pub(in crate::x_object) tail: super::Tail,
 }
 
 impl DecodedImage {
+    pub(crate) fn bands(
+        self,
+        mut draw: impl FnMut(ImageData, kurbo::Affine, Option<(LumaData, kurbo::Affine)>),
+    ) {
+        use kurbo::Affine;
+        let width = self.tail.width;
+        let height = if self.tail.texel.is_some() {
+            self.tail.declared
+        } else {
+            self.image.height()
+        };
+        let (sx, sy) = self.image.scale_factors();
+        let scale = Affine::scale_non_uniform(f64::from(sx), f64::from(sy));
+        let Some(mask) = self.alpha else {
+            if self.tail.texel.is_none() {
+                if height > 0 {
+                    draw(self.image, scale, None);
+                }
+                return;
+            }
+            for (color, t) in self.tail.bands(self.image) {
+                draw(color, scale * t, None);
+            }
+            return;
+        };
+        let mask_height = if mask.tail.texel.is_some() {
+            mask.tail.declared
+        } else {
+            mask.luma.height
+        };
+        if mask_height == 0 {
+            return;
+        }
+        let mask_scale = scale
+            * Affine::scale_non_uniform(
+                f64::from(width) / f64::from(mask.tail.width),
+                f64::from(height) / f64::from(mask_height),
+            );
+        if self.tail.texel.is_none() && mask.tail.texel.is_none() {
+            if height > 0 {
+                draw(self.image, scale, Some((mask.luma, mask_scale)));
+            }
+            return;
+        }
+        let mut colors = self.tail.bands(self.image);
+        let masks = mask.bands();
+        if colors.len() == 1 && masks.len() == 1 {
+            let (color, t) = colors.pop().unwrap();
+            let (alpha, m) = masks.into_iter().next().unwrap();
+            draw(color, scale * t, Some((alpha, mask_scale * m)));
+        } else {
+            for (color, t) in colors {
+                for (alpha, m) in &masks {
+                    draw(
+                        color.clone(),
+                        scale * t,
+                        Some((alpha.clone(), mask_scale * *m)),
+                    );
+                }
+            }
+        }
+    }
+
     pub(crate) fn into_whole(mut self) -> Option<(ImageData, Option<LumaData>)> {
         match &mut self.image {
-            ImageData::Rgb(d) => self.tail.complete(&mut d.data, d.width, &mut d.height)?,
-            ImageData::Luma(d) => self.tail.complete(&mut d.data, d.width, &mut d.height)?,
+            ImageData::Rgb(d) => self
+                .tail
+                .complete(&mut d.data, &mut d.width, &mut d.height)?,
+            ImageData::Luma(d) => self
+                .tail
+                .complete(&mut d.data, &mut d.width, &mut d.height)?,
         }
-        Some((self.image, self.alpha))
+        let alpha = match self.alpha {
+            Some(mask) => Some(mask.into_whole()?),
+            None => None,
+        };
+        Some((self.image, alpha))
     }
 }
 pub(crate) fn decode_image(
@@ -226,22 +297,29 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
         }
     }
 
-    fn decode_alpha(&mut self, image: &mut ImageData, key: Option<LumaData>) -> Option<LumaData> {
+    fn decode_alpha(
+        &mut self,
+        image: &mut ImageData,
+        key: Option<LumaData>,
+    ) -> Option<DecodedMask> {
         if let Some((mut alpha, matte_rgb)) = self.resolve_matte()
-            && alpha.width == self.ctx.width
-            && alpha.height == self.ctx.declared
+            && alpha.tail.width == self.ctx.width
+            && alpha.tail.declared == self.ctx.declared
         {
-            alpha.height = self.ctx.height;
+            alpha.tail.declared = self.ctx.height;
+            alpha.luma.height = alpha.luma.height.min(self.ctx.height);
             alpha
+                .luma
                 .data
-                .truncate(alpha.width as usize * alpha.height as usize);
+                .truncate(alpha.luma.width as usize * alpha.luma.height as usize);
+            let alpha = alpha.into_whole()?;
             let (color, c) = match image {
                 ImageData::Luma(d) => (&mut d.data, 1),
                 ImageData::Rgb(d) => (&mut d.data, 3),
             };
             unblend_matte(color, c, &alpha.data, matte_rgb);
 
-            return Some(alpha);
+            return Some(DecodedMask::dense(alpha));
         }
 
         // Drop an invalid alpha channel so the image itself still renders (PDFJS-19611).
@@ -256,13 +334,13 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
                 .and_then(|image| image.alpha.take())?;
             fix_image_length(&mut data, self.ctx.width, &mut self.ctx.height, 0, 1)?;
 
-            Some(LumaData {
+            Some(DecodedMask::dense(LumaData {
                 data,
                 width: self.ctx.width,
                 height: self.ctx.height,
                 interpolate: self.obj.interpolate,
                 scale_factors: self.ctx.scale_factors,
-            })
+            }))
             // `SMask` takes precedence over `Mask`.
         } else if let Some(s_mask) = dict
             .get::<Stream<'_>>(SMASK)
@@ -270,13 +348,13 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
         {
             let obj = ImageXObject::new_mask(&s_mask, &self.obj.warning_sink, &self.obj.cache)?;
 
-            decode_mask(&obj, self.target_dimension)?.into_whole()
+            decode_mask(&obj, self.target_dimension)
         } else {
-            key
+            key.map(DecodedMask::dense)
         }
     }
 
-    fn resolve_matte(&self) -> Option<(LumaData, [u8; 3])> {
+    fn resolve_matte(&self) -> Option<(DecodedMask, [u8; 3])> {
         let s_mask = self.obj.stream.dict().get::<Stream<'_>>(SMASK)?;
         let matte = s_mask.dict().get::<ColorComponents>(MATTE)?;
 
@@ -289,7 +367,7 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
         self.ctx.color_space.convert_values(&matte, &mut matte_rgb);
 
         let mask_obj = ImageXObject::new_mask(&s_mask, &self.obj.warning_sink, &self.obj.cache)?;
-        let alpha = decode_mask(&mask_obj, self.target_dimension)?.into_whole()?;
+        let alpha = decode_mask(&mask_obj, self.target_dimension)?;
 
         Some((alpha, matte_rgb))
     }

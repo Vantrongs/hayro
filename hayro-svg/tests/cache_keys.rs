@@ -47,3 +47,26 @@ fn shallow_soft_mask_after_depth_limit() {
     assert!(shallow.contains("<rect "));
     assert!(svg.contains("mask=\"url(#m1)\""));
 }
+
+#[path = "../../hayro-interpret/tests/common/fixtures.rs"]
+#[allow(dead_code)]
+mod fixtures;
+#[path = "../../hayro-interpret/tests/common/rendering.rs"]
+mod rendering;
+
+#[test]
+fn annotation_group_controls_the_appearance() {
+    for on in [true, false] {
+        assert_eq!(
+            svg(&rendering::group_annotation(on)).contains("#00ff00"),
+            on
+        );
+    }
+}
+
+#[test]
+fn short_image_emits_stored_and_solid_bands() {
+    let output = svg(&rendering::short_image(1_000_000));
+    assert_eq!(output.matches("<image ").count(), 2);
+    assert!(!output.contains("height=\"1000000\""));
+}

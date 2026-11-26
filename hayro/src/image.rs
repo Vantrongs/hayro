@@ -75,15 +75,13 @@ impl RenderImageData {
 }
 
 impl Renderer<'_> {
-    fn draw_image_with_alpha_mask(&mut self, image_data: RenderImageData, alpha_data: LumaData) {
-        let img_width = image_data.width();
-        let img_height = image_data.height();
+    fn draw_image_with_alpha_mask(
+        &mut self,
+        image_data: RenderImageData,
+        alpha_data: LumaData,
+        mask_transform: Affine,
+    ) {
         let image_transform = *self.ctx.transform();
-        let mask_transform = image_transform
-            * Affine::scale_non_uniform(
-                img_width as f64 / alpha_data.width as f64,
-                img_height as f64 / alpha_data.height as f64,
-            );
         let mask_image = SolidColorImage {
             color: [0; 3],
             width: alpha_data.width,
@@ -128,7 +126,16 @@ impl Renderer<'_> {
                 || a.height != img_height
                 || (a.interpolate || self.global.force_image_interpolation) != interpolate)
         {
-            return self.draw_image_with_alpha_mask(image_data, alpha_data.unwrap());
+            let mask_transform = cur_transform
+                * Affine::scale_non_uniform(
+                    f64::from(img_width) / f64::from(a.width),
+                    f64::from(img_height) / f64::from(a.height),
+                );
+            return self.draw_image_with_alpha_mask(
+                image_data,
+                alpha_data.unwrap(),
+                mask_transform,
+            );
         }
 
         let mut quality = if interpolate {
@@ -423,7 +430,7 @@ impl Renderer<'_> {
         }
 
         self.apply_image_props(&props);
-        let mut transform = props.transform;
+        let transform = props.transform;
         self.ctx.set_paint_transform(Affine::IDENTITY);
         self.ctx.set_aliasing_threshold(Some(1));
 
@@ -433,12 +440,9 @@ impl Renderer<'_> {
 
         match image {
             hayro_interpret::Image::Stencil(s) => {
-                s.with_stencil(
-                    |stencil, paint| {
-                        transform *= Affine::scale_non_uniform(
-                            stencil.scale_factors.0 as f64,
-                            stencil.scale_factors.1 as f64,
-                        );
+                s.with_stencil_bands(
+                    |stencil, paint, band| {
+                        let transform = transform * band;
 
                         match paint {
                             Paint::Color(c) => {
@@ -535,12 +539,19 @@ impl Renderer<'_> {
                 );
             }
             hayro_interpret::Image::Raster(r) => {
-                r.with_rgba(
-                    |image, alpha| {
-                        let (sx, sy) = image.scale_factors();
-                        transform *= Affine::scale_non_uniform(sx as f64, sy as f64);
-                        self.ctx.set_transform(transform);
-                        self.draw_image(image, alpha);
+                r.with_rgba_bands(
+                    |image, band, alpha| {
+                        self.ctx.set_transform(transform * band);
+                        match alpha {
+                            Some((mask, m))
+                                if m != band
+                                    || image.width() != mask.width
+                                    || image.height() != mask.height =>
+                            {
+                                self.draw_image_with_alpha_mask(image.into(), mask, transform * m);
+                            }
+                            other => self.draw_image(image, other.map(|(mask, _)| mask)),
+                        }
                     },
                     Some((target_width, target_height)),
                 );

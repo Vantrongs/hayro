@@ -21,6 +21,7 @@ struct DecodeContext<'a> {
     width: u32,
     height: u32,
     declared: u32,
+    logical_width: u32,
     scale_factors: (f32, f32),
     color_space: ColorSpace,
     bits_per_component: u8,
@@ -74,6 +75,13 @@ fn decode_context<'a>(
         std::borrow::Cow::Owned(v) => v.truncate(available),
         std::borrow::Cow::Borrowed(v) => *v = &v[..available],
     }
+    let stride = if available > 0 && available < stride {
+        let channels = usize::from(ctx.color_space.num_components());
+        ctx.width = u32::try_from(available.div_ceil(channels)).ok()?;
+        ctx.width as usize * channels
+    } else {
+        stride
+    };
     if !available.is_multiple_of(stride) {
         ctx.decoded
             .data
@@ -130,6 +138,7 @@ fn color_key(obj: &ImageXObject<'_>, components: u8) -> Option<SmallVec<[u16; 8]
 }
 
 pub(super) struct Tail {
+    pub(super) width: u32,
     pub(super) declared: u32,
     pub(super) texel: Option<Vec<u8>>,
 }
@@ -137,7 +146,7 @@ pub(super) struct Tail {
 impl Tail {
     fn of(ctx: &DecodeContext<'_>, obj: &ImageXObject<'_>) -> Option<Self> {
         let texel =
-            if ctx.height < ctx.declared
+            if (ctx.height < ctx.declared || ctx.width < ctx.logical_width)
                 && !short_rows_transparent(obj, ctx.color_space.num_components())
             {
                 let info = ctx.decoded.image_data.as_ref().map(|d| {
@@ -158,13 +167,58 @@ impl Tail {
             };
         Some(Self {
             declared: ctx.declared,
+            width: ctx.logical_width,
             texel,
         })
     }
 
-    fn complete(&self, data: &mut Vec<u8>, width: u32, height: &mut u32) -> Option<()> {
+    fn bands(self, data: crate::ImageData) -> SmallVec<[(crate::ImageData, kurbo::Affine); 3]> {
+        use crate::{ImageData, LumaData, RgbData};
+        use kurbo::Affine;
+        let (w, h) = (data.width(), data.height());
+        let mut bands = SmallVec::new();
+        let gray = matches!(data, ImageData::Luma(_));
+        if h != 0 {
+            bands.push((data, Affine::IDENTITY));
+        }
+        if let Some(texel) = self.texel {
+            for (left, top, width, height) in [
+                (w, 0, self.width - w, h),
+                (0, h, self.width, self.declared.saturating_sub(h)),
+            ] {
+                if width == 0 || height == 0 {
+                    continue;
+                }
+                let image = if gray {
+                    ImageData::Luma(LumaData {
+                        data: texel.clone(),
+                        width: 1,
+                        height: 1,
+                        interpolate: false,
+                        scale_factors: (1., 1.),
+                    })
+                } else {
+                    ImageData::Rgb(RgbData {
+                        data: texel.clone(),
+                        width: 1,
+                        height: 1,
+                        interpolate: false,
+                        scale_factors: (1., 1.),
+                    })
+                };
+                bands.push((
+                    image,
+                    Affine::translate((f64::from(left), f64::from(top)))
+                        * Affine::scale_non_uniform(f64::from(width), f64::from(height)),
+                ));
+            }
+        }
+        bands
+    }
+
+    fn complete(&self, data: &mut Vec<u8>, width: &mut u32, height: &mut u32) -> Option<()> {
         if let Some(texel) = &self.texel {
-            let len = (width as usize)
+            let len = (self.width as usize)
                 .checked_mul(self.declared as usize)?
                 .checked_mul(texel.len())?;
             data.try_reserve_exact(len.checked_sub(data.len())?).ok()?;
@@ -176,6 +230,7 @@ impl Tail {
                 }
             }
             *height = self.declared;
+            *width = self.width;
         }
         Some(())
     }
@@ -244,6 +299,7 @@ fn sample_context<'a>(
         width,
         height,
         declared: height,
+        logical_width: width,
         scale_factors: (scale_x, scale_y),
         color_space,
         bits_per_component,

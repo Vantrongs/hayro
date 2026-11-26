@@ -15,7 +15,7 @@ impl<'a> SvgRenderer<'a> {
         &mut self,
         image_data: ImageData,
         transform: Affine,
-        alpha: Option<LumaData>,
+        alpha: Option<(LumaData, Affine)>,
     ) {
         let (rgb_data, width, height, interpolate) = match image_data {
             ImageData::Rgb(rgb) => {
@@ -38,8 +38,12 @@ impl<'a> SvgRenderer<'a> {
             }
         };
 
-        if let Some(alpha) = alpha {
-            if alpha.interpolate == interpolate && alpha.width == width && alpha.height == height {
+        if let Some((alpha, mask_transform)) = alpha {
+            if mask_transform == transform
+                && alpha.interpolate == interpolate
+                && alpha.width == width
+                && alpha.height == height
+            {
                 let interleaved = rgb_data
                     .chunks(3)
                     .zip(alpha.data)
@@ -61,15 +65,9 @@ impl<'a> SvgRenderer<'a> {
                         ImageBuffer::from_raw(alpha.width, alpha.height, alpha.data).unwrap(),
                     );
 
-                    let transform = transform
-                        * Affine::scale_non_uniform(
-                            width as f64 / alpha.width as f64,
-                            height as f64 / alpha.height as f64,
-                        );
-
                     ImageLuminanceMask {
                         image,
-                        transform,
+                        transform: mask_transform,
                         interpolate: alpha.interpolate,
                     }
                 };

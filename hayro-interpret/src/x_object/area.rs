@@ -112,6 +112,7 @@ pub(crate) struct Area {
     /// Vertically weighted sums of the current bin row and the next, per byte of the
     /// columns read.
     acc: Acc,
+    suffix: [Vec<u64>; 2],
     /// The weight of the rows added to each of them.
     present: [u64; 2],
     /// The source row the next `push` adds.
@@ -147,7 +148,6 @@ impl Area {
                 }
             })
             .collect();
-        let width = (cols.end - cols.start) as usize * channels;
         let bins = (window[2] - window[0]) as usize * channels;
         let first_row = y.texels(window[1] as u64).start;
         Self {
@@ -159,10 +159,11 @@ impl Area {
             spans,
             // A sum is at most 255 `y.n`.
             acc: if 255 * y.n <= u32::MAX as u64 {
-                Acc::Narrow([vec![0; width], vec![0; width]])
+                Acc::Narrow(Default::default())
             } else {
-                Acc::Wide([vec![0; width], vec![0; width]])
+                Acc::Wide(Default::default())
             },
+            suffix: [vec![0; channels], vec![0; channels]],
             present: [0; 2],
             next_row: first_row,
             bin_row: window[1] as u64,
@@ -185,10 +186,16 @@ impl Area {
 
     /// Adds the next source row (`columns()` texels).
     pub(crate) fn push(&mut self, row: &[u8]) {
+        self.push_prefix(row, &[]);
+    }
+
+    pub(crate) fn push_prefix(&mut self, row: &[u8], tail: &[u8]) {
         let k = self.next_row;
         self.next_row += 1;
         if self.y.is_identity() && self.x.is_identity() {
             self.out.extend_from_slice(row);
+            let width = (self.window[2] - self.window[0]) as usize * self.channels;
+            self.out.extend(tail.iter().cycle().take(width - row.len()));
             self.coverage.push(self.y.n);
             self.bin_row += 1;
             return;
@@ -204,8 +211,13 @@ impl Area {
             self.present[slot] += w;
             match &mut self.acc {
                 // `w` is at most `y.n`.
-                Acc::Narrow(acc) => accumulate(&mut acc[slot], row, w as u32),
-                Acc::Wide(acc) => accumulate(&mut acc[slot], row, w),
+                Acc::Narrow(acc) => {
+                    accumulate(&mut acc[slot], row, tail, &self.suffix[slot], w as u32);
+                }
+                Acc::Wide(acc) => accumulate(&mut acc[slot], row, tail, &self.suffix[slot], w),
+            }
+            for (sum, &byte) in self.suffix[slot].iter_mut().zip(tail) {
+                *sum += w * u64::from(byte);
             }
         }
         // The bin row ends with this source row.
@@ -231,6 +243,9 @@ impl Area {
                     }
                 }
             }
+            for (sum, &byte) in self.suffix[0].iter_mut().zip(texel) {
+                *sum += weight * u64::from(byte);
+            }
             self.present[0] = self.y.n;
             self.emit();
         }
@@ -249,6 +264,7 @@ impl Area {
             Acc::Narrow(acc) => {
                 reduce(
                     &acc[0],
+                    &self.suffix[0],
                     &self.spans,
                     self.channels,
                     self.x,
@@ -256,11 +272,12 @@ impl Area {
                     &mut self.out,
                 );
                 acc.swap(0, 1);
-                acc[1].fill(0);
+                acc[1].clear();
             }
             Acc::Wide(acc) => {
                 reduce(
                     &acc[0],
+                    &self.suffix[0],
                     &self.spans,
                     self.channels,
                     self.x,
@@ -268,9 +285,11 @@ impl Area {
                     &mut self.out,
                 );
                 acc.swap(0, 1);
-                acc[1].fill(0);
+                acc[1].clear();
             }
         }
+        self.suffix.swap(0, 1);
+        self.suffix[1].fill(0);
         self.coverage.push(self.present[0]);
         self.present = [self.present[1], 0];
         self.bin_row += 1;
@@ -315,11 +334,27 @@ enum Acc {
 
 /// Adds `row`, weighted by `w`, to `acc`.
 #[inline]
-fn accumulate<A>(acc: &mut [A], row: &[u8], w: A)
+fn accumulate<A>(acc: &mut Vec<A>, row: &[u8], tail: &[u8], prior_tail: &[u64], w: A)
 where
-    A: Copy + From<u8> + core::ops::Mul<Output = A> + core::ops::AddAssign,
+    A: Copy + From<u8> + TryFrom<u64> + core::ops::Mul<Output = A> + core::ops::AddAssign,
 {
+    if acc.len() < row.len() {
+        if prior_tail.iter().all(|&v| v == 0) {
+            acc.resize(row.len(), A::from(0));
+        } else {
+            acc.extend(
+                prior_tail
+                    .iter()
+                    .cycle()
+                    .take(row.len() - acc.len())
+                    .map(|&v| A::try_from(v).ok().unwrap()),
+            );
+        }
+    }
     for (a, &v) in acc.iter_mut().zip(row) {
+        *a += w * A::from(v);
+    }
+    for (a, &v) in acc[row.len()..].iter_mut().zip(tail.iter().cycle()) {
         *a += w * A::from(v);
     }
 }
@@ -328,12 +363,37 @@ where
 /// row of bins.
 fn reduce<A: Copy + Into<u64>>(
     acc: &[A],
+    tail: &[u64],
     spans: &[Span],
     c: usize,
     x: Axis,
     y: Axis,
     out: &mut Vec<u8>,
 ) {
+    let stored = acc.len() / c;
+    if spans.last().is_some_and(|s| s.last >= stored) {
+        let denominator = u128::from(x.n) * u128::from(y.n);
+        for span in spans {
+            for ch in 0..c {
+                let mut sum = 0_u128;
+                let mut covered = 0;
+                for i in span.first..(span.last + 1).min(stored) {
+                    let weight = if i == span.first {
+                        span.first_weight
+                    } else if i == span.last {
+                        span.last_weight
+                    } else {
+                        x.g
+                    };
+                    covered += weight;
+                    sum += u128::from(weight) * u128::from(acc[i * c + ch].into());
+                }
+                sum += u128::from(x.n - covered) * u128::from(tail[ch]);
+                out.push(((sum + denominator / 2) / denominator) as u8);
+            }
+        }
+        return;
+    }
     if x.is_identity() {
         // `x.n` is 1: each sum is over one column.
         let d = Rounding::new(y.n);

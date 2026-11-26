@@ -10,7 +10,12 @@ fn pdf(images: &[(&str, &[u8])]) -> Pdf {
         } else {
             "/Height 3"
         };
-        file.extend(format!("{} 0 obj << /ColorSpace /DeviceGray /Width 2 {height} {dict} /Length {} >>\nstream\n",3+i,data.len()).bytes());
+        let width = if dict.contains("/Width ") {
+            ""
+        } else {
+            "/Width 2"
+        };
+        file.extend(format!("{} 0 obj << /ColorSpace /DeviceGray {width} {height} {dict} /Length {} >>\nstream\n",3+i,data.len()).bytes());
         file.extend_from_slice(data);
         file.extend(b"\nendstream\nendobj\n");
     }
@@ -167,4 +172,46 @@ fn cancelling_a_request_allows_another_read_of_the_asset() {
     ));
     token.store(false, Ordering::Relaxed);
     assert_eq!(source.request(&request).unwrap().data, [0x50, 0x60]);
+}
+
+#[test]
+fn external_image_ignores_embedded_samples() {
+    let pdf = pdf(&[("/BPC 8 /F (elsewhere)", &[10, 20])]);
+    let obj = image(&pdf);
+    assert!(obj.decoded_image(None).is_none());
+    assert!(obj.asset(None).open(None).is_none());
+}
+
+#[test]
+fn sparse_region_means_match_padded_pixels() {
+    for width in [30, 129, 2049] {
+        let bytes = [0x10, 0x22, 0x34, 0x45];
+        let doc = pdf(&[(&format!("/Width {width} /BPC 8 /Decode [1 0]"), &bytes)]);
+        let obj = image(&doc);
+        let asset = obj.asset(None);
+        let mut source = asset.open(None).unwrap();
+        let mut dense = vec![255; width as usize * 3];
+        for (&b, v) in bytes.iter().zip(&mut dense) {
+            *v = 255 - b;
+        }
+        for (grid, window) in [
+            ((3, 2), [0, 0, 3, 2]),
+            ((width, 3), [width - 3, 1, width, 3]),
+            ((width, 3), [0, 0, 4, 1]),
+            ((3, 2), [0, 0, 3, 2]),
+        ] {
+            let region = source
+                .request(&ImageRequest {
+                    plane: Plane::Image,
+                    grid,
+                    window,
+                    cancel: None,
+                })
+                .unwrap();
+            assert_eq!(
+                region.data,
+                crate::area_resample(&dense, [0, 0, width, 3], (width, 3), 1, grid, window)
+            );
+        }
+    }
 }

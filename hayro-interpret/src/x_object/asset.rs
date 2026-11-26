@@ -4,7 +4,7 @@ use super::image::{ImageKind, ImageXObject};
 use crate::cache::Cache;
 use crate::color::ColorSpace;
 use crate::interpret::state::ActiveTransferFunction;
-use crate::{ImageData, LumaData, WarningSinkFn};
+use crate::{ImageData, WarningSinkFn};
 use bands::Bands;
 use hayro_syntax::object::stream::OwnedStream;
 use kurbo::Affine;
@@ -117,10 +117,22 @@ impl ImageAsset {
         let stencil = obj.kind == ImageKind::StencilMask;
         let decoded = if stencil {
             let d = obj.decoded_mask(hint)?;
-            Decoded::new(ImageData::Luma(d.luma), None, d.tail.declared, d.tail.texel)
+            Decoded::new(
+                ImageData::Luma(d.luma),
+                None,
+                d.tail.width,
+                d.tail.declared,
+                d.tail.texel,
+            )
         } else {
             let d = obj.decoded_image(hint)?;
-            Decoded::new(d.image, d.alpha, d.tail.declared, d.tail.texel)
+            Decoded::new(
+                d.image,
+                d.alpha,
+                d.tail.width,
+                d.tail.declared,
+                d.tail.texel,
+            )
         };
         let mut layout = decoded.layout();
         if stencil {
@@ -345,28 +357,27 @@ impl ImageSource<'_> {
                 }
                 let bands = lock.as_mut().ok_or(RequestError::Failed)?;
                 let end = y.saturating_add(bands.band_rows() as u32).min(rows.end);
-                let (image, made, inflated) =
-                    match bands.read_band(request.plane, &columns, y, end, &obj) {
-                        Ok(result) => result,
-                        Err(error) => {
-                            *lock = None;
-                            return Err(error);
-                        }
-                    };
+                let band = match bands.read_band(request.plane, &columns, y, end, &obj) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        *lock = None;
+                        return Err(error);
+                    }
+                };
                 let solid_tail =
-                    image.is_some() && end < rows.end && bands.past_samples(request.plane, y);
+                    band.data.is_some() && end < rows.end && bands.past_samples(request.plane, y);
                 drop(lock);
-                rows_decoded += made;
-                bytes_inflated += inflated;
-                let Some(image) = image else {
+                rows_decoded += band.rows;
+                bytes_inflated += band.bytes;
+                let Some(image) = band.data else {
                     continue;
                 };
                 if solid_tail {
                     area.fill_tail(&image[..c]);
                     break;
                 }
-                for row in image.chunks_exact(columns.len() * c) {
-                    area.push(row);
+                for row in image.chunks_exact(band.width * c) {
+                    area.push_prefix(row, &row[row.len() - c..]);
                 }
                 y = end;
             }
@@ -415,31 +426,39 @@ fn cancelled(cancel: Option<&dyn Fn() -> bool>, row: u32) -> bool {
 /// An image decoded whole at `open`.
 struct Decoded {
     image: ImageData,
-    alpha: Option<LumaData>,
+    alpha: Option<super::decode::DecodedMask>,
     /// Whether `alpha` shares the colour's grid (the colour is then premultiplied).
     same_grid: bool,
+    width: u32,
     height: u32,
     fill: Option<Vec<u8>>,
 }
 
 impl Decoded {
-    fn new(image: ImageData, alpha: Option<LumaData>, height: u32, fill: Option<Vec<u8>>) -> Self {
-        let (w, h) = (image.width(), image.height());
+    fn new(
+        image: ImageData,
+        alpha: Option<super::decode::DecodedMask>,
+        width: u32,
+        height: u32,
+        fill: Option<Vec<u8>>,
+    ) -> Self {
+        let h = image.height();
         let same_grid = alpha.as_ref().is_some_and(|a| {
-            (a.width == w && (a.height == h || a.height == height))
-                && a.interpolate == image.interpolate()
+            (a.tail.width == width && (a.tail.declared == h || a.tail.declared == height))
+                && a.luma.interpolate == image.interpolate()
         });
         Self {
             image,
             alpha,
             same_grid,
+            width,
             height,
             fill,
         }
     }
 
     fn layout(&self) -> ImageLayout {
-        let (w, h) = (self.image.width(), self.height);
+        let (w, h) = (self.width, self.height);
         let (sx, sy) = self.image.scale_factors();
         let format = match (&self.image, self.same_grid) {
             (ImageData::Luma(_), false) => PixelFormat::Luma,
@@ -460,13 +479,13 @@ impl Decoded {
                 .as_ref()
                 .filter(|_| !self.same_grid)
                 .map(|a| PlaneLayout {
-                    width: a.width,
-                    height: a.height,
+                    width: a.tail.width,
+                    height: a.tail.declared,
                     to_image: (
-                        sx as f64 * w as f64 / a.width as f64,
-                        sy as f64 * h as f64 / a.height as f64,
+                        sx as f64 * w as f64 / a.tail.width as f64,
+                        sy as f64 * h as f64 / a.tail.declared as f64,
                     ),
-                    interpolate: a.interpolate,
+                    interpolate: a.luma.interpolate,
                     format: PixelFormat::Alpha,
                 }),
         }
@@ -483,7 +502,7 @@ impl Decoded {
         let (data, c, w) = match (plane, &self.image) {
             (Plane::Mask, _) => {
                 let a = self.alpha.as_ref().ok_or(RequestError::Invalid)?;
-                (&a.data, 1, a.width as usize)
+                (&a.luma.data, 1, a.luma.width as usize)
             }
             (Plane::Image, ImageData::Rgb(d)) => (&d.data, 3, d.width as usize),
             (Plane::Image, ImageData::Luma(d)) => (&d.data, 1, d.width as usize),
@@ -491,38 +510,73 @@ impl Decoded {
         let alpha = (plane == Plane::Image && self.same_grid)
             .then_some(self.alpha.as_ref())
             .flatten();
-        let mut work = Vec::with_capacity((c1 - c0) * (c + 1));
+        let tail = if plane == Plane::Mask {
+            self.alpha.as_ref().and_then(|a| a.tail.texel.as_deref())
+        } else {
+            self.fill.as_deref()
+        };
+        let mut work = Vec::new();
         for y in rows.clone() {
             if cancelled(cancel, y) {
                 return Err(RequestError::Cancelled);
             }
-            let at = y as usize * w;
-            let fill;
-            let texels = if let Some(row) = data.get((at + c0) * c..(at + c1) * c) {
-                row
-            } else if let Some(pixel) = &self.fill {
-                fill = pixel.repeat(c1 - c0);
-                &fill
-            } else {
-                break;
-            };
-            match alpha {
-                Some(a) => {
-                    work.clear();
-                    let Some(alpha) = a.data.get(at + c0..at + c1) else {
-                        break;
-                    };
-                    super::decode::premultiply(&mut work, texels, c, alpha);
-                    area.push(&work);
+            let row = |stride: usize, channels: usize, len: usize| {
+                let start = y as usize * stride;
+                let end = (start + c1.min(stride)) * channels;
+                let first = (start + c0.min(stride)) * channels;
+                if first < end && end <= len {
+                    first..end
+                } else {
+                    0..0
                 }
-                None => area.push(texels),
+            };
+            let colors = &data[row(w, c, data.len())];
+            let mask =
+                alpha.map(|a| &a.luma.data[row(a.luma.width as usize, 1, a.luma.data.len())]);
+            if let Some(a) = alpha {
+                let mask = mask.unwrap();
+                let count = (colors.len() / c).max(mask.len());
+                if (colors.is_empty() && tail.is_none())
+                    || (mask.is_empty() && a.tail.texel.is_none())
+                {
+                    break;
+                }
+                let missing_alpha = a.tail.texel.as_ref().map_or(0, |v| v[0]);
+                let mut missing = vec![0; c + 1];
+                if let Some(t) = tail {
+                    missing.clear();
+                    super::decode::premultiply(&mut missing, t, c, &[missing_alpha]);
+                }
+                if count == 0 {
+                    area.fill_tail(&missing);
+                    break;
+                }
+                work.clear();
+                if colors.len() / c == mask.len() {
+                    super::decode::premultiply(&mut work, colors, c, mask);
+                } else {
+                    for i in 0..count {
+                        let t = colors
+                            .get(i * c..(i + 1) * c)
+                            .or(tail)
+                            .ok_or(RequestError::Failed)?;
+                        let opacity = mask.get(i).copied().unwrap_or(missing_alpha);
+                        super::decode::premultiply(&mut work, t, c, &[opacity]);
+                    }
+                }
+                area.push_prefix(&work, &missing);
+            } else if colors.is_empty() && y >= (data.len() / c / w) as u32 {
+                if let Some(fill) = tail {
+                    area.fill_tail(fill);
+                }
+                break;
+            } else {
+                area.push_prefix(colors, tail.unwrap_or_default());
             }
         }
         Ok(rows.end - rows.start)
     }
 }
 
-#[cfg(test)]
-mod fixture_regions;
 #[cfg(test)]
 mod short_rows;

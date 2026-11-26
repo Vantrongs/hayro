@@ -22,9 +22,34 @@ pub(crate) struct DecodedMask {
 }
 
 impl DecodedMask {
-    pub(crate) fn into_whole(mut self) -> Option<LumaData> {
+    pub(crate) fn dense(luma: LumaData) -> Self {
+        Self {
+            tail: super::Tail {
+                declared: luma.height,
+                width: luma.width,
+                texel: None,
+            },
+            luma,
+        }
+    }
+
+    pub(crate) fn bands(self) -> smallvec::SmallVec<[(LumaData, kurbo::Affine); 3]> {
         self.tail
-            .complete(&mut self.luma.data, self.luma.width, &mut self.luma.height)?;
+            .bands(crate::ImageData::Luma(self.luma))
+            .into_iter()
+            .map(|(i, t)| match i {
+                crate::ImageData::Luma(v) => (v, t),
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn into_whole(mut self) -> Option<LumaData> {
+        self.tail.complete(
+            &mut self.luma.data,
+            &mut self.luma.width,
+            &mut self.luma.height,
+        )?;
         Some(self.luma)
     }
 }

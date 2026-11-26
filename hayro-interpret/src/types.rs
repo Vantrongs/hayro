@@ -40,6 +40,21 @@ impl<'a, 'b> StencilImage<'a, 'b> {
         self.image_xobject.pixels_key()
     }
 
+    /// Draw stored stencil rows and their constant tail in image coordinates.
+    pub fn with_stencil_bands(
+        &self,
+        mut draw: impl FnMut(LumaData, &Paint<'a>, Affine),
+        target: Option<(u32, u32)>,
+    ) {
+        if let Some(mask) = self.image_xobject.decoded_mask(target) {
+            let (sx, sy) = mask.luma.scale_factors;
+            let scale = Affine::scale_non_uniform(f64::from(sx), f64::from(sy));
+            for (luma, t) in mask.bands() {
+                draw(luma, &self.paint, scale * t);
+            }
+        }
+    }
+
     /// Run `func` with the decoded stencil data, optionally hinting at the desired resolution.
     pub fn with_stencil(
         &self,
@@ -90,6 +105,17 @@ impl RasterImage<'_> {
     /// Identifies the image pixels within the document.
     pub fn pixels_key(&self) -> Option<u128> {
         self.0.pixels_key()
+    }
+
+    /// Draw color and mask bands with their respective transforms in image coordinates.
+    pub fn with_rgba_bands(
+        &self,
+        draw: impl FnMut(ImageData, Affine, Option<(LumaData, Affine)>),
+        target: Option<(u32, u32)>,
+    ) {
+        if let Some(image) = self.0.decoded_image(target) {
+            image.bands(draw);
+        }
     }
 
     /// Run `func` with the decoded RGB and alpha data, optionally hinting at the desired resolution.

@@ -47,6 +47,13 @@ pub(super) struct Bands {
     pub(super) layout: ImageLayout,
 }
 
+pub(super) struct Band {
+    pub(super) data: Option<Vec<u8>>,
+    pub(super) width: usize,
+    pub(super) rows: u32,
+    pub(super) bytes: u64,
+}
+
 impl Bands {
     pub(super) fn new(asset: &ImageAsset, obj: &ImageXObject<'_>) -> Option<Self> {
         Self::from_stream(asset.0.stream.clone(), obj, asset.cancel_token())
@@ -289,11 +296,7 @@ impl Bands {
         first: u32,
         end: u32,
         obj: &ImageXObject<'_>,
-    ) -> Result<(Option<Vec<u8>>, u32, u64), RequestError> {
-        let (ready, advanced, inflated) = self.advance(end)?;
-        if !ready {
-            return Ok((None, advanced, inflated));
-        }
+    ) -> Result<Vec<u8>, RequestError> {
         let stored = self.stored_bytes();
         let start = u64::from(first).saturating_mul(self.stride as u64);
         let available = usize::try_from(stored.saturating_sub(start)).unwrap_or(usize::MAX);
@@ -387,7 +390,17 @@ impl Bands {
         if self.keyed {
             output.resize((end - first) as usize * out_stride, 0);
         }
-        Ok((Some(output), advanced, inflated))
+        Ok(output)
+    }
+
+    fn prefix(&self, first: u32) -> u32 {
+        let bytes = self
+            .stored_bytes()
+            .saturating_sub(u64::from(first) * self.stride as u64)
+            .min(self.stride as u64);
+        (bytes * 8)
+            .div_ceil(self.pixel_bits as u64)
+            .min(u64::from(self.layout.image.width)) as u32
     }
 
     pub(super) fn read_band(
@@ -397,7 +410,50 @@ impl Bands {
         first: u32,
         end: u32,
         obj: &ImageXObject<'_>,
-    ) -> Result<(Option<Vec<u8>>, u32, u64), RequestError> {
+    ) -> Result<Band, RequestError> {
+        let combined = self.mask.is_some() && self.layout.mask.is_none();
+        let (ready, mut rows, mut bytes) = if plane == Plane::Image {
+            self.advance(end)?
+        } else {
+            (true, 0, 0)
+        };
+        let mut prefix = if plane == Plane::Image {
+            self.prefix(first)
+        } else {
+            0
+        };
+        let mut ready = ready;
+        if ready && (plane == Plane::Mask || combined) {
+            let mask = self.mask.as_mut().ok_or(RequestError::Failed)?;
+            let (done, m, n) = mask.advance(end)?;
+            ready = done;
+            rows += m;
+            bytes += n;
+            prefix = prefix.max(mask.prefix(first));
+        }
+        let mut band = Band {
+            data: None,
+            width: 0,
+            rows,
+            bytes,
+        };
+        if ready {
+            let end_col = prefix.max(columns.start).saturating_add(1).min(columns.end);
+            let cropped = columns.start..end_col;
+            band.width = cropped.len();
+            band.data = Some(self.read_samples(plane, &cropped, first, end, obj)?);
+        }
+        Ok(band)
+    }
+
+    fn read_samples(
+        &mut self,
+        plane: Plane,
+        columns: &std::ops::Range<u32>,
+        first: u32,
+        end: u32,
+        obj: &ImageXObject<'_>,
+    ) -> Result<Vec<u8>, RequestError> {
         if self.mask.is_none() || plane == Plane::Image && self.layout.mask.is_some() {
             return self.samples(columns, first, end, obj);
         }
@@ -417,14 +473,8 @@ impl Bands {
         if plane == Plane::Mask {
             return mask.samples(columns, first, end, &mask_obj);
         }
-        let (alpha, m, mi) = mask.samples(columns, first, end, &mask_obj)?;
-        let Some(mut alpha) = alpha else {
-            return Ok((None, m, mi));
-        };
-        let (color, n, ni) = self.samples(columns, first, end, obj)?;
-        let Some(mut color) = color else {
-            return Ok((None, n + m, ni + mi));
-        };
+        let mut alpha = mask.samples(columns, first, end, &mask_obj)?;
+        let mut color = self.samples(columns, first, end, obj)?;
         if self.keyed {
             // Matte rows without stored colour have zero coverage even with an opaque mask.
             let bytes = self.stored_bytes();
@@ -439,7 +489,7 @@ impl Bands {
             unblend_matte(&mut color, channels, &alpha, matte);
         }
         premultiply(&mut data, &color, channels, &alpha);
-        Ok((Some(data), m + n, mi + ni))
+        Ok(data)
     }
 
     fn stored_bytes(&self) -> u64 {
