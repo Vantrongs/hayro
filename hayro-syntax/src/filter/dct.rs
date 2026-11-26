@@ -19,6 +19,7 @@ pub struct JpegRows<'a> {
     colorspace: ColorSpace,
     stride: usize,
     streaming: bool,
+    owned_input_bytes: usize,
 }
 
 pub(crate) fn decode(
@@ -69,6 +70,10 @@ impl<'a> JpegRows<'a> {
 
         // Some JPEGs have bogus oversized dimensions, so patch them from the image dictionary.
         let data = maybe_patch_jpeg_dimensions(data, image_params)?;
+        let owned_input_bytes = match &data {
+            Cow::Owned(bytes) => bytes.capacity(),
+            Cow::Borrowed(_) => 0,
+        };
 
         let streaming = find_marker(&data, true)
             .and_then(|i| data.get(i + 4))
@@ -125,7 +130,13 @@ impl<'a> JpegRows<'a> {
             colorspace: out_colorspace,
             stride,
             streaming,
+            owned_input_bytes,
         })
+    }
+
+    /// Bytes of owned compressed input retained by this decoder.
+    pub fn owned_input_bytes(&self) -> usize {
+        self.owned_input_bytes
     }
 
     pub(crate) fn streaming(self) -> Option<Self> {

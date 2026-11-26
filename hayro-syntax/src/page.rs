@@ -359,9 +359,52 @@ impl<'a> Page<'a> {
             if let Some(contents) = self.inner.get_raw(CONTENTS) {
                 let (id, value) = resolve(contents);
                 if let Object::Array(array) = value {
-                    for item in array.raw_iter() {
+                    const REPEATED_STREAM_MAX: usize = 64 << 10;
+                    const REPEATED_CACHE_BUDGET: usize = 1 << 20;
+
+                    let items: Vec<_> = array.raw_iter().collect();
+                    let keys: Vec<_> = items.iter().map(|item| self.body_key(item)).collect();
+                    let mut counts = hash::Map::<ContentKey<'a>, usize>::default();
+                    for key in keys.iter().flatten() {
+                        *counts.entry(*key).or_default() += 1;
+                    }
+                    let mut kept = hash::Map::<ContentKey<'a>, Vec<u8>>::default();
+                    let mut kept_bytes: usize = 0;
+
+                    for (item, key) in items.into_iter().zip(keys) {
+                        if let Some(cached) = key.and_then(|k| kept.get(&k)) {
+                            out(cached);
+                            out(b" ");
+                            continue;
+                        }
                         let (id, obj) = resolve(item);
-                        emit(id, obj, true, out)?;
+                        let repeat = key.filter(|k| counts.get(k).copied().unwrap_or(0) > 1);
+                        if let (Some(k), Object::Stream(stream)) = (repeat, &obj) {
+                            let mut capture = Some(Vec::new());
+                            stream
+                                .drain_strict(&mut |chunk| {
+                                    out(chunk);
+                                    if let Some(buf) = &mut capture {
+                                        let next = buf.len().saturating_add(chunk.len());
+                                        if next <= REPEATED_STREAM_MAX
+                                            && kept_bytes.saturating_add(next)
+                                                <= REPEATED_CACHE_BUDGET
+                                        {
+                                            buf.extend_from_slice(chunk);
+                                        } else {
+                                            capture = None;
+                                        }
+                                    }
+                                })
+                                .map_err(|e| ContentError::Decode(id, e))?;
+                            out(b" ");
+                            if let Some(buf) = capture {
+                                kept_bytes += buf.len();
+                                kept.insert(k, buf);
+                            }
+                        } else {
+                            emit(id, obj, true, out)?;
+                        }
                     }
                 } else {
                     emit(id, value, false, out)?;

@@ -278,13 +278,14 @@ impl Bands {
             Spool::File(_) => usize::try_from(self.bytes).unwrap_or(usize::MAX),
             Spool::Window { data, .. } => data.capacity(),
         };
-        let packed = self.reader.with_dependent(|_, r| match r {
+        let producer_bytes = self.reader.with_dependent(|_, r| match r {
             Producer::Packed(bytes) => bytes.capacity(),
+            Producer::Jpeg(jpeg) => jpeg.owned_input_bytes(),
             _ => 0,
         });
         storage
             .saturating_add(self.scratch.capacity())
-            .saturating_add(packed)
+            .saturating_add(producer_bytes)
             .saturating_add(self.mask.as_ref().map_or(0, |m| m.retained_bytes()))
     }
 
