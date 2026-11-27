@@ -983,9 +983,7 @@ fn a_loop_through_the_roots_parent_is_not_repaired() {
 /// An [`Inheritance`] follows the /Parent entries as written until a lookup meets a
 /// loop, and the repaired ones from that lookup on: page 3, whose /Parent is node 5
 /// outside the tree, finds node 5's box before page 4's loop is met and the root's
-/// after. The pages' own boxes, rotations and resources are found once every page
-/// has been looked up, so page 3's is the root's. `PyMuPDF` 1.28.2 shows the same
-/// when every page is loaded before the boxes are read.
+/// after. The completed page retains its original box.
 #[test]
 fn lookups_follow_the_repaired_parents_once_a_loop_was_met() {
     let file = pdf(&[
@@ -997,7 +995,7 @@ fn lookups_follow_the_repaired_parents_once_a_loop_was_met() {
     ]);
     let pdf = open("repair_order", file);
     let pages: Vec<String> = pdf.pages().iter().map(line).collect();
-    assert_eq!(pages, ["3 [0 0 300 300] = 0 -", "4 [0 0 300 300] = 0 -"]);
+    assert_eq!(pages, ["3 [0 0 100 100] = 0 -", "4 [0 0 300 300] = 0 -"]);
     let width = |found: Result<Option<Object<'_>>, InheritanceError>| match found {
         Ok(Some(Object::Array(array))) => array.iter::<f64>().nth(2),
         other => panic!("{other:?}"),

@@ -142,15 +142,16 @@ impl<'a> Inherited<'a> {
         let mut lookups = inherit::Lookups::new(xref, tree.root, Some(tree));
         let mut operands = geometry::Operands::new(xref);
         let mut resources = Memo::<ContentKey<'a>, Resources<'a>>::default();
-        let mut each = |lookups: &mut inherit::Lookups<'_, 'a>| -> Vec<(Self, Lost)> {
-            listed
-                .iter()
-                .map(|page| {
-                    let start = inherit::Start {
-                        key: tree::Key::of(page.id, &page.dict),
-                        dict: &page.dict,
-                        under: page.under,
-                    };
+        listed
+            .iter()
+            .map(|page| {
+                let start = inherit::Start {
+                    key: tree::Key::of(page.id, &page.dict),
+                    dict: &page.dict,
+                    under: page.under,
+                };
+                let repaired = lookups.repaired();
+                let mut resolve = |lookups: &mut inherit::Lookups<'_, 'a>| {
                     xref.apart(|| {
                         let found = lookups.get(&start, Inheritable::Resources);
                         let ((media_box, crop_box, rotation, geometry), lost) = xref.watch(|| {
@@ -199,19 +200,15 @@ impl<'a> Inherited<'a> {
                             resources,
                         }
                     })
-                })
-                .collect()
-        };
-        let found = each(&mut lookups);
-        if lookups.repaired() {
-            let mut repaired = each(&mut lookups);
-            for ((current, _), (original, _)) in repaired.iter_mut().zip(found) {
-                current.geometry = original.geometry;
-            }
-            repaired
-        } else {
-            found
-        }
+                };
+                let result = resolve(&mut lookups);
+                if !repaired && lookups.repaired() {
+                    resolve(&mut lookups)
+                } else {
+                    result
+                }
+            })
+            .collect()
     }
 }
 

@@ -220,6 +220,16 @@ pub(crate) mod lzw {
             self.entries.truncate(INITIAL_SIZE as usize);
         }
 
+        pub(in crate::filter) fn retained_bytes(&self) -> usize {
+            self.entries.capacity() * size_of::<Option<Vec<u8>>>()
+                + self
+                    .entries
+                    .iter()
+                    .flatten()
+                    .map(Vec::capacity)
+                    .sum::<usize>()
+        }
+
         pub(in crate::filter) fn size(&self) -> usize {
             self.entries.len()
         }

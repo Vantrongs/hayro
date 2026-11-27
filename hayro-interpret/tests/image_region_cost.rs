@@ -110,3 +110,142 @@ fn extraction_callbacks_return_only_stored_rows() {
         assert_eq!(dims, Some((1, 1, 1)));
     }
 }
+
+fn asset(dict: &str, data: &[u8]) -> hayro_interpret::ImageAsset {
+    let pdf = Pdf::new(common::one_page(
+        32,
+        "/Contents 4 0 R /Resources << /XObject << /I 5 0 R >> >>",
+        vec![
+            common::stream("", b"/I Do"),
+            common::stream(
+                &format!("/Subtype /Image /ColorSpace /DeviceGray {dict}"),
+                data,
+            ),
+        ],
+    ))
+    .unwrap();
+    let mut asset = None;
+    common::interpret_first_page(
+        &pdf,
+        InterpreterSettings::default(),
+        &mut Record(|image: Image<'_, '_>| {
+            if let Image::Raster(r) = image {
+                asset = Some(r.asset());
+            }
+        }),
+    );
+    asset.unwrap()
+}
+
+#[test]
+fn whole_codecs_check_working_planes_before_allocation() {
+    let jpeg = include_bytes!("fixtures/progressive-gray.jpg");
+    let jpx = include_bytes!("../../hayro-jpeg2000/tests/streams/codestream_levels_8.j2k");
+    for (dict, data, min) in [
+        (
+            "/Width 512 /Height 512 /BPC 8 /Filter /DCTDecode",
+            jpeg.as_slice(),
+            512 * 512 * 3,
+        ),
+        (
+            "/Width 128 /Height 96 /BPC 8 /Filter /JPXDecode",
+            jpx.as_slice(),
+            128 * 96 * 5,
+        ),
+        (
+            "/Width 4096 /Height 2048 /BPC 1 /Filter /CCITTFaxDecode /DecodeParms << /Columns 4096 >>",
+            &[0x35, 0x14],
+            4096 * 2048 / 8,
+        ),
+    ] {
+        let image = asset(dict, data);
+        let (opened, used) =
+            allocations::measure(|| image.open_with_budget(None, |bytes| bytes < min));
+        assert!(
+            matches!(opened, Err(hayro_interpret::RequestError::Budget)),
+            "{dict}"
+        );
+        assert!(used.largest < min, "{dict}: {used:?}");
+    }
+}
+
+#[test]
+fn request_scratch_covers_filter_and_keyed_conversion_allocations() {
+    for (dict, data, grid, window) in [
+        (
+            "/Width 8192 /Height 32 /BPC 8 /Filter /FlateDecode /DecodeParms << /Columns 8192 /Predictor 12 >>",
+            include_bytes!("fixtures/predicted-rows.zlib").as_slice(),
+            (8192, 32),
+            [0, 0, 1, 1],
+        ),
+        (
+            "/Width 65536 /Height 1 /BPC 4 /Mask [0 0]",
+            &[0x12; 32768],
+            (1, 1),
+            [0, 0, 1, 1],
+        ),
+    ] {
+        let image = asset(dict, data);
+        let mut source = image.open(None).unwrap();
+        let scratch = source.request_scratch(Plane::Image, grid).unwrap()(window);
+        let (_, used) = allocations::measure(|| {
+            drop(
+                source
+                    .request(&ImageRequest {
+                        plane: Plane::Image,
+                        grid,
+                        window,
+                        cancel: None,
+                    })
+                    .unwrap(),
+            )
+        });
+        assert!(used.peak <= scratch, "{dict}: {used:?} > {scratch}");
+        assert!(
+            used.held <= source.checkpoint_bytes(),
+            "{dict}: {used:?} > {}",
+            source.checkpoint_bytes()
+        );
+    }
+}
+
+#[test]
+fn scratch_covers_a_backward_read_after_failed_spill() {
+    if std::env::var_os("HAYRO_TEST_FAILED_SPILL").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "scratch_covers_a_backward_read_after_failed_spill",
+            ])
+            .env("HAYRO_TEST_FAILED_SPILL", "1")
+            .env("TMPDIR", std::env::current_exe().unwrap())
+            .env("TMP", std::env::current_exe().unwrap())
+            .env("TEMP", std::env::current_exe().unwrap())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let image = asset(
+        "/Width 8192 /Height 32 /BPC 8 /Filter /FlateDecode /DecodeParms << /Columns 8192 /Predictor 12 >>",
+        include_bytes!("fixtures/predicted-rows.zlib"),
+    );
+    let mut source = image.open(None).unwrap();
+    let grid = (8192, 32);
+    for y in [31, 0] {
+        let window = [0, y, 1, y + 1];
+        let scratch = source.request_scratch(Plane::Image, grid).unwrap()(window);
+        let (region, used) = allocations::measure(|| {
+            source
+                .request(&ImageRequest {
+                    plane: Plane::Image,
+                    grid,
+                    window,
+                    cancel: None,
+                })
+                .unwrap()
+        });
+        assert!(region.rows_decoded > 0);
+        assert!(used.peak <= scratch, "{y}: {used:?} > {scratch}");
+    }
+}

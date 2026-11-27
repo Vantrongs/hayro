@@ -178,20 +178,47 @@ impl<'a> DecodedReader<'a> {
         self.pull(self.layers.len(), out)
     }
 
-    /// Storage for the input, previous and output rows of full-row predictors.
-    pub fn predictor_bytes(&self) -> usize {
-        self.layers
-            .iter()
-            .fold(0usize, |sum, layer| match &layer.codec {
-                Codec::Predict(p) => sum.saturating_add(p.layout.width.saturating_mul(
-                    if p.layout.tiff && p.layout.bpc != 16 {
-                        2
-                    } else {
-                        3
-                    },
-                )),
-                _ => sum,
+    /// Heap storage retained by the reader's filter chain.
+    pub fn retained_bytes(&self) -> usize {
+        self.source.bytes.capacity()
+            + self.layers.capacity() * size_of::<Layer>()
+            + self
+                .layers
+                .iter()
+                .map(|layer| {
+                    layer.out.bytes.capacity()
+                        + match &layer.codec {
+                            Codec::Predict(p) => p.previous.capacity() + p.row.capacity(),
+                            Codec::Flate { state, header, .. } => {
+                                header.capacity() + usize::from(state.is_some()) * INFLATER_BYTES
+                            }
+                            Codec::Lzw { table, .. } => table.retained_bytes(),
+                            #[cfg(feature = "images")]
+                            Codec::Fax(_, stored) => stored.capacity(),
+                            _ => 0,
+                        }
+                })
+                .sum::<usize>()
+    }
+
+    /// Working storage for filter input, output, predictor rows and Flate state.
+    pub fn working_bytes(&self) -> usize {
+        self.layers.iter().fold(BLOCK, |sum, layer| {
+            sum.saturating_add(match &layer.codec {
+                Codec::Predict(p) => {
+                    p.layout
+                        .width
+                        .saturating_mul(if p.layout.tiff && p.layout.bpc != 16 {
+                            3
+                        } else {
+                            5
+                        })
+                }
+                Codec::Flate { .. } => BLOCK + INFLATER_BYTES + 8,
+                Codec::Run { .. } | Codec::Lzw { .. } => 2 * BLOCK,
+                _ => BLOCK,
             })
+        })
     }
 
     /// Number of bytes produced by Flate stages.
@@ -577,6 +604,12 @@ impl Codec {
 fn zlib_header(bytes: &[u8]) -> bool {
     matches!(bytes, [a, b] if a & 15 == 8 && a >> 4 <= 7 && u16::from_be_bytes([*a, *b]).is_multiple_of(31))
 }
+
+#[cfg(feature = "unsafe")]
+// zlib-rs owns a 32 KiB window, its decode tables and SIMD alignment padding.
+const INFLATER_BYTES: usize = 48 * 1024;
+#[cfg(not(feature = "unsafe"))]
+const INFLATER_BYTES: usize = size_of::<InflateState>();
 
 struct Inflater {
     #[cfg(feature = "unsafe")]

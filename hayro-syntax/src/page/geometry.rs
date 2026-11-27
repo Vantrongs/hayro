@@ -39,10 +39,12 @@ pub(super) fn visible_geometry(
         Some(c) if !infinite(c) => media.intersect(c),
         _ => media,
     };
-    let visible = if visible.width() <= 0. || visible.height() <= 0. {
+    let visible = if !visible.width().is_finite()
+        || !visible.height().is_finite()
+        || visible.width() <= 0.
+        || visible.height() <= 0.
+    {
         Rect::new(0., 0., 612., 792.)
-    } else if visible.width() < 1. || visible.height() < 1. {
-        Rect::new(0., 0., 1., 1.)
     } else {
         visible
     };

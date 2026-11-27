@@ -87,6 +87,7 @@ self_cell::self_cell!(
 pub(super) struct Bands {
     reader: StreamRows,
     scratch: Vec<u8>,
+    decoder_scratch: usize,
 
     token: Arc<AtomicBool>,
     spool: Spool,
@@ -199,7 +200,14 @@ impl Bands {
                 });
             }
         }
+        let band = stride * (BAND_BYTES / stride).clamp(1, 64);
+        let decoder_scratch = reader.with_dependent(|_, r| match r {
+            Producer::Jpeg(_) => band,
+            Producer::Filter(f) => band.min(BAND_BYTES).saturating_add(f.working_bytes()),
+            _ => 0,
+        });
         Some(Self {
+            decoder_scratch,
             mask,
             matte,
             sample_format,
@@ -280,6 +288,7 @@ impl Bands {
         let producer_bytes = self.reader.with_dependent(|_, r| match r {
             Producer::Packed(bytes) => bytes.capacity(),
             Producer::Jpeg(jpeg) => jpeg.owned_input_bytes(),
+            Producer::Filter(f) => size_of_val(&**f) + f.retained_bytes(),
             _ => 0,
         });
         storage
@@ -584,16 +593,17 @@ impl Bands {
 
     pub(super) fn scratch_layout(&self, plane: Plane) -> [Option<NativeLayout>; 2] {
         let native = |b: &Bands| {
-            let scratch = b.reader.with_dependent(|_, r| match r {
-                Producer::Jpeg(_) => b.stride * b.band_rows(),
-                Producer::Filter(f) => (b.stride * b.band_rows())
-                    .min(BAND_BYTES)
-                    .saturating_add(f.predictor_bytes()),
-                _ => 0,
-            });
+            let finished = b
+                .reader
+                .with_dependent(|_, r| matches!(r, Producer::Finished));
+            let scratch = if finished && matches!(b.spool, Spool::File(_)) {
+                0
+            } else {
+                b.decoder_scratch
+            };
             NativeLayout {
                 bits: b.pixel_bits,
-                channels: b.pixel_bits / usize::from(b.bits),
+                channels: b.pixel_bits / usize::from(b.bits) + usize::from(b.keyed),
                 converted: b.sample_format.channels(),
                 decoder: if scratch == 0 {
                     0

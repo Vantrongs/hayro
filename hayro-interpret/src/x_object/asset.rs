@@ -74,6 +74,16 @@ impl ImageAsset {
     ) -> Result<ImageSource, RequestError> {
         let obj = &self.0.samples;
         let token = Arc::default();
+        let fax_bytes = |s: &Samples<OwnedStream>| {
+            s.stream
+                .get()
+                .and_then(|s1| s1.fax_bytes(s.height))
+                .unwrap_or(0)
+        };
+        let packed = fax_bytes(obj).saturating_add(obj.mask.as_deref().map_or(0, fax_bytes));
+        if packed != 0 && !fits(packed) {
+            return Err(RequestError::Budget);
+        }
         if let Some(bands) = Bands::new(self, &token) {
             return Ok(ImageSource {
                 asset: self.clone(),
@@ -88,8 +98,14 @@ impl ImageAsset {
                 .color_space
                 .as_ref()
                 .map_or(3, |cs| usize::from(cs.num_components()));
-            let pixels = (s.width as usize).saturating_mul(s.height as usize);
-            let native_row = (s.width as usize)
+            let params = super::decode::image_params(s, hint);
+            let (width, height, channels, working) = s
+                .stream
+                .get()
+                .and_then(|stream| stream.image_working_set(&params))
+                .unwrap_or((s.width, s.height, channels, 0));
+            let pixels = (width as usize).saturating_mul(height as usize);
+            let native_row = (width as usize)
                 .saturating_mul(channels)
                 .saturating_mul(usize::from(s.bpc.unwrap_or(8)))
                 .div_ceil(8);
@@ -102,8 +118,9 @@ impl ImageAsset {
                 });
             let output = pixels.saturating_mul(if gray { 1 } else { 3 });
             native_row
-                .saturating_mul(s.height as usize)
-                .max(output)
+                .saturating_mul(height as usize)
+                .saturating_add(output)
+                .saturating_add(working)
                 .saturating_add(if s.key.is_some() || s.in_data != 0 {
                     pixels
                 } else {

@@ -27,14 +27,14 @@ struct DecodeContext<'a> {
     decode_arr: SmallVec<[(f32, f32); 4]>,
 }
 
-fn decode_context<'a>(
-    obj: &'a Samples<impl Source>,
+pub(super) fn image_params(
+    obj: &Samples<impl Source>,
     target_dimension: Option<(u32, u32)>,
-) -> Option<DecodeContext<'a>> {
+) -> ImageDecodeParams {
     let color_space = obj.color_space.as_ref();
     let is_indexed = color_space.is_some_and(ColorSpace::is_indexed);
 
-    let decode_params = ImageDecodeParams {
+    ImageDecodeParams {
         has_color_key: obj.key.is_some(),
         is_indexed,
         bpc: obj.bpc,
@@ -42,8 +42,15 @@ fn decode_context<'a>(
         target_dimension,
         width: obj.width,
         height: obj.height,
-    };
+    }
+}
 
+fn decode_context<'a>(
+    obj: &'a Samples<impl Source>,
+    target_dimension: Option<(u32, u32)>,
+) -> Option<DecodeContext<'a>> {
+    let decode_params = image_params(obj, target_dimension);
+    let color_space = obj.color_space.as_ref();
     let gray = color_space.is_none_or(|cs| cs.is_device_gray_or_rgb() && cs.num_components() == 1);
     let decoded = if gray {
         obj.stream.open_stream()?.decoded_luma_image(&decode_params)

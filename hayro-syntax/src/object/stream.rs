@@ -345,6 +345,62 @@ impl<'a> Stream<'a> {
         FilterEntries::of(&self.dict)
     }
 
+    /// Dimensions, channels and working bytes for a terminal whole-image codec.
+    #[cfg(feature = "images")]
+    pub fn image_working_set(
+        &self,
+        params: &ImageDecodeParams,
+    ) -> Option<(u32, u32, usize, usize)> {
+        let mut prefix = self.data_filters();
+        let filter = prefix.filters.pop()?;
+        let options = prefix.params.pop()?;
+        match filter {
+            Filter::JpxDecode => {
+                let data = self.image_input(&prefix, None)?;
+                let image = crate::filter::jpx::header(&data, params)?;
+                let channels = usize::from(image.color_space().num_channels())
+                    + usize::from(image.has_alpha());
+                let planes = (image.width() as usize)
+                    .saturating_mul(image.height() as usize)
+                    .saturating_mul(channels)
+                    .saturating_mul(size_of::<f32>());
+                Some((image.width(), image.height(), channels, planes))
+            }
+            Filter::DctDecode => {
+                let data = self.image_input(&prefix, None)?;
+                let jpeg = JpegRows::new(data, &options, params, None)?;
+                let meta = jpeg.metadata();
+                let channels = jpeg.stride() / meta.width as usize;
+                let coeffs = (meta.width as usize)
+                    .next_multiple_of(8)
+                    .saturating_mul((meta.height as usize).next_multiple_of(8))
+                    .saturating_mul(channels)
+                    .saturating_mul(size_of::<i16>());
+                Some((meta.width, meta.height, channels, coeffs))
+            }
+            _ => None,
+        }
+    }
+
+    /// Packed output bytes for a terminal CCITT filter.
+    #[cfg(feature = "images")]
+    pub fn fax_bytes(&self, height: u32) -> Option<usize> {
+        let filters = self.data_filters();
+        if filters.filters.last() != Some(&Filter::CcittFaxDecode) {
+            return None;
+        }
+        let columns = filters
+            .params
+            .last()?
+            .get::<u32>(crate::object::dict::keys::COLUMNS)
+            .unwrap_or(1728);
+        Some(
+            (columns as usize)
+                .div_ceil(8)
+                .saturating_mul(height as usize),
+        )
+    }
+
     /// Decodes a terminal CCITT filter to packed rows.
     #[cfg(feature = "images")]
     pub fn fax_image(

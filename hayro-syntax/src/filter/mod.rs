@@ -8,7 +8,7 @@ pub(crate) mod forward;
 #[cfg(feature = "images")]
 mod jbig2;
 #[cfg(feature = "images")]
-mod jpx;
+pub(crate) mod jpx;
 mod lzw_flate;
 mod png;
 mod predictor;
