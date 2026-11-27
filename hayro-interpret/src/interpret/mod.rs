@@ -144,7 +144,7 @@ pub fn draw_appearance_stream<'a>(
     context: &mut Context<'a>,
     device: &mut impl Device<'a>,
 ) {
-    if let Some(form) = FormXObject::with_geometry(stream, bbox, matrix) {
+    if let Some(form) = FormXObject::with_geometry(stream, bbox.map(f64::from), matrix) {
         draw_placed(&form, placement, resources, context, device);
     } else {
         (context.settings.warning_sink)(InterpreterWarning::UnresolvedAnnotationAppearance);
@@ -188,13 +188,7 @@ fn interpret_annotation<'a>(
 
         let annot_rect = rect.to_kurbo();
         let transformed_rect = (apx.matrix
-            * kurbo::Rect::new(
-                apx.bbox[0] as f64,
-                apx.bbox[1] as f64,
-                apx.bbox[2] as f64,
-                apx.bbox[3] as f64,
-            )
-            .to_path(0.1))
+            * kurbo::Rect::new(apx.bbox[0], apx.bbox[1], apx.bbox[2], apx.bbox[3]).to_path(0.1))
         .bounding_box();
 
         let sx = annot_rect.width() / transformed_rect.width();

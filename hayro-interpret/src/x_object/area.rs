@@ -125,6 +125,30 @@ pub(crate) struct Area {
 }
 
 impl Area {
+    pub(super) fn scratch_bytes(
+        size: (u32, u32),
+        grid: (u32, u32),
+        columns: usize,
+        width: usize,
+        height: usize,
+        channels: usize,
+    ) -> usize {
+        let y = Axis::new(size.1, grid.1);
+        let acc = if size == grid {
+            0
+        } else {
+            let sample = if 255 * y.n <= u64::from(u32::MAX) {
+                size_of::<u32>()
+            } else {
+                size_of::<u64>()
+            };
+            columns.saturating_mul(2 * channels * sample)
+        };
+        acc.saturating_add(2 * channels * size_of::<u64>())
+            .saturating_add(width.saturating_mul(size_of::<Span>()))
+            .saturating_add(height.saturating_mul(size_of::<u64>() + size_of::<u8>()))
+    }
+
     /// Bins `window` (`[x0, y0, x1, y1)`, non-empty, within `grid`) of a plane `size`
     /// texels large divided into `grid` bins (`1..=size` on each axis).
     pub(crate) fn new(

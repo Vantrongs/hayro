@@ -12,7 +12,7 @@ use std::borrow::Cow;
 pub(crate) struct FormXObject<'a> {
     pub(crate) decoded: Cow<'a, [u8]>,
     pub(crate) matrix: Affine,
-    pub(crate) bbox: [f32; 4],
+    pub(crate) bbox: [f64; 4],
     is_transparency_group: bool,
     isolated: bool,
     knockout: bool,
@@ -28,7 +28,7 @@ impl<'a> FormXObject<'a> {
 
     pub(crate) fn with_geometry(
         stream: &Stream<'a>,
-        bbox: [f32; 4],
+        bbox: [f64; 4],
         matrix: Affine,
     ) -> Option<Self> {
         let dict = stream.dict();
@@ -102,13 +102,7 @@ impl<'a> FormXObject<'a> {
 
         device.push_clip_path(&ClipPath {
             path: context.ctm()
-                * Rect::new(
-                    self.bbox[0] as f64,
-                    self.bbox[1] as f64,
-                    self.bbox[2] as f64,
-                    self.bbox[3] as f64,
-                )
-                .to_path(0.1),
+                * Rect::new(self.bbox[0], self.bbox[1], self.bbox[2], self.bbox[3]).to_path(0.1),
             fill: FillRule::NonZero,
         });
 

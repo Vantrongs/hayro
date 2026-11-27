@@ -1,5 +1,4 @@
 use super::*;
-use crate::color::ToLuma;
 use crate::x_object::decode::{convert_band, premultiply, unblend_matte};
 use hayro_syntax::Filter;
 use hayro_syntax::object::stream::{
@@ -112,8 +111,8 @@ pub(super) struct Band {
 }
 
 impl Bands {
-    pub(super) fn new(asset: &ImageAsset) -> Option<Self> {
-        Self::from_stream(&asset.0.samples, asset.cancel_token())
+    pub(super) fn new(asset: &ImageAsset, token: &Arc<AtomicBool>) -> Option<Self> {
+        Self::from_stream(&asset.0.samples, token.clone())
     }
 
     fn from_stream(obj: &Samples<OwnedStream>, token: Arc<AtomicBool>) -> Option<Self> {
@@ -583,6 +582,38 @@ impl Bands {
         }
     }
 
+    pub(super) fn scratch_layout(&self, plane: Plane) -> [Option<NativeLayout>; 2] {
+        let native = |b: &Bands| {
+            let scratch = b.reader.with_dependent(|_, r| match r {
+                Producer::Jpeg(_) => b.stride * b.band_rows(),
+                Producer::Filter(f) => (b.stride * b.band_rows())
+                    .min(BAND_BYTES)
+                    .saturating_add(f.predictor_bytes()),
+                _ => 0,
+            });
+            NativeLayout {
+                bits: b.pixel_bits,
+                channels: b.pixel_bits / usize::from(b.bits),
+                converted: b.sample_format.channels(),
+                decoder: if scratch == 0 {
+                    0
+                } else {
+                    scratch.saturating_add(
+                        BAND_BYTES.min(b.stride.saturating_mul(b.layout.image.height as usize)),
+                    )
+                },
+                rows: self.request_rows(plane),
+            }
+        };
+        match (plane, &self.mask) {
+            (Plane::Mask, Some(m)) => [Some(native(m)), None],
+            (Plane::Image, Some(m)) if self.layout.mask.is_none() => {
+                [Some(native(self)), Some(native(m))]
+            }
+            _ => [Some(native(self)), None],
+        }
+    }
+
     pub(super) fn request_rows(&self, plane: Plane) -> usize {
         match (&self.mask, plane) {
             (Some(mask), Plane::Mask) => mask.band_rows(),
@@ -595,6 +626,27 @@ impl Bands {
 
     fn band_rows(&self) -> usize {
         (BAND_BYTES / self.stride).clamp(1, 64)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct NativeLayout {
+    bits: usize,
+    channels: usize,
+    converted: usize,
+    decoder: usize,
+    rows: usize,
+}
+
+impl NativeLayout {
+    pub(super) fn bytes(self, mapped: [u32; 4]) -> usize {
+        let align = 8 >> self.bits.trailing_zeros().min(3);
+        let columns = mapped[2] as usize - (mapped[0] as usize / align * align);
+        let rows = self.rows.min((mapped[3] - mapped[1]) as usize);
+        let row = columns.saturating_mul(self.bits).div_ceil(8);
+        self.decoder.saturating_add(rows.saturating_mul(
+            row.saturating_add(columns.saturating_mul(self.channels + self.converted)),
+        ))
     }
 }
 
@@ -611,7 +663,7 @@ mod tests {
         let asset = image(&doc).asset(None);
         let mut source = asset.open(None).unwrap();
         let bad_dir = tempfile::NamedTempFile::new().unwrap();
-        asset.0.bands.lock().unwrap().as_mut().unwrap().spool =
+        source.bands.as_mut().unwrap().spool =
             Spool::File(SpooledTempFile::new_in(0, bad_dir.path()));
         let result = source.request(&ImageRequest {
             plane: Plane::Image,
@@ -639,7 +691,7 @@ mod tests {
         for fail in [false, true] {
             let mut source = asset.open(None).unwrap();
             if fail {
-                asset.0.bands.lock().unwrap().as_mut().unwrap().spool =
+                source.bands.as_mut().unwrap().spool =
                     Spool::File(SpooledTempFile::new_in(BAND_BYTES, bad_dir.path()));
             }
             for (first, end) in [(0, 43), (43, 104), (128, 192), (100, 149), (0, 64)] {
@@ -655,17 +707,15 @@ mod tests {
                 for (row, data) in result.data.chunks_exact(width as usize).enumerate() {
                     assert!(data.iter().all(|&v| v == first as u8 + row as u8));
                 }
-                assert!(asset.checkpoint_bytes().unwrap() > 0);
+                assert!(source.checkpoint_bytes() > 0);
             }
             if fail {
-                let bands = asset.0.bands.lock().unwrap();
+                let bands = &source.bands;
                 let Spool::Window { data, .. } = &bands.as_ref().unwrap().spool else {
                     panic!("expected window after spill failure");
                 };
                 assert!(data.capacity() <= BAND_BYTES);
             }
-            asset.evict_cache();
-            assert_eq!(asset.checkpoint_bytes().unwrap(), 0);
         }
     }
 }

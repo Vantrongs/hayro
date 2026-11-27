@@ -478,7 +478,7 @@ fn page_queries(page: usize, size: [f32; 2]) -> [ExtractionQuery; 3] {
     [
         ExtractionQuery::new_page(page),
         ExtractionQuery::new_xobject(page),
-        ExtractionQuery::new_user_space_xobject(page, [0.0, 0.0, size[0], size[1]]),
+        ExtractionQuery::new_user_space_xobject(page, [0.0, 0.0, size[0].into(), size[1].into()]),
     ]
 }
 

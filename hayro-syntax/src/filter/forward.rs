@@ -178,6 +178,22 @@ impl<'a> DecodedReader<'a> {
         self.pull(self.layers.len(), out)
     }
 
+    /// Storage for the input, previous and output rows of full-row predictors.
+    pub fn predictor_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .fold(0usize, |sum, layer| match &layer.codec {
+                Codec::Predict(p) => sum.saturating_add(p.layout.width.saturating_mul(
+                    if p.layout.tiff && p.layout.bpc != 16 {
+                        2
+                    } else {
+                        3
+                    },
+                )),
+                _ => sum,
+            })
+    }
+
     /// Number of bytes produced by Flate stages.
     pub fn inflated_bytes(&self) -> u64 {
         self.inflated

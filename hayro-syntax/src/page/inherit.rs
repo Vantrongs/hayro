@@ -31,9 +31,6 @@ pub enum Inheritable {
 }
 
 impl Inheritable {
-    pub(super) const ALL: [Self; 4] =
-        [Self::MediaBox, Self::CropBox, Self::Rotate, Self::Resources];
-
     fn name(self) -> &'static [u8] {
         match self {
             Self::MediaBox => MEDIA_BOX,
@@ -159,6 +156,15 @@ impl<'t, 'a> Lookups<'t, 'a> {
                 xref.apart(|| match dict.get_raw::<Object<'a>>(key.name())? {
                     MaybeRef::NotRef(Object::Null(_)) => None,
                     MaybeRef::NotRef(value) => Some(value),
+                    MaybeRef::Ref(r) if key == Inheritable::Rotate => Some(
+                        match xref.get_with::<MaybeRef<Object<'a>>>(
+                            r.into(),
+                            &crate::reader::ReaderContext::new(xref, false),
+                        ) {
+                            Some(MaybeRef::NotRef(value)) => value,
+                            _ => Object::Null(Null),
+                        },
+                    ),
                     MaybeRef::Ref(r) => Some(
                         xref.get::<Object<'a>>(r.into())
                             .unwrap_or(Object::Null(Null)),

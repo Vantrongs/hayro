@@ -125,7 +125,7 @@ pub enum ExtractionQueryType {
     /// Copy a page as a form placed using its page boxes.
     XObject,
     /// Copy a page as a form clipped in its default user space.
-    UserSpaceXObject([f32; 4]),
+    UserSpaceXObject([f64; 4]),
     /// Extract the page as a new page.
     Page,
     /// Copy a stream as a form with the requested placement.
@@ -184,7 +184,7 @@ impl ExtractionQuery {
     }
 
     /// Copy the page as a form clipped to the supplied box in default user space.
-    pub fn new_user_space_xobject(page_index: usize, bbox: [f32; 4]) -> Self {
+    pub fn new_user_space_xobject(page_index: usize, bbox: [f64; 4]) -> Self {
         Self {
             query_type: ExtractionQueryType::UserSpaceXObject(bbox),
             page_index,
@@ -197,6 +197,8 @@ impl ExtractionQuery {
 pub enum ExtractionError {
     /// An invalid page index was given.
     InvalidPageIndex(usize),
+    /// Non-finite form bounds.
+    InvalidBox(usize),
     /// A form query named an object that is not a stream.
     NotAStream(ObjRef),
     /// The content of the page with this index cannot be read whole.
@@ -514,18 +516,21 @@ enum Placement {
     /// By hayro's reading of the page's boxes.
     Boxes,
     /// In the page's user space, clipped to this box, its numbers' bits.
-    UserSpace([u32; 4]),
+    UserSpace([u64; 4]),
 }
 
 fn write_xobject<'a>(
     page: &Page<'a>,
     page_idx: usize,
-    bbox: Option<[f32; 4]>,
+    bbox: Option<[f64; 4]>,
     ctx: &mut ExtractionContext<'a>,
 ) -> Result<Ref, ExtractionError> {
+    if bbox.is_some_and(|b| b.iter().any(|x| !x.is_finite())) {
+        return Err(ExtractionError::InvalidBox(page_idx));
+    }
     drawn_with(page, ctx);
     let placement = bbox.map_or(Placement::Boxes, |bbox| {
-        Placement::UserSpace(bbox.map(f32::to_bits))
+        Placement::UserSpace(bbox.map(f64::to_bits))
     });
     let key = (page.key(), placement);
     let copy = match ctx.page_forms.get(&key) {
@@ -541,7 +546,7 @@ fn write_xobject<'a>(
 
 fn copy_xobject<'a>(
     page: &Page<'a>,
-    bbox: Option<[f32; 4]>,
+    bbox: Option<[f64; 4]>,
     ctx: &mut ExtractionContext<'a>,
 ) -> Result<Ref, ContentError> {
     let xobj_ref = ctx.new_ref();
@@ -550,8 +555,14 @@ fn copy_xobject<'a>(
     let mut x_object = chunk.form_xobject(xobj_ref, &encoded_stream);
     x_object.deref_mut().filter(Filter::FlateDecode);
 
-    if let Some([x0, y0, x1, y1]) = bbox {
-        x_object.bbox(Rect::new(x0, y0, x1, y1));
+    if let Some(coords) = bbox {
+        let mut array = x_object.insert(Name(b"BBox")).array();
+        for coord in coords {
+            array.item(
+                pdf_writer::NumberToken::new(coord.to_string().as_bytes())
+                    .expect("finite coordinate"),
+            );
+        }
     } else {
         let bbox = page.crop_box();
         let initial_transform = page.initial_transform(false);

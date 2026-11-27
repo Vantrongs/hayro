@@ -3,6 +3,7 @@ use super::area::Area;
 use super::image::samples::Samples;
 use super::image::{ImageKind, ImageXObject};
 use crate::ImageData;
+use crate::color::ToLuma;
 use crate::interpret::state::ActiveTransferFunction;
 #[cfg(test)]
 use crate::{WarningSinkFn, cache::Cache};
@@ -10,7 +11,6 @@ use bands::Bands;
 use hayro_syntax::object::stream::OwnedStream;
 use kurbo::Affine;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 /// Owned raster or stencil image data.
 #[derive(Clone)]
@@ -18,8 +18,6 @@ pub struct ImageAsset(Arc<AssetData>);
 
 struct AssetData {
     samples: Samples<OwnedStream>,
-    bands: Mutex<Option<Bands>>,
-    token: Arc<std::sync::atomic::AtomicBool>,
     key: Option<u128>,
 }
 
@@ -27,8 +25,6 @@ impl ImageXObject<'_> {
     pub(crate) fn asset(&self, key: Option<u128>) -> ImageAsset {
         ImageAsset(Arc::new(AssetData {
             samples: Samples::read(self, &hayro_syntax::object::Stream::to_owned_stream),
-            bands: Mutex::default(),
-            token: Arc::default(),
             key,
         }))
     }
@@ -65,47 +61,62 @@ impl ImageAsset {
                 .map_or(0, |m| m.stream.copied_bytes())
     }
 
-    /// Bytes retained in decoder checkpoints.
-    pub fn checkpoint_bytes(&self) -> Result<usize, RequestError> {
-        let bands = self.0.bands.lock().map_err(|_| RequestError::Failed)?;
-        Ok(bands.as_ref().map_or(0, Bands::retained_bytes))
+    /// Opens an independent decoder for the image.
+    pub fn open(&self, hint: Option<(u32, u32)>) -> Option<ImageSource> {
+        self.open_with_budget(hint, |_| true).ok()
     }
 
-    /// Releases stored image bands and their decoder.
-    pub fn evict_cache(&self) {
-        *self
-            .0
-            .bands
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
-    }
-
-    /// A cancellation flag shared by this asset's decoders.
-    pub fn cancel_token(&self) -> Arc<std::sync::atomic::AtomicBool> {
-        self.0.token.clone()
-    }
-
-    /// Opens the image for requests, optionally hinting the desired size.
-    pub fn open(&self, hint: Option<(u32, u32)>) -> Option<ImageSource<'_>> {
+    /// Checks space for whole-image samples before starting a non-streaming decode.
+    pub fn open_with_budget(
+        &self,
+        hint: Option<(u32, u32)>,
+        fits: impl Fn(usize) -> bool,
+    ) -> Result<ImageSource, RequestError> {
         let obj = &self.0.samples;
-        let mut bands = self.0.bands.lock().ok()?;
-        if bands.is_none() {
-            *bands = Bands::new(self);
-        }
-        if let Some(bands) = bands.as_ref() {
-            return Some(ImageSource {
-                asset: self,
+        let token = Arc::default();
+        if let Some(bands) = Bands::new(self, &token) {
+            return Ok(ImageSource {
+                asset: self.clone(),
                 layout: bands.layout,
+                bands: Some(bands),
+                token: Some(token),
                 decoded: None,
             });
         }
-        drop(bands);
-        if self.0.token.load(std::sync::atomic::Ordering::Relaxed) {
-            return None;
+        let storage = |s: &Samples<OwnedStream>| {
+            let channels = s
+                .color_space
+                .as_ref()
+                .map_or(3, |cs| usize::from(cs.num_components()));
+            let pixels = (s.width as usize).saturating_mul(s.height as usize);
+            let native_row = (s.width as usize)
+                .saturating_mul(channels)
+                .saturating_mul(usize::from(s.bpc.unwrap_or(8)))
+                .div_ceil(8);
+            let gray = s.kind != ImageKind::Image
+                || s.color_space.as_ref().is_some_and(|cs| {
+                    cs.to_luma(&mut []).is_some()
+                        && s.transfer_function
+                            .as_ref()
+                            .is_none_or(|tf| matches!(tf, ActiveTransferFunction::Single(_)))
+                });
+            let output = pixels.saturating_mul(if gray { 1 } else { 3 });
+            native_row
+                .saturating_mul(s.height as usize)
+                .max(output)
+                .saturating_add(if s.key.is_some() || s.in_data != 0 {
+                    pixels
+                } else {
+                    0
+                })
+        };
+        let bytes = storage(obj).saturating_add(obj.mask.as_deref().map_or(0, storage));
+        if !fits(bytes) {
+            return Err(RequestError::Budget);
         }
         let stencil = obj.kind == ImageKind::StencilMask;
         let decoded = if stencil {
-            let d = super::decode::decode_mask(obj, hint)?;
+            let d = super::decode::decode_mask(obj, hint).ok_or(RequestError::Failed)?;
             Decoded::new(
                 ImageData::Luma(d.luma),
                 None,
@@ -114,7 +125,7 @@ impl ImageAsset {
                 d.tail.texel,
             )
         } else {
-            let d = super::decode::decode_image(obj, hint)?;
+            let d = super::decode::decode_image(obj, hint).ok_or(RequestError::Failed)?;
             Decoded::new(
                 d.image,
                 d.alpha,
@@ -127,8 +138,10 @@ impl ImageAsset {
         if stencil {
             layout.image.format = PixelFormat::Alpha;
         }
-        Some(ImageSource {
-            asset: self,
+        Ok(ImageSource {
+            asset: self.clone(),
+            bands: None,
+            token: None,
             layout,
             decoded: Some(decoded),
         })
@@ -264,21 +277,25 @@ pub enum RequestError {
     Invalid,
     /// The `cancel` hook asked to stop.
     Cancelled,
+    /// The decoded samples exceed the available space.
+    Budget,
     /// The data could not be decoded.
     Failed,
 }
 
 /// An image opened for requests (see [`ImageAsset::open`]).
-pub struct ImageSource<'a> {
+pub struct ImageSource {
     layout: ImageLayout,
-    asset: &'a ImageAsset,
+    asset: ImageAsset,
+    bands: Option<Bands>,
+    token: Option<Arc<std::sync::atomic::AtomicBool>>,
     decoded: Option<Decoded>,
 }
 
-impl ImageSource<'_> {
-    /// The shared cancellation flag for this asset's active forward decoder.
+impl ImageSource {
+    /// Cancellation flag for this source's forward decoder.
     pub fn cancel_token(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
-        self.is_streamed().then(|| self.asset.cancel_token())
+        self.token.clone()
     }
 
     /// The planes of the opened image.
@@ -292,8 +309,48 @@ impl ImageSource<'_> {
     }
 
     /// Bytes retained in decoder checkpoints.
-    pub fn checkpoint_bytes(&self) -> Result<usize, RequestError> {
-        self.asset.checkpoint_bytes()
+    pub fn checkpoint_bytes(&self) -> usize {
+        self.bands.as_ref().map_or(0, Bands::retained_bytes)
+    }
+
+    /// Sizes a request window from its decoder layout and resampling grid.
+    pub fn request_scratch(
+        &self,
+        plane: Plane,
+        grid: (u32, u32),
+    ) -> Result<impl Fn([u32; 4]) -> usize + use<>, RequestError> {
+        let p = *self.layout.plane(plane).ok_or(RequestError::Invalid)?;
+        if grid.0 == 0 || grid.1 == 0 || grid.0 > p.width || grid.1 > p.height {
+            return Err(RequestError::Invalid);
+        }
+        let native = self
+            .bands
+            .as_ref()
+            .map_or([None; 2], |b| b.scratch_layout(plane));
+        Ok(move |window: [u32; 4]| {
+            if window[0] >= window[2]
+                || window[1] >= window[3]
+                || window[2] > grid.0
+                || window[3] > grid.1
+            {
+                return usize::MAX;
+            }
+            let mapped = crate::area_texels((p.width, p.height), grid, window);
+            let columns = (mapped[2] - mapped[0]) as usize;
+            let width = (window[2] - window[0]) as usize;
+            let height = (window[3] - window[1]) as usize;
+            let c = p.format.channels();
+            let area = Area::scratch_bytes((p.width, p.height), grid, columns, width, height, c);
+            let output = width.saturating_mul(height).saturating_mul(
+                p.format.with_alpha().channels() + if p.format.has_alpha() { 0 } else { c },
+            );
+            native
+                .iter()
+                .flatten()
+                .fold(output.saturating_add(area), |sum, n| {
+                    sum.saturating_add(n.bytes(mapped))
+                })
+        })
     }
 
     /// The bins `request` asks for.
@@ -335,29 +392,25 @@ impl ImageSource<'_> {
                 if request.cancel.is_some_and(|f| f()) {
                     return Err(RequestError::Cancelled);
                 }
-                let mut lock = self
-                    .asset
-                    .0
-                    .bands
-                    .lock()
-                    .map_err(|_| RequestError::Failed)?;
-                if lock.is_none() {
-                    *lock = Bands::new(self.asset);
+                if self.bands.is_none() {
+                    self.bands = Bands::new(
+                        &self.asset,
+                        self.token.as_ref().ok_or(RequestError::Failed)?,
+                    );
                 }
-                let bands = lock.as_mut().ok_or(RequestError::Failed)?;
+                let bands = self.bands.as_mut().ok_or(RequestError::Failed)?;
                 let end = y
                     .saturating_add(bands.request_rows(request.plane) as u32)
                     .min(rows.end);
                 let band = match bands.read_band(request.plane, &columns, y, end, obj) {
                     Ok(result) => result,
                     Err(error) => {
-                        *lock = None;
+                        self.bands = None;
                         return Err(error);
                     }
                 };
                 let solid_tail =
                     band.data.is_some() && end < rows.end && bands.past_samples(request.plane, y);
-                drop(lock);
                 rows_decoded += band.rows;
                 bytes_inflated += band.bytes;
                 let Some(image) = band.data else {

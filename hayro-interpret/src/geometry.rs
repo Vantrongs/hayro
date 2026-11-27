@@ -22,11 +22,8 @@ pub(crate) fn matrix(dict: &Dict<'_>) -> Affine {
         .unwrap_or_default()
 }
 
-pub(crate) fn box_and_matrix(dict: &Dict<'_>) -> Option<([f32; 4], Affine)> {
-    Some((
-        coordinates::<4>(dict, BBOX)?.map(|v| v as f32),
-        matrix(dict),
-    ))
+pub(crate) fn box_and_matrix(dict: &Dict<'_>) -> Option<([f64; 4], Affine)> {
+    Some((coordinates::<4>(dict, BBOX)?, matrix(dict)))
 }
 
 #[cfg(test)]

@@ -1017,7 +1017,7 @@ fn lookups_follow_the_repaired_parents_once_a_loop_was_met() {
 /// Inherited values are read through references, each number of a box too. A box
 /// is the first four numbers of an array, in either order of its corners; an array
 /// of fewer, or with one that is no number, is no box, and each number is read at
-/// single precision (612.3 is 612.2999877929688). The rotation is the integer
+/// double precision. The rotation is the integer
 /// part of the number, turned into 0 to 359; one that is no multiple of 90, or that
 /// does not fit 32 bits, is none. A crop box is not cut to the media box. `PyMuPDF`
 /// 1.28.2 finds the same entries; it turns /Rotate 90.7 into no rotation, where
@@ -1066,7 +1066,7 @@ fn inherited_values_are_read_through_references() {
             "5 - = 0 /A/B",
             "6 [0 0 300 300] [-10 -10 1000 1000] 90 /A/B",
             "14 [0 0 300 400.5] = 0 /A/B",
-            "15 [0 0 612.2999877929688 792] = 270 /A/B",
+            "15 [0 0 612.3 792] = 270 /A/B",
         ]
     );
 }

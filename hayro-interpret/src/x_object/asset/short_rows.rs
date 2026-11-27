@@ -38,6 +38,23 @@ pub(super) fn image(pdf: &Pdf) -> ImageXObject<'_> {
     .unwrap()
 }
 
+#[test]
+fn whole_decode_checks_the_budget_before_reading_image_data() {
+    let doc = pdf(&[(
+        "/Width 10000 /Height 10000 /CS /DeviceRGB /BPC 8 /Filter /JPXDecode",
+        &[],
+    )]);
+    let obj = image(&doc);
+    let asset = obj.asset(None);
+    assert!(matches!(
+        asset.open_with_budget(None, |bytes| {
+            assert!(bytes >= 300_000_000);
+            bytes <= 256 << 20
+        }),
+        Err(RequestError::Budget)
+    ));
+}
+
 fn replace_mask_on_repair(bytes: &mut [u8]) {
     for (header, replacement) in [(b"5 0 obj", b'9'), (b"6 0 obj", b'4')] {
         let offset = bytes
@@ -257,7 +274,7 @@ fn cancelling_a_request_allows_another_read_of_the_asset() {
     let obj = image(&doc);
     let asset = obj.asset(None);
     let mut source = asset.open(None).unwrap();
-    let token = asset.cancel_token();
+    let token = source.cancel_token().unwrap();
     let request = ImageRequest {
         plane: Plane::Image,
         grid: (2, 3),

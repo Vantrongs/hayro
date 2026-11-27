@@ -22,9 +22,11 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Deref;
 
+mod geometry;
 mod inherit;
 mod tree;
 
+pub use geometry::{GeometryError, VisibleGeometry};
 pub use inherit::{Inheritable, Inheritance, InheritanceError};
 
 /// The pages in listing order, including repeated leaves.
@@ -124,6 +126,7 @@ pub enum Rotation {
 }
 
 struct Inherited<'a> {
+    geometry: Result<VisibleGeometry, GeometryError>,
     media_box: Option<Rect>,
     crop_box: Option<Rect>,
     rotation: Rotation,
@@ -137,7 +140,7 @@ impl<'a> Inherited<'a> {
         listed: &[tree::Listed<'a>],
     ) -> Vec<(Self, Lost)> {
         let mut lookups = inherit::Lookups::new(xref, tree.root, Some(tree));
-        let mut boxes = Memo::<ContentKey<'a>, Option<Rect>>::default();
+        let mut operands = geometry::Operands::new(xref);
         let mut resources = Memo::<ContentKey<'a>, Resources<'a>>::default();
         let mut each = |lookups: &mut inherit::Lookups<'_, 'a>| -> Vec<(Self, Lost)> {
             listed
@@ -149,18 +152,37 @@ impl<'a> Inherited<'a> {
                         under: page.under,
                     };
                     xref.apart(|| {
-                        let [media_box, crop_box, rotate, found] =
-                            Inheritable::ALL.map(|key| lookups.get(&start, key).ok().flatten());
-                        let mut rect = |value: Option<Object<'a>>| match value {
-                            Some(Object::Array(array)) => {
-                                *boxes.get(xref, array.content_key(), || {
-                                    Rect::try_from(Object::Array(array.clone())).ok()
-                                })
-                            }
-                            _ => None,
+                        let found = lookups.get(&start, Inheritable::Resources);
+                        let ((media_box, crop_box, rotation, geometry), lost) = xref.watch(|| {
+                            let unit = operands.unit(&page.dict);
+                            let mut rect =
+                                |key| lookups.get(&start, key).map(|value| operands.rect(value));
+                            let media = rect(Inheritable::MediaBox);
+                            let crop = rect(Inheritable::CropBox);
+                            let rotate = lookups.get(&start, Inheritable::Rotate);
+                            let failed = media.is_err() || crop.is_err() || rotate.is_err();
+                            let (media, valid_media) = media.unwrap_or_default();
+                            let (crop, valid_crop) = crop.unwrap_or_default();
+                            let rotate = rotate.ok().flatten();
+                            let rotation = rotation(rotate.clone());
+                            let geometry = if failed {
+                                Err(GeometryError::ParentLoop)
+                            } else {
+                                geometry::visible_geometry(media, crop, rotate, unit)
+                            };
+                            (
+                                media.filter(|_| valid_media),
+                                crop.filter(|_| valid_crop),
+                                rotation,
+                                geometry,
+                            )
+                        });
+                        let geometry = if found.is_err() {
+                            Err(GeometryError::ParentLoop)
+                        } else {
+                            geometry.map(|g| VisibleGeometry { lost, ..g })
                         };
-                        let media_box = rect(media_box);
-                        let crop_box = rect(crop_box);
+                        let found = found.ok().flatten();
                         let resources = match found {
                             Some(Object::Dict(dict)) => resources
                                 .get(xref, dict.content_key(), || {
@@ -172,7 +194,8 @@ impl<'a> Inherited<'a> {
                         Self {
                             media_box,
                             crop_box,
-                            rotation: rotation(rotate),
+                            geometry,
+                            rotation,
                             resources,
                         }
                     })
@@ -181,7 +204,11 @@ impl<'a> Inherited<'a> {
         };
         let found = each(&mut lookups);
         if lookups.repaired() {
-            each(&mut lookups)
+            let mut repaired = each(&mut lookups);
+            for ((current, _), (original, _)) in repaired.iter_mut().zip(found) {
+                current.geometry = original.geometry;
+            }
+            repaired
         } else {
             found
         }
@@ -205,6 +232,7 @@ fn rotation(value: Option<Object<'_>>) -> Rotation {
 
 /// A PDF page.
 pub struct Page<'a> {
+    geometry: Result<VisibleGeometry, GeometryError>,
     id: Option<ObjectIdentifier>,
     inner: Dict<'a>,
     media_box: Rect,
@@ -228,6 +256,7 @@ impl<'a> Page<'a> {
         let crop_box = inherited.crop_box.unwrap_or(media_box);
 
         Self {
+            geometry: inherited.geometry,
             id: listed.id,
             inner: listed.dict,
             media_box,
@@ -435,6 +464,11 @@ impl<'a> Page<'a> {
     /// Get the resources of the page.
     pub fn resources(&self) -> &Resources<'a> {
         &self.resources
+    }
+
+    /// Checked visible geometry before the default paper size is substituted.
+    pub fn visible_geometry(&self) -> Result<VisibleGeometry, GeometryError> {
+        self.geometry
     }
 
     /// Get the media box of the page.
