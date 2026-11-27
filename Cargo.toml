@@ -129,5 +129,5 @@ overflow-checks = true
 [patch.crates-io]
 pdf-writer = { git = "https://github.com/Vantrongs/pdf-writer", rev = "3bac7d8da8103978ad4d6bd555abbbe191a7845f" }
 zune-core = { git = "https://github.com/Vantrongs/zune-image", rev = "fdfad543194f1b8f79a1b78fd733a7ccc6ee4651" }
-vello_cpu = { git = "https://github.com/Vantrongs/vello", rev = "83292e60514fc3bcc57616c13484be68819ffa74" }
-vello_common = { git = "https://github.com/Vantrongs/vello", rev = "83292e60514fc3bcc57616c13484be68819ffa74" }
+vello_cpu = { git = "https://github.com/Vantrongs/vello", rev = "76e101eb0225938f3d37a4b42b6504415e909992" }
+vello_common = { git = "https://github.com/Vantrongs/vello", rev = "76e101eb0225938f3d37a4b42b6504415e909992" }
