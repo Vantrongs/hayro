@@ -89,6 +89,7 @@ impl ImageAsset {
                 asset: self.clone(),
                 layout: bands.layout,
                 bands: Some(bands),
+                retry_scratch: None,
                 token: Some(token),
                 decoded: None,
             });
@@ -158,6 +159,7 @@ impl ImageAsset {
         Ok(ImageSource {
             asset: self.clone(),
             bands: None,
+            retry_scratch: None,
             token: None,
             layout,
             decoded: Some(decoded),
@@ -305,6 +307,7 @@ pub struct ImageSource {
     layout: ImageLayout,
     asset: ImageAsset,
     bands: Option<Bands>,
+    retry_scratch: Option<Box<[[Option<bands::NativeLayout>; 2]; 2]>>,
     token: Option<Arc<std::sync::atomic::AtomicBool>>,
     decoded: Option<Decoded>,
 }
@@ -343,7 +346,13 @@ impl ImageSource {
         let native = self
             .bands
             .as_ref()
-            .map_or([None; 2], |b| b.scratch_layout(plane));
+            .map(|b| b.scratch_layout(plane, false))
+            .or_else(|| {
+                self.retry_scratch
+                    .as_ref()
+                    .map(|layouts| layouts[plane as usize])
+            })
+            .unwrap_or([None; 2]);
         Ok(move |window: [u32; 4]| {
             if window[0] >= window[2]
                 || window[1] >= window[3]
@@ -422,6 +431,10 @@ impl ImageSource {
                 let band = match bands.read_band(request.plane, &columns, y, end, obj) {
                     Ok(result) => result,
                     Err(error) => {
+                        self.retry_scratch = Some(Box::new(
+                            [Plane::Image, Plane::Mask]
+                                .map(|plane| bands.scratch_layout(plane, true)),
+                        ));
                         self.bands = None;
                         return Err(error);
                     }

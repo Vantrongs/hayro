@@ -363,7 +363,7 @@ impl<'a> Stream<'a> {
                 let planes = (image.width() as usize)
                     .saturating_mul(image.height() as usize)
                     .saturating_mul(channels)
-                    .saturating_mul(size_of::<f32>());
+                    .saturating_mul(2 * size_of::<f32>());
                 Some((image.width(), image.height(), channels, planes))
             }
             Filter::DctDecode => {

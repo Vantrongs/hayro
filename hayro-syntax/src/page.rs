@@ -142,14 +142,20 @@ impl<'a> Inherited<'a> {
         let mut lookups = inherit::Lookups::new(xref, tree.root, Some(tree));
         let mut operands = geometry::Operands::new(xref);
         let mut resources = Memo::<ContentKey<'a>, Resources<'a>>::default();
-        listed
+        let mut read_resources = |found: Option<Object<'a>>| match found {
+            Some(Object::Dict(dict)) => resources
+                .get(xref, dict.content_key(), || {
+                    Resources::read(|key| tree::value(xref, &dict, key))
+                })
+                .clone(),
+            _ => Resources::new(Dict::empty()),
+        };
+        let mut refresh = 0;
+        let mut inherited: Vec<_> = listed
             .iter()
-            .map(|page| {
-                let start = inherit::Start {
-                    key: tree::Key::of(page.id, &page.dict),
-                    dict: &page.dict,
-                    under: page.under,
-                };
+            .enumerate()
+            .map(|(index, page)| {
+                let start = page.start();
                 let repaired = lookups.repaired();
                 let mut resolve = |lookups: &mut inherit::Lookups<'_, 'a>| {
                     xref.apart(|| {
@@ -183,15 +189,7 @@ impl<'a> Inherited<'a> {
                         } else {
                             geometry.map(|g| VisibleGeometry { lost, ..g })
                         };
-                        let found = found.ok().flatten();
-                        let resources = match found {
-                            Some(Object::Dict(dict)) => resources
-                                .get(xref, dict.content_key(), || {
-                                    Resources::read(|key| tree::value(xref, &dict, key))
-                                })
-                                .clone(),
-                            _ => Resources::new(Dict::empty()),
-                        };
+                        let resources = read_resources(found.ok().flatten());
                         Self {
                             media_box,
                             crop_box,
@@ -203,12 +201,34 @@ impl<'a> Inherited<'a> {
                 };
                 let result = resolve(&mut lookups);
                 if !repaired && lookups.repaired() {
+                    refresh = index;
                     resolve(&mut lookups)
                 } else {
                     result
                 }
             })
-            .collect()
+            .collect();
+        for (page, (item, _)) in listed.iter().zip(&mut inherited).take(refresh) {
+            (item.resources, _) = xref.apart(|| {
+                read_resources(
+                    lookups
+                        .get(&page.start(), Inheritable::Resources)
+                        .ok()
+                        .flatten(),
+                )
+            });
+        }
+        inherited
+    }
+}
+
+impl<'a> tree::Listed<'a> {
+    fn start(&self) -> inherit::Start<'a, '_> {
+        inherit::Start {
+            key: tree::Key::of(self.id, &self.dict),
+            dict: &self.dict,
+            under: self.under,
+        }
     }
 }
 

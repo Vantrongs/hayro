@@ -591,12 +591,12 @@ impl Bands {
         }
     }
 
-    pub(super) fn scratch_layout(&self, plane: Plane) -> [Option<NativeLayout>; 2] {
+    pub(super) fn scratch_layout(&self, plane: Plane, fresh: bool) -> [Option<NativeLayout>; 2] {
         let native = |b: &Bands| {
             let finished = b
                 .reader
                 .with_dependent(|_, r| matches!(r, Producer::Finished));
-            let scratch = if finished && matches!(b.spool, Spool::File(_)) {
+            let scratch = if !fresh && finished && matches!(b.spool, Spool::File(_)) {
                 0
             } else {
                 b.decoder_scratch
@@ -672,6 +672,10 @@ mod tests {
         let doc = pdf(&[("/BPC 8 /Width 2048 /Height 192 /Filter /AHx", &encoded)]);
         let asset = image(&doc).asset(None);
         let mut source = asset.open(None).unwrap();
+        let scratch = |source: &ImageSource| {
+            source.request_scratch(Plane::Image, (2048, 192)).unwrap()([0, 0, 2048, 192])
+        };
+        let before = scratch(&source);
         let bad_dir = tempfile::NamedTempFile::new().unwrap();
         source.bands.as_mut().unwrap().spool =
             Spool::File(SpooledTempFile::new_in(0, bad_dir.path()));
@@ -682,6 +686,7 @@ mod tests {
             cancel: None,
         });
         assert!(matches!(result, Err(RequestError::Failed)));
+        assert_eq!(scratch(&source), before);
     }
 
     #[test]

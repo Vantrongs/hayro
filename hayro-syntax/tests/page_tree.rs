@@ -1012,6 +1012,29 @@ fn lookups_follow_the_repaired_parents_once_a_loop_was_met() {
     assert!(matches!(tree.get(page_3, Inheritable::Rotate), Ok(None)));
 }
 
+#[test]
+fn earlier_page_draws_with_repaired_resources() {
+    let file = pdf(&[
+        CATALOG,
+        "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 300 300] /Resources << /XObject << /Logo 6 0 R >> >> >>",
+        "<< /Type /Page /Parent 5 0 R /Contents 8 0 R >>",
+        "<< /Type /Page /Parent 4 0 R >>",
+        "<< /Type /Pages /MediaBox [0 0 100 100] /Resources << /XObject << /Logo 7 0 R >> >> >>",
+        "<< /Subtype /Form /BBox [0 0 1 1] /Length 20 >>\nstream\n1 0 0 rg 0 0 1 1 re f\nendstream",
+        "<< /Subtype /Form /BBox [0 0 1 1] /Length 20 >>\nstream\n0 0 1 rg 0 0 1 1 re f\nendstream",
+        "<< /Length 8 >>\nstream\n/Logo Do\nendstream",
+    ]);
+    let pdf = open("late_repair_resources", file);
+    let page = &pdf.pages()[0];
+    assert_eq!(page.media_box().x1, 100.0);
+    let logo = page
+        .resources()
+        .x_objects
+        .get::<hayro_syntax::object::Stream<'_>>(b"Logo".as_slice())
+        .unwrap();
+    assert_eq!(logo.decoded().unwrap().as_ref(), b"1 0 0 rg 0 0 1 1 re f");
+}
+
 /// Inherited values are read through references, each number of a box too. A box
 /// is the first four numbers of an array, in either order of its corners; an array
 /// of fewer, or with one that is no number, is no box, and each number is read at
